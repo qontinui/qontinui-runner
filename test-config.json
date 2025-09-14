@@ -1,0 +1,89 @@
+{
+  "version": "1.0.0",
+  "metadata": {
+    "name": "Test Automation",
+    "description": "Simple test configuration for runner",
+    "author": "Test User",
+    "created": "2024-01-01T00:00:00Z",
+    "modified": "2024-01-01T00:00:00Z",
+    "tags": ["test"],
+    "targetApplication": "Test App"
+  },
+  "images": [],
+  "processes": [
+    {
+      "id": "process-1",
+      "name": "Test Process",
+      "description": "A simple test process",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-1",
+          "type": "WAIT",
+          "config": {
+            "duration": 1000
+          }
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-1",
+      "name": "Initial State",
+      "description": "Starting state",
+      "identifyingImages": [],
+      "position": {"x": 100, "y": 100},
+      "isInitial": true,
+      "isFinal": false
+    },
+    {
+      "id": "state-2",
+      "name": "Final State",
+      "description": "Ending state",
+      "identifyingImages": [],
+      "position": {"x": 300, "y": 100},
+      "isInitial": false,
+      "isFinal": true
+    }
+  ],
+  "transitions": [
+    {
+      "id": "transition-1",
+      "type": "FromTransition",
+      "name": "Test Transition",
+      "processes": ["process-1"],
+      "fromState": "state-1",
+      "toState": "state-2",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": [],
+      "timeout": 5000,
+      "retryCount": 1
+    }
+  ],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 10000,
+      "defaultRetryCount": 3,
+      "actionDelay": 100,
+      "failureStrategy": "stop"
+    },
+    "recognition": {
+      "defaultThreshold": 0.9,
+      "searchAlgorithm": "template_matching",
+      "multiScaleSearch": true,
+      "colorSpace": "rgb"
+    },
+    "logging": {
+      "level": "info",
+      "screenshotOnError": true,
+      "consoleOutput": true
+    },
+    "performance": {
+      "maxParallelActions": 1,
+      "cacheImages": true,
+      "optimizeSearch": true
+    }
+  }
+}

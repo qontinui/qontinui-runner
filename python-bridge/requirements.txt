@@ -1,0 +1,5 @@
+# Core dependencies for the Python bridge
+Pillow>=9.0.0  # For screenshot handling
+
+# Note: The actual Qontinui library should be installed from the parent directory
+# pip install -e ../../qontinui
