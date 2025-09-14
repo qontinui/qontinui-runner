@@ -365,13 +365,15 @@ function App() {
 
             {configLoaded && config && (
               <div className="space-y-3 p-3 bg-background/50 rounded-lg border border-border/30">
-                <div className="font-semibold text-primary">{config.name}</div>
+                <div className="font-semibold text-primary truncate" title={config.name}>{config.name}</div>
                 <div className="grid grid-cols-2 gap-2 text-sm">
                   <div>Version: <span className="text-accent">{config.version}</span></div>
                   <div>States: <span className="text-accent">{config.statesCount}</span></div>
                   <div>Processes: <span className="text-accent">{config.processesCount}</span></div>
                 </div>
-                <div className="text-xs font-mono text-muted-foreground break-all">{config.path}</div>
+                <div className="text-xs font-mono text-muted-foreground text-ellipsis-start" title={config.path}>
+                  <span>{config.path}</span>
+                </div>
               </div>
             )}
           </div>
