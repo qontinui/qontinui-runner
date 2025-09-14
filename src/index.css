@@ -1,0 +1,69 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Dark gaming theme with neon accents */
+    --background: 10 10 11;
+    --foreground: 0 0 100%;
+    --card: 240 4% 16%;
+    --card-foreground: 0 0 100%;
+    --popover: 10 10 11;
+    --popover-foreground: 0 0 100%;
+    --primary: 191 100% 50%;  /* Cyan */
+    --primary-foreground: 10 10 11;
+    --secondary: 285 100% 50%;  /* Purple */
+    --secondary-foreground: 0 0 100%;
+    --muted: 217 9% 37%;
+    --muted-foreground: 215 8% 64%;
+    --accent: 145 100% 50%;  /* Green */
+    --accent-foreground: 10 10 11;
+    --destructive: 0 84% 71%;
+    --destructive-foreground: 0 0 100%;
+    --border: 0 0 100% / 0.1;
+    --input: 0 0 12%;
+    --ring: 191 100% 50% / 0.5;
+    --radius: 0.5rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+  
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer utilities {
+  .grid-dots {
+    background-image: radial-gradient(circle, rgba(255, 255, 255, 0.1) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+
+  .glow-cyan {
+    box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);
+  }
+
+  .glow-purple {
+    box-shadow: 0 0 20px rgba(189, 0, 255, 0.3);
+  }
+
+  .glow-green {
+    box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+  }
+
+  .pulse-glow {
+    animation: pulse-glow 2s ease-in-out infinite alternate;
+  }
+
+  @keyframes pulse-glow {
+    from {
+      box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);
+    }
+    to {
+      box-shadow: 0 0 30px rgba(0, 217, 255, 0.6);
+    }
+  }
+}

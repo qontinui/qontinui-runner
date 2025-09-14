@@ -1,0 +1,287 @@
+{
+  "version": "1.0.0",
+  "metadata": {
+    "name": "Test Project",
+    "description": "A test project for export/import",
+    "created": "2024-01-01T00:00:00Z",
+    "modified": "2025-09-12T12:00:23.844366Z",
+    "tags": [
+      "calculator",
+      "demo"
+    ],
+    "targetApplication": "Calculator",
+    "author": "testuser"
+  },
+  "images": [
+    {
+      "id": "calc-button-7",
+      "name": "button_7.png",
+      "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "format": "png",
+      "width": 50,
+      "height": 50,
+      "hash": "abbd4841ba31f4d7195c0bae44b30cbebbb9c7cc91f3dad94f68614c6ce4bee8"
+    },
+    {
+      "id": "calc-button-plus",
+      "name": "button_plus.png",
+      "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "format": "png",
+      "width": 50,
+      "height": 50,
+      "hash": "abbd4841ba31f4d7195c0bae44b30cbebbb9c7cc91f3dad94f68614c6ce4bee8"
+    },
+    {
+      "id": "calc-button-3",
+      "name": "button_3.png",
+      "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "format": "png",
+      "width": 50,
+      "height": 50,
+      "hash": "abbd4841ba31f4d7195c0bae44b30cbebbb9c7cc91f3dad94f68614c6ce4bee8"
+    },
+    {
+      "id": "calc-button-equals",
+      "name": "button_equals.png",
+      "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+      "format": "png",
+      "width": 50,
+      "height": 50,
+      "hash": "abbd4841ba31f4d7195c0bae44b30cbebbb9c7cc91f3dad94f68614c6ce4bee8"
+    }
+  ],
+  "processes": [
+    {
+      "id": "click-7",
+      "name": "Click 7",
+      "description": "Clicks the 7 button",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-click-7",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "image",
+              "imageId": "calc-button-7",
+              "threshold": 0.9
+            }
+          },
+          "timeout": 5000,
+          "retryCount": 3
+        }
+      ]
+    },
+    {
+      "id": "click-plus",
+      "name": "Click Plus",
+      "description": "Clicks the plus button",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-click-plus",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "image",
+              "imageId": "calc-button-plus",
+              "threshold": 0.9
+            }
+          },
+          "timeout": 5000,
+          "retryCount": 3
+        }
+      ]
+    },
+    {
+      "id": "click-3",
+      "name": "Click 3",
+      "description": "Clicks the 3 button",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-click-3",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "image",
+              "imageId": "calc-button-3",
+              "threshold": 0.9
+            }
+          },
+          "timeout": 5000,
+          "retryCount": 3
+        }
+      ]
+    },
+    {
+      "id": "click-equals",
+      "name": "Click Equals",
+      "description": "Clicks the equals button",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-click-equals",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "image",
+              "imageId": "calc-button-equals",
+              "threshold": 0.9
+            }
+          },
+          "timeout": 5000,
+          "retryCount": 3
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "calculator-ready",
+      "name": "Calculator Ready",
+      "description": "Calculator is open and ready",
+      "identifyingImages": [],
+      "position": {
+        "x": 100,
+        "y": 200
+      },
+      "isInitial": true,
+      "isFinal": false
+    },
+    {
+      "id": "number-entered",
+      "name": "First Number Entered",
+      "description": "First number has been entered",
+      "identifyingImages": [],
+      "position": {
+        "x": 300,
+        "y": 200
+      },
+      "isInitial": false,
+      "isFinal": false
+    },
+    {
+      "id": "operator-selected",
+      "name": "Operator Selected",
+      "description": "Plus operator selected",
+      "identifyingImages": [],
+      "position": {
+        "x": 500,
+        "y": 200
+      },
+      "isInitial": false,
+      "isFinal": false
+    },
+    {
+      "id": "second-number-entered",
+      "name": "Second Number Entered",
+      "description": "Second number has been entered",
+      "identifyingImages": [],
+      "position": {
+        "x": 700,
+        "y": 200
+      },
+      "isInitial": false,
+      "isFinal": false
+    },
+    {
+      "id": "result-displayed",
+      "name": "Result Displayed",
+      "description": "Calculation complete, result shown",
+      "identifyingImages": [],
+      "position": {
+        "x": 900,
+        "y": 200
+      },
+      "isInitial": false,
+      "isFinal": true
+    }
+  ],
+  "transitions": [
+    {
+      "id": "trans-enter-7",
+      "type": "FromTransition",
+      "name": "Enter 7",
+      "processes": [
+        "click-7"
+      ],
+      "fromState": "calculator-ready",
+      "toState": "number-entered",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": [],
+      "timeout": 10000,
+      "retryCount": 3
+    },
+    {
+      "id": "trans-select-plus",
+      "type": "FromTransition",
+      "name": "Select Plus",
+      "processes": [
+        "click-plus"
+      ],
+      "fromState": "number-entered",
+      "toState": "operator-selected",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": [],
+      "timeout": 10000,
+      "retryCount": 3
+    },
+    {
+      "id": "trans-enter-3",
+      "type": "FromTransition",
+      "name": "Enter 3",
+      "processes": [
+        "click-3"
+      ],
+      "fromState": "operator-selected",
+      "toState": "second-number-entered",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": [],
+      "timeout": 10000,
+      "retryCount": 3
+    },
+    {
+      "id": "trans-calculate",
+      "type": "FromTransition",
+      "name": "Calculate Result",
+      "processes": [
+        "click-equals"
+      ],
+      "fromState": "second-number-entered",
+      "toState": "result-displayed",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": [],
+      "timeout": 10000,
+      "retryCount": 3
+    }
+  ],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 10000,
+      "defaultRetryCount": 3,
+      "actionDelay": 500,
+      "failureStrategy": "stop"
+    },
+    "recognition": {
+      "defaultThreshold": 0.9,
+      "searchAlgorithm": "template_matching",
+      "multiScaleSearch": true,
+      "colorSpace": "rgb"
+    },
+    "logging": {
+      "level": "info",
+      "screenshotOnError": true,
+      "consoleOutput": true
+    },
+    "performance": {
+      "maxParallelActions": 1,
+      "cacheImages": true,
+      "optimizeSearch": true
+    }
+  }
+}

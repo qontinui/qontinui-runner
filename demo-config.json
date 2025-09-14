@@ -1,0 +1,183 @@
+{
+  "version": "1.0.0",
+  "metadata": {
+    "name": "Demo Automation",
+    "description": "A simple demo showing basic automation capabilities",
+    "author": "Demo User",
+    "created": "2024-01-01T00:00:00.000Z",
+    "modified": "2024-01-01T00:00:00.000Z",
+    "tags": [],
+    "targetApplication": "Demo App"
+  },
+  "images": [],
+  "processes": [
+    {
+      "id": "process-demo-1",
+      "name": "Click and Type Demo",
+      "description": "Demonstrates clicking and typing",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-1",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "coordinates",
+              "x": 500,
+              "y": 300
+            },
+            "clickType": "left",
+            "clickCount": 1
+          },
+          "timeout": 5000,
+          "retryCount": 3,
+          "continueOnError": false
+        },
+        {
+          "id": "action-2",
+          "type": "TYPE",
+          "config": {
+            "text": "Hello from Qontinui!",
+            "typing_delay": 50
+          },
+          "timeout": 5000,
+          "retryCount": 3,
+          "continueOnError": false
+        },
+        {
+          "id": "action-3",
+          "type": "WAIT",
+          "config": {
+            "duration": 2000
+          },
+          "timeout": 5000,
+          "retryCount": 1,
+          "continueOnError": false
+        }
+      ]
+    },
+    {
+      "id": "process-demo-2",
+      "name": "Scroll Demo",
+      "description": "Demonstrates scrolling",
+      "type": "sequence",
+      "actions": [
+        {
+          "id": "action-4",
+          "type": "SCROLL",
+          "config": {
+            "direction": "down",
+            "amount": 3
+          },
+          "timeout": 5000,
+          "retryCount": 1,
+          "continueOnError": false
+        },
+        {
+          "id": "action-5",
+          "type": "WAIT",
+          "config": {
+            "duration": 1000
+          },
+          "timeout": 5000,
+          "retryCount": 1,
+          "continueOnError": false
+        },
+        {
+          "id": "action-6",
+          "type": "SCROLL",
+          "config": {
+            "direction": "up",
+            "amount": 3
+          },
+          "timeout": 5000,
+          "retryCount": 1,
+          "continueOnError": false
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-start",
+      "name": "Start State",
+      "description": "Initial state",
+      "identifyingImages": [],
+      "position": { "x": 100, "y": 100 },
+      "isInitial": true,
+      "isFinal": false
+    },
+    {
+      "id": "state-middle",
+      "name": "Middle State",
+      "description": "Intermediate state",
+      "identifyingImages": [],
+      "position": { "x": 300, "y": 100 },
+      "isInitial": false,
+      "isFinal": false
+    },
+    {
+      "id": "state-end",
+      "name": "End State",
+      "description": "Final state",
+      "identifyingImages": [],
+      "position": { "x": 500, "y": 100 },
+      "isInitial": false,
+      "isFinal": true
+    }
+  ],
+  "transitions": [
+    {
+      "id": "trans-1",
+      "type": "FromTransition",
+      "processes": ["process-demo-1"],
+      "timeout": 10000,
+      "retryCount": 3,
+      "fromState": "state-start",
+      "toState": "state-middle",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": []
+    },
+    {
+      "id": "trans-2",
+      "type": "FromTransition",
+      "processes": ["process-demo-2"],
+      "timeout": 10000,
+      "retryCount": 3,
+      "fromState": "state-middle",
+      "toState": "state-end",
+      "staysVisible": false,
+      "activateStates": [],
+      "deactivateStates": []
+    }
+  ],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 10000,
+      "defaultRetryCount": 3,
+      "actionDelay": 100,
+      "failureStrategy": "stop",
+      "headless": false
+    },
+    "recognition": {
+      "defaultThreshold": 0.9,
+      "searchAlgorithm": "template_matching",
+      "multiScaleSearch": true,
+      "colorSpace": "rgb",
+      "edgeDetection": false,
+      "ocrEnabled": false
+    },
+    "logging": {
+      "level": "info",
+      "screenshotOnError": true,
+      "consoleOutput": true,
+      "detailedMatching": false
+    },
+    "performance": {
+      "maxParallelActions": 1,
+      "cacheImages": true,
+      "optimizeSearch": true
+    }
+  }
+}
