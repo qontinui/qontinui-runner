@@ -1,0 +1,94 @@
+{
+  "version": "1.0",
+  "metadata": {
+    "name": "Notepad Automation Example",
+    "description": "Simple Windows Notepad automation that types text",
+    "author": "Qontinui",
+    "created": "2024-01-14"
+  },
+  "states": [
+    {
+      "id": "notepad_ready",
+      "name": "Notepad Ready",
+      "description": "Notepad is open and ready for input",
+      "images": [],
+      "actions": [
+        {
+          "type": "type",
+          "text": "Hello from Qontinui!",
+          "description": "Type greeting text"
+        },
+        {
+          "type": "wait",
+          "duration": 1000,
+          "description": "Wait 1 second"
+        },
+        {
+          "type": "key",
+          "key": "enter",
+          "description": "Press Enter"
+        },
+        {
+          "type": "type",
+          "text": "This is automated typing in Notepad.",
+          "description": "Type more text"
+        }
+      ]
+    }
+  ],
+  "processes": [
+    {
+      "id": "type_in_notepad",
+      "name": "Type in Notepad",
+      "description": "Opens Notepad and types text",
+      "steps": [
+        {
+          "action": "key",
+          "key": "win+r",
+          "description": "Open Run dialog"
+        },
+        {
+          "action": "wait",
+          "duration": 500
+        },
+        {
+          "action": "type",
+          "text": "notepad",
+          "description": "Type notepad command"
+        },
+        {
+          "action": "key",
+          "key": "enter",
+          "description": "Launch Notepad"
+        },
+        {
+          "action": "wait",
+          "duration": 2000,
+          "description": "Wait for Notepad to open"
+        },
+        {
+          "action": "type",
+          "text": "Hello from Qontinui Runner!\n\n",
+          "description": "Type greeting"
+        },
+        {
+          "action": "type",
+          "text": "This text was typed automatically.\n",
+          "description": "Type description"
+        },
+        {
+          "action": "type",
+          "text": "Timestamp: ",
+          "description": "Type timestamp label"
+        },
+        {
+          "action": "key",
+          "keys": ["ctrl", "shift", "d"],
+          "description": "Insert date/time (if supported)"
+        }
+      ]
+    }
+  ],
+  "transitions": [],
+  "images": []
+}
