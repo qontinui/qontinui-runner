@@ -4,6 +4,28 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Qontinui Runner</title>
+    <style>
+      /* Fallback styles to ensure visibility */
+      body {
+        margin: 0;
+        padding: 0;
+        background-color: #0a0a0b;
+        color: white;
+        font-family: system-ui, -apple-system, sans-serif;
+        min-height: 100vh;
+      }
+      #root {
+        min-height: 100vh;
+      }
+      /* Loading indicator */
+      #root:empty::after {
+        content: "Loading Qontinui Runner...";
+        display: block;
+        padding: 20px;
+        text-align: center;
+        color: #00d9ff;
+      }
+    </style>
   </head>
 
   <body>

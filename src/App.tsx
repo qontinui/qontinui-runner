@@ -38,6 +38,11 @@ function App() {
   const [copySuccess, setCopySuccess] = useState(false)
   const logViewerRef = useRef<HTMLDivElement>(null)
   const logIdRef = useRef(0)
+  
+  // Debug on mount
+  useEffect(() => {
+    console.log('App component mounted')
+  }, [])
 
   const addLog = (level: LogEntry['level'], message: string) => {
     const timestamp = new Date().toLocaleTimeString('en-US', { 
