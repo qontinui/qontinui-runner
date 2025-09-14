@@ -66,4 +66,16 @@
       box-shadow: 0 0 30px rgba(0, 217, 255, 0.6);
     }
   }
+  
+  .text-ellipsis-start {
+    direction: rtl;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  
+  .text-ellipsis-start span {
+    direction: ltr;
+    unicode-bidi: bidi-override;
+  }
 }
