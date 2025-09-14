@@ -10,11 +10,12 @@ import json
 import time
 import traceback
 import threading
+import tempfile
 from typing import Optional, Dict, Any
 from enum import Enum
 
 # Import Qontinui library - REQUIRED (no fallback)
-from qontinui.json_executor import JSONRunner
+from qontinui.json_executor.json_runner import JSONRunner
 from qontinui.mock import MockModeManager
 
 
@@ -43,6 +44,8 @@ class QontinuiBridge:
         self.runner = JSONRunner()
         self._sequence = 0
         self._execution_thread = None
+        self._is_running = False
+        self._temp_config_file = None
         self._setup_callbacks()
         
         mode_str = "mock/simulation" if mock_mode else "real"
@@ -111,9 +114,23 @@ class QontinuiBridge:
                     else:
                         return {"success": False, "error": "No configuration provided"}
                 
-                # Pass directly to Qontinui
+                # JSONRunner expects a file path, so save config to temp file
                 self._emit_log("info", "Loading configuration into Qontinui")
-                success = self.runner.load_configuration_from_string(config_data)
+                
+                # Clean up any previous temp file
+                if self._temp_config_file:
+                    try:
+                        import os
+                        os.unlink(self._temp_config_file.name)
+                    except:
+                        pass
+                
+                # Create temp file with config data
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                    f.write(config_data)
+                    self._temp_config_file = f
+                
+                success = self.runner.load_configuration(self._temp_config_file.name)
                 
                 if success:
                     # Parse config to get metadata for event
@@ -138,13 +155,13 @@ class QontinuiBridge:
                 mode = params.get("mode", "state_machine")
                 process_id = params.get("process_id")
                 
-                if not self.runner.has_config():
+                if not self.runner.config:
                     self._emit_event(EventType.ERROR, {
                         "message": "No configuration loaded"
                     })
                     return {"success": False, "error": "No configuration loaded"}
                 
-                if self.runner.is_running:
+                if self._is_running:
                     self._emit_event(EventType.ERROR, {
                         "message": "Execution already in progress"
                     })
@@ -158,15 +175,9 @@ class QontinuiBridge:
                 # Run in separate thread to not block
                 def run_automation():
                     try:
-                        # Pass directly to Qontinui
-                        if mode == "process" and process_id:
-                            # If Qontinui supports process-specific execution
-                            if hasattr(self.runner, 'run_process'):
-                                success = self.runner.run_process(process_id)
-                            else:
-                                success = self.runner.run(mode=mode)
-                        else:
-                            success = self.runner.run(mode=mode)
+                        self._is_running = True
+                        # Pass directly to Qontinui - JSONRunner.run() accepts mode parameter
+                        success = self.runner.run(mode=mode)
                         
                         self._emit_event(EventType.EXECUTION_COMPLETED, {
                             "success": success,
@@ -177,6 +188,8 @@ class QontinuiBridge:
                             "message": "Execution failed",
                             "details": str(e)
                         })
+                    finally:
+                        self._is_running = False
                 
                 self._execution_thread = threading.Thread(target=run_automation)
                 self._execution_thread.daemon = True
@@ -185,9 +198,9 @@ class QontinuiBridge:
                 return {"success": True}
             
             elif cmd_type == "stop":
-                # Pass directly to Qontinui
+                # JSONRunner doesn't have stop(), so we'll track it ourselves
                 self._emit_log("info", "Stopping execution...")
-                self.runner.stop()
+                self._is_running = False
                 self._emit_event(EventType.EXECUTION_COMPLETED, {
                     "success": False,
                     "reason": "User stopped"
@@ -195,11 +208,15 @@ class QontinuiBridge:
                 return {"success": True}
             
             elif cmd_type == "status":
-                # Get status from Qontinui
+                # Get status from our tracking and JSONRunner
+                current_state = None
+                if self.runner.state_executor and hasattr(self.runner.state_executor, 'current_state'):
+                    current_state = self.runner.state_executor.current_state
+                
                 return {
-                    "is_running": self.runner.is_running,
-                    "current_state": self.runner.get_current_state() if hasattr(self.runner, 'get_current_state') else None,
-                    "config_loaded": self.runner.has_config() if hasattr(self.runner, 'has_config') else (self.runner.config is not None)
+                    "is_running": self._is_running,
+                    "current_state": current_state,
+                    "config_loaded": self.runner.config is not None
                 }
             
             else:
