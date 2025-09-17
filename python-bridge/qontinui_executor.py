@@ -106,6 +106,56 @@ class QontinuiExecutor:
             "message": message
         })
     
+    def _process_special_keys(self, text: str) -> str:
+        """Process special key placeholders in text.
+        
+        Converts placeholders like {ENTER}, {TAB}, etc. to actual key values.
+        """
+        # Simple mappings for common special keys
+        replacements = {
+            "{ENTER}": "\n",
+            "{TAB}": "\t",
+            "{SPACE}": " ",
+            "{BACKSPACE}": "\b",
+            # For complex keys, we'll need to handle them separately
+            # For now, just remove the placeholders
+            "{DELETE}": "",  # TODO: Handle DELETE key
+            "{ESCAPE}": "",  # TODO: Handle ESCAPE key
+            "{UP}": "",      # TODO: Handle arrow keys
+            "{DOWN}": "",
+            "{LEFT}": "",
+            "{RIGHT}": "",
+            "{HOME}": "",
+            "{END}": "",
+            "{PAGE_UP}": "",
+            "{PAGE_DOWN}": "",
+            "{INSERT}": "",
+            # Function keys
+            "{F1}": "", "{F2}": "", "{F3}": "", "{F4}": "",
+            "{F5}": "", "{F6}": "", "{F7}": "", "{F8}": "",
+            "{F9}": "", "{F10}": "", "{F11}": "", "{F12}": "",
+            # Key combos - these need special handling
+            "{CTRL+A}": "",  # TODO: Handle key combinations
+            "{CTRL+C}": "",
+            "{CTRL+V}": "",
+            "{CTRL+X}": "",
+            "{CTRL+Z}": "",
+            "{CTRL+S}": "",
+            "{ALT+TAB}": "",
+            "{ALT+F4}": "",
+        }
+        
+        result = text
+        for placeholder, replacement in replacements.items():
+            result = result.replace(placeholder, replacement)
+        
+        # Log if we had to skip any complex keys
+        if any(key in text for key in ["{DELETE}", "{ESCAPE}", "{UP}", "{DOWN}", 
+                                        "{CTRL+", "{ALT+", "{F1", "{F2", "{F3"]):
+            self._emit_log("warning", "Some special keys are not yet fully supported and were skipped")
+        
+        return result
+    
     def load_configuration(self, config_path: str) -> bool:
         """Load configuration from file and set up Qontinui states."""
         try:
@@ -264,11 +314,59 @@ class QontinuiExecutor:
             
             elif action_type == "TYPE":
                 text = config.get("text", "")
+                clear_before = config.get("clear_before", False)
+                press_enter = config.get("press_enter", False)
+                pause_before_begin = config.get("pause_before_begin", 0) / 1000.0  # Convert ms to seconds
+                pause_after_end = config.get("pause_after_end", 0) / 1000.0  # Convert ms to seconds
+                
+                # Apply pause before beginning (matches Qontinui's pause_before_begin)
+                if pause_before_begin > 0:
+                    self._emit_log("debug", f"Pausing {pause_before_begin}s before typing")
+                    time.sleep(pause_before_begin)
+                
+                # Clear existing text if requested
+                if clear_before:
+                    # Standard approach: Select all text (Ctrl+A) then type over it
+                    # This works across most applications and operating systems
+                    self._emit_log("info", "Clearing text field (Ctrl+A)")
+                    if hasattr(self.actions, 'key_combo'):
+                        self.actions.key_combo(['ctrl', 'a'])
+                    elif hasattr(self.actions, 'hotkey'):
+                        self.actions.hotkey('ctrl', 'a')
+                    else:
+                        # Fallback: Try to select all text manually
+                        self._emit_log("warning", "Key combo not available, attempting manual select-all")
+                        # This is a simplified fallback - actual implementation would depend on the library
+                        pass
+                    time.sleep(0.1)  # Small delay to ensure selection completes
+                
+                # Process special key placeholders
+                processed_text = self._process_special_keys(text)
                 if hasattr(self.actions, 'type_text'):
-                    self.actions.type_text(text)
+                    self.actions.type_text(processed_text)
                 elif hasattr(self.actions, 'type'):
-                    self.actions.type(text)
+                    self.actions.type(processed_text)
                 self._emit_log("info", f"Typed: {text}")
+                
+                # Note: The {ENTER} placeholder in the text is already handled by _process_special_keys
+                # The press_enter flag is kept for backward compatibility but may be redundant
+                # if the frontend adds {ENTER} to the text when press_enter is checked
+                if press_enter and not text.endswith("{ENTER}"):
+                    # Only press Enter if it wasn't already in the text as a placeholder
+                    self._emit_log("info", "Pressing Enter key (from press_enter flag)")
+                    if hasattr(self.actions, 'press'):
+                        self.actions.press('enter')
+                    elif hasattr(self.actions, 'key_press'):
+                        self.actions.key_press('enter')
+                    elif hasattr(self.actions, 'type_text'):
+                        self.actions.type_text('\n')
+                    elif hasattr(self.actions, 'type'):
+                        self.actions.type('\n')
+                
+                # Apply pause after end (matches Qontinui's pause_after_end)
+                if pause_after_end > 0:
+                    self._emit_log("debug", f"Pausing {pause_after_end}s after typing")
+                    time.sleep(pause_after_end)
             
             elif action_type == "WAIT":
                 duration = config.get("duration", 1000) / 1000.0  # Convert ms to seconds
