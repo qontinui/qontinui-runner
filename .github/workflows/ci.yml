@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        platform: [ubuntu-22.04, macos-latest, windows-latest]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: qontinui-runner/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install dependencies (Ubuntu)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            qontinui-runner/src-tauri/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend dependencies
+        run: |
+          cd qontinui-runner
+          npm ci
+
+      - name: Lint frontend code
+        run: |
+          cd qontinui-runner
+          npm run lint || true
+
+      - name: Format Rust code check
+        run: |
+          cd qontinui-runner/src-tauri
+          cargo fmt -- --check
+
+      - name: Clippy check
+        run: |
+          cd qontinui-runner/src-tauri
+          cargo clippy -- -D warnings
+
+      - name: Run Rust tests
+        run: |
+          cd qontinui-runner/src-tauri
+          cargo test --verbose
+
+      - name: Build frontend
+        run: |
+          cd qontinui-runner
+          npm run build
+
+      - name: Build Tauri app (development)
+        run: |
+          cd qontinui-runner
+          npm run tauri build -- --debug
+
+  security:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run security audit on Rust dependencies
+        run: |
+          cargo install cargo-audit
+          cd qontinui-runner/src-tauri
+          cargo audit
+
+      - name: Run npm audit
+        run: |
+          cd qontinui-runner
+          npm audit --audit-level=moderate || true

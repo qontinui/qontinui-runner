@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
-import { Play, Square, Settings, FileText, Cpu, Zap, Terminal, Trash2, Filter, ChevronDown, Copy, Check } from 'lucide-react'
+import { Play, Square, Settings, FileText, Cpu, Zap, Terminal, Trash2, Filter, ChevronDown, Copy, Check, Download } from 'lucide-react'
+import StatusIndicator from './components/StatusIndicator'
 import './index.css'
 
 interface LogEntry {
@@ -304,8 +305,31 @@ function App() {
     ? logs 
     : logs.filter(log => log.level === logLevel)
 
+  // Check for updates on mount
+  useEffect(() => {
+    const checkUpdates = async () => {
+      try {
+        const response = await invoke('check_for_updates')
+        console.log('Update check response:', response)
+        if (response && response.data && response.data.available) {
+          addLog('info', `Update available: ${response.data.version}`)
+        }
+      } catch (error) {
+        console.error('Failed to check for updates:', error)
+      }
+    }
+    checkUpdates()
+  }, [])
+
   return (
     <div className="min-h-screen bg-background grid-dots">
+      {/* Status Indicator */}
+      <StatusIndicator
+        pythonStatus={pythonStatus}
+        configLoaded={configLoaded}
+        executionActive={executionActive}
+      />
+
       <div className="container mx-auto p-6 space-y-6">
         {/* Header */}
         <div className="flex items-center justify-between">
