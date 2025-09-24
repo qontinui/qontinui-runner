@@ -7,9 +7,13 @@ mod error;
 mod executor;
 mod logging;
 
+#[cfg(test)]
+mod test;
+
 use commands::AppState;
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
 use std::sync::Mutex;
+use tauri::Manager;
 use tracing::{error, info};
 
 fn main() {
@@ -76,18 +80,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::handle_error,
             commands::check_for_updates,
         ])
-        .setup(|app| {
+        .setup(|_app| {
             info!("Tauri application setup complete");
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 info!("Window close requested");
-                if let Some(app_handle) = window.app_handle().try_state::<AppState>() {
-                    if let Ok(mut bridge) = app_handle.python_bridge.lock() {
-                        if let Some(ref mut pb) = *bridge {
-                            let _ = pb.stop();
-                        }
+                let app_state = window.state::<AppState>();
+                if let Ok(mut bridge) = app_state.python_bridge.lock() {
+                    if let Some(ref mut pb) = *bridge {
+                        let _ = pb.stop();
                     }
                 }
             }
