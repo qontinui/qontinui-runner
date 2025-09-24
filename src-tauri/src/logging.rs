@@ -1,6 +1,6 @@
 use chrono::Local;
 use std::path::PathBuf;
-use tracing::{Level, Subscriber};
+use tracing::Level;
 use tracing_appender::{non_blocking, rolling};
 use tracing_subscriber::{
     fmt::{self, format::FmtSpan},
@@ -119,7 +119,7 @@ macro_rules! log_debug {
     };
 }
 
-pub fn log_panic(info: &std::panic::PanicInfo) {
+pub fn log_panic(info: &std::panic::PanicHookInfo) {
     let location = if let Some(location) = info.location() {
         format!("{}:{}:{}", location.file(), location.line(), location.column())
     } else {
