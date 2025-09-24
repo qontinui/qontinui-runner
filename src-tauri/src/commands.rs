@@ -3,7 +3,7 @@ use crate::error::{AppError, AppResult, UserFacingError};
 use crate::executor::PythonBridge;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, State};
 use tracing::{error, info, warn};
 
 pub struct AppState {

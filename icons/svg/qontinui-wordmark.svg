@@ -1,0 +1,27 @@
+<svg width="400" height="80" viewBox="0 0 400 80" xmlns="http://www.w3.org/2000/svg">
+  <!-- Define gradient -->
+  <defs>
+    <linearGradient id="qontinuiGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00D9FF;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#BD00FF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#00FF88;stop-opacity:1" />
+    </linearGradient>
+
+    <!-- Alternative two-color gradient (blue to purple) -->
+    <linearGradient id="qontinuiGradient2" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00D9FF;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#BD00FF;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- QONTINUI text with gradient fill -->
+  <text x="200" y="55"
+        font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"
+        font-size="48"
+        font-weight="700"
+        text-anchor="middle"
+        fill="url(#qontinuiGradient2)"
+        letter-spacing="-1">
+    QONTINUI
+  </text>
+</svg>

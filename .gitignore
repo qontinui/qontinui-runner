@@ -48,3 +48,12 @@ Thumbs.db
 # Test files
 *.test.json
 test-*.json
+src-tauri/src/test.rs
+
+# Python project files
+python-bridge/poetry.lock
+python-bridge/tox.ini
+
+# Optional config files (add when ready)
+.pre-commit-config.yaml
+docs/TESTING_CHECKLIST.md
