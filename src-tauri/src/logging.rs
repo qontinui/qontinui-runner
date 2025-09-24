@@ -43,6 +43,9 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<()> {
 
     let registry = Registry::default().with(env_filter);
 
+    // Store log_dir for logging before it's moved
+    let log_dir_path = config.log_dir.clone();
+
     if config.log_to_file {
         let file_appender = rolling::daily(config.log_dir, "qontinui-runner.log");
         let (non_blocking_file, _guard) = non_blocking(file_appender);
@@ -73,7 +76,7 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<()> {
     }
 
     tracing::info!("Logging initialized at level: {:?}", config.level);
-    tracing::info!("Log directory: {:?}", config.log_dir);
+    tracing::info!("Log directory: {:?}", log_dir_path);
     tracing::info!("Application started at {}", Local::now());
 
     Ok(())
