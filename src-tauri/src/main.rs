@@ -92,7 +92,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ref mut pb) = *bridge {
                         let _ = pb.stop();
                     }
-                }
+                };  // Add semicolon to drop the temporary earlier
             }
         })
         .build(tauri::generate_context!())?;

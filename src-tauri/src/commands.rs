@@ -1,5 +1,5 @@
 use crate::config::{ConfigLoader, QontinuiConfig};
-use crate::error::{AppError, AppResult, UserFacingError};
+use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -251,7 +251,7 @@ pub fn handle_error(
 
 #[tauri::command]
 pub async fn check_for_updates(
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
 ) -> Result<CommandResponse, String> {
     info!("Checking for updates");
 
