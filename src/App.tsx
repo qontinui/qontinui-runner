@@ -58,6 +58,24 @@ function App() {
     console.log("App component mounted");
   }, []);
 
+  // Debug processes state changes
+  useEffect(() => {
+    console.log("Processes state changed:", processes);
+    console.log("Number of processes:", processes.length);
+    if (processes.length > 0) {
+      console.log("First process:", processes[0]);
+    }
+  }, [processes]);
+
+  // Debug selectedProcess changes
+  useEffect(() => {
+    console.log("Selected process changed:", selectedProcess);
+    if (selectedProcess && processes.length > 0) {
+      const selected = processes.find((p) => p.id === selectedProcess);
+      console.log("Selected process details:", selected);
+    }
+  }, [selectedProcess, processes]);
+
   const addLog = (level: LogEntry["level"], message: string) => {
     const timestamp = new Date().toLocaleTimeString("en-US", {
       hour12: false,
@@ -212,29 +230,68 @@ function App() {
           });
           // Filter processes to only show those in the "main" category
           const allProcesses = result.data?.processes || [];
+
+          // Debug: Log all processes with their categories
+          console.log("All processes loaded:", allProcesses.length);
+          allProcesses.forEach((p: any) => {
+            console.log(`Process: ${p.name} (ID: ${p.id}), Category: "${p.category}"`);
+          });
+
           const mainProcesses = allProcesses.filter(
-            (p: any) => !p.category || p.category === "main", // Show processes without category or with "main" category
+            (p: any) => p.category && p.category.toLowerCase() === "main", // Show only processes with "Main" category (case-insensitive)
           );
 
+          console.log("Filtered main processes:", mainProcesses.length);
+          mainProcesses.forEach((p: any) => {
+            console.log(`Main process: ${p.name} (ID: ${p.id})`);
+          });
+
           setProcesses(mainProcesses);
+          console.log("Processes state updated with:", mainProcesses);
+
           setConfigLoaded(true);
           addLog("success", `Configuration loaded: ${selected}`);
 
-          // Log process filtering info
+          // Log process filtering info with more detail
           if (allProcesses.length > 0) {
+            // Show categories breakdown
+            const categoryCounts: { [key: string]: number } = {};
+            allProcesses.forEach((p: any) => {
+              const cat = p.category || "No category";
+              categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+            });
+
+            const categoryInfo = Object.entries(categoryCounts)
+              .map(([cat, count]) => `${cat}: ${count}`)
+              .join(", ");
+
+            addLog("debug", `Process categories: ${categoryInfo}`);
+
             if (mainProcesses.length !== allProcesses.length) {
               addLog(
                 "info",
-                `Loaded ${mainProcesses.length} processes from "main" category (${allProcesses.length} total)`,
+                `Loaded ${mainProcesses.length} processes from "Main" category (${allProcesses.length} total)`,
               );
             } else {
               addLog("info", `Loaded ${mainProcesses.length} processes`);
+            }
+
+            if (mainProcesses.length === 0) {
+              addLog(
+                "warning",
+                "No processes found with 'Main' category. Check your config categories.",
+              );
             }
           }
 
           // If processes were found, select the first one
           if (mainProcesses.length > 0) {
-            setSelectedProcess(mainProcesses[0].id);
+            const firstProcess = mainProcesses[0];
+            console.log("Setting selected process to:", firstProcess.id, firstProcess.name);
+            setSelectedProcess(firstProcess.id);
+          } else {
+            console.log("No main processes found to select");
+            setSelectedProcess("");
           }
         }
       }
@@ -288,14 +345,26 @@ function App() {
   const handleStartExecution = async () => {
     try {
       const params: any = { mode: executionMode };
-      if (executionMode === "process" && selectedProcess) {
+      if (executionMode === "process") {
+        if (!selectedProcess) {
+          addLog("warning", "Please select a process before starting execution");
+          console.log("No process selected. Available processes:", processes);
+          return;
+        }
         params.processId = selectedProcess;
+        const processName = processes.find((p) => p.id === selectedProcess)?.name;
+        console.log("Starting execution with process:", selectedProcess, processName);
       }
 
+      console.log("Invoking start_execution with params:", params);
       const result: any = await invoke("start_execution", params);
       if (result.success) {
         setExecutionActive(true);
-        addLog("success", `Execution started in ${executionMode} mode`);
+        const processInfo =
+          executionMode === "process" && selectedProcess
+            ? ` (Process: ${processes.find((p) => p.id === selectedProcess)?.name})`
+            : "";
+        addLog("success", `Execution started in ${executionMode} mode${processInfo}`);
       }
     } catch (error) {
       addLog("error", `Failed to start execution: ${error}`);
@@ -513,30 +582,47 @@ function App() {
             {executionMode === "process" && (
               <div className="relative">
                 <button
-                  onClick={() => setShowProcessDropdown(!showProcessDropdown)}
+                  onClick={() => {
+                    console.log("Dropdown clicked. Current processes:", processes);
+                    console.log("Current selectedProcess:", selectedProcess);
+                    setShowProcessDropdown(!showProcessDropdown);
+                  }}
                   className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
                 >
                   <span>
                     {selectedProcess
-                      ? processes.find((p) => p.id === selectedProcess)?.name
-                      : "Select process..."}
+                      ? processes.find((p) => p.id === selectedProcess)?.name ||
+                        `Unknown (${selectedProcess})`
+                      : processes.length > 0
+                        ? "Select process..."
+                        : "No processes available"}
                   </span>
                   <ChevronDown className="w-4 h-4" />
                 </button>
                 {showProcessDropdown && (
                   <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg">
-                    {processes.map((process) => (
-                      <button
-                        key={process.id}
-                        onClick={() => {
-                          setSelectedProcess(process.id);
-                          setShowProcessDropdown(false);
-                        }}
-                        className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
-                      >
-                        {process.name}
-                      </button>
-                    ))}
+                    {processes.length > 0 ? (
+                      processes.map((process) => {
+                        console.log("Rendering dropdown item:", process.id, process.name);
+                        return (
+                          <button
+                            key={process.id}
+                            onClick={() => {
+                              console.log("Process selected:", process.id, process.name);
+                              setSelectedProcess(process.id);
+                              setShowProcessDropdown(false);
+                            }}
+                            className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
+                          >
+                            {process.name}
+                          </button>
+                        );
+                      })
+                    ) : (
+                      <div className="px-3 py-2 text-muted-foreground">
+                        No processes with "Main" category found
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
