@@ -49,6 +49,9 @@ function App() {
   const [showProcessDropdown, setShowProcessDropdown] = useState(false);
   const [showLogFilter, setShowLogFilter] = useState(false);
   const [showExecutorDropdown, setShowExecutorDropdown] = useState(false);
+  const [showMonitorDropdown, setShowMonitorDropdown] = useState(false);
+  const [selectedMonitor, setSelectedMonitor] = useState(0);
+  const [availableMonitors, setAvailableMonitors] = useState<number[]>([0]);
   const [copySuccess, setCopySuccess] = useState(false);
   const logViewerRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
@@ -56,6 +59,9 @@ function App() {
   // Debug on mount
   useEffect(() => {
     console.log("App component mounted");
+    // Initialize with primary monitor, could be expanded to detect actual monitors
+    // For now, we'll support selecting monitors 0-3
+    setAvailableMonitors([0, 1, 2, 3]);
   }, []);
 
   // Debug processes state changes
@@ -344,7 +350,10 @@ function App() {
 
   const handleStartExecution = async () => {
     try {
-      const params: any = { mode: executionMode };
+      const params: any = {
+        mode: executionMode,
+        monitorIndex: selectedMonitor,
+      };
       if (executionMode === "process") {
         if (!selectedProcess) {
           addLog("warning", "Please select a process before starting execution");
@@ -364,7 +373,8 @@ function App() {
           executionMode === "process" && selectedProcess
             ? ` (Process: ${processes.find((p) => p.id === selectedProcess)?.name})`
             : "";
-        addLog("success", `Execution started in ${executionMode} mode${processInfo}`);
+        const monitorInfo = selectedMonitor > 0 ? ` on monitor ${selectedMonitor}` : "";
+        addLog("success", `Execution started in ${executionMode} mode${processInfo}${monitorInfo}`);
       }
     } catch (error) {
       addLog("error", `Failed to start execution: ${error}`);
@@ -627,6 +637,40 @@ function App() {
                 )}
               </div>
             )}
+
+            {/* Monitor Selection */}
+            <div>
+              <label className="text-sm text-muted-foreground">Monitor</label>
+              <div className="relative mt-1">
+                <button
+                  onClick={() => setShowMonitorDropdown(!showMonitorDropdown)}
+                  className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
+                >
+                  <span>Monitor {selectedMonitor}</span>
+                  <ChevronDown className="w-4 h-4" />
+                </button>
+                {showMonitorDropdown && (
+                  <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg">
+                    {availableMonitors.map((monitorIndex) => (
+                      <button
+                        key={monitorIndex}
+                        onClick={() => {
+                          setSelectedMonitor(monitorIndex);
+                          setShowMonitorDropdown(false);
+                          addLog("info", `Selected monitor ${monitorIndex}`);
+                        }}
+                        className={`w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors ${
+                          selectedMonitor === monitorIndex ? "bg-accent/20" : ""
+                        }`}
+                      >
+                        Monitor {monitorIndex}
+                        {monitorIndex === 0 && " (Primary)"}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
 
             <div className="flex gap-2">
               <button
