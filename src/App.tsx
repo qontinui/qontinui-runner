@@ -187,28 +187,20 @@ function App() {
           })
           // Filter processes to show only "main" category
           const allProcesses = result.data?.processes || []
-          const mainProcesses = allProcesses.filter((p: any) =>
-            p.category === 'main' || p.category === 'Main' || p.category === 'MAIN'
-          )
+          const mainProcesses = allProcesses.filter((p: any) => p.category === 'main')
 
-          // If no main processes found but there are processes, check if any have categories
-          const processesToShow = mainProcesses.length > 0 ? mainProcesses :
-            (allProcesses.some((p: any) => p.category) ? [] : allProcesses)
-
-          setProcesses(processesToShow)
+          setProcesses(mainProcesses)
           setConfigLoaded(true)
           addLog('success', `Configuration loaded: ${selected}`)
 
           // Log process filtering info
-          if (mainProcesses.length > 0 && mainProcesses.length !== allProcesses.length) {
+          if (allProcesses.length > 0) {
             addLog('info', `Showing ${mainProcesses.length} main processes out of ${allProcesses.length} total`)
-          } else if (mainProcesses.length === 0 && allProcesses.some((p: any) => p.category)) {
-            addLog('warning', 'No processes in "main" category found. Add processes to "main" category to see them here.')
           }
 
-          // If processes were found, select the first one by default
-          if (processesToShow.length > 0) {
-            setSelectedProcess(processesToShow[0].id)
+          // If main processes were found, select the first one
+          if (mainProcesses.length > 0) {
+            setSelectedProcess(mainProcesses[0].id)
           }
         }
       }
