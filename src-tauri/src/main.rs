@@ -17,9 +17,7 @@ use tauri::Manager;
 use tracing::{error, info};
 
 fn main() {
-    let result = std::panic::catch_unwind(|| {
-        run_app()
-    });
+    let result = std::panic::catch_unwind(run_app);
 
     match result {
         Ok(Ok(())) => {
@@ -55,7 +53,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                         Some(event)
                     })),
                     ..Default::default()
-                }
+                },
             ));
             info!("Sentry crash reporting initialized");
         }
@@ -92,7 +90,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(ref mut pb) = *bridge {
                         let _ = pb.stop();
                     }
-                };  // Add semicolon to drop the temporary earlier
+                }; // Add semicolon to drop the temporary earlier
             }
         })
         .build(tauri::generate_context!())?;

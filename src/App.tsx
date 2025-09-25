@@ -1,334 +1,363 @@
-import { useState, useEffect, useRef } from 'react'
-import { invoke } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
-import { Play, Square, Settings, FileText, Cpu, Zap, Terminal, Trash2, Filter, ChevronDown, Copy, Check, Download } from 'lucide-react'
-import StatusIndicator from './components/StatusIndicator'
-import './index.css'
+import { useState, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import {
+  Play,
+  Square,
+  Settings,
+  FileText,
+  Cpu,
+  Zap,
+  Terminal,
+  Trash2,
+  Filter,
+  ChevronDown,
+  Copy,
+  Check,
+} from "lucide-react";
+import StatusIndicator from "./components/StatusIndicator";
+import "./index.css";
 
 interface LogEntry {
-  id: string
-  timestamp: string
-  level: "info" | "warning" | "error" | "debug" | "success"
-  message: string
+  id: string;
+  timestamp: string;
+  level: "info" | "warning" | "error" | "debug" | "success";
+  message: string;
 }
 
 interface Config {
-  name: string
-  version: string
-  statesCount: number
-  processesCount: number
-  processes: any[]
-  path: string
+  name: string;
+  version: string;
+  statesCount: number;
+  processesCount: number;
+  processes: any[];
+  path: string;
 }
 
 function App() {
-  const [pythonStatus, setPythonStatus] = useState<"stopped" | "running">("stopped")
-  const [configLoaded, setConfigLoaded] = useState(false)
-  const [executionActive, setExecutionActive] = useState(false)
-  const [executionMode, setExecutionMode] = useState<"process" | "state_machine">("process")
-  const [selectedProcess, setSelectedProcess] = useState("")
-  const [executorType, setExecutorType] = useState<"mock" | "real">("mock")
-  const [autoScroll, setAutoScroll] = useState(true)
-  const [logLevel, setLogLevel] = useState("all")
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [config, setConfig] = useState<Config | null>(null)
-  const [processes, setProcesses] = useState<any[]>([])
-  const [showProcessDropdown, setShowProcessDropdown] = useState(false)
-  const [showLogFilter, setShowLogFilter] = useState(false)
-  const [showExecutorDropdown, setShowExecutorDropdown] = useState(false)
-  const [copySuccess, setCopySuccess] = useState(false)
-  const logViewerRef = useRef<HTMLDivElement>(null)
-  const logIdRef = useRef(0)
-  
+  const [pythonStatus, setPythonStatus] = useState<"stopped" | "running">("stopped");
+  const [configLoaded, setConfigLoaded] = useState(false);
+  const [executionActive, setExecutionActive] = useState(false);
+  const [executionMode, setExecutionMode] = useState<"process" | "state_machine">("process");
+  const [selectedProcess, setSelectedProcess] = useState("");
+  const [executorType, setExecutorType] = useState<"mock" | "real" | "minimal">("mock");
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [logLevel, setLogLevel] = useState("all");
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [config, setConfig] = useState<Config | null>(null);
+  const [processes, setProcesses] = useState<any[]>([]);
+  const [showProcessDropdown, setShowProcessDropdown] = useState(false);
+  const [showLogFilter, setShowLogFilter] = useState(false);
+  const [showExecutorDropdown, setShowExecutorDropdown] = useState(false);
+  const [copySuccess, setCopySuccess] = useState(false);
+  const logViewerRef = useRef<HTMLDivElement>(null);
+  const logIdRef = useRef(0);
+
   // Debug on mount
   useEffect(() => {
-    console.log('App component mounted')
-  }, [])
+    console.log("App component mounted");
+  }, []);
 
-  const addLog = (level: LogEntry['level'], message: string) => {
-    const timestamp = new Date().toLocaleTimeString('en-US', { 
-      hour12: false, 
-      hour: '2-digit', 
-      minute: '2-digit', 
-      second: '2-digit' 
-    })
-    setLogs(prev => {
+  const addLog = (level: LogEntry["level"], message: string) => {
+    const timestamp = new Date().toLocaleTimeString("en-US", {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    setLogs((prev) => {
       // Check if the exact same log was just added (prevent duplicates from double mounting)
       if (prev.length > 0) {
-        const lastLog = prev[prev.length - 1]
-        if (lastLog.timestamp === timestamp && lastLog.message === message && lastLog.level === level) {
-          return prev // Skip duplicate
+        const lastLog = prev[prev.length - 1];
+        if (
+          lastLog.timestamp === timestamp &&
+          lastLog.message === message &&
+          lastLog.level === level
+        ) {
+          return prev; // Skip duplicate
         }
       }
-      return [...prev, { 
-        id: String(++logIdRef.current), 
-        timestamp, 
-        level, 
-        message 
-      }]
-    })
-  }
+      return [
+        ...prev,
+        {
+          id: String(++logIdRef.current),
+          timestamp,
+          level,
+          message,
+        },
+      ];
+    });
+  };
 
   useEffect(() => {
-    let unlisten: (() => void) | null = null
-    let isMounted = true
-    
+    let unlisten: (() => void) | null = null;
+    let isMounted = true;
+
     // Check if Python executor is already running on mount
     const checkPythonStatus = async () => {
       try {
-        const result: any = await invoke('get_executor_status')
+        const result: any = await invoke("get_executor_status");
         if (result && result.python_running) {
-          setPythonStatus('running')
-          addLog('info', 'Python executor already running')
+          setPythonStatus("running");
+          addLog("info", "Python executor already running");
         }
       } catch (error) {
-        console.error('Failed to check Python status:', error)
+        console.error("Failed to check Python status:", error);
       }
-    }
-    
+    };
+
     // Listen for events from Tauri backend
     const setupListeners = async () => {
-      const { listen } = await import('@tauri-apps/api/event')
-      
-      const unlistenFn = await listen('executor-event', (event: any) => {
+      const { listen } = await import("@tauri-apps/api/event");
+
+      const unlistenFn = await listen("executor-event", (event: any) => {
         // Prevent processing events if component is unmounted
-        if (!isMounted) return
-        
-        const data = event.payload
+        if (!isMounted) return;
+
+        const data = event.payload;
         // Debug: log the sequence number to check for duplicates
-        console.log('Event received:', data.event, 'Sequence:', data.sequence)
-        
-        if (data.event === 'ready') {
+        console.log("Event received:", data.event, "Sequence:", data.sequence);
+
+        if (data.event === "ready") {
           // Python executor is ready, update status
-          setPythonStatus('running')
-          addLog('info', data.data.message || 'Python executor ready')
+          setPythonStatus("running");
+          addLog("info", data.data.message || "Python executor ready");
         }
-        if (data.event === 'config_loaded' || 
-            data.event === 'execution_started' || data.event === 'execution_completed') {
-          addLog('info', data.data.message || `Event: ${data.event}`)
+        if (
+          data.event === "config_loaded" ||
+          data.event === "execution_started" ||
+          data.event === "execution_completed"
+        ) {
+          addLog("info", data.data.message || `Event: ${data.event}`);
         }
-        if (data.event === 'error') {
-          addLog('error', data.data.message || 'Unknown error')
+        if (data.event === "error") {
+          addLog("error", data.data.message || "Unknown error");
         }
-        if (data.event === 'log') {
-          addLog(data.data.level || 'info', data.data.message)
+        if (data.event === "log") {
+          addLog(data.data.level || "info", data.data.message);
         }
         // Show action events for better visibility
-        if (data.event === 'action_started') {
-          const actionType = data.data.action_type || 'Unknown'
-          const targetState = data.data.target_state
-          if (actionType === 'GO_TO_STATE' && targetState) {
-            addLog('debug', `Action started: ${actionType} → ${targetState}`)
+        if (data.event === "action_started") {
+          const actionType = data.data.action_type || "Unknown";
+          const targetState = data.data.target_state;
+          if (actionType === "GO_TO_STATE" && targetState) {
+            addLog("debug", `Action started: ${actionType} → ${targetState}`);
           } else {
-            addLog('debug', `Action started: ${actionType}`)
+            addLog("debug", `Action started: ${actionType}`);
           }
         }
-        if (data.event === 'action_completed') {
-          const actionType = data.data.action_type || 'Unknown'
-          const targetState = data.data.target_state
-          if (actionType === 'GO_TO_STATE' && targetState) {
-            addLog('debug', `Action completed: ${actionType} → ${targetState}`)
+        if (data.event === "action_completed") {
+          const actionType = data.data.action_type || "Unknown";
+          const targetState = data.data.target_state;
+          if (actionType === "GO_TO_STATE" && targetState) {
+            addLog("debug", `Action completed: ${actionType} → ${targetState}`);
           } else {
-            addLog('debug', `Action completed: ${actionType}`)
+            addLog("debug", `Action completed: ${actionType}`);
           }
         }
-        if (data.event === 'process_started') {
-          const processName = data.data.process_name || data.data.process_id || 'Unknown'
-          addLog('info', `Process started: ${processName}`)
+        if (data.event === "process_started") {
+          const processName = data.data.process_name || data.data.process_id || "Unknown";
+          addLog("info", `Process started: ${processName}`);
         }
-        if (data.event === 'process_completed') {
-          const processName = data.data.process_name || data.data.process_id || 'Unknown'
-          addLog('info', `Process completed: ${processName}`)
+        if (data.event === "process_completed") {
+          const processName = data.data.process_name || data.data.process_id || "Unknown";
+          addLog("info", `Process completed: ${processName}`);
         }
         // Note: state_changed events are handled by the Qontinui library
         // Both mock and real execution modes support full state management
-      })
-      unlisten = unlistenFn
-    }
-    
-    checkPythonStatus()
-    setupListeners()
-    
+      });
+      unlisten = unlistenFn;
+    };
+
+    checkPythonStatus();
+    setupListeners();
+
     // Cleanup listener on unmount
     return () => {
-      isMounted = false
+      isMounted = false;
       if (unlisten) {
-        unlisten()
+        unlisten();
       }
-    }
-  }, [])
+    };
+  }, []);
 
   useEffect(() => {
     if (autoScroll && logViewerRef.current) {
-      logViewerRef.current.scrollTop = logViewerRef.current.scrollHeight
+      logViewerRef.current.scrollTop = logViewerRef.current.scrollHeight;
     }
-  }, [logs, autoScroll])
+  }, [logs, autoScroll]);
 
   const handleLoadConfiguration = async () => {
     try {
       const selected = await open({
         multiple: false,
-        filters: [{
-          name: 'JSON',
-          extensions: ['json']
-        }]
-      })
-      
+        filters: [
+          {
+            name: "JSON",
+            extensions: ["json"],
+          },
+        ],
+      });
+
       if (selected) {
-        const result: any = await invoke('load_configuration', { path: selected })
+        const result: any = await invoke("load_configuration", { path: selected });
         if (result.success) {
           setConfig({
-            name: selected.split('/').pop() || 'config.json',
-            version: '1.0.0',
+            name: selected.split("/").pop() || "config.json",
+            version: "1.0.0",
             statesCount: result.data?.states?.length || 0,
             processesCount: result.data?.processes?.length || 0,
             processes: result.data?.processes || [],
-            path: selected
-          })
-          // Filter processes to show only "main" category
-          const allProcesses = result.data?.processes || []
-          const mainProcesses = allProcesses.filter((p: any) => p.category === 'main')
+            path: selected,
+          });
+          // TODO: Enable filtering once qontinui-web adds category field
+          const allProcesses = result.data?.processes || [];
+          // const mainProcesses = allProcesses.filter((p: any) => p.category === 'main')
 
-          setProcesses(mainProcesses)
-          setConfigLoaded(true)
-          addLog('success', `Configuration loaded: ${selected}`)
+          setProcesses(allProcesses);
+          setConfigLoaded(true);
+          addLog("success", `Configuration loaded: ${selected}`);
 
           // Log process filtering info
           if (allProcesses.length > 0) {
-            addLog('info', `Showing ${mainProcesses.length} main processes out of ${allProcesses.length} total`)
+            addLog("info", `Loaded ${allProcesses.length} processes`);
           }
 
-          // If main processes were found, select the first one
-          if (mainProcesses.length > 0) {
-            setSelectedProcess(mainProcesses[0].id)
+          // If processes were found, select the first one
+          if (allProcesses.length > 0) {
+            setSelectedProcess(allProcesses[0].id);
           }
         }
       }
     } catch (error) {
-      addLog('error', `Failed to load configuration: ${error}`)
+      addLog("error", `Failed to load configuration: ${error}`);
     }
-  }
+  };
 
   const handleStartPython = async () => {
-    console.log('handleStartPython called')
+    console.log("handleStartPython called");
     try {
-      addLog('info', 'Starting Python executor...')
-      const result: any = await invoke('start_python_executor_with_type', { 
-        executorType 
-      })
-      console.log('Invoke result:', result)
+      addLog("info", "Starting Python executor...");
+      const result: any = await invoke("start_python_executor_with_type", {
+        executorType,
+      });
+      console.log("Invoke result:", result);
       if (result.success) {
-        setPythonStatus('running')
-        addLog('success', 'Python executor started')
-        
+        setPythonStatus("running");
+        addLog("success", "Python executor started");
+
         // If configuration is already loaded, send it to Python
         if (configLoaded && config) {
           try {
-            await invoke('load_configuration', { path: config.path })
-            addLog('info', 'Configuration sent to Python executor')
+            await invoke("load_configuration", { path: config.path });
+            addLog("info", "Configuration sent to Python executor");
           } catch (error) {
-            addLog('warning', `Failed to send configuration to Python: ${error}`)
+            addLog("warning", `Failed to send configuration to Python: ${error}`);
           }
         }
       } else {
-        addLog('error', `Python executor failed to start: ${result.message || 'Unknown error'}`)
+        addLog("error", `Python executor failed to start: ${result.message || "Unknown error"}`);
       }
     } catch (error) {
-      console.error('Error in handleStartPython:', error)
-      addLog('error', `Failed to start Python: ${error}`)
+      console.error("Error in handleStartPython:", error);
+      addLog("error", `Failed to start Python: ${error}`);
     }
-  }
+  };
 
   const handleStopPython = async () => {
     try {
-      const result: any = await invoke('stop_python_executor')
+      const result: any = await invoke("stop_python_executor");
       if (result.success) {
-        setPythonStatus('stopped')
-        addLog('info', 'Python executor stopped')
+        setPythonStatus("stopped");
+        addLog("info", "Python executor stopped");
       }
     } catch (error) {
-      addLog('error', `Failed to stop Python: ${error}`)
+      addLog("error", `Failed to stop Python: ${error}`);
     }
-  }
+  };
 
   const handleStartExecution = async () => {
     try {
-      const params: any = { mode: executionMode }
-      if (executionMode === 'process' && selectedProcess) {
-        params.processId = selectedProcess
+      const params: any = { mode: executionMode };
+      if (executionMode === "process" && selectedProcess) {
+        params.processId = selectedProcess;
       }
-      
-      const result: any = await invoke('start_execution', params)
+
+      const result: any = await invoke("start_execution", params);
       if (result.success) {
-        setExecutionActive(true)
-        addLog('success', `Execution started in ${executionMode} mode`)
+        setExecutionActive(true);
+        addLog("success", `Execution started in ${executionMode} mode`);
       }
     } catch (error) {
-      addLog('error', `Failed to start execution: ${error}`)
+      addLog("error", `Failed to start execution: ${error}`);
     }
-  }
+  };
 
   const handleStopExecution = async () => {
     try {
-      const result: any = await invoke('stop_execution')
+      const result: any = await invoke("stop_execution");
       if (result.success) {
-        setExecutionActive(false)
-        addLog('info', 'Execution stopped')
+        setExecutionActive(false);
+        addLog("info", "Execution stopped");
       }
     } catch (error) {
-      addLog('error', `Failed to stop execution: ${error}`)
+      addLog("error", `Failed to stop execution: ${error}`);
     }
-  }
+  };
 
   const clearLogs = () => {
-    setLogs([])
-  }
+    setLogs([]);
+  };
 
   const copyLogs = async () => {
-    const logText = logs.map(log => 
-      `[${log.timestamp}] ${log.level.toUpperCase()}: ${log.message}`
-    ).join('\n')
-    
+    const logText = logs
+      .map((log) => `[${log.timestamp}] ${log.level.toUpperCase()}: ${log.message}`)
+      .join("\n");
+
     try {
-      await navigator.clipboard.writeText(logText)
-      setCopySuccess(true)
-      setTimeout(() => setCopySuccess(false), 2000)
+      await navigator.clipboard.writeText(logText);
+      setCopySuccess(true);
+      setTimeout(() => setCopySuccess(false), 2000);
     } catch (error) {
-      console.error('Failed to copy logs:', error)
-      addLog('error', 'Failed to copy logs to clipboard')
+      console.error("Failed to copy logs:", error);
+      addLog("error", "Failed to copy logs to clipboard");
     }
-  }
+  };
 
   const getLogColor = (level: string) => {
     switch (level) {
-      case "info": return "text-cyan-400"
-      case "warning": return "text-yellow-400"
-      case "error": return "text-red-400"
-      case "debug": return "text-blue-400"
-      case "success": return "text-green-400"
-      default: return "text-gray-400"
+      case "info":
+        return "text-cyan-400";
+      case "warning":
+        return "text-yellow-400";
+      case "error":
+        return "text-red-400";
+      case "debug":
+        return "text-blue-400";
+      case "success":
+        return "text-green-400";
+      default:
+        return "text-gray-400";
     }
-  }
+  };
 
-  const filteredLogs = logLevel === "all" 
-    ? logs 
-    : logs.filter(log => log.level === logLevel)
+  const filteredLogs = logLevel === "all" ? logs : logs.filter((log) => log.level === logLevel);
 
   // Check for updates on mount
   useEffect(() => {
     const checkUpdates = async () => {
       try {
-        const response = await invoke('check_for_updates')
-        console.log('Update check response:', response)
-        if (response && response.data && response.data.available) {
-          addLog('info', `Update available: ${response.data.version}`)
+        const response = await invoke("check_for_updates");
+        console.log("Update check response:", response);
+        if (response && (response as any).data && (response as any).data.available) {
+          addLog("info", `Update available: ${(response as any).data.version}`);
         }
       } catch (error) {
-        console.error('Failed to check for updates:', error)
+        console.error("Failed to check for updates:", error);
       }
-    }
-    checkUpdates()
-  }, [])
+    };
+    checkUpdates();
+  }, []);
 
   return (
     <div className="min-h-screen bg-background grid-dots">
@@ -352,33 +381,39 @@ function App() {
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-2">
               <Cpu className="w-4 h-4 text-muted-foreground" />
-              <div className={`px-3 py-1 rounded-full text-sm font-medium ${
-                pythonStatus === "running" 
-                  ? "bg-accent/20 text-accent glow-green" 
-                  : "bg-muted/20 text-muted-foreground"
-              }`}>
+              <div
+                className={`px-3 py-1 rounded-full text-sm font-medium ${
+                  pythonStatus === "running"
+                    ? "bg-accent/20 text-accent glow-green"
+                    : "bg-muted/20 text-muted-foreground"
+                }`}
+              >
                 Python Executor
               </div>
             </div>
 
             <div className="flex items-center gap-2">
               <FileText className="w-4 h-4 text-muted-foreground" />
-              <div className={`px-3 py-1 rounded-full text-sm font-medium ${
-                configLoaded 
-                  ? "bg-primary/20 text-primary glow-cyan" 
-                  : "bg-muted/20 text-muted-foreground"
-              }`}>
+              <div
+                className={`px-3 py-1 rounded-full text-sm font-medium ${
+                  configLoaded
+                    ? "bg-primary/20 text-primary glow-cyan"
+                    : "bg-muted/20 text-muted-foreground"
+                }`}
+              >
                 Configuration
               </div>
             </div>
 
             <div className="flex items-center gap-2">
               <Zap className="w-4 h-4 text-muted-foreground" />
-              <div className={`px-3 py-1 rounded-full text-sm font-medium ${
-                executionActive 
-                  ? "bg-secondary/20 text-secondary glow-purple pulse-glow" 
-                  : "bg-muted/20 text-muted-foreground"
-              }`}>
+              <div
+                className={`px-3 py-1 rounded-full text-sm font-medium ${
+                  executionActive
+                    ? "bg-secondary/20 text-secondary glow-purple pulse-glow"
+                    : "bg-muted/20 text-muted-foreground"
+                }`}
+              >
                 Execution
               </div>
             </div>
@@ -393,7 +428,7 @@ function App() {
               <FileText className="w-5 h-5" />
               <h2 className="text-lg font-semibold">Configuration</h2>
             </div>
-            
+
             <button
               onClick={handleLoadConfiguration}
               className="w-full bg-primary hover:bg-primary/80 text-primary-foreground px-4 py-2 rounded-md font-medium transition-colors"
@@ -403,13 +438,24 @@ function App() {
 
             {configLoaded && config && (
               <div className="space-y-3 p-3 bg-background/50 rounded-lg border border-border/30">
-                <div className="font-semibold text-primary truncate" title={config.name}>{config.name}</div>
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div>Version: <span className="text-accent">{config.version}</span></div>
-                  <div>States: <span className="text-accent">{config.statesCount}</span></div>
-                  <div>Processes: <span className="text-accent">{config.processesCount}</span></div>
+                <div className="font-semibold text-primary truncate" title={config.name}>
+                  {config.name}
                 </div>
-                <div className="text-xs font-mono text-muted-foreground text-ellipsis-start" title={config.path}>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div>
+                    Version: <span className="text-accent">{config.version}</span>
+                  </div>
+                  <div>
+                    States: <span className="text-accent">{config.statesCount}</span>
+                  </div>
+                  <div>
+                    Processes: <span className="text-accent">{config.processesCount}</span>
+                  </div>
+                </div>
+                <div
+                  className="text-xs font-mono text-muted-foreground text-ellipsis-start"
+                  title={config.path}
+                >
                   <span>{config.path}</span>
                 </div>
               </div>
@@ -426,20 +472,30 @@ function App() {
             <div className="flex items-center justify-between">
               <span className="text-sm">Mode:</span>
               <div className="flex items-center gap-2">
-                <span className={executionMode === "process" ? "text-primary" : "text-muted-foreground"}>
+                <span
+                  className={executionMode === "process" ? "text-primary" : "text-muted-foreground"}
+                >
                   Process
                 </span>
                 <button
-                  onClick={() => setExecutionMode(executionMode === "process" ? "state_machine" : "process")}
+                  onClick={() =>
+                    setExecutionMode(executionMode === "process" ? "state_machine" : "process")
+                  }
                   className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                     executionMode === "state_machine" ? "bg-primary" : "bg-muted"
                   }`}
                 >
-                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                    executionMode === "state_machine" ? "translate-x-6" : "translate-x-1"
-                  }`} />
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      executionMode === "state_machine" ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
                 </button>
-                <span className={executionMode === "state_machine" ? "text-primary" : "text-muted-foreground"}>
+                <span
+                  className={
+                    executionMode === "state_machine" ? "text-primary" : "text-muted-foreground"
+                  }
+                >
                   State Machine
                 </span>
               </div>
@@ -451,7 +507,11 @@ function App() {
                   onClick={() => setShowProcessDropdown(!showProcessDropdown)}
                   className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
                 >
-                  <span>{selectedProcess ? processes.find(p => p.id === selectedProcess)?.name : "Select process..."}</span>
+                  <span>
+                    {selectedProcess
+                      ? processes.find((p) => p.id === selectedProcess)?.name
+                      : "Select process..."}
+                  </span>
                   <ChevronDown className="w-4 h-4" />
                 </button>
                 {showProcessDropdown && (
@@ -460,8 +520,8 @@ function App() {
                       <button
                         key={process.id}
                         onClick={() => {
-                          setSelectedProcess(process.id)
-                          setShowProcessDropdown(false)
+                          setSelectedProcess(process.id);
+                          setShowProcessDropdown(false);
                         }}
                         className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
                       >
@@ -507,15 +567,21 @@ function App() {
                   onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
                   className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
                 >
-                  <span className="capitalize">{executorType === 'mock' ? 'Mock/Simulation' : 'Real Automation'}</span>
+                  <span className="capitalize">
+                    {executorType === "mock"
+                      ? "Mock/Simulation"
+                      : executorType === "real"
+                        ? "Real Automation"
+                        : "Minimal Test"}
+                  </span>
                   <ChevronDown className="w-4 h-4" />
                 </button>
                 {showExecutorDropdown && (
                   <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg">
                     <button
                       onClick={() => {
-                        setExecutorType('mock')
-                        setShowExecutorDropdown(false)
+                        setExecutorType("mock");
+                        setShowExecutorDropdown(false);
                       }}
                       className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
                     >
@@ -523,12 +589,21 @@ function App() {
                     </button>
                     <button
                       onClick={() => {
-                        setExecutorType('real')
-                        setShowExecutorDropdown(false)
+                        setExecutorType("real");
+                        setShowExecutorDropdown(false);
                       }}
                       className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
                     >
                       Real Automation
+                    </button>
+                    <button
+                      onClick={() => {
+                        setExecutorType("minimal");
+                        setShowExecutorDropdown(false);
+                      }}
+                      className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
+                    >
+                      Minimal Test (No Qontinui)
                     </button>
                   </div>
                 )}
@@ -540,7 +615,9 @@ function App() {
                 onClick={handleStartPython}
                 disabled={pythonStatus === "running"}
                 className="flex-1 bg-accent hover:bg-accent/80 text-accent-foreground px-4 py-2 rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                title={pythonStatus === "running" ? "Python is already running" : "Start Python executor"}
+                title={
+                  pythonStatus === "running" ? "Python is already running" : "Start Python executor"
+                }
               >
                 Start Python
               </button>
@@ -554,8 +631,13 @@ function App() {
             </div>
 
             <div className="flex items-center gap-2 text-sm">
-              <div className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-accent" : "bg-muted"}`} />
-              Status: <span className={pythonStatus === "running" ? "text-accent" : "text-muted-foreground"}>
+              <div
+                className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-accent" : "bg-muted"}`}
+              />
+              Status:{" "}
+              <span
+                className={pythonStatus === "running" ? "text-accent" : "text-muted-foreground"}
+              >
                 {pythonStatus === "running" ? "Running" : "Stopped"}
               </span>
             </div>
@@ -569,7 +651,7 @@ function App() {
               <Terminal className="w-5 h-5" />
               <h2 className="text-lg font-semibold">Log Viewer</h2>
             </div>
-            
+
             <div className="flex items-center gap-4">
               <div className="flex items-center gap-2">
                 <button
@@ -578,9 +660,11 @@ function App() {
                     autoScroll ? "bg-primary" : "bg-muted"
                   }`}
                 >
-                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                    autoScroll ? "translate-x-6" : "translate-x-1"
-                  }`} />
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      autoScroll ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
                 </button>
                 <span className="text-sm text-muted-foreground">Auto-scroll</span>
               </div>
@@ -596,12 +680,12 @@ function App() {
                 </button>
                 {showLogFilter && (
                   <div className="absolute right-0 z-10 w-32 mt-1 bg-card border border-border rounded-md shadow-lg">
-                    {['all', 'info', 'warning', 'error', 'debug', 'success'].map(level => (
+                    {["all", "info", "warning", "error", "debug", "success"].map((level) => (
                       <button
                         key={level}
                         onClick={() => {
-                          setLogLevel(level)
-                          setShowLogFilter(false)
+                          setLogLevel(level);
+                          setShowLogFilter(false);
                         }}
                         className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors text-sm capitalize"
                       >
@@ -628,7 +712,7 @@ function App() {
                   </>
                 )}
               </button>
-              
+
               <button
                 onClick={clearLogs}
                 className="px-3 py-1 border border-border hover:bg-destructive/10 hover:text-destructive rounded-md font-medium transition-colors flex items-center gap-2"
@@ -639,7 +723,7 @@ function App() {
             </div>
           </div>
 
-          <div 
+          <div
             ref={logViewerRef}
             className="h-80 w-full rounded-md bg-[#1e1e1e] p-4 font-mono text-sm overflow-y-auto"
           >
@@ -658,7 +742,7 @@ function App() {
         </div>
       </div>
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

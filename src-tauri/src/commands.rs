@@ -19,10 +19,7 @@ pub struct CommandResponse {
 }
 
 #[tauri::command]
-pub fn load_configuration(
-    path: String,
-    state: State<AppState>,
-) -> Result<CommandResponse, String> {
+pub fn load_configuration(path: String, state: State<AppState>) -> Result<CommandResponse, String> {
     info!("Loading configuration from: {}", path);
 
     // Load the configuration file
@@ -34,7 +31,7 @@ pub fn load_configuration(
         .map_err(|e| e.to_string())?;
 
     let summary = config.summary();
-    
+
     // Create data object with configuration info
     let config_data = serde_json::json!({
         "processes": config.processes.clone(),
@@ -49,11 +46,10 @@ pub fn load_configuration(
     // If Python bridge is running, send the configuration
     if let Some(ref mut bridge) = *state.python_bridge.lock().unwrap() {
         if bridge.is_running() {
-            bridge.load_configuration(&path)
-                .map_err(|e| {
-                    error!("Failed to send configuration to Python: {}", e);
-                    format!("Failed to send configuration to Python: {}", e)
-                })?;
+            bridge.load_configuration(&path).map_err(|e| {
+                error!("Failed to send configuration to Python: {}", e);
+                format!("Failed to send configuration to Python: {}", e)
+            })?;
             info!("Configuration sent to Python executor");
         }
     }
@@ -96,18 +92,23 @@ pub fn start_python_executor_with_type(
 
     // Create and start new bridge with specified executor type
     let mut bridge = PythonBridge::new(app_handle);
-    bridge.start_with_executor(&executor_type)
-        .map_err(|e| {
-            error!("Failed to start Python executor: {}", e);
-            format!("Failed to start Python executor: {}", e)
-        })?;
+    bridge.start_with_executor(&executor_type).map_err(|e| {
+        error!("Failed to start Python executor: {}", e);
+        format!("Failed to start Python executor: {}", e)
+    })?;
 
     *bridge_lock = Some(bridge);
-    info!("Python executor started successfully in {} mode", executor_type);
+    info!(
+        "Python executor started successfully in {} mode",
+        executor_type
+    );
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Python executor started with {} mode", executor_type)),
+        message: Some(format!(
+            "Python executor started with {} mode",
+            executor_type
+        )),
         data: None,
     })
 }
@@ -118,11 +119,10 @@ pub fn stop_python_executor(state: State<AppState>) -> Result<CommandResponse, S
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
     if let Some(ref mut bridge) = *bridge_lock {
-        bridge.stop()
-            .map_err(|e| {
-                error!("Failed to stop Python executor: {}", e);
-                format!("Failed to stop Python executor: {}", e)
-            })?;
+        bridge.stop().map_err(|e| {
+            error!("Failed to stop Python executor: {}", e);
+            format!("Failed to stop Python executor: {}", e)
+        })?;
         info!("Python executor stopped successfully");
     }
 
@@ -161,7 +161,8 @@ pub fn start_execution(
             None
         };
 
-        bridge.start_execution_with_params(&mode, params)
+        bridge
+            .start_execution_with_params(&mode, params)
             .map_err(|e| format!("Failed to start execution: {}", e))?;
 
         Ok(CommandResponse {
@@ -179,7 +180,8 @@ pub fn stop_execution(state: State<AppState>) -> Result<CommandResponse, String>
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
     if let Some(ref mut bridge) = *bridge_lock {
-        bridge.stop_execution()
+        bridge
+            .stop_execution()
             .map_err(|e| format!("Failed to stop execution: {}", e))?;
 
         Ok(CommandResponse {
@@ -198,9 +200,10 @@ pub fn get_executor_status(state: State<AppState>) -> Result<CommandResponse, St
 
     if let Some(ref mut bridge) = *bridge_lock {
         let is_running = bridge.is_running();
-        
+
         if is_running {
-            bridge.get_status()
+            bridge
+                .get_status()
                 .map_err(|e| format!("Failed to get status: {}", e))?;
         }
 
@@ -235,10 +238,7 @@ pub fn get_current_configuration(state: State<AppState>) -> Result<QontinuiConfi
 }
 
 #[tauri::command]
-pub fn handle_error(
-    error: UserFacingError,
-    app_handle: AppHandle,
-) -> Result<(), String> {
+pub fn handle_error(error: UserFacingError, app_handle: AppHandle) -> Result<(), String> {
     error!("User-facing error: {:?}", error);
 
     // Emit error event to frontend
@@ -250,9 +250,7 @@ pub fn handle_error(
 }
 
 #[tauri::command]
-pub async fn check_for_updates(
-    _app_handle: AppHandle,
-) -> Result<CommandResponse, String> {
+pub async fn check_for_updates(_app_handle: AppHandle) -> Result<CommandResponse, String> {
     info!("Checking for updates");
 
     #[cfg(not(debug_assertions))]
@@ -260,36 +258,34 @@ pub async fn check_for_updates(
         use tauri_plugin_updater::UpdaterExt;
 
         match app_handle.updater_builder().build() {
-            Ok(updater) => {
-                match updater.check().await {
-                    Ok(Some(update)) => {
-                        info!("Update available: {}", update.version);
-                        Ok(CommandResponse {
-                            success: true,
-                            message: Some(format!("Update available: {}", update.version)),
-                            data: Some(serde_json::json!({
-                                "available": true,
-                                "version": update.version.to_string(),
-                                "notes": update.body,
-                            })),
-                        })
-                    }
-                    Ok(None) => {
-                        info!("No updates available");
-                        Ok(CommandResponse {
-                            success: true,
-                            message: Some("No updates available".to_string()),
-                            data: Some(serde_json::json!({
-                                "available": false,
-                            })),
-                        })
-                    }
-                    Err(e) => {
-                        error!("Failed to check for updates: {}", e);
-                        Err(format!("Failed to check for updates: {}", e))
-                    }
+            Ok(updater) => match updater.check().await {
+                Ok(Some(update)) => {
+                    info!("Update available: {}", update.version);
+                    Ok(CommandResponse {
+                        success: true,
+                        message: Some(format!("Update available: {}", update.version)),
+                        data: Some(serde_json::json!({
+                            "available": true,
+                            "version": update.version.to_string(),
+                            "notes": update.body,
+                        })),
+                    })
                 }
-            }
+                Ok(None) => {
+                    info!("No updates available");
+                    Ok(CommandResponse {
+                        success: true,
+                        message: Some("No updates available".to_string()),
+                        data: Some(serde_json::json!({
+                            "available": false,
+                        })),
+                    })
+                }
+                Err(e) => {
+                    error!("Failed to check for updates: {}", e);
+                    Err(format!("Failed to check for updates: {}", e))
+                }
+            },
             Err(e) => {
                 error!("Failed to build updater: {}", e);
                 Err(format!("Failed to build updater: {}", e))

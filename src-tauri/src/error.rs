@@ -3,6 +3,7 @@ use std::fmt;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum AppError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
@@ -62,7 +63,9 @@ impl AppError {
                 error_code: "CONFIG_001".to_string(),
                 severity: ErrorSeverity::Error,
                 recoverable: true,
-                suggested_action: Some("Please check your configuration file and try again.".to_string()),
+                suggested_action: Some(
+                    "Please check your configuration file and try again.".to_string(),
+                ),
             },
 
             AppError::ExecutorError(msg) => UserFacingError {
@@ -72,7 +75,9 @@ impl AppError {
                 error_code: "EXEC_001".to_string(),
                 severity: ErrorSeverity::Warning,
                 recoverable: true,
-                suggested_action: Some("Try restarting the executor or check your Python installation.".to_string()),
+                suggested_action: Some(
+                    "Try restarting the executor or check your Python installation.".to_string(),
+                ),
             },
 
             AppError::IoError(err) => UserFacingError {
@@ -92,7 +97,9 @@ impl AppError {
                 error_code: "JSON_001".to_string(),
                 severity: ErrorSeverity::Warning,
                 recoverable: true,
-                suggested_action: Some("The data format may be corrupted. Try reloading.".to_string()),
+                suggested_action: Some(
+                    "The data format may be corrupted. Try reloading.".to_string(),
+                ),
             },
 
             AppError::ProcessError(msg) => UserFacingError {
@@ -102,7 +109,9 @@ impl AppError {
                 error_code: "PROC_001".to_string(),
                 severity: ErrorSeverity::Error,
                 recoverable: true,
-                suggested_action: Some("Restart the application or check system resources.".to_string()),
+                suggested_action: Some(
+                    "Restart the application or check system resources.".to_string(),
+                ),
             },
 
             AppError::CommunicationError(msg) => UserFacingError {
@@ -142,7 +151,10 @@ impl AppError {
                 error_code: "UNK_001".to_string(),
                 severity: ErrorSeverity::Critical,
                 recoverable: false,
-                suggested_action: Some("Please restart the application. If the problem persists, contact support.".to_string()),
+                suggested_action: Some(
+                    "Please restart the application. If the problem persists, contact support."
+                        .to_string(),
+                ),
             },
         }
     }
@@ -160,8 +172,10 @@ impl From<AppError> for String {
     }
 }
 
+#[allow(dead_code)]
 pub type AppResult<T> = Result<T, AppError>;
 
+#[allow(dead_code)]
 pub fn handle_error_with_context<T>(
     result: Result<T, AppError>,
     context: &str,
