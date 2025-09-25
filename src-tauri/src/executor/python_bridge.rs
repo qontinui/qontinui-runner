@@ -66,26 +66,51 @@ impl PythonBridge {
         // Get the path to the Python bridge script
         // Try multiple possible locations
         let possible_paths = vec![
-            // When running from src-tauri
-            std::env::current_dir().ok().and_then(|p| p.parent().map(|p| p.join("python-bridge").join(script_name))),
-            // When running from qontinui-runner
+            // When running from src-tauri (most common in development)
+            std::env::current_dir().ok().and_then(|p| {
+                // Go up from src-tauri/target/debug to qontinui-runner
+                if p.ends_with("debug") || p.ends_with("release") {
+                    p.parent()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.parent())
+                        .map(|p| p.join("python-bridge").join(script_name))
+                } else if p.ends_with("src-tauri") {
+                    p.parent().map(|p| p.join("python-bridge").join(script_name))
+                } else {
+                    None
+                }
+            }),
+            // When running from qontinui-runner directory
             std::env::current_dir().ok().map(|p| p.join("python-bridge").join(script_name)),
-            // Absolute path fallback
-            Some(std::path::PathBuf::from(format!("/home/jspinak/qontinui_parent_directory/qontinui-runner/python-bridge/{}", script_name))),
+            // When in src-tauri directory
+            std::env::current_dir().ok().map(|p| p.join("..").join("python-bridge").join(script_name)),
         ];
         
+        // Debug: Print current directory
+        eprintln!("Current directory: {:?}", std::env::current_dir());
+
         let bridge_script = possible_paths
             .into_iter()
             .flatten()
+            .inspect(|p| eprintln!("Checking path: {:?}, exists: {}", p, p.exists()))
             .find(|p| p.exists())
             .ok_or(format!("Python bridge script {} not found in any expected location", script_name))?;
+
+        eprintln!("Using Python bridge script: {:?}", bridge_script);
 
         if !bridge_script.exists() {
             return Err(format!("Python bridge script not found at: {:?}", bridge_script));
         }
 
         // Start the Python process with appropriate mode
-        let mut cmd = Command::new("python3");
+        // Use "python" on Windows, "python3" on Unix
+        let python_cmd = if cfg!(target_os = "windows") {
+            "python"
+        } else {
+            "python3"
+        };
+
+        let mut cmd = Command::new(python_cmd);
         cmd.arg(bridge_script);
         
         // Pass --mock flag for simulation/mock mode
