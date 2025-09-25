@@ -11,13 +11,13 @@
     --card-foreground: 0 0 100%;
     --popover: 10 10 11;
     --popover-foreground: 0 0 100%;
-    --primary: 191 100% 50%;  /* Cyan */
+    --primary: 191 100% 50%; /* Cyan */
     --primary-foreground: 10 10 11;
-    --secondary: 285 100% 50%;  /* Purple */
+    --secondary: 285 100% 50%; /* Purple */
     --secondary-foreground: 0 0 100%;
     --muted: 217 9% 37%;
     --muted-foreground: 215 8% 64%;
-    --accent: 145 100% 50%;  /* Green */
+    --accent: 145 100% 50%; /* Green */
     --accent-foreground: 10 10 11;
     --destructive: 0 84% 71%;
     --destructive-foreground: 0 0 100%;
@@ -30,7 +30,7 @@
   * {
     @apply border-border;
   }
-  
+
   body {
     @apply bg-background text-foreground;
   }
@@ -66,14 +66,14 @@
       box-shadow: 0 0 30px rgba(0, 217, 255, 0.6);
     }
   }
-  
+
   .text-ellipsis-start {
     direction: rtl;
     text-overflow: ellipsis;
     white-space: nowrap;
     overflow: hidden;
   }
-  
+
   .text-ellipsis-start span {
     direction: ltr;
     unicode-bidi: bidi-override;

@@ -57,3 +57,6 @@ python-bridge/tox.ini
 # Optional config files (add when ready)
 .pre-commit-config.yaml
 docs/TESTING_CHECKLIST.md
+python-bridge/test_*.py
+test_python_executor.sh
+python-bridge/test_full_communication.py

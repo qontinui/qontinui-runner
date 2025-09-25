@@ -36,9 +36,8 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.log_dir)?;
 
     let env_filter = EnvFilter::new(
-        std::env::var("RUST_LOG").unwrap_or_else(|_| {
-            format!("qontinui_runner={},tauri=info", config.level)
-        }),
+        std::env::var("RUST_LOG")
+            .unwrap_or_else(|_| format!("qontinui_runner={},tauri=info", config.level)),
     );
 
     let registry = Registry::default().with(env_filter);
@@ -54,7 +53,9 @@ pub fn init_logging(config: LoggingConfig) -> anyhow::Result<()> {
             .with_writer(non_blocking_file)
             .with_ansi(false)
             .with_span_events(FmtSpan::CLOSE)
-            .with_timer(fmt::time::ChronoLocal::new("%Y-%m-%d %H:%M:%S%.3f".to_string()));
+            .with_timer(fmt::time::ChronoLocal::new(
+                "%Y-%m-%d %H:%M:%S%.3f".to_string(),
+            ));
 
         let subscriber = registry.with(file_layer);
 
@@ -124,7 +125,12 @@ macro_rules! log_debug {
 
 pub fn log_panic(info: &std::panic::PanicHookInfo) {
     let location = if let Some(location) = info.location() {
-        format!("{}:{}:{}", location.file(), location.line(), location.column())
+        format!(
+            "{}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        )
     } else {
         "unknown location".to_string()
     };
@@ -157,7 +163,7 @@ pub fn setup_panic_handler() {
                     release: sentry::release_name!(),
                     environment: Some("production".into()),
                     ..Default::default()
-                }
+                },
             )) {
                 std::mem::forget(guard);
             }
