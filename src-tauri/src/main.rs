@@ -75,6 +75,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::stop_execution,
             commands::get_executor_status,
             commands::get_current_configuration,
+            commands::get_monitors,
             commands::handle_error,
             commands::check_for_updates,
         ])
