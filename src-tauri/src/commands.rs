@@ -3,7 +3,7 @@ use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{error, info, warn};
 
 pub struct AppState {
@@ -253,6 +253,32 @@ pub fn handle_error(error: UserFacingError, app_handle: AppHandle) -> Result<(),
         .map_err(|e| format!("Failed to emit error event: {}", e))?;
 
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
+    info!("Detecting system monitors");
+
+    // Get available monitors from the main window
+    let monitors = app_handle
+        .get_webview_window("main")
+        .ok_or("Failed to get main window")?
+        .available_monitors()
+        .map_err(|e| format!("Failed to get monitors: {}", e))?;
+
+    let monitor_count = monitors.len();
+    let monitor_indices: Vec<i32> = (0..monitor_count as i32).collect();
+
+    info!("Detected {} monitors", monitor_count);
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Detected {} monitors", monitor_count)),
+        data: Some(serde_json::json!({
+            "count": monitor_count,
+            "indices": monitor_indices,
+        })),
+    })
 }
 
 #[tauri::command]

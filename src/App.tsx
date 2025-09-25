@@ -38,9 +38,9 @@ function App() {
   const [pythonStatus, setPythonStatus] = useState<"stopped" | "running">("stopped");
   const [configLoaded, setConfigLoaded] = useState(false);
   const [executionActive, setExecutionActive] = useState(false);
-  const [executionMode, setExecutionMode] = useState<"process" | "state_machine">("process");
+  const [executionMode, _setExecutionMode] = useState<"process">("process");
   const [selectedProcess, setSelectedProcess] = useState("");
-  const [executorType, setExecutorType] = useState<"mock" | "real" | "minimal">("mock");
+  const [executorType, setExecutorType] = useState<"mock" | "real" | "minimal">("real");
   const [autoScroll, setAutoScroll] = useState(true);
   const [logLevel, setLogLevel] = useState("all");
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -56,13 +56,32 @@ function App() {
   const logViewerRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
 
-  // Debug on mount
+  // Detect monitors on mount
   useEffect(() => {
     console.log("App component mounted");
-    // Initialize with primary monitor, could be expanded to detect actual monitors
-    // For now, we'll support selecting monitors 0-3
-    setAvailableMonitors([0, 1, 2, 3]);
+    detectSystemMonitors();
   }, []);
+
+  const detectSystemMonitors = async () => {
+    try {
+      const result: any = await invoke("get_monitors");
+      if (result.success && result.data) {
+        const indices = result.data.indices || [0];
+        setAvailableMonitors(indices);
+        addLog("info", `Detected ${result.data.count} monitor(s)`);
+
+        // If currently selected monitor is not available, reset to primary
+        if (!indices.includes(selectedMonitor)) {
+          setSelectedMonitor(0);
+        }
+      }
+    } catch (error) {
+      console.error("Failed to detect monitors:", error);
+      addLog("warning", "Could not detect monitors, using default");
+      // Fallback to single monitor if detection fails
+      setAvailableMonitors([0]);
+    }
+  };
 
   // Debug processes state changes
   useEffect(() => {
@@ -557,40 +576,10 @@ function App() {
               <h2 className="text-lg font-semibold">Execution Control</h2>
             </div>
 
-            <div className="flex items-center justify-between">
-              <span className="text-sm">Mode:</span>
-              <div className="flex items-center gap-2">
-                <span
-                  className={executionMode === "process" ? "text-primary" : "text-muted-foreground"}
-                >
-                  Process
-                </span>
-                <button
-                  onClick={() =>
-                    setExecutionMode(executionMode === "process" ? "state_machine" : "process")
-                  }
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    executionMode === "state_machine" ? "bg-primary" : "bg-muted"
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      executionMode === "state_machine" ? "translate-x-6" : "translate-x-1"
-                    }`}
-                  />
-                </button>
-                <span
-                  className={
-                    executionMode === "state_machine" ? "text-primary" : "text-muted-foreground"
-                  }
-                >
-                  State Machine
-                </span>
-              </div>
-            </div>
-
-            {executionMode === "process" && (
-              <div className="relative">
+            {/* Process Selection */}
+            <div>
+              <label className="text-sm text-muted-foreground">Process</label>
+              <div className="relative mt-1">
                 <button
                   onClick={() => {
                     console.log("Dropdown clicked. Current processes:", processes);
@@ -636,17 +625,23 @@ function App() {
                   </div>
                 )}
               </div>
-            )}
+            </div>
 
             {/* Monitor Selection */}
             <div>
-              <label className="text-sm text-muted-foreground">Monitor</label>
+              <label className="text-sm text-muted-foreground">
+                Monitor {availableMonitors.length > 1 && `(${availableMonitors.length} detected)`}
+              </label>
               <div className="relative mt-1">
                 <button
                   onClick={() => setShowMonitorDropdown(!showMonitorDropdown)}
                   className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
+                  title={`${availableMonitors.length} monitor(s) available`}
                 >
-                  <span>Monitor {selectedMonitor}</span>
+                  <span>
+                    Monitor {selectedMonitor}
+                    {selectedMonitor === 0 && " (Primary)"}
+                  </span>
                   <ChevronDown className="w-4 h-4" />
                 </button>
                 {showMonitorDropdown && (
@@ -719,21 +714,21 @@ function App() {
                   <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg">
                     <button
                       onClick={() => {
-                        setExecutorType("mock");
-                        setShowExecutorDropdown(false);
-                      }}
-                      className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
-                    >
-                      Mock/Simulation
-                    </button>
-                    <button
-                      onClick={() => {
                         setExecutorType("real");
                         setShowExecutorDropdown(false);
                       }}
                       className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
                     >
                       Real Automation
+                    </button>
+                    <button
+                      onClick={() => {
+                        setExecutorType("mock");
+                        setShowExecutorDropdown(false);
+                      }}
+                      className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
+                    >
+                      Mock/Simulation
                     </button>
                     <button
                       onClick={() => {

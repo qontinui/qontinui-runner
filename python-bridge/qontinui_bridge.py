@@ -109,6 +109,8 @@ class QontinuiBridge:
                 return self._handle_stop()
             elif cmd_type == "status":
                 return self._handle_status()
+            elif cmd_type == "get_monitors":
+                return self._handle_get_monitors()
             else:
                 return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -173,6 +175,26 @@ class QontinuiBridge:
                     self._emit_event(EventType.CONFIG_LOADED, {"name": "Configuration loaded"})
 
             return {"success": success}
+        except Exception:
+            raise
+
+    def _handle_get_monitors(self) -> dict[str, Any]:
+        """Handle monitor detection request."""
+        try:
+            # Get monitor count from JSONRunner's monitor manager
+            monitor_count = 1  # Default
+            monitor_indices = [0]  # Default to single monitor
+
+            if hasattr(self.runner, "monitor_manager") and self.runner.monitor_manager:
+                monitor_count = self.runner.monitor_manager.get_monitor_count()
+                monitor_indices = list(range(monitor_count))
+                self._emit_log("info", f"Detected {monitor_count} monitor(s) from qontinui")
+
+            return {
+                "success": True,
+                "count": monitor_count,
+                "indices": monitor_indices,
+            }
         except Exception:
             raise
 
