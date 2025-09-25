@@ -139,6 +139,7 @@ pub fn stop_python_executor(state: State<AppState>) -> Result<CommandResponse, S
 pub fn start_execution(
     mode: String,
     process_id: Option<String>,
+    monitor_index: Option<i32>,
     state: State<AppState>,
 ) -> Result<CommandResponse, String> {
     let mut bridge_lock = state.python_bridge.lock().unwrap();
@@ -148,21 +149,26 @@ pub fn start_execution(
             return Err("Python executor not running".to_string());
         }
 
-        // Build params based on mode
-        let params = if mode == "process" {
+        // Build params based on mode and monitor
+        let mut params = serde_json::Map::new();
+
+        // Add monitor index (default to 0 if not provided)
+        params.insert(
+            "monitor_index".to_string(),
+            serde_json::json!(monitor_index.unwrap_or(0)),
+        );
+
+        // Add process_id if in process mode
+        if mode == "process" {
             if let Some(pid) = process_id {
-                Some(serde_json::json!({
-                    "process_id": pid
-                }))
+                params.insert("process_id".to_string(), serde_json::json!(pid));
             } else {
                 return Err("Process ID required for process mode".to_string());
             }
-        } else {
-            None
-        };
+        }
 
         bridge
-            .start_execution_with_params(&mode, params)
+            .start_execution_with_params(&mode, Some(serde_json::Value::Object(params)))
             .map_err(|e| format!("Failed to start execution: {}", e))?;
 
         Ok(CommandResponse {

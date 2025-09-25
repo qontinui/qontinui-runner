@@ -104,6 +104,7 @@ class MinimalBridge:
             elif cmd_type == "start":
                 mode = params.get("mode", "state_machine")
                 process_id = params.get("process_id")
+                monitor_index = params.get("monitor_index", 0)  # Default to primary monitor
 
                 if not self.config:
                     self._emit_event(EventType.ERROR, {"message": "No configuration loaded"})
@@ -114,14 +115,18 @@ class MinimalBridge:
                     return {"success": False, "error": "Already running"}
 
                 self._emit_event(
-                    EventType.EXECUTION_STARTED, {"mode": mode, "process_id": process_id}
+                    EventType.EXECUTION_STARTED,
+                    {"mode": mode, "process_id": process_id, "monitor_index": monitor_index},
                 )
 
                 # Simulate execution in separate thread
                 def simulate_execution():
                     try:
                         self._is_running = True
-                        self._emit_log("info", f"Starting simulated execution in {mode} mode")
+                        self._emit_log(
+                            "info",
+                            f"Starting simulated execution in {mode} mode on monitor {monitor_index}",
+                        )
 
                         # Simulate some work
                         for i in range(3):
