@@ -210,22 +210,31 @@ function App() {
             processes: result.data?.processes || [],
             path: selected,
           });
-          // TODO: Enable filtering once qontinui-web adds category field
+          // Filter processes to only show those in the "main" category
           const allProcesses = result.data?.processes || [];
-          // const mainProcesses = allProcesses.filter((p: any) => p.category === 'main')
+          const mainProcesses = allProcesses.filter(
+            (p: any) => !p.category || p.category === "main", // Show processes without category or with "main" category
+          );
 
-          setProcesses(allProcesses);
+          setProcesses(mainProcesses);
           setConfigLoaded(true);
           addLog("success", `Configuration loaded: ${selected}`);
 
           // Log process filtering info
           if (allProcesses.length > 0) {
-            addLog("info", `Loaded ${allProcesses.length} processes`);
+            if (mainProcesses.length !== allProcesses.length) {
+              addLog(
+                "info",
+                `Loaded ${mainProcesses.length} processes from "main" category (${allProcesses.length} total)`,
+              );
+            } else {
+              addLog("info", `Loaded ${mainProcesses.length} processes`);
+            }
           }
 
           // If processes were found, select the first one
-          if (allProcesses.length > 0) {
-            setSelectedProcess(allProcesses[0].id);
+          if (mainProcesses.length > 0) {
+            setSelectedProcess(mainProcesses[0].id);
           }
         }
       }
