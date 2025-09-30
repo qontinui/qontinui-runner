@@ -22,6 +22,8 @@ pub struct QontinuiConfig {
     pub processes: Vec<Value>,
     pub states: Vec<Value>,
     pub transitions: Vec<Value>,
+    #[serde(default)]
+    pub categories: Vec<String>,
     pub settings: Option<Value>,
 }
 
@@ -53,13 +55,14 @@ impl QontinuiConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "Configuration: {} (v{})\nStates: {}, Processes: {}, Transitions: {}, Images: {}",
+            "Configuration: {} (v{})\nStates: {}, Processes: {}, Transitions: {}, Images: {}, Categories: {}",
             self.metadata.name,
             self.version,
             self.states.len(),
             self.processes.len(),
             self.transitions.len(),
-            self.images.len()
+            self.images.len(),
+            self.categories.len()
         )
     }
 }
