@@ -22,7 +22,6 @@ pub struct QontinuiConfig {
     pub processes: Vec<Value>,
     pub states: Vec<Value>,
     pub transitions: Vec<Value>,
-    #[serde(default)]
     pub categories: Vec<String>,
     pub settings: Option<Value>,
 }

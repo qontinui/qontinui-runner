@@ -4,7 +4,6 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   Play,
   Square,
-  Settings,
   FileText,
   Cpu,
   Zap,
@@ -40,7 +39,6 @@ function App() {
   const [executionActive, setExecutionActive] = useState(false);
   const [executionMode, _setExecutionMode] = useState<"process">("process");
   const [selectedProcess, setSelectedProcess] = useState("");
-  const [executorType, setExecutorType] = useState<"mock" | "real" | "minimal">("real");
   const [autoScroll, setAutoScroll] = useState(true);
   const [logLevel, setLogLevel] = useState("all");
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -48,7 +46,6 @@ function App() {
   const [processes, setProcesses] = useState<any[]>([]);
   const [showProcessDropdown, setShowProcessDropdown] = useState(false);
   const [showLogFilter, setShowLogFilter] = useState(false);
-  const [showExecutorDropdown, setShowExecutorDropdown] = useState(false);
   const [showMonitorDropdown, setShowMonitorDropdown] = useState(false);
   const [selectedMonitor, setSelectedMonitor] = useState(0);
   const [availableMonitors, setAvailableMonitors] = useState<number[]>([0]);
@@ -230,6 +227,31 @@ function App() {
     }
   }, [logs, autoScroll]);
 
+  const startPythonExecutor = async () => {
+    try {
+      if (pythonStatus === "running") {
+        return; // Already running
+      }
+
+      addLog("info", "Starting Python executor...");
+      const result: any = await invoke("start_python_executor_with_type", {
+        executorType: "real",
+      });
+
+      if (result.success) {
+        setPythonStatus("running");
+        addLog("success", "Python executor started");
+        return true;
+      } else {
+        addLog("error", `Python executor failed to start: ${result.message || "Unknown error"}`);
+        return false;
+      }
+    } catch (error) {
+      addLog("error", `Failed to start Python: ${error}`);
+      return false;
+    }
+  };
+
   const handleLoadConfiguration = async () => {
     try {
       const selected = await open({
@@ -243,6 +265,17 @@ function App() {
       });
 
       if (selected) {
+        // Start Python executor first if not running
+        if (pythonStatus !== "running") {
+          const started = await startPythonExecutor();
+          if (!started) {
+            addLog("error", "Cannot load configuration: Python executor failed to start");
+            return;
+          }
+          // Wait a moment for Python to be ready
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+        }
+
         const result: any = await invoke("load_configuration", { path: selected });
         if (result.success) {
           setConfig({
@@ -322,48 +355,6 @@ function App() {
       }
     } catch (error) {
       addLog("error", `Failed to load configuration: ${error}`);
-    }
-  };
-
-  const handleStartPython = async () => {
-    console.log("handleStartPython called");
-    try {
-      addLog("info", "Starting Python executor...");
-      const result: any = await invoke("start_python_executor_with_type", {
-        executorType,
-      });
-      console.log("Invoke result:", result);
-      if (result.success) {
-        setPythonStatus("running");
-        addLog("success", "Python executor started");
-
-        // If configuration is already loaded, send it to Python
-        if (configLoaded && config) {
-          try {
-            await invoke("load_configuration", { path: config.path });
-            addLog("info", "Configuration sent to Python executor");
-          } catch (error) {
-            addLog("warning", `Failed to send configuration to Python: ${error}`);
-          }
-        }
-      } else {
-        addLog("error", `Python executor failed to start: ${result.message || "Unknown error"}`);
-      }
-    } catch (error) {
-      console.error("Error in handleStartPython:", error);
-      addLog("error", `Failed to start Python: ${error}`);
-    }
-  };
-
-  const handleStopPython = async () => {
-    try {
-      const result: any = await invoke("stop_python_executor");
-      if (result.success) {
-        setPythonStatus("stopped");
-        addLog("info", "Python executor stopped");
-      }
-    } catch (error) {
-      addLog("error", `Failed to stop Python: ${error}`);
     }
   };
 
@@ -528,7 +519,7 @@ function App() {
         </div>
 
         {/* Control Panel */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Configuration Card */}
           <div className="bg-card rounded-lg border border-border/50 hover:border-primary/50 transition-all duration-300 p-6 space-y-4">
             <div className="flex items-center gap-2 text-primary">
@@ -684,96 +675,6 @@ function App() {
                 <Square className="w-4 h-4" />
                 Stop
               </button>
-            </div>
-          </div>
-
-          {/* Executor Settings Card */}
-          <div className="bg-card rounded-lg border border-border/50 hover:border-accent/50 transition-all duration-300 p-6 space-y-4">
-            <div className="flex items-center gap-2 text-accent">
-              <Settings className="w-5 h-5" />
-              <h2 className="text-lg font-semibold">Executor Settings</h2>
-            </div>
-
-            <div>
-              <label className="text-sm text-muted-foreground">Executor Type</label>
-              <div className="relative mt-1">
-                <button
-                  onClick={() => setShowExecutorDropdown(!showExecutorDropdown)}
-                  className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
-                >
-                  <span className="capitalize">
-                    {executorType === "mock"
-                      ? "Mock/Simulation"
-                      : executorType === "real"
-                        ? "Real Automation"
-                        : "Minimal Test"}
-                  </span>
-                  <ChevronDown className="w-4 h-4" />
-                </button>
-                {showExecutorDropdown && (
-                  <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg">
-                    <button
-                      onClick={() => {
-                        setExecutorType("real");
-                        setShowExecutorDropdown(false);
-                      }}
-                      className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
-                    >
-                      Real Automation
-                    </button>
-                    <button
-                      onClick={() => {
-                        setExecutorType("mock");
-                        setShowExecutorDropdown(false);
-                      }}
-                      className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
-                    >
-                      Mock/Simulation
-                    </button>
-                    <button
-                      onClick={() => {
-                        setExecutorType("minimal");
-                        setShowExecutorDropdown(false);
-                      }}
-                      className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
-                    >
-                      Minimal Test (No Qontinui)
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            <div className="flex gap-2">
-              <button
-                onClick={handleStartPython}
-                disabled={pythonStatus === "running"}
-                className="flex-1 bg-accent hover:bg-accent/80 text-accent-foreground px-4 py-2 rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                title={
-                  pythonStatus === "running" ? "Python is already running" : "Start Python executor"
-                }
-              >
-                Start Python
-              </button>
-              <button
-                onClick={handleStopPython}
-                disabled={pythonStatus === "stopped"}
-                className="flex-1 border border-border hover:bg-card text-foreground px-4 py-2 rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                Stop Python
-              </button>
-            </div>
-
-            <div className="flex items-center gap-2 text-sm">
-              <div
-                className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-accent" : "bg-muted"}`}
-              />
-              Status:{" "}
-              <span
-                className={pythonStatus === "running" ? "text-accent" : "text-muted-foreground"}
-              >
-                {pythonStatus === "running" ? "Running" : "Stopped"}
-              </span>
             </div>
           </div>
         </div>
