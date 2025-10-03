@@ -39,9 +39,11 @@ ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
-select = ["E", "F", "W", "C90", "I", "N", "UP", "B", "A", "C4", "ICN", "PIE", "T20", "SIM"]
-ignore = ["E501"]
 target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C90", "I", "N", "UP", "B", "A", "C4", "ICN", "PIE", "SIM"]
+ignore = ["E501", "C901", "T201"]
 
 [tool.pylint]
 max-line-length = 100

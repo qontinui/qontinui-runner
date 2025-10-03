@@ -34,4 +34,3 @@ tracing-appender = "0.2"
 chrono = "0.4"
 sentry = { version = "0.34", default-features = false, features = ["backtrace", "contexts", "panic", "anyhow", "reqwest", "rustls"] }
 dirs = "5.0"
-

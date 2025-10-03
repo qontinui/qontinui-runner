@@ -53,6 +53,7 @@ src-tauri/src/test.rs
 # Python project files
 python-bridge/poetry.lock
 python-bridge/tox.ini
+python-bridge/requirements.txt
 
 # Optional config files (add when ready)
 .pre-commit-config.yaml
@@ -61,3 +62,14 @@ python-bridge/test_*.py
 test_python_executor.sh
 python-bridge/test_full_communication.py
 docs/
+
+# Configuration files
+configs/
+demo-config.json
+
+# Build/config files
+postcss.config.js
+tailwind.config.js
+tsconfig.json
+tsconfig.node.json
+vite.config.ts
