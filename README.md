@@ -10,12 +10,14 @@ Desktop automation executor for [Qontinui Web](https://qontinui.com). Run your a
 ## 🚀 Features
 
 ### Core Functionality
+
 - **Automation Execution**: Execute automation projects created in Qontinui Web
 - **Real-time Monitoring**: Watch execution progress with detailed logging
 - **Configuration Management**: Load and manage automation configurations
 - **Multiple Execution Modes**: Support for process-based and state machine execution
 
 ### Production-Ready Features (Beta)
+
 - ✅ **Comprehensive Error Handling**: Graceful error recovery with user-friendly messages
 - ✅ **Panic Recovery**: Application continues running even after unexpected errors
 - ✅ **Logging System**: Detailed logs saved locally for debugging
@@ -80,6 +82,7 @@ npm run tauri build
 ### Status Indicators
 
 The application provides real-time status for:
+
 - **Executor Status**: Running/Stopped state of the Python executor
 - **Configuration**: Whether a valid configuration is loaded
 - **Execution**: Current execution state
@@ -95,6 +98,7 @@ The application provides real-time status for:
 ### Log Files
 
 Logs are stored in:
+
 - **Windows**: `%LOCALAPPDATA%\qontinui-runner\logs\`
 - **macOS**: `~/Library/Application Support/qontinui-runner/logs/`
 - **Linux**: `~/.local/share/qontinui-runner/logs/`
@@ -146,6 +150,7 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for deta
 ## 🙏 Acknowledgments
 
 Built with:
+
 - [Tauri](https://tauri.app/) - Desktop application framework
 - [React](https://reactjs.org/) - UI framework
 - [Rust](https://www.rust-lang.org/) - Backend language
@@ -154,6 +159,7 @@ Built with:
 ## 📊 Telemetry
 
 The application includes:
+
 - **Crash Reporting**: Anonymous crash reports to improve stability (can be disabled)
 - **Update Checks**: Periodic checks for new versions (can be disabled)
 
