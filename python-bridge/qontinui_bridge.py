@@ -226,8 +226,10 @@ class QontinuiBridge:
 
                     self._emit_log("info", f"Using monitor {monitor_index} for automation")
 
-                    # Pass monitor_index to JSONRunner.run()
-                    success = self.runner.run(mode=mode, monitor_index=monitor_index)
+                    # Pass monitor_index and process_id to JSONRunner.run()
+                    success = self.runner.run(
+                        mode=mode, monitor_index=monitor_index, process_id=process_id
+                    )
 
                     self._emit_event(
                         EventType.EXECUTION_COMPLETED, {"success": success, "mode": mode}
