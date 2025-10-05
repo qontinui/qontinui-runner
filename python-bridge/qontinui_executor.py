@@ -59,6 +59,8 @@ class EventType(Enum):
     LOG = "log"
     MATCH_FOUND = "match_found"
     SCREENSHOT_TAKEN = "screenshot_taken"
+    IMAGE_RECOGNITION = "image_recognition"
+    ACTION_EXECUTION = "action_execution"
 
 
 class QontinuiExecutor:
@@ -100,6 +102,139 @@ class QontinuiExecutor:
     def _emit_log(self, level: str, message: str):
         """Emit log message."""
         self._emit_event(EventType.LOG, {"level": level, "message": message})
+
+    def _get_best_match_regardless_of_threshold(self, image_id: str) -> dict:
+        """Get best match info even if it doesn't meet threshold.
+
+        Args:
+            image_id: ID of the image to search for
+
+        Returns:
+            Dict with 'confidence', 'x', 'y' or None if matching fails
+        """
+        if image_id not in self.images:
+            return None
+
+        try:
+            import cv2
+            import numpy as np
+            from PIL import ImageGrab
+
+            # Get template image
+            image_obj = self.images[image_id]
+            image_path = getattr(image_obj, 'path', None)
+            if not image_path:
+                return None
+
+            template = cv2.imread(image_path)
+            if template is None:
+                return None
+
+            # Capture screenshot
+            screenshot = ImageGrab.grab()
+            screenshot_cv = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+
+            # Perform template matching
+            result = cv2.matchTemplate(screenshot_cv, template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+
+            # Get template dimensions to calculate center
+            h, w = template.shape[:2]
+            center_x = max_loc[0] + w // 2
+            center_y = max_loc[1] + h // 2
+
+            return {
+                'confidence': float(max_val),
+                'x': center_x,
+                'y': center_y
+            }
+
+        except Exception as e:
+            self._emit_log("debug", f"Could not get best match: {e}")
+            return None
+
+    def _emit_image_recognition_event(self, image_id: str, matches: list, threshold: float = 0.9, best_match_info: dict = None):
+        """Emit image recognition event with detailed information.
+
+        Args:
+            image_id: ID of the image being searched for
+            matches: List of matches found (empty list if not found)
+            threshold: Similarity threshold used for matching
+            best_match_info: Optional dict with best match info even if it didn't meet threshold
+                           Should contain: 'confidence', 'x', 'y'
+        """
+        self._emit_log("debug", f"_emit_image_recognition_event called for image: {image_id}, matches: {len(matches) if matches else 0}")
+
+        if image_id not in self.images:
+            self._emit_log("warning", f"Image {image_id} not in loaded images")
+            return
+
+        # Get image information
+        image_obj = self.images[image_id]
+        image_path = getattr(image_obj, 'path', None) or image_id
+
+        # Try to get template size
+        try:
+            import cv2
+            template = cv2.imread(image_path) if hasattr(cv2, 'imread') else None
+            template_size = f"{template.shape[1]}x{template.shape[0]}" if template is not None else "unknown"
+        except:
+            template_size = "unknown"
+
+        # Try to get screenshot size
+        screenshot_size = "unknown"
+        try:
+            from PIL import ImageGrab
+            screenshot = ImageGrab.grab()
+            screenshot_size = f"{screenshot.width}x{screenshot.height}"
+        except:
+            pass
+
+        if matches:
+            # Get confidence from first match
+            first_match = matches[0]
+            confidence = getattr(first_match, 'score', threshold)
+            location = f"({getattr(first_match, 'x', 0)}, {getattr(first_match, 'y', 0)})"
+
+            # Emit event for successful match
+            event_data = {
+                "image_path": image_path,
+                "template_size": template_size,
+                "screenshot_size": screenshot_size,
+                "threshold": threshold,
+                "confidence": confidence,
+                "found": True,
+                "location": location,
+                "gap": threshold - confidence if confidence < threshold else 0,
+                "percent_off": ((threshold - confidence) / threshold * 100) if confidence < threshold else 0,
+            }
+            self._emit_log("debug", f"Emitting IMAGE_RECOGNITION event (FOUND): {image_path}, confidence: {confidence}")
+            self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
+        else:
+            # Build event data for no match found
+            event_data = {
+                "image_path": image_path,
+                "template_size": template_size,
+                "screenshot_size": screenshot_size,
+                "threshold": threshold,
+                "confidence": 0.0,
+                "found": False,
+            }
+
+            # Add best match information if available
+            if best_match_info:
+                best_confidence = best_match_info.get('confidence', 0.0)
+                best_x = best_match_info.get('x', 0)
+                best_y = best_match_info.get('y', 0)
+
+                event_data["confidence"] = best_confidence
+                event_data["best_match_location"] = f"({best_x}, {best_y})"
+                event_data["gap"] = threshold - best_confidence
+                event_data["percent_off"] = ((threshold - best_confidence) / threshold * 100) if threshold > 0 else 0
+
+            # Emit event
+            self._emit_log("debug", f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_path}, best_match: {best_match_info is not None}")
+            self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
 
     def _process_special_keys(self, text: str) -> str:
         """Process special key placeholders in text.
@@ -351,6 +486,8 @@ class QontinuiExecutor:
         action_type = action_data.get("type")
         config = action_data.get("config", {})
 
+        self._emit_log("info", f"Executing action: {action_type}")
+
         # Handle missing actions library
         if not QONTINUI_AVAILABLE or not hasattr(self, "actions"):
             self._emit_log("warning", f"Simulating action: {action_type}")
@@ -365,11 +502,25 @@ class QontinuiExecutor:
 
             if action_type == "CLICK":
                 target = config.get("target", {})
+                self._emit_log("info", f"CLICK action - target type: {target.get('type')}")
                 if target.get("type") == "image":
                     image_id = target.get("imageId")
+                    self._emit_log("info", f"CLICK - Looking for image: {image_id}")
                     if image_id in self.images:
+                        # Get similarity/threshold from target config (default 0.9)
+                        threshold = target.get("threshold", config.get("similarity", 0.9))
+
                         # Find image on screen
                         matches = Find(self.images[image_id]).find_all()
+
+                        # If no matches, get best match info anyway
+                        best_match_info = None
+                        if not matches:
+                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                        # Emit image recognition event
+                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+
                         if matches:
                             # Click on first match
                             location = matches[0].location
@@ -451,8 +602,22 @@ class QontinuiExecutor:
 
             elif action_type == "FIND":
                 image_id = config.get("image") or config.get("imageId")
+                self._emit_log("info", f"FIND action - Looking for image: {image_id}")
                 if image_id and image_id in self.images:
+                    # Get similarity/threshold from config (default 0.9)
+                    threshold = config.get("similarity", 0.9)
+
+                    # Perform find operation
                     matches = Find(self.images[image_id]).find_all()
+
+                    # If no matches, get best match info anyway
+                    best_match_info = None
+                    if not matches:
+                        best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                    # Emit image recognition event
+                    self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+
                     if matches:
                         self._emit_log("info", f"Found {len(matches)} matches for image {image_id}")
                         self._emit_event(
@@ -494,7 +659,7 @@ class QontinuiExecutor:
             elif action_type == "RUN_PROCESS":
                 process_id = config.get("process")
                 if process_id:
-                    self._emit_log("info", f"Running sub-process: {process_id}")
+                    self._emit_log("info", f"RUN_PROCESS - Running sub-process: {process_id}")
                     return self._execute_process(process_id)
                 else:
                     self._emit_log("warning", "No process specified for RUN_PROCESS action")
@@ -504,11 +669,21 @@ class QontinuiExecutor:
                 image_id = config.get("image") or config.get("imageId")
                 timeout = config.get("timeout", 5000) / 1000.0  # Convert to seconds
                 check_interval = config.get("check_interval", 500) / 1000.0
+                threshold = config.get("similarity", 0.9)
 
                 if image_id and image_id in self.images:
                     start_time = time.time()
                     while time.time() - start_time < timeout:
                         matches = Find(self.images[image_id]).find_all()
+
+                        # If no matches, get best match info anyway
+                        best_match_info = None
+                        if not matches:
+                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                        # Emit image recognition event for each check
+                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+
                         if not matches:
                             self._emit_log("info", f"Image {image_id} has vanished")
                             return True
@@ -527,6 +702,7 @@ class QontinuiExecutor:
             elif action_type == "DRAG":
                 from_target = config.get("from", {})
                 to_target = config.get("to", {})
+                threshold = config.get("similarity", 0.9)
 
                 # Get from location
                 from_loc = None
@@ -534,6 +710,14 @@ class QontinuiExecutor:
                     image_id = from_target.get("imageId")
                     if image_id in self.images:
                         matches = Find(self.images[image_id]).find_all()
+
+                        # If no matches, get best match info anyway
+                        best_match_info = None
+                        if not matches:
+                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                        # Emit image recognition event for from location
+                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
                         if matches:
                             from_loc = matches[0].location
                 elif from_target.get("type") == "coordinates":
@@ -545,6 +729,14 @@ class QontinuiExecutor:
                     image_id = to_target.get("imageId")
                     if image_id in self.images:
                         matches = Find(self.images[image_id]).find_all()
+
+                        # If no matches, get best match info anyway
+                        best_match_info = None
+                        if not matches:
+                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                        # Emit image recognition event for to location
+                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
                         if matches:
                             to_loc = matches[0].location
                 elif to_target.get("type") == "coordinates":

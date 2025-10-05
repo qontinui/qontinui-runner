@@ -267,21 +267,9 @@ impl PythonBridge {
 
     pub fn start_execution_with_params(
         &mut self,
-        mode: &str,
         params: Option<serde_json::Value>,
     ) -> Result<(), String> {
-        let mut command_params = json!({
-            "mode": mode
-        });
-
-        // Merge additional params if provided
-        if let Some(serde_json::Value::Object(map)) = params {
-            for (key, value) in map {
-                command_params[key] = value;
-            }
-        }
-
-        self.send_command("start", Some(command_params))
+        self.send_command("start", params)
     }
 
     pub fn stop_execution(&mut self) -> Result<(), String> {

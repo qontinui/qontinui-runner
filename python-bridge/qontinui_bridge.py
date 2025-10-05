@@ -33,6 +33,8 @@ class EventType(Enum):
     EXECUTION_COMPLETED = "execution_completed"
     ERROR = "error"
     LOG = "log"
+    IMAGE_RECOGNITION = "image_recognition"
+    ACTION_EXECUTION = "action_execution"
 
 
 class QontinuiBridge:
@@ -201,8 +203,6 @@ class QontinuiBridge:
     def _handle_start(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle execution start."""
         try:
-            # Get execution mode
-            mode = params.get("mode", "state_machine")
             process_id = params.get("process_id")
             monitor_index = params.get("monitor_index", 0)  # Default to primary monitor
 
@@ -216,7 +216,7 @@ class QontinuiBridge:
 
             self._emit_event(
                 EventType.EXECUTION_STARTED,
-                {"mode": mode, "process_id": process_id, "monitor_index": monitor_index},
+                {"process_id": process_id, "monitor_index": monitor_index},
             )
 
             # Run in separate thread to not block
@@ -228,11 +228,11 @@ class QontinuiBridge:
 
                     # Pass monitor_index and process_id to JSONRunner.run()
                     success = self.runner.run(
-                        mode=mode, monitor_index=monitor_index, process_id=process_id
+                        monitor_index=monitor_index, process_id=process_id
                     )
 
                     self._emit_event(
-                        EventType.EXECUTION_COMPLETED, {"success": success, "mode": mode}
+                        EventType.EXECUTION_COMPLETED, {"success": success}
                     )
                 except Exception as e:
                     self._emit_event(
