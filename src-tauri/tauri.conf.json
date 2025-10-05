@@ -15,9 +15,9 @@
       {
         "title": "Qontinui Runner",
         "width": 1200,
-        "height": 1200,
+        "height": 750,
         "minWidth": 1100,
-        "minHeight": 1000
+        "minHeight": 700
       }
     ],
     "security": {

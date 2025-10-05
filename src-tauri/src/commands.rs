@@ -36,7 +36,8 @@ pub fn load_configuration(path: String, state: State<AppState>) -> Result<Comman
     let config_data = serde_json::json!({
         "processes": config.processes.clone(),
         "states": config.states.clone(),
-        "transitions": config.transitions.clone()
+        "transitions": config.transitions.clone(),
+        "images": config.images.clone()
     });
 
     // Store the configuration
@@ -137,7 +138,6 @@ pub fn stop_python_executor(state: State<AppState>) -> Result<CommandResponse, S
 
 #[tauri::command]
 pub fn start_execution(
-    mode: String,
     process_id: Option<String>,
     monitor_index: Option<i32>,
     state: State<AppState>,
@@ -149,7 +149,7 @@ pub fn start_execution(
             return Err("Python executor not running".to_string());
         }
 
-        // Build params based on mode and monitor
+        // Build params
         let mut params = serde_json::Map::new();
 
         // Add monitor index (default to 0 if not provided)
@@ -158,22 +158,20 @@ pub fn start_execution(
             serde_json::json!(monitor_index.unwrap_or(0)),
         );
 
-        // Add process_id if in process mode
-        if mode == "process" {
-            if let Some(pid) = process_id {
-                params.insert("process_id".to_string(), serde_json::json!(pid));
-            } else {
-                return Err("Process ID required for process mode".to_string());
-            }
+        // Add process_id (required)
+        if let Some(pid) = process_id {
+            params.insert("process_id".to_string(), serde_json::json!(pid));
+        } else {
+            return Err("Process ID is required".to_string());
         }
 
         bridge
-            .start_execution_with_params(&mode, Some(serde_json::Value::Object(params)))
+            .start_execution_with_params(Some(serde_json::Value::Object(params)))
             .map_err(|e| format!("Failed to start execution: {}", e))?;
 
         Ok(CommandResponse {
             success: true,
-            message: Some(format!("Execution started in {} mode", mode)),
+            message: Some("Execution started".to_string()),
             data: None,
         })
     } else {
