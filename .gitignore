@@ -73,3 +73,9 @@ tailwind.config.js
 tsconfig.json
 tsconfig.node.json
 vite.config.ts
+
+# Icon source files (for packaging only, platform-specific)
+icons/source/
+
+# Development/diagnostic files
+python-bridge/diagnostics/
