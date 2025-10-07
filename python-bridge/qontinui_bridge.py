@@ -225,18 +225,22 @@ class QontinuiBridge:
                     self._is_running = True
 
                     self._emit_log("info", f"Using monitor {monitor_index} for automation")
+                    self._emit_log("info", f"Starting process: {process_id}")
 
-                    # Pass monitor_index and process_id to JSONRunner.run()
+                    # Pass process_id and monitor_index to JSONRunner.run()
                     success = self.runner.run(
-                        monitor_index=monitor_index, process_id=process_id
+                        process_id=process_id, monitor_index=monitor_index
                     )
 
+                    self._emit_log("info", f"Execution completed with success={success}")
                     self._emit_event(
                         EventType.EXECUTION_COMPLETED, {"success": success}
                     )
                 except Exception as e:
+                    error_details = f"{str(e)}\n{traceback.format_exc()}"
+                    self._emit_log("error", f"Execution failed: {error_details}")
                     self._emit_event(
-                        EventType.ERROR, {"message": "Execution failed", "details": str(e)}
+                        EventType.ERROR, {"message": "Execution failed", "details": error_details}
                     )
                 finally:
                     self._is_running = False
@@ -252,9 +256,13 @@ class QontinuiBridge:
     def _handle_stop(self) -> dict[str, Any]:
         """Handle execution stop."""
         try:
-            # JSONRunner doesn't have stop(), so we'll track it ourselves
             self._emit_log("info", "Stopping execution...")
             self._is_running = False
+
+            # Request the runner to stop gracefully
+            if self.runner:
+                self.runner.request_stop()
+
             self._emit_event(
                 EventType.EXECUTION_COMPLETED, {"success": False, "reason": "User stopped"}
             )

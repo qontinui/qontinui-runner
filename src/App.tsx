@@ -16,6 +16,7 @@ import {
   Image,
 } from "lucide-react";
 import StatusIndicator from "./components/StatusIndicator";
+import CollapsiblePanel from "./components/CollapsiblePanel";
 import "./index.css";
 
 interface LogEntry {
@@ -85,6 +86,8 @@ function App() {
   const [availableMonitors, setAvailableMonitors] = useState<number[]>([0]);
   const [autoMinimize, setAutoMinimize] = useState(true); // Default enabled for single monitor
   const [copySuccess, setCopySuccess] = useState(false);
+  const [configPanelCollapsed, setConfigPanelCollapsed] = useState(false);
+  const [executionPanelCollapsed, setExecutionPanelCollapsed] = useState(false);
   const logViewerRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
 
@@ -470,6 +473,10 @@ function App() {
         return;
       }
 
+      // Auto-collapse panels when starting
+      setConfigPanelCollapsed(true);
+      setExecutionPanelCollapsed(true);
+
       const params: any = {
         processId: selectedProcess,
         monitorIndex: selectedMonitor,
@@ -525,6 +532,12 @@ function App() {
     } else if (activeLogTab === "actions") {
       setActionExecutionLogs([]);
     }
+  };
+
+  const clearAllLogs = () => {
+    setLogs([]);
+    setImageRecognitionLogs([]);
+    setActionExecutionLogs([]);
   };
 
   const copyLogs = async () => {
@@ -749,12 +762,15 @@ Attempts: ${entry.attempts}`;
         {/* Control Panel */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Configuration Card */}
-          <div className="bg-card rounded-lg border border-border/50 hover:border-primary/50 transition-all duration-300 p-6 space-y-4">
-            <div className="flex items-center gap-2 text-primary">
-              <FileText className="w-5 h-5" />
-              <h2 className="text-lg font-semibold">Configuration</h2>
-            </div>
-
+          <CollapsiblePanel
+            title="Configuration"
+            icon={<FileText className="w-5 h-5" />}
+            collapsed={configPanelCollapsed}
+            onToggle={setConfigPanelCollapsed}
+            storageKey="qontinui-config-panel-collapsed"
+            colorClass="text-primary"
+            borderColorClass="border-primary/50"
+          >
             <button
               onClick={handleLoadConfiguration}
               className="w-full bg-primary hover:bg-primary/80 text-primary-foreground px-4 py-2 rounded-md font-medium transition-colors"
@@ -786,15 +802,18 @@ Attempts: ${entry.attempts}`;
                 </div>
               </div>
             )}
-          </div>
+          </CollapsiblePanel>
 
           {/* Execution Control Card */}
-          <div className="bg-card rounded-lg border border-border/50 hover:border-secondary/50 transition-all duration-300 p-6 space-y-4">
-            <div className="flex items-center gap-2 text-secondary">
-              <Play className="w-5 h-5" />
-              <h2 className="text-lg font-semibold">Execution Control</h2>
-            </div>
-
+          <CollapsiblePanel
+            title="Execution Control"
+            icon={<Play className="w-5 h-5" />}
+            collapsed={executionPanelCollapsed}
+            onToggle={setExecutionPanelCollapsed}
+            storageKey="qontinui-execution-panel-collapsed"
+            colorClass="text-secondary"
+            borderColorClass="border-secondary/50"
+          >
             {/* Process Selection */}
             <div>
               <label className="text-sm text-muted-foreground">Process</label>
@@ -925,7 +944,7 @@ Attempts: ${entry.attempts}`;
                 Stop
               </button>
             </div>
-          </div>
+          </CollapsiblePanel>
         </div>
 
         {/* Log Viewer */}
@@ -1069,6 +1088,14 @@ Attempts: ${entry.attempts}`;
               >
                 <Trash2 className="w-4 h-4" />
                 Clear
+              </button>
+
+              <button
+                onClick={clearAllLogs}
+                className="px-3 py-1 border border-destructive text-destructive hover:bg-destructive hover:text-destructive-foreground rounded-md font-medium transition-colors flex items-center gap-2"
+              >
+                <Trash2 className="w-4 h-4" />
+                Clear All Logs
               </button>
             </div>
           </div>
