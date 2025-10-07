@@ -79,7 +79,36 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::handle_error,
             commands::check_for_updates,
         ])
-        .setup(|_app| {
+        .setup(|app| {
+            info!("Tauri application setup starting");
+
+            // Position window at top-center of screen
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(monitor) = window.current_monitor() {
+                    if let Some(monitor) = monitor {
+                        let monitor_size = monitor.size();
+                        let monitor_pos = monitor.position();
+
+                        if let Ok(window_size) = window.outer_size() {
+                            // Calculate center X position
+                            let x = monitor_pos.x + ((monitor_size.width as i32 - window_size.width as i32) / 2);
+                            // Position at top (with small margin)
+                            let y = monitor_pos.y + 20;
+
+                            if let Err(e) = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y })) {
+                                error!("Failed to set window position: {}", e);
+                            } else {
+                                info!("Window positioned at top-center: x={}, y={}", x, y);
+                            }
+                        }
+                    }
+                } else {
+                    error!("Failed to get current monitor");
+                }
+            } else {
+                error!("Failed to get main window");
+            }
+
             info!("Tauri application setup complete");
             Ok(())
         })
