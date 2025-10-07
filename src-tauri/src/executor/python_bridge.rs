@@ -119,14 +119,30 @@ impl PythonBridge {
         }
 
         // Start the Python process with appropriate mode
-        // Use "python" on Windows, "python3" on Unix
-        let python_cmd = if cfg!(target_os = "windows") {
-            "python"
+        // Try to use venv Python first, fall back to system Python
+        let venv_python = bridge_script.parent()
+            .and_then(|p| {
+                let venv_path = p.join("venv/Scripts/python.exe");
+                eprintln!("Checking venv path: {:?}, exists: {}", venv_path, venv_path.exists());
+                if venv_path.exists() {
+                    Some(venv_path)
+                } else {
+                    None
+                }
+            });
+
+        let python_cmd = if let Some(venv_path) = venv_python {
+            eprintln!("Using venv Python: {:?}", venv_path);
+            venv_path.to_string_lossy().to_string()
+        } else if cfg!(target_os = "windows") {
+            eprintln!("Using system python");
+            "python".to_string()
         } else {
-            "python3"
+            eprintln!("Using system python3");
+            "python3".to_string()
         };
 
-        let mut cmd = Command::new(python_cmd);
+        let mut cmd = Command::new(&python_cmd);
         cmd.arg(bridge_script);
 
         // Pass --mock flag for simulation/mock mode
