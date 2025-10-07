@@ -1,170 +1,220 @@
 # Qontinui Runner
 
-[![CI](https://github.com/your-username/qontinui-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/your-username/qontinui-runner/actions/workflows/ci.yml)
-[![Release](https://github.com/your-username/qontinui-runner/actions/workflows/release.yml/badge.svg)](https://github.com/your-username/qontinui-runner/actions/workflows/release.yml)
-![Beta](https://img.shields.io/badge/status-beta-yellow)
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
-Desktop automation executor for [Qontinui Web](https://qontinui.com). Run your automation projects locally with a secure, robust desktop application.
+Desktop application for running [Qontinui](https://github.com/yourusername/qontinui) GUI automation projects.
 
-## 🚀 Features
+## Features
 
-### Core Functionality
+- 🚀 Execute automation configurations locally
+- 📊 Real-time execution monitoring
+- 🔄 Mock and real execution modes
+- 💾 Load and manage JSON configurations
+- 🖥️ Cross-platform support (Windows, macOS, Linux)
 
-- **Automation Execution**: Execute automation projects created in Qontinui Web
-- **Real-time Monitoring**: Watch execution progress with detailed logging
-- **Configuration Management**: Load and manage automation configurations
-- **Multiple Execution Modes**: Support for process-based and state machine execution
+## Installation
 
-### Production-Ready Features (Beta)
+### Prerequisites
 
-- ✅ **Comprehensive Error Handling**: Graceful error recovery with user-friendly messages
-- ✅ **Panic Recovery**: Application continues running even after unexpected errors
-- ✅ **Logging System**: Detailed logs saved locally for debugging
-- ✅ **Auto-Updates**: Automatic updates to get the latest features and fixes
-- ✅ **Status Indicators**: Real-time system status monitoring
-- ✅ **Crash Reporting**: Automatic crash reports via Sentry (opt-in)
+- **Python 3.10+** with qontinui and multistate installed
+- **Node.js 18+** and npm (for building from source)
+- **Rust** (for building from source)
 
-## 📦 Installation
-
-### Download Pre-built Binaries
-
-Download the latest release for your platform:
-
-- **Windows**: [Download .msi installer](https://github.com/your-username/qontinui-runner/releases)
-- **macOS**: [Download .dmg](https://github.com/your-username/qontinui-runner/releases)
-  - Intel: `qontinui-runner_x64.dmg`
-  - Apple Silicon: `qontinui-runner_aarch64.dmg`
-- **Linux**: [Download .AppImage or .deb](https://github.com/your-username/qontinui-runner/releases)
-
-### Build from Source
-
-#### Prerequisites
-
-- [Node.js](https://nodejs.org/) (v18 or later)
-- [Rust](https://rustup.rs/) (latest stable)
-- Platform-specific dependencies:
-  - **Linux**: `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, `librsvg2-dev`
-  - **macOS**: Xcode Command Line Tools
-  - **Windows**: WebView2 (comes with Windows 10/11)
-
-#### Build Steps
+### Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/qontinui-runner.git
-cd qontinui-runner
-
 # Install dependencies
-npm install
+cd multistate && poetry install && cd ..
+cd qontinui && poetry install && cd ..
+cd qontinui-runner && npm install
 
-# Development build with hot-reload
+# Run in development mode
 npm run tauri dev
-
-# Production build
-npm run tauri build
 ```
 
-## 🎮 Usage
+### Platform-Specific Setup
 
-### Basic Usage
+#### Windows
 
-1. **Start the Runner**: Launch Qontinui Runner from your applications
-2. **Start Python Executor**: Click "Start Executor" to initialize the automation engine
-3. **Load Configuration**: Use "Load Config" to select your automation project file
-4. **Execute**: Choose execution mode and start your automation
+```bash
+# Install Rust
+winget install Rustlang.Rustup
 
-### Execution Modes
+# Install Python libraries
+cd multistate && poetry install && cd ..
+cd qontinui && poetry install && cd ..
 
-- **Mock Mode** (Default): Test your automations without actual execution
-- **Real Mode**: Execute automations with actual system interactions
+# Run the app
+cd qontinui-runner
+npm install
+npm run tauri dev
+```
 
-### Status Indicators
+**Note**: WSL cannot perform GUI automation as it's headless. Use native Windows.
 
-The application provides real-time status for:
+#### macOS
 
-- **Executor Status**: Running/Stopped state of the Python executor
-- **Configuration**: Whether a valid configuration is loaded
-- **Execution**: Current execution state
-- **Connection**: Connection status to Qontinui Web (when available)
+```bash
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-## 🔧 Configuration
+# Install Python libraries
+cd multistate && poetry install && cd ..
+cd qontinui && poetry install && cd ..
 
-### Environment Variables
+# Run the app
+cd qontinui-runner
+npm install
+npm run tauri dev
+```
 
-- `RUST_LOG`: Set logging level (default: `info`)
-- `SENTRY_DSN`: Sentry DSN for crash reporting (optional)
+#### Linux
 
-### Log Files
+```bash
+# Install system dependencies
+sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
 
-Logs are stored in:
+# Install Rust
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-- **Windows**: `%LOCALAPPDATA%\qontinui-runner\logs\`
-- **macOS**: `~/Library/Application Support/qontinui-runner/logs/`
-- **Linux**: `~/.local/share/qontinui-runner/logs/`
+# Install Python libraries
+cd multistate && poetry install && cd ..
+cd qontinui && poetry install && cd ..
 
-## 🛡️ Security
+# Run the app
+cd qontinui-runner
+npm install
+npm run tauri dev
+```
 
-### Code Signing
+## Usage
 
-- **Windows**: Signed with Authenticode certificate
-- **macOS**: Signed and notarized with Apple Developer certificate
-- **Linux**: AppImage includes signature
+1. **Start the application**
 
-### Auto-Updates
+   ```bash
+   npm run tauri dev
+   ```
 
-Updates are delivered securely through GitHub releases with signature verification.
+2. **Start Python Executor**
+   - Click "Start Executor" button
+   - Choose execution mode (Mock or Real)
 
-## 🐛 Beta Status
+3. **Load Configuration**
+   - Click "Load Config"
+   - Select your automation JSON file
 
-This is a **BETA** release. While the core functionality is stable, you may encounter bugs. Please report issues to help improve the application.
+4. **Execute**
+   - Click "Start" to run your automation
+   - Monitor progress in real-time
 
-### Known Limitations
+## Execution Modes
 
-- Auto-update requires manual approval on first run
-- Some antivirus software may flag the application (false positive)
-- macOS users need to allow the app in Security & Privacy settings on first run
+### Mock Mode
 
-## 🤝 Contributing
+- Simulates automation without actual system interactions
+- Safe for testing configurations
+- Faster execution
 
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
+### Real Mode
 
-### Development Setup
+- Performs actual mouse clicks, keyboard input, etc.
+- Requires active display (no headless environments)
+- Use for production automation
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests: `npm run test`
-5. Submit a pull request
+## Project Structure
 
-## 📄 License
+```
+qontinui-runner/
+├── src/                      # React frontend (TypeScript)
+│   ├── components/           # UI components
+│   ├── services/             # API services
+│   └── App.tsx              # Main app
+├── src-tauri/               # Tauri backend (Rust)
+│   ├── src/                 # Rust code
+│   └── Cargo.toml           # Rust dependencies
+├── python-bridge/           # Python → qontinui bridge
+│   └── qontinui_bridge.py  # Minimal bridge script
+└── public/                  # Static assets
+```
 
-[MIT License](LICENSE) - See LICENSE file for details
+## Building for Production
 
-## 🆘 Support
+```bash
+# Build for current platform
+npm run tauri build
 
-- **Documentation**: [docs.qontinui.com](https://docs.qontinui.com)
-- **Issues**: [GitHub Issues](https://github.com/your-username/qontinui-runner/issues)
-- **Community**: [Discord Server](https://discord.gg/qontinui)
+# Output locations:
+# Windows: src-tauri/target/release/bundle/msi/
+# macOS:   src-tauri/target/release/bundle/dmg/
+# Linux:   src-tauri/target/release/bundle/appimage/
+```
 
-## 🙏 Acknowledgments
+## Configuration Format
 
-Built with:
+Qontinui Runner uses JSON configurations created by qontinui-web or written manually:
 
-- [Tauri](https://tauri.app/) - Desktop application framework
+```json
+{
+  "version": "1.0",
+  "states": [...],
+  "processes": [...],
+  "images": [...]
+}
+```
+
+See [qontinui documentation](https://github.com/yourusername/qontinui) for details.
+
+## Troubleshooting
+
+### Windows
+
+**"cargo: command not found"**
+
+- Close and reopen PowerShell after installing Rust
+- Or manually add to PATH: `C:\Users\YourUsername\.cargo\bin`
+
+**Antivirus blocking build**
+
+- Add exclusion for `.cargo` directory
+- Temporarily disable real-time protection during first build
+
+### macOS
+
+**"xcrun: error"**
+
+- Install Xcode Command Line Tools: `xcode-select --install`
+
+### Linux
+
+**"webkit2gtk not found"**
+
+- Install dependencies: `sudo apt install libwebkit2gtk-4.1-dev`
+
+**GUI automation not working**
+
+- Ensure you're running on a display (not SSH/headless)
+- Check permissions for input control
+
+## Contributing
+
+We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## License
+
+MIT License - See [LICENSE](LICENSE) file for details.
+
+## Related Projects
+
+- **[qontinui](https://github.com/yourusername/qontinui)** - Core automation library
+- **[qontinui-web](https://github.com/yourusername/qontinui-web)** - Web-based configuration editor
+- **[multistate](https://github.com/jspinak/multistate)** - Multi-state state management
+
+## Built With
+
+- [Tauri](https://tauri.app/) - Desktop app framework
 - [React](https://reactjs.org/) - UI framework
-- [Rust](https://www.rust-lang.org/) - Backend language
-- [TypeScript](https://www.typescriptlang.org/) - Frontend language
-
-## 📊 Telemetry
-
-The application includes:
-
-- **Crash Reporting**: Anonymous crash reports to improve stability (can be disabled)
-- **Update Checks**: Periodic checks for new versions (can be disabled)
-
-No personal data or automation content is collected.
-
----
-
-**Note**: This is a beta release. Use in production at your own risk. We recommend testing thoroughly in your environment before deploying for critical workflows.
+- [Rust](https://www.rust-lang.org/) - Backend
+- [TypeScript](https://www.typescriptlang.org/) - Frontend
+- [Qontinui](https://github.com/yourusername/qontinui) - Automation engine
