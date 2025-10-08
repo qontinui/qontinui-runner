@@ -157,16 +157,15 @@ pub fn setup_panic_handler() {
 
         #[cfg(not(debug_assertions))]
         {
-            if let Ok(guard) = sentry::init((
+            let guard = sentry::init((
                 std::env::var("SENTRY_DSN").unwrap_or_default(),
                 sentry::ClientOptions {
                     release: sentry::release_name!(),
                     environment: Some("production".into()),
                     ..Default::default()
                 },
-            )) {
-                std::mem::forget(guard);
-            }
+            ));
+            std::mem::forget(guard);
         }
     }));
 }

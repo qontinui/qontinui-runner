@@ -280,7 +280,7 @@ pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
 }
 
 #[tauri::command]
-pub async fn check_for_updates(_app_handle: AppHandle) -> Result<CommandResponse, String> {
+pub async fn check_for_updates(app_handle: AppHandle) -> Result<CommandResponse, String> {
     info!("Checking for updates");
 
     #[cfg(not(debug_assertions))]
