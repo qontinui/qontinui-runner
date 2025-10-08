@@ -109,19 +109,17 @@ npm run tauri dev
    - Click "Start" to run your automation
    - Monitor progress in real-time
 
-## Execution Modes
+## Execution Mode
 
-### Mock Mode
+**Qontinui Runner performs REAL GUI automation only.**
 
-- Simulates automation without actual system interactions
-- Safe for testing configurations
-- Faster execution
+- ✅ Executes actual mouse clicks, keyboard input, and screen interactions
+- ✅ Performs real image recognition using OpenCV template matching
+- ✅ Requires active display (not headless/SSH environments)
+- ✅ Suitable for production automation workflows
+- ✅ Multi-monitor support for targeting specific displays
 
-### Real Mode
-
-- Performs actual mouse clicks, keyboard input, etc.
-- Requires active display (no headless environments)
-- Use for production automation
+**For testing and configuration validation**, use [qontinui-web](https://github.com/jspinak/qontinui-web)'s mock execution mode, which simulates automation logic in your browser without requiring a GUI environment.
 
 ## Project Structure
 
