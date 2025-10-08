@@ -91,11 +91,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
                         if let Ok(window_size) = window.outer_size() {
                             // Calculate center X position
-                            let x = monitor_pos.x + ((monitor_size.width as i32 - window_size.width as i32) / 2);
+                            let x = monitor_pos.x
+                                + ((monitor_size.width as i32 - window_size.width as i32) / 2);
                             // Position at top (with small margin)
                             let y = monitor_pos.y + 20;
 
-                            if let Err(e) = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition { x, y })) {
+                            if let Err(e) = window.set_position(tauri::Position::Physical(
+                                tauri::PhysicalPosition { x, y },
+                            )) {
                                 error!("Failed to set window position: {}", e);
                             } else {
                                 info!("Window positioned at top-center: x={}, y={}", x, y);
