@@ -79,3 +79,6 @@ icons/source/
 
 # Development/diagnostic files
 python-bridge/diagnostics/
+
+# Ignore CLAUDE notes file
+CLAUDE.md
