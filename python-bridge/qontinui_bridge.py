@@ -35,6 +35,13 @@ class EventType(Enum):
     LOG = "log"
     IMAGE_RECOGNITION = "image_recognition"
     ACTION_EXECUTION = "action_execution"
+    # Scheduler events
+    SCHEDULER_STARTED = "scheduler_started"
+    SCHEDULER_STOPPED = "scheduler_stopped"
+    SCHEDULE_TRIGGERED = "schedule_triggered"
+    SCHEDULE_EXECUTION_STARTED = "schedule_execution_started"
+    SCHEDULE_EXECUTION_COMPLETED = "schedule_execution_completed"
+    STATE_CHECK_PERFORMED = "state_check_performed"
 
 
 class QontinuiBridge:
@@ -49,6 +56,7 @@ class QontinuiBridge:
         self._execution_thread = None
         self._is_running = False
         self._temp_config_file = None
+        self._scheduler_running = False
         self._setup_callbacks()
 
         mode_str = "mock/simulation" if mock_mode else "real"
@@ -113,6 +121,14 @@ class QontinuiBridge:
                 return self._handle_status()
             elif cmd_type == "get_monitors":
                 return self._handle_get_monitors()
+            elif cmd_type == "scheduler_start":
+                return self._handle_scheduler_start(params)
+            elif cmd_type == "scheduler_stop":
+                return self._handle_scheduler_stop()
+            elif cmd_type == "scheduler_status":
+                return self._handle_scheduler_status()
+            elif cmd_type == "scheduler_get_statistics":
+                return self._handle_scheduler_get_statistics()
             else:
                 return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -228,14 +244,10 @@ class QontinuiBridge:
                     self._emit_log("info", f"Starting process: {process_id}")
 
                     # Pass process_id and monitor_index to JSONRunner.run()
-                    success = self.runner.run(
-                        process_id=process_id, monitor_index=monitor_index
-                    )
+                    success = self.runner.run(process_id=process_id, monitor_index=monitor_index)
 
                     self._emit_log("info", f"Execution completed with success={success}")
-                    self._emit_event(
-                        EventType.EXECUTION_COMPLETED, {"success": success}
-                    )
+                    self._emit_event(EventType.EXECUTION_COMPLETED, {"success": success})
                 except Exception as e:
                     error_details = f"{str(e)}\n{traceback.format_exc()}"
                     self._emit_log("error", f"Execution failed: {error_details}")
@@ -282,6 +294,104 @@ class QontinuiBridge:
                 "is_running": self._is_running,
                 "current_state": current_state,
                 "config_loaded": self.runner.config is not None,
+            }
+        except Exception:
+            raise
+
+    def _handle_scheduler_start(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle scheduler start command."""
+        try:
+            if not self.runner.scheduler_executor:
+                return {"success": False, "error": "No schedules configured"}
+
+            if self._scheduler_running:
+                return {"success": False, "error": "Scheduler already running"}
+
+            self._emit_log("info", "Starting scheduler...")
+            self.runner.start_scheduler()
+            self._scheduler_running = True
+
+            # Get schedule information
+            schedule_count = len(self.runner.config.schedules) if self.runner.config else 0
+            active_count = sum(
+                1 for s in (self.runner.config.schedules if self.runner.config else []) if s.enabled
+            )
+
+            self._emit_event(
+                EventType.SCHEDULER_STARTED,
+                {
+                    "total_schedules": schedule_count,
+                    "active_schedules": active_count,
+                },
+            )
+
+            return {
+                "success": True,
+                "total_schedules": schedule_count,
+                "active_schedules": active_count,
+            }
+        except Exception:
+            raise
+
+    def _handle_scheduler_stop(self) -> dict[str, Any]:
+        """Handle scheduler stop command."""
+        try:
+            if not self._scheduler_running:
+                return {"success": False, "error": "Scheduler not running"}
+
+            self._emit_log("info", "Stopping scheduler...")
+            self.runner.stop_scheduler()
+            self._scheduler_running = False
+
+            self._emit_event(EventType.SCHEDULER_STOPPED, {})
+
+            return {"success": True}
+        except Exception:
+            raise
+
+    def _handle_scheduler_status(self) -> dict[str, Any]:
+        """Handle scheduler status request."""
+        try:
+            has_scheduler = self.runner.scheduler_executor is not None
+            schedule_count = (
+                len(self.runner.config.schedules) if self.runner.config and has_scheduler else 0
+            )
+            active_count = 0
+
+            if has_scheduler and self.runner.config:
+                active_count = sum(1 for s in self.runner.config.schedules if s.enabled)
+
+            return {
+                "success": True,
+                "scheduler_running": self._scheduler_running,
+                "has_schedules": schedule_count > 0,
+                "total_schedules": schedule_count,
+                "active_schedules": active_count,
+            }
+        except Exception:
+            raise
+
+    def _handle_scheduler_get_statistics(self) -> dict[str, Any]:
+        """Handle scheduler statistics request."""
+        try:
+            if not self.runner.scheduler_executor:
+                return {
+                    "success": True,
+                    "statistics": {
+                        "total_schedules": 0,
+                        "active_schedules": 0,
+                        "total_executions": 0,
+                        "successful_executions": 0,
+                        "failed_executions": 0,
+                        "average_iteration_count": 0.0,
+                    },
+                }
+
+            stats = self.runner.get_scheduler_statistics()
+
+            return {
+                "success": True,
+                "statistics": stats,
             }
         except Exception:
             raise
