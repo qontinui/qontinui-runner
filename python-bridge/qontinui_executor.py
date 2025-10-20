@@ -20,13 +20,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 try:
     from qontinui import Find, FluentActions, Image, Location, QontinuiStateManager, State
+    from qontinui.config.execution_mode import ExecutionModeConfig, MockMode, set_execution_mode
+    from qontinui.json_executor.action_executor import ActionExecutor
+    from qontinui.json_executor.config_parser import ConfigParser
     from qontinui.model.element import Position
     from qontinui.model.state import StateLocation
+    from qontinui.wrappers import get_controller
 
     QONTINUI_AVAILABLE = True
 except ImportError:
     QONTINUI_AVAILABLE = False
-    sys.stdout.write(
+    print(
         json.dumps(
             {
                 "type": "event",
@@ -52,8 +56,10 @@ class EventType(Enum):
     STATE_CHANGED = "state_changed"
     ACTION_STARTED = "action_started"
     ACTION_COMPLETED = "action_completed"
-    PROCESS_STARTED = "process_started"
-    PROCESS_COMPLETED = "process_completed"
+    WORKFLOW_STARTED = "workflow_started"  # v2.0.0 terminology
+    WORKFLOW_COMPLETED = "workflow_completed"  # v2.0.0 terminology
+    PROCESS_STARTED = "process_started"  # Deprecated: use WORKFLOW_STARTED
+    PROCESS_COMPLETED = "process_completed"  # Deprecated: use WORKFLOW_COMPLETED
     EXECUTION_COMPLETED = "execution_completed"
     ERROR = "error"
     LOG = "log"
@@ -61,6 +67,8 @@ class EventType(Enum):
     SCREENSHOT_TAKEN = "screenshot_taken"
     IMAGE_RECOGNITION = "image_recognition"
     ACTION_EXECUTION = "action_execution"
+    RECORDING_STARTED = "recording_started"
+    RECORDING_STOPPED = "recording_stopped"
 
 
 class QontinuiExecutor:
@@ -71,12 +79,18 @@ class QontinuiExecutor:
         self.state_manager = None
         self.states = {}
         self.transitions = {}
-        self.processes = {}
+        self.workflows = {}  # v2.0.0: renamed from processes
+        self.processes = self.workflows  # Backward compatibility alias
         self.images = {}
         self.current_state = None
         self.is_running = False
         self._sequence = 0
         self.temp_dir = None
+        self.use_graph_execution = False
+        self.qontinui_config = None
+        self.action_executor = None
+        self.execution_mode = None  # ExecutionModeConfig instance
+        self.controller = None  # ExecutionModeController instance
 
         if QONTINUI_AVAILABLE:
             self.state_manager = QontinuiStateManager()
@@ -122,7 +136,7 @@ class QontinuiExecutor:
 
             # Get template image
             image_obj = self.images[image_id]
-            image_path = getattr(image_obj, 'path', None)
+            image_path = getattr(image_obj, "path", None)
             if not image_path:
                 return None
 
@@ -143,17 +157,15 @@ class QontinuiExecutor:
             center_x = max_loc[0] + w // 2
             center_y = max_loc[1] + h // 2
 
-            return {
-                'confidence': float(max_val),
-                'x': center_x,
-                'y': center_y
-            }
+            return {"confidence": float(max_val), "x": center_x, "y": center_y}
 
         except Exception as e:
             self._emit_log("debug", f"Could not get best match: {e}")
             return None
 
-    def _emit_image_recognition_event(self, image_id: str, matches: list, threshold: float = 0.9, best_match_info: dict = None):
+    def _emit_image_recognition_event(
+        self, image_id: str, matches: list, threshold: float = 0.9, best_match_info: dict = None
+    ):
         """Emit image recognition event with detailed information.
 
         Args:
@@ -163,7 +175,10 @@ class QontinuiExecutor:
             best_match_info: Optional dict with best match info even if it didn't meet threshold
                            Should contain: 'confidence', 'x', 'y'
         """
-        self._emit_log("debug", f"_emit_image_recognition_event called for image: {image_id}, matches: {len(matches) if matches else 0}")
+        self._emit_log(
+            "debug",
+            f"_emit_image_recognition_event called for image: {image_id}, matches: {len(matches) if matches else 0}",
+        )
 
         if image_id not in self.images:
             self._emit_log("warning", f"Image {image_id} not in loaded images")
@@ -171,29 +186,33 @@ class QontinuiExecutor:
 
         # Get image information
         image_obj = self.images[image_id]
-        image_path = getattr(image_obj, 'path', None) or image_id
+        image_path = getattr(image_obj, "path", None) or image_id
 
         # Try to get template size
         try:
             import cv2
-            template = cv2.imread(image_path) if hasattr(cv2, 'imread') else None
-            template_size = f"{template.shape[1]}x{template.shape[0]}" if template is not None else "unknown"
-        except:
+
+            template = cv2.imread(image_path) if hasattr(cv2, "imread") else None
+            template_size = (
+                f"{template.shape[1]}x{template.shape[0]}" if template is not None else "unknown"
+            )
+        except Exception:
             template_size = "unknown"
 
         # Try to get screenshot size
         screenshot_size = "unknown"
         try:
             from PIL import ImageGrab
+
             screenshot = ImageGrab.grab()
             screenshot_size = f"{screenshot.width}x{screenshot.height}"
-        except:
+        except Exception:
             pass
 
         if matches:
             # Get confidence from first match
             first_match = matches[0]
-            confidence = getattr(first_match, 'score', threshold)
+            confidence = getattr(first_match, "score", threshold)
             location = f"({getattr(first_match, 'x', 0)}, {getattr(first_match, 'y', 0)})"
 
             # Emit event for successful match
@@ -206,9 +225,14 @@ class QontinuiExecutor:
                 "found": True,
                 "location": location,
                 "gap": threshold - confidence if confidence < threshold else 0,
-                "percent_off": ((threshold - confidence) / threshold * 100) if confidence < threshold else 0,
+                "percent_off": (
+                    ((threshold - confidence) / threshold * 100) if confidence < threshold else 0
+                ),
             }
-            self._emit_log("debug", f"Emitting IMAGE_RECOGNITION event (FOUND): {image_path}, confidence: {confidence}")
+            self._emit_log(
+                "debug",
+                f"Emitting IMAGE_RECOGNITION event (FOUND): {image_path}, confidence: {confidence}",
+            )
             self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
         else:
             # Build event data for no match found
@@ -223,17 +247,22 @@ class QontinuiExecutor:
 
             # Add best match information if available
             if best_match_info:
-                best_confidence = best_match_info.get('confidence', 0.0)
-                best_x = best_match_info.get('x', 0)
-                best_y = best_match_info.get('y', 0)
+                best_confidence = best_match_info.get("confidence", 0.0)
+                best_x = best_match_info.get("x", 0)
+                best_y = best_match_info.get("y", 0)
 
                 event_data["confidence"] = best_confidence
                 event_data["best_match_location"] = f"({best_x}, {best_y})"
                 event_data["gap"] = threshold - best_confidence
-                event_data["percent_off"] = ((threshold - best_confidence) / threshold * 100) if threshold > 0 else 0
+                event_data["percent_off"] = (
+                    ((threshold - best_confidence) / threshold * 100) if threshold > 0 else 0
+                )
 
             # Emit event
-            self._emit_log("debug", f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_path}, best_match: {best_match_info is not None}")
+            self._emit_log(
+                "debug",
+                f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_path}, best_match: {best_match_info is not None}",
+            )
             self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
 
     def _process_special_keys(self, text: str) -> str:
@@ -317,12 +346,13 @@ class QontinuiExecutor:
             with open(config_path) as f:
                 self.config = json.load(f)
 
+            # Note: We allow config loading even without Qontinui library for testing
+            # Actual execution will still require the library
             if not QONTINUI_AVAILABLE:
-                self._emit_event(
-                    EventType.ERROR,
-                    {"message": "Cannot load configuration without Qontinui library"},
+                self._emit_log(
+                    "warning",
+                    "Qontinui library not available - config loaded but execution will not work",
                 )
-                return False
 
             # Create temp directory for images
             self.temp_dir = tempfile.mkdtemp(prefix="qontinui_")
@@ -340,95 +370,181 @@ class QontinuiExecutor:
                     with open(img_path, "wb") as f:
                         f.write(img_bytes)
 
-                    # Create Qontinui Image object
-                    self.images[img_id] = Image(img_path)
+                    # Create Qontinui Image object if library is available
+                    if QONTINUI_AVAILABLE:
+                        self.images[img_id] = Image(img_path)
+                    else:
+                        # Store path for testing purposes
+                        self.images[img_id] = {"path": img_path}
                     self._emit_log("debug", f"Loaded image: {img_id} -> {img_path}")
                 except Exception as e:
                     self._emit_log("error", f"Failed to load image {img_id}: {e}")
 
-            # Process states
-            for state_data in self.config.get("states", []):
-                state_id = state_data.get("id")
-                state = State(
-                    name=state_data.get("name", state_id),
-                    description=state_data.get("description", ""),
-                )
+            # Process states (only if Qontinui is available)
+            if QONTINUI_AVAILABLE:
+                for state_data in self.config.get("states", []):
+                    state_id = state_data.get("id")
+                    state = State(
+                        name=state_data.get("name", state_id),
+                        description=state_data.get("description", ""),
+                    )
 
-                # Add identifying images to state
-                for img_info in state_data.get("identifyingImages", []):
-                    # Handle both string IDs and object format
-                    if isinstance(img_info, str):
-                        img_id = img_info
+                    # Add identifying images to state
+                    for img_info in state_data.get("identifyingImages", []):
+                        # Handle both string IDs and object format
+                        if isinstance(img_info, str):
+                            img_id = img_info
+                        else:
+                            img_id = img_info.get("image") or img_info.get("imageId")
+
+                        if img_id and img_id in self.images:
+                            state.add_image(self.images[img_id])
+
+                    # Process StateLocations for this state
+                    for loc_data in state_data.get("locations", []):
+                        try:
+                            # Create base Location object
+                            location = Location(
+                                x=loc_data.get("x", 0),
+                                y=loc_data.get("y", 0),
+                                name=loc_data.get("name"),
+                                offset_x=loc_data.get("offsetX", 0),
+                                offset_y=loc_data.get("offsetY", 0),
+                                fixed=loc_data.get("fixed", True),
+                            )
+
+                            # Handle reference image for relative positioning
+                            ref_img_id = loc_data.get("referenceImageId")
+                            if ref_img_id and ref_img_id in self.images:
+                                location.reference_image_id = ref_img_id
+
+                                # Handle position within the image
+                                pos_data = loc_data.get("position")
+                                if pos_data:
+                                    # Create Position object with percentages
+                                    position = Position(
+                                        percent_w=pos_data.get("percentW", 0.5),
+                                        percent_h=pos_data.get("percentH", 0.5),
+                                    )
+                                    location.position = position
+                                else:
+                                    # Default to center if no position specified
+                                    location.position = Position(percent_w=0.5, percent_h=0.5)
+
+                            # Create StateLocation wrapper
+                            state_location = StateLocation(
+                                location=location, name=loc_data.get("name"), owner_state=state
+                            )
+
+                            # Set StateLocation flags
+                            if loc_data.get("anchor"):
+                                state_location.set_anchor(True)
+                            if loc_data.get("fixed"):
+                                state_location.set_fixed(True)
+
+                            # Add to state
+                            state.add_location(state_location)
+                            self._emit_log(
+                                "debug",
+                                f"Added location '{loc_data.get('name')}' to state '{state.name}'",
+                            )
+                        except Exception as e:
+                            self._emit_log("error", f"Failed to create location: {e}")
+
+                    self.states[state_id] = state
+                    self.state_manager.add_state(state)
+
+                    # Set initial state
+                    if state_data.get("isInitial"):
+                        self.current_state = state_id
+                        self.state_manager.set_current_state(state)
+            else:
+                # If Qontinui not available, just count states for testing
+                for state_data in self.config.get("states", []):
+                    state_id = state_data.get("id")
+                    self.states[state_id] = {"name": state_data.get("name", state_id)}
+                    if state_data.get("isInitial"):
+                        self.current_state = state_id
+
+            # Load execution mode configuration (REAL, MOCK, or SCREENSHOT)
+            execution_settings = self.config.get("settings", {}).get("execution", {})
+            exec_mode_str = execution_settings.get("executionMode", "real").upper()
+            screenshot_dir = execution_settings.get("screenshotDirectory")
+
+            # Parse execution mode from config
+            if QONTINUI_AVAILABLE:
+                try:
+                    # Map string to MockMode enum
+                    if exec_mode_str == "REAL":
+                        mode = MockMode.REAL
+                    elif exec_mode_str == "MOCK":
+                        mode = MockMode.MOCK
+                    elif exec_mode_str == "SCREENSHOT":
+                        mode = MockMode.SCREENSHOT
                     else:
-                        img_id = img_info.get("image") or img_info.get("imageId")
-
-                    if img_id and img_id in self.images:
-                        state.add_image(self.images[img_id])
-
-                # Process StateLocations for this state
-                for loc_data in state_data.get("locations", []):
-                    try:
-                        # Create base Location object
-                        location = Location(
-                            x=loc_data.get("x", 0),
-                            y=loc_data.get("y", 0),
-                            name=loc_data.get("name"),
-                            offset_x=loc_data.get("offsetX", 0),
-                            offset_y=loc_data.get("offsetY", 0),
-                            fixed=loc_data.get("fixed", True),
-                        )
-
-                        # Handle reference image for relative positioning
-                        ref_img_id = loc_data.get("referenceImageId")
-                        if ref_img_id and ref_img_id in self.images:
-                            location.reference_image_id = ref_img_id
-
-                            # Handle position within the image
-                            pos_data = loc_data.get("position")
-                            if pos_data:
-                                # Create Position object with percentages
-                                position = Position(
-                                    percent_w=pos_data.get("percentW", 0.5),
-                                    percent_h=pos_data.get("percentH", 0.5),
-                                )
-                                location.position = position
-                            else:
-                                # Default to center if no position specified
-                                location.position = Position(percent_w=0.5, percent_h=0.5)
-
-                        # Create StateLocation wrapper
-                        state_location = StateLocation(
-                            location=location, name=loc_data.get("name"), owner_state=state
-                        )
-
-                        # Set StateLocation flags
-                        if loc_data.get("anchor"):
-                            state_location.set_anchor(True)
-                        if loc_data.get("fixed"):
-                            state_location.set_fixed(True)
-
-                        # Add to state
-                        state.add_location(state_location)
                         self._emit_log(
-                            "debug",
-                            f"Added location '{loc_data.get('name')}' to state '{state.name}'",
+                            "warning",
+                            f"Unknown execution mode '{exec_mode_str}', defaulting to REAL",
                         )
-                    except Exception as e:
-                        self._emit_log("error", f"Failed to create location: {e}")
+                        mode = MockMode.REAL
 
-                self.states[state_id] = state
-                self.state_manager.add_state(state)
+                    # Create ExecutionModeConfig
+                    self.execution_mode = ExecutionModeConfig(
+                        mode=mode, screenshot_dir=screenshot_dir
+                    )
 
-                # Set initial state
-                if state_data.get("isInitial"):
-                    self.current_state = state_id
-                    self.state_manager.set_current_state(state)
+                    # Set global execution mode
+                    set_execution_mode(self.execution_mode)
 
-            # Process processes (action sequences)
-            for process_data in self.config.get("processes", []):
-                process_id = process_data.get("id")
-                actions = process_data.get("actions", [])
-                self.processes[process_id] = actions
+                    # Get controller instance
+                    self.controller = get_controller()
+
+                    self._emit_log(
+                        "info", f"Execution mode set to: {self.execution_mode.mode.value}"
+                    )
+                    if self.execution_mode.is_screenshot_mode():
+                        self._emit_log(
+                            "info", f"Screenshot directory: {self.execution_mode.screenshot_dir}"
+                        )
+
+                except Exception as e:
+                    self._emit_log(
+                        "warning",
+                        f"Failed to initialize execution mode: {e}. Defaulting to REAL mode.",
+                    )
+                    self.execution_mode = ExecutionModeConfig(mode=MockMode.REAL)
+                    set_execution_mode(self.execution_mode)
+                    self.controller = get_controller()
+
+            # Check for graph execution setting (v2.0.0)
+            self.use_graph_execution = execution_settings.get("useGraphExecution", False)
+
+            # If graph execution is enabled and library is available, parse config with library's parser
+            if self.use_graph_execution and QONTINUI_AVAILABLE:
+                try:
+                    config_parser = ConfigParser()
+                    self.qontinui_config = config_parser.parse_config(self.config)
+                    self.action_executor = ActionExecutor(
+                        self.qontinui_config, use_graph_execution=True
+                    )
+                    self._emit_log(
+                        "info", "Graph execution mode enabled - using library's ActionExecutor"
+                    )
+                except Exception as e:
+                    self._emit_log(
+                        "warning",
+                        f"Failed to initialize graph executor: {e}. Falling back to manual execution.",
+                    )
+                    self.use_graph_execution = False
+                    self.action_executor = None
+
+            # Process workflows (v2.0.0) or processes (v1.0.0) - action sequences
+            # Support both v2.0.0 (workflows) and v1.0.0 (processes) formats
+            workflow_data = self.config.get("workflows", self.config.get("processes", []))
+            for workflow in workflow_data:
+                workflow_id = workflow.get("id")
+                actions = workflow.get("actions", [])
+                self.workflows[workflow_id] = actions
 
             # Process transitions
             for trans_data in self.config.get("transitions", []):
@@ -463,9 +579,18 @@ class QontinuiExecutor:
                 "version": self.config.get("version", "unknown"),
                 "name": self.config.get("metadata", {}).get("name", "Unnamed"),
                 "states": len(self.states),
-                "processes": len(self.processes),
+                "workflows": len(self.workflows),  # v2.0.0 terminology
+                "processes": len(self.workflows),  # Backward compatibility
                 "transitions": len(self.transitions),
                 "images": len(self.images),
+                "execution_mode": "graph" if self.use_graph_execution else "sequential",
+                "graph_execution_available": QONTINUI_AVAILABLE
+                and self.action_executor is not None,
+                "mock_mode": self.execution_mode.mode.value if self.execution_mode else "real",
+                "is_mock_mode": self.execution_mode.is_mock() if self.execution_mode else False,
+                "is_screenshot_mode": (
+                    self.execution_mode.is_screenshot_mode() if self.execution_mode else False
+                ),
             }
             self._emit_event(EventType.CONFIG_LOADED, config_info)
             return True
@@ -519,7 +644,9 @@ class QontinuiExecutor:
                             best_match_info = self._get_best_match_regardless_of_threshold(image_id)
 
                         # Emit image recognition event
-                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+                        self._emit_image_recognition_event(
+                            image_id, matches, threshold, best_match_info
+                        )
 
                         if matches:
                             # Click on first match
@@ -616,7 +743,9 @@ class QontinuiExecutor:
                         best_match_info = self._get_best_match_regardless_of_threshold(image_id)
 
                     # Emit image recognition event
-                    self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+                    self._emit_image_recognition_event(
+                        image_id, matches, threshold, best_match_info
+                    )
 
                     if matches:
                         self._emit_log("info", f"Found {len(matches)} matches for image {image_id}")
@@ -657,12 +786,15 @@ class QontinuiExecutor:
                     return False
 
             elif action_type == "RUN_PROCESS":
-                process_id = config.get("process")
-                if process_id:
-                    self._emit_log("info", f"RUN_PROCESS - Running sub-process: {process_id}")
-                    return self._execute_process(process_id)
+                # Support both 'process' (v1.0.0) and 'workflow' (v2.0.0) config keys
+                workflow_id = config.get("workflow") or config.get("process")
+                if workflow_id:
+                    self._emit_log("info", f"RUN_PROCESS - Running workflow: {workflow_id}")
+                    return self._execute_workflow(workflow_id)
                 else:
-                    self._emit_log("warning", "No process specified for RUN_PROCESS action")
+                    self._emit_log(
+                        "warning", "No workflow/process specified for RUN_PROCESS action"
+                    )
                     return False
 
             elif action_type == "VANISH":
@@ -682,7 +814,9 @@ class QontinuiExecutor:
                             best_match_info = self._get_best_match_regardless_of_threshold(image_id)
 
                         # Emit image recognition event for each check
-                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+                        self._emit_image_recognition_event(
+                            image_id, matches, threshold, best_match_info
+                        )
 
                         if not matches:
                             self._emit_log("info", f"Image {image_id} has vanished")
@@ -717,7 +851,9 @@ class QontinuiExecutor:
                             best_match_info = self._get_best_match_regardless_of_threshold(image_id)
 
                         # Emit image recognition event for from location
-                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+                        self._emit_image_recognition_event(
+                            image_id, matches, threshold, best_match_info
+                        )
                         if matches:
                             from_loc = matches[0].location
                 elif from_target.get("type") == "coordinates":
@@ -736,7 +872,9 @@ class QontinuiExecutor:
                             best_match_info = self._get_best_match_regardless_of_threshold(image_id)
 
                         # Emit image recognition event for to location
-                        self._emit_image_recognition_event(image_id, matches, threshold, best_match_info)
+                        self._emit_image_recognition_event(
+                            image_id, matches, threshold, best_match_info
+                        )
                         if matches:
                             to_loc = matches[0].location
                 elif to_target.get("type") == "coordinates":
@@ -762,17 +900,67 @@ class QontinuiExecutor:
             self._emit_log("error", f"Action failed: {e}")
             return False
 
-    def _execute_process(self, process_id: str) -> bool:
-        """Execute a process (sequence of actions)."""
-        if process_id not in self.processes:
-            self._emit_log("error", f"Process {process_id} not found")
+    def _execute_workflow(self, workflow_id: str) -> bool:
+        """Execute a workflow using the library's ActionExecutor or manual fallback."""
+
+        if self.use_graph_execution and self.action_executor:
+            try:
+                # Use library's graph executor
+                self._emit_log("info", f"Executing workflow '{workflow_id}' using graph execution")
+                result = self.action_executor.execute_workflow(workflow_id)
+
+                # Emit events based on result
+                if result.get("success"):
+                    self._emit_event(
+                        EventType.WORKFLOW_COMPLETED,
+                        {
+                            "workflow_id": workflow_id,
+                            "success": True,
+                            "actions_executed": result.get("actions_executed", 0),
+                        },
+                    )
+                    self._emit_event(
+                        EventType.PROCESS_COMPLETED, {"process_id": workflow_id, "success": True}
+                    )
+                    return True
+                else:
+                    self._emit_event(
+                        EventType.WORKFLOW_COMPLETED,
+                        {
+                            "workflow_id": workflow_id,
+                            "success": False,
+                            "error": result.get("error"),
+                        },
+                    )
+                    self._emit_event(
+                        EventType.PROCESS_COMPLETED, {"process_id": workflow_id, "success": False}
+                    )
+                    return False
+
+            except Exception as e:
+                self._emit_log("error", f"Graph execution failed: {str(e)}")
+                self._emit_log("info", "Falling back to manual execution")
+                # Fall back to manual execution
+                return self._execute_workflow_manual(workflow_id)
+        else:
+            # No library available or graph execution disabled - use manual execution
+            return self._execute_workflow_manual(workflow_id)
+
+    def _execute_workflow_manual(self, workflow_id: str) -> bool:
+        """Manual workflow execution (legacy/fallback). v2.0.0 terminology."""
+        if workflow_id not in self.workflows:
+            self._emit_log("error", f"Workflow {workflow_id} not found")
             return False
 
+        # Emit both new and old event types for backward compatibility
         self._emit_event(
-            EventType.PROCESS_STARTED, {"process_id": process_id, "process_name": process_id}
+            EventType.WORKFLOW_STARTED, {"workflow_id": workflow_id, "workflow_name": workflow_id}
+        )
+        self._emit_event(
+            EventType.PROCESS_STARTED, {"process_id": workflow_id, "process_name": workflow_id}
         )
 
-        actions = self.processes[process_id]
+        actions = self.workflows[workflow_id]
         success = True
 
         for action in actions:
@@ -786,11 +974,19 @@ class QontinuiExecutor:
             # Small delay between actions
             time.sleep(0.5)
 
+        # Emit both new and old event types for backward compatibility
         self._emit_event(
-            EventType.PROCESS_COMPLETED, {"process_id": process_id, "success": success}
+            EventType.WORKFLOW_COMPLETED, {"workflow_id": workflow_id, "success": success}
+        )
+        self._emit_event(
+            EventType.PROCESS_COMPLETED, {"process_id": workflow_id, "success": success}
         )
 
         return success
+
+    def _execute_process(self, process_id: str) -> bool:
+        """Deprecated: Use _execute_workflow instead. Kept for backward compatibility."""
+        return self._execute_workflow(process_id)
 
     def _run_state_machine(self):
         """Run the state machine execution."""
@@ -810,14 +1006,14 @@ class QontinuiExecutor:
                     ):
                         self._emit_log("info", f"Executing transition: {transition.get('name')}")
 
-                        # Execute processes in transition
-                        for process_id in transition.get("processes", []):
-                            if not self._execute_process(process_id):
-                                self._emit_log("error", f"Process {process_id} failed")
+                        # Execute workflows in transition (processes field kept for backward compatibility)
+                        for workflow_id in transition.get("processes", []):
+                            if not self._execute_workflow(workflow_id):
+                                self._emit_log("error", f"Workflow {workflow_id} failed")
                                 self.is_running = False
                                 break
                         else:
-                            # Only continue if all processes succeeded
+                            # Only continue if all workflows succeeded
                             pass
 
                         if self.is_running:
@@ -850,11 +1046,11 @@ class QontinuiExecutor:
                                         "info",
                                         f"Executing ToTransition: {to_transition.get('name')}",
                                     )
-                                    for process_id in to_transition.get("processes", []):
-                                        if not self._execute_process(process_id):
+                                    for workflow_id in to_transition.get("processes", []):
+                                        if not self._execute_workflow(workflow_id):
                                             self._emit_log(
                                                 "error",
-                                                f"Process {process_id} in ToTransition failed",
+                                                f"Workflow {workflow_id} in ToTransition failed",
                                             )
 
                             # Check if final state
@@ -895,23 +1091,28 @@ class QontinuiExecutor:
         finally:
             self.is_running = False
 
-    def _run_process(self, process_id: str):
-        """Run a specific process directly."""
+    def _run_workflow(self, workflow_id: str):
+        """Run a specific workflow directly. v2.0.0 terminology."""
         try:
-            self._emit_log("info", f"Starting process execution: {process_id}")
+            self._emit_log("info", f"Starting workflow execution: {workflow_id}")
 
-            success = self._execute_process(process_id)
+            success = self._execute_workflow(workflow_id)
 
             self._emit_event(
                 EventType.EXECUTION_COMPLETED,
-                {"success": success, "process_id": process_id, "mode": "process"},
+                {
+                    "success": success,
+                    "workflow_id": workflow_id,
+                    "process_id": workflow_id,
+                    "mode": "workflow",
+                },
             )
 
         except Exception as e:
             self._emit_event(
                 EventType.ERROR,
                 {
-                    "message": "Process execution failed",
+                    "message": "Workflow execution failed",
                     "details": str(e),
                     "traceback": traceback.format_exc(),
                 },
@@ -919,8 +1120,20 @@ class QontinuiExecutor:
         finally:
             self.is_running = False
 
-    def start_execution(self, mode: str = "state_machine", process_id: str = None) -> bool:
-        """Start automation execution."""
+    def _run_process(self, process_id: str):
+        """Deprecated: Use _run_workflow instead. Kept for backward compatibility."""
+        self._run_workflow(process_id)
+
+    def start_execution(
+        self, mode: str = "state_machine", process_id: str = None, workflow_id: str = None
+    ) -> bool:
+        """Start automation execution.
+
+        Args:
+            mode: Execution mode - 'state_machine', 'workflow', or 'process' (deprecated)
+            process_id: Process ID for backward compatibility (deprecated, use workflow_id)
+            workflow_id: Workflow ID for v2.0.0 format
+        """
         if not self.config:
             self._emit_event(EventType.ERROR, {"message": "No configuration loaded"})
             return False
@@ -947,12 +1160,14 @@ class QontinuiExecutor:
                 execution_thread = threading.Thread(target=self._run_state_machine)
                 execution_thread.daemon = True
                 execution_thread.start()
-            elif mode == "process":
-                # Run a specific process directly
-                if not process_id:
-                    self._emit_log("error", "Process ID required for process mode")
+            elif mode in ("workflow", "process"):
+                # Support both 'workflow' (v2.0.0) and 'process' (v1.0.0) modes
+                # workflow_id takes precedence over process_id
+                target_id = workflow_id or process_id
+                if not target_id:
+                    self._emit_log("error", "Workflow ID required for workflow/process mode")
                     return False
-                execution_thread = threading.Thread(target=self._run_process, args=(process_id,))
+                execution_thread = threading.Thread(target=self._run_workflow, args=(target_id,))
                 execution_thread.daemon = True
                 execution_thread.start()
             else:
@@ -994,8 +1209,10 @@ class QontinuiExecutor:
 
         elif cmd_type == "start":
             mode = params.get("mode", "state_machine")
+            # Support both workflow_id (v2.0.0) and process_id (v1.0.0)
+            workflow_id = params.get("workflow_id")
             process_id = params.get("process_id")
-            success = self.start_execution(mode, process_id)
+            success = self.start_execution(mode, process_id=process_id, workflow_id=workflow_id)
             return {"success": success}
 
         elif cmd_type == "stop":
@@ -1010,8 +1227,101 @@ class QontinuiExecutor:
                 "library_available": QONTINUI_AVAILABLE,
             }
 
+        elif cmd_type == "start_recording":
+            return self._handle_start_recording(params)
+
+        elif cmd_type == "stop_recording":
+            return self._handle_stop_recording()
+
+        elif cmd_type == "recording_status":
+            return self._handle_recording_status()
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
+
+    def _handle_start_recording(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle start_recording command.
+
+        Args:
+            params: Command parameters containing 'base_dir'
+
+        Returns:
+            Response with success status and snapshot directory
+        """
+        if not QONTINUI_AVAILABLE or not self.controller:
+            return {"success": False, "error": "Qontinui library or controller not available"}
+
+        try:
+            base_dir = params.get("base_dir", "/tmp/qontinui-snapshots")
+
+            # Start recording
+            snapshot_dir = self.controller.start_recording(base_dir)
+
+            # Emit event
+            self._emit_event(
+                EventType.RECORDING_STARTED,
+                {"snapshot_directory": snapshot_dir, "base_directory": base_dir},
+            )
+
+            self._emit_log("info", f"Recording started: {snapshot_dir}")
+
+            return {"success": True, "snapshot_directory": snapshot_dir}
+
+        except Exception as e:
+            error_msg = f"Failed to start recording: {str(e)}"
+            self._emit_log("error", error_msg)
+            return {"success": False, "error": error_msg}
+
+    def _handle_stop_recording(self) -> dict[str, Any]:
+        """Handle stop_recording command.
+
+        Returns:
+            Response with success status and snapshot directory
+        """
+        if not QONTINUI_AVAILABLE or not self.controller:
+            return {"success": False, "error": "Qontinui library or controller not available"}
+
+        try:
+            # Stop recording
+            snapshot_dir = self.controller.stop_recording()
+
+            if snapshot_dir:
+                # Get final statistics
+                stats = {"snapshot_directory": snapshot_dir}
+
+                # Emit event
+                self._emit_event(EventType.RECORDING_STOPPED, stats)
+
+                self._emit_log("info", f"Recording stopped: {snapshot_dir}")
+
+                return {"success": True, "snapshot_directory": snapshot_dir}
+            else:
+                return {"success": False, "error": "No recording in progress"}
+
+        except Exception as e:
+            error_msg = f"Failed to stop recording: {str(e)}"
+            self._emit_log("error", error_msg)
+            return {"success": False, "error": error_msg}
+
+    def _handle_recording_status(self) -> dict[str, Any]:
+        """Handle recording_status command.
+
+        Returns:
+            Response with recording status and statistics
+        """
+        if not QONTINUI_AVAILABLE or not self.controller:
+            return {"success": False, "error": "Qontinui library or controller not available"}
+
+        try:
+            is_recording = self.controller.is_recording()
+            stats = self.controller.get_recording_stats() if is_recording else None
+
+            return {"success": True, "is_recording": is_recording, "statistics": stats}
+
+        except Exception as e:
+            error_msg = f"Failed to get recording status: {str(e)}"
+            self._emit_log("error", error_msg)
+            return {"success": False, "error": error_msg}
 
     def __del__(self):
         """Clean up temp directory on exit."""

@@ -47,6 +47,17 @@ impl ConfigLoader {
         // Validate the configuration
         config.validate().map_err(|errors| errors.join(", "))?;
 
+        // Log execution mode configuration
+        eprintln!(
+            "DEBUG: Execution mode: {} (mock: {}, screenshot: {})",
+            config.get_execution_mode().as_str(),
+            config.is_mock_mode(),
+            config.is_screenshot_mode()
+        );
+        if let Some(screenshot_dir) = config.get_screenshot_directory() {
+            eprintln!("DEBUG: Screenshot directory: {}", screenshot_dir);
+        }
+
         Ok(config)
     }
 }

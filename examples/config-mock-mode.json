@@ -1,0 +1,66 @@
+{
+  "version": "2.0.0",
+  "metadata": {
+    "name": "Mock Mode Example",
+    "description": "Example configuration using mock implementations for fast testing",
+    "author": "Example User"
+  },
+  "images": [],
+  "workflows": [
+    {
+      "id": "workflow-test",
+      "name": "Test Workflow",
+      "actions": [
+        {
+          "id": "action-1",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "coordinates",
+              "x": 100,
+              "y": 200
+            }
+          }
+        },
+        {
+          "id": "action-2",
+          "type": "WAIT",
+          "config": {
+            "duration": 5000
+          }
+        },
+        {
+          "id": "action-3",
+          "type": "TYPE",
+          "config": {
+            "text": "Testing in mock mode - instant waits!"
+          }
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-test",
+      "name": "Test State",
+      "isInitial": true,
+      "identifyingImages": []
+    }
+  ],
+  "transitions": [],
+  "categories": [],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 10000,
+      "executionMode": "mock",
+      "screenshotDirectory": null,
+      "useGraphExecution": false
+    },
+    "recognition": {
+      "defaultThreshold": 0.9
+    },
+    "logging": {
+      "level": "debug"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "version": "2.0.0",
+  "metadata": {
+    "name": "Real Mode Example",
+    "description": "Example configuration using real screen capture and input",
+    "author": "Example User"
+  },
+  "images": [],
+  "workflows": [
+    {
+      "id": "workflow-example",
+      "name": "Example Workflow",
+      "actions": [
+        {
+          "id": "action-1",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "coordinates",
+              "x": 500,
+              "y": 300
+            }
+          }
+        },
+        {
+          "id": "action-2",
+          "type": "TYPE",
+          "config": {
+            "text": "Hello World"
+          }
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-1",
+      "name": "Start",
+      "isInitial": true,
+      "identifyingImages": []
+    }
+  ],
+  "transitions": [],
+  "categories": [],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 10000,
+      "executionMode": "real",
+      "screenshotDirectory": null
+    },
+    "recognition": {
+      "defaultThreshold": 0.9
+    },
+    "logging": {
+      "level": "info"
+    }
+  }
+}
