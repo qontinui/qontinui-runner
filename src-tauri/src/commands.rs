@@ -35,7 +35,7 @@ pub fn load_configuration(path: String, state: State<AppState>) -> Result<Comman
 
     // Create data object with configuration info
     let config_data = serde_json::json!({
-        "processes": config.processes.clone(),
+        "workflows": config.workflows.clone(),
         "states": config.states.clone(),
         "transitions": config.transitions.clone(),
         "images": config.images.clone()

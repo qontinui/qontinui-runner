@@ -83,7 +83,7 @@ pub struct QontinuiConfig {
     pub version: String,
     pub metadata: ConfigMetadata,
     pub images: Vec<Value>,
-    pub processes: Vec<Value>,
+    pub workflows: Vec<Value>,
     pub states: Vec<Value>,
     pub transitions: Vec<Value>,
     pub categories: Vec<String>,
@@ -118,11 +118,11 @@ impl QontinuiConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "Configuration: {} (v{})\nStates: {}, Processes: {}, Transitions: {}, Images: {}, Categories: {}",
+            "Configuration: {} (v{})\nStates: {}, Workflows: {}, Transitions: {}, Images: {}, Categories: {}",
             self.metadata.name,
             self.version,
             self.states.len(),
-            self.processes.len(),
+            self.workflows.len(),
             self.transitions.len(),
             self.images.len(),
             self.categories.len()
