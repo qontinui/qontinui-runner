@@ -61,9 +61,12 @@ impl PythonBridge {
         }
 
         // Use minimal_bridge.py for testing when executor_type is "minimal"
+        // Use qontinui_executor.py for "real" mode (has recording support)
         // Otherwise use qontinui_bridge.py which handles both real and mock modes
         let script_name = if executor_type == "minimal" {
             "minimal_bridge.py"
+        } else if executor_type == "real" {
+            "qontinui_executor.py"
         } else {
             "qontinui_bridge.py"
         };
@@ -120,16 +123,19 @@ impl PythonBridge {
 
         // Start the Python process with appropriate mode
         // Try to use venv Python first, fall back to system Python
-        let venv_python = bridge_script.parent()
-            .and_then(|p| {
-                let venv_path = p.join("venv/Scripts/python.exe");
-                eprintln!("Checking venv path: {:?}, exists: {}", venv_path, venv_path.exists());
-                if venv_path.exists() {
-                    Some(venv_path)
-                } else {
-                    None
-                }
-            });
+        let venv_python = bridge_script.parent().and_then(|p| {
+            let venv_path = p.join("venv/Scripts/python.exe");
+            eprintln!(
+                "Checking venv path: {:?}, exists: {}",
+                venv_path,
+                venv_path.exists()
+            );
+            if venv_path.exists() {
+                Some(venv_path)
+            } else {
+                None
+            }
+        });
 
         let python_cmd = if let Some(venv_path) = venv_python {
             eprintln!("Using venv Python: {:?}", venv_path);
@@ -294,6 +300,23 @@ impl PythonBridge {
 
     pub fn get_status(&mut self) -> Result<(), String> {
         self.send_command("status", None)
+    }
+
+    pub fn start_recording(&mut self, base_dir: &str) -> Result<(), String> {
+        self.send_command(
+            "start_recording",
+            Some(json!({
+                "base_dir": base_dir
+            })),
+        )
+    }
+
+    pub fn stop_recording(&mut self) -> Result<(), String> {
+        self.send_command("stop_recording", None)
+    }
+
+    pub fn get_recording_status(&mut self) -> Result<(), String> {
+        self.send_command("recording_status", None)
     }
 
     pub fn is_running(&self) -> bool {

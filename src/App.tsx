@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import StatusIndicator from "./components/StatusIndicator";
 import CollapsiblePanel from "./components/CollapsiblePanel";
+import RecordingControl from "./components/RecordingControl";
 import "./index.css";
 
 interface LogEntry {
@@ -559,7 +560,8 @@ Confidence: ${(entry.confidence * 100).toFixed(1)}%`;
 
           if (entry.location) details += `\nLocation: ${entry.location}`;
           if (entry.gap !== undefined) details += `\nGap: ${entry.gap.toFixed(3)}`;
-          if (entry.percentOff !== undefined) details += `\nPercent Off: ${entry.percentOff.toFixed(1)}%`;
+          if (entry.percentOff !== undefined)
+            details += `\nPercent Off: ${entry.percentOff.toFixed(1)}%`;
           if (entry.bestMatchLocation) details += `\nBest Match: ${entry.bestMatchLocation}`;
           if (entry.error) details += `\nError: ${entry.error}`;
 
@@ -614,7 +616,7 @@ Attempts: ${entry.attempts}`;
         const stateImages = state.stateImages || [];
         for (const stateImage of stateImages) {
           if (stateImage.id === imageId) {
-            console.log(`StateImage lookup: ${imageId} -> ${stateImage.name || 'unnamed'}`);
+            console.log(`StateImage lookup: ${imageId} -> ${stateImage.name || "unnamed"}`);
             return stateImage.name || imageId;
           }
         }
@@ -629,7 +631,10 @@ Attempts: ${entry.attempts}`;
     if (!obj) return obj;
 
     const replaced = JSON.parse(JSON.stringify(obj)); // Deep clone
-    console.log("replaceImageIdsWithNames called for:", replaced.image || replaced.imageId || "no image");
+    console.log(
+      "replaceImageIdsWithNames called for:",
+      replaced.image || replaced.imageId || "no image",
+    );
 
     // Replace image IDs with names in common config fields
     if (replaced.image) {
@@ -760,7 +765,7 @@ Attempts: ${entry.attempts}`;
         </div>
 
         {/* Control Panel */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
           {/* Configuration Card */}
           <CollapsiblePanel
             title="Configuration"
@@ -945,6 +950,13 @@ Attempts: ${entry.attempts}`;
               </button>
             </div>
           </CollapsiblePanel>
+
+          {/* Recording Control */}
+          <RecordingControl
+            pythonStatus={pythonStatus}
+            configLoaded={configLoaded}
+            onLog={addLog}
+          />
         </div>
 
         {/* Log Viewer */}
@@ -1148,20 +1160,53 @@ Attempts: ${entry.attempts}`;
                       </div>
                       <div className="text-xs">
                         <span className="text-muted-foreground">Confidence: </span>
-                        <span className={entry.confidence >= entry.threshold ? "text-green-400" : "text-red-400"}>
+                        <span
+                          className={
+                            entry.confidence >= entry.threshold ? "text-green-400" : "text-red-400"
+                          }
+                        >
                           {(entry.confidence * 100).toFixed(1)}%
                         </span>
                       </div>
                     </div>
                     <div className="grid grid-cols-2 gap-2 text-xs">
-                      <div><span className="text-muted-foreground">Image:</span> {entry.imagePath}</div>
-                      <div><span className="text-muted-foreground">Threshold:</span> {(entry.threshold * 100).toFixed(1)}%</div>
-                      <div><span className="text-muted-foreground">Template:</span> {entry.templateSize}</div>
-                      <div><span className="text-muted-foreground">Screenshot:</span> {entry.screenshotSize}</div>
-                      {entry.location && <div><span className="text-muted-foreground">Location:</span> {entry.location}</div>}
-                      {entry.gap !== undefined && <div><span className="text-muted-foreground">Gap:</span> {entry.gap.toFixed(3)}</div>}
-                      {entry.percentOff !== undefined && <div><span className="text-muted-foreground">Percent Off:</span> {entry.percentOff.toFixed(1)}%</div>}
-                      {entry.bestMatchLocation && <div><span className="text-muted-foreground">Best Match:</span> {entry.bestMatchLocation}</div>}
+                      <div>
+                        <span className="text-muted-foreground">Image:</span> {entry.imagePath}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Threshold:</span>{" "}
+                        {(entry.threshold * 100).toFixed(1)}%
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Template:</span>{" "}
+                        {entry.templateSize}
+                      </div>
+                      <div>
+                        <span className="text-muted-foreground">Screenshot:</span>{" "}
+                        {entry.screenshotSize}
+                      </div>
+                      {entry.location && (
+                        <div>
+                          <span className="text-muted-foreground">Location:</span> {entry.location}
+                        </div>
+                      )}
+                      {entry.gap !== undefined && (
+                        <div>
+                          <span className="text-muted-foreground">Gap:</span> {entry.gap.toFixed(3)}
+                        </div>
+                      )}
+                      {entry.percentOff !== undefined && (
+                        <div>
+                          <span className="text-muted-foreground">Percent Off:</span>{" "}
+                          {entry.percentOff.toFixed(1)}%
+                        </div>
+                      )}
+                      {entry.bestMatchLocation && (
+                        <div>
+                          <span className="text-muted-foreground">Best Match:</span>{" "}
+                          {entry.bestMatchLocation}
+                        </div>
+                      )}
                     </div>
                     {entry.error && (
                       <div className="mt-2 text-xs text-red-400">
@@ -1194,25 +1239,32 @@ Attempts: ${entry.attempts}`;
                             ✗ FAILED
                           </span>
                         )}
-                        <span className={`font-bold text-sm ${entry.success ? "text-green-400" : "text-red-400"}`}>
+                        <span
+                          className={`font-bold text-sm ${entry.success ? "text-green-400" : "text-red-400"}`}
+                        >
                           {entry.actionType}
                         </span>
                       </div>
-                      <span className="text-xs text-muted-foreground">Attempts: {entry.attempts}</span>
+                      <span className="text-xs text-muted-foreground">
+                        Attempts: {entry.attempts}
+                      </span>
                     </div>
                     {entry.typedText && (
                       <div className="mt-2 text-xs text-blue-400 font-semibold">
-                        <span>Typed:</span> <span className="text-blue-300">"{entry.typedText}"</span>
+                        <span>Typed:</span>{" "}
+                        <span className="text-blue-300">"{entry.typedText}"</span>
                       </div>
                     )}
                     {entry.actionType === "TYPE" && !entry.typedText && entry.success && (
                       <div className="mt-2 text-xs text-yellow-400">
-                        <span className="font-semibold">Warning:</span> TYPE succeeded but no text was recorded
+                        <span className="font-semibold">Warning:</span> TYPE succeeded but no text
+                        was recorded
                       </div>
                     )}
                     {entry.config && (
                       <div className="mt-2 text-xs text-muted-foreground">
-                        <span className="font-semibold">Config:</span> {JSON.stringify(replaceImageIdsWithNames(entry.config))}
+                        <span className="font-semibold">Config:</span>{" "}
+                        {JSON.stringify(replaceImageIdsWithNames(entry.config))}
                       </div>
                     )}
                     {entry.error && (

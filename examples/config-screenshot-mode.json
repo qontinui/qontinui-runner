@@ -1,0 +1,71 @@
+{
+  "version": "2.0.0",
+  "metadata": {
+    "name": "Screenshot Mode Example",
+    "description": "Example configuration using cached screenshots for deterministic playback",
+    "author": "Example User"
+  },
+  "images": [
+    {
+      "id": "img-button",
+      "name": "submit_button.png",
+      "data": ""
+    }
+  ],
+  "workflows": [
+    {
+      "id": "workflow-playback",
+      "name": "Playback Workflow",
+      "actions": [
+        {
+          "id": "action-1",
+          "type": "FIND",
+          "config": {
+            "imageId": "img-button",
+            "similarity": 0.9
+          }
+        },
+        {
+          "id": "action-2",
+          "type": "CLICK",
+          "config": {
+            "target": {
+              "type": "image",
+              "imageId": "img-button"
+            }
+          }
+        },
+        {
+          "id": "action-3",
+          "type": "WAIT",
+          "config": {
+            "duration": 2000
+          }
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-playback",
+      "name": "Playback State",
+      "isInitial": true,
+      "identifyingImages": ["img-button"]
+    }
+  ],
+  "transitions": [],
+  "categories": [],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 10000,
+      "executionMode": "screenshot",
+      "screenshotDirectory": "/tmp/qontinui-snapshots/example-run-1"
+    },
+    "recognition": {
+      "defaultThreshold": 0.9
+    },
+    "logging": {
+      "level": "info"
+    }
+  }
+}

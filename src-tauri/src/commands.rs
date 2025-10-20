@@ -2,6 +2,7 @@ use crate::config::{ConfigLoader, QontinuiConfig};
 use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
 use serde::{Deserialize, Serialize};
+use std::process::Command;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{error, info, warn};
@@ -337,4 +338,132 @@ pub async fn check_for_updates(
             })),
         })
     }
+}
+
+#[tauri::command]
+pub fn start_recording(
+    base_dir: String,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Starting recording with base_dir: {}", base_dir);
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        bridge
+            .start_recording(&base_dir)
+            .map_err(|e| format!("Failed to start recording: {}", e))?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Recording start command sent".to_string()),
+            data: Some(serde_json::json!({
+                "base_dir": base_dir
+            })),
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn stop_recording(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Stopping recording");
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        bridge
+            .stop_recording()
+            .map_err(|e| format!("Failed to stop recording: {}", e))?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Recording stop command sent".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn get_recording_status(state: State<AppState>) -> Result<CommandResponse, String> {
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Ok(CommandResponse {
+                success: true,
+                message: None,
+                data: Some(serde_json::json!({
+                    "is_recording": false,
+                })),
+            });
+        }
+
+        bridge
+            .get_recording_status()
+            .map_err(|e| format!("Failed to get recording status: {}", e))?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Recording status command sent".to_string()),
+            data: None,
+        })
+    } else {
+        Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::json!({
+                "is_recording": false,
+            })),
+        })
+    }
+}
+
+#[tauri::command]
+pub fn open_folder(path: String) -> Result<CommandResponse, String> {
+    info!("Opening folder: {}", path);
+
+    // Check if path exists
+    if !std::path::Path::new(&path).exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open folder: {}", e))?;
+    }
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Opened folder: {}", path)),
+        data: None,
+    })
 }

@@ -78,6 +78,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::get_monitors,
             commands::handle_error,
             commands::check_for_updates,
+            commands::start_recording,
+            commands::stop_recording,
+            commands::get_recording_status,
+            commands::open_folder,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

@@ -158,7 +158,11 @@
       "defaultRetryCount": 3,
       "actionDelay": 100,
       "failureStrategy": "stop",
-      "headless": false
+      "headless": false,
+      "executionMode": "real",
+      "screenshotDirectory": null,
+      "recordingEnabled": false,
+      "recordingBaseDir": "/tmp/qontinui-snapshots"
     },
     "recognition": {
       "defaultThreshold": 0.9,

@@ -17,6 +17,7 @@ from typing import Any
 # Import Qontinui library - REQUIRED (no fallback)
 from qontinui.json_executor.json_runner import JSONRunner
 from qontinui.mock import MockModeManager
+from qontinui.runner import DSLParser, ExecutionError, StatementExecutor
 
 
 class EventType(Enum):
@@ -42,6 +43,10 @@ class EventType(Enum):
     SCHEDULE_EXECUTION_STARTED = "schedule_execution_started"
     SCHEDULE_EXECUTION_COMPLETED = "schedule_execution_completed"
     STATE_CHECK_PERFORMED = "state_check_performed"
+    # DSL events
+    DSL_IF_BRANCH = "dsl_if_branch"
+    DSL_LOOP_ITERATION = "dsl_loop_iteration"
+    DSL_EXECUTION_ERROR = "dsl_execution_error"
 
 
 class QontinuiBridge:
@@ -57,6 +62,8 @@ class QontinuiBridge:
         self._is_running = False
         self._temp_config_file = None
         self._scheduler_running = False
+        self._dsl_parser = DSLParser()
+        self._dsl_executor = None
         self._setup_callbacks()
 
         mode_str = "mock/simulation" if mock_mode else "real"
@@ -129,6 +136,8 @@ class QontinuiBridge:
                 return self._handle_scheduler_status()
             elif cmd_type == "scheduler_get_statistics":
                 return self._handle_scheduler_get_statistics()
+            elif cmd_type == "execute_dsl":
+                return self._handle_execute_dsl(params)
             else:
                 return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -395,6 +404,122 @@ class QontinuiBridge:
             }
         except Exception:
             raise
+
+    def _handle_execute_dsl(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle DSL execution request.
+
+        Executes DSL instruction sets with control flow support.
+
+        Args:
+            params: Dictionary with:
+                - dsl_json: JSON string with DSL instruction set
+
+        Returns:
+            Execution result with success status and return value
+        """
+        try:
+            dsl_json = params.get("dsl_json")
+            if not dsl_json:
+                return {"success": False, "error": "No DSL JSON provided"}
+
+            self._emit_log("info", "Parsing DSL instruction set")
+
+            # Parse DSL JSON
+            instruction_set = self._dsl_parser.parse_json(dsl_json)
+
+            if not instruction_set.automation_functions:
+                return {"success": False, "error": "No automation functions in DSL"}
+
+            # Initialize DSL executor with action executor bridge
+            # For now, we'll create a simple action executor that can call Qontinui actions
+            from .dsl_action_executor import DSLActionExecutor
+
+            action_executor = DSLActionExecutor(self.runner)
+            self._dsl_executor = StatementExecutor(action_executor=action_executor)
+
+            # Execute each automation function
+            results = []
+            for func in instruction_set.automation_functions:
+                try:
+                    self._emit_log("info", f"Executing automation function: {func.name}")
+
+                    # Execute function statements
+                    return_value = None
+                    try:
+                        for statement in func.statements:
+                            # Execute statement using the executor's execute method
+                            self._dsl_executor.execute(statement)
+
+                    except Exception as e:
+                        from qontinui.runner.dsl.executor.flow_control import ReturnException
+
+                        if isinstance(e, ReturnException):
+                            return_value = e.value
+                        else:
+                            raise
+
+                    results.append(
+                        {
+                            "function": func.name,
+                            "success": True,
+                            "return_value": return_value,
+                        }
+                    )
+
+                except ExecutionError as e:
+                    self._emit_event(
+                        EventType.DSL_EXECUTION_ERROR,
+                        {
+                            "function": func.name,
+                            "error": str(e),
+                            "statement_type": e.statement_type,
+                            "context": e.context,
+                        },
+                    )
+                    results.append(
+                        {
+                            "function": func.name,
+                            "success": False,
+                            "error": str(e),
+                        }
+                    )
+                except Exception as e:
+                    self._emit_event(
+                        EventType.DSL_EXECUTION_ERROR,
+                        {
+                            "function": func.name,
+                            "error": str(e),
+                        },
+                    )
+                    results.append(
+                        {
+                            "function": func.name,
+                            "success": False,
+                            "error": str(e),
+                        }
+                    )
+
+            overall_success = all(r["success"] for r in results)
+            return {
+                "success": overall_success,
+                "results": results,
+            }
+
+        except Exception as e:
+            error_msg = f"DSL execution failed: {str(e)}"
+            self._emit_log("error", error_msg)
+            self._emit_event(
+                EventType.DSL_EXECUTION_ERROR,
+                {
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+            return {
+                "success": False,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }
 
 
 def main():
