@@ -159,11 +159,11 @@ pub fn start_execution(
             serde_json::json!(monitor_index.unwrap_or(0)),
         );
 
-        // Add process_id (required)
+        // Add workflow_id (required)
         if let Some(pid) = process_id {
-            params.insert("process_id".to_string(), serde_json::json!(pid));
+            params.insert("workflow_id".to_string(), serde_json::json!(pid));
         } else {
-            return Err("Process ID is required".to_string());
+            return Err("Workflow ID is required".to_string());
         }
 
         bridge
