@@ -15,21 +15,42 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-# Add parent directory to path to import qontinui
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+# Add qontinui library src directory to path
+# This file is in: qontinui_parent/qontinui-runner/python-bridge/qontinui_executor.py
+# We need to add: qontinui_parent/qontinui/src
+qontinui_src_path = Path(__file__).parent.parent.parent / "qontinui" / "src"
+sys.path.insert(0, str(qontinui_src_path))
+
+# Debug: Print the resolved path
+print(json.dumps({
+    "type": "event",
+    "event": "log",
+    "timestamp": time.time(),
+    "sequence": 0,
+    "data": {
+        "level": "debug",
+        "message": f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
+    }
+}), flush=True)
 
 try:
-    from qontinui import Find, FluentActions, Image, Location, QontinuiStateManager, State
-    from qontinui.config.execution_mode import ExecutionModeConfig, MockMode, set_execution_mode
-    from qontinui.json_executor.action_executor import ActionExecutor
-    from qontinui.json_executor.config_parser import ConfigParser
-    from qontinui.model.element import Position
-    from qontinui.model.state import StateLocation
-    from qontinui.wrappers import get_controller
+    from qontinui import Find, FluentActions, Image, Location
+    from qontinui.config import get_settings, enable_mock_mode, disable_mock_mode
+    from qontinui import navigation_api, registry
+    # json_executor and wrappers.get_controller don't exist - commented out
+    # from qontinui.json_executor.action_executor import ActionExecutor
+    # from qontinui.json_executor.config_parser import ConfigParser
+    # from qontinui.wrappers import get_controller
 
     QONTINUI_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     QONTINUI_AVAILABLE = False
+    import_error_details = f"{type(e).__name__}: {str(e)}"
+
+    # Get full traceback for debugging
+    import traceback
+    full_traceback = traceback.format_exc()
+
     print(
         json.dumps(
             {
@@ -39,7 +60,10 @@ except ImportError:
                 "sequence": 0,
                 "data": {
                     "message": "Qontinui library not available. Please install qontinui package.",
-                    "details": "Run: pip install -e /home/jspinak/qontinui_parent_directory/qontinui",
+                    "details": import_error_details,
+                    "qontinui_path": str(qontinui_src_path),
+                    "path_exists": qontinui_src_path.exists(),
+                    "full_traceback": full_traceback,
                 },
             }
         ),
@@ -56,10 +80,8 @@ class EventType(Enum):
     STATE_CHANGED = "state_changed"
     ACTION_STARTED = "action_started"
     ACTION_COMPLETED = "action_completed"
-    WORKFLOW_STARTED = "workflow_started"  # v2.0.0 terminology
-    WORKFLOW_COMPLETED = "workflow_completed"  # v2.0.0 terminology
-    PROCESS_STARTED = "process_started"  # Deprecated: use WORKFLOW_STARTED
-    PROCESS_COMPLETED = "process_completed"  # Deprecated: use WORKFLOW_COMPLETED
+    WORKFLOW_STARTED = "workflow_started"
+    WORKFLOW_COMPLETED = "workflow_completed"
     EXECUTION_COMPLETED = "execution_completed"
     ERROR = "error"
     LOG = "log"
@@ -76,25 +98,20 @@ class QontinuiExecutor:
 
     def __init__(self):
         self.config = None
-        self.state_manager = None
-        self.states = {}
-        self.transitions = {}
-        self.workflows = {}  # v2.0.0: renamed from processes
-        self.processes = self.workflows  # Backward compatibility alias
+        self.workflows = {}
         self.images = {}
-        self.current_state = None
         self.is_running = False
         self._sequence = 0
         self.temp_dir = None
         self.use_graph_execution = False
         self.qontinui_config = None
-        self.action_executor = None
-        self.execution_mode = None  # ExecutionModeConfig instance
-        self.controller = None  # ExecutionModeController instance
+        self.mock_mode = "real"  # Track mock mode: "real", "mock", "screenshot"
+        self.screenshot_dir = None  # Screenshot directory for screenshot mode
+        self.settings = None  # FrameworkSettings instance
 
         if QONTINUI_AVAILABLE:
-            self.state_manager = QontinuiStateManager()
             self.actions = FluentActions()
+            self.settings = get_settings()
 
         self._emit_event(
             EventType.READY,
@@ -357,7 +374,7 @@ class QontinuiExecutor:
             # Create temp directory for images
             self.temp_dir = tempfile.mkdtemp(prefix="qontinui_")
 
-            # Process images - save to temp files
+            # Process images - save to temp files and register in library
             for img_data in self.config.get("images", []):
                 img_id = img_data.get("id")
                 img_base64 = img_data.get("data", "")
@@ -372,225 +389,99 @@ class QontinuiExecutor:
 
                     # Create Qontinui Image object if library is available
                     if QONTINUI_AVAILABLE:
-                        self.images[img_id] = Image(img_path)
+                        image_obj = Image(img_path)
+                        self.images[img_id] = image_obj
+                        # Register image in library's registry for state/transition loading
+                        registry.register_image(img_id, image_obj)
+                        self._emit_log("debug", f"Loaded and registered image: {img_id} -> {img_path}")
                     else:
                         # Store path for testing purposes
                         self.images[img_id] = {"path": img_path}
-                    self._emit_log("debug", f"Loaded image: {img_id} -> {img_path}")
+                        self._emit_log("debug", f"Loaded image: {img_id} -> {img_path}")
                 except Exception as e:
                     self._emit_log("error", f"Failed to load image {img_id}: {e}")
 
-            # Process states (only if Qontinui is available)
-            if QONTINUI_AVAILABLE:
-                for state_data in self.config.get("states", []):
-                    state_id = state_data.get("id")
-                    state = State(
-                        name=state_data.get("name", state_id),
-                        description=state_data.get("description", ""),
-                    )
-
-                    # Add identifying images to state
-                    for img_info in state_data.get("identifyingImages", []):
-                        # Handle both string IDs and object format
-                        if isinstance(img_info, str):
-                            img_id = img_info
-                        else:
-                            img_id = img_info.get("image") or img_info.get("imageId")
-
-                        if img_id and img_id in self.images:
-                            state.add_image(self.images[img_id])
-
-                    # Process StateLocations for this state
-                    for loc_data in state_data.get("locations", []):
-                        try:
-                            # Create base Location object
-                            location = Location(
-                                x=loc_data.get("x", 0),
-                                y=loc_data.get("y", 0),
-                                name=loc_data.get("name"),
-                                offset_x=loc_data.get("offsetX", 0),
-                                offset_y=loc_data.get("offsetY", 0),
-                                fixed=loc_data.get("fixed", True),
-                            )
-
-                            # Handle reference image for relative positioning
-                            ref_img_id = loc_data.get("referenceImageId")
-                            if ref_img_id and ref_img_id in self.images:
-                                location.reference_image_id = ref_img_id
-
-                                # Handle position within the image
-                                pos_data = loc_data.get("position")
-                                if pos_data:
-                                    # Create Position object with percentages
-                                    position = Position(
-                                        percent_w=pos_data.get("percentW", 0.5),
-                                        percent_h=pos_data.get("percentH", 0.5),
-                                    )
-                                    location.position = position
-                                else:
-                                    # Default to center if no position specified
-                                    location.position = Position(percent_w=0.5, percent_h=0.5)
-
-                            # Create StateLocation wrapper
-                            state_location = StateLocation(
-                                location=location, name=loc_data.get("name"), owner_state=state
-                            )
-
-                            # Set StateLocation flags
-                            if loc_data.get("anchor"):
-                                state_location.set_anchor(True)
-                            if loc_data.get("fixed"):
-                                state_location.set_fixed(True)
-
-                            # Add to state
-                            state.add_location(state_location)
-                            self._emit_log(
-                                "debug",
-                                f"Added location '{loc_data.get('name')}' to state '{state.name}'",
-                            )
-                        except Exception as e:
-                            self._emit_log("error", f"Failed to create location: {e}")
-
-                    self.states[state_id] = state
-                    self.state_manager.add_state(state)
-
-                    # Set initial state
-                    if state_data.get("isInitial"):
-                        self.current_state = state_id
-                        self.state_manager.set_current_state(state)
-            else:
-                # If Qontinui not available, just count states for testing
-                for state_data in self.config.get("states", []):
-                    state_id = state_data.get("id")
-                    self.states[state_id] = {"name": state_data.get("name", state_id)}
-                    if state_data.get("isInitial"):
-                        self.current_state = state_id
+            # Note: State management is handled by the Qontinui library internally
+            # The runner does not need to create or manage states
 
             # Load execution mode configuration (REAL, MOCK, or SCREENSHOT)
             execution_settings = self.config.get("settings", {}).get("execution", {})
-            exec_mode_str = execution_settings.get("executionMode", "real").upper()
+            exec_mode_str = execution_settings.get("executionMode", "real").lower()
             screenshot_dir = execution_settings.get("screenshotDirectory")
 
-            # Parse execution mode from config
+            # Parse execution mode from config and update FrameworkSettings
             if QONTINUI_AVAILABLE:
                 try:
-                    # Map string to MockMode enum
-                    if exec_mode_str == "REAL":
-                        mode = MockMode.REAL
-                    elif exec_mode_str == "MOCK":
-                        mode = MockMode.MOCK
-                    elif exec_mode_str == "SCREENSHOT":
-                        mode = MockMode.SCREENSHOT
-                    else:
-                        self._emit_log(
-                            "warning",
-                            f"Unknown execution mode '{exec_mode_str}', defaulting to REAL",
-                        )
-                        mode = MockMode.REAL
+                    # Store mode and screenshot dir
+                    self.mock_mode = exec_mode_str
+                    self.screenshot_dir = screenshot_dir
 
-                    # Create ExecutionModeConfig
-                    self.execution_mode = ExecutionModeConfig(
-                        mode=mode, screenshot_dir=screenshot_dir
-                    )
-
-                    # Set global execution mode
-                    set_execution_mode(self.execution_mode)
-
-                    # Get controller instance
-                    self.controller = get_controller()
-
-                    self._emit_log(
-                        "info", f"Execution mode set to: {self.execution_mode.mode.value}"
-                    )
-                    if self.execution_mode.is_screenshot_mode():
-                        self._emit_log(
-                            "info", f"Screenshot directory: {self.execution_mode.screenshot_dir}"
-                        )
+                    # Update FrameworkSettings based on mode
+                    if exec_mode_str == "mock":
+                        enable_mock_mode()
+                        self._emit_log("info", "Mock mode enabled via FrameworkSettings")
+                    elif exec_mode_str == "screenshot":
+                        # Screenshot mode: enable mock and set screenshot path
+                        enable_mock_mode()
+                        if screenshot_dir and self.settings:
+                            self.settings.screenshot_path = screenshot_dir
+                            self.settings.save_snapshots = True
+                        self._emit_log("info", f"Screenshot mode enabled, directory: {screenshot_dir}")
+                    else:  # real mode
+                        disable_mock_mode()
+                        self._emit_log("info", "Real execution mode enabled")
 
                 except Exception as e:
                     self._emit_log(
                         "warning",
                         f"Failed to initialize execution mode: {e}. Defaulting to REAL mode.",
                     )
-                    self.execution_mode = ExecutionModeConfig(mode=MockMode.REAL)
-                    set_execution_mode(self.execution_mode)
-                    self.controller = get_controller()
+                    self.mock_mode = "real"
+                    disable_mock_mode()
 
             # Check for graph execution setting (v2.0.0)
-            self.use_graph_execution = execution_settings.get("useGraphExecution", False)
+            # Note: Graph execution not available - json_executor modules don't exist in qontinui
+            self.use_graph_execution = False
+            if execution_settings.get("useGraphExecution", False):
+                self._emit_log(
+                    "warning",
+                    "Graph execution requested but not available (json_executor modules don't exist). Using sequential execution.",
+                )
 
-            # If graph execution is enabled and library is available, parse config with library's parser
-            if self.use_graph_execution and QONTINUI_AVAILABLE:
-                try:
-                    config_parser = ConfigParser()
-                    self.qontinui_config = config_parser.parse_config(self.config)
-                    self.action_executor = ActionExecutor(
-                        self.qontinui_config, use_graph_execution=True
-                    )
-                    self._emit_log(
-                        "info", "Graph execution mode enabled - using library's ActionExecutor"
-                    )
-                except Exception as e:
-                    self._emit_log(
-                        "warning",
-                        f"Failed to initialize graph executor: {e}. Falling back to manual execution.",
-                    )
-                    self.use_graph_execution = False
-                    self.action_executor = None
-
-            # Process workflows (v2.0.0) or processes (v1.0.0) - action sequences
-            # Support both v2.0.0 (workflows) and v1.0.0 (processes) formats
-            workflow_data = self.config.get("workflows", self.config.get("processes", []))
+            # Process workflows and register in library
+            workflow_data = self.config.get("workflows", [])
             for workflow in workflow_data:
                 workflow_id = workflow.get("id")
                 actions = workflow.get("actions", [])
                 self.workflows[workflow_id] = actions
 
-            # Process transitions
-            for trans_data in self.config.get("transitions", []):
-                trans_id = trans_data.get("id")
-                trans_type = trans_data.get("type")
+                # Register workflow in library's registry for transition loading
+                if QONTINUI_AVAILABLE:
+                    registry.register_workflow(workflow_id, actions)
+                    self._emit_log("debug", f"Registered workflow: {workflow_id}")
 
-                if trans_type == "FromTransition":
-                    from_state_id = trans_data.get("fromState")
-                    to_state_id = trans_data.get("toState")
-
-                    if from_state_id in self.states and to_state_id in self.states:
-                        # Store transition data directly for simpler processing
-                        self.transitions[trans_id] = {
-                            "type": "FromTransition",
-                            "from_state": from_state_id,
-                            "to_state": to_state_id,
-                            "processes": trans_data.get("processes", []),
-                            "name": trans_data.get("name", trans_id),
-                        }
-                elif trans_type == "ToTransition":
-                    to_state_id = trans_data.get("toState")
-                    if to_state_id in self.states:
-                        self.transitions[trans_id] = {
-                            "type": "ToTransition",
-                            "to_state": to_state_id,
-                            "processes": trans_data.get("processes", []),
-                            "name": trans_data.get("name", trans_id),
-                        }
+            # Initialize navigation system with config (if library is available)
+            # This must happen AFTER images and workflows are registered
+            if QONTINUI_AVAILABLE:
+                try:
+                    navigation_api.load_configuration(self.config)
+                    self._emit_log("info", "Navigation system initialized with states and transitions")
+                except Exception as e:
+                    self._emit_log("warning", f"Failed to initialize navigation: {e}")
+                    import traceback
+                    self._emit_log("debug", f"Traceback: {traceback.format_exc()}")
 
             config_info = {
                 "path": config_path,
                 "version": self.config.get("version", "unknown"),
                 "name": self.config.get("metadata", {}).get("name", "Unnamed"),
-                "states": len(self.states),
-                "workflows": len(self.workflows),  # v2.0.0 terminology
-                "processes": len(self.workflows),  # Backward compatibility
-                "transitions": len(self.transitions),
+                "workflows": len(self.workflows),
                 "images": len(self.images),
-                "execution_mode": "graph" if self.use_graph_execution else "sequential",
-                "graph_execution_available": QONTINUI_AVAILABLE
-                and self.action_executor is not None,
-                "mock_mode": self.execution_mode.mode.value if self.execution_mode else "real",
-                "is_mock_mode": self.execution_mode.is_mock() if self.execution_mode else False,
-                "is_screenshot_mode": (
-                    self.execution_mode.is_screenshot_mode() if self.execution_mode else False
-                ),
+                "execution_mode": "sequential",
+                "graph_execution_available": False,
+                "mock_mode": self.mock_mode,
+                "is_mock_mode": self.mock_mode in ("mock", "screenshot"),
+                "is_screenshot_mode": self.mock_mode == "screenshot",
             }
             self._emit_event(EventType.CONFIG_LOADED, config_info)
             return True
@@ -767,35 +658,35 @@ class QontinuiExecutor:
                 time.sleep(0.5)  # Simulate scroll time
 
             elif action_type == "GO_TO_STATE":
-                state_id = config.get("state")
-                if state_id and state_id in self.states:
-                    self.current_state = state_id
-                    if QONTINUI_AVAILABLE:
-                        self.state_manager.set_current_state(self.states[state_id])
-                    self._emit_event(
-                        EventType.STATE_CHANGED,
-                        {
-                            "from_state": self.current_state,
-                            "to_state": state_id,
-                            "transition": "GO_TO_STATE action",
-                        },
-                    )
-                    self._emit_log("info", f"Changed to state: {state_id}")
-                else:
-                    self._emit_log("warning", f"State {state_id} not found")
+                # GO_TO_STATE action - navigate to specified state using library's navigation API
+                state_name = config.get("state") or config.get("stateName")
+                if not state_name:
+                    self._emit_log("error", "GO_TO_STATE action missing state name")
                     return False
 
-            elif action_type == "RUN_PROCESS":
-                # Support both 'process' (v1.0.0) and 'workflow' (v2.0.0) config keys
-                workflow_id = config.get("workflow") or config.get("process")
-                if workflow_id:
-                    self._emit_log("info", f"RUN_PROCESS - Running workflow: {workflow_id}")
-                    return self._execute_workflow(workflow_id)
+                self._emit_log("info", f"GO_TO_STATE - Navigating to state: {state_name}")
+
+                # Use the library's navigation API - all state management is handled internally
+                success = navigation_api.open_state(state_name)
+
+                if success:
+                    self._emit_log("info", f"Successfully navigated to state: {state_name}")
                 else:
-                    self._emit_log(
-                        "warning", "No workflow/process specified for RUN_PROCESS action"
-                    )
+                    self._emit_log("warning", f"Failed to navigate to state: {state_name}")
+
+                return success
+
+            elif action_type in ("RUN_WORKFLOW", "RUN_PROCESS"):
+                workflow_id = config.get("workflow")
+                if not workflow_id:
+                    self._emit_log("error", f"No workflow ID in config: {config}")
                     return False
+
+                self._emit_log("info", f"RUN_WORKFLOW - Running nested workflow: {workflow_id}")
+                self._emit_log("debug", f"Nested workflow exists: {workflow_id in self.workflows}")
+                if workflow_id in self.workflows:
+                    self._emit_log("debug", f"Nested workflow has {len(self.workflows[workflow_id])} actions")
+                return self._execute_workflow(workflow_id)
 
             elif action_type == "VANISH":
                 image_id = config.get("image") or config.get("imageId")
@@ -901,63 +792,18 @@ class QontinuiExecutor:
             return False
 
     def _execute_workflow(self, workflow_id: str) -> bool:
-        """Execute a workflow using the library's ActionExecutor or manual fallback."""
-
-        if self.use_graph_execution and self.action_executor:
-            try:
-                # Use library's graph executor
-                self._emit_log("info", f"Executing workflow '{workflow_id}' using graph execution")
-                result = self.action_executor.execute_workflow(workflow_id)
-
-                # Emit events based on result
-                if result.get("success"):
-                    self._emit_event(
-                        EventType.WORKFLOW_COMPLETED,
-                        {
-                            "workflow_id": workflow_id,
-                            "success": True,
-                            "actions_executed": result.get("actions_executed", 0),
-                        },
-                    )
-                    self._emit_event(
-                        EventType.PROCESS_COMPLETED, {"process_id": workflow_id, "success": True}
-                    )
-                    return True
-                else:
-                    self._emit_event(
-                        EventType.WORKFLOW_COMPLETED,
-                        {
-                            "workflow_id": workflow_id,
-                            "success": False,
-                            "error": result.get("error"),
-                        },
-                    )
-                    self._emit_event(
-                        EventType.PROCESS_COMPLETED, {"process_id": workflow_id, "success": False}
-                    )
-                    return False
-
-            except Exception as e:
-                self._emit_log("error", f"Graph execution failed: {str(e)}")
-                self._emit_log("info", "Falling back to manual execution")
-                # Fall back to manual execution
-                return self._execute_workflow_manual(workflow_id)
-        else:
-            # No library available or graph execution disabled - use manual execution
-            return self._execute_workflow_manual(workflow_id)
+        """Execute a workflow using manual execution (graph execution not available)."""
+        # Note: Graph execution not available - json_executor modules don't exist
+        return self._execute_workflow_manual(workflow_id)
 
     def _execute_workflow_manual(self, workflow_id: str) -> bool:
-        """Manual workflow execution (legacy/fallback). v2.0.0 terminology."""
+        """Manual workflow execution."""
         if workflow_id not in self.workflows:
             self._emit_log("error", f"Workflow {workflow_id} not found")
             return False
 
-        # Emit both new and old event types for backward compatibility
         self._emit_event(
             EventType.WORKFLOW_STARTED, {"workflow_id": workflow_id, "workflow_name": workflow_id}
-        )
-        self._emit_event(
-            EventType.PROCESS_STARTED, {"process_id": workflow_id, "process_name": workflow_id}
         )
 
         actions = self.workflows[workflow_id]
@@ -974,127 +820,18 @@ class QontinuiExecutor:
             # Small delay between actions
             time.sleep(0.5)
 
-        # Emit both new and old event types for backward compatibility
         self._emit_event(
             EventType.WORKFLOW_COMPLETED, {"workflow_id": workflow_id, "success": success}
-        )
-        self._emit_event(
-            EventType.PROCESS_COMPLETED, {"process_id": workflow_id, "success": success}
         )
 
         return success
 
-    def _execute_process(self, process_id: str) -> bool:
-        """Deprecated: Use _execute_workflow instead. Kept for backward compatibility."""
-        return self._execute_workflow(process_id)
-
-    def _run_state_machine(self):
-        """Run the state machine execution."""
-        try:
-            # Execute transitions from current state
-            executed_count = 0
-            max_iterations = 100  # Prevent infinite loops
-
-            while self.is_running and executed_count < max_iterations:
-                transition_found = False
-
-                # Find transitions from current state
-                for transition in self.transitions.values():
-                    if (
-                        transition.get("type") == "FromTransition"
-                        and transition.get("from_state") == self.current_state
-                    ):
-                        self._emit_log("info", f"Executing transition: {transition.get('name')}")
-
-                        # Execute workflows in transition (processes field kept for backward compatibility)
-                        for workflow_id in transition.get("processes", []):
-                            if not self._execute_workflow(workflow_id):
-                                self._emit_log("error", f"Workflow {workflow_id} failed")
-                                self.is_running = False
-                                break
-                        else:
-                            # Only continue if all workflows succeeded
-                            pass
-
-                        if self.is_running:
-                            # Change state
-                            old_state = self.current_state
-                            self.current_state = transition.get("to_state")
-
-                            # Update state manager if available
-                            if self.current_state in self.states and QONTINUI_AVAILABLE:
-                                self.state_manager.set_current_state(
-                                    self.states[self.current_state]
-                                )
-
-                            self._emit_event(
-                                EventType.STATE_CHANGED,
-                                {
-                                    "from_state": old_state,
-                                    "to_state": self.current_state,
-                                    "transition": transition.get("name"),
-                                },
-                            )
-
-                            # Execute ToTransitions for the new state
-                            for to_transition in self.transitions.values():
-                                if (
-                                    to_transition.get("type") == "ToTransition"
-                                    and to_transition.get("to_state") == self.current_state
-                                ):
-                                    self._emit_log(
-                                        "info",
-                                        f"Executing ToTransition: {to_transition.get('name')}",
-                                    )
-                                    for workflow_id in to_transition.get("processes", []):
-                                        if not self._execute_workflow(workflow_id):
-                                            self._emit_log(
-                                                "error",
-                                                f"Workflow {workflow_id} in ToTransition failed",
-                                            )
-
-                            # Check if final state
-                            for state_data in self.config.get("states", []):
-                                if state_data.get("id") == self.current_state and state_data.get(
-                                    "isFinal"
-                                ):
-                                    self._emit_log("info", "Reached final state")
-                                    self.is_running = False
-                                    break
-
-                            transition_found = True
-                            executed_count += 1
-                            break
-
-                if not transition_found:
-                    self._emit_log("info", "No more transitions available from current state")
-                    break
-
-            self._emit_event(
-                EventType.EXECUTION_COMPLETED,
-                {
-                    "success": True,
-                    "final_state": self.current_state,
-                    "transitions_executed": executed_count,
-                },
-            )
-
-        except Exception as e:
-            self._emit_event(
-                EventType.ERROR,
-                {
-                    "message": "State machine execution failed",
-                    "details": str(e),
-                    "traceback": traceback.format_exc(),
-                },
-            )
-        finally:
-            self.is_running = False
-
     def _run_workflow(self, workflow_id: str):
-        """Run a specific workflow directly. v2.0.0 terminology."""
+        """Run a specific workflow directly."""
         try:
-            self._emit_log("info", f"Starting workflow execution: {workflow_id}")
+            self._emit_log("info", f"Thread started - beginning workflow execution: {workflow_id}")
+            self._emit_log("debug", f"Workflow exists: {workflow_id in self.workflows}")
+            self._emit_log("debug", f"Available workflows: {list(self.workflows.keys())}")
 
             success = self._execute_workflow(workflow_id)
 
@@ -1103,12 +840,11 @@ class QontinuiExecutor:
                 {
                     "success": success,
                     "workflow_id": workflow_id,
-                    "process_id": workflow_id,
-                    "mode": "workflow",
                 },
             )
 
         except Exception as e:
+            self._emit_log("error", f"Exception in _run_workflow: {e}")
             self._emit_event(
                 EventType.ERROR,
                 {
@@ -1118,21 +854,14 @@ class QontinuiExecutor:
                 },
             )
         finally:
+            self._emit_log("debug", "Thread completing, setting is_running=False")
             self.is_running = False
 
-    def _run_process(self, process_id: str):
-        """Deprecated: Use _run_workflow instead. Kept for backward compatibility."""
-        self._run_workflow(process_id)
-
-    def start_execution(
-        self, mode: str = "state_machine", process_id: str = None, workflow_id: str = None
-    ) -> bool:
-        """Start automation execution.
+    def start_execution(self, workflow_id: str) -> bool:
+        """Start workflow execution.
 
         Args:
-            mode: Execution mode - 'state_machine', 'workflow', or 'process' (deprecated)
-            process_id: Process ID for backward compatibility (deprecated, use workflow_id)
-            workflow_id: Workflow ID for v2.0.0 format
+            workflow_id: Workflow ID to execute
         """
         if not self.config:
             self._emit_event(EventType.ERROR, {"message": "No configuration loaded"})
@@ -1148,31 +877,21 @@ class QontinuiExecutor:
             self._emit_event(EventType.ERROR, {"message": "Execution already in progress"})
             return False
 
+        if not workflow_id:
+            self._emit_log("error", "Workflow ID is required")
+            return False
+
         try:
             self.is_running = True
 
             self._emit_event(
-                EventType.EXECUTION_STARTED, {"mode": mode, "initial_state": self.current_state}
+                EventType.EXECUTION_STARTED, {"workflow_id": workflow_id}
             )
 
-            if mode == "state_machine":
-                # Run state machine in separate thread
-                execution_thread = threading.Thread(target=self._run_state_machine)
-                execution_thread.daemon = True
-                execution_thread.start()
-            elif mode in ("workflow", "process"):
-                # Support both 'workflow' (v2.0.0) and 'process' (v1.0.0) modes
-                # workflow_id takes precedence over process_id
-                target_id = workflow_id or process_id
-                if not target_id:
-                    self._emit_log("error", "Workflow ID required for workflow/process mode")
-                    return False
-                execution_thread = threading.Thread(target=self._run_workflow, args=(target_id,))
-                execution_thread.daemon = True
-                execution_thread.start()
-            else:
-                self._emit_log("error", f"Unsupported execution mode: {mode}")
-                return False
+            # Run workflow in separate thread
+            execution_thread = threading.Thread(target=self._run_workflow, args=(workflow_id,))
+            execution_thread.daemon = True
+            execution_thread.start()
 
             return True
 
@@ -1208,11 +927,9 @@ class QontinuiExecutor:
             return {"success": success}
 
         elif cmd_type == "start":
-            mode = params.get("mode", "state_machine")
-            # Support both workflow_id (v2.0.0) and process_id (v1.0.0)
+            # Get workflow_id from params
             workflow_id = params.get("workflow_id")
-            process_id = params.get("process_id")
-            success = self.start_execution(mode, process_id=process_id, workflow_id=workflow_id)
+            success = self.start_execution(workflow_id)
             return {"success": success}
 
         elif cmd_type == "stop":
@@ -1222,7 +939,6 @@ class QontinuiExecutor:
         elif cmd_type == "status":
             return {
                 "is_running": self.is_running,
-                "current_state": self.current_state,
                 "config_loaded": self.config is not None,
                 "library_available": QONTINUI_AVAILABLE,
             }
@@ -1248,29 +964,8 @@ class QontinuiExecutor:
         Returns:
             Response with success status and snapshot directory
         """
-        if not QONTINUI_AVAILABLE or not self.controller:
-            return {"success": False, "error": "Qontinui library or controller not available"}
-
-        try:
-            base_dir = params.get("base_dir", "/tmp/qontinui-snapshots")
-
-            # Start recording
-            snapshot_dir = self.controller.start_recording(base_dir)
-
-            # Emit event
-            self._emit_event(
-                EventType.RECORDING_STARTED,
-                {"snapshot_directory": snapshot_dir, "base_directory": base_dir},
-            )
-
-            self._emit_log("info", f"Recording started: {snapshot_dir}")
-
-            return {"success": True, "snapshot_directory": snapshot_dir}
-
-        except Exception as e:
-            error_msg = f"Failed to start recording: {str(e)}"
-            self._emit_log("error", error_msg)
-            return {"success": False, "error": error_msg}
+        # Note: Recording not available - controller (from wrappers) doesn't exist in qontinui
+        return {"success": False, "error": "Recording not available (controller module doesn't exist)"}
 
     def _handle_stop_recording(self) -> dict[str, Any]:
         """Handle stop_recording command.
@@ -1278,30 +973,8 @@ class QontinuiExecutor:
         Returns:
             Response with success status and snapshot directory
         """
-        if not QONTINUI_AVAILABLE or not self.controller:
-            return {"success": False, "error": "Qontinui library or controller not available"}
-
-        try:
-            # Stop recording
-            snapshot_dir = self.controller.stop_recording()
-
-            if snapshot_dir:
-                # Get final statistics
-                stats = {"snapshot_directory": snapshot_dir}
-
-                # Emit event
-                self._emit_event(EventType.RECORDING_STOPPED, stats)
-
-                self._emit_log("info", f"Recording stopped: {snapshot_dir}")
-
-                return {"success": True, "snapshot_directory": snapshot_dir}
-            else:
-                return {"success": False, "error": "No recording in progress"}
-
-        except Exception as e:
-            error_msg = f"Failed to stop recording: {str(e)}"
-            self._emit_log("error", error_msg)
-            return {"success": False, "error": error_msg}
+        # Note: Recording not available - controller (from wrappers) doesn't exist in qontinui
+        return {"success": False, "error": "Recording not available (controller module doesn't exist)"}
 
     def _handle_recording_status(self) -> dict[str, Any]:
         """Handle recording_status command.
@@ -1309,19 +982,8 @@ class QontinuiExecutor:
         Returns:
             Response with recording status and statistics
         """
-        if not QONTINUI_AVAILABLE or not self.controller:
-            return {"success": False, "error": "Qontinui library or controller not available"}
-
-        try:
-            is_recording = self.controller.is_recording()
-            stats = self.controller.get_recording_stats() if is_recording else None
-
-            return {"success": True, "is_recording": is_recording, "statistics": stats}
-
-        except Exception as e:
-            error_msg = f"Failed to get recording status: {str(e)}"
-            self._emit_log("error", error_msg)
-            return {"success": False, "error": error_msg}
+        # Note: Recording not available - controller (from wrappers) doesn't exist in qontinui
+        return {"success": False, "error": "Recording not available (controller module doesn't exist)"}
 
     def __del__(self):
         """Clean up temp directory on exit."""

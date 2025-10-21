@@ -60,8 +60,8 @@ interface Config {
   name: string;
   version: string;
   statesCount: number;
-  processesCount: number;
-  processes: any[];
+  workflowsCount: number;
+  workflows: any[];
   images?: any[];
   states?: any[];
   path: string;
@@ -71,7 +71,7 @@ function App() {
   const [pythonStatus, setPythonStatus] = useState<"stopped" | "running">("stopped");
   const [configLoaded, setConfigLoaded] = useState(false);
   const [executionActive, setExecutionActive] = useState(false);
-  const [selectedProcess, setSelectedProcess] = useState("");
+  const [selectedWorkflow, setSelectedWorkflow] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const [logLevel, setLogLevel] = useState("all");
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -79,8 +79,8 @@ function App() {
   const [actionExecutionLogs, setActionExecutionLogs] = useState<ActionExecutionEntry[]>([]);
   const [activeLogTab, setActiveLogTab] = useState<"general" | "image" | "actions">("general");
   const [config, setConfig] = useState<Config | null>(null);
-  const [processes, setProcesses] = useState<any[]>([]);
-  const [showProcessDropdown, setShowProcessDropdown] = useState(false);
+  const [workflows, setWorkflows] = useState<any[]>([]);
+  const [showWorkflowDropdown, setShowWorkflowDropdown] = useState(false);
   const [showLogFilter, setShowLogFilter] = useState(false);
   const [showMonitorDropdown, setShowMonitorDropdown] = useState(false);
   const [selectedMonitor, setSelectedMonitor] = useState(0);
@@ -119,23 +119,23 @@ function App() {
     }
   };
 
-  // Debug processes state changes
+  // Debug workflows state changes
   useEffect(() => {
-    console.log("Processes state changed:", processes);
-    console.log("Number of processes:", processes.length);
-    if (processes.length > 0) {
-      console.log("First process:", processes[0]);
+    console.log("Workflows state changed:", workflows);
+    console.log("Number of workflows:", workflows.length);
+    if (workflows.length > 0) {
+      console.log("First workflow:", workflows[0]);
     }
-  }, [processes]);
+  }, [workflows]);
 
-  // Debug selectedProcess changes
+  // Debug selectedWorkflow changes
   useEffect(() => {
-    console.log("Selected process changed:", selectedProcess);
-    if (selectedProcess && processes.length > 0) {
-      const selected = processes.find((p) => p.id === selectedProcess);
-      console.log("Selected process details:", selected);
+    console.log("Selected workflow changed:", selectedWorkflow);
+    if (selectedWorkflow && workflows.length > 0) {
+      const selected = workflows.find((w) => w.id === selectedWorkflow);
+      console.log("Selected workflow details:", selected);
     }
-  }, [selectedProcess, processes]);
+  }, [selectedWorkflow, workflows]);
 
   const addLog = (level: LogEntry["level"], message: string) => {
     const timestamp = new Date().toLocaleTimeString("en-US", {
@@ -373,8 +373,8 @@ function App() {
             name: selected.split("/").pop() || "config.json",
             version: "1.0.0",
             statesCount: result.data?.states?.length || 0,
-            processesCount: result.data?.processes?.length || 0,
-            processes: result.data?.processes || [],
+            workflowsCount: result.data?.workflows?.length || 0,
+            workflows: result.data?.workflows || [],
             images: result.data?.images || [],
             states: result.data?.states || [],
             path: selected,
@@ -394,36 +394,37 @@ function App() {
             }
           }
           setConfig(loadedConfig);
-          // Filter processes to only show those in the "main" category
-          const allProcesses = result.data?.processes || [];
+          // Filter workflows to only show those in the "main" category
+          const allWorkflows = result.data?.workflows || [];
 
-          // Debug: Log all processes with their categories
-          console.log("All processes loaded:", allProcesses.length);
-          allProcesses.forEach((p: any) => {
-            console.log(`Process: ${p.name} (ID: ${p.id}), Category: "${p.category}"`);
+          // Debug: Log all workflows with their categories
+          console.log("All workflows loaded:", allWorkflows.length);
+          allWorkflows.forEach((w: any) => {
+            console.log(`Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}"`);
           });
 
-          const mainProcesses = allProcesses.filter(
-            (p: any) => p.category && p.category.toLowerCase() === "main", // Show only processes with "Main" category (case-insensitive)
+          // Show only workflows with "Main" category (case-insensitive)
+          const mainWorkflows = allWorkflows.filter(
+            (w: any) => w.category && w.category.toLowerCase() === "main"
           );
 
-          console.log("Filtered main processes:", mainProcesses.length);
-          mainProcesses.forEach((p: any) => {
-            console.log(`Main process: ${p.name} (ID: ${p.id})`);
+          console.log("Filtered main workflows:", mainWorkflows.length);
+          mainWorkflows.forEach((w: any) => {
+            console.log(`Main workflow: ${w.name} (ID: ${w.id})`);
           });
 
-          setProcesses(mainProcesses);
-          console.log("Processes state updated with:", mainProcesses);
+          setWorkflows(mainWorkflows);
+          console.log("Workflows state updated with:", mainWorkflows);
 
           setConfigLoaded(true);
           addLog("success", `Configuration loaded: ${selected}`);
 
-          // Log process filtering info with more detail
-          if (allProcesses.length > 0) {
+          // Log workflow filtering info with more detail
+          if (allWorkflows.length > 0) {
             // Show categories breakdown
             const categoryCounts: { [key: string]: number } = {};
-            allProcesses.forEach((p: any) => {
-              const cat = p.category || "No category";
+            allWorkflows.forEach((w: any) => {
+              const cat = w.category || "No category";
               categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
             });
 
@@ -431,33 +432,33 @@ function App() {
               .map(([cat, count]) => `${cat}: ${count}`)
               .join(", ");
 
-            addLog("debug", `Process categories: ${categoryInfo}`);
+            addLog("debug", `Workflow categories: ${categoryInfo}`);
 
-            if (mainProcesses.length !== allProcesses.length) {
+            if (mainWorkflows.length !== allWorkflows.length) {
               addLog(
                 "info",
-                `Loaded ${mainProcesses.length} processes from "Main" category (${allProcesses.length} total)`,
+                `Loaded ${mainWorkflows.length} workflows from "Main" category (${allWorkflows.length} total)`,
               );
             } else {
-              addLog("info", `Loaded ${mainProcesses.length} processes`);
+              addLog("info", `Loaded ${mainWorkflows.length} workflows`);
             }
 
-            if (mainProcesses.length === 0) {
+            if (mainWorkflows.length === 0) {
               addLog(
                 "warning",
-                "No processes found with 'Main' category. Check your config categories.",
+                "No workflows found with 'Main' category. Check your config categories.",
               );
             }
           }
 
-          // If processes were found, select the first one
-          if (mainProcesses.length > 0) {
-            const firstProcess = mainProcesses[0];
-            console.log("Setting selected process to:", firstProcess.id, firstProcess.name);
-            setSelectedProcess(firstProcess.id);
+          // If workflows were found, select the first one
+          if (mainWorkflows.length > 0) {
+            const firstWorkflow = mainWorkflows[0];
+            console.log("Setting selected workflow to:", firstWorkflow.id, firstWorkflow.name);
+            setSelectedWorkflow(firstWorkflow.id);
           } else {
-            console.log("No main processes found to select");
-            setSelectedProcess("");
+            console.log("No main workflows found to select");
+            setSelectedWorkflow("");
           }
         }
       }
@@ -468,9 +469,9 @@ function App() {
 
   const handleStartExecution = async () => {
     try {
-      if (!selectedProcess) {
-        addLog("warning", "Please select a process before starting execution");
-        console.log("No process selected. Available processes:", processes);
+      if (!selectedWorkflow) {
+        addLog("warning", "Please select a workflow before starting execution");
+        console.log("No workflow selected. Available workflows:", workflows);
         return;
       }
 
@@ -479,12 +480,12 @@ function App() {
       setExecutionPanelCollapsed(true);
 
       const params: any = {
-        processId: selectedProcess,
+        processId: selectedWorkflow,
         monitorIndex: selectedMonitor,
       };
 
-      const processName = processes.find((p) => p.id === selectedProcess)?.name;
-      console.log("Starting execution with process:", selectedProcess, processName);
+      const workflowName = workflows.find((w) => w.id === selectedWorkflow)?.name;
+      console.log("Starting execution with workflow:", selectedWorkflow, workflowName);
 
       // Minimize window if auto-minimize is enabled and only one monitor
       if (autoMinimize && availableMonitors.length === 1) {
@@ -504,9 +505,9 @@ function App() {
       const result: any = await invoke("start_execution", params);
       if (result.success) {
         setExecutionActive(true);
-        const processInfo = ` (Process: ${processName})`;
+        const workflowInfo = ` (Workflow: ${workflowName})`;
         const monitorInfo = selectedMonitor > 0 ? ` on monitor ${selectedMonitor}` : "";
-        addLog("success", `Execution started${processInfo}${monitorInfo}`);
+        addLog("success", `Execution started${workflowInfo}${monitorInfo}`);
       }
     } catch (error) {
       addLog("error", `Failed to start execution: ${error}`);
@@ -796,7 +797,7 @@ Attempts: ${entry.attempts}`;
                     States: <span className="text-accent">{config.statesCount}</span>
                   </div>
                   <div>
-                    Processes: <span className="text-accent">{config.processesCount}</span>
+                    Workflows: <span className="text-accent">{config.workflowsCount}</span>
                   </div>
                 </div>
                 <div
@@ -819,50 +820,50 @@ Attempts: ${entry.attempts}`;
             colorClass="text-secondary"
             borderColorClass="border-secondary/50"
           >
-            {/* Process Selection */}
+            {/* Workflow Selection */}
             <div>
-              <label className="text-sm text-muted-foreground">Process</label>
+              <label className="text-sm text-muted-foreground">Workflow</label>
               <div className="relative mt-1">
                 <button
                   onClick={() => {
-                    console.log("Dropdown clicked. Current processes:", processes);
-                    console.log("Current selectedProcess:", selectedProcess);
-                    setShowProcessDropdown(!showProcessDropdown);
+                    console.log("Dropdown clicked. Current workflows:", workflows);
+                    console.log("Current selectedWorkflow:", selectedWorkflow);
+                    setShowWorkflowDropdown(!showWorkflowDropdown);
                   }}
                   className="w-full px-3 py-2 text-left bg-input border border-border/50 rounded-md flex items-center justify-between"
                 >
                   <span>
-                    {selectedProcess
-                      ? processes.find((p) => p.id === selectedProcess)?.name ||
-                        `Unknown (${selectedProcess})`
-                      : processes.length > 0
-                        ? "Select process..."
-                        : "No processes available"}
+                    {selectedWorkflow
+                      ? workflows.find((w) => w.id === selectedWorkflow)?.name ||
+                        `Unknown (${selectedWorkflow})`
+                      : workflows.length > 0
+                        ? "Select workflow..."
+                        : "No workflows available"}
                   </span>
                   <ChevronDown className="w-4 h-4" />
                 </button>
-                {showProcessDropdown && (
+                {showWorkflowDropdown && (
                   <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg">
-                    {processes.length > 0 ? (
-                      processes.map((process) => {
-                        console.log("Rendering dropdown item:", process.id, process.name);
+                    {workflows.length > 0 ? (
+                      workflows.map((workflow) => {
+                        console.log("Rendering dropdown item:", workflow.id, workflow.name);
                         return (
                           <button
-                            key={process.id}
+                            key={workflow.id}
                             onClick={() => {
-                              console.log("Process selected:", process.id, process.name);
-                              setSelectedProcess(process.id);
-                              setShowProcessDropdown(false);
+                              console.log("Workflow selected:", workflow.id, workflow.name);
+                              setSelectedWorkflow(workflow.id);
+                              setShowWorkflowDropdown(false);
                             }}
                             className="w-full px-3 py-2 text-left hover:bg-accent/10 transition-colors"
                           >
-                            {process.name}
+                            {workflow.name}
                           </button>
                         );
                       })
                     ) : (
                       <div className="px-3 py-2 text-muted-foreground">
-                        No processes with "Main" category found
+                        No workflows with "Main" category found
                       </div>
                     )}
                   </div>

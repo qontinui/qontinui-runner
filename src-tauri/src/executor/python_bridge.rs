@@ -122,7 +122,31 @@ impl PythonBridge {
         }
 
         // Start the Python process with appropriate mode
-        // Try to use venv Python first, fall back to system Python
+        // Strategy:
+        // 1. For qontinui_executor.py and qontinui_bridge.py: use Poetry (needs qontinui library)
+        // 2. For minimal_bridge.py: use system Python (no dependencies)
+        // 3. Fall back to venv if it exists
+
+        let use_poetry = script_name == "qontinui_executor.py" || script_name == "qontinui_bridge.py";
+
+        // Check for Poetry and qontinui library location
+        let poetry_available = if use_poetry {
+            // Check if we can find the qontinui library directory
+            let qontinui_path = bridge_script.parent()
+                .and_then(|p| p.parent()) // Go up from python-bridge to qontinui-runner
+                .and_then(|p| p.parent()) // Go up to qontinui_parent
+                .map(|p| p.join("qontinui").join("pyproject.toml"));
+
+            if let Some(ref path) = qontinui_path {
+                eprintln!("Checking for qontinui at: {:?}, exists: {}", path, path.exists());
+                path.exists()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let venv_python = bridge_script.parent().and_then(|p| {
             let venv_path = p.join("venv/Scripts/python.exe");
             eprintln!(
@@ -137,19 +161,36 @@ impl PythonBridge {
             }
         });
 
-        let python_cmd = if let Some(venv_path) = venv_python {
+        let mut cmd = if poetry_available && use_poetry {
+            eprintln!("Using Poetry to run Python with qontinui library");
+            let qontinui_dir = bridge_script.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .map(|p| p.join("qontinui"))
+                .expect("Could not determine qontinui directory");
+
+            let mut poetry_cmd = Command::new("poetry");
+            poetry_cmd.current_dir(&qontinui_dir);
+            poetry_cmd.arg("run");
+            poetry_cmd.arg("python");
+            poetry_cmd.arg(bridge_script);
+            poetry_cmd
+        } else if let Some(venv_path) = venv_python {
             eprintln!("Using venv Python: {:?}", venv_path);
-            venv_path.to_string_lossy().to_string()
+            let mut python_cmd = Command::new(venv_path);
+            python_cmd.arg(bridge_script);
+            python_cmd
         } else if cfg!(target_os = "windows") {
             eprintln!("Using system python");
-            "python".to_string()
+            let mut python_cmd = Command::new("python");
+            python_cmd.arg(bridge_script);
+            python_cmd
         } else {
             eprintln!("Using system python3");
-            "python3".to_string()
+            let mut python_cmd = Command::new("python3");
+            python_cmd.arg(bridge_script);
+            python_cmd
         };
-
-        let mut cmd = Command::new(&python_cmd);
-        cmd.arg(bridge_script);
 
         // Pass --mock flag for simulation/mock mode
         // executor_type values: "real", "mock", "simulation", "qontinui", "simple", "minimal"
