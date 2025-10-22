@@ -464,8 +464,11 @@ class QontinuiExecutor:
             # This must happen AFTER images and workflows are registered
             if QONTINUI_AVAILABLE:
                 try:
-                    navigation_api.load_configuration(self.config)
-                    self._emit_log("info", "Navigation system initialized with states and transitions")
+                    success = navigation_api.load_configuration(self.config)
+                    if success:
+                        self._emit_log("info", "Navigation system initialized with states and transitions")
+                    else:
+                        self._emit_log("error", "Failed to initialize navigation system - check configuration")
                 except Exception as e:
                     self._emit_log("warning", f"Failed to initialize navigation: {e}")
                     import traceback
@@ -658,21 +661,24 @@ class QontinuiExecutor:
                 time.sleep(0.5)  # Simulate scroll time
 
             elif action_type == "GO_TO_STATE":
-                # GO_TO_STATE action - navigate to specified state using library's navigation API
-                state_name = config.get("state") or config.get("stateName")
-                if not state_name:
-                    self._emit_log("error", "GO_TO_STATE action missing state name")
+                # GO_TO_STATE action - navigate to specified states using library's navigation API
+                # The library accepts state names (strings) and converts them to IDs internally
+                state_names = config.get("stateNames", [])
+
+                if not state_names:
+                    self._emit_log("error", "GO_TO_STATE action missing stateNames")
                     return False
 
-                self._emit_log("info", f"GO_TO_STATE - Navigating to state: {state_name}")
+                self._emit_log("info", f"GO_TO_STATE - Navigating to states: {state_names}")
 
-                # Use the library's navigation API - all state management is handled internally
-                success = navigation_api.open_state(state_name)
+                # Use the library's navigation API - pass state names as strings
+                # The library will convert them to IDs and handle all state management internally
+                success = navigation_api.open_states(state_names)
 
                 if success:
-                    self._emit_log("info", f"Successfully navigated to state: {state_name}")
+                    self._emit_log("info", f"Successfully navigated to states: {state_names}")
                 else:
-                    self._emit_log("warning", f"Failed to navigate to state: {state_name}")
+                    self._emit_log("warning", f"Failed to navigate to states: {state_names}")
 
                 return success
 
