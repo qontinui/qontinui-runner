@@ -6,6 +6,8 @@
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus",
     "opener:default",
     "dialog:default",
     "dialog:allow-open"
