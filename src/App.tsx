@@ -91,6 +91,7 @@ function App() {
   const [executionPanelCollapsed, setExecutionPanelCollapsed] = useState(false);
   const logViewerRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
+  const wasAutoMinimizedRef = useRef(false); // Track if we minimized the window (using ref to avoid closure issues)
 
   // Detect monitors on mount
   useEffect(() => {
@@ -168,6 +169,39 @@ function App() {
     });
   };
 
+  const restoreWindowIfMinimized = async () => {
+    console.log("[RESTORE] restoreWindowIfMinimized called, wasAutoMinimized:", wasAutoMinimizedRef.current);
+    addLog("debug", `Restore check: wasAutoMinimized=${wasAutoMinimizedRef.current}`);
+    if (wasAutoMinimizedRef.current) {
+      try {
+        console.log("[RESTORE] Attempting to restore window...");
+        addLog("info", "Attempting to restore window...");
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const window = getCurrentWindow();
+
+        // Unminimize and set focus to bring window to foreground
+        await window.unminimize();
+        console.log("[RESTORE] Window unminimized");
+        addLog("debug", "Window unminimized, setting focus...");
+
+        await window.setFocus();
+        console.log("[RESTORE] Window focus set");
+        addLog("debug", "Window focus set");
+
+        wasAutoMinimizedRef.current = false;
+        console.log("[RESTORE] Window restored successfully");
+        addLog("info", "Window restored successfully");
+      } catch (error) {
+        console.error("[RESTORE] Failed to restore window:", error);
+        addLog("error", `Failed to restore window: ${error}`);
+        wasAutoMinimizedRef.current = false; // Reset flag even on error
+      }
+    } else {
+      console.log("[RESTORE] Skipping restore - window was not auto-minimized");
+      addLog("debug", "Skipping restore - window was not auto-minimized");
+    }
+  };
+
   useEffect(() => {
     let unlisten: (() => void) | null = null;
     let isMounted = true;
@@ -208,6 +242,12 @@ function App() {
           data.event === "execution_completed"
         ) {
           addLog("info", data.data.message || `Event: ${data.event}`);
+          // Restore window when automation completes
+          if (data.event === "execution_completed") {
+            console.log("[EVENT] execution_completed received, calling restoreWindowIfMinimized");
+            addLog("debug", "Execution completed event received, attempting to restore window");
+            restoreWindowIfMinimized();
+          }
         }
         if (data.event === "error") {
           addLog("error", data.data.message || "Unknown error");
@@ -488,17 +528,24 @@ function App() {
       console.log("Starting execution with workflow:", selectedWorkflow, workflowName);
 
       // Minimize window if auto-minimize is enabled and only one monitor
+      console.log("[START] Auto-minimize check: autoMinimize=", autoMinimize, "monitors=", availableMonitors.length);
       if (autoMinimize && availableMonitors.length === 1) {
         try {
+          console.log("[START] Minimizing window...");
           const { getCurrentWindow } = await import("@tauri-apps/api/window");
           const window = getCurrentWindow();
           await window.minimize();
+          wasAutoMinimizedRef.current = true; // Track that we minimized the window
+          console.log("[START] Window minimized, wasAutoMinimized set to true");
           addLog("info", "Window minimized - waiting 1 second before starting automation");
           // Wait 1 second to allow window minimization and user to refocus previous window
           await new Promise((resolve) => setTimeout(resolve, 1000));
         } catch (error) {
-          console.error("Failed to minimize window:", error);
+          console.error("[START] Failed to minimize window:", error);
+          addLog("error", `Failed to minimize window: ${error}`);
         }
+      } else {
+        console.log("[START] Skipping auto-minimize");
       }
 
       console.log("Invoking start_execution with params:", params);
@@ -516,10 +563,14 @@ function App() {
 
   const handleStopExecution = async () => {
     try {
+      console.log("[STOP] Stop execution called");
       const result: any = await invoke("stop_execution");
       if (result.success) {
         setExecutionActive(false);
         addLog("info", "Execution stopped");
+        console.log("[STOP] Calling restoreWindowIfMinimized");
+        // Restore window if it was auto-minimized
+        await restoreWindowIfMinimized();
       }
     } catch (error) {
       addLog("error", `Failed to stop execution: ${error}`);

@@ -108,6 +108,7 @@ class QontinuiExecutor:
         self.mock_mode = "real"  # Track mock mode: "real", "mock", "screenshot"
         self.screenshot_dir = None  # Screenshot directory for screenshot mode
         self.settings = None  # FrameworkSettings instance
+        self._last_find_location = None  # Store location of most recent FIND result for "Last Find Result" clicks
 
         if QONTINUI_AVAILABLE:
             self.actions = FluentActions()
@@ -151,14 +152,13 @@ class QontinuiExecutor:
             import numpy as np
             from PIL import ImageGrab
 
-            # Get template image
+            # Get template image from Image object
             image_obj = self.images[image_id]
-            image_path = getattr(image_obj, "path", None)
-            if not image_path:
-                return None
 
-            template = cv2.imread(image_path)
+            # Use Image object's BGR conversion method
+            template = image_obj.get_mat_bgr()
             if template is None:
+                self._emit_log("debug", f"Could not convert image {image_id} to BGR format")
                 return None
 
             # Capture screenshot
@@ -203,16 +203,13 @@ class QontinuiExecutor:
 
         # Get image information
         image_obj = self.images[image_id]
-        image_path = getattr(image_obj, "path", None) or image_id
 
-        # Try to get template size
+        # Try to get template size from Image object
         try:
-            import cv2
-
-            template = cv2.imread(image_path) if hasattr(cv2, "imread") else None
-            template_size = (
-                f"{template.shape[1]}x{template.shape[0]}" if template is not None else "unknown"
-            )
+            if hasattr(image_obj, "width") and hasattr(image_obj, "height"):
+                template_size = f"{image_obj.width}x{image_obj.height}"
+            else:
+                template_size = "unknown"
         except Exception:
             template_size = "unknown"
 
@@ -234,7 +231,7 @@ class QontinuiExecutor:
 
             # Emit event for successful match
             event_data = {
-                "image_path": image_path,
+                "image_path": image_id,
                 "template_size": template_size,
                 "screenshot_size": screenshot_size,
                 "threshold": threshold,
@@ -248,13 +245,13 @@ class QontinuiExecutor:
             }
             self._emit_log(
                 "debug",
-                f"Emitting IMAGE_RECOGNITION event (FOUND): {image_path}, confidence: {confidence}",
+                f"Emitting IMAGE_RECOGNITION event (FOUND): {image_id}, confidence: {confidence}",
             )
             self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
         else:
             # Build event data for no match found
             event_data = {
-                "image_path": image_path,
+                "image_path": image_id,
                 "template_size": template_size,
                 "screenshot_size": screenshot_size,
                 "threshold": threshold,
@@ -278,7 +275,7 @@ class QontinuiExecutor:
             # Emit event
             self._emit_log(
                 "debug",
-                f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_path}, best_match: {best_match_info is not None}",
+                f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_id}, best_match: {best_match_info is not None}",
             )
             self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
 
@@ -389,7 +386,7 @@ class QontinuiExecutor:
 
                     # Create Qontinui Image object if library is available
                     if QONTINUI_AVAILABLE:
-                        image_obj = Image(img_path)
+                        image_obj = Image.from_file(img_path)
                         self.images[img_id] = image_obj
                         # Register image in library's registry for state/transition loading
                         registry.register_image(img_id, image_obj)
@@ -400,6 +397,40 @@ class QontinuiExecutor:
                         self._emit_log("debug", f"Loaded image: {img_id} -> {img_path}")
                 except Exception as e:
                     self._emit_log("error", f"Failed to load image {img_id}: {e}")
+
+            # Load state images - map state image IDs to their underlying image objects
+            # State images are used by IF actions in inline workflows to check state visibility
+            if QONTINUI_AVAILABLE:
+                states = self.config.get("states", [])
+                self._emit_log("debug", f"Loading state images from {len(states)} states")
+
+                for state in states:
+                    state_name = state.get("name", "unknown")
+                    state_images = state.get("stateImages", [])  # Config uses 'stateImages' not 'images'
+                    self._emit_log("debug", f"State '{state_name}' has {len(state_images)} state images")
+
+                    for state_image in state_images:
+                        state_image_id = state_image.get("id")
+                        state_image_name = state_image.get("name", "unknown")
+                        patterns = state_image.get("patterns", [])
+
+                        self._emit_log("debug", f"Processing state image '{state_image_name}' (id={state_image_id}) with {len(patterns)} patterns")
+
+                        if patterns and len(patterns) > 0:
+                            # Get the first pattern's image ID
+                            first_pattern = patterns[0]
+                            underlying_image_id = first_pattern.get("image")
+
+                            self._emit_log("debug", f"State image {state_image_id} -> underlying image {underlying_image_id}")
+
+                            if underlying_image_id and underlying_image_id in self.images:
+                                # Map state image ID to the underlying image object
+                                self.images[state_image_id] = self.images[underlying_image_id]
+                                self._emit_log("debug", f"Mapped state image {state_image_id} -> {underlying_image_id}")
+                            else:
+                                self._emit_log("warning", f"State image {state_image_id} references missing image {underlying_image_id}")
+                        else:
+                            self._emit_log("warning", f"State image {state_image_id} has no patterns")
 
             # Note: State management is handled by the Qontinui library internally
             # The runner does not need to create or manage states
@@ -452,13 +483,14 @@ class QontinuiExecutor:
             workflow_data = self.config.get("workflows", [])
             for workflow in workflow_data:
                 workflow_id = workflow.get("id")
+                workflow_name = workflow.get("name", workflow_id)
                 actions = workflow.get("actions", [])
                 self.workflows[workflow_id] = actions
 
                 # Register workflow in library's registry for transition loading
                 if QONTINUI_AVAILABLE:
-                    registry.register_workflow(workflow_id, actions)
-                    self._emit_log("debug", f"Registered workflow: {workflow_id}")
+                    registry.register_workflow(workflow_id, actions, workflow_name)
+                    self._emit_log("debug", f"Registered workflow: {workflow_name}")
 
             # Initialize navigation system with config (if library is available)
             # This must happen AFTER images and workflows are registered
@@ -521,44 +553,95 @@ class QontinuiExecutor:
 
             if action_type == "CLICK":
                 target = config.get("target", {})
-                self._emit_log("info", f"CLICK action - target type: {target.get('type')}")
-                if target.get("type") == "image":
-                    image_id = target.get("imageId")
-                    self._emit_log("info", f"CLICK - Looking for image: {image_id}")
-                    if image_id in self.images:
-                        # Get similarity/threshold from target config (default 0.9)
-                        threshold = target.get("threshold", config.get("similarity", 0.9))
 
-                        # Find image on screen
-                        matches = Find(self.images[image_id]).find_all()
-
-                        # If no matches, get best match info anyway
-                        best_match_info = None
-                        if not matches:
-                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
-
-                        # Emit image recognition event
-                        self._emit_image_recognition_event(
-                            image_id, matches, threshold, best_match_info
-                        )
-
-                        if matches:
-                            # Click on first match
-                            location = matches[0].location
-                            self.actions.click(location)
-                            self._emit_log("info", f"Clicked at {location}")
+                # Handle string targets (like "Last Find Result")
+                if isinstance(target, str):
+                    if target == "Last Find Result":
+                        if self._last_find_location:
+                            self.actions.click(self._last_find_location)
+                            self._emit_log("info", f"Clicked at last find location: {self._last_find_location}")
                         else:
-                            self._emit_log("warning", f"Image {image_id} not found on screen")
+                            self._emit_log("error", "CLICK - No previous find result available")
                             return False
-                elif target.get("type") == "coordinates":
-                    x = target.get("x", 0)
-                    y = target.get("y", 0)
+                    else:
+                        self._emit_log("error", f"CLICK - Unknown string target: {target}")
+                        return False
+                # Handle dictionary targets (image or coordinates)
+                elif isinstance(target, dict):
+                    self._emit_log("info", f"CLICK action - target type: {target.get('type')}")
+                    if target.get("type") == "image":
+                        image_id = target.get("imageId")
+                        self._emit_log("info", f"CLICK - Looking for image: {image_id}")
+                        if image_id in self.images:
+                            # Get similarity/threshold from target config (default 0.9)
+                            threshold = target.get("threshold", config.get("similarity", 0.9))
+
+                            # Find image on screen with configured threshold
+                            results = Find(self.images[image_id]).similarity(threshold).execute()
+                            matches = results.matches
+
+                            # If no matches, get best match info anyway
+                            best_match_info = None
+                            if not matches:
+                                best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                            # Emit image recognition event
+                            self._emit_image_recognition_event(
+                                image_id, matches, threshold, best_match_info
+                            )
+
+                            if matches:
+                                # Click on first match
+                                location = matches[0].location
+                                self.actions.click(location)
+                                self._emit_log("info", f"Clicked at {location}")
+                            else:
+                                self._emit_log("warning", f"Image {image_id} not found on screen")
+                                return False
+                    elif target.get("type") == "coordinates":
+                        x = target.get("x", 0)
+                        y = target.get("y", 0)
+                        location = Location(x, y)
+                        self.actions.click(location)
+                        self._emit_log("info", f"Clicked at ({x}, {y})")
+                # Fallback: check for x,y directly in config (legacy format)
+                elif "x" in config and "y" in config:
+                    x = config.get("x", 0)
+                    y = config.get("y", 0)
                     location = Location(x, y)
                     self.actions.click(location)
-                    self._emit_log("info", f"Clicked at ({x}, {y})")
+                    self._emit_log("info", f"Clicked at ({x}, {y}) [legacy format]")
 
             elif action_type == "TYPE":
-                text = config.get("text", "")
+                # Get text from config or from stateString
+                text_source = config.get("textSource", "direct")
+                if text_source == "stateString":
+                    # Load text from state string
+                    selected_state = config.get("selectedState")
+                    selected_strings = config.get("selectedStateStrings", [])
+                    text = ""
+
+                    if selected_state and selected_strings and self.config:
+                        # Find the state in config
+                        states = self.config.get("states", [])
+                        for state in states:
+                            if state.get("name") == selected_state or state.get("id") == selected_state:
+                                # Find the string in the state
+                                for string_id in selected_strings:
+                                    for state_string in state.get("strings", []):
+                                        if state_string.get("id") == string_id:
+                                            text = state_string.get("value", "")
+                                            self._emit_log("debug", f"Loaded text from stateString {string_id}: '{text}'")
+                                            break
+                                    if text:
+                                        break
+                                break
+
+                    if not text:
+                        self._emit_log("warning", f"Could not load text from stateString (state={selected_state}, strings={selected_strings})")
+                else:
+                    text = config.get("text", "")
+
                 clear_before = config.get("clear_before", False)
                 press_enter = config.get("press_enter", False)
                 pause_before_begin = (
@@ -591,7 +674,9 @@ class QontinuiExecutor:
                 # Process special key placeholders
                 processed_text = self._process_special_keys(text)
                 if hasattr(self.actions, "type_text"):
-                    self.actions.type_text(processed_text)
+                    # FluentActions uses builder pattern - must call execute() to actually type
+                    self.actions.type_text(processed_text).execute()
+                    self.actions.clear()  # Clear the chain for next use
                 elif hasattr(self.actions, "type"):
                     self.actions.type(processed_text)
                 self._emit_log("info", f"Typed: {text}")
@@ -602,12 +687,15 @@ class QontinuiExecutor:
                 if press_enter and not text.endswith("{ENTER}"):
                     # Only press Enter if it wasn't already in the text as a placeholder
                     self._emit_log("info", "Pressing Enter key (from press_enter flag)")
-                    if hasattr(self.actions, "press"):
-                        self.actions.press("enter")
+                    if hasattr(self.actions, "key"):
+                        # FluentActions uses builder pattern - must call execute()
+                        self.actions.key("enter").execute()
+                        self.actions.clear()
                     elif hasattr(self.actions, "key_press"):
                         self.actions.key_press("enter")
                     elif hasattr(self.actions, "type_text"):
-                        self.actions.type_text("\n")
+                        self.actions.type_text("\n").execute()
+                        self.actions.clear()
                     elif hasattr(self.actions, "type"):
                         self.actions.type("\n")
 
@@ -627,14 +715,68 @@ class QontinuiExecutor:
                 if image_id and image_id in self.images:
                     # Get similarity/threshold from config (default 0.9)
                     threshold = config.get("similarity", 0.9)
+                    if "threshold" in config:
+                        threshold = config["threshold"]
 
-                    # Perform find operation
-                    matches = Find(self.images[image_id]).find_all()
+                    self._emit_log("debug", f"FIND - Using threshold: {threshold}, config keys: {config.keys()}")
+                    self._emit_log("debug", f"FIND - Config similarity: {config.get('similarity')}, threshold: {config.get('threshold')}")
+
+                    # Perform find operation with configured threshold
+                    find_obj = Find(self.images[image_id]).similarity(threshold)
+                    self._emit_log("debug", f"FIND - Created Find object with threshold {threshold}")
+
+                    # Debug: Check actual threshold values AFTER setting
+                    if hasattr(find_obj, '_options') and hasattr(find_obj._options, '_min_similarity'):
+                        actual_min_sim = find_obj._options._min_similarity
+                        self._emit_log("debug", f"FIND - FindOptions._min_similarity is actually: {actual_min_sim}")
+
+                    # Check the pattern's threshold
+                    if hasattr(find_obj, '_target') and find_obj._target:
+                        pattern_threshold = getattr(find_obj._target, 'similarity_threshold', 'N/A')
+                        self._emit_log("debug", f"FIND - Pattern similarity_threshold: {pattern_threshold}")
+
+                    # Check the options
+                    if hasattr(find_obj, '_options'):
+                        self._emit_log("debug", f"FIND - Options object: {find_obj._options}")
+
+                    results = find_obj.execute()
+                    self._emit_log("debug", f"FIND - Execute returned results object: {results}")
+                    self._emit_log("debug", f"FIND - Results type: {type(results)}, has matches: {hasattr(results, 'matches')}")
+
+                    matches = results.matches
+                    self._emit_log("debug", f"FIND - Matches: {matches}, type: {type(matches)}, len: {len(matches) if matches else 0}")
 
                     # If no matches, get best match info anyway
                     best_match_info = None
                     if not matches:
                         best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+
+                        # Save debug screenshots when FIND fails
+                        try:
+                            import os
+                            from datetime import datetime
+                            debug_dir = os.path.join(os.path.dirname(self.images[image_id]), "debug_screenshots")
+                            os.makedirs(debug_dir, exist_ok=True)
+
+                            # Save current screenshot
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            screenshot_path = os.path.join(debug_dir, f"{image_id}_{timestamp}_screenshot.png")
+
+                            # Capture and save current screen
+                            from qontinui.hal.factory import HALFactory
+                            screen_capture = HALFactory.get_screen_capture()
+                            screenshot = screen_capture.capture_screen()
+                            screenshot.save(screenshot_path)
+
+                            # Copy template for comparison
+                            import shutil
+                            template_path = os.path.join(debug_dir, f"{image_id}_{timestamp}_template.png")
+                            shutil.copy(self.images[image_id], template_path)
+
+                            self._emit_log("info", f"DEBUG: Saved screenshot to {screenshot_path}")
+                            self._emit_log("info", f"DEBUG: Saved template to {template_path}")
+                        except Exception as e:
+                            self._emit_log("warning", f"Failed to save debug screenshots: {e}")
 
                     # Emit image recognition event
                     self._emit_image_recognition_event(
@@ -643,6 +785,9 @@ class QontinuiExecutor:
 
                     if matches:
                         self._emit_log("info", f"Found {len(matches)} matches for image {image_id}")
+                        # Store first match location for "Last Find Result" clicks
+                        self._last_find_location = matches[0].location
+                        self._emit_log("debug", f"Stored last find location: {self._last_find_location}")
                         self._emit_event(
                             EventType.MATCH_FOUND, {"image_id": image_id, "matches": len(matches)}
                         )
@@ -663,13 +808,18 @@ class QontinuiExecutor:
             elif action_type == "GO_TO_STATE":
                 # GO_TO_STATE action - navigate to specified states using library's navigation API
                 # The library accepts state names (strings) and converts them to IDs internally
-                state_names = config.get("stateNames", [])
+                # Check for both stateIds (preferred) and stateNames (for backward compatibility)
+                state_names = config.get("stateIds", config.get("stateNames", []))
 
                 if not state_names:
-                    self._emit_log("error", "GO_TO_STATE action missing stateNames")
+                    self._emit_log("error", "GO_TO_STATE action missing 'stateIds' or 'stateNames' in config")
                     return False
 
                 self._emit_log("info", f"GO_TO_STATE - Navigating to states: {state_names}")
+
+                # CRITICAL: Inject workflow executor so navigation system can execute transition workflows
+                # The executor (self) can execute workflows via execute_workflow()
+                navigation_api.set_workflow_executor(self)
 
                 # Use the library's navigation API - pass state names as strings
                 # The library will convert them to IDs and handle all state management internally
@@ -683,7 +833,7 @@ class QontinuiExecutor:
                 return success
 
             elif action_type in ("RUN_WORKFLOW", "RUN_PROCESS"):
-                workflow_id = config.get("workflow")
+                workflow_id = config.get("workflow") or config.get("workflowId")
                 if not workflow_id:
                     self._emit_log("error", f"No workflow ID in config: {config}")
                     return False
@@ -703,7 +853,8 @@ class QontinuiExecutor:
                 if image_id and image_id in self.images:
                     start_time = time.time()
                     while time.time() - start_time < timeout:
-                        matches = Find(self.images[image_id]).find_all()
+                        results = Find(self.images[image_id]).similarity(threshold).execute()
+                        matches = results.matches
 
                         # If no matches, get best match info anyway
                         best_match_info = None
@@ -740,7 +891,9 @@ class QontinuiExecutor:
                 if from_target.get("type") == "image":
                     image_id = from_target.get("imageId")
                     if image_id in self.images:
-                        matches = Find(self.images[image_id]).find_all()
+                        threshold = from_target.get("threshold", config.get("similarity", 0.9))
+                        results = Find(self.images[image_id]).similarity(threshold).execute()
+                        matches = results.matches
 
                         # If no matches, get best match info anyway
                         best_match_info = None
@@ -761,7 +914,9 @@ class QontinuiExecutor:
                 if to_target.get("type") == "image":
                     image_id = to_target.get("imageId")
                     if image_id in self.images:
-                        matches = Find(self.images[image_id]).find_all()
+                        threshold = to_target.get("threshold", config.get("similarity", 0.9))
+                        results = Find(self.images[image_id]).similarity(threshold).execute()
+                        matches = results.matches
 
                         # If no matches, get best match info anyway
                         best_match_info = None
@@ -784,6 +939,74 @@ class QontinuiExecutor:
                     self._emit_log("warning", "Could not find drag locations")
                     return False
 
+            elif action_type == "IF":
+                condition = config.get("condition", {})
+                condition_type = condition.get("type")
+
+                if condition_type == "image_exists":
+                    image_id = condition.get("imageId")
+                    threshold = condition.get("threshold", config.get("similarity", 0.9))
+
+                    if image_id and image_id in self.images:
+                        self._emit_log("debug", f"IF - Checking if image exists: {image_id}")
+
+                        # Find image on screen
+                        results = Find(self.images[image_id]).similarity(threshold).execute()
+                        matches = results.matches
+
+                        # Store location for "Last Find Result" usage
+                        if matches:
+                            self._last_find_location = matches[0].location
+                            self._emit_log("debug", f"IF - Image found, stored location: {self._last_find_location}")
+                        else:
+                            self._emit_log("debug", f"IF - Image not found: {image_id}")
+
+                        # Execute then/else actions (currently empty in the config, so we skip this)
+                        # In the future, we could execute nested actions here
+
+                    else:
+                        self._emit_log("warning", f"IF - Image {image_id} not loaded")
+                else:
+                    self._emit_log("warning", f"IF - Unknown condition type: {condition_type}")
+
+            elif action_type == "MOUSE_MOVE":
+                target = config.get("target", {})
+
+                # Handle string targets (like "Last Find Result")
+                if isinstance(target, str):
+                    if target == "Last Find Result":
+                        if self._last_find_location:
+                            self.actions.move(self._last_find_location)
+                            self._emit_log("info", f"Moved mouse to last find location: {self._last_find_location}")
+                        else:
+                            self._emit_log("error", "MOUSE_MOVE - No previous find result available")
+                            return False
+                    else:
+                        self._emit_log("error", f"MOUSE_MOVE - Unknown string target: {target}")
+                        return False
+                # Handle dictionary targets (image or coordinates)
+                elif isinstance(target, dict):
+                    if target.get("type") == "image":
+                        image_id = target.get("imageId")
+                        if image_id in self.images:
+                            threshold = target.get("threshold", config.get("similarity", 0.9))
+                            results = Find(self.images[image_id]).similarity(threshold).execute()
+                            matches = results.matches
+
+                            if matches:
+                                location = matches[0].location
+                                self.actions.move(location)
+                                self._emit_log("info", f"Moved mouse to {location}")
+                            else:
+                                self._emit_log("warning", f"Image {image_id} not found for MOUSE_MOVE")
+                                return False
+                    elif target.get("type") == "coordinates":
+                        x = target.get("x", 0)
+                        y = target.get("y", 0)
+                        location = Location(x, y)
+                        self.actions.move(location)
+                        self._emit_log("info", f"Moved mouse to ({x}, {y})")
+
             self._emit_event(
                 EventType.ACTION_COMPLETED, {"action_id": action_data.get("id"), "success": True}
             )
@@ -804,7 +1027,19 @@ class QontinuiExecutor:
 
     def _execute_workflow_manual(self, workflow_id: str) -> bool:
         """Manual workflow execution."""
-        if workflow_id not in self.workflows:
+        # Try local workflows first
+        if workflow_id in self.workflows:
+            actions = self.workflows[workflow_id]
+        # Fallback to registry for inline workflows registered by transition loader
+        elif QONTINUI_AVAILABLE:
+            actions = registry.get_workflow(workflow_id)
+            if actions is None:
+                self._emit_log("error", f"Workflow {workflow_id} not found in local workflows or registry")
+                return False
+            # Cache it locally for future use
+            self.workflows[workflow_id] = actions
+            self._emit_log("debug", f"Loaded workflow {workflow_id} from registry")
+        else:
             self._emit_log("error", f"Workflow {workflow_id} not found")
             return False
 
@@ -812,7 +1047,6 @@ class QontinuiExecutor:
             EventType.WORKFLOW_STARTED, {"workflow_id": workflow_id, "workflow_name": workflow_id}
         )
 
-        actions = self.workflows[workflow_id]
         success = True
 
         for action in actions:
@@ -831,6 +1065,25 @@ class QontinuiExecutor:
         )
 
         return success
+
+    def execute_workflow(self, workflow_id: str) -> dict:
+        """Execute a workflow and return result in navigation API expected format.
+
+        This method is called by the navigation system when executing transitions.
+        It wraps _execute_workflow() to provide the expected return format.
+
+        Args:
+            workflow_id: ID of workflow to execute
+
+        Returns:
+            dict with 'success' key: {'success': True/False}
+        """
+        try:
+            success = self._execute_workflow(workflow_id)
+            return {'success': success}
+        except Exception as e:
+            self._emit_log("error", f"Workflow execution failed: {e}")
+            return {'success': False, 'error': str(e)}
 
     def _run_workflow(self, workflow_id: str):
         """Run a specific workflow directly."""
