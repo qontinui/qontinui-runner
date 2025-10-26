@@ -34,13 +34,15 @@ print(json.dumps({
 }), flush=True)
 
 try:
-    from qontinui import Find, FluentActions, Image, Location
+    from qontinui import Find, Image, Location
     from qontinui.config import get_settings, enable_mock_mode, disable_mock_mode
     from qontinui import navigation_api, registry
-    # json_executor and wrappers.get_controller don't exist - commented out
-    # from qontinui.json_executor.action_executor import ActionExecutor
-    # from qontinui.json_executor.config_parser import ConfigParser
-    # from qontinui.wrappers import get_controller
+    from qontinui.reporting import register_callback, EventType as QontinuiEventType
+    from qontinui.json_executor.action_executor import ActionExecutor
+    from qontinui.json_executor.config_parser import ConfigParser, QontinuiConfig
+
+    # Import EventTranslator for callback management
+    from event_translator import EventTranslator
 
     QONTINUI_AVAILABLE = True
 except ImportError as e:
@@ -93,6 +95,123 @@ class EventType(Enum):
     RECORDING_STOPPED = "recording_stopped"
 
 
+class HierarchyMetadata:
+    """Metadata about an action/workflow's position in the execution hierarchy.
+
+    This enables the frontend to display actions in a hierarchical, toggleable tree
+    structure that mirrors the JSON configuration.
+    """
+
+    def __init__(self, parent_id: str | None = None, nesting_level: int = 0,
+                 workflow_name: str | None = None, is_expandable: bool = False):
+        self.parent_id = parent_id
+        self.nesting_level = nesting_level
+        self.workflow_name = workflow_name
+        self.is_expandable = is_expandable
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary for event emission."""
+        return {
+            "parent_id": self.parent_id,
+            "nesting_level": self.nesting_level,
+            "workflow_name": self.workflow_name,
+            "is_expandable": self.is_expandable,
+        }
+
+    def child(self, parent_id: str, workflow_name: str | None = None,
+              is_expandable: bool = False) -> "HierarchyMetadata":
+        """Create child metadata with incremented nesting level."""
+        return HierarchyMetadata(
+            parent_id=parent_id,
+            nesting_level=self.nesting_level + 1,
+            workflow_name=workflow_name,
+            is_expandable=is_expandable
+        )
+
+
+class ExecutionContext:
+    """Tracks the current execution hierarchy for hierarchical logging.
+
+    This class maintains a stack of execution contexts, allowing us to track:
+    - Current nesting level
+    - Parent workflow/action IDs
+    - Whether we're in a user-visible or helper workflow
+
+    Follows Single Responsibility Principle: Only responsible for tracking execution context.
+    """
+
+    def __init__(self):
+        self.stack: list[dict[str, Any]] = []
+        self._suppress_events = False
+
+    def push_workflow(self, workflow_id: str, workflow_name: str, is_helper: bool = False):
+        """Push a workflow onto the context stack."""
+        self.stack.append({
+            "type": "workflow",
+            "id": workflow_id,
+            "name": workflow_name,
+            "is_helper": is_helper,
+        })
+        if is_helper:
+            self._suppress_events = True
+
+    def pop_workflow(self):
+        """Pop a workflow from the context stack."""
+        if self.stack:
+            popped = self.stack.pop()
+            # If we're popping a helper workflow, check if we should un-suppress
+            if popped.get("is_helper"):
+                # Check if there are any remaining helper workflows in the stack
+                self._suppress_events = any(ctx.get("is_helper") for ctx in self.stack)
+
+    def push_action(self, action_id: str, action_type: str):
+        """Push an action onto the context stack."""
+        self.stack.append({
+            "type": "action",
+            "id": action_id,
+            "action_type": action_type,
+        })
+
+    def pop_action(self):
+        """Pop an action from the context stack."""
+        if self.stack:
+            self.stack.pop()
+
+    def get_hierarchy_metadata(self, action_id: str | None = None,
+                               is_expandable: bool = False) -> HierarchyMetadata:
+        """Get hierarchy metadata for the current context."""
+        nesting_level = len(self.stack)
+        parent_id = None
+        workflow_name = None
+
+        # Find parent and workflow name
+        if self.stack:
+            # Parent is the last item in the stack
+            parent = self.stack[-1]
+            parent_id = parent.get("id")
+
+            # Find the nearest workflow in the stack
+            for ctx in reversed(self.stack):
+                if ctx.get("type") == "workflow":
+                    workflow_name = ctx.get("name")
+                    break
+
+        return HierarchyMetadata(
+            parent_id=parent_id,
+            nesting_level=nesting_level,
+            workflow_name=workflow_name,
+            is_expandable=is_expandable
+        )
+
+    def should_suppress_events(self) -> bool:
+        """Check if events should be suppressed (for helper workflows)."""
+        return self._suppress_events
+
+    def get_nesting_level(self) -> int:
+        """Get current nesting level."""
+        return len(self.stack)
+
+
 class QontinuiExecutor:
     """Executor that uses the Qontinui library for real automation."""
 
@@ -109,10 +228,32 @@ class QontinuiExecutor:
         self.screenshot_dir = None  # Screenshot directory for screenshot mode
         self.settings = None  # FrameworkSettings instance
         self._last_find_location = None  # Store location of most recent FIND result for "Last Find Result" clicks
+        self.action_executor = None  # ActionExecutor instance (initialized in load_configuration)
+
+        # Execution context for hierarchical logging
+        self.execution_context = ExecutionContext()
 
         if QONTINUI_AVAILABLE:
-            self.actions = FluentActions()
+            # Get framework settings
             self.settings = get_settings()
+
+            # Initialize EventTranslator for callback management
+            # EventTranslator handles all event translation from qontinui library to frontend format
+            # Pass _get_state_for_image as state_lookup callback to add state info to events
+            # Pass _get_current_hierarchy as hierarchy_lookup callback to add hierarchy info to events
+            self.event_translator = EventTranslator(
+                self._emit_event_wrapper,
+                state_lookup=self._get_state_for_image,
+                hierarchy_lookup=self._get_current_hierarchy
+            )
+            self.event_translator.register_all_callbacks()
+
+            # Verify callbacks were registered
+            from qontinui.reporting import get_event_registry
+            event_registry = get_event_registry()
+            self._emit_log("debug", f"[INIT] Event registry has_listeners: {event_registry.has_listeners}")
+            self._emit_log("debug", f"[INIT] Event registry MATCH_ATTEMPTED callbacks: {len(event_registry._callbacks.get(QontinuiEventType.MATCH_ATTEMPTED, []))}")
+            self._emit_log("debug", f"[INIT] EventTranslator initialized and callbacks registered")
 
         self._emit_event(
             EventType.READY,
@@ -134,6 +275,197 @@ class QontinuiExecutor:
     def _emit_log(self, level: str, message: str):
         """Emit log message."""
         self._emit_event(EventType.LOG, {"level": level, "message": message})
+
+    def _emit_action_event(self, event_type: EventType, data: dict[str, Any],
+                          hierarchy: HierarchyMetadata | None = None):
+        """Emit an action-related event with hierarchy information.
+
+        Args:
+            event_type: Type of event to emit
+            data: Event data
+            hierarchy: Optional hierarchy metadata. If None, will be fetched from execution context
+        """
+        # Don't emit if we're in a helper workflow
+        if self.execution_context.should_suppress_events():
+            return
+
+        # Add hierarchy information to the event data
+        if hierarchy is None:
+            # Check if we're currently inside an action execution
+            # If so, we need to use the action's parent as parent_id, not the action itself
+            stack = self.execution_context.stack
+            if stack and stack[-1].get("type") == "action":
+                # Currently executing an action - get hierarchy from parent context
+                # Temporarily pop the action to get parent's hierarchy
+                action_ctx = stack.pop()
+                hierarchy = self.execution_context.get_hierarchy_metadata(
+                    action_id=data.get("action_id")
+                )
+                # Restore the action to the stack
+                stack.append(action_ctx)
+            else:
+                # Not inside an action, get hierarchy normally
+                hierarchy = self.execution_context.get_hierarchy_metadata(
+                    action_id=data.get("action_id")
+                )
+
+        # Merge hierarchy data into event data
+        data_with_hierarchy = {**data, "hierarchy": hierarchy.to_dict()}
+
+        # DEBUG: Log hierarchy for troubleshooting
+        if event_type in [EventType.ACTION_STARTED, EventType.ACTION_EXECUTION]:
+            self._emit_log("debug", f"{event_type.name} hierarchy: action_id={data.get('action_id')}, parent={hierarchy.parent_id}, level={hierarchy.nesting_level}, workflow={hierarchy.workflow_name}")
+
+        self._emit_event(event_type, data_with_hierarchy)
+
+    def _emit_workflow_event(self, event_type: EventType, data: dict[str, Any]):
+        """Emit a workflow-related event with hierarchy information.
+
+        Workflow events are emitted for WORKFLOW_STARTED and WORKFLOW_COMPLETED.
+        They are suppressed for helper workflows.
+
+        Args:
+            event_type: Type of event (WORKFLOW_STARTED or WORKFLOW_COMPLETED)
+            data: Event data containing workflow_id, workflow_name, etc.
+        """
+        # Check if this is a helper workflow (by ID prefix)
+        # We check the workflow_id directly since workflow_started is emitted before push
+        workflow_id = data.get("workflow_id", "")
+        is_helper = workflow_id.startswith("wf-helper-")
+
+        # Don't emit if we're in a helper workflow or if this is a helper workflow
+        if is_helper or self.execution_context.should_suppress_events():
+            self._emit_log("debug", f"SUPPRESSED workflow event: {data.get('workflow_name')} (helper workflow)")
+            return
+
+        # Get hierarchy metadata
+        hierarchy = self.execution_context.get_hierarchy_metadata()
+
+        # Adjust nesting level for workflow events
+        # workflow_started is emitted BEFORE push, so stack doesn't include this workflow yet
+        # workflow_completed is emitted AFTER pop, so stack doesn't include this workflow anymore
+        # Therefore, we add 1 to reflect the workflow's actual position in the hierarchy
+        adjusted_hierarchy = HierarchyMetadata(
+            parent_id=hierarchy.parent_id,
+            nesting_level=hierarchy.nesting_level + 1,
+            workflow_name=hierarchy.workflow_name,
+            is_expandable=hierarchy.is_expandable
+        )
+
+        # DEBUG: Log workflow event
+        self._emit_log("debug", f"{event_type.value.upper()}: {data.get('workflow_name')} (parent={adjusted_hierarchy.parent_id}, level={adjusted_hierarchy.nesting_level})")
+
+        # Add hierarchy and mark as expandable
+        data_with_hierarchy = {
+            **data,
+            "hierarchy": adjusted_hierarchy.to_dict(),
+            "is_workflow": True,  # Mark this as a workflow event for frontend
+        }
+        self._emit_event(event_type, data_with_hierarchy)
+
+    def _emit_event_wrapper(self, event_type: str, data: dict[str, Any]):
+        """Wrapper for EventTranslator to convert string event names to EventType enum.
+
+        This method acts as a bridge between EventTranslator (which uses string event names)
+        and _emit_event (which expects EventType enum values).
+
+        Args:
+            event_type: String event type name (e.g., "image_recognition", "action_execution")
+            data: Event data dictionary
+        """
+        # Map string event names to EventType enum values
+        event_type_map = {
+            "image_recognition": EventType.IMAGE_RECOGNITION,
+            "action_execution": EventType.ACTION_EXECUTION,
+            "action_started": EventType.ACTION_STARTED,
+            "action_completed": EventType.ACTION_COMPLETED,
+            "match_found": EventType.MATCH_FOUND,
+            "screenshot_taken": EventType.SCREENSHOT_TAKEN,
+            "log": EventType.LOG,
+        }
+
+        # Get the EventType enum value, defaulting to LOG if not found
+        enum_event_type = event_type_map.get(event_type, EventType.LOG)
+
+        # If we had to fallback to LOG, add a prefix to the data
+        if enum_event_type == EventType.LOG and event_type not in event_type_map:
+            data = {**data, "original_event_type": event_type}
+
+        # Emit the event using the existing method
+        self._emit_event(enum_event_type, data)
+
+    # NOTE: _capture_qontinui_output() and _parse_and_emit_qontinui_log() have been REMOVED.
+    # The log parsing infrastructure has been replaced with structured events from the library.
+    # Events are now emitted directly by the library via EventTranslator callbacks (line ~141):
+    # - TEXT_TYPED events: handled by EventTranslator.on_text_typed()
+    # - MATCH_ATTEMPTED events: handled by EventTranslator.on_match_attempted()
+    # The library uses standard Python logging which doesn't output to stdout by default.
+
+    def _get_current_hierarchy(self) -> dict[str, Any]:
+        """Get current execution hierarchy from execution context.
+
+        This callback is used by EventTranslator to add hierarchy information
+        to events emitted by the library's ActionExecutor.
+
+        When library executes nested actions (e.g., TYPE inside GO_TO_STATE),
+        the parent action is already on the stack. We get hierarchy normally,
+        which will correctly set parent_id to the action on top of the stack.
+
+        Returns:
+            Dictionary with hierarchy fields: parent_id, nesting_level, workflow_name, is_expandable
+        """
+        # Get hierarchy from current execution context
+        # If an action is on the stack (e.g., GO_TO_STATE), its action_id becomes the parent_id
+        hierarchy = self.execution_context.get_hierarchy_metadata()
+
+        # Add +1 to nesting level for the library-executed action
+        # Example: If GO_TO_STATE is at level 1, TYPE inside it should be level 2
+        return {
+            "parent_id": hierarchy.parent_id,
+            "nesting_level": hierarchy.nesting_level + 1,
+            "workflow_name": hierarchy.workflow_name,
+            "is_expandable": False  # Library actions are not expandable
+        }
+
+    def _get_state_for_image(self, image_id: str) -> str | None:
+        """Find which state an image belongs to.
+
+        Args:
+            image_id: ID of the image to check
+
+        Returns:
+            State name if found, None otherwise
+        """
+        if not self.config:
+            self._emit_log("debug", f"_get_state_for_image: No config available for image {image_id}")
+            return None
+
+        states = self.config.get("states", [])
+        self._emit_log("debug", f"_get_state_for_image: Checking {len(states)} states for image {image_id}")
+
+        for state in states:
+            state_name = state.get("name")
+            state_images = state.get("stateImages", [])
+
+            for state_image in state_images:
+                state_image_id = state_image.get("id")
+                state_image_name = state_image.get("name")
+
+                # Check if this is the state image ID
+                if state_image_id == image_id:
+                    self._emit_log("debug", f"_get_state_for_image: Found image {image_id} as state image in state '{state_name}'")
+                    return state_name
+
+                # Check if this image is used in any pattern
+                patterns = state_image.get("patterns", [])
+                for pattern in patterns:
+                    pattern_image_id = pattern.get("image")
+                    if pattern_image_id == image_id:
+                        self._emit_log("debug", f"_get_state_for_image: Found image {image_id} in pattern of state image '{state_image_name}' in state '{state_name}'")
+                        return state_name
+
+        self._emit_log("debug", f"_get_state_for_image: Image {image_id} not found in any state")
+        return None
 
     def _get_best_match_regardless_of_threshold(self, image_id: str) -> dict:
         """Get best match info even if it doesn't meet threshold.
@@ -204,24 +536,38 @@ class QontinuiExecutor:
         # Get image information
         image_obj = self.images[image_id]
 
+        # Get display name for the image (prefer name over ID)
+        display_name = image_id  # Default to ID
+        if hasattr(image_obj, "name") and image_obj.name:
+            display_name = image_obj.name
+        elif isinstance(image_obj, dict) and "name" in image_obj:
+            display_name = image_obj["name"]
+
         # Try to get template size from Image object
+        template_size = ""
         try:
-            if hasattr(image_obj, "width") and hasattr(image_obj, "height"):
-                template_size = f"{image_obj.width}x{image_obj.height}"
-            else:
-                template_size = "unknown"
-        except Exception:
-            template_size = "unknown"
+            if hasattr(image_obj, "mat") and image_obj.mat is not None:
+                # OpenCV mat format: (height, width, channels)
+                template_size = f"{image_obj.mat.shape[1]}, {image_obj.mat.shape[0]}"
+            elif hasattr(image_obj, '_pattern') and hasattr(image_obj._pattern, 'mat'):
+                template_size = f"{image_obj._pattern.mat.shape[1]}, {image_obj._pattern.mat.shape[0]}"
+            elif hasattr(image_obj, "width") and hasattr(image_obj, "height"):
+                template_size = f"{image_obj.width}, {image_obj.height}"
+        except Exception as e:
+            self._emit_log("debug", f"Could not get template size: {e}")
 
         # Try to get screenshot size
-        screenshot_size = "unknown"
+        screenshot_size = "1920, 1080"  # Default from screen capture
         try:
             from PIL import ImageGrab
 
             screenshot = ImageGrab.grab()
-            screenshot_size = f"{screenshot.width}x{screenshot.height}"
+            screenshot_size = f"{screenshot.width}, {screenshot.height}"
         except Exception:
             pass
+
+        # Get state information for this image
+        state_name = self._get_state_for_image(image_id)
 
         if matches:
             # Get confidence from first match
@@ -230,34 +576,53 @@ class QontinuiExecutor:
             location = f"({getattr(first_match, 'x', 0)}, {getattr(first_match, 'y', 0)})"
 
             # Emit event for successful match
+            self._emit_log(
+                "debug",
+                f"[EXECUTOR] Values: threshold={threshold}, confidence={confidence}",
+            )
+
             event_data = {
-                "image_path": image_id,
+                "image_path": display_name,
                 "template_size": template_size,
                 "screenshot_size": screenshot_size,
-                "threshold": threshold,
-                "confidence": confidence,
+                "threshold": threshold,  # Send raw 0.0-1.0 value
+                "confidence": confidence,  # Send raw 0.0-1.0 value
                 "found": True,
                 "location": location,
                 "gap": threshold - confidence if confidence < threshold else 0,
                 "percent_off": (
-                    ((threshold - confidence) / threshold * 100) if confidence < threshold else 0
+                    ((threshold - confidence) / threshold) if confidence < threshold else 0
                 ),
             }
+
+            # Add state information if available
+            if state_name:
+                event_data["state"] = state_name
+
             self._emit_log(
                 "debug",
-                f"Emitting IMAGE_RECOGNITION event (FOUND): {image_id}, confidence: {confidence}",
+                f"Emitting IMAGE_RECOGNITION event (FOUND): {image_id}, threshold={threshold}, confidence={confidence}, state: {state_name or 'N/A'}",
             )
             self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
         else:
             # Build event data for no match found
+            self._emit_log(
+                "debug",
+                f"[EXECUTOR] Threshold for NOT FOUND: {threshold}",
+            )
+
             event_data = {
-                "image_path": image_id,
+                "image_path": display_name,
                 "template_size": template_size,
                 "screenshot_size": screenshot_size,
-                "threshold": threshold,
+                "threshold": threshold,  # Send raw 0.0-1.0 value
                 "confidence": 0.0,
                 "found": False,
             }
+
+            # Add state information if available
+            if state_name:
+                event_data["state"] = state_name
 
             # Add best match information if available
             if best_match_info:
@@ -265,17 +630,22 @@ class QontinuiExecutor:
                 best_x = best_match_info.get("x", 0)
                 best_y = best_match_info.get("y", 0)
 
-                event_data["confidence"] = best_confidence
+                self._emit_log(
+                    "debug",
+                    f"[EXECUTOR] Best match confidence: {best_confidence}",
+                )
+
+                event_data["confidence"] = best_confidence  # Send raw 0.0-1.0 value
                 event_data["best_match_location"] = f"({best_x}, {best_y})"
                 event_data["gap"] = threshold - best_confidence
                 event_data["percent_off"] = (
-                    ((threshold - best_confidence) / threshold * 100) if threshold > 0 else 0
+                    ((threshold - best_confidence) / threshold) if threshold > 0 else 0
                 )
 
             # Emit event
             self._emit_log(
                 "debug",
-                f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_id}, best_match: {best_match_info is not None}",
+                f"Emitting IMAGE_RECOGNITION event (NOT FOUND): {image_id}, threshold={threshold}, confidence={event_data.get('confidence', 0)}, best_match: {best_match_info is not None}, state: {state_name or 'N/A'}",
             )
             self._emit_event(EventType.IMAGE_RECOGNITION, event_data)
 
@@ -387,10 +757,18 @@ class QontinuiExecutor:
                     # Create Qontinui Image object if library is available
                     if QONTINUI_AVAILABLE:
                         image_obj = Image.from_file(img_path)
+
+                        # Validate that the image loaded successfully
+                        if image_obj.is_empty():
+                            self._emit_log("error", f"Image {img_id} failed to load - PIL image is empty (width=0, height=0)")
+                            self._emit_log("error", f"Check if base64 data is valid for image: {img_name}")
+                            # Still register it so we don't crash, but it won't work
+                        else:
+                            self._emit_log("debug", f"Loaded and registered image: {img_id} -> {img_path} ({image_obj.width}x{image_obj.height})")
+
                         self.images[img_id] = image_obj
                         # Register image in library's registry for state/transition loading
                         registry.register_image(img_id, image_obj)
-                        self._emit_log("debug", f"Loaded and registered image: {img_id} -> {img_path}")
                     else:
                         # Store path for testing purposes
                         self.images[img_id] = {"path": img_path}
@@ -485,7 +863,11 @@ class QontinuiExecutor:
                 workflow_id = workflow.get("id")
                 workflow_name = workflow.get("name", workflow_id)
                 actions = workflow.get("actions", [])
-                self.workflows[workflow_id] = actions
+                # Store both actions and name for hierarchical logging
+                self.workflows[workflow_id] = {
+                    "actions": actions,
+                    "name": workflow_name
+                }
 
                 # Register workflow in library's registry for transition loading
                 if QONTINUI_AVAILABLE:
@@ -503,8 +885,36 @@ class QontinuiExecutor:
                         self._emit_log("error", "Failed to initialize navigation system - check configuration")
                 except Exception as e:
                     self._emit_log("warning", f"Failed to initialize navigation: {e}")
-                    import traceback
                     self._emit_log("debug", f"Traceback: {traceback.format_exc()}")
+
+            # Parse config into QontinuiConfig and initialize StateExecutor
+            # This must happen AFTER navigation is initialized
+            if QONTINUI_AVAILABLE:
+                try:
+                    # Parse JSON config into QontinuiConfig object
+                    config_parser = ConfigParser()
+                    self.qontinui_config = config_parser.parse_config(self.config)
+                    self._emit_log("info", f"Parsed config into QontinuiConfig: {len(self.qontinui_config.workflows)} workflows, {len(self.qontinui_config.states)} states")
+
+                    # Initialize StateExecutor which creates its own ActionExecutor
+                    # StateExecutor handles state machine execution (GO_TO_STATE, etc.)
+                    # and internally creates ActionExecutor with itself as the state_executor
+                    from qontinui.json_executor.state_executor import StateExecutor
+
+                    self.state_executor = StateExecutor(config=self.qontinui_config)
+                    self.state_executor.initialize()
+
+                    # Use the StateExecutor's ActionExecutor for action execution
+                    # This ensures GO_TO_STATE and other state-based actions work correctly
+                    self.action_executor = self.state_executor.action_executor
+
+                    self._emit_log("info", "StateExecutor and ActionExecutor initialized - library will handle all GUI actions")
+                except Exception as e:
+                    self._emit_log("error", f"Failed to initialize StateExecutor: {e}")
+                    self._emit_log("debug", f"Traceback: {traceback.format_exc()}")
+                    # Fall back to None - execution will fail but won't crash
+                    self.action_executor = None
+                    self.state_executor = None
 
             config_info = {
                 "path": config_path,
@@ -533,492 +943,155 @@ class QontinuiExecutor:
             return False
 
     def _execute_action(self, action_data: dict[str, Any]) -> bool:
-        """Execute a single action using Qontinui."""
+        """Execute a single action by delegating to the library's ActionExecutor.
+
+        The runner's role is to:
+        - Track execution hierarchy for frontend display
+        - Emit workflow/action lifecycle events
+        - Coordinate workflow execution
+
+        The library's ActionExecutor handles:
+        - All GUI action execution (clicks, typing, image finding, etc.)
+        - Action retries and error handling
+        - Action-specific event emission
+        """
         action_type = action_data.get("type")
+        action_id = action_data.get("id", f"action-{action_type}-{id(action_data)}")
         config = action_data.get("config", {})
 
-        self._emit_log("info", f"Executing action: {action_type}")
+        # Determine if action is expandable (contains sub-workflows)
+        is_expandable = action_type in ["GO_TO_STATE", "RUN_WORKFLOW", "RUN_PROCESS"]
 
-        # Handle missing actions library
-        if not QONTINUI_AVAILABLE or not hasattr(self, "actions"):
-            self._emit_log("warning", f"Simulating action: {action_type}")
-            time.sleep(0.5)  # Simulate action delay
-            return True
+        # Get hierarchy metadata BEFORE pushing action onto stack
+        # This ensures parent_id references the containing workflow, not this action itself
+        hierarchy = self.execution_context.get_hierarchy_metadata(
+            action_id=action_id,
+            is_expandable=is_expandable
+        )
+
+        # Adjust nesting level for actions (same as workflows)
+        # Actions are emitted BEFORE push, so stack doesn't include this action yet
+        # Add +1 to reflect the action's actual position in the hierarchy
+        adjusted_hierarchy = HierarchyMetadata(
+            parent_id=hierarchy.parent_id,
+            nesting_level=hierarchy.nesting_level + 1,
+            workflow_name=hierarchy.workflow_name,
+            is_expandable=hierarchy.is_expandable
+        )
+
+        # Now push action onto execution context stack
+        self.execution_context.push_action(action_id, action_type)
 
         try:
-            self._emit_event(
+            self._emit_log("info", f"Executing action: {action_type}")
+
+            # Handle missing action executor
+            if not QONTINUI_AVAILABLE or not self.action_executor:
+                self._emit_log("warning", f"Simulating action: {action_type} (ActionExecutor not available)")
+                time.sleep(0.5)  # Simulate action delay
+                return True
+
+            # Emit ACTION_STARTED event with adjusted hierarchy (suppressed for helper workflows)
+            self._emit_action_event(
                 EventType.ACTION_STARTED,
-                {"action_id": action_data.get("id"), "action_type": action_type},
+                {
+                    "action_id": action_id,
+                    "action_type": action_type
+                },
+                hierarchy=adjusted_hierarchy
             )
 
-            if action_type == "CLICK":
-                target = config.get("target", {})
+            # Convert action_data to Action object for library
+            from qontinui.json_executor.config_parser import Action as ConfigAction
 
-                # Handle string targets (like "Last Find Result")
-                if isinstance(target, str):
-                    if target == "Last Find Result":
-                        if self._last_find_location:
-                            self.actions.click(self._last_find_location)
-                            self._emit_log("info", f"Clicked at last find location: {self._last_find_location}")
-                        else:
-                            self._emit_log("error", "CLICK - No previous find result available")
-                            return False
-                    else:
-                        self._emit_log("error", f"CLICK - Unknown string target: {target}")
-                        return False
-                # Handle dictionary targets (image or coordinates)
-                elif isinstance(target, dict):
-                    self._emit_log("info", f"CLICK action - target type: {target.get('type')}")
-                    if target.get("type") == "image":
-                        image_id = target.get("imageId")
-                        self._emit_log("info", f"CLICK - Looking for image: {image_id}")
-                        if image_id in self.images:
-                            # Get similarity/threshold from target config (default 0.9)
-                            threshold = target.get("threshold", config.get("similarity", 0.9))
+            action = ConfigAction(
+                id=action_id,
+                type=action_type,
+                config=config,
+                timeout=action_data.get("timeout", 5000),
+                retry_count=action_data.get("retry_count", 3),
+                continue_on_error=action_data.get("continue_on_error", False)
+            )
 
-                            # Find image on screen with configured threshold
-                            results = Find(self.images[image_id]).similarity(threshold).execute()
-                            matches = results.matches
+            # Delegate to library's ActionExecutor
+            # The library handles:
+            # - All GUI execution (mouse, keyboard, screen capture)
+            # - Image recognition and template matching
+            # - Action retries and timing
+            # - Event emission (via EventTranslator callbacks)
+            success = self.action_executor.execute_action(action)
 
-                            # If no matches, get best match info anyway
-                            best_match_info = None
-                            if not matches:
-                                best_match_info = self._get_best_match_regardless_of_threshold(image_id)
+            # Sync last_find_location from library if available
+            if hasattr(self.action_executor, 'last_find_location') and self.action_executor.last_find_location:
+                from qontinui import Location
+                loc = self.action_executor.last_find_location
+                self._last_find_location = Location(loc[0], loc[1])
+                self._emit_log("debug", f"Synced last_find_location from library: {self._last_find_location}")
 
-                            # Emit image recognition event
-                            self._emit_image_recognition_event(
-                                image_id, matches, threshold, best_match_info
-                            )
-
-                            if matches:
-                                # Click on first match
-                                location = matches[0].location
-                                self.actions.click(location)
-                                self._emit_log("info", f"Clicked at {location}")
-                            else:
-                                self._emit_log("warning", f"Image {image_id} not found on screen")
-                                return False
-                    elif target.get("type") == "coordinates":
-                        x = target.get("x", 0)
-                        y = target.get("y", 0)
-                        location = Location(x, y)
-                        self.actions.click(location)
-                        self._emit_log("info", f"Clicked at ({x}, {y})")
-                # Fallback: check for x,y directly in config (legacy format)
-                elif "x" in config and "y" in config:
-                    x = config.get("x", 0)
-                    y = config.get("y", 0)
-                    location = Location(x, y)
-                    self.actions.click(location)
-                    self._emit_log("info", f"Clicked at ({x}, {y}) [legacy format]")
-
-            elif action_type == "TYPE":
-                # Get text from config or from stateString
-                text_source = config.get("textSource", "direct")
-                if text_source == "stateString":
-                    # Load text from state string
-                    selected_state = config.get("selectedState")
-                    selected_strings = config.get("selectedStateStrings", [])
-                    text = ""
-
-                    if selected_state and selected_strings and self.config:
-                        # Find the state in config
-                        states = self.config.get("states", [])
-                        for state in states:
-                            if state.get("name") == selected_state or state.get("id") == selected_state:
-                                # Find the string in the state
-                                for string_id in selected_strings:
-                                    for state_string in state.get("strings", []):
-                                        if state_string.get("id") == string_id:
-                                            text = state_string.get("value", "")
-                                            self._emit_log("debug", f"Loaded text from stateString {string_id}: '{text}'")
-                                            break
-                                    if text:
-                                        break
-                                break
-
-                    if not text:
-                        self._emit_log("warning", f"Could not load text from stateString (state={selected_state}, strings={selected_strings})")
-                else:
-                    text = config.get("text", "")
-
-                clear_before = config.get("clear_before", False)
-                press_enter = config.get("press_enter", False)
-                pause_before_begin = (
-                    config.get("pause_before_begin", 0) / 1000.0
-                )  # Convert ms to seconds
-                pause_after_end = config.get("pause_after_end", 0) / 1000.0  # Convert ms to seconds
-
-                # Apply pause before beginning (matches Qontinui's pause_before_begin)
-                if pause_before_begin > 0:
-                    self._emit_log("debug", f"Pausing {pause_before_begin}s before typing")
-                    time.sleep(pause_before_begin)
-
-                # Clear existing text if requested
-                if clear_before:
-                    # Standard approach: Select all text (Ctrl+A) then type over it
-                    # This works across most applications and operating systems
-                    self._emit_log("info", "Clearing text field (Ctrl+A)")
-                    if hasattr(self.actions, "key_combo"):
-                        self.actions.key_combo(["ctrl", "a"])
-                    elif hasattr(self.actions, "hotkey"):
-                        self.actions.hotkey("ctrl", "a")
-                    else:
-                        # Fallback: Try to select all text manually
-                        self._emit_log(
-                            "warning", "Key combo not available, attempting manual select-all"
-                        )
-                        # This is a simplified fallback - actual implementation would depend on the library
-                    time.sleep(0.1)  # Small delay to ensure selection completes
-
-                # Process special key placeholders
-                processed_text = self._process_special_keys(text)
-                if hasattr(self.actions, "type_text"):
-                    # FluentActions uses builder pattern - must call execute() to actually type
-                    self.actions.type_text(processed_text).execute()
-                    self.actions.clear()  # Clear the chain for next use
-                elif hasattr(self.actions, "type"):
-                    self.actions.type(processed_text)
-                self._emit_log("info", f"Typed: {text}")
-
-                # Note: The {ENTER} placeholder in the text is already handled by _process_special_keys
-                # The press_enter flag is kept for backward compatibility but may be redundant
-                # if the frontend adds {ENTER} to the text when press_enter is checked
-                if press_enter and not text.endswith("{ENTER}"):
-                    # Only press Enter if it wasn't already in the text as a placeholder
-                    self._emit_log("info", "Pressing Enter key (from press_enter flag)")
-                    if hasattr(self.actions, "key"):
-                        # FluentActions uses builder pattern - must call execute()
-                        self.actions.key("enter").execute()
-                        self.actions.clear()
-                    elif hasattr(self.actions, "key_press"):
-                        self.actions.key_press("enter")
-                    elif hasattr(self.actions, "type_text"):
-                        self.actions.type_text("\n").execute()
-                        self.actions.clear()
-                    elif hasattr(self.actions, "type"):
-                        self.actions.type("\n")
-
-                # Apply pause after end (matches Qontinui's pause_after_end)
-                if pause_after_end > 0:
-                    self._emit_log("debug", f"Pausing {pause_after_end}s after typing")
-                    time.sleep(pause_after_end)
-
-            elif action_type == "WAIT":
-                duration = config.get("duration", 1000) / 1000.0  # Convert ms to seconds
-                time.sleep(duration)
-                self._emit_log("info", f"Waited {duration} seconds")
-
-            elif action_type == "FIND":
-                image_id = config.get("image") or config.get("imageId")
-                self._emit_log("info", f"FIND action - Looking for image: {image_id}")
-                if image_id and image_id in self.images:
-                    # Get similarity/threshold from config (default 0.9)
-                    threshold = config.get("similarity", 0.9)
-                    if "threshold" in config:
-                        threshold = config["threshold"]
-
-                    self._emit_log("debug", f"FIND - Using threshold: {threshold}, config keys: {config.keys()}")
-                    self._emit_log("debug", f"FIND - Config similarity: {config.get('similarity')}, threshold: {config.get('threshold')}")
-
-                    # Perform find operation with configured threshold
-                    find_obj = Find(self.images[image_id]).similarity(threshold)
-                    self._emit_log("debug", f"FIND - Created Find object with threshold {threshold}")
-
-                    # Debug: Check actual threshold values AFTER setting
-                    if hasattr(find_obj, '_options') and hasattr(find_obj._options, '_min_similarity'):
-                        actual_min_sim = find_obj._options._min_similarity
-                        self._emit_log("debug", f"FIND - FindOptions._min_similarity is actually: {actual_min_sim}")
-
-                    # Check the pattern's threshold
-                    if hasattr(find_obj, '_target') and find_obj._target:
-                        pattern_threshold = getattr(find_obj._target, 'similarity_threshold', 'N/A')
-                        self._emit_log("debug", f"FIND - Pattern similarity_threshold: {pattern_threshold}")
-
-                    # Check the options
-                    if hasattr(find_obj, '_options'):
-                        self._emit_log("debug", f"FIND - Options object: {find_obj._options}")
-
-                    results = find_obj.execute()
-                    self._emit_log("debug", f"FIND - Execute returned results object: {results}")
-                    self._emit_log("debug", f"FIND - Results type: {type(results)}, has matches: {hasattr(results, 'matches')}")
-
-                    matches = results.matches
-                    self._emit_log("debug", f"FIND - Matches: {matches}, type: {type(matches)}, len: {len(matches) if matches else 0}")
-
-                    # If no matches, get best match info anyway
-                    best_match_info = None
-                    if not matches:
-                        best_match_info = self._get_best_match_regardless_of_threshold(image_id)
-
-                        # Save debug screenshots when FIND fails
-                        try:
-                            import os
-                            from datetime import datetime
-                            debug_dir = os.path.join(os.path.dirname(self.images[image_id]), "debug_screenshots")
-                            os.makedirs(debug_dir, exist_ok=True)
-
-                            # Save current screenshot
-                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                            screenshot_path = os.path.join(debug_dir, f"{image_id}_{timestamp}_screenshot.png")
-
-                            # Capture and save current screen
-                            from qontinui.hal.factory import HALFactory
-                            screen_capture = HALFactory.get_screen_capture()
-                            screenshot = screen_capture.capture_screen()
-                            screenshot.save(screenshot_path)
-
-                            # Copy template for comparison
-                            import shutil
-                            template_path = os.path.join(debug_dir, f"{image_id}_{timestamp}_template.png")
-                            shutil.copy(self.images[image_id], template_path)
-
-                            self._emit_log("info", f"DEBUG: Saved screenshot to {screenshot_path}")
-                            self._emit_log("info", f"DEBUG: Saved template to {template_path}")
-                        except Exception as e:
-                            self._emit_log("warning", f"Failed to save debug screenshots: {e}")
-
-                    # Emit image recognition event
-                    self._emit_image_recognition_event(
-                        image_id, matches, threshold, best_match_info
-                    )
-
-                    if matches:
-                        self._emit_log("info", f"Found {len(matches)} matches for image {image_id}")
-                        # Store first match location for "Last Find Result" clicks
-                        self._last_find_location = matches[0].location
-                        self._emit_log("debug", f"Stored last find location: {self._last_find_location}")
-                        self._emit_event(
-                            EventType.MATCH_FOUND, {"image_id": image_id, "matches": len(matches)}
-                        )
-                    else:
-                        self._emit_log("warning", f"Image {image_id} not found on screen")
-                        return False
-                else:
-                    self._emit_log("warning", "Image not specified or not loaded for FIND action")
-                    return False
-
-            elif action_type == "SCROLL":
-                direction = config.get("direction", "down")
-                amount = config.get("amount", 3)
-                # Simple scroll simulation
-                self._emit_log("info", f"Scrolling {direction} by {amount} units")
-                time.sleep(0.5)  # Simulate scroll time
-
-            elif action_type == "GO_TO_STATE":
-                # GO_TO_STATE action - navigate to specified states using library's navigation API
-                # The library accepts state names (strings) and converts them to IDs internally
-                # Check for both stateIds (preferred) and stateNames (for backward compatibility)
-                state_names = config.get("stateIds", config.get("stateNames", []))
-
-                if not state_names:
-                    self._emit_log("error", "GO_TO_STATE action missing 'stateIds' or 'stateNames' in config")
-                    return False
-
-                self._emit_log("info", f"GO_TO_STATE - Navigating to states: {state_names}")
-
-                # CRITICAL: Inject workflow executor so navigation system can execute transition workflows
-                # The executor (self) can execute workflows via execute_workflow()
+            # For workflow-executing actions, inject the runner as workflow executor
+            # This allows the library to call back to the runner for nested workflow execution
+            if action_type in ["GO_TO_STATE", "RUN_WORKFLOW", "RUN_PROCESS"]:
                 navigation_api.set_workflow_executor(self)
 
-                # Use the library's navigation API - pass state names as strings
-                # The library will convert them to IDs and handle all state management internally
-                success = navigation_api.open_states(state_names)
+            # Emit ACTION_EXECUTION event with hierarchy for frontend display
+            # The library emits its own action_execution events, but they don't have hierarchy
+            # So we emit our own with full context
+            action_execution_data = {
+                "action_id": action_id,
+                "action_type": action_type,
+                "success": success,
+                "attempts": getattr(action, 'retry_count', 1) + 1 if not success else 1,
+                "config": config,
+            }
 
-                if success:
-                    self._emit_log("info", f"Successfully navigated to states: {state_names}")
-                else:
-                    self._emit_log("warning", f"Failed to navigate to states: {state_names}")
+            # Add action-specific fields for frontend display
+            if action_type == "GO_TO_STATE" and "stateNames" in config:
+                action_execution_data["target_states"] = config.get("stateNames", [])
+            elif action_type == "TYPE" and "text" in config:
+                action_execution_data["typed_text"] = config.get("text", "")
+            elif action_type == "RUN_WORKFLOW":
+                # Will be populated by workflow execution
+                pass
 
-                return success
-
-            elif action_type in ("RUN_WORKFLOW", "RUN_PROCESS"):
-                workflow_id = config.get("workflow") or config.get("workflowId")
-                if not workflow_id:
-                    self._emit_log("error", f"No workflow ID in config: {config}")
-                    return False
-
-                self._emit_log("info", f"RUN_WORKFLOW - Running nested workflow: {workflow_id}")
-                self._emit_log("debug", f"Nested workflow exists: {workflow_id in self.workflows}")
-                if workflow_id in self.workflows:
-                    self._emit_log("debug", f"Nested workflow has {len(self.workflows[workflow_id])} actions")
-                return self._execute_workflow(workflow_id)
-
-            elif action_type == "VANISH":
-                image_id = config.get("image") or config.get("imageId")
-                timeout = config.get("timeout", 5000) / 1000.0  # Convert to seconds
-                check_interval = config.get("check_interval", 500) / 1000.0
-                threshold = config.get("similarity", 0.9)
-
-                if image_id and image_id in self.images:
-                    start_time = time.time()
-                    while time.time() - start_time < timeout:
-                        results = Find(self.images[image_id]).similarity(threshold).execute()
-                        matches = results.matches
-
-                        # If no matches, get best match info anyway
-                        best_match_info = None
-                        if not matches:
-                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
-
-                        # Emit image recognition event for each check
-                        self._emit_image_recognition_event(
-                            image_id, matches, threshold, best_match_info
-                        )
-
-                        if not matches:
-                            self._emit_log("info", f"Image {image_id} has vanished")
-                            return True
-                        time.sleep(check_interval)
-
-                    self._emit_log("warning", f"Image {image_id} did not vanish within timeout")
-                    return False
-                else:
-                    self._emit_log("warning", "Image not specified for VANISH action")
-
-            elif action_type == "KEY":
-                key = config.get("key", "")
-                self.actions.key_press(key)
-                self._emit_log("info", f"Pressed key: {key}")
-
-            elif action_type == "DRAG":
-                from_target = config.get("from", {})
-                to_target = config.get("to", {})
-                threshold = config.get("similarity", 0.9)
-
-                # Get from location
-                from_loc = None
-                if from_target.get("type") == "image":
-                    image_id = from_target.get("imageId")
-                    if image_id in self.images:
-                        threshold = from_target.get("threshold", config.get("similarity", 0.9))
-                        results = Find(self.images[image_id]).similarity(threshold).execute()
-                        matches = results.matches
-
-                        # If no matches, get best match info anyway
-                        best_match_info = None
-                        if not matches:
-                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
-
-                        # Emit image recognition event for from location
-                        self._emit_image_recognition_event(
-                            image_id, matches, threshold, best_match_info
-                        )
-                        if matches:
-                            from_loc = matches[0].location
-                elif from_target.get("type") == "coordinates":
-                    from_loc = Location(from_target.get("x", 0), from_target.get("y", 0))
-
-                # Get to location
-                to_loc = None
-                if to_target.get("type") == "image":
-                    image_id = to_target.get("imageId")
-                    if image_id in self.images:
-                        threshold = to_target.get("threshold", config.get("similarity", 0.9))
-                        results = Find(self.images[image_id]).similarity(threshold).execute()
-                        matches = results.matches
-
-                        # If no matches, get best match info anyway
-                        best_match_info = None
-                        if not matches:
-                            best_match_info = self._get_best_match_regardless_of_threshold(image_id)
-
-                        # Emit image recognition event for to location
-                        self._emit_image_recognition_event(
-                            image_id, matches, threshold, best_match_info
-                        )
-                        if matches:
-                            to_loc = matches[0].location
-                elif to_target.get("type") == "coordinates":
-                    to_loc = Location(to_target.get("x", 0), to_target.get("y", 0))
-
-                if from_loc and to_loc:
-                    self.actions.drag(from_loc, to_loc)
-                    self._emit_log("info", f"Dragged from {from_loc} to {to_loc}")
-                else:
-                    self._emit_log("warning", "Could not find drag locations")
-                    return False
-
-            elif action_type == "IF":
-                condition = config.get("condition", {})
-                condition_type = condition.get("type")
-
-                if condition_type == "image_exists":
-                    image_id = condition.get("imageId")
-                    threshold = condition.get("threshold", config.get("similarity", 0.9))
-
-                    if image_id and image_id in self.images:
-                        self._emit_log("debug", f"IF - Checking if image exists: {image_id}")
-
-                        # Find image on screen
-                        results = Find(self.images[image_id]).similarity(threshold).execute()
-                        matches = results.matches
-
-                        # Store location for "Last Find Result" usage
-                        if matches:
-                            self._last_find_location = matches[0].location
-                            self._emit_log("debug", f"IF - Image found, stored location: {self._last_find_location}")
-                        else:
-                            self._emit_log("debug", f"IF - Image not found: {image_id}")
-
-                        # Execute then/else actions (currently empty in the config, so we skip this)
-                        # In the future, we could execute nested actions here
-
-                    else:
-                        self._emit_log("warning", f"IF - Image {image_id} not loaded")
-                else:
-                    self._emit_log("warning", f"IF - Unknown condition type: {condition_type}")
-
-            elif action_type == "MOUSE_MOVE":
-                target = config.get("target", {})
-
-                # Handle string targets (like "Last Find Result")
-                if isinstance(target, str):
-                    if target == "Last Find Result":
-                        if self._last_find_location:
-                            self.actions.move(self._last_find_location)
-                            self._emit_log("info", f"Moved mouse to last find location: {self._last_find_location}")
-                        else:
-                            self._emit_log("error", "MOUSE_MOVE - No previous find result available")
-                            return False
-                    else:
-                        self._emit_log("error", f"MOUSE_MOVE - Unknown string target: {target}")
-                        return False
-                # Handle dictionary targets (image or coordinates)
-                elif isinstance(target, dict):
-                    if target.get("type") == "image":
-                        image_id = target.get("imageId")
-                        if image_id in self.images:
-                            threshold = target.get("threshold", config.get("similarity", 0.9))
-                            results = Find(self.images[image_id]).similarity(threshold).execute()
-                            matches = results.matches
-
-                            if matches:
-                                location = matches[0].location
-                                self.actions.move(location)
-                                self._emit_log("info", f"Moved mouse to {location}")
-                            else:
-                                self._emit_log("warning", f"Image {image_id} not found for MOUSE_MOVE")
-                                return False
-                    elif target.get("type") == "coordinates":
-                        x = target.get("x", 0)
-                        y = target.get("y", 0)
-                        location = Location(x, y)
-                        self.actions.move(location)
-                        self._emit_log("info", f"Moved mouse to ({x}, {y})")
+            self._emit_action_event(
+                EventType.ACTION_EXECUTION,
+                action_execution_data,
+                hierarchy=adjusted_hierarchy
+            )
 
             self._emit_event(
-                EventType.ACTION_COMPLETED, {"action_id": action_data.get("id"), "success": True}
+                EventType.ACTION_COMPLETED, {"action_id": action_id, "success": success}
             )
-            return True
+            return success
 
         except Exception as e:
+            # Emit ACTION_EXECUTION event for failed action with hierarchy
+            action_execution_data = {
+                "action_id": action_id,
+                "action_type": action_type,
+                "success": False,
+                "attempts": 1,
+                "config": config,
+                "error": str(e),
+                "reason": str(e),
+            }
+
+            self._emit_action_event(
+                EventType.ACTION_EXECUTION,
+                action_execution_data,
+                hierarchy=adjusted_hierarchy
+            )
+
             self._emit_event(
                 EventType.ACTION_COMPLETED,
-                {"action_id": action_data.get("id"), "success": False, "error": str(e)},
+                {"action_id": action_id, "success": False, "error": str(e)},
             )
             self._emit_log("error", f"Action failed: {e}")
             return False
+
+        finally:
+            # Pop action from execution context stack
+            self.execution_context.pop_action()
 
     def _execute_workflow(self, workflow_id: str) -> bool:
         """Execute a workflow using manual execution (graph execution not available)."""
@@ -1026,26 +1099,57 @@ class QontinuiExecutor:
         return self._execute_workflow_manual(workflow_id)
 
     def _execute_workflow_manual(self, workflow_id: str) -> bool:
-        """Manual workflow execution."""
+        """Manual workflow execution with hierarchical context tracking."""
+        # Get workflow data (actions and name)
+        workflow_data = None
+        workflow_name = workflow_id  # Default to ID if name not found
+
         # Try local workflows first
         if workflow_id in self.workflows:
-            actions = self.workflows[workflow_id]
+            workflow_data = self.workflows[workflow_id]
+            if isinstance(workflow_data, dict):
+                actions = workflow_data.get("actions", [])
+                workflow_name = workflow_data.get("name", workflow_id)
+            else:
+                # Legacy format: just actions array
+                actions = workflow_data
         # Fallback to registry for inline workflows registered by transition loader
         elif QONTINUI_AVAILABLE:
             actions = registry.get_workflow(workflow_id)
             if actions is None:
                 self._emit_log("error", f"Workflow {workflow_id} not found in local workflows or registry")
                 return False
+            # Try to get name from registry
+            workflow_name = registry.get_workflow_name(workflow_id) if hasattr(registry, 'get_workflow_name') else workflow_id
             # Cache it locally for future use
-            self.workflows[workflow_id] = actions
+            self.workflows[workflow_id] = {
+                "actions": actions,
+                "name": workflow_name
+            }
             self._emit_log("debug", f"Loaded workflow {workflow_id} from registry")
         else:
             self._emit_log("error", f"Workflow {workflow_id} not found")
             return False
 
-        self._emit_event(
-            EventType.WORKFLOW_STARTED, {"workflow_id": workflow_id, "workflow_name": workflow_id}
+        # Check if this is a helper workflow (auto-generated state verification)
+        # Helper workflows have IDs starting with "wf-helper-" and should not emit action events
+        is_helper_workflow = workflow_id.startswith("wf-helper-")
+
+        if is_helper_workflow:
+            self._emit_log("debug", f"Executing helper workflow (events suppressed): {workflow_name}")
+
+        # Emit workflow started event BEFORE pushing to stack
+        # This ensures parent_id references the containing workflow, not this workflow itself
+        self._emit_workflow_event(
+            EventType.WORKFLOW_STARTED,
+            {
+                "workflow_id": workflow_id,
+                "workflow_name": workflow_name,
+            }
         )
+
+        # Push workflow onto execution context stack
+        self.execution_context.push_workflow(workflow_id, workflow_name, is_helper=is_helper_workflow)
 
         success = True
 
@@ -1060,8 +1164,18 @@ class QontinuiExecutor:
             # Small delay between actions
             time.sleep(0.5)
 
-        self._emit_event(
-            EventType.WORKFLOW_COMPLETED, {"workflow_id": workflow_id, "success": success}
+        # Pop workflow from execution context stack
+        self.execution_context.pop_workflow()
+
+        # Emit workflow completed event AFTER popping from stack
+        # This ensures parent_id references the containing workflow, not this workflow itself
+        self._emit_workflow_event(
+            EventType.WORKFLOW_COMPLETED,
+            {
+                "workflow_id": workflow_id,
+                "workflow_name": workflow_name,
+                "success": success,
+            }
         )
 
         return success
@@ -1091,6 +1205,18 @@ class QontinuiExecutor:
             self._emit_log("info", f"Thread started - beginning workflow execution: {workflow_id}")
             self._emit_log("debug", f"Workflow exists: {workflow_id in self.workflows}")
             self._emit_log("debug", f"Available workflows: {list(self.workflows.keys())}")
+
+            # Reset navigation state to initial conditions before each run
+            # This ensures the automation starts from the same state every time
+            if QONTINUI_AVAILABLE:
+                try:
+                    reset_success = navigation_api.reset_to_initial_state()
+                    if reset_success:
+                        self._emit_log("info", "Navigation state reset to initial conditions")
+                    else:
+                        self._emit_log("warning", "Failed to reset navigation state - continuing anyway")
+                except Exception as e:
+                    self._emit_log("warning", f"Error resetting navigation state: {e}")
 
             success = self._execute_workflow(workflow_id)
 

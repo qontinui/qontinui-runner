@@ -18,6 +18,13 @@ import {
 import StatusIndicator from "./components/StatusIndicator";
 import CollapsiblePanel from "./components/CollapsiblePanel";
 import RecordingControl from "./components/RecordingControl";
+import HierarchicalActionLog from "./components/HierarchicalActionLog";
+import { HierarchicalEvent, ActionExecutionEvent, WorkflowStartedEvent, WorkflowCompletedEvent } from "./types/events";
+
+// Type guard to check if event is an action
+function isActionEvent(event: HierarchicalEvent): event is ActionExecutionEvent {
+  return 'action_type' in event;
+}
 import "./index.css";
 
 interface LogEntry {
@@ -43,18 +50,6 @@ interface ImageRecognitionEntry {
   error?: string;
 }
 
-interface ActionExecutionEntry {
-  id: string;
-  timestamp: string;
-  actionType: string;
-  actionId: string;
-  success: boolean;
-  attempts: number;
-  config?: any;
-  typedText?: string;
-  error?: string;
-  reason?: string;
-}
 
 interface Config {
   name: string;
@@ -76,7 +71,7 @@ function App() {
   const [logLevel, setLogLevel] = useState("all");
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [imageRecognitionLogs, setImageRecognitionLogs] = useState<ImageRecognitionEntry[]>([]);
-  const [actionExecutionLogs, setActionExecutionLogs] = useState<ActionExecutionEntry[]>([]);
+  const [hierarchicalEvents, setHierarchicalEvents] = useState<HierarchicalEvent[]>([]);
   const [activeLogTab, setActiveLogTab] = useState<"general" | "image" | "actions">("general");
   const [config, setConfig] = useState<Config | null>(null);
   const [workflows, setWorkflows] = useState<any[]>([]);
@@ -98,6 +93,20 @@ function App() {
     console.log("App component mounted");
     detectSystemMonitors();
   }, []);
+
+  // Debug hierarchicalEvents changes
+  useEffect(() => {
+    console.log("=== hierarchicalEvents state updated ===");
+    console.log("Total events in state:", hierarchicalEvents.length);
+    if (hierarchicalEvents.length > 0) {
+      console.log("Events:", hierarchicalEvents.map(e => ({
+        id: e.id,
+        type: e.is_workflow ? 'workflow' : 'action',
+        parent_id: e.hierarchy.parent_id,
+        nesting_level: e.hierarchy.nesting_level
+      })));
+    }
+  }, [hierarchicalEvents]);
 
   const detectSystemMonitors = async () => {
     try {
@@ -257,6 +266,7 @@ function App() {
         }
         if (data.event === "image_recognition") {
           console.log("Received image_recognition event:", data);
+          console.log("Current imageRecognitionLogs length:", imageRecognitionLogs.length);
           // Add to image recognition logs
           const timestamp = new Date().toLocaleTimeString("en-US", {
             hour12: false,
@@ -264,48 +274,109 @@ function App() {
             minute: "2-digit",
             second: "2-digit",
           });
-          setImageRecognitionLogs((prev) => [
-            ...prev,
-            {
-              id: `img-${++logIdRef.current}`,
-              timestamp,
-              imagePath: data.data.image_path || "",
-              templateSize: data.data.template_size || "",
-              screenshotSize: data.data.screenshot_size || "",
-              threshold: data.data.threshold || 0,
-              confidence: data.data.confidence || 0,
-              found: data.data.found || false,
-              location: data.data.location,
-              gap: data.data.gap,
-              percentOff: data.data.percent_off,
-              bestMatchLocation: data.data.best_match_location,
-              error: data.data.error,
+
+          const newEntry = {
+            id: `img-${++logIdRef.current}`,
+            timestamp,
+            imagePath: data.data.image_path || "",
+            templateSize: data.data.template_size || "",
+            screenshotSize: data.data.screenshot_size || "",
+            threshold: data.data.threshold || 0,
+            confidence: data.data.confidence || 0,
+            found: data.data.found || false,
+            location: data.data.location,
+            gap: data.data.gap,
+            percentOff: data.data.percent_off,
+            bestMatchLocation: data.data.best_match_location,
+            error: data.data.error,
+          };
+
+          console.log("Adding image recognition entry:", newEntry);
+          setImageRecognitionLogs((prev) => {
+            const updated = [...prev, newEntry];
+            console.log("Updated imageRecognitionLogs length:", updated.length);
+            return updated;
+          });
+        }
+        if (data.event === "workflow_started") {
+          // Add workflow started event
+          // IMPORTANT: Use workflow_id as the event id so parent_id references work
+          const event: WorkflowStartedEvent = {
+            id: data.data.workflow_id || `event-${++logIdRef.current}`,
+            timestamp: data.timestamp || Date.now() / 1000,
+            workflow_id: data.data.workflow_id || "",
+            workflow_name: data.data.workflow_name || "Unknown Workflow",
+            is_workflow: true,
+            hierarchy: data.data.hierarchy || {
+              parent_id: null,
+              nesting_level: 0,
+              workflow_name: null,
+              is_expandable: false,
             },
-          ]);
+          };
+          console.log("WORKFLOW_STARTED event created:", event);
+          setHierarchicalEvents((prev) => [...prev, event]);
+        }
+        if (data.event === "workflow_completed") {
+          // Update the existing workflow_started event with success status
+          // Don't add a duplicate event - workflow tree should have one node per workflow
+          const workflowId = data.data.workflow_id;
+          const success = data.data.success ?? true;
+
+          console.log(`WORKFLOW_COMPLETED: updating workflow ${workflowId} with success=${success}`);
+
+          setHierarchicalEvents((prev) => {
+            const updated = prev.map((event) => {
+              // Find the matching workflow_started event and add success status
+              if (event.is_workflow &&
+                  'workflow_id' in event &&
+                  event.workflow_id === workflowId) {
+                console.log(`  Found and updating workflow node:`, event);
+                return {
+                  ...event,
+                  success, // Add success status to the workflow node
+                };
+              }
+              return event;
+            });
+            console.log(`  Total events after update: ${updated.length}`);
+            return updated;
+          });
         }
         if (data.event === "action_execution") {
-          // Add to action execution logs
-          const timestamp = new Date().toLocaleTimeString("en-US", {
-            hour12: false,
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          });
-          setActionExecutionLogs((prev) => [
-            ...prev,
-            {
-              id: `action-${++logIdRef.current}`,
-              timestamp,
-              actionType: data.data.action_type || "UNKNOWN",
-              actionId: data.data.action_id || "",
-              success: data.data.success || false,
-              attempts: data.data.attempts || 1,
-              config: data.data.config,
-              typedText: data.data.typed_text,
-              error: data.data.error,
-              reason: data.data.reason,
+          // Add action execution event
+          // IMPORTANT: Use action_id as the event id so parent_id references work
+          const event: ActionExecutionEvent = {
+            id: data.data.action_id || `event-${++logIdRef.current}`,
+            timestamp: data.timestamp || Date.now() / 1000,
+            action_id: data.data.action_id || "",
+            action_type: data.data.action_type || "UNKNOWN",
+            success: data.data.success || false,
+            attempts: data.data.attempts || 1,
+            config: data.data.config,
+            typed_text: data.data.typed_text,
+            error: data.data.error,
+            reason: data.data.reason,
+            hierarchy: data.data.hierarchy || {
+              parent_id: null,
+              nesting_level: 0,
+              workflow_name: null,
+              is_expandable: false,
             },
-          ]);
+            is_workflow: false,  // Explicitly mark as non-workflow event
+          };
+          console.log("ACTION_EXECUTION event created:", {
+            id: event.id,
+            action_type: event.action_type,
+            parent_id: event.hierarchy.parent_id,
+            nesting_level: event.hierarchy.nesting_level,
+            is_workflow: event.is_workflow
+          });
+          setHierarchicalEvents((prev) => {
+            const updated = [...prev, event];
+            console.log(`  Total hierarchical events: ${updated.length}`);
+            return updated;
+          });
         }
         // Show action events for better visibility
         if (data.event === "action_started") {
@@ -583,14 +654,14 @@ function App() {
     } else if (activeLogTab === "image") {
       setImageRecognitionLogs([]);
     } else if (activeLogTab === "actions") {
-      setActionExecutionLogs([]);
+      setHierarchicalEvents([]);
     }
   };
 
   const clearAllLogs = () => {
     setLogs([]);
     setImageRecognitionLogs([]);
-    setActionExecutionLogs([]);
+    setHierarchicalEvents([]);
   };
 
   const copyLogs = async () => {
@@ -621,17 +692,35 @@ Confidence: ${(entry.confidence * 100).toFixed(1)}%`;
         })
         .join("\n\n");
     } else if (activeLogTab === "actions") {
-      logText = actionExecutionLogs
-        .map((entry) => {
-          let details = `[${entry.timestamp}] ${entry.success ? "✓ SUCCESS" : "✗ FAILED"} - ${entry.actionType}
-Attempts: ${entry.attempts}`;
+      logText = hierarchicalEvents
+        .map((event) => {
+          const timestamp = new Date(event.timestamp * 1000).toLocaleTimeString("en-US", {
+            hour12: false,
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+          });
 
-          if (entry.typedText) details += `\nTyped: "${entry.typedText}"`;
-          if (entry.config) details += `\nConfig: ${JSON.stringify(entry.config)}`;
-          if (entry.error) details += `\nError: ${entry.error}`;
-          if (entry.reason) details += `\nReason: ${entry.reason}`;
+          if ('is_workflow' in event && event.is_workflow) {
+            // Workflow event
+            const success = 'success' in event ? event.success : undefined;
+            const status = success !== undefined ? (success ? "✓ SUCCESS" : "✗ FAILED") : "";
+            return `[${timestamp}] ${status} WORKFLOW: ${event.workflow_name}
+Nesting Level: ${event.hierarchy.nesting_level}`;
+          } else if (isActionEvent(event)) {
+            // Action event
+            let details = `[${timestamp}] ${event.success ? "✓ SUCCESS" : "✗ FAILED"} - ${event.action_type}
+Attempts: ${event.attempts}`;
 
-          return details;
+            if (event.typed_text) details += `\nTyped: "${event.typed_text}"`;
+            if (event.config) details += `\nConfig: ${JSON.stringify(event.config)}`;
+            if (event.error) details += `\nError: ${event.error}`;
+            if (event.reason) details += `\nReason: ${event.reason}`;
+            details += `\nNesting Level: ${event.hierarchy.nesting_level}`;
+
+            return details;
+          }
+          return `[${timestamp}] Unknown event type`;
         })
         .join("\n\n");
     }
@@ -646,79 +735,7 @@ Attempts: ${entry.attempts}`;
     }
   };
 
-  const getImageName = (imageId: string): string => {
-    if (!config) {
-      console.log("No config, returning ID:", imageId);
-      return imageId;
-    }
 
-    // First try direct image lookup
-    if (config.images) {
-      const image = config.images.find((img: any) => img.id === imageId);
-      if (image?.name) {
-        console.log(`Direct image lookup: ${imageId} -> ${image.name}`);
-        return image.name;
-      }
-    }
-
-    // StateImage IDs start with "stateimage-", need to search in states
-    if (imageId.startsWith("stateimage-") && config.states) {
-      // Search through all states for StateImages
-      for (const state of config.states) {
-        const stateImages = state.stateImages || [];
-        for (const stateImage of stateImages) {
-          if (stateImage.id === imageId) {
-            console.log(`StateImage lookup: ${imageId} -> ${stateImage.name || "unnamed"}`);
-            return stateImage.name || imageId;
-          }
-        }
-      }
-    }
-
-    console.log(`Image lookup failed: ${imageId} -> ${imageId}`);
-    return imageId;
-  };
-
-  const replaceImageIdsWithNames = (obj: any): any => {
-    if (!obj) return obj;
-
-    const replaced = JSON.parse(JSON.stringify(obj)); // Deep clone
-    console.log(
-      "replaceImageIdsWithNames called for:",
-      replaced.image || replaced.imageId || "no image",
-    );
-
-    // Replace image IDs with names in common config fields
-    if (replaced.image) {
-      replaced.image = getImageName(replaced.image);
-    }
-    if (replaced.imageId) {
-      replaced.imageId = getImageName(replaced.imageId);
-    }
-    if (replaced.target?.imageId) {
-      replaced.target.imageId = getImageName(replaced.target.imageId);
-    }
-
-    // Compute final similarity value using precedence rules
-    // Precedence: action similarity > target threshold > default 0.9
-    let finalSimilarity = 0.9; // Global default
-    if (replaced.target?.threshold !== undefined) {
-      finalSimilarity = replaced.target.threshold; // StateImage/Pattern similarity
-    }
-    if (replaced.similarity !== undefined) {
-      finalSimilarity = replaced.similarity; // Action options similarity (highest priority)
-    }
-
-    // Replace similarity/threshold with single computed value
-    replaced.similarity = finalSimilarity;
-
-    // Remove threshold from target to avoid confusion
-    if (replaced.target) {
-      delete replaced.target.threshold;
-    }
-
-    return replaced;
-  };
 
   const getLogColor = (level: string) => {
     switch (level) {
@@ -1057,9 +1074,9 @@ Attempts: ${entry.attempts}`;
             >
               <Zap className="w-4 h-4" />
               <span className="font-medium">Actions</span>
-              {actionExecutionLogs.length > 0 && (
+              {hierarchicalEvents.length > 0 && (
                 <span className="px-2 py-0.5 text-xs bg-accent/20 text-accent rounded-full">
-                  {actionExecutionLogs.length}
+                  {hierarchicalEvents.length}
                 </span>
               )}
             </button>
@@ -1269,69 +1286,11 @@ Attempts: ${entry.attempts}`;
                 ))}
               </div>
             ) : (
-              <div className="space-y-2">
-                {actionExecutionLogs.map((entry) => (
-                  <div
-                    key={entry.id}
-                    className={`p-3 rounded-lg border ${
-                      entry.success
-                        ? "border-green-500/30 bg-green-500/5"
-                        : "border-red-500/30 bg-red-500/5"
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <span className="text-xs">[{entry.timestamp}]</span>
-                        {entry.success ? (
-                          <span className="px-2 py-0.5 text-xs bg-green-500/20 text-green-400 rounded-full">
-                            ✓ SUCCESS
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full">
-                            ✗ FAILED
-                          </span>
-                        )}
-                        <span
-                          className={`font-bold text-sm ${entry.success ? "text-green-400" : "text-red-400"}`}
-                        >
-                          {entry.actionType}
-                        </span>
-                      </div>
-                      <span className="text-xs text-muted-foreground">
-                        Attempts: {entry.attempts}
-                      </span>
-                    </div>
-                    {entry.typedText && (
-                      <div className="mt-2 text-xs text-blue-400 font-semibold">
-                        <span>Typed:</span>{" "}
-                        <span className="text-blue-300">"{entry.typedText}"</span>
-                      </div>
-                    )}
-                    {entry.actionType === "TYPE" && !entry.typedText && entry.success && (
-                      <div className="mt-2 text-xs text-yellow-400">
-                        <span className="font-semibold">Warning:</span> TYPE succeeded but no text
-                        was recorded
-                      </div>
-                    )}
-                    {entry.config && (
-                      <div className="mt-2 text-xs text-muted-foreground">
-                        <span className="font-semibold">Config:</span>{" "}
-                        {JSON.stringify(replaceImageIdsWithNames(entry.config))}
-                      </div>
-                    )}
-                    {entry.error && (
-                      <div className="mt-2 text-xs text-red-400">
-                        <span className="font-semibold">Error:</span> {entry.error}
-                      </div>
-                    )}
-                    {entry.reason && (
-                      <div className="mt-2 text-xs text-yellow-400">
-                        <span className="font-semibold">Reason:</span> {entry.reason}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
+              <HierarchicalActionLog
+                events={hierarchicalEvents}
+                autoScroll={autoScroll}
+                onClear={clearLogs}
+              />
             )}
           </div>
         </div>
