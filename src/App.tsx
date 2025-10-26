@@ -48,6 +48,7 @@ interface ImageRecognitionEntry {
   percentOff?: number;
   bestMatchLocation?: string;
   error?: string;
+  imageData?: string; // Base64 image data for thumbnail display
 }
 
 
@@ -86,6 +87,7 @@ function App() {
   const [executionPanelCollapsed, setExecutionPanelCollapsed] = useState(false);
   const logViewerRef = useRef<HTMLDivElement>(null);
   const logIdRef = useRef(0);
+  const executionScopeRef = useRef<string | null>(null); // Tracks current workflow execution scope
   const wasAutoMinimizedRef = useRef(false); // Track if we minimized the window (using ref to avoid closure issues)
 
   // Detect monitors on mount
@@ -289,6 +291,7 @@ function App() {
             percentOff: data.data.percent_off,
             bestMatchLocation: data.data.best_match_location,
             error: data.data.error,
+            imageData: data.data.image_data, // Base64 image data from backend
           };
 
           console.log("Adding image recognition entry:", newEntry);
@@ -300,9 +303,15 @@ function App() {
         }
         if (data.event === "workflow_started") {
           // Add workflow started event
-          // IMPORTANT: Use workflow_id as the event id so parent_id references work
+          // Create unique execution scope ID using workflow_id + timestamp
+          // This ensures different runs of the same workflow get unique IDs
+          const executionScope = `${data.data.workflow_id || 'workflow'}-exec-${data.timestamp || Date.now()}`;
+
+          // Store the current execution scope for scoping child action IDs
+          executionScopeRef.current = executionScope;
+
           const event: WorkflowStartedEvent = {
-            id: data.data.workflow_id || `event-${++logIdRef.current}`,
+            id: executionScope,
             timestamp: data.timestamp || Date.now() / 1000,
             workflow_id: data.data.workflow_id || "",
             workflow_name: data.data.workflow_name || "Unknown Workflow",
@@ -314,7 +323,8 @@ function App() {
               is_expandable: false,
             },
           };
-          console.log("WORKFLOW_STARTED event created:", event);
+          console.log("WORKFLOW_STARTED event created with execution scope:", executionScope);
+
           setHierarchicalEvents((prev) => [...prev, event]);
         }
         if (data.event === "workflow_completed") {
@@ -345,9 +355,26 @@ function App() {
         }
         if (data.event === "action_execution") {
           // Add action execution event
-          // IMPORTANT: Use action_id as the event id so parent_id references work
+          // Scope action IDs to current workflow execution to prevent collisions between runs
+          const scope = executionScopeRef.current || 'unknown';
+          const scopedId = data.data.action_id
+            ? `${scope}::${data.data.action_id}`
+            : `${scope}::event-${++logIdRef.current}`;
+
+          // Also scope the parent_id if it exists
+          const originalHierarchy = data.data.hierarchy || {
+            parent_id: null,
+            nesting_level: 0,
+            workflow_name: null,
+            is_expandable: false,
+          };
+
+          const scopedParentId = originalHierarchy.parent_id
+            ? `${scope}::${originalHierarchy.parent_id}`
+            : scope; // Top-level workflow is the parent
+
           const event: ActionExecutionEvent = {
-            id: data.data.action_id || `event-${++logIdRef.current}`,
+            id: scopedId,
             timestamp: data.timestamp || Date.now() / 1000,
             action_id: data.data.action_id || "",
             action_type: data.data.action_type || "UNKNOWN",
@@ -357,9 +384,9 @@ function App() {
             typed_text: data.data.typed_text,
             error: data.data.error,
             reason: data.data.reason,
-            hierarchy: data.data.hierarchy || {
-              parent_id: null,
-              nesting_level: 0,
+            hierarchy: {
+              ...originalHierarchy,
+              parent_id: scopedParentId,
               workflow_name: null,
               is_expandable: false,
             },
@@ -1212,20 +1239,31 @@ Attempts: ${event.attempts}`;
                   >
                     <div className="flex items-start justify-between mb-2">
                       <div className="flex items-center gap-2">
-                        <span className="text-muted-foreground text-xs">[{entry.timestamp}]</span>
-                        {entry.found ? (
-                          <span className="px-2 py-0.5 text-xs bg-green-500/20 text-green-400 rounded-full font-semibold">
-                            ✅ FOUND
-                          </span>
-                        ) : entry.error ? (
-                          <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full font-semibold">
-                            ❌ ERROR
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded-full font-semibold">
-                            ⚠️ NOT FOUND
-                          </span>
+                        {/* Image thumbnail */}
+                        {entry.imageData && (
+                          <img
+                            src={`data:image/png;base64,${entry.imageData}`}
+                            alt={entry.imagePath}
+                            className="w-12 h-12 object-contain border border-border rounded"
+                            title={entry.imagePath}
+                          />
                         )}
+                        <div className="flex flex-col gap-1">
+                          <span className="text-muted-foreground text-xs">[{entry.timestamp}]</span>
+                          {entry.found ? (
+                            <span className="px-2 py-0.5 text-xs bg-green-500/20 text-green-400 rounded-full font-semibold">
+                              ✅ FOUND
+                            </span>
+                          ) : entry.error ? (
+                            <span className="px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded-full font-semibold">
+                              ❌ ERROR
+                            </span>
+                          ) : (
+                            <span className="px-2 py-0.5 text-xs bg-yellow-500/20 text-yellow-400 rounded-full font-semibold">
+                              ⚠️ NOT FOUND
+                            </span>
+                          )}
+                        </div>
                       </div>
                       <div className="text-xs">
                         <span className="text-muted-foreground">Confidence: </span>

@@ -205,7 +205,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
 }) => {
   const event = node.data;
   const nestingLevel = level !== undefined ? level : event.hierarchy.nesting_level;
-  const indentation = nestingLevel * 20;
+  // Offset indentation by 2 levels since we hide level 1 (workflow)
+  // Level 2 (GO_TO_STATE) starts at 0, level 3 (nested TYPE) at 20px, etc.
+  const indentation = Math.max(0, (nestingLevel - 2) * 20);
   const isExpandable = event.hierarchy.is_expandable || node.children.length > 0;
   const success = getEventSuccess(event);
 

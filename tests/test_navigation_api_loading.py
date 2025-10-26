@@ -5,7 +5,7 @@ import json
 
 def test_load_bdo_config():
     """Test that BDO config loads correctly."""
-    with open("bdo_config (21).json", "r") as f:
+    with open("../bdo_config (42).json", "r") as f:
         config = json.load(f)
 
     print("\n=== BDO Config Structure ===")

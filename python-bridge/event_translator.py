@@ -43,7 +43,8 @@ class EventTranslator:
 
     def __init__(self, emitter: Callable[[str, dict[str, Any]], None],
                  state_lookup: Callable[[str], str | None] | None = None,
-                 hierarchy_lookup: Callable[[], dict[str, Any]] | None = None):
+                 hierarchy_lookup: Callable[[], dict[str, Any]] | None = None,
+                 image_data_lookup: Callable[[str], str | None] | None = None):
         """Initialize the event translator.
 
         Args:
@@ -54,6 +55,8 @@ class EventTranslator:
                          Accepts image_id and returns state name or None.
             hierarchy_lookup: Optional callback to get current execution hierarchy.
                              Returns dict with parent_id, nesting_level, workflow_name, is_expandable.
+            image_data_lookup: Optional callback to look up base64 image data for an image ID.
+                              Accepts image_id and returns base64 data string or None.
 
         Note:
             The emitter should handle converting the event_type string to the
@@ -62,6 +65,7 @@ class EventTranslator:
         self.emitter = emitter
         self.state_lookup = state_lookup
         self.hierarchy_lookup = hierarchy_lookup
+        self.image_data_lookup = image_data_lookup
         self._real_stdout = sys.stdout
 
         if not QONTINUI_AVAILABLE:
@@ -174,6 +178,13 @@ class EventTranslator:
             if self.hierarchy_lookup:
                 hierarchy = self.hierarchy_lookup()
                 frontend_data["hierarchy"] = hierarchy
+
+            # Add image data if image_data_lookup callback is available
+            if self.image_data_lookup:
+                image_id = data.get("image_id", "")
+                image_data = self.image_data_lookup(image_id)
+                if image_data:
+                    frontend_data["image_data"] = image_data
 
             # Debug logging
             print(f"[EventTranslator] Emitting IMAGE_RECOGNITION: found={frontend_data['found']}, confidence={frontend_data['confidence']}")

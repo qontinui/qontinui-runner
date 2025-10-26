@@ -12,6 +12,7 @@ import threading
 import time
 import traceback
 from enum import Enum
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -241,10 +242,12 @@ class QontinuiExecutor:
             # EventTranslator handles all event translation from qontinui library to frontend format
             # Pass _get_state_for_image as state_lookup callback to add state info to events
             # Pass _get_current_hierarchy as hierarchy_lookup callback to add hierarchy info to events
+            # Pass _get_image_data as image_data_lookup callback to add image thumbnails to events
             self.event_translator = EventTranslator(
                 self._emit_event_wrapper,
                 state_lookup=self._get_state_for_image,
-                hierarchy_lookup=self._get_current_hierarchy
+                hierarchy_lookup=self._get_current_hierarchy,
+                image_data_lookup=self._get_image_data
             )
             self.event_translator.register_all_callbacks()
 
@@ -465,6 +468,26 @@ class QontinuiExecutor:
                         return state_name
 
         self._emit_log("debug", f"_get_state_for_image: Image {image_id} not found in any state")
+        return None
+
+    def _get_image_data(self, image_id: str) -> str | None:
+        """Get base64 image data for an image ID.
+
+        Args:
+            image_id: ID of the image to retrieve
+
+        Returns:
+            Base64 image data string if found, None otherwise
+        """
+        if not self.config:
+            return None
+
+        images = self.config.get("images", [])
+        for image in images:
+            if image.get("id") == image_id:
+                # Return the base64 data
+                return image.get("data")
+
         return None
 
     def _get_best_match_regardless_of_threshold(self, image_id: str) -> dict:
@@ -1002,9 +1025,9 @@ class QontinuiExecutor:
             )
 
             # Convert action_data to Action object for library
-            from qontinui.json_executor.config_parser import Action as ConfigAction
+            from qontinui.config.schema import Action
 
-            action = ConfigAction(
+            action = Action(
                 id=action_id,
                 type=action_type,
                 config=config,
@@ -1018,8 +1041,74 @@ class QontinuiExecutor:
             # - All GUI execution (mouse, keyboard, screen capture)
             # - Image recognition and template matching
             # - Action retries and timing
-            # - Event emission (via EventTranslator callbacks)
-            success = self.action_executor.execute_action(action)
+            # - Event emission via stdout (we capture and enhance with hierarchy below)
+
+            # Capture library's stdout to intercept action_execution events
+            captured_events = []
+            original_stdout = sys.stdout
+            capture_buffer = StringIO()
+            sys.stdout = capture_buffer
+
+            try:
+                success = self.action_executor.execute_action(action)
+            finally:
+                # Restore stdout and process captured output
+                sys.stdout = original_stdout
+                captured_output = capture_buffer.getvalue()
+
+                # Parse captured JSON events and add hierarchy
+                import json
+                for line in captured_output.strip().split('\n'):
+                    if not line.strip():
+                        continue
+                    try:
+                        event_obj = json.loads(line)
+                        # Check if this is an action_execution event from library
+                        if (event_obj.get('type') == 'event' and
+                            event_obj.get('event') == 'action_execution'):
+                            # Add hierarchy to the event data
+                            event_data = event_obj.get('data', {})
+
+                            # Get hierarchy for nested library actions
+                            # At this point, the current action is on the stack, so nested actions
+                            # should have this action as their parent
+                            lib_action_type = event_data.get('action_type', 'UNKNOWN')
+                            lib_action_id = event_data.get('action_id', f'lib-{lib_action_type}')
+
+                            # If this is the same action we just executed, use adjusted_hierarchy
+                            # Otherwise, it's a nested action executed by the library, get hierarchy from stack
+                            if lib_action_id == action_id:
+                                # This is the action we delegated to the library
+                                event_hierarchy = adjusted_hierarchy
+                            else:
+                                # This is a nested action executed by library (e.g., TYPE inside GO_TO_STATE)
+                                # Current action is on the stack, so it becomes the parent
+                                nested_hierarchy = self.execution_context.get_hierarchy_metadata(
+                                    action_id=lib_action_id,
+                                    is_expandable=False
+                                )
+                                # Add +1 for nesting level
+                                event_hierarchy = HierarchyMetadata(
+                                    parent_id=nested_hierarchy.parent_id,
+                                    nesting_level=nested_hierarchy.nesting_level + 1,
+                                    workflow_name=nested_hierarchy.workflow_name,
+                                    is_expandable=False
+                                )
+
+                            event_data['hierarchy'] = event_hierarchy.to_dict()
+
+                            # Re-emit with proper sequence and hierarchy
+                            self._emit_event(
+                                EventType.ACTION_EXECUTION,
+                                event_data
+                            )
+                            self._emit_log("debug", f"Enhanced library action_execution with hierarchy: {lib_action_type} (parent={event_hierarchy.parent_id}, level={event_hierarchy.nesting_level})")
+                        else:
+                            # Re-emit other events as-is
+                            print(line, file=original_stdout)
+                    except json.JSONDecodeError:
+                        # Not JSON, just print it
+                        print(line, file=original_stdout)
 
             # Sync last_find_location from library if available
             if hasattr(self.action_executor, 'last_find_location') and self.action_executor.last_find_location:
@@ -1033,60 +1122,20 @@ class QontinuiExecutor:
             if action_type in ["GO_TO_STATE", "RUN_WORKFLOW", "RUN_PROCESS"]:
                 navigation_api.set_workflow_executor(self)
 
-            # Emit ACTION_EXECUTION event with hierarchy for frontend display
-            # The library emits its own action_execution events, but they don't have hierarchy
-            # So we emit our own with full context
-            action_execution_data = {
-                "action_id": action_id,
-                "action_type": action_type,
-                "success": success,
-                "attempts": getattr(action, 'retry_count', 1) + 1 if not success else 1,
-                "config": config,
-            }
-
-            # Add action-specific fields for frontend display
-            if action_type == "GO_TO_STATE" and "stateNames" in config:
-                action_execution_data["target_states"] = config.get("stateNames", [])
-            elif action_type == "TYPE" and "text" in config:
-                action_execution_data["typed_text"] = config.get("text", "")
-            elif action_type == "RUN_WORKFLOW":
-                # Will be populated by workflow execution
-                pass
-
-            self._emit_action_event(
-                EventType.ACTION_EXECUTION,
-                action_execution_data,
-                hierarchy=adjusted_hierarchy
-            )
-
             self._emit_event(
                 EventType.ACTION_COMPLETED, {"action_id": action_id, "success": success}
             )
             return success
 
         except Exception as e:
-            # Emit ACTION_EXECUTION event for failed action with hierarchy
-            action_execution_data = {
-                "action_id": action_id,
-                "action_type": action_type,
-                "success": False,
-                "attempts": 1,
-                "config": config,
-                "error": str(e),
-                "reason": str(e),
-            }
-
-            self._emit_action_event(
-                EventType.ACTION_EXECUTION,
-                action_execution_data,
-                hierarchy=adjusted_hierarchy
-            )
-
+            # Emit ACTION_COMPLETED event for exception case
+            # Note: The library may have emitted action_execution before throwing,
+            # which we would have captured and enhanced with hierarchy above
             self._emit_event(
                 EventType.ACTION_COMPLETED,
                 {"action_id": action_id, "success": False, "error": str(e)},
             )
-            self._emit_log("error", f"Action failed: {e}")
+            self._emit_log("error", f"Action failed with exception: {e}")
             return False
 
         finally:
