@@ -31,6 +31,7 @@ class EventType(Enum):
     EXECUTION_COMPLETED = "execution_completed"
     ERROR = "error"
     LOG = "log"
+    PONG = "pong"
 
 
 class MinimalBridge:
@@ -66,13 +67,27 @@ class MinimalBridge:
         """Emit log message."""
         self._emit_event(EventType.LOG, {"level": level, "message": message})
 
+    def _emit_pong(self):
+        """Emit pong response for health check."""
+        pong = {
+            "type": "pong",
+            "timestamp": time.time(),
+        }
+        sys.stdout.write(json.dumps(pong) + "\n")
+        sys.stdout.flush()
+
     def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:  # noqa: C901
         """Handle command from Tauri."""
         cmd_type = command.get("command")
         params = command.get("params", {})
 
         try:
-            if cmd_type == "load":
+            if cmd_type == "ping":
+                # Health check - respond with pong
+                self._emit_pong()
+                return {"success": True, "message": "pong"}
+
+            elif cmd_type == "load":
                 # Simulate loading configuration
                 config_data = params.get("config_data")
                 config_path = params.get("config_path")

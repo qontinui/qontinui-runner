@@ -47,6 +47,8 @@ class EventType(Enum):
     DSL_IF_BRANCH = "dsl_if_branch"
     DSL_LOOP_ITERATION = "dsl_loop_iteration"
     DSL_EXECUTION_ERROR = "dsl_execution_error"
+    # Health check
+    PONG = "pong"
 
 
 class QontinuiBridge:
@@ -112,13 +114,27 @@ class QontinuiBridge:
         """Emit log message."""
         self._emit_event(EventType.LOG, {"level": level, "message": message})
 
+    def _emit_pong(self):
+        """Emit pong response for health check."""
+        pong = {
+            "type": "pong",
+            "timestamp": time.time(),
+        }
+        sys.stdout.write(json.dumps(pong) + "\n")
+        sys.stdout.flush()
+
     def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Handle command from Tauri - all delegated to Qontinui."""
         cmd_type = command.get("command")
         params = command.get("params", {})
 
         try:
-            if cmd_type == "load":
+            if cmd_type == "ping":
+                # Health check - respond with pong
+                self._emit_pong()
+                return {"success": True, "message": "pong"}
+
+            elif cmd_type == "load":
                 return self._handle_load(params)
             elif cmd_type == "start":
                 return self._handle_start(params)

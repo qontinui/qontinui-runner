@@ -136,12 +136,12 @@ class EventTranslator:
             match_loc = data.get("best_match_location", {})
 
             # Debug logging
-            print(f"[EventTranslator] Processing MATCH_ATTEMPTED: image_id={data.get('image_id')}, threshold_passed={data.get('threshold_passed')}")
+            print(f"[EventTranslator] Processing MATCH_ATTEMPTED: image_id={data.get('image_id')}, threshold_passed={data.get('threshold_passed')}", file=sys.stderr)
 
             # Get raw values from library (library provides 0.0-1.0 decimal format)
             threshold = data.get("similarity_threshold", 0)
             confidence = data.get("best_match_confidence", 0)
-            print(f"[EventTranslator] Values from library: threshold={threshold}, confidence={confidence}")
+            print(f"[EventTranslator] Values from library: threshold={threshold}, confidence={confidence}", file=sys.stderr)
 
             # Build frontend-compatible event data
             frontend_data = {
@@ -187,16 +187,16 @@ class EventTranslator:
                     frontend_data["image_data"] = image_data
 
             # Debug logging
-            print(f"[EventTranslator] Emitting IMAGE_RECOGNITION: found={frontend_data['found']}, confidence={frontend_data['confidence']}")
+            print(f"[EventTranslator] Emitting IMAGE_RECOGNITION: found={frontend_data['found']}, confidence={frontend_data['confidence']}", file=sys.stderr)
 
             # Emit to frontend via the provided emitter callback
             self.emitter("image_recognition", frontend_data)
 
-            print(f"[EventTranslator] IMAGE_RECOGNITION event emitted successfully")
+            print(f"[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr)
 
         except Exception as e:
             # Log exception to help debug translation failures
-            print(f"[EventTranslator] ERROR translating MATCH_ATTEMPTED: {e}")
+            print(f"[EventTranslator] ERROR translating MATCH_ATTEMPTED: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc()
             # Re-raise so event registry can also log it
@@ -242,7 +242,7 @@ class EventTranslator:
             if self.hierarchy_lookup:
                 hierarchy = self.hierarchy_lookup()
                 frontend_data["hierarchy"] = hierarchy
-                print(f"[EventTranslator] TYPE action hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}")
+                print(f"[EventTranslator] TYPE action hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}", file=sys.stderr)
 
             self.emitter("action_execution", frontend_data)
 
@@ -394,13 +394,13 @@ class EventTranslator:
             if self.hierarchy_lookup:
                 hierarchy = self.hierarchy_lookup()
                 frontend_data["hierarchy"] = hierarchy
-                print(f"[EventTranslator] Library action {action_type} completed with hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}")
+                print(f"[EventTranslator] Library action {action_type} completed with hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}", file=sys.stderr)
 
             # Emit as action_execution event for frontend
             self.emitter("action_execution", frontend_data)
 
         except Exception as e:
-            print(f"[EventTranslator] ERROR in on_action_completed_library: {e}")
+            print(f"[EventTranslator] ERROR in on_action_completed_library: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc()
 

@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod executor;
 mod logging;
+mod settings;
 
 #[cfg(test)]
 mod test;
@@ -82,6 +83,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::stop_recording,
             commands::get_recording_status,
             commands::open_folder,
+            commands::get_last_config_path,
+            commands::execute_transition,
+            commands::navigate_to_state,
+            commands::navigate_to_multiple_states,
+            commands::get_active_states,
+            commands::get_available_transitions,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

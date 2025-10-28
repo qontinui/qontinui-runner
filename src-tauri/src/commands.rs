@@ -1,6 +1,7 @@
 use crate::config::{ConfigLoader, QontinuiConfig};
 use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
+use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::Mutex;
@@ -44,6 +45,11 @@ pub fn load_configuration(path: String, state: State<AppState>) -> Result<Comman
     // Store the configuration
     *state.current_config.lock().unwrap() = Some(config);
     info!("Configuration loaded successfully: {}", summary);
+
+    // Save the path as the last loaded config
+    if let Err(e) = settings::save_last_config_path(&path) {
+        warn!("Failed to save last config path: {}", e);
+    }
 
     // If Python bridge is running, send the configuration
     if let Some(ref mut bridge) = *state.python_bridge.lock().unwrap() {
@@ -466,4 +472,245 @@ pub fn open_folder(path: String) -> Result<CommandResponse, String> {
         message: Some(format!("Opened folder: {}", path)),
         data: None,
     })
+}
+
+#[tauri::command]
+pub fn get_last_config_path() -> Result<CommandResponse, String> {
+    info!("Getting last config path");
+
+    if let Some(path) = settings::get_last_config_path() {
+        // Check if the file still exists
+        if std::path::Path::new(&path).exists() {
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Last config found: {}", path)),
+                data: Some(serde_json::json!({
+                    "path": path
+                })),
+            })
+        } else {
+            info!("Last config path exists in settings but file not found: {}", path);
+            Ok(CommandResponse {
+                success: false,
+                message: Some("Last config file not found".to_string()),
+                data: None,
+            })
+        }
+    } else {
+        Ok(CommandResponse {
+            success: false,
+            message: Some("No last config path saved".to_string()),
+            data: None,
+        })
+    }
+}
+
+/// Execute a specific transition in the state machine.
+///
+/// Sends a command to the Python executor to trigger a transition by ID.
+/// The executor will validate the transition is available from the current state(s)
+/// and execute any associated actions.
+///
+/// # Arguments
+/// * `state` - The application state containing the Python bridge
+/// * `transition_id` - The unique identifier of the transition to execute
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with optional response data from Python
+/// * `Err(String)` - Error message if the executor is not running or command fails
+#[tauri::command]
+pub async fn execute_transition(
+    state: tauri::State<'_, AppState>,
+    transition_id: String,
+) -> Result<CommandResponse, String> {
+    info!("Executing transition: {}", transition_id);
+    let bridge = state.python_bridge.lock().unwrap();
+
+    if let Some(ref bridge) = *bridge {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        let params = serde_json::json!({
+            "transition_id": transition_id
+        });
+
+        bridge
+            .send_command("execute_transition", Some(params))
+            .map_err(|e| e.to_string())?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Transition {} execution command sent", transition_id)),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+/// Navigate to a specific state in the state machine.
+///
+/// Sends a command to the Python executor to directly navigate to a target state.
+/// This bypasses normal transition logic and forces the state machine into the specified state.
+///
+/// # Arguments
+/// * `state` - The application state containing the Python bridge
+/// * `state_id` - The unique identifier of the state to navigate to
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with optional response data from Python
+/// * `Err(String)` - Error message if the executor is not running or command fails
+#[tauri::command]
+pub async fn navigate_to_state(
+    state: tauri::State<'_, AppState>,
+    state_id: String,
+) -> Result<CommandResponse, String> {
+    info!("Navigating to state: {}", state_id);
+    let bridge = state.python_bridge.lock().unwrap();
+
+    if let Some(ref bridge) = *bridge {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        let params = serde_json::json!({
+            "state_id": state_id
+        });
+
+        bridge
+            .send_command("navigate_to_state", Some(params))
+            .map_err(|e| e.to_string())?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Navigate to state {} command sent", state_id)),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+/// Navigate to multiple states simultaneously in the state machine.
+///
+/// Sends a command to the Python executor to activate multiple states at once.
+/// This is useful for hierarchical state machines or parallel regions where
+/// multiple states can be active simultaneously.
+///
+/// # Arguments
+/// * `state` - The application state containing the Python bridge
+/// * `state_ids` - Vector of unique state identifiers to navigate to
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with optional response data from Python
+/// * `Err(String)` - Error message if the executor is not running or command fails
+#[tauri::command]
+pub async fn navigate_to_multiple_states(
+    state: tauri::State<'_, AppState>,
+    state_ids: Vec<String>,
+) -> Result<CommandResponse, String> {
+    info!("Navigating to multiple states: {:?}", state_ids);
+    let bridge = state.python_bridge.lock().unwrap();
+
+    if let Some(ref bridge) = *bridge {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        let params = serde_json::json!({
+            "state_ids": state_ids
+        });
+
+        bridge
+            .send_command("navigate_to_multiple_states", Some(params))
+            .map_err(|e| e.to_string())?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Navigate to {} states command sent", state_ids.len())),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+/// Get the currently active states from the state machine.
+///
+/// Sends a command to the Python executor to query which states are currently active.
+/// The response will be emitted as an event to the frontend with the active state information.
+///
+/// # Arguments
+/// * `state` - The application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success, active states will be sent via event
+/// * `Err(String)` - Error message if the executor is not running or command fails
+#[tauri::command]
+pub async fn get_active_states(
+    state: tauri::State<'_, AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Getting active states");
+    let bridge = state.python_bridge.lock().unwrap();
+
+    if let Some(ref bridge) = *bridge {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        let params = serde_json::json!({});
+
+        bridge
+            .send_command("get_active_states", Some(params))
+            .map_err(|e| e.to_string())?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Get active states command sent".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+/// Get available transitions from the current state(s).
+///
+/// Sends a command to the Python executor to query which transitions are currently
+/// available based on the active state(s). The response will be emitted as an event
+/// to the frontend with the available transition information.
+///
+/// # Arguments
+/// * `state` - The application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success, available transitions will be sent via event
+/// * `Err(String)` - Error message if the executor is not running or command fails
+#[tauri::command]
+pub async fn get_available_transitions(
+    state: tauri::State<'_, AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Getting available transitions");
+    let bridge = state.python_bridge.lock().unwrap();
+
+    if let Some(ref bridge) = *bridge {
+        if !bridge.is_running() {
+            return Err("Python executor not running".to_string());
+        }
+
+        let params = serde_json::json!({});
+
+        bridge
+            .send_command("get_available_transitions", Some(params))
+            .map_err(|e| e.to_string())?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Get available transitions command sent".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
 }

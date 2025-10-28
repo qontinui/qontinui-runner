@@ -3,10 +3,22 @@
 Qontinui executor that integrates with the actual Qontinui library.
 """
 
-import base64
 import json
-import os
 import sys
+
+# CRITICAL: Send READY signal IMMEDIATELY to prevent timeout
+# Must happen before any other imports that might be slow
+# Using sys.stdout.write for immediate output without buffering
+sys.stdout.write(json.dumps({
+    "type": "ready",
+    "data": {"message": "Python executor starting", "library_available": None}
+}) + "\n")
+sys.stdout.flush()
+
+# Now import remaining modules
+import base64
+import logging
+import os
 import tempfile
 import threading
 import time
@@ -14,7 +26,10 @@ import traceback
 from enum import Enum
 from io import StringIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 # Add qontinui library src directory to path
 # This file is in: qontinui_parent/qontinui-runner/python-bridge/qontinui_executor.py
@@ -213,6 +228,270 @@ class ExecutionContext:
         return len(self.stack)
 
 
+class RunnerOrchestrator:
+    """
+    Pure orchestrator for runner.
+
+    Responsibilities:
+    - Load configuration
+    - Create StateExecutionAPI (library handles state)
+    - Translate Tauri requests to library calls
+    - Emit events to Tauri frontend
+
+    Does NOT:
+    - Manage states
+    - Execute transitions directly
+    - Track state memory
+    """
+
+    def __init__(self, config_path: str):
+        """Initialize orchestrator with configuration.
+
+        Args:
+            config_path: Path to JSON configuration file
+        """
+        self.config_path = config_path
+        self.config: Optional[Any] = None
+        self.state_executor: Optional[Any] = None
+        self.action_executor: Optional[Any] = None
+        self._sequence = 0
+
+        # Load configuration
+        self.config = self._load_config(config_path)
+
+        # Initialize HAL
+        self._initialize_hal()
+
+        logger.info(f"RunnerOrchestrator initialized with config: {config_path}")
+
+    def _load_config(self, config_path: str) -> Any:
+        """Load config and register inline workflows.
+
+        Args:
+            config_path: Path to JSON configuration file
+
+        Returns:
+            QontinuiConfig object
+        """
+        if not QONTINUI_AVAILABLE:
+            raise RuntimeError("Qontinui library not available")
+
+        from qontinui.json_executor.config_parser import ConfigParser
+        import json
+
+        with open(config_path, 'r') as f:
+            config_dict = json.load(f)
+
+        # Parse config using ConfigParser
+        config_parser = ConfigParser()
+        config = config_parser.parse_config(config_dict)
+
+        logger.info(f"Config loaded: {len(config.states)} states, {len(config.workflows)} workflows, {len(config.transitions)} transitions")
+
+        # Initialize StateExecutor with config
+        from qontinui.json_executor.state_executor import StateExecutor
+        self.state_executor = StateExecutor(config)
+        self.state_executor.initialize()
+
+        # Get ActionExecutor from StateExecutor
+        self.action_executor = self.state_executor.action_executor
+
+        logger.info("StateExecutor and ActionExecutor initialized")
+
+        return config
+
+    def _initialize_hal(self) -> None:
+        """Initialize HAL (Hardware Abstraction Layer)."""
+        if not QONTINUI_AVAILABLE:
+            return
+
+        # HAL is initialized automatically when qontinui is imported
+        # This method exists for future HAL-specific initialization
+        logger.debug("HAL initialized")
+
+    def execute_transition(self, transition_id: str) -> Dict[str, Any]:
+        """Execute transition via library.
+
+        Args:
+            transition_id: ID of transition to execute
+
+        Returns:
+            Dict with success status and details
+        """
+        if not self.state_executor:
+            return {
+                "success": False,
+                "error": "StateExecutor not initialized"
+            }
+
+        try:
+            # Find transition by ID
+            transition = self.config.transition_map.get(transition_id)
+            if not transition:
+                return {
+                    "success": False,
+                    "error": f"Transition {transition_id} not found"
+                }
+
+            # Execute transition
+            success = self.state_executor._execute_transition(transition)
+
+            return {
+                "success": success,
+                "transition_id": transition_id,
+                "active_states": self.state_executor.get_active_states()
+            }
+        except Exception as e:
+            logger.error(f"Failed to execute transition {transition_id}: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    def navigate_to_state(self, target_state_id: str) -> Dict[str, Any]:
+        """Navigate to state via library.
+
+        Args:
+            target_state_id: ID of target state
+
+        Returns:
+            Dict with success status and details
+        """
+        if not QONTINUI_AVAILABLE:
+            return {
+                "success": False,
+                "error": "Qontinui library not available"
+            }
+
+        try:
+            from qontinui import navigation_api
+
+            # Use navigation API to navigate to state
+            result = navigation_api.open_state(target_state_id)
+
+            return {
+                "success": result.get("success", False),
+                "target_state": target_state_id,
+                "active_states": self.state_executor.get_active_states() if self.state_executor else [],
+                "path": result.get("path", [])
+            }
+        except Exception as e:
+            logger.error(f"Failed to navigate to state {target_state_id}: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+
+    def navigate_to_multiple_states(self, target_state_ids: List[str]) -> Dict[str, Any]:
+        """Navigate to multiple states via library.
+
+        Args:
+            target_state_ids: List of target state IDs
+
+        Returns:
+            Dict with success status and details
+        """
+        if not QONTINUI_AVAILABLE:
+            return {
+                "success": False,
+                "error": "Qontinui library not available"
+            }
+
+        results = []
+        overall_success = True
+
+        for state_id in target_state_ids:
+            result = self.navigate_to_state(state_id)
+            results.append(result)
+            if not result.get("success", False):
+                overall_success = False
+
+        return {
+            "success": overall_success,
+            "results": results,
+            "active_states": self.state_executor.get_active_states() if self.state_executor else []
+        }
+
+    def get_active_states(self) -> Dict[str, Any]:
+        """Get active states from library.
+
+        Returns:
+            Dict with active state information
+        """
+        if not self.state_executor:
+            return {
+                "success": False,
+                "error": "StateExecutor not initialized",
+                "active_states": []
+            }
+
+        return {
+            "success": True,
+            "active_states": self.state_executor.get_active_states(),
+            "current_state": self.state_executor.current_state,
+            "state_history": self.state_executor.get_state_history()
+        }
+
+    def get_available_transitions(self) -> Dict[str, Any]:
+        """Get available transitions from library.
+
+        Returns:
+            Dict with available transition information
+        """
+        if not self.state_executor:
+            return {
+                "success": False,
+                "error": "StateExecutor not initialized",
+                "transitions": []
+            }
+
+        try:
+            current_state = self.state_executor.current_state
+            if not current_state:
+                return {
+                    "success": True,
+                    "transitions": [],
+                    "message": "No current state"
+                }
+
+            # Get outgoing transitions from current state
+            outgoing_transitions = self.state_executor._find_outgoing_transitions(current_state)
+
+            # Format transition information
+            transitions = []
+            for trans in outgoing_transitions:
+                transitions.append({
+                    "id": trans.id,
+                    "from_state": trans.from_state,
+                    "to_state": trans.to_state if hasattr(trans, 'to_state') else None,
+                    "workflows": trans.workflows
+                })
+
+            return {
+                "success": True,
+                "transitions": transitions,
+                "current_state": current_state
+            }
+        except Exception as e:
+            logger.error(f"Failed to get available transitions: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "transitions": []
+            }
+
+    def _emit_to_tauri(self, event: Dict[str, Any]) -> None:
+        """Emit event to Tauri frontend.
+
+        Args:
+            event: Event dictionary to emit
+        """
+        event["timestamp"] = time.time()
+        event["sequence"] = self._sequence
+        self._sequence += 1
+        print(json.dumps(event), flush=True)
+
+
 class QontinuiExecutor:
     """Executor that uses the Qontinui library for real automation."""
 
@@ -258,10 +537,9 @@ class QontinuiExecutor:
             self._emit_log("debug", f"[INIT] Event registry MATCH_ATTEMPTED callbacks: {len(event_registry._callbacks.get(QontinuiEventType.MATCH_ATTEMPTED, []))}")
             self._emit_log("debug", f"[INIT] EventTranslator initialized and callbacks registered")
 
-        self._emit_event(
-            EventType.READY,
-            {"message": "Qontinui executor initialized", "library_available": QONTINUI_AVAILABLE},
-        )
+        # READY signal already sent at module import time (before heavy imports)
+        # This ensures Rust doesn't timeout waiting for the signal
+        self._emit_log("info", f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})")
 
     def _emit_event(self, event_type: EventType, data: dict[str, Any]):
         """Emit event to Tauri through stdout."""
@@ -820,7 +1098,8 @@ class QontinuiExecutor:
                         if patterns and len(patterns) > 0:
                             # Get the first pattern's image ID
                             first_pattern = patterns[0]
-                            underlying_image_id = first_pattern.get("image")
+                            # NEW: Use imageId field (proper reference), fallback to image field (legacy embedded data)
+                            underlying_image_id = first_pattern.get("imageId") or first_pattern.get("image")
 
                             self._emit_log("debug", f"State image {state_image_id} -> underlying image {underlying_image_id}")
 
@@ -918,6 +1197,36 @@ class QontinuiExecutor:
                     config_parser = ConfigParser()
                     self.qontinui_config = config_parser.parse_config(self.config)
                     self._emit_log("info", f"Parsed config into QontinuiConfig: {len(self.qontinui_config.workflows)} workflows, {len(self.qontinui_config.states)} states")
+
+                    # Sync inline workflows from registry to workflow_map
+                    # Inline workflows are registered during transition loading but not in config.workflows[]
+                    # Add them to workflow_map so StateExecutor can find them
+                    from qontinui.config.schema import Workflow, WorkflowVisibility
+
+                    registry_workflow_ids = registry.get_all_workflow_ids()
+                    inline_workflow_count = 0
+                    failed_workflow_count = 0
+                    for workflow_id in registry_workflow_ids:
+                        if workflow_id not in self.qontinui_config.workflow_map:
+                            # This is an inline workflow - get its definition from registry
+                            workflow_def = registry.get_workflow_definition(workflow_id)
+                            if workflow_def:
+                                # Mark as INTERNAL and validate against schema
+                                workflow_def['visibility'] = WorkflowVisibility.INTERNAL.value
+                                try:
+                                    workflow_obj = Workflow(**workflow_def)
+                                    self.qontinui_config.workflow_map[workflow_id] = workflow_obj
+                                    inline_workflow_count += 1
+                                except Exception as e:
+                                    failed_workflow_count += 1
+                                    self._emit_log("error", f"Inline workflow {workflow_id} has invalid format and cannot be loaded")
+                                    self._emit_log("error", f"Validation error: {e}")
+                                    self._emit_log("error", f"Please re-export your configuration to update inline workflow format")
+
+                    if inline_workflow_count > 0:
+                        self._emit_log("info", f"Added {inline_workflow_count} inline workflows to workflow_map")
+                    if failed_workflow_count > 0:
+                        self._emit_log("error", f"{failed_workflow_count} inline workflows failed validation - re-export config to fix")
 
                     # Initialize StateExecutor which creates its own ActionExecutor
                     # StateExecutor handles state machine execution (GO_TO_STATE, etc.)
@@ -1046,6 +1355,8 @@ class QontinuiExecutor:
             # Capture library's stdout to intercept action_execution events
             captured_events = []
             original_stdout = sys.stdout
+
+            # Capture stdout to intercept library's action_execution events
             capture_buffer = StringIO()
             sys.stdout = capture_buffer
 
@@ -1055,6 +1366,10 @@ class QontinuiExecutor:
                 # Restore stdout and process captured output
                 sys.stdout = original_stdout
                 captured_output = capture_buffer.getvalue()
+
+                # Debug: Log captured output size
+                if captured_output:
+                    self._emit_log("debug", f"Captured {len(captured_output)} chars from library stdout")
 
                 # Parse captured JSON events and add hierarchy
                 import json
@@ -1107,8 +1422,8 @@ class QontinuiExecutor:
                             # Re-emit other events as-is
                             print(line, file=original_stdout)
                     except json.JSONDecodeError:
-                        # Not JSON, just print it
-                        print(line, file=original_stdout)
+                        # Not JSON, send to stderr instead of stdout
+                        print(line, file=sys.stderr)
 
             # Sync last_find_location from library if available
             if hasattr(self.action_executor, 'last_find_location') and self.action_executor.last_find_location:
@@ -1386,6 +1701,31 @@ class QontinuiExecutor:
         elif cmd_type == "recording_status":
             return self._handle_recording_status()
 
+        elif cmd_type == "ping":
+            # Health check ping - send pong message directly to stdout
+            pong_message = {
+                "type": "pong",
+                "timestamp": time.time()
+            }
+            print(json.dumps(pong_message), flush=True)
+            # Also return success response
+            return {"success": True}
+
+        elif cmd_type == "execute_transition":
+            return execute_transition(params.get("transition_id"))
+
+        elif cmd_type == "navigate_to_state":
+            return navigate_to_state(params.get("state_id"))
+
+        elif cmd_type == "navigate_to_multiple_states":
+            return navigate_to_multiple_states(params.get("state_ids", []))
+
+        elif cmd_type == "get_active_states":
+            return get_active_states()
+
+        elif cmd_type == "get_available_transitions":
+            return get_available_transitions()
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -1428,6 +1768,108 @@ class QontinuiExecutor:
             with contextlib.suppress(Exception):
                 shutil.rmtree(self.temp_dir)
 
+
+# ============================================================================
+# Global Orchestrator Management
+# ============================================================================
+
+_orchestrator: Optional[RunnerOrchestrator] = None
+
+
+def initialize_orchestrator(config_path: str) -> None:
+    """Initialize the global orchestrator instance.
+
+    Args:
+        config_path: Path to JSON configuration file
+
+    Raises:
+        RuntimeError: If initialization fails
+    """
+    global _orchestrator
+    _orchestrator = RunnerOrchestrator(config_path)
+    logger.info(f"Orchestrator initialized with config: {config_path}")
+
+
+def get_orchestrator() -> RunnerOrchestrator:
+    """Get the global orchestrator instance.
+
+    Returns:
+        RunnerOrchestrator instance
+
+    Raises:
+        RuntimeError: If orchestrator not initialized
+    """
+    if _orchestrator is None:
+        raise RuntimeError("Orchestrator not initialized. Call initialize_orchestrator() first.")
+    return _orchestrator
+
+
+# ============================================================================
+# Tauri Command Bindings
+# ============================================================================
+
+def execute_transition(transition_id: str) -> dict:
+    """Execute transition via library.
+
+    Args:
+        transition_id: ID of transition to execute
+
+    Returns:
+        Dict with success status and details
+    """
+    orchestrator = get_orchestrator()
+    return orchestrator.execute_transition(transition_id)
+
+
+def navigate_to_state(state_id: str) -> dict:
+    """Navigate to state via library.
+
+    Args:
+        state_id: ID of target state
+
+    Returns:
+        Dict with success status and details
+    """
+    orchestrator = get_orchestrator()
+    return orchestrator.navigate_to_state(state_id)
+
+
+def navigate_to_multiple_states(state_ids: List[str]) -> dict:
+    """Navigate to multiple states via library.
+
+    Args:
+        state_ids: List of target state IDs
+
+    Returns:
+        Dict with success status and details
+    """
+    orchestrator = get_orchestrator()
+    return orchestrator.navigate_to_multiple_states(state_ids)
+
+
+def get_active_states() -> dict:
+    """Get active states from library.
+
+    Returns:
+        Dict with active state information
+    """
+    orchestrator = get_orchestrator()
+    return orchestrator.get_active_states()
+
+
+def get_available_transitions() -> dict:
+    """Get available transitions from library.
+
+    Returns:
+        Dict with available transition information
+    """
+    orchestrator = get_orchestrator()
+    return orchestrator.get_available_transitions()
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 def main():
     """Main entry point for the Qontinui executor."""

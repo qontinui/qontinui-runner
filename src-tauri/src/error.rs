@@ -31,6 +31,15 @@ pub enum AppError {
 
     #[error("Unexpected error: {0}")]
     UnexpectedError(String),
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Timeout error: {0}")]
+    TimeoutError(String),
+
+    #[error("Health check error: {0}")]
+    HealthCheckError(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -155,6 +164,36 @@ impl AppError {
                     "Please restart the application. If the problem persists, contact support."
                         .to_string(),
                 ),
+            },
+
+            AppError::ParseError(msg) => UserFacingError {
+                title: "Parse Error".to_string(),
+                message: "Failed to parse data from executor.".to_string(),
+                details: Some(msg.clone()),
+                error_code: "PARSE_001".to_string(),
+                severity: ErrorSeverity::Error,
+                recoverable: true,
+                suggested_action: Some("Check executor output and logs.".to_string()),
+            },
+
+            AppError::TimeoutError(msg) => UserFacingError {
+                title: "Timeout Error".to_string(),
+                message: "Operation timed out.".to_string(),
+                details: Some(msg.clone()),
+                error_code: "TIME_001".to_string(),
+                severity: ErrorSeverity::Warning,
+                recoverable: true,
+                suggested_action: Some("Try the operation again.".to_string()),
+            },
+
+            AppError::HealthCheckError(msg) => UserFacingError {
+                title: "Health Check Error".to_string(),
+                message: "Executor health check failed.".to_string(),
+                details: Some(msg.clone()),
+                error_code: "HEALTH_001".to_string(),
+                severity: ErrorSeverity::Error,
+                recoverable: true,
+                suggested_action: Some("Restart the executor.".to_string()),
             },
         }
     }

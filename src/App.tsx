@@ -89,11 +89,20 @@ function App() {
   const logIdRef = useRef(0);
   const executionScopeRef = useRef<string | null>(null); // Tracks current workflow execution scope
   const wasAutoMinimizedRef = useRef(false); // Track if we minimized the window (using ref to avoid closure issues)
+  const hasInitializedRef = useRef(false); // Prevent double initialization in StrictMode
 
-  // Detect monitors on mount
+  // Detect monitors and auto-load last config on mount
   useEffect(() => {
-    console.log("App component mounted");
+    // Prevent double initialization in React StrictMode
+    if (hasInitializedRef.current) {
+      console.log("App component already initialized, skipping");
+      return;
+    }
+    hasInitializedRef.current = true;
+
+    console.log("App component mounted - initializing");
     detectSystemMonitors();
+    autoLoadLastConfig();
   }, []);
 
   // Debug hierarchicalEvents changes
@@ -369,9 +378,20 @@ function App() {
             is_expandable: false,
           };
 
-          const scopedParentId = originalHierarchy.parent_id
-            ? `${scope}::${originalHierarchy.parent_id}`
-            : scope; // Top-level workflow is the parent
+          // Scope parent_id correctly:
+          // - If parent_id is null, parent is the workflow (use scope as-is)
+          // - If parent_id matches the workflow ID pattern, parent is the workflow (use scope as-is)
+          // - Otherwise, parent is another action (scope it with ::)
+          let scopedParentId: string | null;
+          if (!originalHierarchy.parent_id) {
+            scopedParentId = scope; // Top-level workflow is the parent
+          } else if (scope.startsWith(originalHierarchy.parent_id)) {
+            // parent_id is the workflow_id, and scope is already the scoped workflow ID
+            scopedParentId = scope;
+          } else {
+            // parent_id is an action_id, scope it
+            scopedParentId = `${scope}::${originalHierarchy.parent_id}`;
+          }
 
           const event: ActionExecutionEvent = {
             id: scopedId,
@@ -395,8 +415,10 @@ function App() {
           console.log("ACTION_EXECUTION event created:", {
             id: event.id,
             action_type: event.action_type,
-            parent_id: event.hierarchy.parent_id,
+            original_parent_id: originalHierarchy.parent_id,
+            scoped_parent_id: event.hierarchy.parent_id,
             nesting_level: event.hierarchy.nesting_level,
+            scope: scope,
             is_workflow: event.is_workflow
           });
           setHierarchicalEvents((prev) => {
@@ -481,6 +503,148 @@ function App() {
     }
   };
 
+  // Extract config loading logic into reusable function
+  const loadConfigFromPath = async (configPath: string) => {
+    // Start Python executor first if not running
+    if (pythonStatus !== "running") {
+      const started = await startPythonExecutor();
+      if (!started) {
+        addLog("error", "Cannot load configuration: Python executor failed to start");
+        return false;
+      }
+      // Wait a moment for Python to be ready
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    }
+
+    const result: any = await invoke("load_configuration", { path: configPath });
+    if (result.success) {
+      const loadedConfig = {
+        name: configPath.split("/").pop() || configPath.split("\\").pop() || "config.json",
+        version: "1.0.0",
+        statesCount: result.data?.states?.length || 0,
+        workflowsCount: result.data?.workflows?.length || 0,
+        workflows: result.data?.workflows || [],
+        images: result.data?.images || [],
+        states: result.data?.states || [],
+        path: configPath,
+      };
+      console.log("Config loaded with images:", loadedConfig.images?.length || 0, "images");
+      console.log("Config loaded with states:", loadedConfig.states?.length || 0, "states");
+      if (loadedConfig.states && loadedConfig.states.length > 0) {
+        const firstState = loadedConfig.states[0];
+        console.log("First state:", firstState);
+        console.log("First state keys:", Object.keys(firstState));
+        if (firstState.stateImages && firstState.stateImages.length > 0) {
+          const firstStateImage = firstState.stateImages[0];
+          console.log("First StateImage:", firstStateImage);
+          console.log("First StateImage keys:", Object.keys(firstStateImage));
+          console.log("First StateImage id:", firstStateImage.id);
+          console.log("First StateImage name:", firstStateImage.name);
+        }
+      }
+      setConfig(loadedConfig);
+      // Filter workflows to only show those in the "main" category
+      const allWorkflows = result.data?.workflows || [];
+
+      // Debug: Log all workflows with their categories and visibility
+      console.log("All workflows loaded:", allWorkflows.length);
+      allWorkflows.forEach((w: any) => {
+        console.log(`Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}", Visibility: "${w.visibility || 'public'}"`);
+      });
+
+      // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
+      const mainWorkflows = allWorkflows.filter(
+        (w: any) =>
+          w.category &&
+          w.category.toLowerCase() === "main" &&
+          (!w.visibility || w.visibility !== "internal") // Exclude internal workflows
+      );
+
+      console.log("Filtered main workflows:", mainWorkflows.length);
+      mainWorkflows.forEach((w: any) => {
+        console.log(`Main workflow: ${w.name} (ID: ${w.id})`);
+      });
+
+      setWorkflows(mainWorkflows);
+      console.log("Workflows state updated with:", mainWorkflows);
+
+      setConfigLoaded(true);
+      addLog("success", `Configuration loaded: ${configPath}`);
+
+      // Log workflow filtering info with more detail
+      if (allWorkflows.length > 0) {
+        // Show categories breakdown
+        const categoryCounts: { [key: string]: number } = {};
+        const visibilityCounts: { [key: string]: number } = {};
+        allWorkflows.forEach((w: any) => {
+          const cat = w.category || "No category";
+          const vis = w.visibility || "public";
+          categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
+          visibilityCounts[vis] = (visibilityCounts[vis] || 0) + 1;
+        });
+
+        const categoryInfo = Object.entries(categoryCounts)
+          .map(([cat, count]) => `${cat}: ${count}`)
+          .join(", ");
+
+        const visibilityInfo = Object.entries(visibilityCounts)
+          .map(([vis, count]) => `${vis}: ${count}`)
+          .join(", ");
+
+        addLog("debug", `Workflow categories: ${categoryInfo}`);
+        addLog("debug", `Workflow visibility: ${visibilityInfo}`);
+
+        const internalCount = allWorkflows.length - mainWorkflows.length;
+        if (internalCount > 0) {
+          addLog(
+            "info",
+            `Loaded ${mainWorkflows.length} public workflows (${internalCount} internal workflows hidden)`,
+          );
+        } else if (mainWorkflows.length !== allWorkflows.length) {
+          addLog(
+            "info",
+            `Loaded ${mainWorkflows.length} workflows from "Main" category (${allWorkflows.length} total)`,
+          );
+        } else {
+          addLog("info", `Loaded ${mainWorkflows.length} workflows`);
+        }
+
+        if (mainWorkflows.length === 0) {
+          addLog(
+            "warning",
+            "No workflows found with 'Main' category. Check your config categories.",
+          );
+        }
+      }
+
+      // If workflows were found, select the first one
+      if (mainWorkflows.length > 0) {
+        const firstWorkflow = mainWorkflows[0];
+        console.log("Setting selected workflow to:", firstWorkflow.id, firstWorkflow.name);
+        setSelectedWorkflow(firstWorkflow.id);
+      } else {
+        console.log("No main workflows found to select");
+        setSelectedWorkflow("");
+      }
+
+      return true;
+    }
+    return false;
+  };
+
+  // Auto-load last config on startup
+  const autoLoadLastConfig = async () => {
+    try {
+      const result: any = await invoke("get_last_config_path");
+      if (result.success && result.data?.path) {
+        addLog("info", `Auto-loading last config: ${result.data.path}`);
+        await loadConfigFromPath(result.data.path);
+      }
+    } catch (error) {
+      console.log("No last config to auto-load:", error);
+    }
+  };
+
   const handleLoadConfiguration = async () => {
     try {
       const selected = await open({
@@ -494,111 +658,7 @@ function App() {
       });
 
       if (selected) {
-        // Start Python executor first if not running
-        if (pythonStatus !== "running") {
-          const started = await startPythonExecutor();
-          if (!started) {
-            addLog("error", "Cannot load configuration: Python executor failed to start");
-            return;
-          }
-          // Wait a moment for Python to be ready
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-        }
-
-        const result: any = await invoke("load_configuration", { path: selected });
-        if (result.success) {
-          const loadedConfig = {
-            name: selected.split("/").pop() || "config.json",
-            version: "1.0.0",
-            statesCount: result.data?.states?.length || 0,
-            workflowsCount: result.data?.workflows?.length || 0,
-            workflows: result.data?.workflows || [],
-            images: result.data?.images || [],
-            states: result.data?.states || [],
-            path: selected,
-          };
-          console.log("Config loaded with images:", loadedConfig.images?.length || 0, "images");
-          console.log("Config loaded with states:", loadedConfig.states?.length || 0, "states");
-          if (loadedConfig.states && loadedConfig.states.length > 0) {
-            const firstState = loadedConfig.states[0];
-            console.log("First state:", firstState);
-            console.log("First state keys:", Object.keys(firstState));
-            if (firstState.stateImages && firstState.stateImages.length > 0) {
-              const firstStateImage = firstState.stateImages[0];
-              console.log("First StateImage:", firstStateImage);
-              console.log("First StateImage keys:", Object.keys(firstStateImage));
-              console.log("First StateImage id:", firstStateImage.id);
-              console.log("First StateImage name:", firstStateImage.name);
-            }
-          }
-          setConfig(loadedConfig);
-          // Filter workflows to only show those in the "main" category
-          const allWorkflows = result.data?.workflows || [];
-
-          // Debug: Log all workflows with their categories
-          console.log("All workflows loaded:", allWorkflows.length);
-          allWorkflows.forEach((w: any) => {
-            console.log(`Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}"`);
-          });
-
-          // Show only workflows with "Main" category (case-insensitive)
-          const mainWorkflows = allWorkflows.filter(
-            (w: any) => w.category && w.category.toLowerCase() === "main"
-          );
-
-          console.log("Filtered main workflows:", mainWorkflows.length);
-          mainWorkflows.forEach((w: any) => {
-            console.log(`Main workflow: ${w.name} (ID: ${w.id})`);
-          });
-
-          setWorkflows(mainWorkflows);
-          console.log("Workflows state updated with:", mainWorkflows);
-
-          setConfigLoaded(true);
-          addLog("success", `Configuration loaded: ${selected}`);
-
-          // Log workflow filtering info with more detail
-          if (allWorkflows.length > 0) {
-            // Show categories breakdown
-            const categoryCounts: { [key: string]: number } = {};
-            allWorkflows.forEach((w: any) => {
-              const cat = w.category || "No category";
-              categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
-            });
-
-            const categoryInfo = Object.entries(categoryCounts)
-              .map(([cat, count]) => `${cat}: ${count}`)
-              .join(", ");
-
-            addLog("debug", `Workflow categories: ${categoryInfo}`);
-
-            if (mainWorkflows.length !== allWorkflows.length) {
-              addLog(
-                "info",
-                `Loaded ${mainWorkflows.length} workflows from "Main" category (${allWorkflows.length} total)`,
-              );
-            } else {
-              addLog("info", `Loaded ${mainWorkflows.length} workflows`);
-            }
-
-            if (mainWorkflows.length === 0) {
-              addLog(
-                "warning",
-                "No workflows found with 'Main' category. Check your config categories.",
-              );
-            }
-          }
-
-          // If workflows were found, select the first one
-          if (mainWorkflows.length > 0) {
-            const firstWorkflow = mainWorkflows[0];
-            console.log("Setting selected workflow to:", firstWorkflow.id, firstWorkflow.name);
-            setSelectedWorkflow(firstWorkflow.id);
-          } else {
-            console.log("No main workflows found to select");
-            setSelectedWorkflow("");
-          }
-        }
+        await loadConfigFromPath(selected);
       }
     } catch (error) {
       addLog("error", `Failed to load configuration: ${error}`);
