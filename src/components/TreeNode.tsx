@@ -6,16 +6,23 @@
  * and different visual representations for workflows and actions.
  */
 
-import React from 'react';
-import { ChevronRight, ChevronDown, CheckCircle2, XCircle, FolderOpen, Activity } from 'lucide-react';
-import { TreeNode as TreeNodeType } from '../utils/eventTree';
-import { HierarchicalEvent, ActionExecutionEvent, WorkflowEvent } from '../types/events';
+import React from "react";
+import {
+  ChevronRight,
+  ChevronDown,
+  CheckCircle2,
+  XCircle,
+  FolderOpen,
+  Activity,
+  Loader,
+} from "lucide-react";
+import { DisplayNode } from "../types/treeEvents";
 
 interface TreeNodeProps {
   /**
    * The tree node to render
    */
-  node: TreeNodeType<HierarchicalEvent>;
+  node: DisplayNode;
 
   /**
    * Whether this node is currently expanded
@@ -39,158 +46,148 @@ interface TreeNodeProps {
 }
 
 /**
- * Type guard to check if an event is a workflow event
+ * Helper function to format action details from metadata
  */
-function isWorkflowEvent(event: HierarchicalEvent): event is WorkflowEvent {
-  return 'is_workflow' in event && event.is_workflow === true;
-}
-
-/**
- * Type guard to check if an event is an action execution event
- */
-function isActionEvent(event: HierarchicalEvent): event is ActionExecutionEvent {
-  return !isWorkflowEvent(event);
-}
-
-/**
- * Helper function to format action details for display
- */
-function formatActionDetails(action: ActionExecutionEvent): string {
+function formatActionDetails(node: DisplayNode): string {
   const details: string[] = [];
-  const config = action.config as any;
+  const config = node.metadata.config || {};
 
-  // Action-specific details
-  switch (action.action_type) {
-    case 'GO_TO_STATE':
-      // Show target state(s)
-      if (action.target_states && action.target_states.length > 0) {
-        details.push(`→ ${action.target_states.join(', ')}`);
-      } else if (config?.stateNames && config.stateNames.length > 0) {
-        details.push(`→ ${config.stateNames.join(', ')}`);
-      }
-      break;
-
-    case 'TYPE':
-      // Show typed text
-      if (action.typed_text) {
-        details.push(`"${action.typed_text}"`);
-      } else if (action.text) {
-        details.push(`"${action.text}"`);
-      } else if (config?.text) {
+  // Handle different action types
+  switch (node.name) {
+    case "TYPE":
+      // Check for text in various possible locations
+      // Priority: actual text > textToType > text from state reference
+      if (config.text) {
         details.push(`"${config.text}"`);
-      }
-      break;
-
-    case 'RUN_WORKFLOW':
-      // Show workflow name (user noted it's redundant since next line shows workflow)
-      // But useful if workflow hasn't expanded yet
-      if (action.workflow_name) {
-        details.push(action.workflow_name);
-      }
-      break;
-
-    case 'MOUSE_MOVE':
-      // Show move location
-      if (action.x !== undefined && action.y !== undefined) {
-        details.push(`→ (${action.x}, ${action.y})`);
-      } else if (config?.x !== undefined && config?.y !== undefined) {
-        details.push(`→ (${config.x}, ${config.y})`);
-      }
-      break;
-
-    case 'CLICK':
-      // Show click location
-      if (action.x !== undefined && action.y !== undefined) {
-        details.push(`at (${action.x}, ${action.y})`);
-      } else if (config?.x !== undefined && config?.y !== undefined) {
-        details.push(`at (${config.x}, ${config.y})`);
-      }
-      // Show image target if available
-      if (action.image_id) {
-        details.push(`[${action.image_id}]`);
-      } else if (config?.target?.imageId) {
-        details.push(`[${config.target.imageId}]`);
-      }
-      break;
-
-    case 'FIND':
-      // Show image being searched
-      if (action.image_id) {
-        details.push(`"${action.image_id}"`);
-      } else if (config?.imageId) {
-        details.push(`"${config.imageId}"`);
-      }
-      // Show if found/not found with match count
-      if (action.found !== undefined) {
-        if (action.found) {
-          const matchCount = action.matches || 1;
-          details.push(`✓ found (${matchCount} match${matchCount > 1 ? 'es' : ''})`);
-          // Show location if available
-          if (action.x !== undefined && action.y !== undefined) {
-            details.push(`at (${action.x}, ${action.y})`);
-          }
+      } else if (config.textToType) {
+        details.push(`"${config.textToType}"`);
+      } else if (config.textSource?.text) {
+        details.push(`"${config.textSource.text}"`);
+      } else if (config.textSource?.stateId) {
+        // Text comes from a state's string - show both state name and actual text if available
+        const stateRef = config.textSource.stateId;
+        // Check if there's actual typed text in metadata (from execution result)
+        if (node.metadata.typedText) {
+          details.push(`"${node.metadata.typedText}" (from ${stateRef})`);
         } else {
-          details.push('✗ not found');
+          details.push(`text from ${stateRef}`);
         }
       }
       break;
 
-    case 'WAIT':
-      // Show wait duration
-      if (action.duration !== undefined) {
-        details.push(`${action.duration}ms`);
-      } else if (config?.duration !== undefined) {
-        details.push(`${config.duration}ms`);
+    case "CLICK":
+      if (config.target?.type === "lastFindResult") {
+        details.push("on last find result");
+      } else if (config.target?.type === "currentPosition") {
+        details.push("at current position");
+      } else if (config.target?.type === "image" && config.target.imageId) {
+        details.push(`on "${config.target.imageId}"`);
+      } else if (config.x !== undefined && config.y !== undefined) {
+        details.push(`at (${config.x}, ${config.y})`);
       }
       break;
 
-    case 'IF':
-      // Show condition being checked (usually image-based)
-      if (action.image_id) {
-        details.push(`check "${action.image_id}"`);
-      } else if (config?.imageId) {
-        details.push(`check "${config.imageId}"`);
-      } else if (config?.image) {
-        details.push(`check "${config.image}"`);
+    case "FIND":
+      // Handle multiple images (new format)
+      if (config.imageNames && Array.isArray(config.imageNames)) {
+        const names = config.imageNames;
+        if (names.length === 1) {
+          details.push(`"${names[0]}"`);
+        } else if (names.length <= 3) {
+          details.push(`"${names.join('", "')}"`);
+        } else {
+          details.push(`${names.length} images: "${names.slice(0, 2).join('", "')}", ...`);
+        }
       }
-      // Show result if available
-      if (action.condition_result !== undefined) {
-        details.push(action.condition_result ? '✓ true' : '✗ false');
+      // Handle single image (includes backward compat string from enrichment)
+      else if (config.imageName) {
+        details.push(`"${config.imageName}"`);
+      } else if (config.target?.imageName) {
+        details.push(`"${config.target.imageName}"`);
+      } else if (config.target?.imageId) {
+        details.push(`"${config.target.imageId}"`);
+      } else if (config.imageId) {
+        details.push(`"${config.imageId}"`);
+      } else if (config.target?.imageIds && Array.isArray(config.target.imageIds)) {
+        // Fallback to IDs if names not available
+        const ids = config.target.imageIds;
+        if (ids.length === 1) {
+          details.push(`"${ids[0]}"`);
+        } else {
+          details.push(`${ids.length} images`);
+        }
+      } else if (config.imageIds && Array.isArray(config.imageIds)) {
+        // Fallback to IDs if names not available
+        const ids = config.imageIds;
+        if (ids.length === 1) {
+          details.push(`"${ids[0]}"`);
+        } else {
+          details.push(`${ids.length} images`);
+        }
+      } else if (config.image) {
+        details.push(`"${config.image}"`);
+      }
+      break;
+
+    case "IF":
+      // Image ID is shown in main label as FIND, no need to repeat
+      // Only show additional condition details if not image-based
+      const target = config.target;
+      const hasImageCondition = (typeof target === 'object' && target !== null && target.imageId) || config.imageId;
+
+      if (!hasImageCondition && config.condition) {
+        details.push(`${config.condition}`);
+      }
+      break;
+
+    case "WAIT":
+      if (config.duration !== undefined) {
+        const seconds = config.duration / 1000;
+        details.push(`${seconds}s`);
+      }
+      break;
+
+    case "GO_TO_STATE":
+      // State names are shown in main label, no need to repeat here
+      break;
+
+    case "RUN_WORKFLOW":
+      if (config.workflowId) {
+        details.push(`"${config.workflowId}"`);
+      }
+      break;
+
+    case "MOUSE_MOVE":
+      if (config.target?.type === "lastFindResult") {
+        details.push("to last find result");
+      } else if (config.target?.type === "image" && config.target.imageId) {
+        details.push(`to "${config.target.imageId}"`);
       }
       break;
 
     default:
-      // Generic handling for other action types
-      if (action.typed_text) {
-        details.push(`"${action.typed_text}"`);
-      }
-      if (config?.target) {
-        details.push(`target: ${config.target}`);
-      }
-      if (config?.url) {
-        details.push(`url: ${config.url}`);
+      // Generic handling
+      if (config.target?.imageId) {
+        details.push(`"${config.target.imageId}"`);
+      } else if (config.imageId) {
+        details.push(`"${config.imageId}"`);
       }
   }
 
-  // Add attempts if more than 1
-  if (action.attempts > 1) {
-    details.push(`(${action.attempts} attempts)`);
-  }
-
-  return details.length > 0 ? ` - ${details.join(', ')}` : '';
+  return details.length > 0 ? ` ${details.join(", ")}` : "";
 }
 
 /**
- * Helper function to get the success status of an event
+ * Calculate nesting level from parent chain
  */
-function getEventSuccess(event: HierarchicalEvent): boolean | null {
-  if (isActionEvent(event)) {
-    return event.success;
+function calculateNestingLevel(node: DisplayNode): number {
+  let level = 0;
+  let current: DisplayNode | null = node.parent;
+  while (current) {
+    level++;
+    current = current.parent;
   }
-  if ('success' in event) {
-    return event.success;
-  }
-  return null; // WorkflowStartedEvent doesn't have success
+  return level;
 }
 
 /**
@@ -203,16 +200,12 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
   expandedNodes,
   level,
 }) => {
-  const event = node.data;
-  const nestingLevel = level !== undefined ? level : event.hierarchy.nesting_level;
-  // Offset indentation by 2 levels since we hide level 1 (workflow)
-  // Level 2 (GO_TO_STATE) starts at 0, level 3 (nested TYPE) at 20px, etc.
-  const indentation = Math.max(0, (nestingLevel - 2) * 20);
-  const isExpandable = event.hierarchy.is_expandable || node.children.length > 0;
-  const success = getEventSuccess(event);
-
-  // Determine if this is a workflow event
-  const isWorkflow = isWorkflowEvent(event);
+  const nestingLevel = level !== undefined ? level : calculateNestingLevel(node);
+  // Each level adds 20px of indentation
+  const indentation = nestingLevel * 20;
+  const isExpandable = node.metadata.is_expandable || node.children.length > 0;
+  const isWorkflow = node.type === "workflow";
+  const isTransition = node.type === "transition";
 
   /**
    * Renders the toggle button for expandable nodes
@@ -229,13 +222,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
           onToggle(node.id);
         }}
         className="w-5 h-5 flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
-        aria-label={isExpanded ? 'Collapse' : 'Expand'}
+        aria-label={isExpanded ? "Collapse" : "Expand"}
       >
-        {isExpanded ? (
-          <ChevronDown className="w-4 h-4" />
-        ) : (
-          <ChevronRight className="w-4 h-4" />
-        )}
+        {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
       </button>
     );
   };
@@ -247,6 +236,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
     if (isWorkflow) {
       return <FolderOpen className="w-4 h-4 text-primary" />;
     }
+    if (isTransition) {
+      return <Activity className="w-4 h-4 text-purple-500" />;
+    }
     return <Activity className="w-4 h-4 text-secondary" />;
   };
 
@@ -254,104 +246,208 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
    * Renders the success/failure indicator
    */
   const renderStatusIndicator = () => {
-    if (success === null) {
-      return null; // No status for workflow started events
+    switch (node.status) {
+      case "success":
+        return <CheckCircle2 className="w-4 h-4 text-green-500" />;
+      case "failed":
+        return <XCircle className="w-4 h-4 text-red-500" />;
+      case "running":
+        return <Loader className="w-4 h-4 text-blue-500 animate-spin" />;
+      case "pending":
+      default:
+        return null;
     }
-
-    if (success) {
-      return <CheckCircle2 className="w-4 h-4 text-accent" aria-label="Success" />;
-    }
-    return <XCircle className="w-4 h-4 text-destructive" aria-label="Failure" />;
   };
 
   /**
-   * Renders the event content based on event type
+   * Format the timestamp for display
    */
-  const renderEventContent = () => {
+  const formatTimestamp = (timestamp: number) => {
+    return new Date(timestamp * 1000).toLocaleTimeString("en-US", {
+      hour12: false,
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  };
+
+  /**
+   * Format duration for display
+   */
+  const formatDuration = (duration: number | undefined) => {
+    if (duration === undefined || duration === null) {
+      return null;
+    }
+
+    // Convert to milliseconds
+    const ms = duration * 1000;
+
+    if (ms < 1000) {
+      // Less than 1 second - show milliseconds
+      return `${Math.round(ms)}ms`;
+    } else if (ms < 60000) {
+      // Less than 1 minute - show seconds with 2 decimal places
+      return `${(ms / 1000).toFixed(2)}s`;
+    } else {
+      // 1 minute or more - show minutes and seconds
+      const minutes = Math.floor(ms / 60000);
+      const seconds = ((ms % 60000) / 1000).toFixed(0);
+      return `${minutes}m ${seconds}s`;
+    }
+  };
+
+  /**
+   * Get the display label for the node
+   */
+  const getNodeLabel = () => {
     if (isWorkflow) {
-      const workflow = event as WorkflowEvent;
-      return (
-        <span className="font-semibold text-primary">
-          {workflow.workflow_name}
-        </span>
-      );
+      return node.name;
     }
 
-    const action = event as ActionExecutionEvent;
-    const details = formatActionDetails(action);
-
-    return (
-      <span className={success ? 'text-foreground' : 'text-destructive'}>
-        <span className="font-medium">{action.action_type}</span>
-        {details && <span className="text-sm text-muted-foreground">{details}</span>}
-      </span>
-    );
-  };
-
-  /**
-   * Renders error/reason information if available
-   */
-  const renderAdditionalInfo = () => {
-    if (isActionEvent(event)) {
-      const action = event as ActionExecutionEvent;
-
-      if (action.error) {
-        return (
-          <div
-            className="text-xs text-destructive mt-1"
-            style={{ paddingLeft: `${indentation + 28}px` }}
-          >
-            Error: {action.error}
-          </div>
-        );
+    if (isTransition) {
+      // Transitions should show their type and target states
+      const targetStates = node.metadata.target_states;
+      if (targetStates && Array.isArray(targetStates)) {
+        return `${node.name} (${targetStates.join(", ")})`;
       }
-
-      if (action.reason && !action.success) {
-        return (
-          <div
-            className="text-xs text-muted-foreground mt-1"
-            style={{ paddingLeft: `${indentation + 28}px` }}
-          >
-            {action.reason}
-          </div>
-        );
-      }
+      return node.name;
     }
 
-    return null;
+    // For actions, create descriptive labels
+    const details = formatActionDetails(node);
+    const config = node.metadata.config || {};
+
+    // Override default labels for clarity
+    switch (node.name) {
+      case "GO_TO_STATE":
+        if (config.stateNames && Array.isArray(config.stateNames)) {
+          return `ACTIVATE STATE ${config.stateNames.join(", ")}`;
+        } else if (config.stateIds && Array.isArray(config.stateIds)) {
+          return `ACTIVATE STATE ${config.stateIds.join(", ")}`;
+        }
+        return "ACTIVATE STATE" + details;
+
+      case "IF":
+        // IF actions that check for images should show as FIND
+        const target = config.target;
+        if (config.imageName) {
+          return `FIND "${config.imageName}"`;
+        } else if (typeof target === 'object' && target !== null && target.imageName) {
+          return `FIND "${target.imageName}"`;
+        } else if (typeof target === 'object' && target !== null && target.imageId) {
+          return `FIND "${target.imageId}"`;
+        } else if (config.imageId) {
+          return `FIND "${config.imageId}"`;
+        }
+        return "IF" + details;
+
+      default:
+        return node.name + details;
+    }
   };
 
   return (
-    <div className="tree-node">
-      {/* Main node row */}
+    <div className="space-y-1">
+      {/* Node Row */}
       <div
-        className="flex items-center gap-2 py-1.5 px-2 hover:bg-card/50 rounded transition-colors cursor-pointer group"
-        style={{ paddingLeft: `${indentation + 8}px` }}
+        className="flex items-center gap-2 px-2 py-1.5 rounded-md hover:bg-accent/5 transition-colors cursor-pointer group"
+        style={{ paddingLeft: `${8 + indentation}px` }}
         onClick={() => isExpandable && onToggle(node.id)}
       >
+        {/* Toggle Button */}
         {renderToggleButton()}
+
+        {/* Icon */}
         {renderIcon()}
-        <div className="flex-1 flex items-center gap-2 min-w-0">
-          {renderEventContent()}
-        </div>
+
+        {/* Label */}
+        <span
+          className={`flex-1 font-mono text-sm ${
+            node.status === "failed" ? "text-red-400" : "text-foreground"
+          }`}
+        >
+          {getNodeLabel()}
+        </span>
+
+        {/* Status Indicator */}
         {renderStatusIndicator()}
+
+        {/* Duration (always visible if available) */}
+        {node.duration !== undefined && (
+          <span className="text-xs text-muted-foreground font-mono">
+            {formatDuration(node.duration)}
+          </span>
+        )}
+
+        {/* Timestamp (show on hover) */}
+        <span className="text-xs text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity">
+          {formatTimestamp(node.timestamp)}
+        </span>
       </div>
 
-      {/* Additional info row (error/reason) */}
-      {renderAdditionalInfo()}
+      {/* Error Message */}
+      {node.error && (
+        <div
+          className="text-xs text-red-400 ml-7 px-2 py-1 bg-red-500/10 rounded border-l-2 border-red-500/50"
+          style={{ marginLeft: `${16 + indentation}px` }}
+        >
+          {node.error}
+        </div>
+      )}
 
-      {/* Recursively render children if expanded */}
+      {/* Children */}
       {isExpanded && node.children.length > 0 && (
-        <div className="tree-children">
-          {node.children.map((childNode) => (
-            <TreeNode
-              key={childNode.id}
-              node={childNode}
-              isExpanded={expandedNodes.has(childNode.id)}
-              onToggle={onToggle}
-              expandedNodes={expandedNodes}
-            />
-          ))}
+        <div>
+          {node.children.flatMap((child) => {
+            // Transitions should always be rendered (they're the structural containers)
+            if (child.type === "transition") {
+              return [
+                <TreeNode
+                  key={child.id}
+                  node={child}
+                  isExpanded={expandedNodes.has(child.id)}
+                  onToggle={onToggle}
+                  expandedNodes={expandedNodes}
+                  level={nestingLevel + 1}
+                />
+              ];
+            }
+
+            // Filter out inline workflow wrappers recursively
+            if (child.type === "workflow" && child.children.length > 0) {
+              const isInline = child.metadata.is_inline === true;
+              const isUserWorkflow = child.metadata.is_expandable === true;
+
+              console.log(`[TreeNode] Child workflow ${child.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`);
+
+              // Skip inline workflows (transition workflows) and render their children instead
+              if (isInline && !isUserWorkflow) {
+                console.log(`[TreeNode] Skipping inline workflow wrapper: ${child.name}, rendering its children`);
+                return child.children.map((grandchild) => (
+                  <TreeNode
+                    key={grandchild.id}
+                    node={grandchild}
+                    isExpanded={expandedNodes.has(grandchild.id)}
+                    onToggle={onToggle}
+                    expandedNodes={expandedNodes}
+                    level={nestingLevel + 1}
+                  />
+                ));
+              }
+            }
+
+            // Render this child normally
+            return [
+              <TreeNode
+                key={child.id}
+                node={child}
+                isExpanded={expandedNodes.has(child.id)}
+                onToggle={onToggle}
+                expandedNodes={expandedNodes}
+                level={nestingLevel + 1}
+              />
+            ];
+          })}
         </div>
       )}
     </div>

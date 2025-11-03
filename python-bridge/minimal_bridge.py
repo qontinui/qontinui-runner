@@ -12,8 +12,19 @@ import time
 from enum import Enum
 from typing import Any
 
-# Configure logging to stderr to avoid print statements
-logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+# Check for --disable-console-logging flag
+if "--disable-console-logging" in sys.argv:
+    # Disable all logging output
+    logging.basicConfig(
+        level=logging.CRITICAL + 1,
+        handlers=[logging.NullHandler()],
+        force=True
+    )
+    sys.argv.remove("--disable-console-logging")
+else:
+    # Configure logging to stderr to avoid print statements
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr)
+
 logger = logging.getLogger(__name__)
 
 

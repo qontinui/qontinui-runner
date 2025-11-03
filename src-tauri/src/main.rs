@@ -3,18 +3,19 @@
 
 mod commands;
 mod config;
+mod display;
 mod error;
 mod executor;
 mod logging;
 mod settings;
 
-#[cfg(test)]
-mod test;
-
 use commands::AppState;
+use display::profiles::ActionLogProfile;
+use display::DisplayProcessor;
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info};
 
 fn main() {
@@ -60,17 +61,22 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Initialize DisplayProcessor with ActionLogProfile
+    let mut display_processor = DisplayProcessor::new();
+    display_processor.register_profile(ActionLogProfile::with_default_config());
+    let display_processor = Arc::new(TokioMutex::new(display_processor));
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState {
             python_bridge: Mutex::new(None),
             current_config: Mutex::new(None),
+            display_processor,
         })
         .invoke_handler(tauri::generate_handler![
             commands::load_configuration,
             commands::start_python_executor,
-            commands::start_python_executor_with_type,
             commands::stop_python_executor,
             commands::start_execution,
             commands::stop_execution,
@@ -89,6 +95,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::navigate_to_multiple_states,
             commands::get_active_states,
             commands::get_available_transitions,
+            commands::get_debug_settings,
+            commands::set_debug_settings,
+            commands::get_action_log_view,
+            commands::clear_action_log,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

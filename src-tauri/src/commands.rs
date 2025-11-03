@@ -1,16 +1,19 @@
 use crate::config::{ConfigLoader, QontinuiConfig};
+use crate::display::DisplayProcessor;
 use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
 use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 
 pub struct AppState {
     pub python_bridge: Mutex<Option<PythonBridge>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
+    pub display_processor: Arc<TokioMutex<DisplayProcessor>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,9 +54,21 @@ pub fn load_configuration(path: String, state: State<AppState>) -> Result<Comman
         warn!("Failed to save last config path: {}", e);
     }
 
-    // If Python bridge is running, send the configuration
+    // If Python bridge is running, send the configuration and debug settings
     if let Some(ref mut bridge) = *state.python_bridge.lock().unwrap() {
         if bridge.is_running() {
+            // First send debug settings to ensure they're applied before config execution
+            let debug_settings = settings::get_debug_settings();
+            if let Err(e) = bridge.set_debug_settings(
+                debug_settings.enable_image_debug,
+                debug_settings.top_matches_count,
+            ) {
+                warn!("Failed to send debug settings before config load: {}", e);
+            } else {
+                info!("Debug settings sent before config load: enable={}, top_matches={}",
+                      debug_settings.enable_image_debug, debug_settings.top_matches_count);
+            }
+
             bridge.load_configuration(&path).map_err(|e| {
                 error!("Failed to send configuration to Python: {}", e);
                 format!("Failed to send configuration to Python: {}", e)
@@ -74,16 +89,7 @@ pub fn start_python_executor(
     app_handle: tauri::AppHandle,
     state: State<AppState>,
 ) -> Result<CommandResponse, String> {
-    start_python_executor_with_type(app_handle, state, "simple".to_string())
-}
-
-#[tauri::command]
-pub fn start_python_executor_with_type(
-    app_handle: tauri::AppHandle,
-    state: State<AppState>,
-    executor_type: String,
-) -> Result<CommandResponse, String> {
-    info!("Starting Python executor with type: {}", executor_type);
+    info!("Starting Python executor");
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
     // Check if already running
@@ -98,25 +104,49 @@ pub fn start_python_executor_with_type(
         }
     }
 
-    // Create and start new bridge with specified executor type
+    // Create and start new bridge (always uses real mode)
     let mut bridge = PythonBridge::new(app_handle);
-    bridge.start_with_executor(&executor_type).map_err(|e| {
+    bridge.start_with_executor("real").map_err(|e| {
         error!("Failed to start Python executor: {}", e);
         format!("Failed to start Python executor: {}", e)
     })?;
 
+    // If a configuration was already loaded, send it to the Python executor
+    let config_lock = state.current_config.lock().unwrap();
+    let has_config = config_lock.is_some();
+    drop(config_lock); // Release lock before calling bridge methods
+
+    if has_config {
+        // Get the last config path from settings
+        if let Some(config_path) = settings::get_last_config_path() {
+            info!("Sending previously loaded configuration to Python executor: {}", config_path);
+
+        // Send debug settings first
+        let debug_settings = settings::get_debug_settings();
+        if let Err(e) = bridge.set_debug_settings(
+            debug_settings.enable_image_debug,
+            debug_settings.top_matches_count,
+        ) {
+            warn!("Failed to send debug settings: {}", e);
+        }
+
+            // Send configuration
+            if let Err(e) = bridge.load_configuration(&config_path) {
+                error!("Failed to send configuration to Python executor: {}", e);
+                // Don't fail the start operation, just warn
+                warn!("Python executor started but configuration could not be sent");
+            } else {
+                info!("Configuration sent to Python executor successfully");
+            }
+        }
+    }
+
     *bridge_lock = Some(bridge);
-    info!(
-        "Python executor started successfully in {} mode",
-        executor_type
-    );
+    info!("Python executor started successfully");
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!(
-            "Python executor started with {} mode",
-            executor_type
-        )),
+        message: Some("Python executor started successfully".to_string()),
         data: None,
     })
 }
@@ -524,9 +554,9 @@ pub async fn execute_transition(
     transition_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Executing transition: {}", transition_id);
-    let bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = state.python_bridge.lock().unwrap();
 
-    if let Some(ref bridge) = *bridge {
+    if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
@@ -567,9 +597,9 @@ pub async fn navigate_to_state(
     state_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to state: {}", state_id);
-    let bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = state.python_bridge.lock().unwrap();
 
-    if let Some(ref bridge) = *bridge {
+    if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
@@ -611,9 +641,9 @@ pub async fn navigate_to_multiple_states(
     state_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to multiple states: {:?}", state_ids);
-    let bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = state.python_bridge.lock().unwrap();
 
-    if let Some(ref bridge) = *bridge {
+    if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
@@ -652,9 +682,9 @@ pub async fn get_active_states(
     state: tauri::State<'_, AppState>,
 ) -> Result<CommandResponse, String> {
     info!("Getting active states");
-    let bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = state.python_bridge.lock().unwrap();
 
-    if let Some(ref bridge) = *bridge {
+    if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
@@ -692,9 +722,9 @@ pub async fn get_available_transitions(
     state: tauri::State<'_, AppState>,
 ) -> Result<CommandResponse, String> {
     info!("Getting available transitions");
-    let bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = state.python_bridge.lock().unwrap();
 
-    if let Some(ref bridge) = *bridge {
+    if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
             return Err("Python executor not running".to_string());
         }
@@ -713,4 +743,139 @@ pub async fn get_available_transitions(
     } else {
         Err("Python executor not initialized".to_string())
     }
+}
+
+/// Get the current debug settings.
+///
+/// Returns the debug settings stored in the persistent settings file.
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with debug settings data
+/// * `Err(String)` - Error message if settings cannot be loaded
+#[tauri::command]
+pub fn get_debug_settings() -> Result<CommandResponse, String> {
+    info!("Getting debug settings");
+
+    let debug_settings = settings::get_debug_settings();
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Debug settings retrieved".to_string()),
+        data: Some(serde_json::to_value(&debug_settings)
+            .map_err(|e| format!("Failed to serialize debug settings: {}", e))?),
+    })
+}
+
+/// Set debug settings.
+///
+/// Updates the debug settings in the persistent settings file and sends them
+/// to the running Python executor if active.
+///
+/// # Arguments
+/// * `enable_image_debug` - Enable detailed image matching debug information
+/// * `top_matches_count` - Number of top matches to include in debug output
+/// * `state` - The application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success
+/// * `Err(String)` - Error message if settings cannot be saved
+#[tauri::command]
+pub fn set_debug_settings(
+    enable_image_debug: bool,
+    top_matches_count: u32,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Setting debug settings: enable_image_debug={}, top_matches_count={}",
+        enable_image_debug, top_matches_count
+    );
+
+    let debug_settings = settings::DebugSettings {
+        enable_image_debug,
+        top_matches_count,
+    };
+
+    // Save settings to disk
+    settings::save_debug_settings(debug_settings)
+        .map_err(|e| format!("Failed to save debug settings: {}", e))?;
+
+    // If Python bridge is running, send the settings
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref mut bridge) = *bridge_lock {
+        if bridge.is_running() {
+            bridge
+                .set_debug_settings(enable_image_debug, top_matches_count)
+                .map_err(|e| {
+                    error!("Failed to send debug settings to Python: {}", e);
+                    format!("Failed to send debug settings to Python: {}", e)
+                })?;
+            info!("Debug settings sent to Python executor");
+        }
+    }
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Debug settings saved".to_string()),
+        data: None,
+    })
+}
+
+/// Get action log view data from the display processor.
+///
+/// Returns the current action log view with filtered actions based on the
+/// ActionLogProfile configuration.
+///
+/// # Arguments
+/// * `state` - The application state containing the display processor
+///
+/// # Returns
+/// * `Ok(serde_json::Value)` - Action log view data as JSON
+/// * `Err(String)` - Error message if view cannot be retrieved
+#[tauri::command]
+pub async fn get_action_log_view(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Getting action log view");
+
+    let processor = state.display_processor.lock().await;
+    let view_data = processor.get_view("action_log")
+        .map_err(|e| {
+            error!("Failed to get action log view: {}", e);
+            format!("Failed to get action log view: {}", e)
+        })?;
+
+    info!("Action log view retrieved successfully");
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Action log view retrieved".to_string()),
+        data: Some(view_data),
+    })
+}
+
+/// Clear the action log by clearing all events from the display processor.
+///
+/// This removes all stored events from the EventLog, effectively resetting
+/// all display views.
+///
+/// # Arguments
+/// * `state` - The application state containing the display processor
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message
+/// * `Err(String)` - Error message if clear fails
+#[tauri::command]
+pub async fn clear_action_log(
+    state: State<'_, AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Clearing action log");
+
+    let mut processor = state.display_processor.lock().await;
+    processor.clear_events();
+
+    info!("Action log cleared successfully");
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Action log cleared".to_string()),
+        data: None,
+    })
 }

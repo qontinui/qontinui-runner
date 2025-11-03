@@ -83,11 +83,7 @@ const CollapsiblePanel = ({
           <span className="text-sm text-muted-foreground">
             {isCollapsed ? "Expand" : "Collapse"}
           </span>
-          {isCollapsed ? (
-            <ChevronDown className="w-5 h-5" />
-          ) : (
-            <ChevronUp className="w-5 h-5" />
-          )}
+          {isCollapsed ? <ChevronDown className="w-5 h-5" /> : <ChevronUp className="w-5 h-5" />}
         </div>
       </button>
 

@@ -30,8 +30,7 @@
             "clickCount": 1
           },
           "timeout": 5000,
-          "retryCount": 3,
-          "continueOnError": false
+          "retryCount": 3
         },
         {
           "id": "action-2",
@@ -41,8 +40,7 @@
             "typing_delay": 50
           },
           "timeout": 5000,
-          "retryCount": 3,
-          "continueOnError": false
+          "retryCount": 3
         },
         {
           "id": "action-3",
@@ -51,8 +49,7 @@
             "duration": 2000
           },
           "timeout": 5000,
-          "retryCount": 1,
-          "continueOnError": false
+          "retryCount": 1
         }
       ]
     },
@@ -70,8 +67,7 @@
             "amount": 3
           },
           "timeout": 5000,
-          "retryCount": 1,
-          "continueOnError": false
+          "retryCount": 1
         },
         {
           "id": "action-5",
@@ -80,8 +76,7 @@
             "duration": 1000
           },
           "timeout": 5000,
-          "retryCount": 1,
-          "continueOnError": false
+          "retryCount": 1
         },
         {
           "id": "action-6",
@@ -91,8 +86,7 @@
             "amount": 3
           },
           "timeout": 5000,
-          "retryCount": 1,
-          "continueOnError": false
+          "retryCount": 1
         }
       ]
     }

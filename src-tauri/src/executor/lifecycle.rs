@@ -48,6 +48,21 @@ pub enum ExecutorMessage {
         sequence: u32,
     },
 
+    /// Tree-based hierarchical event
+    #[serde(rename = "tree_event")]
+    TreeEvent {
+        /// Tree event type (workflow_started, action_completed, etc.)
+        event_type: String,
+        /// Node data
+        node: serde_json::Value,
+        /// Path from root to this node
+        path: Vec<serde_json::Value>,
+        /// Event timestamp
+        timestamp: f64,
+        /// Event sequence number
+        sequence: u32,
+    },
+
     /// Response to a command
     Response {
         /// Command ID this is responding to
@@ -72,6 +87,13 @@ pub enum ExecutorMessage {
         message: String,
         /// Additional error details
         details: Option<String>,
+    },
+
+    /// Image recognition event with debug data
+    #[serde(rename = "image_recognition")]
+    ImageRecognition {
+        /// Image recognition data (pattern info, matches, debug details)
+        data: serde_json::Value,
     },
 }
 
@@ -217,6 +239,27 @@ impl ExecutorLifecycle {
                 }
             }
 
+            ExecutorMessage::TreeEvent { .. } => {
+                // Tree events are always forwarded (same logic as regular events)
+                let state = self.state.read().await;
+
+                if state.is_initializing() {
+                    // Queue event for later processing
+                    warn!("Received tree event during initialization, queuing for later");
+                    self.queue_event(message.clone()).await;
+                    Ok(None)
+                } else if state.can_accept_commands() {
+                    // Forward event immediately
+                    Ok(Some(message))
+                } else {
+                    warn!(
+                        "Received tree event in non-ready state: {}, dropping",
+                        state.name()
+                    );
+                    Ok(None)
+                }
+            }
+
             ExecutorMessage::Error { message: msg, details } => {
                 error!("Executor error: {} - {:?}", msg, details);
 
@@ -240,6 +283,28 @@ impl ExecutorLifecycle {
                 Ok(None)
             }
 
+            ExecutorMessage::ImageRecognition { .. } => {
+                // Image recognition events are always forwarded
+                let state = self.state.read().await;
+
+                if state.is_initializing() {
+                    // Queue event for later processing
+                    warn!("Received image recognition event during initialization, queuing for later");
+                    self.queue_event(message.clone()).await;
+                    Ok(None)
+                } else if state.can_accept_commands() {
+                    // Forward event immediately
+                    debug!("Forwarding IMAGE_RECOGNITION event");
+                    Ok(Some(message))
+                } else {
+                    warn!(
+                        "Received image recognition event in non-ready state: {}, dropping",
+                        state.name()
+                    );
+                    Ok(None)
+                }
+            }
+
             _ => {
                 // Forward other messages (Response, etc.)
                 Ok(Some(message))
@@ -249,29 +314,40 @@ impl ExecutorLifecycle {
 
     /// Queues an event received during initialization
     async fn queue_event(&self, message: ExecutorMessage) {
-        if let ExecutorMessage::Event {
-            event,
-            data,
-            timestamp: _,
-            sequence: _,
-        } = message
-        {
-            let mut queue = self.event_queue.write().await;
+        let mut queue = self.event_queue.write().await;
 
-            // Check queue capacity
-            if queue.len() >= EVENT_QUEUE_CAPACITY {
-                warn!(
-                    "Event queue at capacity ({}), dropping oldest event",
-                    EVENT_QUEUE_CAPACITY
-                );
-                queue.remove(0);
-            }
+        // Check queue capacity
+        if queue.len() >= EVENT_QUEUE_CAPACITY {
+            warn!(
+                "Event queue at capacity ({}), dropping oldest event",
+                EVENT_QUEUE_CAPACITY
+            );
+            queue.remove(0);
+        }
 
-            queue.push(QueuedEvent {
-                event_type: event,
+        match message {
+            ExecutorMessage::Event {
+                event,
                 data,
-                queued_at: current_timestamp(),
-            });
+                timestamp: _,
+                sequence: _,
+            } => {
+                queue.push(QueuedEvent {
+                    event_type: event,
+                    data,
+                    queued_at: current_timestamp(),
+                });
+            }
+            ExecutorMessage::ImageRecognition { data } => {
+                queue.push(QueuedEvent {
+                    event_type: "image_recognition".to_string(),
+                    data,
+                    queued_at: current_timestamp(),
+                });
+            }
+            _ => {
+                warn!("Attempted to queue non-event message type");
+            }
         }
     }
 

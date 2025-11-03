@@ -5,6 +5,35 @@ Qontinui executor that integrates with the actual Qontinui library.
 
 import json
 import sys
+import logging
+
+# CRITICAL: Configure logging to use stderr FIRST before any other imports
+# This ensures ALL debug logs go to stderr, keeping stdout clean for JSON events
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.DEBUG,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+
+# CRITICAL: Check for --disable-console-logging flag BEFORE any imports
+# This prevents structlog from outputting to stderr/stdout
+import os
+if "--disable-console-logging" in sys.argv:
+    os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
+    # Remove the flag so it doesn't interfere with other parsing
+    sys.argv.remove("--disable-console-logging")
+
+# IMMEDIATE debug logging to verify executor is being invoked
+import tempfile
+from datetime import datetime
+debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_executor_startup.log")
+try:
+    with open(debug_log_path, "a", encoding="utf-8") as f:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        f.write(f"[{timestamp}] EXECUTOR STARTED - qontinui_executor.py is running\n")
+        f.write(f"[{timestamp}] Console logging disabled: {os.getenv('QONTINUI_DISABLE_CONSOLE_LOGGING') == '1'}\n")
+except Exception as e:
+    pass
 
 # CRITICAL: Send READY signal IMMEDIATELY to prevent timeout
 # Must happen before any other imports that might be slow
@@ -37,28 +66,25 @@ logger = logging.getLogger(__name__)
 qontinui_src_path = Path(__file__).parent.parent.parent / "qontinui" / "src"
 sys.path.insert(0, str(qontinui_src_path))
 
-# Debug: Print the resolved path
-print(json.dumps({
-    "type": "event",
-    "event": "log",
-    "timestamp": time.time(),
-    "sequence": 0,
-    "data": {
-        "level": "debug",
-        "message": f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
-    }
-}), flush=True)
+# Debug: Log to stderr instead of stdout to avoid polluting JSON event stream
+logger.debug(f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})")
+
+# CRITICAL: Import local python-bridge modules BEFORE qontinui library
+# These modules are always available and needed even if qontinui library fails to import
+from event_translator import EventTranslator
+from execution_tree import ExecutionTree, ExecutionNode
+from action_definitions import get_action_definition
+from services.unified_data_collector import UnifiedDataCollector
+from services.screenshot_service import ScreenshotService
+from services.tree_view_layer import TreeViewLayer
 
 try:
     from qontinui import Find, Image, Location
     from qontinui.config import get_settings, enable_mock_mode, disable_mock_mode
     from qontinui import navigation_api, registry
     from qontinui.reporting import register_callback, EventType as QontinuiEventType
-    from qontinui.json_executor.action_executor import ActionExecutor
+    from qontinui.action_executors import DelegatingActionExecutor
     from qontinui.json_executor.config_parser import ConfigParser, QontinuiConfig
-
-    # Import EventTranslator for callback management
-    from event_translator import EventTranslator
 
     QONTINUI_AVAILABLE = True
 except ImportError as e:
@@ -111,121 +137,34 @@ class EventType(Enum):
     RECORDING_STOPPED = "recording_stopped"
 
 
-class HierarchyMetadata:
-    """Metadata about an action/workflow's position in the execution hierarchy.
+# ExecutionContext and HierarchyMetadata classes removed - replaced by ExecutionTree
 
-    This enables the frontend to display actions in a hierarchical, toggleable tree
-    structure that mirrors the JSON configuration.
+
+class StateMemoryAdapter:
+    """Adapter to bridge StateExecutor interface to UnifiedDataCollector's expected interface.
+
+    StateExecutor provides get_active_states() which returns a list of state names.
+    UnifiedDataCollector expects get_active_state_names() for clarity.
+    This adapter bridges the interface difference without modifying either component.
     """
 
-    def __init__(self, parent_id: str | None = None, nesting_level: int = 0,
-                 workflow_name: str | None = None, is_expandable: bool = False):
-        self.parent_id = parent_id
-        self.nesting_level = nesting_level
-        self.workflow_name = workflow_name
-        self.is_expandable = is_expandable
+    def __init__(self, state_executor):
+        """Initialize adapter with StateExecutor instance.
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert to dictionary for event emission."""
-        return {
-            "parent_id": self.parent_id,
-            "nesting_level": self.nesting_level,
-            "workflow_name": self.workflow_name,
-            "is_expandable": self.is_expandable,
-        }
+        Args:
+            state_executor: StateExecutor instance that provides get_active_states()
+        """
+        self.state_executor = state_executor
 
-    def child(self, parent_id: str, workflow_name: str | None = None,
-              is_expandable: bool = False) -> "HierarchyMetadata":
-        """Create child metadata with incremented nesting level."""
-        return HierarchyMetadata(
-            parent_id=parent_id,
-            nesting_level=self.nesting_level + 1,
-            workflow_name=workflow_name,
-            is_expandable=is_expandable
-        )
+    def get_active_state_names(self) -> list[str]:
+        """Get list of active state names.
 
-
-class ExecutionContext:
-    """Tracks the current execution hierarchy for hierarchical logging.
-
-    This class maintains a stack of execution contexts, allowing us to track:
-    - Current nesting level
-    - Parent workflow/action IDs
-    - Whether we're in a user-visible or helper workflow
-
-    Follows Single Responsibility Principle: Only responsible for tracking execution context.
-    """
-
-    def __init__(self):
-        self.stack: list[dict[str, Any]] = []
-        self._suppress_events = False
-
-    def push_workflow(self, workflow_id: str, workflow_name: str, is_helper: bool = False):
-        """Push a workflow onto the context stack."""
-        self.stack.append({
-            "type": "workflow",
-            "id": workflow_id,
-            "name": workflow_name,
-            "is_helper": is_helper,
-        })
-        if is_helper:
-            self._suppress_events = True
-
-    def pop_workflow(self):
-        """Pop a workflow from the context stack."""
-        if self.stack:
-            popped = self.stack.pop()
-            # If we're popping a helper workflow, check if we should un-suppress
-            if popped.get("is_helper"):
-                # Check if there are any remaining helper workflows in the stack
-                self._suppress_events = any(ctx.get("is_helper") for ctx in self.stack)
-
-    def push_action(self, action_id: str, action_type: str):
-        """Push an action onto the context stack."""
-        self.stack.append({
-            "type": "action",
-            "id": action_id,
-            "action_type": action_type,
-        })
-
-    def pop_action(self):
-        """Pop an action from the context stack."""
-        if self.stack:
-            self.stack.pop()
-
-    def get_hierarchy_metadata(self, action_id: str | None = None,
-                               is_expandable: bool = False) -> HierarchyMetadata:
-        """Get hierarchy metadata for the current context."""
-        nesting_level = len(self.stack)
-        parent_id = None
-        workflow_name = None
-
-        # Find parent and workflow name
-        if self.stack:
-            # Parent is the last item in the stack
-            parent = self.stack[-1]
-            parent_id = parent.get("id")
-
-            # Find the nearest workflow in the stack
-            for ctx in reversed(self.stack):
-                if ctx.get("type") == "workflow":
-                    workflow_name = ctx.get("name")
-                    break
-
-        return HierarchyMetadata(
-            parent_id=parent_id,
-            nesting_level=nesting_level,
-            workflow_name=workflow_name,
-            is_expandable=is_expandable
-        )
-
-    def should_suppress_events(self) -> bool:
-        """Check if events should be suppressed (for helper workflows)."""
-        return self._suppress_events
-
-    def get_nesting_level(self) -> int:
-        """Get current nesting level."""
-        return len(self.stack)
+        Returns:
+            List of active state names from StateExecutor
+        """
+        if self.state_executor is None:
+            return []
+        return self.state_executor.get_active_states()
 
 
 class RunnerOrchestrator:
@@ -298,6 +237,10 @@ class RunnerOrchestrator:
 
         logger.info("StateExecutor and ActionExecutor initialized")
 
+        # Apply any debug settings that were set before config was loaded
+        if self.debug_settings:
+            self._apply_debug_settings_to_executor()
+
         return config
 
     def _initialize_hal(self) -> None:
@@ -357,7 +300,11 @@ class RunnerOrchestrator:
         Returns:
             Dict with success status and details
         """
+        # DEBUG: Confirm this method is being called
+        self._emit_log("info", f"[NAVIGATE] navigate_to_state called with target: {target_state_id}")
+
         if not QONTINUI_AVAILABLE:
+            self._emit_log("error", "[NAVIGATE] Qontinui library not available")
             return {
                 "success": False,
                 "error": "Qontinui library not available"
@@ -366,17 +313,70 @@ class RunnerOrchestrator:
         try:
             from qontinui import navigation_api
 
+            # Create a workflow node for this navigation operation
+            # This ensures navigation actions appear in the Actions tab
+            try:
+                nav_node = ExecutionNode(
+                    id=f"nav_{self._navigation_sequence}",
+                    node_type="workflow",
+                    name=f"Navigate to {target_state_id}",
+                    timestamp=time.time(),
+                    metadata={"target_state": target_state_id},
+                    parent=None
+                )
+                self._navigation_sequence += 1
+                self._emit_log("info", f"[NAVIGATE] Created nav_node: {nav_node.id}")
+            except Exception as e:
+                self._emit_log("error", f"[NAVIGATE] Failed to create ExecutionNode: {e}")
+                self._emit_log("error", f"[NAVIGATE] ExecutionNode class: {ExecutionNode}")
+                import traceback
+                self._emit_log("error", f"[NAVIGATE] Traceback: {traceback.format_exc()}")
+                raise
+
+            # Emit workflow_started
+            try:
+                self._emit_log("info", f"[NAVIGATE] About to emit workflow_started")
+                self._emit_tree_event("workflow_started", nav_node)
+                self._emit_log("info", f"[NAVIGATE] workflow_started emitted successfully")
+            except Exception as e:
+                self._emit_log("error", f"[NAVIGATE] Failed to emit tree event: {e}")
+                import traceback
+                self._emit_log("error", f"[NAVIGATE] Traceback: {traceback.format_exc()}")
+                raise
+
+            self._emit_log("info", f"[NAVIGATE] Calling navigation_api.open_state")
+
             # Use navigation API to navigate to state
             result = navigation_api.open_state(target_state_id)
 
+            self._emit_log("info", f"[NAVIGATE] navigation_api.open_state returned: {result}")
+
+            # Update node status
+            success = result.get("success", False) if isinstance(result, dict) else result
+            nav_node.status = "completed" if success else "failed"
+            if not success:
+                nav_node.error = result.get("error", "Navigation failed") if isinstance(result, dict) else "Navigation failed"
+
+            self._emit_log("info", f"[NAVIGATE] Emitting workflow_{'completed' if success else 'failed'}")
+
+            # Emit workflow_completed or workflow_failed
+            self._emit_tree_event("workflow_completed" if success else "workflow_failed", nav_node)
+
             return {
-                "success": result.get("success", False),
+                "success": success,
                 "target_state": target_state_id,
                 "active_states": self.state_executor.get_active_states() if self.state_executor else [],
-                "path": result.get("path", [])
+                "path": result.get("path", []) if isinstance(result, dict) else []
             }
         except Exception as e:
             logger.error(f"Failed to navigate to state {target_state_id}: {e}")
+
+            # Emit failure event if we created a node
+            if 'nav_node' in locals():
+                nav_node.status = "failed"
+                nav_node.error = str(e)
+                self._emit_tree_event("workflow_failed", nav_node)
+
             return {
                 "success": False,
                 "error": str(e)
@@ -509,9 +509,24 @@ class QontinuiExecutor:
         self.settings = None  # FrameworkSettings instance
         self._last_find_location = None  # Store location of most recent FIND result for "Last Find Result" clicks
         self.action_executor = None  # ActionExecutor instance (initialized in load_configuration)
+        self.state_executor = None  # StateExecutor instance (initialized in load_configuration)
 
-        # Execution context for hierarchical logging
-        self.execution_context = ExecutionContext()
+        # Debug settings from frontend
+        self.debug_settings = {
+            'enable_image_debug': False,
+            'top_matches_count': 5
+        }
+
+        # Thread-safe output lock to prevent JSON concatenation from concurrent threads
+        self._output_lock = threading.Lock()
+
+        # Execution tree for hierarchical tracking
+        self.execution_tree = ExecutionTree()
+
+        # Unified data architecture services (initialized in load_configuration)
+        # These services are created after we have a run directory and state_executor
+        self.screenshot_service = None  # ScreenshotService for screenshot storage
+        self.unified_data_collector = None  # UnifiedDataCollector for action execution data
 
         if QONTINUI_AVAILABLE:
             # Get framework settings
@@ -522,6 +537,7 @@ class QontinuiExecutor:
             # Pass _get_state_for_image as state_lookup callback to add state info to events
             # Pass _get_current_hierarchy as hierarchy_lookup callback to add hierarchy info to events
             # Pass _get_image_data as image_data_lookup callback to add image thumbnails to events
+            # NOTE: UnifiedDataCollector will be passed to EventTranslator in load_configuration
             self.event_translator = EventTranslator(
                 self._emit_event_wrapper,
                 state_lookup=self._get_state_for_image,
@@ -529,6 +545,9 @@ class QontinuiExecutor:
                 image_data_lookup=self._get_image_data
             )
             self.event_translator.register_all_callbacks()
+
+            # Navigation sequence counter for creating unique IDs
+            self._navigation_sequence = 0
 
             # Verify callbacks were registered
             from qontinui.reporting import get_event_registry
@@ -542,7 +561,7 @@ class QontinuiExecutor:
         self._emit_log("info", f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})")
 
     def _emit_event(self, event_type: EventType, data: dict[str, Any]):
-        """Emit event to Tauri through stdout."""
+        """Emit event to Tauri through stdout (thread-safe)."""
         event = {
             "type": "event",
             "event": event_type.value,
@@ -551,98 +570,156 @@ class QontinuiExecutor:
             "data": data,
         }
         self._sequence += 1
-        print(json.dumps(event), flush=True)
+        # Use lock to prevent concurrent threads from interleaving JSON output
+        with self._output_lock:
+            print(json.dumps(event), flush=True)
 
     def _emit_log(self, level: str, message: str):
         """Emit log message."""
         self._emit_event(EventType.LOG, {"level": level, "message": message})
 
-    def _emit_action_event(self, event_type: EventType, data: dict[str, Any],
-                          hierarchy: HierarchyMetadata | None = None):
-        """Emit an action-related event with hierarchy information.
+    def set_debug_settings(self, settings: dict):
+        """Update debug settings from frontend.
 
         Args:
-            event_type: Type of event to emit
-            data: Event data
-            hierarchy: Optional hierarchy metadata. If None, will be fetched from execution context
+            settings: Dictionary containing debug configuration:
+                - enable_image_debug: bool - Enable detailed image matching debug info
+                - top_matches_count: int - Number of top matches to report
         """
-        # Don't emit if we're in a helper workflow
-        if self.execution_context.should_suppress_events():
+        self.debug_settings = settings
+        self._emit_log("info", f"Debug settings updated: {settings}")
+
+        # Apply settings to ActionExecutor if available
+        if QONTINUI_AVAILABLE and self.action_executor:
+            self._apply_debug_settings_to_executor()
+
+    def _apply_debug_settings_to_executor(self):
+        """Apply current debug settings to the FrameworkSettings singleton."""
+        if not QONTINUI_AVAILABLE:
             return
 
-        # Add hierarchy information to the event data
-        if hierarchy is None:
-            # Check if we're currently inside an action execution
-            # If so, we need to use the action's parent as parent_id, not the action itself
-            stack = self.execution_context.stack
-            if stack and stack[-1].get("type") == "action":
-                # Currently executing an action - get hierarchy from parent context
-                # Temporarily pop the action to get parent's hierarchy
-                action_ctx = stack.pop()
-                hierarchy = self.execution_context.get_hierarchy_metadata(
-                    action_id=data.get("action_id")
-                )
-                # Restore the action to the stack
-                stack.append(action_ctx)
+        try:
+            # Import FrameworkSettings to update the singleton
+            from qontinui.config.framework_settings import FrameworkSettings
+
+            # Get the singleton instance
+            settings = FrameworkSettings.get_instance()
+
+            # Set emit_match_details based on debug settings
+            enable_debug = self.debug_settings.get('enable_image_debug', False)
+            settings.image_debug.emit_match_details = enable_debug
+
+            # Verify it was actually set by reading it back
+            actual_value = settings.image_debug.emit_match_details
+
+            self._emit_log(
+                "info",
+                f"Applied debug settings to FrameworkSettings: emit_match_details={enable_debug}, verified={actual_value}"
+            )
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to apply debug settings: {e}")
+
+    def _initialize_unified_data_services(self):
+        """Initialize unified data architecture services.
+
+        This method sets up:
+        1. ScreenshotService with run directory
+        2. StateMemoryAdapter to bridge StateExecutor to UnifiedDataCollector
+        3. UnifiedDataCollector with state memory adapter and screenshot service
+
+        Integration point: Called after StateExecutor initialization in load_configuration
+        """
+        if not QONTINUI_AVAILABLE:
+            return
+
+        try:
+            # Create run directory for screenshots (use temp_dir if available, else create new)
+            if self.temp_dir:
+                run_dir = Path(self.temp_dir) / "run_data"
             else:
-                # Not inside an action, get hierarchy normally
-                hierarchy = self.execution_context.get_hierarchy_metadata(
-                    action_id=data.get("action_id")
-                )
+                run_dir = Path(tempfile.mkdtemp(prefix="qontinui_run_"))
 
-        # Merge hierarchy data into event data
-        data_with_hierarchy = {**data, "hierarchy": hierarchy.to_dict()}
+            run_dir.mkdir(parents=True, exist_ok=True)
 
-        # DEBUG: Log hierarchy for troubleshooting
-        if event_type in [EventType.ACTION_STARTED, EventType.ACTION_EXECUTION]:
-            self._emit_log("debug", f"{event_type.name} hierarchy: action_id={data.get('action_id')}, parent={hierarchy.parent_id}, level={hierarchy.nesting_level}, workflow={hierarchy.workflow_name}")
+            # Initialize ScreenshotService
+            # Storage structure: run_dir/screenshots/ and run_dir/debug_visuals/
+            self.screenshot_service = ScreenshotService(
+                storage_dir=run_dir,
+                enabled=True  # Always enabled for data collection
+            )
+            self._emit_log("info", f"ScreenshotService initialized with storage: {run_dir}")
 
-        self._emit_event(event_type, data_with_hierarchy)
+            # Create state memory adapter
+            # StateExecutor has get_active_states() but UnifiedDataCollector expects get_active_state_names()
+            # Adapter bridges this interface difference
+            state_memory_adapter = StateMemoryAdapter(self.state_executor)
 
-    def _emit_workflow_event(self, event_type: EventType, data: dict[str, Any]):
-        """Emit a workflow-related event with hierarchy information.
+            # Initialize UnifiedDataCollector
+            # Pass state memory adapter for state snapshot capture
+            # Pass screenshot_service for screenshot storage integration
+            self.unified_data_collector = UnifiedDataCollector(
+                state_memory=state_memory_adapter,
+                screenshot_service=self.screenshot_service
+            )
+            self._emit_log("info", "UnifiedDataCollector initialized with StateExecutor adapter and ScreenshotService")
 
-        Workflow events are emitted for WORKFLOW_STARTED and WORKFLOW_COMPLETED.
-        They are suppressed for helper workflows.
+            # Connect UnifiedDataCollector to EventTranslator
+            # This enables the translator to record execution data (typed text, match results, etc.)
+            # The translator operates in dual mode: records to collector AND emits to frontend
+            if hasattr(self, 'event_translator') and self.event_translator:
+                self.event_translator.collector = self.unified_data_collector
+                self._emit_log("info", "EventTranslator connected to UnifiedDataCollector")
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to initialize unified data services: {e}")
+            self._emit_log("debug", f"Traceback: {traceback.format_exc()}")
+            # Set to None so we can check availability
+            self.screenshot_service = None
+            self.unified_data_collector = None
+
+    def _emit_tree_event(self, event_type: str, node: "ExecutionNode", extra_data: dict = None):
+        """Emit a tree-based event with full tree context.
 
         Args:
-            event_type: Type of event (WORKFLOW_STARTED or WORKFLOW_COMPLETED)
-            data: Event data containing workflow_id, workflow_name, etc.
+            event_type: Type of event (e.g., "workflow_started", "action_completed")
+            node: The execution node this event relates to
+            extra_data: Optional additional data to include in the event
         """
-        # Check if this is a helper workflow (by ID prefix)
-        # We check the workflow_id directly since workflow_started is emitted before push
-        workflow_id = data.get("workflow_id", "")
-        is_helper = workflow_id.startswith("wf-helper-")
+        node_dict = node.to_dict(include_children=False)
 
-        # Don't emit if we're in a helper workflow or if this is a helper workflow
-        if is_helper or self.execution_context.should_suppress_events():
-            self._emit_log("debug", f"SUPPRESSED workflow event: {data.get('workflow_name')} (helper workflow)")
-            return
+        # Add nesting_level directly to the node dict for workflows
+        # Actions already have this in their execution_record, but workflows don't
+        if "nesting_level" not in node_dict:
+            node_dict["nesting_level"] = node.get_depth()
 
-        # Get hierarchy metadata
-        hierarchy = self.execution_context.get_hierarchy_metadata()
+        # Workflows should be expandable (they contain actions)
+        # Actions have is_expandable in their metadata from action definitions
+        if node.node_type == "workflow":
+            if "metadata" not in node_dict:
+                node_dict["metadata"] = {}
+            if isinstance(node_dict["metadata"], dict):
+                node_dict["metadata"]["is_expandable"] = True
 
-        # Adjust nesting level for workflow events
-        # workflow_started is emitted BEFORE push, so stack doesn't include this workflow yet
-        # workflow_completed is emitted AFTER pop, so stack doesn't include this workflow anymore
-        # Therefore, we add 1 to reflect the workflow's actual position in the hierarchy
-        adjusted_hierarchy = HierarchyMetadata(
-            parent_id=hierarchy.parent_id,
-            nesting_level=hierarchy.nesting_level + 1,
-            workflow_name=hierarchy.workflow_name,
-            is_expandable=hierarchy.is_expandable
-        )
-
-        # DEBUG: Log workflow event
-        self._emit_log("debug", f"{event_type.value.upper()}: {data.get('workflow_name')} (parent={adjusted_hierarchy.parent_id}, level={adjusted_hierarchy.nesting_level})")
-
-        # Add hierarchy and mark as expandable
-        data_with_hierarchy = {
-            **data,
-            "hierarchy": adjusted_hierarchy.to_dict(),
-            "is_workflow": True,  # Mark this as a workflow event for frontend
+        event_data = {
+            "type": "tree_event",
+            "event_type": event_type,
+            "node": node_dict,
+            "timestamp": time.time(),
+            "sequence": self._sequence,
         }
-        self._emit_event(event_type, data_with_hierarchy)
+        self._sequence += 1
+
+        # Include path from root for easy breadcrumb display
+        event_data["path"] = node.get_path_from_root()
+
+        # Merge in extra data if provided
+        if extra_data:
+            event_data.update(extra_data)
+
+        # Use lock to prevent concurrent threads from interleaving JSON output
+        with self._output_lock:
+            print(json.dumps(event_data), flush=True)
 
     def _emit_event_wrapper(self, event_type: str, data: dict[str, Any]):
         """Wrapper for EventTranslator to convert string event names to EventType enum.
@@ -654,6 +731,16 @@ class QontinuiExecutor:
             event_type: String event type name (e.g., "image_recognition", "action_execution")
             data: Event data dictionary
         """
+        # IMAGE_RECOGNITION events get their own message type (not wrapped as Event)
+        if event_type == "image_recognition":
+            event = {
+                "type": "image_recognition",
+                "data": data,
+            }
+            with self._output_lock:
+                print(json.dumps(event), flush=True)
+            return
+
         # Map string event names to EventType enum values
         event_type_map = {
             "image_recognition": EventType.IMAGE_RECOGNITION,
@@ -683,29 +770,57 @@ class QontinuiExecutor:
     # The library uses standard Python logging which doesn't output to stdout by default.
 
     def _get_current_hierarchy(self) -> dict[str, Any]:
-        """Get current execution hierarchy from execution context.
+        """Get current execution hierarchy from execution tree.
 
         This callback is used by EventTranslator to add hierarchy information
         to events emitted by the library's ActionExecutor.
 
-        When library executes nested actions (e.g., TYPE inside GO_TO_STATE),
-        the parent action is already on the stack. We get hierarchy normally,
-        which will correctly set parent_id to the action on top of the stack.
-
         Returns:
             Dictionary with hierarchy fields: parent_id, nesting_level, workflow_name, is_expandable
         """
-        # Get hierarchy from current execution context
-        # If an action is on the stack (e.g., GO_TO_STATE), its action_id becomes the parent_id
-        hierarchy = self.execution_context.get_hierarchy_metadata()
+        # Get hierarchy from execution tree
+        return self.execution_tree.get_current_hierarchy()
 
-        # Add +1 to nesting level for the library-executed action
-        # Example: If GO_TO_STATE is at level 1, TYPE inside it should be level 2
+    def _get_hierarchy_context(self) -> dict[str, Any]:
+        """Extract hierarchy context for data collection.
+
+        This method extracts hierarchy information from the execution tree
+        for use with UnifiedDataCollector.start_action().
+
+        Returns:
+            Dictionary with:
+                - parent_action_id: ID of parent action/workflow (None for root)
+                - workflow_id: ID of containing workflow
+                - nesting_level: Depth in execution hierarchy (0 for root)
+        """
+        if not self.execution_tree or not self.execution_tree.current:
+            return {
+                "parent_action_id": None,
+                "workflow_id": None,
+                "nesting_level": 0
+            }
+
+        current = self.execution_tree.current
+
+        # Parent is the current node (action will be added as child)
+        parent_action_id = current.id
+
+        # Find workflow by traversing up the tree
+        workflow_id = None
+        node = current
+        while node:
+            if node.node_type == "workflow":
+                workflow_id = node.id
+                break
+            node = node.parent
+
+        # Nesting level is current depth + 1 (for the new child)
+        nesting_level = current.get_depth() + 1
+
         return {
-            "parent_id": hierarchy.parent_id,
-            "nesting_level": hierarchy.nesting_level + 1,
-            "workflow_name": hierarchy.workflow_name,
-            "is_expandable": False  # Library actions are not expandable
+            "parent_action_id": parent_action_id,
+            "workflow_id": workflow_id,
+            "nesting_level": nesting_level
         }
 
     def _get_state_for_image(self, image_id: str) -> str | None:
@@ -746,6 +861,41 @@ class QontinuiExecutor:
                         return state_name
 
         self._emit_log("debug", f"_get_state_for_image: Image {image_id} not found in any state")
+        return None
+
+    def _get_image_name(self, image_id: str) -> str | None:
+        """Get the human-readable name for an image ID.
+
+        Args:
+            image_id: ID of the image to look up
+
+        Returns:
+            Image name if found, None otherwise
+        """
+        if not self.config:
+            return None
+
+        states = self.config.get("states", [])
+
+        for state in states:
+            state_images = state.get("stateImages", [])
+
+            for state_image in state_images:
+                state_image_id = state_image.get("id")
+                state_image_name = state_image.get("name")
+
+                # Check if this is the state image ID
+                if state_image_id == image_id:
+                    return state_image_name
+
+                # Check if this image is used in any pattern
+                patterns = state_image.get("patterns", [])
+                for pattern in patterns:
+                    pattern_image_id = pattern.get("image")
+                    if pattern_image_id == image_id:
+                        # Return the state image name (parent) for pattern images
+                        return state_image_name
+
         return None
 
     def _get_image_data(self, image_id: str) -> str | None:
@@ -1068,8 +1218,8 @@ class QontinuiExecutor:
                             self._emit_log("debug", f"Loaded and registered image: {img_id} -> {img_path} ({image_obj.width}x{image_obj.height})")
 
                         self.images[img_id] = image_obj
-                        # Register image in library's registry for state/transition loading
-                        registry.register_image(img_id, image_obj)
+                        # Register image in library's registry with metadata for state/transition loading
+                        registry.register_image(img_id, image_obj, file_path=img_path, name=img_name)
                     else:
                         # Store path for testing purposes
                         self.images[img_id] = {"path": img_path}
@@ -1106,7 +1256,19 @@ class QontinuiExecutor:
                             if underlying_image_id and underlying_image_id in self.images:
                                 # Map state image ID to the underlying image object
                                 self.images[state_image_id] = self.images[underlying_image_id]
-                                self._emit_log("debug", f"Mapped state image {state_image_id} -> {underlying_image_id}")
+                                # Also register the state image ID in the library's registry
+                                # so IF conditions can find it - copy metadata from underlying image
+                                underlying_metadata = registry.get_image_metadata(underlying_image_id)
+                                if underlying_metadata:
+                                    registry.register_image(
+                                        state_image_id,
+                                        self.images[underlying_image_id],
+                                        file_path=underlying_metadata.get("file_path"),
+                                        name=underlying_metadata.get("name")
+                                    )
+                                else:
+                                    registry.register_image(state_image_id, self.images[underlying_image_id])
+                                self._emit_log("debug", f"Mapped and registered state image {state_image_id} -> {underlying_image_id}")
                             else:
                                 self._emit_log("warning", f"State image {state_image_id} references missing image {underlying_image_id}")
                         else:
@@ -1185,9 +1347,22 @@ class QontinuiExecutor:
                         self._emit_log("info", "Navigation system initialized with states and transitions")
                     else:
                         self._emit_log("error", "Failed to initialize navigation system - check configuration")
+
+                    # CRITICAL: Inject the runner as workflow executor so transitions can execute workflows
+                    # This must happen after load_configuration, even if there were non-critical errors
+                    # The navigator may have been partially initialized and needs the executor
+                    navigation_api.set_workflow_executor(self)
+                    self._emit_log("info", "Runner injected as workflow_executor for navigation transitions")
+
                 except Exception as e:
                     self._emit_log("warning", f"Failed to initialize navigation: {e}")
                     self._emit_log("debug", f"Traceback: {traceback.format_exc()}")
+                    # Even after an exception, attempt to set the workflow executor if navigator exists
+                    try:
+                        navigation_api.set_workflow_executor(self)
+                        self._emit_log("info", "Runner injected as workflow_executor (after exception recovery)")
+                    except Exception as executor_error:
+                        self._emit_log("debug", f"Could not set workflow executor: {executor_error}")
 
             # Parse config into QontinuiConfig and initialize StateExecutor
             # This must happen AFTER navigation is initialized
@@ -1241,6 +1416,15 @@ class QontinuiExecutor:
                     self.action_executor = self.state_executor.action_executor
 
                     self._emit_log("info", "StateExecutor and ActionExecutor initialized - library will handle all GUI actions")
+
+                    # Apply any existing debug settings to the newly initialized executor
+                    if self.debug_settings:
+                        self._apply_debug_settings_to_executor()
+
+                    # Initialize unified data architecture services
+                    # These depend on state_executor being initialized for state memory access
+                    self._initialize_unified_data_services()
+
                 except Exception as e:
                     self._emit_log("error", f"Failed to initialize StateExecutor: {e}")
                     self._emit_log("debug", f"Traceback: {traceback.format_exc()}")
@@ -1275,44 +1459,84 @@ class QontinuiExecutor:
             return False
 
     def _execute_action(self, action_data: dict[str, Any]) -> bool:
-        """Execute a single action by delegating to the library's ActionExecutor.
+        """Execute a single action using ExecutionTree and UnifiedDataCollector.
 
         The runner's role is to:
-        - Track execution hierarchy for frontend display
-        - Emit workflow/action lifecycle events
-        - Coordinate workflow execution
+        - Track execution hierarchy using ExecutionTree
+        - Collect execution data using UnifiedDataCollector
+        - Emit action lifecycle events with enriched data
+        - Delegate actual execution to the library's ActionExecutor
 
-        The library's ActionExecutor handles:
-        - All GUI action execution (clicks, typing, image finding, etc.)
-        - Action retries and error handling
-        - Action-specific event emission
+        Integration with unified data architecture:
+        1. Extract hierarchy context (parent_action_id, workflow_id, nesting_level)
+        2. Start data collection with collector.start_action()
+        3. Execute action via ActionExecutor (which emits events to collector)
+        4. Create ActionExecutionRecord with collector.create_record()
+        5. Enrich ExecutionNode metadata with record data
+        6. Emit tree events with complete execution data
+
+        Args:
+            action_data: Dictionary containing action type, id, config, etc.
+
+        Returns:
+            True if action succeeded, False otherwise
         """
+        # File-based debug logging
+        import os
+        import tempfile
+        from datetime import datetime
+        debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_runner_execute_debug.log")
+
+        try:
+            with open(debug_log_path, "a", encoding="utf-8") as f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                f.write(f"[{timestamp}] _execute_action() called\n")
+                f.write(f"[{timestamp}]   Action data: {json.dumps(action_data, indent=2)}\n")
+        except Exception:
+            pass
+
         action_type = action_data.get("type")
         action_id = action_data.get("id", f"action-{action_type}-{id(action_data)}")
         config = action_data.get("config", {})
 
-        # Determine if action is expandable (contains sub-workflows)
-        is_expandable = action_type in ["GO_TO_STATE", "RUN_WORKFLOW", "RUN_PROCESS"]
+        # Get action definition from registry
+        action_def = get_action_definition(action_type)
 
-        # Get hierarchy metadata BEFORE pushing action onto stack
-        # This ensures parent_id references the containing workflow, not this action itself
-        hierarchy = self.execution_context.get_hierarchy_metadata(
-            action_id=action_id,
-            is_expandable=is_expandable
+        # Extract hierarchy context from execution tree for data collection
+        # This provides parent_action_id, workflow_id, and nesting_level
+        import sys
+        print(f"[LEVEL_DEBUG] Before _get_hierarchy_context for action {action_id} type={action_type}", file=sys.stderr, flush=True)
+        print(f"[LEVEL_DEBUG]   execution_tree.current = {self.execution_tree.current.id if self.execution_tree.current else 'None'}", file=sys.stderr, flush=True)
+        print(f"[LEVEL_DEBUG]   execution_tree.current.get_depth() = {self.execution_tree.current.get_depth() if self.execution_tree.current else 'N/A'}", file=sys.stderr, flush=True)
+        hierarchy_context = self._get_hierarchy_context()
+        print(f"[LEVEL_DEBUG]   hierarchy_context = {hierarchy_context}", file=sys.stderr, flush=True)
+
+        # Start data collection in UnifiedDataCollector
+        # Captures "before" state snapshot and initializes buffer
+        if self.unified_data_collector:
+            self.unified_data_collector.start_action(
+                action_id=action_id,
+                parent_action_id=hierarchy_context["parent_action_id"],
+                workflow_id=hierarchy_context["workflow_id"],
+                nesting_level=hierarchy_context["nesting_level"]
+            )
+
+        # Start action in execution tree with metadata
+        node = self.execution_tree.start_action(
+            action_id,
+            action_type,
+            metadata={
+                "config": config,
+                "is_expandable": action_def.is_expandable,
+                "action_definition": action_def.to_dict()
+            }
         )
+        self._emit_tree_event("action_started", node)
 
-        # Adjust nesting level for actions (same as workflows)
-        # Actions are emitted BEFORE push, so stack doesn't include this action yet
-        # Add +1 to reflect the action's actual position in the hierarchy
-        adjusted_hierarchy = HierarchyMetadata(
-            parent_id=hierarchy.parent_id,
-            nesting_level=hierarchy.nesting_level + 1,
-            workflow_name=hierarchy.workflow_name,
-            is_expandable=hierarchy.is_expandable
-        )
-
-        # Now push action onto execution context stack
-        self.execution_context.push_action(action_id, action_type)
+        # Capture start time for record creation
+        start_time = time.time()
+        success = False
+        error_message = None
 
         try:
             self._emit_log("info", f"Executing action: {action_type}")
@@ -1321,17 +1545,10 @@ class QontinuiExecutor:
             if not QONTINUI_AVAILABLE or not self.action_executor:
                 self._emit_log("warning", f"Simulating action: {action_type} (ActionExecutor not available)")
                 time.sleep(0.5)  # Simulate action delay
+                success = True
+                self.execution_tree.end_action(action_id, success=True)
+                self._emit_tree_event("action_completed", node)
                 return True
-
-            # Emit ACTION_STARTED event with adjusted hierarchy (suppressed for helper workflows)
-            self._emit_action_event(
-                EventType.ACTION_STARTED,
-                {
-                    "action_id": action_id,
-                    "action_type": action_type
-                },
-                hierarchy=adjusted_hierarchy
-            )
 
             # Convert action_data to Action object for library
             from qontinui.config.schema import Action
@@ -1340,90 +1557,25 @@ class QontinuiExecutor:
                 id=action_id,
                 type=action_type,
                 config=config,
-                timeout=action_data.get("timeout", 5000),
-                retry_count=action_data.get("retry_count", 3),
-                continue_on_error=action_data.get("continue_on_error", False)
+                base=action_data.get("base")  # Include base settings (pauseBeforeBegin, pauseAfterEnd, etc.)
             )
 
-            # Delegate to library's ActionExecutor
-            # The library handles:
-            # - All GUI execution (mouse, keyboard, screen capture)
-            # - Image recognition and template matching
-            # - Action retries and timing
-            # - Event emission via stdout (we capture and enhance with hierarchy below)
-
-            # Capture library's stdout to intercept action_execution events
-            captured_events = []
-            original_stdout = sys.stdout
-
-            # Capture stdout to intercept library's action_execution events
-            capture_buffer = StringIO()
-            sys.stdout = capture_buffer
-
-            try:
+            # Handle RUN_WORKFLOW specially - execute workflow via runner's _execute_workflow
+            # This ensures each child action goes through _execute_action and emits tree events
+            if action_type == "RUN_WORKFLOW":
+                workflow_id = config.get("workflowId")
+                if workflow_id:
+                    # Execute workflow via runner (not library) so child actions emit tree events
+                    # _execute_workflow will create the workflow node and execute each action
+                    success = self._execute_workflow(workflow_id)
+                else:
+                    # No workflow ID - fail
+                    self._emit_log("error", "RUN_WORKFLOW action missing workflowId")
+                    success = False
+            else:
+                # Normal action delegation
+                # During execution, library events are captured by UnifiedDataCollector
                 success = self.action_executor.execute_action(action)
-            finally:
-                # Restore stdout and process captured output
-                sys.stdout = original_stdout
-                captured_output = capture_buffer.getvalue()
-
-                # Debug: Log captured output size
-                if captured_output:
-                    self._emit_log("debug", f"Captured {len(captured_output)} chars from library stdout")
-
-                # Parse captured JSON events and add hierarchy
-                import json
-                for line in captured_output.strip().split('\n'):
-                    if not line.strip():
-                        continue
-                    try:
-                        event_obj = json.loads(line)
-                        # Check if this is an action_execution event from library
-                        if (event_obj.get('type') == 'event' and
-                            event_obj.get('event') == 'action_execution'):
-                            # Add hierarchy to the event data
-                            event_data = event_obj.get('data', {})
-
-                            # Get hierarchy for nested library actions
-                            # At this point, the current action is on the stack, so nested actions
-                            # should have this action as their parent
-                            lib_action_type = event_data.get('action_type', 'UNKNOWN')
-                            lib_action_id = event_data.get('action_id', f'lib-{lib_action_type}')
-
-                            # If this is the same action we just executed, use adjusted_hierarchy
-                            # Otherwise, it's a nested action executed by the library, get hierarchy from stack
-                            if lib_action_id == action_id:
-                                # This is the action we delegated to the library
-                                event_hierarchy = adjusted_hierarchy
-                            else:
-                                # This is a nested action executed by library (e.g., TYPE inside GO_TO_STATE)
-                                # Current action is on the stack, so it becomes the parent
-                                nested_hierarchy = self.execution_context.get_hierarchy_metadata(
-                                    action_id=lib_action_id,
-                                    is_expandable=False
-                                )
-                                # Add +1 for nesting level
-                                event_hierarchy = HierarchyMetadata(
-                                    parent_id=nested_hierarchy.parent_id,
-                                    nesting_level=nested_hierarchy.nesting_level + 1,
-                                    workflow_name=nested_hierarchy.workflow_name,
-                                    is_expandable=False
-                                )
-
-                            event_data['hierarchy'] = event_hierarchy.to_dict()
-
-                            # Re-emit with proper sequence and hierarchy
-                            self._emit_event(
-                                EventType.ACTION_EXECUTION,
-                                event_data
-                            )
-                            self._emit_log("debug", f"Enhanced library action_execution with hierarchy: {lib_action_type} (parent={event_hierarchy.parent_id}, level={event_hierarchy.nesting_level})")
-                        else:
-                            # Re-emit other events as-is
-                            print(line, file=original_stdout)
-                    except json.JSONDecodeError:
-                        # Not JSON, send to stderr instead of stdout
-                        print(line, file=sys.stderr)
 
             # Sync last_find_location from library if available
             if hasattr(self.action_executor, 'last_find_location') and self.action_executor.last_find_location:
@@ -1432,30 +1584,149 @@ class QontinuiExecutor:
                 self._last_find_location = Location(loc[0], loc[1])
                 self._emit_log("debug", f"Synced last_find_location from library: {self._last_find_location}")
 
-            # For workflow-executing actions, inject the runner as workflow executor
-            # This allows the library to call back to the runner for nested workflow execution
-            if action_type in ["GO_TO_STATE", "RUN_WORKFLOW", "RUN_PROCESS"]:
-                navigation_api.set_workflow_executor(self)
+            # Handle GO_TO_STATE actions specially
+            # Record transition data in collector
+            if action_type == "GO_TO_STATE" and self.unified_data_collector:
+                # Extract transition information from config
+                target_state = config.get("targetState", "unknown")
+                # Get current state from state_executor (this is the "from" state)
+                from_state = self.state_executor.current_state if self.state_executor else None
 
-            self._emit_event(
-                EventType.ACTION_COMPLETED, {"action_id": action_id, "success": success}
-            )
-            return success
+                transition_data = {
+                    "from_state": from_state,
+                    "to_state": target_state,
+                    "transition_type": "navigation",
+                    "success": success
+                }
+                self.unified_data_collector.record_transition(transition_data)
+
+            # Handle RUN_WORKFLOW actions specially
+            # Add workflow name to metadata so it can be displayed in frontend
+            if action_type == "RUN_WORKFLOW" and self.unified_data_collector:
+                workflow_id = config.get("workflowId")
+                if workflow_id:
+                    # Try to get workflow name from registry or local workflows
+                    workflow_name = workflow_id  # Default to ID
+                    if workflow_id in self.workflows:
+                        workflow_data = self.workflows[workflow_id]
+                        if isinstance(workflow_data, dict):
+                            workflow_name = workflow_data.get("name", workflow_id)
+
+                    # Record workflow metadata
+                    # This will be picked up by _format_runtime_for_display in ActionExecutionRecord
+                    self.unified_data_collector.record_workflow_execution(
+                        workflow_name=workflow_name,
+                        workflow_status="success" if success else "failed"
+                    )
 
         except Exception as e:
-            # Emit ACTION_COMPLETED event for exception case
-            # Note: The library may have emitted action_execution before throwing,
-            # which we would have captured and enhanced with hierarchy above
-            self._emit_event(
-                EventType.ACTION_COMPLETED,
-                {"action_id": action_id, "success": False, "error": str(e)},
-            )
+            success = False
+            error_message = str(e)
             self._emit_log("error", f"Action failed with exception: {e}")
-            return False
 
         finally:
-            # Pop action from execution context stack
-            self.execution_context.pop_action()
+            # Capture end time
+            end_time = time.time()
+
+            # Debug: Print to both stdout and stderr to ensure we see output
+            import sys
+            print(f"[FINALLY_BLOCK] Action {action_id} type={action_type} entering finally block", file=sys.stderr, flush=True)
+            print(f"[FINALLY_BLOCK] Action {action_id} type={action_type} entering finally block", flush=True)
+
+            # Enrich FIND action config with human-readable image names
+            print(f"[ENRICHMENT] Checking FIND action enrichment: action_type={action_type}", file=sys.stderr, flush=True)
+            print(f"[ENRICHMENT] Checking FIND action enrichment: action_type={action_type}", flush=True)
+            if action_type == "FIND":
+                print(f"[ENRICHMENT] FIND action detected, config keys: {config.keys() if isinstance(config, dict) else 'not a dict'}", file=sys.stderr, flush=True)
+                print(f"[ENRICHMENT] FIND action detected, config: {config}", file=sys.stderr, flush=True)
+                config_copy = None
+
+                # Check for imageId at root level
+                if "imageId" in config:
+                    image_id = config.get("imageId")
+                    image_name = self._get_image_name(image_id)
+                    if image_name:
+                        config_copy = config.copy() if config_copy is None else config_copy
+                        config_copy["imageName"] = image_name
+                        self._emit_log("debug", f"Enriched FIND action (root imageId) with image name: {image_name}")
+
+                # Check for imageId nested in target object
+                target = config.get("target")
+                if isinstance(target, dict):
+                    if "imageId" in target:
+                        image_id = target.get("imageId")
+                        image_name = self._get_image_name(image_id)
+                        if image_name:
+                            config_copy = config.copy() if config_copy is None else config_copy
+                            target_copy = config_copy.get("target", {}).copy() if isinstance(config_copy.get("target"), dict) else {}
+                            target_copy["imageName"] = image_name
+                            config_copy["target"] = target_copy
+                            # Also add at root for easier frontend access
+                            config_copy["imageName"] = image_name
+                            self._emit_log("debug", f"Enriched FIND action (target.imageId) with image name: {image_name}")
+
+                    # Handle multiple images in target
+                    if "imageIds" in target:
+                        image_ids = target.get("imageIds", [])
+                        image_names = [self._get_image_name(img_id) for img_id in image_ids]
+                        image_names = [name for name in image_names if name]  # Filter None
+                        if image_names:
+                            config_copy = config.copy() if config_copy is None else config_copy
+                            target_copy = config_copy.get("target", {}).copy() if isinstance(config_copy.get("target"), dict) else {}
+                            target_copy["imageNames"] = image_names
+                            config_copy["target"] = target_copy
+                            # Also add at root for easier frontend access
+                            config_copy["imageNames"] = image_names
+                            config_copy["imageName"] = ", ".join(image_names)
+                            self._emit_log("debug", f"Enriched FIND action (target.imageIds) with {len(image_names)} image names")
+
+                # Handle multiple images at root level
+                if "imageIds" in config:
+                    image_ids = config.get("imageIds", [])
+                    image_names = [self._get_image_name(img_id) for img_id in image_ids]
+                    image_names = [name for name in image_names if name]  # Filter None
+                    if image_names:
+                        config_copy = config.copy() if config_copy is None else config_copy
+                        config_copy["imageNames"] = image_names
+                        config_copy["imageName"] = ", ".join(image_names)
+                        self._emit_log("debug", f"Enriched FIND action (root imageIds) with {len(image_names)} image names")
+
+                # Use enriched config if we made changes
+                if config_copy:
+                    config = config_copy
+                    # Also update the node metadata with enriched config
+                    node.metadata["config"] = config
+                    print(f"[ENRICHMENT] Updated node metadata with enriched config", file=sys.stderr, flush=True)
+
+            # Create ActionExecutionRecord with UnifiedDataCollector
+            # This captures "after" state snapshot, extracts buffered data, and creates immutable record
+            if self.unified_data_collector:
+                record = self.unified_data_collector.create_record(
+                    action_type=action_type,
+                    config=config,
+                    start_time=start_time,
+                    end_time=end_time,
+                    success=success,
+                    error_message=error_message,
+                    retry_count=0,  # TODO: Track actual retry count from ActionExecutor
+                    metadata={
+                        "action_definition": action_def.to_dict()
+                    }
+                )
+
+                # Enrich ExecutionNode metadata with record data
+                # This allows tree events to include complete execution information
+                node.metadata.update({
+                    "execution_record": record.to_tree_event_data()
+                })
+
+            # End action in execution tree
+            self.execution_tree.end_action(action_id, success=success, error=error_message)
+
+            # Emit tree event with enriched metadata
+            self._emit_tree_event("action_completed" if success else "action_failed", node)
+
+            return success
 
     def _execute_workflow(self, workflow_id: str) -> bool:
         """Execute a workflow using manual execution (graph execution not available)."""
@@ -1463,10 +1734,18 @@ class QontinuiExecutor:
         return self._execute_workflow_manual(workflow_id)
 
     def _execute_workflow_manual(self, workflow_id: str) -> bool:
-        """Manual workflow execution with hierarchical context tracking."""
+        """Manual workflow execution using ExecutionTree for tracking."""
         # Get workflow data (actions and name)
         workflow_data = None
         workflow_name = workflow_id  # Default to ID if name not found
+        is_inline = False  # Track if this is an inline transition workflow
+
+        # Check if this workflow is being called from within an action (not top-level)
+        # If we're inside an action node, this is an inline workflow (called by GO_TO_STATE or similar)
+        current_node = self.execution_tree.current
+        if current_node and current_node.node_type == "action":
+            is_inline = True
+            self._emit_log("debug", f"Workflow {workflow_id} called from action {current_node.name}, marking as inline")
 
         # Try local workflows first
         if workflow_id in self.workflows:
@@ -1485,66 +1764,84 @@ class QontinuiExecutor:
                 return False
             # Try to get name from registry
             workflow_name = registry.get_workflow_name(workflow_id) if hasattr(registry, 'get_workflow_name') else workflow_id
+            # This is an inline workflow from a transition - mark it
+            is_inline = True
             # Cache it locally for future use
             self.workflows[workflow_id] = {
                 "actions": actions,
                 "name": workflow_name
             }
-            self._emit_log("debug", f"Loaded workflow {workflow_id} from registry")
+            self._emit_log("debug", f"Loaded inline workflow {workflow_id} from registry")
         else:
             self._emit_log("error", f"Workflow {workflow_id} not found")
             return False
 
-        # Check if this is a helper workflow (auto-generated state verification)
-        # Helper workflows have IDs starting with "wf-helper-" and should not emit action events
-        is_helper_workflow = workflow_id.startswith("wf-helper-")
-
-        if is_helper_workflow:
-            self._emit_log("debug", f"Executing helper workflow (events suppressed): {workflow_name}")
-
-        # Emit workflow started event BEFORE pushing to stack
-        # This ensures parent_id references the containing workflow, not this workflow itself
-        self._emit_workflow_event(
-            EventType.WORKFLOW_STARTED,
-            {
-                "workflow_id": workflow_id,
-                "workflow_name": workflow_name,
-            }
-        )
-
-        # Push workflow onto execution context stack
-        self.execution_context.push_workflow(workflow_id, workflow_name, is_helper=is_helper_workflow)
+        # Start workflow in execution tree (mark inline workflows appropriately)
+        node = self.execution_tree.start_workflow(workflow_id, workflow_name, is_inline=is_inline)
+        self._emit_log("debug", f"[TREE] Starting workflow node: {workflow_id} (inline={is_inline})")
+        self._emit_tree_event("workflow_started", node)
+        self._emit_log("debug", f"[TREE] Emitted workflow_started tree event")
 
         success = True
 
-        for action in actions:
-            if not self.is_running:
-                break
+        # File-based debug logging
+        import os
+        import tempfile
+        from datetime import datetime
+        workflow_debug_log = os.path.join(tempfile.gettempdir(), "qontinui_workflow_execution_debug.log")
 
-            if not self._execute_action(action):
-                success = False
-                break
+        try:
+            with open(workflow_debug_log, "a", encoding="utf-8") as f:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                f.write(f"[{timestamp}] Executing workflow {workflow_id} with {len(actions)} actions\n")
+        except Exception:
+            pass
 
-            # Small delay between actions
-            time.sleep(0.5)
+        try:
+            for idx, action in enumerate(actions):
+                # Log each action
+                try:
+                    with open(workflow_debug_log, "a", encoding="utf-8") as f:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        f.write(f"[{timestamp}] Action {idx+1}/{len(actions)}: {action.get('type')} (ID: {action.get('id')})\n")
+                except Exception:
+                    pass
 
-        # Pop workflow from execution context stack
-        self.execution_context.pop_workflow()
+                if not self.is_running:
+                    break
 
-        # Emit workflow completed event AFTER popping from stack
-        # This ensures parent_id references the containing workflow, not this workflow itself
-        self._emit_workflow_event(
-            EventType.WORKFLOW_COMPLETED,
-            {
-                "workflow_id": workflow_id,
-                "workflow_name": workflow_name,
-                "success": success,
-            }
-        )
+                # Execute action and track success, but always continue
+                # Model-based GUI automation should be resilient - never stop on action failure
+                action_success = self._execute_action(action)
+
+                # Log result
+                try:
+                    with open(workflow_debug_log, "a", encoding="utf-8") as f:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        f.write(f"[{timestamp}] Action result: {action_success}\n")
+                except Exception:
+                    pass
+
+                if not action_success:
+                    success = False
+                    self._emit_log("debug", f"Action failed, continuing workflow (model-based automation principle)")
+
+                # Small delay between actions
+                time.sleep(0.5)
+
+            # End workflow with success status
+            self.execution_tree.end_workflow(workflow_id, success=success)
+            self._emit_tree_event("workflow_completed" if success else "workflow_failed", node)
+
+        except Exception as e:
+            # End workflow with failure status
+            self.execution_tree.end_workflow(workflow_id, success=False, error=str(e))
+            self._emit_tree_event("workflow_failed", node, {"error": str(e)})
+            success = False
 
         return success
 
-    def execute_workflow(self, workflow_id: str) -> dict:
+    def execute_workflow(self, workflow_id: str, transition_context: dict = None) -> dict:
         """Execute a workflow and return result in navigation API expected format.
 
         This method is called by the navigation system when executing transitions.
@@ -1552,13 +1849,53 @@ class QontinuiExecutor:
 
         Args:
             workflow_id: ID of workflow to execute
+            transition_context: Optional dict with transition metadata:
+                - transition_id: Unique ID for the transition
+                - transition_name: Display name (e.g., "outgoing (processing, inventory)")
+                - transition_type: "outgoing" or "incoming"
+                - target_states: List of state names or IDs being activated
+                - source_state: Source state name (for display)
 
         Returns:
             dict with 'success' key: {'success': True/False}
         """
         try:
-            success = self._execute_workflow(workflow_id)
-            return {'success': success}
+            # If transition context provided, create a transition node
+            if transition_context:
+                transition_id = transition_context.get('transition_id', f"transition-{time.time()}")
+                transition_name = transition_context.get('transition_name', 'Transition')
+
+                # Start transition node
+                trans_node = self.execution_tree.start_transition(
+                    transition_id,
+                    transition_name,
+                    metadata={
+                        'transition_type': transition_context.get('transition_type'),
+                        'target_states': transition_context.get('target_states', []),
+                        'source_state': transition_context.get('source_state'),
+                        'is_expandable': True  # Transitions are always expandable
+                    }
+                )
+                self._emit_tree_event("transition_started", trans_node)
+
+                try:
+                    # Execute workflow under this transition
+                    success = self._execute_workflow(workflow_id)
+
+                    # End transition node
+                    self.execution_tree.end_transition(transition_id, success=success)
+                    self._emit_tree_event("transition_completed" if success else "transition_failed", trans_node)
+
+                    return {'success': success}
+                except Exception as e:
+                    # End transition with failure
+                    self.execution_tree.end_transition(transition_id, success=False, error=str(e))
+                    self._emit_tree_event("transition_failed", trans_node, {"error": str(e)})
+                    raise
+            else:
+                # No transition context - execute workflow normally
+                success = self._execute_workflow(workflow_id)
+                return {'success': success}
         except Exception as e:
             self._emit_log("error", f"Workflow execution failed: {e}")
             return {'success': False, 'error': str(e)}
@@ -1691,6 +2028,12 @@ class QontinuiExecutor:
                 "config_loaded": self.config is not None,
                 "library_available": QONTINUI_AVAILABLE,
             }
+
+        elif cmd_type == "set_debug_settings":
+            # Update debug settings from frontend
+            settings = params.get("settings", {})
+            self.set_debug_settings(settings)
+            return {"success": True}
 
         elif cmd_type == "start_recording":
             return self._handle_start_recording(params)
@@ -1884,8 +2227,10 @@ def main():
                 response = executor.handle_command(command)
                 response["id"] = command.get("id")
                 response["type"] = "response"
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+                # Use lock to prevent concurrent threads from interleaving JSON output
+                with executor._output_lock:
+                    sys.stdout.write(json.dumps(response) + "\n")
+                    sys.stdout.flush()
 
         except json.JSONDecodeError as e:
             executor._emit_event(

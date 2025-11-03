@@ -7,6 +7,13 @@ The library handles both real and mock execution modes.
 
 import json
 import sys
+
+# CRITICAL: Check for --disable-console-logging flag BEFORE any qontinui imports
+# This prevents logging from outputting to stderr/stdout
+import os
+if "--disable-console-logging" in sys.argv:
+    os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
+    sys.argv.remove("--disable-console-logging")
 import tempfile
 import threading
 import time
@@ -17,7 +24,9 @@ from typing import Any
 # Import Qontinui library - REQUIRED (no fallback)
 from qontinui.json_executor.json_runner import JSONRunner
 from qontinui.mock import MockModeManager
-from qontinui.runner import DSLParser, ExecutionError, StatementExecutor
+
+# DSL imports are lazy-loaded only when needed (in _handle_execute_dsl)
+# This prevents import errors when DSL features are not being used
 
 
 class EventType(Enum):
@@ -64,8 +73,8 @@ class QontinuiBridge:
         self._is_running = False
         self._temp_config_file = None
         self._scheduler_running = False
-        self._dsl_parser = DSLParser()
-        self._dsl_executor = None
+        self._dsl_parser = None  # Lazy-loaded when DSL is used
+        self._dsl_executor = None  # Lazy-loaded when DSL is used
         self._setup_callbacks()
 
         mode_str = "mock/simulation" if mock_mode else "real"
@@ -434,6 +443,19 @@ class QontinuiBridge:
             Execution result with success status and return value
         """
         try:
+            # Lazy-load DSL imports only when DSL execution is requested
+            if self._dsl_parser is None:
+                try:
+                    from qontinui.runner import DSLParser, ExecutionError, StatementExecutor
+                    self._dsl_parser = DSLParser()
+                    self._ExecutionError = ExecutionError
+                    self._StatementExecutor = StatementExecutor
+                except ImportError as e:
+                    return {
+                        "success": False,
+                        "error": f"DSL features not available: {str(e)}",
+                    }
+
             dsl_json = params.get("dsl_json")
             if not dsl_json:
                 return {"success": False, "error": "No DSL JSON provided"}
@@ -451,7 +473,7 @@ class QontinuiBridge:
             from .dsl_action_executor import DSLActionExecutor
 
             action_executor = DSLActionExecutor(self.runner)
-            self._dsl_executor = StatementExecutor(action_executor=action_executor)
+            self._dsl_executor = self._StatementExecutor(action_executor=action_executor)
 
             # Execute each automation function
             results = []
@@ -482,7 +504,7 @@ class QontinuiBridge:
                         }
                     )
 
-                except ExecutionError as e:
+                except self._ExecutionError as e:
                     self._emit_event(
                         EventType.DSL_EXECUTION_ERROR,
                         {

@@ -341,11 +341,7 @@ async function example9_complexWorkflow() {
 
   // Step 4: Navigate to multiple states in parallel
   console.log("Opening multiple applications...");
-  const multiNav = await navigateToMultipleStates([
-    "email_client",
-    "calendar",
-    "tasks",
-  ]);
+  const multiNav = await navigateToMultipleStates(["email_client", "calendar", "tasks"]);
 
   if (multiNav.success) {
     console.log("All applications opened successfully!");

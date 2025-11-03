@@ -1,13 +1,15 @@
 use super::health::{HealthCheckTask, HealthMonitor};
 use super::lifecycle::{parse_executor_message, ExecutorLifecycle, ExecutorMessage};
 use super::state::ExecutorState;
+use crate::commands::AppState;
+use crate::display::RawEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
 
@@ -92,6 +94,9 @@ impl PythonBridge {
 
         info!("Starting Python executor with type: {}", executor_type);
 
+        // Load debug settings to send to Python
+        let debug_settings = crate::settings::get_debug_settings();
+
         // Determine script name
         let script_name = match executor_type {
             "minimal" => "minimal_bridge.py",
@@ -111,8 +116,19 @@ impl PythonBridge {
             cmd.arg("--mock");
         }
 
+        // CRITICAL: Disable console logging to prevent JSON parse errors
+        // The executor expects all stderr/stdout to be valid JSON messages
+        // Use command-line flag instead of environment variable for reliability
+        cmd.arg("--disable-console-logging");
+
+        // CRITICAL: Set environment variables AFTER building command
+        // These must be set on the final Command object that will be spawned
+
         // Set PYTHONUNBUFFERED to force immediate output (more reliable than -u flag)
         cmd.env("PYTHONUNBUFFERED", "1");
+
+        // Also set environment variable as backup (some code paths might check it)
+        cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
 
         // Spawn Python process
         let mut child = cmd
@@ -158,11 +174,11 @@ impl PythonBridge {
             });
         });
 
-        // Spawn stderr reader task
+        // Spawn stderr reader task with log level parsing
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines().map_while(Result::ok) {
-                error!("Python stderr: {}", line);
+                Self::log_python_stderr(&line);
             }
             info!("Stderr reader thread ending");
         });
@@ -226,6 +242,26 @@ impl PythonBridge {
                     });
                 });
 
+                // Send debug settings to Python executor
+                info!("Sending debug settings to Python executor: {:?}", debug_settings);
+                let debug_params = json!({
+                    "enable_image_debug": debug_settings.enable_image_debug,
+                    "top_matches_count": debug_settings.top_matches_count,
+                });
+
+                let debug_cmd = ExecutorCommand {
+                    cmd_type: "command".to_string(),
+                    id: uuid::Uuid::new_v4().to_string(),
+                    command: "set_debug_settings".to_string(),
+                    params: Some(debug_params),
+                };
+
+                if let Err(e) = self.runtime.block_on(async {
+                    cmd_tx.send(debug_cmd).await
+                }) {
+                    error!("Failed to send debug settings to Python: {}", e);
+                }
+
                 // Drain any queued events
                 let queued_events = self.runtime.block_on(async {
                     self.lifecycle.read().await.drain_queued_events().await
@@ -249,6 +285,49 @@ impl PythonBridge {
                 }
 
                 Ok(())
+        }
+    }
+
+    /// Parse and log Python stderr output with appropriate log levels
+    fn log_python_stderr(line: &str) {
+        // Python structlog outputs in format: "YYYY-MM-DD HH:MM:SS [level    ] message"
+        // Also handle plain output like "[EventTranslator] message"
+
+        // Try to extract log level from structlog format
+        if let Some(start) = line.find('[') {
+            if let Some(end) = line[start..].find(']') {
+                let level_part = &line[start + 1..start + end];
+                let level = level_part.trim();
+
+                // Map Python log levels to Rust tracing levels
+                match level.to_lowercase().as_str() {
+                    "debug" => debug!("Python: {}", line),
+                    "info" => info!("Python: {}", line),
+                    "warning" | "warn" => tracing::warn!("Python: {}", line),
+                    "error" => error!("Python: {}", line),
+                    "critical" => error!("Python CRITICAL: {}", line),
+                    _ => {
+                        // Not a recognized log level, check if it's an info-level message
+                        // (like "[EventTranslator] message")
+                        if line.contains("event emitted") || line.contains("successfully") {
+                            info!("Python: {}", line);
+                        } else {
+                            // Default to debug for unknown bracketed content
+                            debug!("Python: {}", line);
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        // No brackets found, treat as info if it looks informational, debug otherwise
+        if line.contains("error") || line.contains("Error") || line.contains("ERROR") {
+            error!("Python: {}", line);
+        } else if line.contains("warning") || line.contains("Warning") || line.contains("WARN") {
+            tracing::warn!("Python: {}", line);
+        } else if !line.trim().is_empty() {
+            debug!("Python: {}", line);
         }
     }
 
@@ -372,8 +451,47 @@ impl PythonBridge {
         info!("Command sender task ending");
     }
 
-    /// Emits a message to the Tauri frontend
+    /// Emits a message to the Tauri frontend and feeds events to DisplayProcessor
     async fn emit_message_to_frontend(app_handle: &tauri::AppHandle, message: ExecutorMessage) {
+        // Feed tree events to DisplayProcessor
+        if let ExecutorMessage::TreeEvent {
+            ref event_type,
+            ref node,
+            ref timestamp,
+            ref sequence,
+            ..
+        } = message
+        {
+            eprintln!("[PYTHON_BRIDGE] Received TreeEvent: type={}, seq={}", event_type, sequence);
+            eprintln!("[PYTHON_BRIDGE] Node data: {:?}", node);
+
+            // Get the AppState and add event to DisplayProcessor
+            if let Some(app_state) = app_handle.try_state::<AppState>() {
+                eprintln!("[PYTHON_BRIDGE] AppState found, creating RawEvent");
+
+                let raw_event = RawEvent {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    event_type: event_type.clone(),
+                    timestamp: *timestamp,
+                    data: json!({
+                        "node": node.clone(),
+                    }),
+                    sequence: *sequence as u64,
+                };
+
+                eprintln!("[PYTHON_BRIDGE] RawEvent created: id={}, type={}", raw_event.id, raw_event.event_type);
+
+                let mut processor = app_state.display_processor.lock().await;
+                eprintln!("[PYTHON_BRIDGE] Got display_processor lock, calling add_event");
+                processor.event_log_mut().add_event(raw_event);
+                eprintln!("[PYTHON_BRIDGE] add_event completed");
+            } else {
+                eprintln!("[PYTHON_BRIDGE] AppState NOT available!");
+                debug!("AppState not available for feeding events to DisplayProcessor");
+            }
+        }
+
+        // Continue with normal event emission
         match message {
             ExecutorMessage::Event {
                 event,
@@ -390,6 +508,26 @@ impl PythonBridge {
                 };
                 if let Err(e) = app_handle.emit("executor-event", &event_obj) {
                     error!("Failed to emit event: {}", e);
+                }
+            }
+            ExecutorMessage::TreeEvent {
+                event_type,
+                node,
+                path,
+                timestamp,
+                sequence,
+            } => {
+                // Emit tree event with all data
+                let tree_event = json!({
+                    "type": "tree_event",
+                    "event_type": event_type,
+                    "node": node,
+                    "path": path,
+                    "timestamp": timestamp,
+                    "sequence": sequence,
+                });
+                if let Err(e) = app_handle.emit("executor-event", &tree_event) {
+                    error!("Failed to emit tree event: {}", e);
                 }
             }
             ExecutorMessage::Response {
@@ -418,6 +556,17 @@ impl PythonBridge {
                 });
                 if let Err(e) = app_handle.emit("executor-error", &error_event) {
                     error!("Failed to emit error: {}", e);
+                }
+            }
+            ExecutorMessage::ImageRecognition { data } => {
+                // Emit image recognition event with debug data
+                // Use "event" field to match frontend's expectation (data.event === "image_recognition")
+                let image_recognition_event = json!({
+                    "event": "image_recognition",
+                    "data": data,
+                });
+                if let Err(e) = app_handle.emit("executor-event", &image_recognition_event) {
+                    error!("Failed to emit image recognition event: {}", e);
                 }
             }
             _ => {
@@ -501,17 +650,29 @@ impl PythonBridge {
         };
 
         let venv_python = bridge_script.parent().and_then(|p| {
-            let venv_path = p.join("venv/Scripts/python.exe");
+            // Try Windows-style venv first (Scripts/python.exe)
+            let venv_path_windows = p.join(".venv/Scripts/python.exe");
             debug!(
-                "Checking venv path: {:?}, exists: {}",
-                venv_path,
-                venv_path.exists()
+                "Checking Windows venv path: {:?}, exists: {}",
+                venv_path_windows,
+                venv_path_windows.exists()
             );
-            if venv_path.exists() {
-                Some(venv_path)
-            } else {
-                None
+            if venv_path_windows.exists() {
+                return Some(venv_path_windows);
             }
+
+            // Try Unix-style venv (bin/python)
+            let venv_path_unix = p.join(".venv/bin/python");
+            debug!(
+                "Checking Unix venv path: {:?}, exists: {}",
+                venv_path_unix,
+                venv_path_unix.exists()
+            );
+            if venv_path_unix.exists() {
+                return Some(venv_path_unix);
+            }
+
+            None
         });
 
         let cmd = if poetry_available && use_poetry {
@@ -650,6 +811,22 @@ impl PythonBridge {
 
     pub fn get_recording_status(&mut self) -> Result<(), String> {
         self.send_command("recording_status", None)
+    }
+
+    pub fn set_debug_settings(
+        &mut self,
+        enable_image_debug: bool,
+        top_matches_count: u32,
+    ) -> Result<(), String> {
+        self.send_command(
+            "set_debug_settings",
+            Some(json!({
+                "settings": {
+                    "enable_image_debug": enable_image_debug,
+                    "top_matches_count": top_matches_count,
+                }
+            })),
+        )
     }
 
     pub fn is_running(&self) -> bool {

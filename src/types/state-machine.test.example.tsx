@@ -201,9 +201,7 @@ export function AvailableTransitionsPanel() {
                 <br />
                 From: {transition.from_state} → To: {transition.to_state || "Dynamic"}
               </div>
-              <button onClick={() => handleExecuteTransition(transition.id)}>
-                Execute
-              </button>
+              <button onClick={() => handleExecuteTransition(transition.id)}>Execute</button>
             </div>
           ))}
         </div>
@@ -247,9 +245,7 @@ export function MultiAppLauncher({ apps }: AppLauncherProps) {
     setLaunching(true);
     setResults(new Map());
 
-    const stateIds = apps
-      .filter((app) => selectedApps.has(app.id))
-      .map((app) => app.stateId);
+    const stateIds = apps.filter((app) => selectedApps.has(app.id)).map((app) => app.stateId);
 
     const result = await navigateToMultipleStates(stateIds);
 
@@ -506,10 +502,7 @@ export const testPatterns = {
     console.assert(result.success, "Transition should succeed");
 
     // Assert transition ID matches
-    console.assert(
-      result.transition_id === "test_transition",
-      "Transition ID should match"
-    );
+    console.assert(result.transition_id === "test_transition", "Transition ID should match");
 
     // Assert active states updated
     console.assert(result.active_states.length > 0, "Should have active states");
@@ -528,10 +521,7 @@ export const testPatterns = {
     console.assert(result.path.length > 0, "Should have navigation path");
 
     // Assert target state is active
-    console.assert(
-      result.active_states.includes("target_state"),
-      "Target state should be active"
-    );
+    console.assert(result.active_states.includes("target_state"), "Target state should be active");
   },
 
   /**
@@ -546,16 +536,13 @@ export const testPatterns = {
 
     // Assert all states are active
     targetStates.forEach((state) => {
-      console.assert(
-        result.active_states.includes(state),
-        `State ${state} should be active`
-      );
+      console.assert(result.active_states.includes(state), `State ${state} should be active`);
     });
 
     // Assert individual results
     console.assert(
       result.results?.length === targetStates.length,
-      "Should have result for each state"
+      "Should have result for each state",
     );
   },
 

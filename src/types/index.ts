@@ -4,15 +4,17 @@
  * Central export point for all type definitions used in the application.
  */
 
-// Event types for hierarchical action logging
+// Tree event types for hierarchical action logging
 export type {
-  HierarchyMetadata,
-  ActionExecutionEvent,
-  WorkflowEvent,
-  WorkflowStartedEvent,
-  WorkflowCompletedEvent,
-  HierarchicalEvent,
-} from "./events";
+  TreeEventData,
+  DisplayNode,
+  TreeNode,
+  NodeMetadata,
+  NodeType,
+  NodeStatus,
+  TreeEventType,
+  PathElement,
+} from "./treeEvents";
 
 // State machine types and functions
 export type {
@@ -35,3 +37,10 @@ export {
   isAnyStateActive,
   areAllStatesActive,
 } from "./state-machine";
+
+// Display profile types for the new architecture
+export type {
+  ActionLogViewData,
+  ActionLogEntry,
+  CommandResponse,
+} from "./displayProfile";

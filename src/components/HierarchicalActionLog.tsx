@@ -1,71 +1,79 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
-import { TreeNode as TreeNodeComponent } from './TreeNode';
-import { buildEventTree } from '../utils/eventTree';
-import { HierarchicalEvent } from '../types/events';
+import { useEffect, useRef, useState } from "react";
+import { TreeNode as TreeNodeComponent } from "./TreeNode";
+import { DisplayNode } from "../types/treeEvents";
 
 interface HierarchicalActionLogProps {
-  events: HierarchicalEvent[];
+  treeRoots: DisplayNode[];
   autoScroll: boolean;
   onClear: () => void;
 }
 
+/**
+ * Helper function to render a node, skipping workflow wrappers
+ */
+function renderNodeTree(
+  node: DisplayNode,
+  expandedNodes: Set<string>,
+  onToggle: (id: string) => void,
+  skipRootWorkflows: boolean = false
+): React.ReactNode[] {
+  // Skip workflow nodes that are just wrappers
+  if (node.type === "workflow") {
+    console.log(`[HierarchicalActionLog] Checking workflow node: ${node.name}`, {
+      isRoot: node.parent === null,
+      skipRootWorkflows,
+      metadata: node.metadata,
+      childCount: node.children.length
+    });
+
+    // If this is a root workflow, skip it and render children
+    // (user already knows which workflow they ran)
+    if (skipRootWorkflows && node.parent === null) {
+      console.log(`[HierarchicalActionLog] Skipping root workflow: ${node.name}, children count: ${node.children.length}`);
+      const result = node.children.flatMap((child) =>
+        renderNodeTree(child, expandedNodes, onToggle, false)
+      );
+      console.log(`[HierarchicalActionLog] Returning ${result.length} child nodes instead of root`);
+      return result;
+    }
+
+    // If this is an inline workflow (transition workflow), skip it
+    // Inline workflows are marked with is_inline=true in metadata
+    // RUN_WORKFLOW actions create workflows with is_expandable=true and should be visible
+    // Only check for inline workflows if they have children (otherwise we can't skip and render children)
+    if (node.children.length > 0) {
+      const isInline = node.metadata.is_inline === true;
+      const isUserWorkflow = node.metadata.is_expandable === true;
+
+      console.log(`[HierarchicalActionLog] Workflow ${node.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`);
+
+      if (isInline && !isUserWorkflow) {
+        console.log(`[HierarchicalActionLog] Skipping inline workflow: ${node.name}`);
+        return node.children.flatMap((child) =>
+          renderNodeTree(child, expandedNodes, onToggle, false)
+        );
+      }
+    }
+  }
+
+  // Render this node normally
+  return [
+    <TreeNodeComponent
+      key={node.id}
+      node={node}
+      isExpanded={expandedNodes.has(node.id)}
+      onToggle={onToggle}
+      expandedNodes={expandedNodes}
+    />
+  ];
+}
+
 export default function HierarchicalActionLog({
-  events,
+  treeRoots,
   autoScroll,
 }: HierarchicalActionLogProps) {
   const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
   const scrollContainerRef = useRef<HTMLDivElement>(null);
-
-  // Build tree structure from flat events array
-  const treeNodes = useMemo(() => {
-    console.log("=== HierarchicalActionLog: Building tree ===");
-    console.log("Total events:", events.length);
-    console.log("Sample event:", events[0]);
-    if (events.length > 0) {
-      console.log("First event parent_id:", events[0]?.hierarchy?.parent_id);
-      console.log("First event nesting_level:", events[0]?.hierarchy?.nesting_level);
-      console.log("All parent_ids:", events.map(e => e.hierarchy?.parent_id));
-      console.log("All nesting_levels:", events.map(e => e.hierarchy?.nesting_level));
-      console.log("All is_workflow flags:", events.map(e => e.is_workflow));
-      console.log("Full events:", JSON.stringify(events, null, 2));
-    }
-    const tree = buildEventTree(events);
-    console.log("Built tree with", tree.length, "root nodes");
-    if (tree.length > 0) {
-      console.log("First root node data:", tree[0].data);
-      console.log("First root has", tree[0].children.length, "children");
-      console.log("First root children:", tree[0].children.map(c => ({
-        id: c.data.id,
-        type: c.data.is_workflow ? 'workflow' : 'action',
-        nesting_level: c.data.hierarchy?.nesting_level
-      })));
-    }
-
-    // If there's only one root node and it's the top-level workflow (nesting_level === 1),
-    // skip showing it and display its children directly
-    // This avoids redundant nesting since only one workflow runs at a time
-    if (tree.length === 1 &&
-        tree[0] &&
-        tree[0].data &&
-        tree[0].data.hierarchy &&
-        tree[0].data.hierarchy.nesting_level === 1 &&
-        tree[0].data.is_workflow &&
-        tree[0].children &&
-        tree[0].children.length > 0) {
-      console.log("Skipping top-level workflow node, showing children directly");
-      console.log("Returning", tree[0].children.length, "children");
-      return tree[0].children;
-    }
-
-    console.log("Returning full tree with", tree.length, "nodes");
-    console.log("Final treeNodes that will be rendered:", tree.map(n => ({
-      id: n.data.id,
-      type: n.data.is_workflow ? 'workflow' : 'action',
-      nesting_level: n.data.hierarchy?.nesting_level,
-      children: n.children.length
-    })));
-    return tree;
-  }, [events]);
 
   // Handle node expand/collapse toggle
   const handleToggleNode = (nodeId: string) => {
@@ -85,25 +93,19 @@ export default function HierarchicalActionLog({
     if (autoScroll && scrollContainerRef.current) {
       scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
     }
-  }, [events, autoScroll]);
+  }, [treeRoots, autoScroll]);
 
   return (
     <div className="space-y-2">
-      {treeNodes.length === 0 ? (
+      {treeRoots.length === 0 ? (
         <div className="text-center text-muted-foreground py-8">
           <p>No events to display</p>
         </div>
       ) : (
         <div className="space-y-1">
-          {treeNodes.map((node) => (
-            <TreeNodeComponent
-              key={node.data.id}
-              node={node}
-              isExpanded={expandedNodes.has(node.data.id)}
-              onToggle={handleToggleNode}
-              expandedNodes={expandedNodes}
-            />
-          ))}
+          {treeRoots.flatMap((node) =>
+            renderNodeTree(node, expandedNodes, handleToggleNode, true)
+          )}
         </div>
       )}
     </div>

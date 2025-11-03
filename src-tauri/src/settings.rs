@@ -1,15 +1,36 @@
 use std::fs;
 use std::path::PathBuf;
 use tracing::{error, info};
+use serde::{Deserialize, Serialize};
 
 const SETTINGS_FILE: &str = "settings.json";
 #[allow(dead_code)]
 const LAST_CONFIG_KEY: &str = "last_config_path";
 
+/// Debug settings for image matching and other diagnostic features
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugSettings {
+    /// Enable detailed image matching debug information
+    pub enable_image_debug: bool,
+    /// Number of top matches to include in debug output
+    pub top_matches_count: u32,
+}
+
+impl Default for DebugSettings {
+    fn default() -> Self {
+        Self {
+            enable_image_debug: false,
+            top_matches_count: 5,
+        }
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Settings {
+pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_config_path: Option<String>,
+    #[serde(default)]
+    pub debug: DebugSettings,
 }
 
 /// Get the settings file path in the app data directory
@@ -80,4 +101,19 @@ pub fn save_last_config_path(path: &str) -> Result<(), String> {
 pub fn get_last_config_path() -> Option<String> {
     let settings = load_settings();
     settings.last_config_path
+}
+
+/// Get the current debug settings
+pub fn get_debug_settings() -> DebugSettings {
+    let settings = load_settings();
+    settings.debug
+}
+
+/// Save debug settings
+pub fn save_debug_settings(debug_settings: DebugSettings) -> Result<(), String> {
+    info!("Saving debug settings: {:?}", debug_settings);
+    let mut settings = load_settings();
+    settings.debug = debug_settings;
+    save_settings(&settings)?;
+    Ok(())
 }

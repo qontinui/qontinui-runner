@@ -204,9 +204,7 @@ export interface AvailableTransitionsResult {
  * }
  * ```
  */
-export async function executeTransition(
-  transitionId: string
-): Promise<TransitionExecutionResult> {
+export async function executeTransition(transitionId: string): Promise<TransitionExecutionResult> {
   try {
     const result = await invoke<TransitionExecutionResult>("execute_transition", {
       transitionId,
@@ -279,9 +277,7 @@ export async function navigateToState(stateId: string): Promise<NavigationResult
  * }
  * ```
  */
-export async function navigateToMultipleStates(
-  stateIds: string[]
-): Promise<NavigationResult> {
+export async function navigateToMultipleStates(stateIds: string[]): Promise<NavigationResult> {
   try {
     const result = await invoke<NavigationResult>("navigate_to_multiple_states", {
       stateIds,
@@ -381,11 +377,9 @@ export async function getAvailableTransitions(): Promise<AvailableTransitionsRes
  */
 export function isStateActive(
   stateId: string,
-  activeStates: ActiveStatesResult | string[]
+  activeStates: ActiveStatesResult | string[],
 ): boolean {
-  const states = Array.isArray(activeStates)
-    ? activeStates
-    : activeStates.active_states;
+  const states = Array.isArray(activeStates) ? activeStates : activeStates.active_states;
   return states.includes(stateId);
 }
 
@@ -407,7 +401,7 @@ export function isStateActive(
  */
 export function findTransitionById(
   transitionId: string,
-  availableTransitions: AvailableTransitionsResult
+  availableTransitions: AvailableTransitionsResult,
 ): TransitionInfo | undefined {
   return availableTransitions.transitions.find((t) => t.id === transitionId);
 }
@@ -428,11 +422,9 @@ export function findTransitionById(
  */
 export function getTransitionsToState(
   targetStateId: string,
-  availableTransitions: AvailableTransitionsResult
+  availableTransitions: AvailableTransitionsResult,
 ): TransitionInfo[] {
-  return availableTransitions.transitions.filter(
-    (t) => t.to_state === targetStateId
-  );
+  return availableTransitions.transitions.filter((t) => t.to_state === targetStateId);
 }
 
 /**
@@ -452,11 +444,9 @@ export function getTransitionsToState(
  */
 export function isAnyStateActive(
   stateIds: string[],
-  activeStates: ActiveStatesResult | string[]
+  activeStates: ActiveStatesResult | string[],
 ): boolean {
-  const states = Array.isArray(activeStates)
-    ? activeStates
-    : activeStates.active_states;
+  const states = Array.isArray(activeStates) ? activeStates : activeStates.active_states;
   return stateIds.some((id) => states.includes(id));
 }
 
@@ -477,10 +467,8 @@ export function isAnyStateActive(
  */
 export function areAllStatesActive(
   stateIds: string[],
-  activeStates: ActiveStatesResult | string[]
+  activeStates: ActiveStatesResult | string[],
 ): boolean {
-  const states = Array.isArray(activeStates)
-    ? activeStates
-    : activeStates.active_states;
+  const states = Array.isArray(activeStates) ? activeStates : activeStates.active_states;
   return stateIds.every((id) => states.includes(id));
 }

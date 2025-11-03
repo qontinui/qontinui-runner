@@ -2994,6 +2994,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 5.0.1",
+ "erased-serde",
  "sentry",
  "serde",
  "serde_json",
