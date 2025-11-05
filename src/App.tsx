@@ -150,6 +150,23 @@ function AppContent() {
     }
   };
 
+  // Clear action logs
+  const clearActionLogs = async () => {
+    try {
+      await invoke("clear_action_log");
+      refreshActionLog();
+    } catch (error) {
+      console.error("Failed to clear action logs:", error);
+    }
+  };
+
+  // Clear all logs
+  const clearAllLogs = async () => {
+    clearGeneralLogs();
+    clearImageLogs();
+    await clearActionLogs();
+  };
+
   // Handle workflow selection
   const handleWorkflowSelect = (workflowId: string) => {
     execution.setSelectedWorkflow(workflowId);
@@ -235,13 +252,24 @@ function AppContent() {
                 Load Configuration
               </button>
 
+              <button
+                onClick={execution.loadLastConfiguration}
+                className="w-full btn-secondary flex items-center justify-center gap-2"
+              >
+                <FileText className="w-4 h-4" />
+                Load Last Config
+              </button>
+
               {execution.config && (
                 <div className="space-y-2">
-                  <div className="text-sm">
-                    <p className="text-muted-foreground">States: {execution.config.statesCount}</p>
-                    <p className="text-muted-foreground">
-                      Workflows: {execution.config.workflowsCount}
-                    </p>
+                  <div className="p-3 bg-accent/50 rounded-lg border border-border/50">
+                    <p className="font-medium text-sm mb-2">{execution.config.name}</p>
+                    <div className="text-sm space-y-1">
+                      <p className="text-muted-foreground">States: {execution.config.statesCount}</p>
+                      <p className="text-muted-foreground">
+                        Workflows: {execution.config.workflowsCount}
+                      </p>
+                    </div>
                   </div>
                 </div>
               )}
@@ -477,6 +505,26 @@ function AppContent() {
                   <Trash2 className="w-4 h-4" />
                 </button>
               )}
+
+              {activeLogTab === "actions" && (
+                <button
+                  onClick={clearActionLogs}
+                  className="p-2 hover:bg-accent rounded-lg transition-colors"
+                  title="Clear action logs"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
+
+              {/* Clear All button - visible on all tabs */}
+              <button
+                onClick={clearAllLogs}
+                className="p-2 hover:bg-destructive hover:text-destructive-foreground rounded-lg transition-colors flex items-center"
+                title="Clear all logs (General, Image, and Actions)"
+              >
+                <Trash2 className="w-4 h-4" />
+                <Trash2 className="w-4 h-4 -ml-1" />
+              </button>
 
               <button
                 onClick={handleCopyLogs}

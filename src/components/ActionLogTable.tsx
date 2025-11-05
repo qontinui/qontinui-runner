@@ -441,7 +441,7 @@ function getTreePrefix(
 
     // Filter siblings to only include visible ones
     const visibleSiblings = siblings.filter(sibId =>
-      visibleActions.some(a => a.id === sibId)
+      visibleActions.some(a => a && a.id === sibId)
     );
 
     const isLastSibling = visibleSiblings.indexOf(ancestor.id) === visibleSiblings.length - 1;
@@ -451,10 +451,15 @@ function getTreePrefix(
   }
 
   // Add the final branch character for this action itself
+  if (ancestors.length === 0) {
+    // Safety check: if no ancestors, just return the branch character
+    return "├─ ";
+  }
+
   const parent = ancestors[ancestors.length - 1];
   const ourSiblings = parentChildMap.get(parent.id) || [];
   const visibleOurSiblings = ourSiblings.filter(sibId =>
-    visibleActions.some(a => a.id === sibId)
+    visibleActions.some(a => a && a.id === sibId)
   );
   const isLastChild = visibleOurSiblings.indexOf(action.id) === visibleOurSiblings.length - 1;
   prefix += isLastChild ? "└─ " : "├─ ";
@@ -794,7 +799,7 @@ export default function ActionLogTable({
                   style={{ maxWidth: `${typeColumnWidth}rem` }}
                   title={`${treePrefix}${action.action_type}`}
                 >
-                  <span className="text-gray-500">{treePrefix}</span>
+                  <span className="text-gray-500" style={{ whiteSpace: 'pre' }}>{treePrefix}</span>
                   {action.action_type}
                 </td>
 

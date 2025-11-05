@@ -58,6 +58,7 @@ interface ExecutionContextValue {
   setSelectedMonitor: (index: number) => void;
   setAutoMinimize: (enabled: boolean) => void;
   loadConfiguration: () => Promise<void>;
+  loadLastConfiguration: () => Promise<void>;
   startExecution: () => Promise<void>;
   stopExecution: () => Promise<void>;
   detectSystemMonitors: () => Promise<void>;
@@ -123,8 +124,11 @@ export function ExecutionProvider({
 
   // Load configuration from a specific path
   const loadConfigFromPath = useCallback(
-    async (configPath: string) => {
+    async (configPath: string, workflowIdToSelect?: string) => {
       console.log("[EXECUTION_CTX] Loading configuration from:", configPath);
+      if (workflowIdToSelect) {
+        console.log("[EXECUTION_CTX] Will select workflow after load:", workflowIdToSelect);
+      }
       addLog("info", `Loading configuration: ${configPath}`);
 
       try {
@@ -132,8 +136,14 @@ export function ExecutionProvider({
         console.log("[EXECUTION_CTX] load_configuration result:", result);
 
         if (result.success) {
+        // Extract filename without extension
+        // Handle both forward and backward slashes
+        const pathParts = configPath.split(/[/\\]/);
+        const fullFilename = pathParts[pathParts.length - 1] || "config.json";
+        const nameWithoutExtension = fullFilename.replace(/\.[^/.]+$/, "");
+
         const loadedConfig = {
-          name: configPath.split("/").pop() || configPath.split("\\").pop() || "config.json",
+          name: nameWithoutExtension,
           version: "1.0.0",
           statesCount: result.data?.states?.length || 0,
           workflowsCount: result.data?.workflows?.length || 0,
@@ -176,6 +186,17 @@ export function ExecutionProvider({
 
         setConfigLoaded(true);
         addLog("success", `Configuration loaded: ${configPath}`);
+
+        // Auto-select workflow if provided and it exists in the loaded workflows
+        if (workflowIdToSelect && mainWorkflows.some((w: any) => w.id === workflowIdToSelect)) {
+          console.log("[EXECUTION_CTX] Auto-selecting workflow:", workflowIdToSelect);
+          setSelectedWorkflow(workflowIdToSelect);
+          const workflowName = mainWorkflows.find((w: any) => w.id === workflowIdToSelect)?.name;
+          addLog("info", `Auto-selected workflow: ${workflowName}`);
+        } else if (workflowIdToSelect) {
+          console.log("[EXECUTION_CTX] Workflow not found in loaded config:", workflowIdToSelect);
+          addLog("warning", "Last used workflow not found in this configuration");
+        }
 
         // Auto-start Python executor after config is loaded
         if (pythonStatus !== "running") {
@@ -259,13 +280,21 @@ export function ExecutionProvider({
     [addLog, pythonStatus]
   );
 
-  // Auto-load last configuration
+  // Auto-load last configuration (if enabled in settings)
   const autoLoadLastConfig = useCallback(async () => {
     try {
+      // Check if auto-load is enabled
+      const autoLoadResult: any = await invoke("get_auto_load_last_config");
+      if (!autoLoadResult.success || !autoLoadResult.data?.enabled) {
+        console.log("[EXECUTION_CTX] Auto-load last config is disabled");
+        return;
+      }
+
       const result: any = await invoke("get_last_config_path");
       if (result.success && result.data?.path) {
+        const workflowId = result.data?.workflow_id;
         addLog("info", `Auto-loading last config: ${result.data.path}`);
-        await loadConfigFromPath(result.data.path);
+        await loadConfigFromPath(result.data.path, workflowId);
       }
     } catch (error) {
       console.log("No last config to auto-load:", error);
@@ -298,6 +327,24 @@ export function ExecutionProvider({
     } catch (error) {
       console.error("[EXECUTION_CTX] Error in loadConfiguration:", error);
       addLog("error", `Failed to load configuration: ${error}`);
+    }
+  }, [addLog, loadConfigFromPath]);
+
+  // Manually load last configuration (for button)
+  const loadLastConfiguration = useCallback(async () => {
+    console.log("[EXECUTION_CTX] loadLastConfiguration called");
+    try {
+      const result: any = await invoke("get_last_config_path");
+      if (result.success && result.data?.path) {
+        const workflowId = result.data?.workflow_id;
+        addLog("info", `Loading last config: ${result.data.path}`);
+        await loadConfigFromPath(result.data.path, workflowId);
+      } else {
+        addLog("warning", "No previous configuration found");
+      }
+    } catch (error) {
+      console.error("[EXECUTION_CTX] Error loading last config:", error);
+      addLog("error", `Failed to load last configuration: ${error}`);
     }
   }, [addLog, loadConfigFromPath]);
 
@@ -349,6 +396,15 @@ export function ExecutionProvider({
         const workflowInfo = ` (Workflow: ${workflowName})`;
         const monitorInfo = selectedMonitor > 0 ? ` on monitor ${selectedMonitor}` : "";
         addLog("success", `Execution started${workflowInfo}${monitorInfo}`);
+
+        // Save the workflow ID as the last used workflow
+        try {
+          await invoke("save_last_workflow_id", { workflowId: selectedWorkflow });
+          console.log("[EXECUTION_CTX] Saved last workflow ID:", selectedWorkflow);
+        } catch (saveError) {
+          console.error("[EXECUTION_CTX] Failed to save last workflow ID:", saveError);
+          // Non-critical error, don't show to user
+        }
       }
     } catch (error) {
       addLog("error", `Failed to start execution: ${error}`);
@@ -431,6 +487,7 @@ export function ExecutionProvider({
     setSelectedMonitor,
     setAutoMinimize,
     loadConfiguration,
+    loadLastConfiguration,
     startExecution,
     stopExecution,
     detectSystemMonitors,

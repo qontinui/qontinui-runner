@@ -25,12 +25,31 @@ impl Default for DebugSettings {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_config_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_workflow_id: Option<String>,
+    #[serde(default = "default_auto_load_last_config")]
+    pub auto_load_last_config: bool,
     #[serde(default)]
     pub debug: DebugSettings,
+}
+
+fn default_auto_load_last_config() -> bool {
+    false
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            last_config_path: None,
+            last_workflow_id: None,
+            auto_load_last_config: false,
+            debug: DebugSettings::default(),
+        }
+    }
 }
 
 /// Get the settings file path in the app data directory
@@ -114,6 +133,36 @@ pub fn save_debug_settings(debug_settings: DebugSettings) -> Result<(), String> 
     info!("Saving debug settings: {:?}", debug_settings);
     let mut settings = load_settings();
     settings.debug = debug_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Save the last used workflow ID
+pub fn save_last_workflow_id(workflow_id: &str) -> Result<(), String> {
+    info!("Saving last workflow ID: {}", workflow_id);
+    let mut settings = load_settings();
+    settings.last_workflow_id = Some(workflow_id.to_string());
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the last used workflow ID
+pub fn get_last_workflow_id() -> Option<String> {
+    let settings = load_settings();
+    settings.last_workflow_id
+}
+
+/// Get the auto-load last config setting
+pub fn get_auto_load_last_config() -> bool {
+    let settings = load_settings();
+    settings.auto_load_last_config
+}
+
+/// Save the auto-load last config setting
+pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
+    info!("Saving auto-load last config setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.auto_load_last_config = enabled;
     save_settings(&settings)?;
     Ok(())
 }

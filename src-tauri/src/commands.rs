@@ -511,11 +511,13 @@ pub fn get_last_config_path() -> Result<CommandResponse, String> {
     if let Some(path) = settings::get_last_config_path() {
         // Check if the file still exists
         if std::path::Path::new(&path).exists() {
+            let workflow_id = settings::get_last_workflow_id();
             Ok(CommandResponse {
                 success: true,
                 message: Some(format!("Last config found: {}", path)),
                 data: Some(serde_json::json!({
-                    "path": path
+                    "path": path,
+                    "workflow_id": workflow_id
                 })),
             })
         } else {
@@ -533,6 +535,47 @@ pub fn get_last_config_path() -> Result<CommandResponse, String> {
             data: None,
         })
     }
+}
+
+#[tauri::command]
+pub fn save_last_workflow_id(workflow_id: String) -> Result<CommandResponse, String> {
+    info!("Saving last workflow ID: {}", workflow_id);
+
+    settings::save_last_workflow_id(&workflow_id)
+        .map_err(|e| format!("Failed to save last workflow ID: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Last workflow ID saved".to_string()),
+        data: None,
+    })
+}
+
+#[tauri::command]
+pub fn get_auto_load_last_config() -> Result<CommandResponse, String> {
+    let enabled = settings::get_auto_load_last_config();
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "enabled": enabled
+        })),
+    })
+}
+
+#[tauri::command]
+pub fn save_auto_load_last_config(enabled: bool) -> Result<CommandResponse, String> {
+    info!("Saving auto-load last config setting: {}", enabled);
+
+    settings::save_auto_load_last_config(enabled)
+        .map_err(|e| format!("Failed to save auto-load setting: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Auto-load last config {}", if enabled { "enabled" } else { "disabled" })),
+        data: None,
+    })
 }
 
 /// Execute a specific transition in the state machine.

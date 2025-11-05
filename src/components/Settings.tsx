@@ -7,6 +7,10 @@ interface DebugSettings {
   top_matches_count: number;
 }
 
+interface AppSettings {
+  auto_load_last_config: boolean;
+}
+
 interface SettingsProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   onDebugModeChange: (enabled: boolean) => void;
@@ -17,6 +21,9 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     enable_image_debug: false,
     top_matches_count: 5,
   });
+  const [appSettings, setAppSettings] = useState<AppSettings>({
+    auto_load_last_config: false,
+  });
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -25,6 +32,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
   // Load current settings on mount
   useEffect(() => {
     loadSettings();
+    loadAppSettings();
   }, []);
 
   const loadSettings = async () => {
@@ -54,6 +62,23 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       onLog("error", `Failed to load settings: ${err}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadAppSettings = async () => {
+    try {
+      console.log("Loading app settings...");
+      const result: any = await invoke("get_auto_load_last_config");
+      console.log("get_auto_load_last_config result:", result);
+
+      if (result && result.success && result.data) {
+        setAppSettings({
+          auto_load_last_config: result.data.enabled || false,
+        });
+        console.log("App settings loaded:", result.data.enabled);
+      }
+    } catch (err) {
+      console.error("Failed to load app settings:", err);
     }
   };
 
@@ -107,6 +132,37 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     }));
   };
 
+  const handleToggleAutoLoad = async () => {
+    const newValue = !appSettings.auto_load_last_config;
+    setAppSettings((prev) => ({
+      ...prev,
+      auto_load_last_config: newValue,
+    }));
+
+    // Save immediately
+    try {
+      const result: any = await invoke("save_auto_load_last_config", { enabled: newValue });
+      if (result && result.success) {
+        onLog("success", `Auto-load last config ${newValue ? "enabled" : "disabled"}`);
+      } else {
+        onLog("error", "Failed to save auto-load setting");
+        // Revert on failure
+        setAppSettings((prev) => ({
+          ...prev,
+          auto_load_last_config: !newValue,
+        }));
+      }
+    } catch (err) {
+      console.error("Failed to save auto-load setting:", err);
+      onLog("error", `Failed to save auto-load setting: ${err}`);
+      // Revert on failure
+      setAppSettings((prev) => ({
+        ...prev,
+        auto_load_last_config: !newValue,
+      }));
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -120,7 +176,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       {/* Header */}
       <div className="flex items-center gap-3">
         <SettingsIcon className="w-6 h-6 text-primary" />
-        <h3 className="text-xl font-semibold">Debug Settings</h3>
+        <h3 className="text-xl font-semibold">Settings</h3>
       </div>
 
       {/* Error message */}
@@ -139,8 +195,39 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
         </div>
       )}
 
-      {/* Settings Form */}
+      {/* Application Settings */}
       <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <h4 className="font-semibold text-lg mb-4">Application</h4>
+
+        {/* Auto-load Last Config Toggle */}
+        <div className="space-y-2">
+          <label className="flex items-center justify-between cursor-pointer">
+            <div className="space-y-1">
+              <div className="font-medium">Auto-load Last Configuration on Startup</div>
+              <div className="text-sm text-muted-foreground">
+                Automatically load the last used configuration file and workflow when the application starts
+              </div>
+            </div>
+            <button
+              onClick={handleToggleAutoLoad}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                appSettings.auto_load_last_config ? "bg-primary" : "bg-muted"
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  appSettings.auto_load_last_config ? "translate-x-6" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+        </div>
+      </div>
+
+      {/* Debug Settings Form */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <h4 className="font-semibold text-lg mb-4">Debug</h4>
+
         {/* Image Debug Mode Toggle */}
         <div className="space-y-2">
           <label className="flex items-center justify-between cursor-pointer">
@@ -201,32 +288,32 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
             Image Recognition Debug tab.
           </div>
         </div>
-      </div>
 
-      {/* Save Button */}
-      <div className="flex justify-end">
-        <button
-          onClick={saveSettings}
-          disabled={saving}
-          className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-        >
-          {saving ? (
-            <>
-              <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-              Saving...
-            </>
-          ) : saveSuccess ? (
-            <>
-              <Check className="w-4 h-4" />
-              Saved!
-            </>
-          ) : (
-            <>
-              <SettingsIcon className="w-4 h-4" />
-              Save Settings
-            </>
-          )}
-        </button>
+        {/* Save Debug Settings Button */}
+        <div className="flex justify-end">
+          <button
+            onClick={saveSettings}
+            disabled={saving}
+            className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          >
+            {saving ? (
+              <>
+                <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                Saving...
+              </>
+            ) : saveSuccess ? (
+              <>
+                <Check className="w-4 h-4" />
+                Saved!
+              </>
+            ) : (
+              <>
+                <SettingsIcon className="w-4 h-4" />
+                Save Debug Settings
+              </>
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );
