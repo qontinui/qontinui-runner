@@ -77,6 +77,7 @@ from action_definitions import get_action_definition
 from services.unified_data_collector import UnifiedDataCollector
 from services.screenshot_service import ScreenshotService
 from services.tree_view_layer import TreeViewLayer
+from services.capture_tool_service import CaptureToolService, ScreenshotCaptureSettings, ManualClickListener
 
 try:
     from qontinui import Find, Image, Location
@@ -528,6 +529,12 @@ class QontinuiExecutor:
         self.screenshot_service = None  # ScreenshotService for screenshot storage
         self.unified_data_collector = None  # UnifiedDataCollector for action execution data
 
+        # Screenshot capture tool for configuration builder (qontinui-web)
+        self.capture_tool_service = CaptureToolService()  # Initially disabled, enabled via update_capture_settings
+
+        # Manual click listener for capture tool (captures user clicks, not automation clicks)
+        self.manual_click_listener = ManualClickListener(self.capture_tool_service)
+
         if QONTINUI_AVAILABLE:
             # Get framework settings
             self.settings = get_settings()
@@ -545,6 +552,9 @@ class QontinuiExecutor:
                 image_data_lookup=self._get_image_data
             )
             self.event_translator.register_all_callbacks()
+
+            # Register callback for screenshot capture tool (MOUSE_CLICKED events)
+            register_callback(QontinuiEventType.MOUSE_CLICKED, self._on_mouse_clicked)
 
             # Navigation sequence counter for creating unique IDs
             self._navigation_sequence = 0
@@ -822,6 +832,78 @@ class QontinuiExecutor:
             "workflow_id": workflow_id,
             "nesting_level": nesting_level
         }
+
+    def _on_mouse_clicked(self, event) -> None:
+        """Handle MOUSE_CLICKED event for screenshot capture tool.
+
+        Args:
+            event: Mouse clicked event from qontinui library
+        """
+        if self.capture_tool_service and hasattr(event, 'x') and hasattr(event, 'y'):
+            button = getattr(event, 'button', 'left')
+            self.capture_tool_service.on_click(event.x, event.y, button)
+
+    def update_capture_settings(self, settings_dict: dict[str, Any]) -> dict[str, Any]:
+        """Update screenshot capture tool settings.
+
+        Automatically starts/stops the manual click listener based on settings.
+
+        Args:
+            settings_dict: Dictionary with capture settings:
+                - enabled: bool - Enable/disable capture
+                - manualClicksEnabled: bool - Enable/disable manual click capture
+                - output_folder: str - Where to save screenshots
+                - base_image_name: str - Base name for screenshot files
+                - screens: dict - Screen selection configuration
+                - capture_timings: list[int] - Capture delays in milliseconds
+
+        Returns:
+            Dict with success status
+        """
+        self._emit_log("info", f"update_capture_settings called: enabled={settings_dict.get('enabled')}, manualClicksEnabled={settings_dict.get('manualClicksEnabled')}")
+        try:
+            settings = ScreenshotCaptureSettings.from_dict(settings_dict)
+            self._emit_log("info", f"Parsed settings: enabled={settings.enabled}, manual_clicks_enabled={settings.manual_clicks_enabled}")
+            self._emit_log("info", f"Output folder: {settings.output_folder}")
+
+            self.capture_tool_service.update_settings(settings)
+
+            # Start or stop manual click listener based on manual_clicks_enabled setting
+            if settings.manual_clicks_enabled and settings.enabled:
+                self._emit_log("info", "Attempting to start manual click listener")
+                if not self.manual_click_listener.is_running():
+                    self._emit_log("info", "Starting listener...")
+                    success = self.manual_click_listener.start()
+                    self._emit_log("info", f"Listener start result: {success}")
+                    if success:
+                        self._emit_log("info", "Manual click capture started successfully")
+                    else:
+                        self._emit_log("warning", "Failed to start manual click capture")
+                else:
+                    self._emit_log("info", "Listener already running")
+            else:
+                self._emit_log("info", f"Manual clicks disabled or capture disabled")
+                if self.manual_click_listener.is_running():
+                    self._emit_log("info", "Stopping listener")
+                    self.manual_click_listener.stop()
+                    self._emit_log("info", "Manual click capture stopped")
+
+            is_running = self.manual_click_listener.is_running()
+            self._emit_log("info", f"Final state: listener is_running={is_running}")
+
+            # Emit event with manual capture status for frontend
+            self._emit_event(EventType.LOG, {
+                "level": "info",
+                "message": "capture_status_update",
+                "manual_capture_running": is_running
+            })
+
+            return {"success": True, "manual_capture_running": is_running}
+        except Exception as e:
+            self._emit_log("error", f"update_capture_settings failed: {e}")
+            import traceback
+            self._emit_log("error", f"Traceback: {traceback.format_exc()}")
+            return {"success": False, "error": str(e)}
 
     def _get_state_for_image(self, image_id: str) -> str | None:
         """Find which state an image belongs to.
@@ -1653,14 +1735,12 @@ class QontinuiExecutor:
             # Capture end time
             end_time = time.time()
 
-            # Debug: Print to both stdout and stderr to ensure we see output
+            # Debug: Only use stderr for non-JSON debug output
             import sys
             print(f"[FINALLY_BLOCK] Action {action_id} type={action_type} entering finally block", file=sys.stderr, flush=True)
-            print(f"[FINALLY_BLOCK] Action {action_id} type={action_type} entering finally block", flush=True)
 
             # Enrich FIND action config with human-readable image names
             print(f"[ENRICHMENT] Checking FIND action enrichment: action_type={action_type}", file=sys.stderr, flush=True)
-            print(f"[ENRICHMENT] Checking FIND action enrichment: action_type={action_type}", flush=True)
             if action_type == "FIND":
                 print(f"[ENRICHMENT] FIND action detected, config keys: {config.keys() if isinstance(config, dict) else 'not a dict'}", file=sys.stderr, flush=True)
                 print(f"[ENRICHMENT] FIND action detected, config: {config}", file=sys.stderr, flush=True)
@@ -2049,6 +2129,9 @@ class QontinuiExecutor:
         cmd_type = command.get("command")
         params = command.get("params", {})
 
+        # Log command receipt at INFO level so it appears in backend logs
+        self._emit_log("info", f"handle_command: received '{cmd_type}'")
+
         if cmd_type == "load":
             config_path = params.get("config_path")
             success = self.load_configuration(config_path)
@@ -2066,6 +2149,7 @@ class QontinuiExecutor:
 
         elif cmd_type == "status":
             return {
+                "success": True,
                 "is_running": self.is_running,
                 "config_loaded": self.config is not None,
                 "library_available": QONTINUI_AVAILABLE,
@@ -2085,6 +2169,33 @@ class QontinuiExecutor:
 
         elif cmd_type == "recording_status":
             return self._handle_recording_status()
+
+        elif cmd_type == "update_capture_settings":
+            # Update screenshot capture tool settings
+            settings = params.get("settings", {})
+            return self.update_capture_settings(settings)
+
+        elif cmd_type == "start_manual_capture":
+            # Manually start manual click capture
+            if not self.capture_tool_service.is_enabled():
+                return {"success": False, "error": "Capture service not enabled"}
+            if self.manual_click_listener.is_running():
+                return {"success": False, "error": "Manual capture already running"}
+            success = self.manual_click_listener.start()
+            return {"success": success}
+
+        elif cmd_type == "stop_manual_capture":
+            # Manually stop manual click capture
+            self.manual_click_listener.stop()
+            return {"success": True}
+
+        elif cmd_type == "manual_capture_status":
+            # Check manual click capture status
+            return {
+                "success": True,
+                "is_running": self.manual_click_listener.is_running(),
+                "capture_enabled": self.capture_tool_service.is_enabled()
+            }
 
         elif cmd_type == "ping":
             # Health check ping - send pong message directly to stdout
@@ -2146,6 +2257,14 @@ class QontinuiExecutor:
 
     def __del__(self):
         """Clean up temp directory on exit."""
+        # Stop manual click listener
+        if hasattr(self, 'manual_click_listener'):
+            try:
+                self.manual_click_listener.cleanup()
+            except Exception:
+                pass
+
+        # Clean up temp directory
         if self.temp_dir and os.path.exists(self.temp_dir):
             import contextlib
             import shutil
@@ -2260,10 +2379,18 @@ def main():
     """Main entry point for the Qontinui executor."""
     executor = QontinuiExecutor()
 
+    # Emit startup log via JSON event (will appear in backend logs)
+    executor._emit_log("info", "Python executor main loop started, waiting for commands")
+
     # Read commands from stdin
     for line in sys.stdin:
         try:
+            # Only log non-ping commands to avoid spam
             command = json.loads(line.strip())
+            cmd_name = command.get('command', 'unknown')
+
+            if cmd_name != 'ping':
+                executor._emit_log("info", f"Received command: {cmd_name}")
 
             if command.get("type") == "command":
                 response = executor.handle_command(command)
@@ -2274,11 +2401,16 @@ def main():
                     sys.stdout.write(json.dumps(response) + "\n")
                     sys.stdout.flush()
 
+                if cmd_name != 'ping':
+                    executor._emit_log("info", f"Command {cmd_name} completed successfully")
+
         except json.JSONDecodeError as e:
+            executor._emit_log("error", f"JSON decode error: {e}")
             executor._emit_event(
                 EventType.ERROR, {"message": "Invalid JSON command", "details": str(e)}
             )
-        except Exception:
+        except Exception as e:
+            executor._emit_log("error", f"Exception in main loop: {e}\n{traceback.format_exc()}")
             executor._emit_event(
                 EventType.ERROR,
                 {

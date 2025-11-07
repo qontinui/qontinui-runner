@@ -102,6 +102,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::set_debug_settings,
             commands::get_action_log_view,
             commands::clear_action_log,
+            commands::update_capture_settings,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -135,6 +136,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 error!("Failed to get main window");
             }
+
+            // Auto-start Python executor for screenshot capture and other features
+            info!("Auto-starting Python executor");
+            let app_state = app.state::<AppState>();
+            let mut bridge_lock = app_state.python_bridge.lock().unwrap();
+            let mut bridge = executor::PythonBridge::new(app.handle().clone());
+            match bridge.start_with_executor("real") {
+                Ok(_) => {
+                    info!("Python executor auto-started successfully");
+                    *bridge_lock = Some(bridge);
+                }
+                Err(e) => {
+                    error!("Failed to auto-start Python executor: {}", e);
+                    error!("Screenshot capture and other features will not work until the executor is started");
+                    // Don't fail app startup, just log the error
+                }
+            }
+            drop(bridge_lock);
 
             info!("Tauri application setup complete");
             Ok(())

@@ -157,3 +157,36 @@ impl QontinuiConfig {
         self.get_execution_mode().is_real()
     }
 }
+
+/// Screen selection for screenshot capture
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ScreenSelection {
+    /// Capture all screens
+    All,
+    /// Capture primary screen only
+    Primary,
+    /// Capture specific screens by index
+    Specific { indices: Vec<u32> },
+}
+
+/// Settings for screenshot capture tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotCaptureSettings {
+    /// Whether screenshot capture is enabled
+    pub enabled: bool,
+    /// Whether manual click capture is enabled
+    #[serde(rename = "manualClicksEnabled")]
+    pub manual_clicks_enabled: bool,
+    /// Output folder for screenshots
+    #[serde(rename = "outputFolder")]
+    pub output_folder: String,
+    /// Base name for screenshot files
+    #[serde(rename = "baseImageName")]
+    pub base_image_name: String,
+    /// Which screens to capture
+    pub screens: ScreenSelection,
+    /// Capture timings in milliseconds (delays after click)
+    #[serde(rename = "captureTimings")]
+    pub capture_timings: Vec<u32>,
+}

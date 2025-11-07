@@ -1,4 +1,4 @@
-use crate::config::{ConfigLoader, QontinuiConfig};
+use crate::config::{ConfigLoader, QontinuiConfig, ScreenshotCaptureSettings};
 use crate::display::DisplayProcessor;
 use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
@@ -294,15 +294,49 @@ pub fn handle_error(error: UserFacingError, app_handle: AppHandle) -> Result<(),
 pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
     info!("Detecting system monitors");
 
-    // Get available monitors from the main window
-    let monitors = app_handle
+    let window = app_handle
         .get_webview_window("main")
-        .ok_or("Failed to get main window")?
+        .ok_or("Failed to get main window")?;
+
+    // Get available monitors
+    let monitors = window
         .available_monitors()
         .map_err(|e| format!("Failed to get monitors: {}", e))?;
 
+    // Get current monitor (primary)
+    let current_monitor = window
+        .current_monitor()
+        .map_err(|e| format!("Failed to get current monitor: {}", e))?;
+
     let monitor_count = monitors.len();
-    let monitor_indices: Vec<i32> = (0..monitor_count as i32).collect();
+
+    // Build detailed monitor info
+    let monitor_details: Vec<serde_json::Value> = monitors
+        .iter()
+        .enumerate()
+        .map(|(idx, monitor)| {
+            let position = monitor.position();
+            let size = monitor.size();
+            let is_primary = if let Some(ref current) = current_monitor {
+                // Check if this is the primary monitor by comparing position and size
+                position.x == current.position().x
+                    && position.y == current.position().y
+                    && size.width == current.size().width
+                    && size.height == current.size().height
+            } else {
+                idx == 0 // fallback to first monitor
+            };
+
+            serde_json::json!({
+                "index": idx,
+                "x": position.x,
+                "y": position.y,
+                "width": size.width,
+                "height": size.height,
+                "is_primary": is_primary,
+            })
+        })
+        .collect();
 
     info!("Detected {} monitors", monitor_count);
 
@@ -311,7 +345,8 @@ pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
         message: Some(format!("Detected {} monitors", monitor_count)),
         data: Some(serde_json::json!({
             "count": monitor_count,
-            "indices": monitor_indices,
+            "indices": (0..monitor_count as i32).collect::<Vec<i32>>(),
+            "monitors": monitor_details,
         })),
     })
 }
@@ -921,4 +956,29 @@ pub async fn clear_action_log(
         message: Some("Action log cleared".to_string()),
         data: None,
     })
+}
+
+#[tauri::command]
+pub fn update_capture_settings(
+    settings: ScreenshotCaptureSettings,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Updating screenshot capture settings: enabled={}", settings.enabled);
+    let bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor is not running. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string());
+        }
+        bridge.update_capture_settings(settings).map_err(|e| {
+            error!("Failed to update capture settings: {}", e);
+            format!("Failed to update capture settings: {}", e)
+        })?;
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Capture settings updated".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string())
+    }
 }

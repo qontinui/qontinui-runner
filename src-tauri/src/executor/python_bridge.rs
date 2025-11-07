@@ -428,8 +428,12 @@ impl PythonBridge {
         mut cmd_rx: mpsc::Receiver<ExecutorCommand>,
     ) {
         while let Some(cmd) = cmd_rx.recv().await {
+            info!("Command sender received command: {}", cmd.command);
             match serde_json::to_string(&cmd) {
                 Ok(json) => {
+                    info!("Serialized command to JSON, length: {} bytes", json.len());
+                    info!("JSON payload (first 200 chars): {}", &json.chars().take(200).collect::<String>());
+
                     if let Err(e) = writeln!(stdin, "{}", json) {
                         error!("Failed to write command to stdin: {}", e);
                         break;
@@ -440,7 +444,7 @@ impl PythonBridge {
                         break;
                     }
 
-                    debug!("Sent command: {}", cmd.command);
+                    info!("Successfully wrote command '{}' to Python stdin and flushed", cmd.command);
                 }
                 Err(e) => {
                     error!("Failed to serialize command: {}", e);
@@ -827,6 +831,28 @@ impl PythonBridge {
                 }
             })),
         )
+    }
+
+    pub fn update_capture_settings(
+        &self,
+        settings: crate::config::ScreenshotCaptureSettings,
+    ) -> Result<(), String> {
+        if let Some(ref tx) = self.command_tx {
+            let cmd = ExecutorCommand {
+                cmd_type: "command".to_string(),
+                id: uuid::Uuid::new_v4().to_string(),
+                command: "update_capture_settings".to_string(),
+                params: Some(json!({
+                    "settings": settings
+                })),
+            };
+            self.runtime
+                .block_on(async { tx.send(cmd).await })
+                .map_err(|e| format!("Failed to send command: {}", e))?;
+            Ok(())
+        } else {
+            Err("Command channel not initialized".to_string())
+        }
     }
 
     pub fn is_running(&self) -> bool {
