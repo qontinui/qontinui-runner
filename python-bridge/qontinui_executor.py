@@ -1577,6 +1577,17 @@ class QontinuiExecutor:
                 # During execution, library events are captured by UnifiedDataCollector
                 success = self.action_executor.execute_action(action)
 
+                # DEBUG: Log success value immediately after library returns
+                import os, tempfile
+                from datetime import datetime
+                debug_log = os.path.join(tempfile.gettempdir(), "qontinui_action_success_trace.log")
+                try:
+                    with open(debug_log, "a", encoding="utf-8") as f:
+                        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        f.write(f"[{ts}] LIBRARY RETURNED: action={action_type} id={action_id} success={success} type={type(success)}\n")
+                except Exception:
+                    pass
+
             # Sync last_find_location from library if available
             if hasattr(self.action_executor, 'last_find_location') and self.action_executor.last_find_location:
                 from qontinui import Location
@@ -1620,6 +1631,20 @@ class QontinuiExecutor:
                     )
 
         except Exception as e:
+            # DEBUG: Log exception details
+            import os, tempfile
+            from datetime import datetime
+            debug_log = os.path.join(tempfile.gettempdir(), "qontinui_action_success_trace.log")
+            try:
+                with open(debug_log, "a", encoding="utf-8") as f:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    f.write(f"[{ts}] EXCEPTION CAUGHT: action={action_type} id={action_id} exception={e}\n")
+                    import traceback
+                    f.write(f"[{ts}] TRACEBACK:\n")
+                    traceback.print_exc(file=f)
+            except Exception:
+                pass
+
             success = False
             error_message = str(e)
             self._emit_log("error", f"Action failed with exception: {e}")
@@ -1722,6 +1747,23 @@ class QontinuiExecutor:
 
             # End action in execution tree
             self.execution_tree.end_action(action_id, success=success, error=error_message)
+
+            # DEBUG: Log final success value before emitting to frontend
+            import os, tempfile
+            from datetime import datetime
+            debug_log = os.path.join(tempfile.gettempdir(), "qontinui_action_success_trace.log")
+            try:
+                with open(debug_log, "a", encoding="utf-8") as f:
+                    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    event_type = "action_completed" if success else "action_failed"
+                    f.write(f"[{ts}] EMITTING TO FRONTEND: action={action_type} id={action_id} success={success} event={event_type}\n")
+                    f.write(f"[{ts}]   error_message={error_message}\n")
+                    f.write(f"[{ts}]   node.metadata keys={list(node.metadata.keys())}\n")
+                    if 'execution_record' in node.metadata:
+                        f.write(f"[{ts}]   execution_record.success={node.metadata['execution_record'].get('success', 'N/A')}\n")
+                    f.write("\n")
+            except Exception:
+                pass
 
             # Emit tree event with enriched metadata
             self._emit_tree_event("action_completed" if success else "action_failed", node)

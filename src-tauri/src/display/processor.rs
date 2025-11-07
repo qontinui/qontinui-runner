@@ -66,6 +66,7 @@ impl DisplayProcessor {
     }
 
     /// Get the event log (immutable)
+    #[allow(dead_code)]
     pub fn event_log(&self) -> &EventLog {
         &self.event_log
     }
@@ -83,6 +84,7 @@ impl DisplayProcessor {
     }
 
     /// Get view data by view type
+    #[allow(dead_code)]
     pub fn get_view_by_type(&self, view_type: ViewType) -> Result<serde_json::Value, String> {
         let profile = self.profiles
             .values()
@@ -96,6 +98,7 @@ impl DisplayProcessor {
     }
 
     /// List all registered profiles
+    #[allow(dead_code)]
     pub fn list_profiles(&self) -> Vec<(String, ViewType)> {
         self.profiles
             .iter()

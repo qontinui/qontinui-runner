@@ -15,6 +15,7 @@ pub struct ActionLogConfig {
     pub exclude_inline_workflows: bool,
 
     /// Whether to flatten the hierarchy
+    #[allow(dead_code)]
     pub flatten_hierarchy: bool,
 }
 

@@ -4,6 +4,7 @@ use crate::display::RawEvent;
 /// Type of view this profile generates
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum ViewType {
     ActionLog,
     StateTimeline,
@@ -23,9 +24,11 @@ pub trait DisplayProfile: Send + Sync {
     fn name(&self) -> &str;
 
     /// Get the view type this profile generates
+    #[allow(dead_code)]
     fn view_type(&self) -> ViewType;
 
     /// Optional: Check if this profile can handle the given events
+    #[allow(dead_code)]
     fn can_process(&self, _events: &[RawEvent]) -> bool {
         true
     }
