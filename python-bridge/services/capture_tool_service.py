@@ -21,6 +21,49 @@ from typing import Any, Dict, List, Literal, Optional
 from PIL import Image
 
 
+# Module-level flag to track if DPI awareness has been set
+_dpi_awareness_set = False
+
+
+def _set_windows_dpi_awareness_once() -> None:
+    """Set Windows DPI awareness once per process.
+
+    This must be called before any screen operations (MSS, pynput, etc.)
+    to prevent DPI virtualization on high-DPI monitors.
+
+    Requires Windows 10 1703+ for Per-Monitor DPI Awareness V2.
+    """
+    global _dpi_awareness_set
+
+    import sys
+    if sys.platform != "win32":
+        return
+
+    if _dpi_awareness_set:
+        return
+
+    try:
+        import ctypes
+
+        # Set Per-Monitor DPI Awareness V2 (Windows 10 1703+)
+        shcore = ctypes.windll.shcore
+        # PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
+        result = shcore.SetProcessDpiAwareness(2)
+
+        # S_OK = 0, E_ACCESSDENIED = -2147024891 (already set by another component)
+        if result == 0 or result == -2147024891:
+            _dpi_awareness_set = True
+            print(f"[DPI] DPI awareness set successfully (result={result})", file=sys.stderr, flush=True)
+        else:
+            print(f"[DPI] DPI awareness unexpected result: {result}", file=sys.stderr, flush=True)
+            _dpi_awareness_set = True  # Mark as attempted
+
+    except Exception as e:
+        # Don't let DPI awareness failures crash the process
+        print(f"[DPI] Warning: Failed to set DPI awareness: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        _dpi_awareness_set = True  # Mark as attempted to avoid retry
+
+
 @dataclass
 class ScreenSelection:
     """Defines which screen(s) to capture."""
@@ -181,20 +224,35 @@ class CaptureToolService:
     def _initialize_mss(self) -> None:
         """Initialize MSS screen capture."""
         try:
+            print("[CaptureService] Initializing MSS capture...", file=sys.stderr, flush=True)
+
+            # CRITICAL: Set DPI awareness before creating MSS
+            _set_windows_dpi_awareness_once()
+
             # Import qontinui HAL
             from qontinui.hal.implementations.mss_capture import MSSScreenCapture
             from qontinui.hal.config import HALConfig
 
+            print("[CaptureService] Imports successful, creating HALConfig...", file=sys.stderr, flush=True)
+
             # Create MSS instance
             config = HALConfig()
             config.capture_cache_enabled = False  # Don't cache for capture tool
+
+            print("[CaptureService] Creating MSSScreenCapture instance...", file=sys.stderr, flush=True)
             self.mss_capture = MSSScreenCapture(config)
 
+            print(f"[CaptureService] ✓ MSS initialized successfully, found {len(self.mss_capture.get_monitors())} monitors", file=sys.stderr, flush=True)
+
         except ImportError as e:
-            print(f"Failed to import qontinui MSS capture: {e}", file=sys.stderr, flush=True)
+            print(f"[CaptureService] ✗ Failed to import qontinui MSS capture: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             self.mss_capture = None
         except Exception as e:
-            print(f"Failed to initialize MSS capture: {e}", file=sys.stderr, flush=True)
+            print(f"[CaptureService] ✗ Failed to initialize MSS capture: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
             self.mss_capture = None
 
     def _capture_screenshot(self) -> None:
@@ -226,12 +284,15 @@ class CaptureToolService:
             # Capture all monitors
             monitors = self.mss_capture.get_monitors()
             for monitor in monitors:
+                print(f"[CaptureService] Capturing monitor {monitor.index}: expected {monitor.width}x{monitor.height}", file=sys.stderr, flush=True)
                 image = self.mss_capture.capture_screen(monitor.index)
+                print(f"[CaptureService] Captured monitor {monitor.index}: actual {image.width}x{image.height}", file=sys.stderr, flush=True)
                 images.append(image)
 
         elif self.settings.screens.type == 'primary':
             # Capture primary monitor only
             image = self.mss_capture.capture_screen(None)
+            print(f"[CaptureService] Captured primary monitor: {image.width}x{image.height}", file=sys.stderr, flush=True)
             images.append(image)
 
         elif self.settings.screens.type == 'specific':
@@ -239,7 +300,12 @@ class CaptureToolService:
             if self.settings.screens.indices:
                 for monitor_index in self.settings.screens.indices:
                     try:
+                        monitors = self.mss_capture.get_monitors()
+                        monitor = monitors[monitor_index] if monitor_index < len(monitors) else None
+                        if monitor:
+                            print(f"[CaptureService] Capturing monitor {monitor_index}: expected {monitor.width}x{monitor.height}", file=sys.stderr, flush=True)
                         image = self.mss_capture.capture_screen(monitor_index)
+                        print(f"[CaptureService] Captured monitor {monitor_index}: actual {image.width}x{image.height}", file=sys.stderr, flush=True)
                         images.append(image)
                     except Exception as e:
                         print(f"Failed to capture monitor {monitor_index}: {e}", file=sys.stderr, flush=True)
@@ -494,6 +560,10 @@ class ManualClickListener:
             True if started successfully, False otherwise
         """
         print(f"[ManualClickListener] ========== start() called ==========", file=sys.stderr, flush=True)
+
+        # CRITICAL: Set DPI awareness before starting mouse listener
+        # This ensures pynput receives correct coordinates on high-DPI monitors
+        _set_windows_dpi_awareness_once()
 
         # First check if pynput is available
         try:
