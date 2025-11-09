@@ -4,7 +4,9 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
-Desktop application for running [Qontinui](https://github.com/yourusername/qontinui) GUI automation projects.
+Desktop application for running [Qontinui](https://github.com/qontinui/qontinui) GUI automation projects.
+
+Built with Tauri (Rust) + React (TypeScript) for a native, performant desktop experience.
 
 ## Features
 
@@ -15,6 +17,30 @@ Desktop application for running [Qontinui](https://github.com/yourusername/qonti
 - 🖥️ Cross-platform support (Windows, macOS, Linux)
 
 ## Installation
+
+### Download Pre-built Binaries
+
+**Latest Release: [v0.1.0](https://github.com/qontinui/qontinui-runner/releases/tag/v0.1.0)** (Pre-release)
+
+#### Windows
+
+Download and run the MSI installer:
+- **[Qontinui Runner v0.1.0 (MSI)](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64_en-US.msi)** *(Recommended)*
+- **[Qontinui Runner v0.1.0 (EXE)](https://github.com/qontinui/qontinui-runner/releases/download/v0.1.0/Qontinui.Runner_0.1.0_x64-setup.exe)** *(Alternative)*
+
+**⚠️ Windows SmartScreen Warning:** You'll see a "Windows protected your PC" warning because the installer isn't code-signed. This is normal for open-source projects. To install:
+1. Click "More info"
+2. Click "Run anyway"
+
+For security verification, check the [SHA256 checksums](https://github.com/qontinui/qontinui-runner/releases/tag/v0.1.0).
+
+**Requirements:** Python 3.10+ with qontinui and multistate installed (see Prerequisites below).
+
+#### macOS / Linux
+
+Pre-built binaries coming soon. For now, build from source (see instructions below).
+
+---
 
 ### Prerequisites
 
@@ -119,7 +145,7 @@ npm run tauri dev
 - ✅ Suitable for production automation workflows
 - ✅ Multi-monitor support for targeting specific displays
 
-**For testing and configuration validation**, use [qontinui-web](https://github.com/jspinak/qontinui-web)'s mock execution mode, which simulates automation logic in your browser without requiring a GUI environment.
+**For testing and configuration validation**, use [qontinui-web](https://qontinui.com)'s mock execution mode (launching Feb 2026), which simulates automation logic in your browser without requiring a GUI environment.
 
 ## Project Structure
 
@@ -162,7 +188,7 @@ Qontinui Runner uses JSON configurations created by qontinui-web or written manu
 }
 ```
 
-See [qontinui documentation](https://github.com/yourusername/qontinui) for details.
+See [qontinui documentation](https://github.com/qontinui/qontinui) for details.
 
 ## Troubleshooting
 
@@ -207,9 +233,15 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 ## Related Projects
 
-- **[qontinui](https://github.com/yourusername/qontinui)** - Core automation library
-- **[qontinui-web](https://github.com/yourusername/qontinui-web)** - Web-based configuration editor
-- **[multistate](https://github.com/jspinak/multistate)** - Multi-state state management
+- **[qontinui](https://github.com/qontinui/qontinui)** - Core automation library (Python)
+- **[multistate](https://github.com/qontinui/multistate)** - State machine library | [Docs](https://qontinui.github.io/multistate/)
+- **[qontinui-api](https://github.com/qontinui/qontinui-api)** - REST API bridge
+- **[qontinui-web](https://qontinui.com)** - Web-based visual builder (launching Feb 2026)
+- **[Brobot](https://github.com/jspinak/brobot)** - Original Java implementation
+
+## Research
+
+Based on [Model-based GUI Automation](https://link.springer.com/article/10.1007/s10270-025-01319-9) published in Springer SoSyM (October 2025).
 
 ## Built With
 
@@ -217,4 +249,4 @@ MIT License - See [LICENSE](LICENSE) file for details.
 - [React](https://reactjs.org/) - UI framework
 - [Rust](https://www.rust-lang.org/) - Backend
 - [TypeScript](https://www.typescriptlang.org/) - Frontend
-- [Qontinui](https://github.com/yourusername/qontinui) - Automation engine
+- [Qontinui](https://github.com/qontinui/qontinui) - Automation engine (Python)

@@ -10,7 +10,7 @@
 /**
  * Type of nodes in the execution tree
  */
-export type NodeType = "workflow" | "action";
+export type NodeType = "workflow" | "action" | "transition";
 
 /**
  * Status of a node in the execution tree
