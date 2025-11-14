@@ -79,6 +79,16 @@ from services.screenshot_service import ScreenshotService
 from services.tree_view_layer import TreeViewLayer
 from services.capture_tool_service import CaptureToolService, ScreenshotCaptureSettings, ManualClickListener
 
+# WebSocket integration for qontinui-web
+try:
+    from websocket_client import RunnerWebSocketClient, authenticate
+    from websocket_config import WebSocketConfig
+    import asyncio
+    WEBSOCKET_AVAILABLE = True
+except ImportError as e:
+    WEBSOCKET_AVAILABLE = False
+    logger.debug(f"WebSocket modules not available: {e}")
+
 try:
     from qontinui import Find, Image, Location
     from qontinui.config import get_settings, enable_mock_mode, disable_mock_mode
@@ -535,6 +545,22 @@ class QontinuiExecutor:
         # Manual click listener for capture tool (captures user clicks, not automation clicks)
         self.manual_click_listener = ManualClickListener(self.capture_tool_service)
 
+        # WebSocket client for qontinui-web integration
+        self.ws_client: Optional[RunnerWebSocketClient] = None
+        self.ws_config: Optional[WebSocketConfig] = None
+        self.ws_loop: Optional[asyncio.AbstractEventLoop] = None
+        self.ws_thread: Optional[threading.Thread] = None
+        self.ws_enabled = False
+
+        # Initialize WebSocket configuration from environment
+        if WEBSOCKET_AVAILABLE:
+            try:
+                self.ws_config = WebSocketConfig.from_env()
+                if self.ws_config.enabled:
+                    self._emit_log("info", "WebSocket configuration loaded from environment")
+            except Exception as e:
+                self._emit_log("error", f"Failed to load WebSocket config: {e}")
+
         if QONTINUI_AVAILABLE:
             # Get framework settings
             self.settings = get_settings()
@@ -587,6 +613,220 @@ class QontinuiExecutor:
     def _emit_log(self, level: str, message: str):
         """Emit log message."""
         self._emit_event(EventType.LOG, {"level": level, "message": message})
+
+        # Also send to WebSocket if enabled
+        if self.ws_enabled and self.ws_client:
+            self._ws_send_log(level, message)
+
+    def _ws_send_log(self, level: str, message: str, log_data: Optional[Dict[str, Any]] = None):
+        """Send log to WebSocket (non-blocking)."""
+        if not self.ws_enabled or not self.ws_client or not self.ws_loop:
+            return
+
+        try:
+            # Schedule coroutine in WebSocket event loop
+            asyncio.run_coroutine_threadsafe(
+                self.ws_client.send_log(level, message, log_data),
+                self.ws_loop
+            )
+        except Exception as e:
+            logger.error(f"Error sending log to WebSocket: {e}")
+
+    def _ws_send_screenshot(self, image, name: str, metadata: Optional[Dict[str, Any]] = None):
+        """Send screenshot to WebSocket (non-blocking)."""
+        if not self.ws_enabled or not self.ws_client or not self.ws_loop:
+            return
+
+        try:
+            # Schedule coroutine in WebSocket event loop
+            asyncio.run_coroutine_threadsafe(
+                self.ws_client.send_screenshot(image, name, metadata),
+                self.ws_loop
+            )
+        except Exception as e:
+            logger.error(f"Error sending screenshot to WebSocket: {e}")
+
+    def _ws_start_event_loop(self):
+        """Start WebSocket event loop in background thread."""
+        try:
+            self.ws_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.ws_loop)
+            self.ws_loop.run_forever()
+        except Exception as e:
+            logger.error(f"WebSocket event loop error: {e}")
+        finally:
+            if self.ws_loop:
+                self.ws_loop.close()
+
+    def _ws_connect(self) -> bool:
+        """Connect to WebSocket server (blocking until connected)."""
+        if not WEBSOCKET_AVAILABLE:
+            self._emit_log("error", "WebSocket libraries not available")
+            return False
+
+        if not self.ws_config:
+            self._emit_log("error", "WebSocket configuration not set")
+            return False
+
+        # Validate config
+        is_valid, error = self.ws_config.validate()
+        if not is_valid:
+            self._emit_log("error", f"Invalid WebSocket config: {error}")
+            return False
+
+        try:
+            # Start event loop in background thread
+            if not self.ws_thread or not self.ws_thread.is_alive():
+                self.ws_thread = threading.Thread(target=self._ws_start_event_loop, daemon=True)
+                self.ws_thread.start()
+
+                # Wait for loop to be ready
+                timeout = 5
+                start_time = time.time()
+                while not self.ws_loop and time.time() - start_time < timeout:
+                    time.sleep(0.1)
+
+                if not self.ws_loop:
+                    self._emit_log("error", "WebSocket event loop failed to start")
+                    return False
+
+            # Get or refresh token
+            token = self.ws_config.token
+            if not token and self.ws_config.email and self.ws_config.password:
+                self._emit_log("info", "Authenticating with qontinui-web...")
+                # Convert ws:// to http:// for auth
+                auth_url = self.ws_config.api_url.replace("ws://", "http://").replace("wss://", "https://")
+
+                # Run auth in event loop
+                future = asyncio.run_coroutine_threadsafe(
+                    authenticate(auth_url, self.ws_config.email, self.ws_config.password),
+                    self.ws_loop
+                )
+                token = future.result(timeout=10)
+
+                if not token:
+                    self._emit_log("error", "Authentication failed")
+                    return False
+
+                self.ws_config.token = token
+                self._emit_log("info", "Authentication successful")
+
+            # Create WebSocket client
+            self.ws_client = RunnerWebSocketClient(
+                api_url=self.ws_config.api_url,
+                token=token,
+                project_id=self.ws_config.project_id,
+                runner_version=self.ws_config.runner_version,
+                auto_reconnect=self.ws_config.auto_reconnect,
+                heartbeat_interval=self.ws_config.heartbeat_interval,
+                max_reconnect_attempts=self.ws_config.max_reconnect_attempts,
+                on_connected=lambda: self._emit_log("info", "WebSocket connected"),
+                on_disconnected=lambda: self._emit_log("warning", "WebSocket disconnected"),
+                on_error=lambda msg: self._emit_log("error", f"WebSocket error: {msg}"),
+            )
+
+            # Connect
+            self._emit_log("info", f"Connecting to WebSocket: {self.ws_config.api_url}")
+            future = asyncio.run_coroutine_threadsafe(
+                self.ws_client.connect(),
+                self.ws_loop
+            )
+            success = future.result(timeout=10)
+
+            if success:
+                self.ws_enabled = True
+                self._emit_log("info", "WebSocket connection established")
+                return True
+            else:
+                self._emit_log("error", "WebSocket connection failed")
+                return False
+
+        except Exception as e:
+            self._emit_log("error", f"WebSocket connection error: {e}")
+            logger.error(f"WebSocket connection error: {traceback.format_exc()}")
+            return False
+
+    def _ws_disconnect(self):
+        """Disconnect from WebSocket server."""
+        if not self.ws_client:
+            return
+
+        try:
+            self._emit_log("info", "Disconnecting WebSocket...")
+
+            # Disconnect client
+            if self.ws_loop and self.ws_client:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.ws_client.disconnect(),
+                    self.ws_loop
+                )
+                future.result(timeout=5)
+
+            # Stop event loop
+            if self.ws_loop:
+                self.ws_loop.call_soon_threadsafe(self.ws_loop.stop)
+
+            self.ws_enabled = False
+            self.ws_client = None
+
+            self._emit_log("info", "WebSocket disconnected")
+
+        except Exception as e:
+            self._emit_log("error", f"Error disconnecting WebSocket: {e}")
+            logger.error(f"WebSocket disconnect error: {traceback.format_exc()}")
+
+    def _ws_start_session(self, config_snapshot: Optional[Dict[str, Any]] = None) -> bool:
+        """Start WebSocket session."""
+        if not self.ws_enabled or not self.ws_client or not self.ws_loop:
+            self._emit_log("warning", "Cannot start WebSocket session: not connected")
+            return False
+
+        try:
+            self._emit_log("info", "Starting WebSocket session...")
+
+            future = asyncio.run_coroutine_threadsafe(
+                self.ws_client.start_session(config_snapshot),
+                self.ws_loop
+            )
+            success = future.result(timeout=10)
+
+            if success:
+                self._emit_log("info", f"WebSocket session started: {self.ws_client.session_id}")
+                return True
+            else:
+                self._emit_log("error", "Failed to start WebSocket session")
+                return False
+
+        except Exception as e:
+            self._emit_log("error", f"Error starting WebSocket session: {e}")
+            logger.error(f"WebSocket session start error: {traceback.format_exc()}")
+            return False
+
+    def _ws_end_session(self, status: str = "completed", error: Optional[str] = None) -> bool:
+        """End WebSocket session."""
+        if not self.ws_enabled or not self.ws_client or not self.ws_loop:
+            return False
+
+        try:
+            self._emit_log("info", f"Ending WebSocket session with status: {status}")
+
+            future = asyncio.run_coroutine_threadsafe(
+                self.ws_client.end_session(status, error),
+                self.ws_loop
+            )
+            success = future.result(timeout=10)
+
+            if success:
+                self._emit_log("info", "WebSocket session ended")
+            else:
+                self._emit_log("error", "Failed to end WebSocket session")
+
+            return success
+
+        except Exception as e:
+            self._emit_log("error", f"Error ending WebSocket session: {e}")
+            logger.error(f"WebSocket session end error: {traceback.format_exc()}")
+            return False
 
     def set_debug_settings(self, settings: dict):
         """Update debug settings from frontend.
@@ -2051,6 +2291,10 @@ class QontinuiExecutor:
                 },
             )
 
+            # End WebSocket session on success
+            if self.ws_enabled and self.ws_client:
+                self._ws_end_session(status="completed")
+
         except Exception as e:
             self._emit_log("error", f"Exception in _run_workflow: {e}")
             self._emit_event(
@@ -2061,6 +2305,11 @@ class QontinuiExecutor:
                     "traceback": traceback.format_exc(),
                 },
             )
+
+            # End WebSocket session on failure
+            if self.ws_enabled and self.ws_client:
+                self._ws_end_session(status="failed", error=str(e))
+
         finally:
             self._emit_log("debug", "Thread completing, setting is_running=False")
             self.is_running = False
@@ -2091,6 +2340,15 @@ class QontinuiExecutor:
 
         try:
             self.is_running = True
+
+            # Start WebSocket session if enabled
+            if self.ws_enabled and self.ws_client:
+                # Create config snapshot for session
+                config_snapshot = {
+                    "workflow_id": workflow_id,
+                    "workflows": [w for w in (self.config.get("workflows", []) if isinstance(self.config, dict) else [])],
+                }
+                self._ws_start_session(config_snapshot)
 
             self._emit_event(
                 EventType.EXECUTION_STARTED, {"workflow_id": workflow_id}
@@ -2195,6 +2453,49 @@ class QontinuiExecutor:
                 "success": True,
                 "is_running": self.manual_click_listener.is_running(),
                 "capture_enabled": self.capture_tool_service.is_enabled()
+            }
+
+        elif cmd_type == "ws_configure":
+            # Configure WebSocket from params
+            config_dict = params.get("config", {})
+            try:
+                self.ws_config = WebSocketConfig.from_dict(config_dict)
+                return {"success": True, "message": "WebSocket configured"}
+            except Exception as e:
+                return {"success": False, "error": str(e)}
+
+        elif cmd_type == "ws_connect":
+            # Connect to WebSocket server
+            success = self._ws_connect()
+            return {"success": success}
+
+        elif cmd_type == "ws_disconnect":
+            # Disconnect from WebSocket server
+            self._ws_disconnect()
+            return {"success": True}
+
+        elif cmd_type == "ws_start_session":
+            # Start WebSocket session
+            config_snapshot = params.get("config_snapshot")
+            success = self._ws_start_session(config_snapshot)
+            return {"success": success}
+
+        elif cmd_type == "ws_end_session":
+            # End WebSocket session
+            status = params.get("status", "completed")
+            error = params.get("error")
+            success = self._ws_end_session(status, error)
+            return {"success": success}
+
+        elif cmd_type == "ws_status":
+            # Get WebSocket status
+            stats = self.ws_client.get_stats() if self.ws_client else {}
+            return {
+                "success": True,
+                "enabled": self.ws_enabled,
+                "connected": self.ws_enabled and self.ws_client is not None,
+                "stats": stats,
+                "config": self.ws_config.to_dict() if self.ws_config else None,
             }
 
         elif cmd_type == "ping":

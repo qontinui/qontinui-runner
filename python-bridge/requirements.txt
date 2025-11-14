@@ -1,5 +1,7 @@
 # Core dependencies for the Python bridge
 Pillow>=9.0.0  # For screenshot handling
+websockets>=12.0  # For WebSocket client communication with qontinui-web
+requests>=2.31.0  # For HTTP authentication
 
 # Note: The actual Qontinui library should be installed from the parent directory
 # pip install -e ../../qontinui
