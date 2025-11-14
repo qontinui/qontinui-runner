@@ -977,6 +977,8 @@ class QontinuiExecutor:
         This method acts as a bridge between EventTranslator (which uses string event names)
         and _emit_event (which expects EventType enum values).
 
+        Also forwards automation events to WebSocket backend for real-time monitoring.
+
         Args:
             event_type: String event type name (e.g., "image_recognition", "action_execution")
             data: Event data dictionary
@@ -989,6 +991,43 @@ class QontinuiExecutor:
             }
             with self._output_lock:
                 print(json.dumps(event), flush=True)
+
+            # Forward image recognition events to WebSocket
+            if self.ws_enabled and self.ws_client:
+                # Extract screenshot if available and send via WebSocket
+                screenshot_base64 = data.get("screenshot_base64")
+                if screenshot_base64:
+                    # Create metadata for screenshot
+                    metadata = {
+                        "event_type": "image_recognition",
+                        "image_id": data.get("image_id"),
+                        "state_name": data.get("state_name"),
+                        "found": data.get("found"),
+                        "confidence": data.get("confidence"),
+                        "threshold": data.get("threshold"),
+                        "match_location": data.get("match_location"),
+                        "action_type": "find_image",
+                    }
+                    # Send screenshot (non-blocking)
+                    self._ws_send_screenshot(
+                        image=screenshot_base64,
+                        name=f"match_{data.get('image_id', 'unknown')}_{int(time.time())}",
+                        metadata=metadata
+                    )
+
+                # Also send as structured log
+                self._ws_send_log(
+                    level="info" if data.get("found") else "debug",
+                    message=f"Image recognition: {data.get('image_id')} - {'found' if data.get('found') else 'not found'}",
+                    log_data={
+                        "event_type": "image_recognition",
+                        "image_id": data.get("image_id"),
+                        "found": data.get("found"),
+                        "confidence": data.get("confidence"),
+                        "threshold": data.get("threshold"),
+                        "match_location": data.get("match_location"),
+                    }
+                )
             return
 
         # Map string event names to EventType enum values
@@ -1008,6 +1047,47 @@ class QontinuiExecutor:
         # If we had to fallback to LOG, add a prefix to the data
         if enum_event_type == EventType.LOG and event_type not in event_type_map:
             data = {**data, "original_event_type": event_type}
+
+        # Forward automation events to WebSocket
+        if self.ws_enabled and self.ws_client:
+            # Determine log level based on event type
+            log_level_map = {
+                "action_started": "info",
+                "action_completed": "info",
+                "action_execution": "info",
+                "match_found": "info",
+                "screenshot_taken": "debug",
+                "log": data.get("level", "info"),
+            }
+            level = log_level_map.get(event_type, "info")
+
+            # Create message based on event type
+            if event_type == "action_started":
+                message = f"Action started: {data.get('action_type', 'unknown')}"
+            elif event_type == "action_completed":
+                success = data.get("success", True)
+                action_type = data.get("action_type", 'unknown')
+                message = f"Action {'completed' if success else 'failed'}: {action_type}"
+                if not success:
+                    level = "error"
+            elif event_type == "action_execution":
+                message = f"Executed: {data.get('action_type', 'unknown')}"
+            elif event_type == "match_found":
+                message = f"Match found: {data.get('image_id', 'unknown')}"
+            elif event_type == "screenshot_taken":
+                message = f"Screenshot captured: {data.get('reference', 'unknown')}"
+            else:
+                message = data.get("message", f"Event: {event_type}")
+
+            # Send to WebSocket with full event data as structured log
+            self._ws_send_log(
+                level=level,
+                message=message,
+                log_data={
+                    "event_type": event_type,
+                    **data  # Include all event data
+                }
+            )
 
         # Emit the event using the existing method
         self._emit_event(enum_event_type, data)
