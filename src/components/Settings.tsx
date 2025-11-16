@@ -216,6 +216,70 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     }
   };
 
+  const applyWebSocketSettings = async () => {
+    if (!wsSettings.enabled) {
+      onLog("info", "WebSocket streaming is disabled");
+      return;
+    }
+
+    if (!wsSettings.url || !wsSettings.token) {
+      onLog("error", "WebSocket URL and token are required");
+      setError("WebSocket URL and token are required");
+      return;
+    }
+
+    try {
+      console.log("Applying WebSocket settings...");
+
+      // Parse project ID as integer (or null if empty)
+      const projectId = wsSettings.projectId ? parseInt(wsSettings.projectId, 10) : null;
+
+      // Configure WebSocket
+      const configResult: any = await invoke("configure_websocket", {
+        config: {
+          enabled: wsSettings.enabled,
+          url: wsSettings.url,
+          token: wsSettings.token,
+          project_id: projectId,
+        },
+      });
+
+      if (configResult && configResult.success) {
+        onLog("success", "WebSocket configured successfully");
+
+        // Connect to WebSocket
+        const connectResult: any = await invoke("connect_websocket");
+        if (connectResult && connectResult.success) {
+          setWsSettings(prev => ({ ...prev, connected: true }));
+          onLog("success", "WebSocket connected successfully");
+        } else {
+          onLog("error", `Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`);
+        }
+      } else {
+        onLog("error", `Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Failed to apply WebSocket settings:", err);
+      onLog("error", `Failed to apply WebSocket settings: ${err}`);
+      setError(`Failed to apply WebSocket settings: ${err}`);
+    }
+  };
+
+  const disconnectWebSocket = async () => {
+    try {
+      const result: any = await invoke("disconnect_websocket");
+      if (result && result.success) {
+        setWsSettings(prev => ({ ...prev, connected: false }));
+        onLog("success", "WebSocket disconnected");
+      } else {
+        onLog("error", `Failed to disconnect WebSocket: ${result?.message || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Failed to disconnect WebSocket:", err);
+      onLog("error", `Failed to disconnect WebSocket: ${err}`);
+    }
+  };
+
   const handleToggleDebug = () => {
     setSettings((prev) => ({
       ...prev,
@@ -560,6 +624,25 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
                 Enable this only when you need real-time monitoring or integration testing. This will send
                 screenshots and logs to your qontinui.com account.
               </div>
+            </div>
+
+            {/* Apply/Disconnect buttons */}
+            <div className="flex gap-3">
+              {!wsSettings.connected ? (
+                <button
+                  onClick={applyWebSocketSettings}
+                  className="px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
+                >
+                  Connect
+                </button>
+              ) : (
+                <button
+                  onClick={disconnectWebSocket}
+                  className="px-4 py-2 bg-destructive text-destructive-foreground rounded-md hover:bg-destructive/90 transition-colors"
+                >
+                  Disconnect
+                </button>
+              )}
             </div>
           </>
         )}

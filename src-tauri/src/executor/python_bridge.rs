@@ -838,6 +838,32 @@ impl PythonBridge {
         }
     }
 
+    pub fn configure_websocket(
+        &mut self,
+        enabled: bool,
+        url: String,
+        token: String,
+        project_id: Option<i32>,
+    ) -> Result<(), String> {
+        self.send_command(
+            "ws_configure",
+            Some(json!({
+                "enabled": enabled,
+                "api_url": url,
+                "jwt_token": token,
+                "project_id": project_id,
+            })),
+        )
+    }
+
+    pub fn connect_websocket(&mut self) -> Result<(), String> {
+        self.send_command("ws_connect", None)
+    }
+
+    pub fn disconnect_websocket(&mut self) -> Result<(), String> {
+        self.send_command("ws_disconnect", None)
+    }
+
     pub fn is_running(&self) -> bool {
         self.runtime.block_on(async {
             let state = self.lifecycle.read().await.get_state().await;

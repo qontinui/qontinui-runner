@@ -895,3 +895,94 @@ pub fn update_capture_settings(
         Err("Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string())
     }
 }
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WebSocketConfig {
+    pub enabled: bool,
+    pub url: String,
+    pub token: String,
+    pub project_id: Option<i32>,
+}
+
+#[tauri::command]
+pub fn configure_websocket(
+    config: WebSocketConfig,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Configuring WebSocket: enabled={}, url={}", config.enabled, config.url);
+
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor is not running. Please start the executor first.".to_string());
+        }
+
+        bridge.configure_websocket(
+            config.enabled,
+            config.url,
+            config.token,
+            config.project_id,
+        ).map_err(|e| {
+            error!("Failed to configure WebSocket: {}", e);
+            format!("Failed to configure WebSocket: {}", e)
+        })?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("WebSocket configured successfully".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized. Please start the executor first.".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn connect_websocket(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Connecting WebSocket");
+
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor is not running. Please start the executor first.".to_string());
+        }
+
+        bridge.connect_websocket().map_err(|e| {
+            error!("Failed to connect WebSocket: {}", e);
+            format!("Failed to connect WebSocket: {}", e)
+        })?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("WebSocket connection initiated".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized. Please start the executor first.".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn disconnect_websocket(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Disconnecting WebSocket");
+
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor is not running. Please start the executor first.".to_string());
+        }
+
+        bridge.disconnect_websocket().map_err(|e| {
+            error!("Failed to disconnect WebSocket: {}", e);
+            format!("Failed to disconnect WebSocket: {}", e)
+        })?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some("WebSocket disconnection initiated".to_string()),
+            data: None,
+        })
+    } else {
+        Err("Python executor not initialized. Please start the executor first.".to_string())
+    }
+}

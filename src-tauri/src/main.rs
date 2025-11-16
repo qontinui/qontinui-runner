@@ -100,6 +100,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::get_action_log_view,
             commands::clear_action_log,
             commands::update_capture_settings,
+            commands::configure_websocket,
+            commands::connect_websocket,
+            commands::disconnect_websocket,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
