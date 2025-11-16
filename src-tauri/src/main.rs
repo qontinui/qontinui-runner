@@ -8,15 +8,19 @@ mod error;
 mod executor;
 mod logging;
 mod settings;
+mod storage;
+mod video_recorder;
 
 use commands::AppState;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
+use storage::LocalStorage;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info};
+use video_recorder::VideoRecordingService;
 
 fn main() {
     let result = std::panic::catch_unwind(run_app);
@@ -66,6 +70,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     display_processor.register_profile(ActionLogProfile::with_default_config());
     let display_processor = Arc::new(TokioMutex::new(display_processor));
 
+    // Initialize LocalStorage
+    let local_storage = Arc::new(Mutex::new(
+        LocalStorage::with_default_config().expect("Failed to initialize local storage"),
+    ));
+
+    // Initialize VideoRecordingService
+    let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -73,6 +85,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             python_bridge: Mutex::new(None),
             current_config: Mutex::new(None),
             display_processor,
+            local_storage,
+            video_recorder,
         })
         .invoke_handler(tauri::generate_handler![
             commands::load_configuration,
@@ -103,6 +117,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::configure_websocket,
             commands::connect_websocket,
             commands::disconnect_websocket,
+            commands::start_video_recording,
+            commands::stop_video_recording,
+            commands::get_video_recording_status,
+            commands::save_screenshot_to_disk,
+            commands::save_video_to_disk,
+            commands::get_local_storage_usage,
+            commands::delete_old_sessions,
+            commands::clear_all_storage,
+            commands::get_storage_paths,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

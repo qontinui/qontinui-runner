@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Settings as SettingsIcon, Check, X, Camera, FolderOpen, Monitor, Plus, Trash2, Wifi } from "lucide-react";
+import { Settings as SettingsIcon, Check, X, Camera, FolderOpen, Monitor, Plus, Trash2, Wifi, Cloud, AlertCircle, HardDrive, Trash } from "lucide-react";
 
 interface DebugSettings {
   enable_image_debug: boolean;
@@ -13,11 +13,24 @@ interface AppSettings {
 }
 
 interface WebSocketSettings {
+  // Connection
   enabled: boolean;
   url: string;
   token: string;
   projectId: string;
   connected: boolean;
+
+  // Cloud permission status (read-only, from API)
+  cloudPermissionEnabled: boolean;
+  sessionsLimit: number | null;  // null = unlimited
+  sessionsUsed: number;
+  sessionsResetAt: string | null;
+
+  // User controls
+  sendToCloud: boolean;          // Master toggle
+  sendLogs: boolean;             // Default: true if sendToCloud
+  sendScreenshots: boolean;      // Default: true if sendToCloud
+  sendVideos: boolean;           // Default: false
 }
 
 type ScreenSelectionType =
@@ -57,11 +70,24 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     auto_load_last_config: false,
   });
   const [wsSettings, setWsSettings] = useState<WebSocketSettings>({
+    // Connection
     enabled: false,
     url: "ws://localhost:8001",
     token: "",
     projectId: "",
     connected: false,
+
+    // Cloud permission status
+    cloudPermissionEnabled: false,
+    sessionsLimit: null,
+    sessionsUsed: 0,
+    sessionsResetAt: null,
+
+    // User controls
+    sendToCloud: false,
+    sendLogs: true,
+    sendScreenshots: true,
+    sendVideos: false,
   });
   const [captureSettings, setCaptureSettings] = useState<ScreenshotCaptureSettings>({
     enabled: false,
@@ -81,11 +107,28 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
   const [error, setError] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
 
+  // Storage state
+  const [storageUsage, setStorageUsage] = useState({
+    screenshots: 0,
+    videos: 0,
+    screenshotCount: 0,
+    videoCount: 0,
+  });
+  const [storagePaths, setStoragePaths] = useState({
+    screenshot_path: "",
+    video_path: "",
+    max_screenshot_mb: 500,
+    max_video_mb: 500,
+    auto_cleanup: true,
+  });
+  const [storageLoading, setStorageLoading] = useState(false);
+
   // Load current settings on mount
   useEffect(() => {
     loadSettings();
     loadAppSettings();
     loadMonitors();
+    loadStorageInfo();
   }, []);
 
   // Auto-select primary screen as specific when monitors load
@@ -100,6 +143,51 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       }
     }
   }, [monitors]);
+
+  // Check cloud permission when token changes
+  useEffect(() => {
+    const checkCloudPermission = async () => {
+      if (wsSettings.token) {
+        try {
+          const response = await fetch('http://localhost:8001/api/v1/users/me/automation-streaming', {
+            headers: {
+              'Authorization': `Bearer ${wsSettings.token}`
+            }
+          });
+          if (response.ok) {
+            const data = await response.json();
+            setWsSettings(prev => ({
+              ...prev,
+              cloudPermissionEnabled: data.enabled,
+              sessionsLimit: data.sessions_limit,
+              sessionsUsed: data.sessions_used,
+              sessionsResetAt: data.sessions_reset_at,
+            }));
+          } else {
+            // Token invalid or permission not available
+            setWsSettings(prev => ({
+              ...prev,
+              cloudPermissionEnabled: false,
+            }));
+          }
+        } catch (error) {
+          console.error('Failed to check cloud permission:', error);
+          setWsSettings(prev => ({
+            ...prev,
+            cloudPermissionEnabled: false,
+          }));
+        }
+      } else {
+        // No token, reset permission status
+        setWsSettings(prev => ({
+          ...prev,
+          cloudPermissionEnabled: false,
+        }));
+      }
+    };
+
+    checkCloudPermission();
+  }, [wsSettings.token]);
 
   // Listen for manual capture status updates from Python
   useEffect(() => {
@@ -228,6 +316,18 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       return;
     }
 
+    // Check cloud permission first
+    if (!wsSettings.cloudPermissionEnabled) {
+      onLog("error", "Cloud sync not available. Enable it in your qontinui.com profile.");
+      setError("Cloud sync not available. Enable it in your qontinui.com profile.");
+      return;
+    }
+
+    if (!wsSettings.sendToCloud) {
+      onLog("info", "Cloud sync disabled by user preference");
+      return;
+    }
+
     try {
       console.log("Applying WebSocket settings...");
 
@@ -325,6 +425,16 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
         auto_load_last_config: !newValue,
       }));
     }
+  };
+
+  const handleToggleSendToCloud = (checked: boolean) => {
+    setWsSettings((prev) => ({
+      ...prev,
+      sendToCloud: checked,
+      // Auto-enable logs and screenshots when turning on cloud sync
+      sendLogs: checked ? true : prev.sendLogs,
+      sendScreenshots: checked ? true : prev.sendScreenshots,
+    }));
   };
 
   const handleToggleCapture = () => {
@@ -466,6 +576,89 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     }
   };
 
+  // Storage management functions
+  const loadStorageInfo = async () => {
+    try {
+      setStorageLoading(true);
+
+      // Load storage usage
+      const usageResult: any = await invoke("get_local_storage_usage");
+      if (usageResult && usageResult.success && usageResult.data) {
+        setStorageUsage({
+          screenshots: usageResult.data.screenshots_mb || 0,
+          videos: usageResult.data.videos_mb || 0,
+          screenshotCount: usageResult.data.screenshot_count || 0,
+          videoCount: usageResult.data.video_count || 0,
+        });
+      }
+
+      // Load storage paths
+      const pathsResult: any = await invoke("get_storage_paths");
+      if (pathsResult && pathsResult.success && pathsResult.data) {
+        setStoragePaths({
+          screenshot_path: pathsResult.data.screenshot_path || "",
+          video_path: pathsResult.data.video_path || "",
+          max_screenshot_mb: pathsResult.data.max_screenshot_mb || 500,
+          max_video_mb: pathsResult.data.max_video_mb || 500,
+          auto_cleanup: pathsResult.data.auto_cleanup ?? true,
+        });
+      }
+    } catch (err) {
+      console.error("Failed to load storage info:", err);
+    } finally {
+      setStorageLoading(false);
+    }
+  };
+
+  const handleDeleteOldSessions = async (type: 'screenshots' | 'videos', days: number) => {
+    try {
+      const result: any = await invoke("delete_old_sessions", {
+        storageType: type,
+        olderThanDays: days,
+      });
+
+      if (result && result.success) {
+        onLog("success", `Deleted ${type} older than ${days} days`);
+        await loadStorageInfo(); // Refresh storage info
+      } else {
+        onLog("error", `Failed to delete old sessions: ${result?.message || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Failed to delete old sessions:", err);
+      onLog("error", `Failed to delete old sessions: ${err}`);
+    }
+  };
+
+  const handleClearAllStorage = async () => {
+    if (!confirm("Are you sure you want to delete all screenshots and videos? This cannot be undone.")) {
+      return;
+    }
+
+    try {
+      const result: any = await invoke("clear_all_storage");
+
+      if (result && result.success) {
+        onLog("success", "All storage cleared successfully");
+        await loadStorageInfo(); // Refresh storage info
+      } else {
+        onLog("error", `Failed to clear storage: ${result?.message || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Failed to clear storage:", err);
+      onLog("error", `Failed to clear storage: ${err}`);
+    }
+  };
+
+  const handleOpenStorageFolder = async (type: 'screenshots' | 'videos') => {
+    try {
+      const path = type === 'screenshots' ? storagePaths.screenshot_path : storagePaths.video_path;
+      await invoke("open_folder", { path });
+    } catch (err) {
+      console.error("Failed to open folder:", err);
+      onLog("error", `Failed to open folder: ${err}`);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -527,13 +720,13 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
         </div>
       </div>
 
-      {/* WebSocket Settings */}
+      {/* Cloud Sync Settings */}
       <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
         <div className="flex items-center gap-3">
-          <Wifi className="w-5 h-5 text-primary" />
-          <h4 className="font-semibold text-lg">WebSocket Streaming</h4>
+          <Cloud className="w-5 h-5 text-primary" />
+          <h4 className="font-semibold text-lg">Cloud Sync</h4>
           {wsSettings.connected && (
-            <span className="flex items-center gap-2 text-green-600 text-sm font-medium">
+            <span className="flex items-center gap-2 text-green-600 text-sm">
               <span className="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
               Connected
             </span>
@@ -546,7 +739,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
             <div className="space-y-1">
               <div className="font-medium">Enable Automation Streaming</div>
               <div className="text-sm text-muted-foreground">
-                Stream automation data to qontinui.com for real-time monitoring and integration testing
+                Connect to qontinui.com for real-time monitoring and cloud storage
               </div>
             </div>
             <button
@@ -564,9 +757,10 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
           </label>
         </div>
 
-        {/* WebSocket URL */}
+        {/* Configuration fields */}
         {wsSettings.enabled && (
           <>
+            {/* WebSocket URL */}
             <div className="space-y-2">
               <label className="block">
                 <div className="font-medium mb-1">WebSocket URL</div>
@@ -617,12 +811,97 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
               </label>
             </div>
 
+            {/* Cloud Permission Status */}
+            {wsSettings.cloudPermissionEnabled && wsSettings.token && (
+              <div className="p-3 bg-primary/10 border border-primary/30 rounded-lg">
+                <div className="text-sm">
+                  <strong>Cloud Storage Available</strong>
+                  <p className="text-muted-foreground mt-1">
+                    {wsSettings.sessionsLimit
+                      ? `${wsSettings.sessionsUsed} of ${wsSettings.sessionsLimit} sessions used this month`
+                      : 'Unlimited sessions available'
+                    }
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {!wsSettings.cloudPermissionEnabled && wsSettings.token && (
+              <div className="p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg flex items-start gap-2">
+                <AlertCircle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
+                <div className="text-sm text-orange-300">
+                  Cloud sync is not enabled for your account. Enable it in your profile at qontinui.com.
+                </div>
+              </div>
+            )}
+
+            {/* Master Toggle - Send to Cloud */}
+            <div className="space-y-2">
+              <label className="flex items-center justify-between cursor-pointer">
+                <div className="space-y-1">
+                  <div className="font-medium">Send to Cloud</div>
+                  <div className="text-sm text-muted-foreground">
+                    Upload automation data to qontinui.com for analysis and collaboration
+                  </div>
+                </div>
+                <button
+                  onClick={() => handleToggleSendToCloud(!wsSettings.sendToCloud)}
+                  disabled={!wsSettings.cloudPermissionEnabled}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    wsSettings.sendToCloud ? "bg-primary" : "bg-muted"
+                  } ${!wsSettings.cloudPermissionEnabled ? "opacity-50 cursor-not-allowed" : ""}`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      wsSettings.sendToCloud ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </label>
+            </div>
+
+            {/* What to Send - only shown if sendToCloud enabled */}
+            {wsSettings.sendToCloud && (
+              <div className="space-y-3 pl-6 border-l-2 border-primary/30">
+                <div className="text-sm font-medium">What to send:</div>
+
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={wsSettings.sendLogs}
+                    onChange={(e) => setWsSettings(prev => ({ ...prev, sendLogs: e.target.checked }))}
+                    className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
+                  />
+                  <span className="text-sm">Logs & Events (required for analysis)</span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={wsSettings.sendScreenshots}
+                    onChange={(e) => setWsSettings(prev => ({ ...prev, sendScreenshots: e.target.checked }))}
+                    className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
+                  />
+                  <span className="text-sm">Screenshots (required for State Discovery)</span>
+                </label>
+
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={wsSettings.sendVideos}
+                    onChange={(e) => setWsSettings(prev => ({ ...prev, sendVideos: e.target.checked }))}
+                    className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
+                  />
+                  <span className="text-sm">Videos (optional, large files)</span>
+                </label>
+              </div>
+            )}
+
             {/* Info box */}
             <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
               <div className="text-sm text-muted-foreground">
-                <strong className="text-foreground">Note:</strong> WebSocket streaming is disabled by default.
-                Enable this only when you need real-time monitoring or integration testing. This will send
-                screenshots and logs to your qontinui.com account.
+                <strong className="text-foreground">Note:</strong> Cloud sync requires both account permission
+                and your consent. You can control exactly what data is uploaded.
               </div>
             </div>
 
@@ -991,6 +1270,140 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
           </button>
         </div>
       </div>
+
+      {/* Local Storage Management */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <div className="flex items-center gap-3">
+          <HardDrive className="w-5 h-5 text-primary" />
+          <h4 className="font-semibold text-lg">Local Storage</h4>
+        </div>
+
+        {/* Storage Usage Display */}
+        <div className="space-y-4">
+          <div>
+            <div className="font-medium mb-2">Storage Usage</div>
+
+            {/* Screenshots */}
+            <div className="space-y-2 mb-4">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Screenshots</span>
+                <span className="font-medium">
+                  {storageUsage.screenshots.toFixed(2)} MB / {storagePaths.max_screenshot_mb} MB
+                  ({storageUsage.screenshotCount} files)
+                </span>
+              </div>
+              <div className="w-full bg-muted rounded-full h-2">
+                <div
+                  className="bg-primary h-2 rounded-full transition-all"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (storageUsage.screenshots / storagePaths.max_screenshot_mb) * 100
+                    )}%`,
+                  }}
+                ></div>
+              </div>
+            </div>
+
+            {/* Videos */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-muted-foreground">Videos</span>
+                <span className="font-medium">
+                  {storageUsage.videos.toFixed(2)} MB / {storagePaths.max_video_mb} MB
+                  ({storageUsage.videoCount} files)
+                </span>
+              </div>
+              <div className="w-full bg-muted rounded-full h-2">
+                <div
+                  className="bg-primary h-2 rounded-full transition-all"
+                  style={{
+                    width: `${Math.min(
+                      100,
+                      (storageUsage.videos / storagePaths.max_video_mb) * 100
+                    )}%`,
+                  }}
+                ></div>
+              </div>
+            </div>
+          </div>
+
+          {/* Storage Paths */}
+          <div className="space-y-2">
+            <div className="font-medium">Storage Locations</div>
+            <div className="space-y-2 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Screenshots:</span>
+                <div className="flex items-center gap-2">
+                  <code className="px-2 py-1 bg-muted rounded text-xs max-w-md truncate">
+                    {storagePaths.screenshot_path || "~/qontinui/screenshots/"}
+                  </code>
+                  <button
+                    onClick={() => handleOpenStorageFolder('screenshots')}
+                    className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
+                    title="Open folder"
+                  >
+                    <FolderOpen className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-muted-foreground">Videos:</span>
+                <div className="flex items-center gap-2">
+                  <code className="px-2 py-1 bg-muted rounded text-xs max-w-md truncate">
+                    {storagePaths.video_path || "~/qontinui/videos/"}
+                  </code>
+                  <button
+                    onClick={() => handleOpenStorageFolder('videos')}
+                    className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
+                    title="Open folder"
+                  >
+                    <FolderOpen className="w-3 h-3" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Cleanup Actions */}
+          <div className="space-y-2">
+            <div className="font-medium">Storage Cleanup</div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => handleDeleteOldSessions('screenshots', 30)}
+                className="px-3 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 rounded-md transition-colors flex items-center gap-2 text-sm"
+              >
+                <Trash2 className="w-4 h-4" />
+                Delete Screenshots (30+ days)
+              </button>
+              <button
+                onClick={() => handleDeleteOldSessions('videos', 30)}
+                className="px-3 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 rounded-md transition-colors flex items-center gap-2 text-sm"
+              >
+                <Trash2 className="w-4 h-4" />
+                Delete Videos (30+ days)
+              </button>
+              <button
+                onClick={handleClearAllStorage}
+                className="px-3 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-600 rounded-md transition-colors flex items-center gap-2 text-sm"
+              >
+                <Trash className="w-4 h-4" />
+                Clear All Storage
+              </button>
+            </div>
+          </div>
+
+          {/* Info box */}
+          <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+            <div className="text-sm text-muted-foreground">
+              <strong className="text-foreground">Storage Info:</strong> Screenshots and videos are
+              organized by session. Auto-cleanup removes oldest sessions when storage limits are reached.
+              Files are stored locally on your machine at the paths shown above.
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
+

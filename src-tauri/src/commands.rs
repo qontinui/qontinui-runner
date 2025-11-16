@@ -3,6 +3,8 @@ use crate::display::DisplayProcessor;
 use crate::error::{AppError, UserFacingError};
 use crate::executor::PythonBridge;
 use crate::settings;
+use crate::storage::LocalStorage;
+use crate::video_recorder::{VideoRecordingConfig, VideoRecordingService};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -14,6 +16,8 @@ pub struct AppState {
     pub python_bridge: Mutex<Option<PythonBridge>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
     pub display_processor: Arc<TokioMutex<DisplayProcessor>>,
+    pub local_storage: Arc<Mutex<LocalStorage>>,
+    pub video_recorder: Arc<Mutex<VideoRecordingService>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -985,4 +989,232 @@ pub fn disconnect_websocket(state: State<AppState>) -> Result<CommandResponse, S
     } else {
         Err("Python executor not initialized. Please start the executor first.".to_string())
     }
+}
+
+/// Start video recording for the current automation session
+#[tauri::command]
+pub fn start_video_recording(
+    session_id: String,
+    config: VideoRecordingConfig,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!("Starting video recording for session: {}", session_id);
+
+    let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
+
+    recorder.start_recording(&session_id, config).map_err(|e| {
+        error!("Failed to start video recording: {}", e);
+        format!("Failed to start video recording: {}", e)
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Video recording started".to_string()),
+        data: None,
+    })
+}
+
+/// Stop the current video recording
+#[tauri::command]
+pub fn stop_video_recording(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Stopping video recording");
+
+    let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
+
+    let video_path = recorder.stop_recording().map_err(|e| {
+        error!("Failed to stop video recording: {}", e);
+        format!("Failed to stop video recording: {}", e)
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!("Video saved to: {}", video_path)),
+        data: Some(serde_json::json!({
+            "path": video_path
+        })),
+    })
+}
+
+/// Get the current video recording status
+#[tauri::command]
+pub fn get_video_recording_status(state: State<AppState>) -> Result<CommandResponse, String> {
+    let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
+
+    let status = recorder.get_status().map_err(|e| {
+        error!("Failed to get video recording status: {}", e);
+        format!("Failed to get video recording status: {}", e)
+    })?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::to_value(status).map_err(|e| e.to_string())?),
+    })
+}
+
+// ============================================================================
+// Local Storage Commands
+// ============================================================================
+
+/// Save a screenshot to local disk storage
+#[tauri::command]
+pub fn save_screenshot_to_disk(
+    session_id: String,
+    screenshot_id: String,
+    data: Vec<u8>,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Saving screenshot to disk: session={}, id={}, size={} bytes",
+        session_id,
+        screenshot_id,
+        data.len()
+    );
+
+    let storage = state.local_storage.lock().unwrap();
+    let path = storage
+        .save_screenshot(&session_id, &screenshot_id, &data)
+        .map_err(|e| {
+            error!("Failed to save screenshot: {}", e);
+            format!("Failed to save screenshot: {}", e)
+        })?;
+
+    info!("Screenshot saved successfully: {:?}", path);
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Screenshot saved successfully".to_string()),
+        data: Some(serde_json::json!({
+            "path": path.to_string_lossy().to_string(),
+        })),
+    })
+}
+
+/// Save a video to local disk storage
+#[tauri::command]
+pub fn save_video_to_disk(
+    session_id: String,
+    data: Vec<u8>,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Saving video to disk: session={}, size={} bytes",
+        session_id,
+        data.len()
+    );
+
+    let storage = state.local_storage.lock().unwrap();
+    let path = storage.save_video(&session_id, &data).map_err(|e| {
+        error!("Failed to save video: {}", e);
+        format!("Failed to save video: {}", e)
+    })?;
+
+    info!("Video saved successfully: {:?}", path);
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Video saved successfully".to_string()),
+        data: Some(serde_json::json!({
+            "path": path.to_string_lossy().to_string(),
+        })),
+    })
+}
+
+/// Get local storage usage statistics
+#[tauri::command]
+pub fn get_local_storage_usage(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Getting local storage usage");
+
+    let storage = state.local_storage.lock().unwrap();
+    let usage = storage.get_storage_usage().map_err(|e| {
+        error!("Failed to get storage usage: {}", e);
+        format!("Failed to get storage usage: {}", e)
+    })?;
+
+    info!(
+        "Storage usage: screenshots={:.2} MB ({} files), videos={:.2} MB ({} files)",
+        usage.screenshots_mb, usage.screenshot_count, usage.videos_mb, usage.video_count
+    );
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::to_value(&usage).map_err(|e| {
+            error!("Failed to serialize storage usage: {}", e);
+            format!("Failed to serialize storage usage: {}", e)
+        })?),
+    })
+}
+
+/// Delete old sessions from local storage
+#[tauri::command]
+pub fn delete_old_sessions(
+    storage_type: String,
+    older_than_days: u32,
+    state: State<AppState>,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Deleting old sessions: type={}, older_than_days={}",
+        storage_type, older_than_days
+    );
+
+    let storage = state.local_storage.lock().unwrap();
+    storage
+        .delete_old_sessions(&storage_type, older_than_days)
+        .map_err(|e| {
+            error!("Failed to delete old sessions: {}", e);
+            format!("Failed to delete old sessions: {}", e)
+        })?;
+
+    info!("Old sessions deleted successfully");
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Deleted {} sessions older than {} days",
+            storage_type, older_than_days
+        )),
+        data: None,
+    })
+}
+
+/// Clear all local storage (screenshots and videos)
+#[tauri::command]
+pub fn clear_all_storage(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Clearing all local storage");
+
+    let storage = state.local_storage.lock().unwrap();
+    storage.clear_all_storage().map_err(|e| {
+        error!("Failed to clear all storage: {}", e);
+        format!("Failed to clear all storage: {}", e)
+    })?;
+
+    info!("All storage cleared successfully");
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("All storage cleared successfully".to_string()),
+        data: None,
+    })
+}
+
+/// Get the storage paths configuration
+#[tauri::command]
+pub fn get_storage_paths(state: State<AppState>) -> Result<CommandResponse, String> {
+    info!("Getting storage paths");
+
+    let storage = state.local_storage.lock().unwrap();
+    let config = &storage.config;
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "screenshot_path": config.screenshot_path.to_string_lossy().to_string(),
+            "video_path": config.video_path.to_string_lossy().to_string(),
+            "max_screenshot_mb": config.max_screenshot_mb,
+            "max_video_mb": config.max_video_mb,
+            "auto_cleanup": config.auto_cleanup,
+        })),
+    })
 }
