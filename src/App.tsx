@@ -40,7 +40,6 @@ import { useActionLogView, useLogManager } from "./hooks";
 // Components
 import StatusIndicator from "./components/StatusIndicator";
 import CollapsiblePanel from "./components/CollapsiblePanel";
-import RecordingControl from "./components/RecordingControl";
 import ActionLogTable from "./components/ActionLogTable";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageLogTable from "./components/ImageLogTable";
@@ -231,11 +230,11 @@ function AppContent() {
         {/* Header */}
         <div className="text-center space-y-2">
           <h1 className="text-4xl font-bold gradient-text">Qontinui Runner</h1>
-          <p className="text-muted-foreground">Workflow Automation & Recording</p>
+          <p className="text-muted-foreground">Workflow Automation</p>
         </div>
 
         {/* Control Panels Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Configuration Panel */}
           <CollapsiblePanel
             title="Configuration"
@@ -378,13 +377,6 @@ function AppContent() {
               </div>
             </div>
           </CollapsiblePanel>
-
-          {/* Recording Control Panel */}
-          <RecordingControl
-            pythonStatus={execution.pythonStatus}
-            configLoaded={execution.configLoaded}
-            onLog={addLog}
-          />
         </div>
 
         {/* Log Viewer */}

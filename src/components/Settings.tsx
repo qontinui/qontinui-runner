@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Settings as SettingsIcon, Check, X, Camera, FolderOpen, Monitor, Plus, Trash2 } from "lucide-react";
+import { Settings as SettingsIcon, Check, X, Camera, FolderOpen, Monitor, Plus, Trash2, Wifi } from "lucide-react";
 
 interface DebugSettings {
   enable_image_debug: boolean;
@@ -10,6 +10,14 @@ interface DebugSettings {
 
 interface AppSettings {
   auto_load_last_config: boolean;
+}
+
+interface WebSocketSettings {
+  enabled: boolean;
+  url: string;
+  token: string;
+  projectId: string;
+  connected: boolean;
 }
 
 type ScreenSelectionType =
@@ -47,6 +55,13 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
   });
   const [appSettings, setAppSettings] = useState<AppSettings>({
     auto_load_last_config: false,
+  });
+  const [wsSettings, setWsSettings] = useState<WebSocketSettings>({
+    enabled: false,
+    url: "ws://localhost:8001",
+    token: "",
+    projectId: "",
+    connected: false,
   });
   const [captureSettings, setCaptureSettings] = useState<ScreenshotCaptureSettings>({
     enabled: false,
@@ -446,6 +461,108 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
             </button>
           </label>
         </div>
+      </div>
+
+      {/* WebSocket Settings */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <div className="flex items-center gap-3">
+          <Wifi className="w-5 h-5 text-primary" />
+          <h4 className="font-semibold text-lg">WebSocket Streaming</h4>
+          {wsSettings.connected && (
+            <span className="flex items-center gap-2 text-green-600 text-sm font-medium">
+              <span className="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
+              Connected
+            </span>
+          )}
+        </div>
+
+        {/* Enable WebSocket Toggle */}
+        <div className="space-y-2">
+          <label className="flex items-center justify-between cursor-pointer">
+            <div className="space-y-1">
+              <div className="font-medium">Enable Automation Streaming</div>
+              <div className="text-sm text-muted-foreground">
+                Stream automation data to qontinui.com for real-time monitoring and integration testing
+              </div>
+            </div>
+            <button
+              onClick={() => setWsSettings(prev => ({ ...prev, enabled: !prev.enabled }))}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                wsSettings.enabled ? "bg-primary" : "bg-muted"
+              }`}
+            >
+              <span
+                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                  wsSettings.enabled ? "translate-x-6" : "translate-x-1"
+                }`}
+              />
+            </button>
+          </label>
+        </div>
+
+        {/* WebSocket URL */}
+        {wsSettings.enabled && (
+          <>
+            <div className="space-y-2">
+              <label className="block">
+                <div className="font-medium mb-1">WebSocket URL</div>
+                <div className="text-sm text-muted-foreground mb-3">
+                  qontinui-web backend WebSocket endpoint
+                </div>
+                <input
+                  type="text"
+                  value={wsSettings.url}
+                  onChange={(e) => setWsSettings(prev => ({ ...prev, url: e.target.value }))}
+                  placeholder="ws://localhost:8001"
+                  className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                />
+              </label>
+            </div>
+
+            {/* JWT Token */}
+            <div className="space-y-2">
+              <label className="block">
+                <div className="font-medium mb-1">JWT Token</div>
+                <div className="text-sm text-muted-foreground mb-3">
+                  Authentication token from qontinui.com
+                </div>
+                <input
+                  type="password"
+                  value={wsSettings.token}
+                  onChange={(e) => setWsSettings(prev => ({ ...prev, token: e.target.value }))}
+                  placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6..."
+                  className="w-full px-3 py-2 bg-input border border-border/50 rounded-md font-mono text-sm"
+                />
+              </label>
+            </div>
+
+            {/* Project ID */}
+            <div className="space-y-2">
+              <label className="block">
+                <div className="font-medium mb-1">Project ID</div>
+                <div className="text-sm text-muted-foreground mb-3">
+                  Project identifier (integer)
+                </div>
+                <input
+                  type="text"
+                  value={wsSettings.projectId}
+                  onChange={(e) => setWsSettings(prev => ({ ...prev, projectId: e.target.value }))}
+                  placeholder="1"
+                  className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                />
+              </label>
+            </div>
+
+            {/* Info box */}
+            <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+              <div className="text-sm text-muted-foreground">
+                <strong className="text-foreground">Note:</strong> WebSocket streaming is disabled by default.
+                Enable this only when you need real-time monitoring or integration testing. This will send
+                screenshots and logs to your qontinui.com account.
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Debug Settings Form */}

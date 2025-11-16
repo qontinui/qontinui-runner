@@ -144,8 +144,6 @@ class EventType(Enum):
     SCREENSHOT_TAKEN = "screenshot_taken"
     IMAGE_RECOGNITION = "image_recognition"
     ACTION_EXECUTION = "action_execution"
-    RECORDING_STARTED = "recording_started"
-    RECORDING_STOPPED = "recording_stopped"
 
 
 # ExecutionContext and HierarchyMetadata classes removed - replaced by ExecutionTree
@@ -2499,15 +2497,6 @@ class QontinuiExecutor:
             self.set_debug_settings(settings)
             return {"success": True}
 
-        elif cmd_type == "start_recording":
-            return self._handle_start_recording(params)
-
-        elif cmd_type == "stop_recording":
-            return self._handle_stop_recording()
-
-        elif cmd_type == "recording_status":
-            return self._handle_recording_status()
-
         elif cmd_type == "update_capture_settings":
             # Update screenshot capture tool settings
             settings = params.get("settings", {})
@@ -2605,36 +2594,6 @@ class QontinuiExecutor:
 
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
-
-    def _handle_start_recording(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Handle start_recording command.
-
-        Args:
-            params: Command parameters containing 'base_dir'
-
-        Returns:
-            Response with success status and snapshot directory
-        """
-        # Note: Recording not available - controller (from wrappers) doesn't exist in qontinui
-        return {"success": False, "error": "Recording not available (controller module doesn't exist)"}
-
-    def _handle_stop_recording(self) -> dict[str, Any]:
-        """Handle stop_recording command.
-
-        Returns:
-            Response with success status and snapshot directory
-        """
-        # Note: Recording not available - controller (from wrappers) doesn't exist in qontinui
-        return {"success": False, "error": "Recording not available (controller module doesn't exist)"}
-
-    def _handle_recording_status(self) -> dict[str, Any]:
-        """Handle recording_status command.
-
-        Returns:
-            Response with recording status and statistics
-        """
-        # Note: Recording not available - controller (from wrappers) doesn't exist in qontinui
-        return {"success": False, "error": "Recording not available (controller module doesn't exist)"}
 
     def __del__(self):
         """Clean up temp directory on exit."""

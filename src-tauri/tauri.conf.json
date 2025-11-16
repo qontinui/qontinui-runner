@@ -17,7 +17,8 @@
         "width": 1200,
         "height": 750,
         "minWidth": 1100,
-        "minHeight": 700
+        "minHeight": 700,
+        "icon": "icons/icon.png"
       }
     ],
     "security": {

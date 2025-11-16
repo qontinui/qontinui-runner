@@ -800,23 +800,6 @@ impl PythonBridge {
         self.send_command("status", None)
     }
 
-    pub fn start_recording(&mut self, base_dir: &str) -> Result<(), String> {
-        self.send_command(
-            "start_recording",
-            Some(json!({
-                "base_dir": base_dir
-            })),
-        )
-    }
-
-    pub fn stop_recording(&mut self) -> Result<(), String> {
-        self.send_command("stop_recording", None)
-    }
-
-    pub fn get_recording_status(&mut self) -> Result<(), String> {
-        self.send_command("recording_status", None)
-    }
-
     pub fn set_debug_settings(
         &mut self,
         enable_image_debug: bool,
