@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Settings as SettingsIcon, Check, X, Camera, FolderOpen, Monitor, Plus, Trash2, Wifi, Cloud, AlertCircle, HardDrive, Trash } from "lucide-react";
+import { QRScannerDialog } from "./QRScannerDialog";
 
 interface DebugSettings {
   enable_image_debug: boolean;
@@ -12,6 +13,16 @@ interface AppSettings {
   auto_load_last_config: boolean;
 }
 
+interface ConnectionInfo {
+  version: string;
+  url: string;
+  token: string;
+  userId: string;
+  projectId: number | null;
+  createdAt: string;
+  backendUrl: string;  // Backend HTTP(S) URL for REST API calls
+}
+
 interface WebSocketSettings {
   // Connection
   enabled: boolean;
@@ -19,6 +30,7 @@ interface WebSocketSettings {
   token: string;
   projectId: string;
   connected: boolean;
+  backendUrl: string;            // Backend API URL for checking permissions
 
   // Cloud permission status (read-only, from API)
   cloudPermissionEnabled: boolean;
@@ -76,6 +88,8 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     token: "",
     projectId: "",
     connected: false,
+    // Default to production URL in release builds, localhost in dev
+    backendUrl: import.meta.env.DEV ? "http://localhost:8000" : "https://qontinui.io/api",
 
     // Cloud permission status
     cloudPermissionEnabled: false,
@@ -106,6 +120,13 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
   const [manualCaptureRunning, setManualCaptureRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
+
+  // Quick Connect state
+  const [connectionString, setConnectionString] = useState('');
+  const [quickConnectError, setQuickConnectError] = useState<string | null>(null);
+  const [quickConnectSuccess, setQuickConnectSuccess] = useState<string | null>(null);
+  const [quickConnecting, setQuickConnecting] = useState(false);
+  const [qrScannerOpen, setQrScannerOpen] = useState(false);
 
   // Storage state
   const [storageUsage, setStorageUsage] = useState({
@@ -149,7 +170,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     const checkCloudPermission = async () => {
       if (wsSettings.token) {
         try {
-          const response = await fetch('http://localhost:8001/api/v1/users/me/automation-streaming', {
+          const response = await fetch(`${wsSettings.backendUrl}/api/v1/users/me/automation-streaming`, {
             headers: {
               'Authorization': `Bearer ${wsSettings.token}`
             }
@@ -187,7 +208,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     };
 
     checkCloudPermission();
-  }, [wsSettings.token]);
+  }, [wsSettings.token, wsSettings.backendUrl]);
 
   // Listen for manual capture status updates from Python
   useEffect(() => {
@@ -207,6 +228,156 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       if (unlisten) unlisten();
     };
   }, []);
+
+  // Quick Connect functions
+  const parseConnectionString = (jsonString: string): ConnectionInfo => {
+    try {
+      const parsed = JSON.parse(jsonString);
+
+      // Validate required fields
+      const requiredFields = ['version', 'url', 'token', 'userId', 'createdAt'];
+      const missingFields = requiredFields.filter(field => !(field in parsed));
+
+      if (missingFields.length > 0) {
+        throw new Error(`Connection string is missing required fields: ${missingFields.join(', ')}`);
+      }
+
+      // Validate URL format
+      if (!parsed.url.startsWith('ws://') && !parsed.url.startsWith('wss://')) {
+        throw new Error('Invalid WebSocket URL format (must start with ws:// or wss://)');
+      }
+
+      // Validate token is not empty
+      if (!parsed.token || parsed.token.trim() === '') {
+        throw new Error('Token cannot be empty');
+      }
+
+      return {
+        version: parsed.version,
+        url: parsed.url,
+        token: parsed.token,
+        userId: parsed.userId,
+        projectId: parsed.projectId || null,
+        createdAt: parsed.createdAt,
+        backendUrl: parsed.backendUrl || 'http://localhost:8000',  // Fallback for old connection strings
+      };
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        throw new Error('Invalid connection string format (must be valid JSON)');
+      }
+      throw err;
+    }
+  };
+
+  const handleQuickConnect = async (connectionStr?: string) => {
+    setQuickConnectError(null);
+    setQuickConnectSuccess(null);
+    setQuickConnecting(true);
+
+    // Use provided connection string or the one from state
+    const connStr = connectionStr || connectionString;
+
+    try {
+      // Parse and validate connection string
+      const connInfo = parseConnectionString(connStr);
+
+      // First check cloud permission with the token
+      let cloudPermissionEnabled = false;
+      try {
+        const permissionResponse = await fetch(`${connInfo.backendUrl}/api/v1/users/me/automation-streaming`, {
+          headers: {
+            'Authorization': `Bearer ${connInfo.token}`
+          }
+        });
+        if (permissionResponse.ok) {
+          const data = await permissionResponse.json();
+          cloudPermissionEnabled = data.enabled;
+        }
+      } catch (err) {
+        console.warn('Failed to check cloud permission:', err);
+      }
+
+      // Auto-populate WebSocket settings
+      const newSettings = {
+        enabled: true,
+        url: connInfo.url,
+        token: connInfo.token,
+        projectId: connInfo.projectId !== null ? connInfo.projectId.toString() : '',
+        connected: false,
+        backendUrl: connInfo.backendUrl,
+        cloudPermissionEnabled,
+        sessionsLimit: null,
+        sessionsUsed: 0,
+        sessionsResetAt: null,
+        sendToCloud: cloudPermissionEnabled,
+        sendLogs: true,
+        sendScreenshots: true,
+        sendVideos: false,
+      };
+
+      setWsSettings(newSettings);
+
+      // Now test connection with the new settings
+      if (!newSettings.url || !newSettings.token) {
+        throw new Error("WebSocket URL and token are required");
+      }
+
+      if (!cloudPermissionEnabled) {
+        throw new Error("Automation streaming is not enabled for your account. Enable it on the \"Connect Runner\" page at qontinui.io.");
+      }
+
+      // Configure WebSocket
+      const projectId = newSettings.projectId ? parseInt(newSettings.projectId, 10) : null;
+      const configResult: any = await invoke("configure_websocket", {
+        config: {
+          enabled: newSettings.enabled,
+          url: newSettings.url,
+          token: newSettings.token,
+          project_id: projectId,
+        },
+      });
+
+      if (!configResult || !configResult.success) {
+        throw new Error(`Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`);
+      }
+
+      // Connect to WebSocket
+      const connectResult: any = await invoke("connect_websocket");
+      if (!connectResult || !connectResult.success) {
+        throw new Error(`Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`);
+      }
+
+      // Update connected status
+      setWsSettings(prev => ({ ...prev, connected: true }));
+
+      // Success!
+      setQuickConnectSuccess('Connected successfully! Your settings have been configured.');
+      setConnectionString(''); // Clear the textarea
+      onLog("success", "Quick Connect: WebSocket connected successfully");
+
+      // Auto-scroll to Cloud Sync section
+      setTimeout(() => {
+        const cloudSyncSection = document.querySelector('[data-section="cloud-sync"]');
+        if (cloudSyncSection) {
+          cloudSyncSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }, 500);
+
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      setQuickConnectError(errorMessage);
+      onLog("error", `Quick Connect failed: ${errorMessage}`);
+    } finally {
+      setQuickConnecting(false);
+    }
+  };
+
+  const handleQRScan = (data: string) => {
+    setQrScannerOpen(false);
+    setConnectionString(data);
+    // Auto-connect after scan
+    handleQuickConnect(data);
+  };
 
   const loadSettings = async () => {
     try {
@@ -318,8 +489,8 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
 
     // Check cloud permission first
     if (!wsSettings.cloudPermissionEnabled) {
-      onLog("error", "Cloud sync not available. Enable it in your qontinui.com profile.");
-      setError("Cloud sync not available. Enable it in your qontinui.com profile.");
+      onLog("error", "Automation streaming is not enabled. Enable it on the \"Connect Runner\" page at qontinui.io.");
+      setError("Automation streaming is not enabled. Enable it on the \"Connect Runner\" page at qontinui.io.");
       return;
     }
 
@@ -691,6 +862,107 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
         </div>
       )}
 
+      {/* Quick Connect Section */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <div className="flex items-center gap-3">
+          <Wifi className="w-5 h-5 text-primary" />
+          <h4 className="font-semibold text-lg">Quick Connect to qontinui.io</h4>
+        </div>
+
+        <div className="text-sm text-muted-foreground">
+          Paste connection details from <strong>qontinui.io/connect-runner</strong> to connect instantly
+        </div>
+
+        {/* Quick Connect Error message */}
+        {quickConnectError && (
+          <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
+            <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <span className="text-red-400 text-sm">{quickConnectError}</span>
+          </div>
+        )}
+
+        {/* Quick Connect Success message */}
+        {quickConnectSuccess && (
+          <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
+            <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
+            <span className="text-green-400 text-sm">{quickConnectSuccess}</span>
+          </div>
+        )}
+
+        {/* Connection String Input */}
+        <div className="space-y-2">
+          <label className="block">
+            <div className="font-medium mb-1">Connection String</div>
+            <div className="text-sm text-muted-foreground mb-3">
+              Paste the JSON connection string from qontinui.io or scan a QR code
+            </div>
+            <textarea
+              value={connectionString}
+              onChange={(e) => setConnectionString(e.target.value)}
+              placeholder='{"version":"1.0","url":"ws://localhost:8001","token":"eyJ...","userId":"...","projectId":1,"createdAt":"..."}'
+              rows={6}
+              className="w-full px-3 py-2 bg-input border border-border/50 rounded-md font-mono text-xs resize-y"
+            />
+          </label>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex flex-wrap gap-3">
+          <button
+            onClick={() => setQrScannerOpen(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors font-medium"
+          >
+            <Camera className="w-4 h-4" />
+            Scan QR Code
+          </button>
+          <button
+            onClick={() => handleQuickConnect()}
+            disabled={quickConnecting || !connectionString.trim()}
+            className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          >
+            {quickConnecting ? (
+              <>
+                <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                Connecting...
+              </>
+            ) : (
+              <>
+                <Wifi className="w-4 h-4" />
+                Connect
+              </>
+            )}
+          </button>
+          {connectionString.trim() && (
+            <button
+              onClick={() => {
+                setConnectionString('');
+                setQuickConnectError(null);
+                setQuickConnectSuccess(null);
+              }}
+              className="px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md font-medium transition-colors"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+
+        {/* Info box */}
+        <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+          <div className="text-sm text-muted-foreground">
+            <strong className="text-foreground">How it works:</strong> Quick Connect automatically
+            configures your WebSocket settings and tests the connection. You can find your
+            connection string at qontinui.io/connect-runner (requires login).
+          </div>
+        </div>
+      </div>
+
+      {/* QR Scanner Dialog */}
+      <QRScannerDialog
+        open={qrScannerOpen}
+        onOpenChange={setQrScannerOpen}
+        onScan={handleQRScan}
+      />
+
       {/* Application Settings */}
       <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
         <h4 className="font-semibold text-lg mb-4">Application</h4>
@@ -721,7 +993,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       </div>
 
       {/* Cloud Sync Settings */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6" data-section="cloud-sync">
         <div className="flex items-center gap-3">
           <Cloud className="w-5 h-5 text-primary" />
           <h4 className="font-semibold text-lg">Cloud Sync</h4>
@@ -739,7 +1011,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
             <div className="space-y-1">
               <div className="font-medium">Enable Automation Streaming</div>
               <div className="text-sm text-muted-foreground">
-                Connect to qontinui.com for real-time monitoring and cloud storage
+                Connect to qontinui.io for real-time monitoring and cloud storage
               </div>
             </div>
             <button
@@ -760,6 +1032,34 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
         {/* Configuration fields */}
         {wsSettings.enabled && (
           <>
+            {/* Backend URL */}
+            <div className="space-y-2">
+              <label className="block">
+                <div className="font-medium mb-1">Backend URL</div>
+                <div className="text-sm text-muted-foreground mb-3">
+                  qontinui-web backend API endpoint (HTTP/HTTPS)
+                  <br />
+                  {import.meta.env.DEV && (
+                    <span className="text-xs text-yellow-500">
+                      ⚠️ Dev Mode: For WSL, use WSL IP (e.g., http://172.x.x.x:8000)
+                    </span>
+                  )}
+                  {!import.meta.env.DEV && (
+                    <span className="text-xs text-green-500">
+                      ✓ Production: Defaults to https://qontinui.io/api
+                    </span>
+                  )}
+                </div>
+                <input
+                  type="text"
+                  value={wsSettings.backendUrl}
+                  onChange={(e) => setWsSettings(prev => ({ ...prev, backendUrl: e.target.value }))}
+                  placeholder={import.meta.env.DEV ? "http://localhost:8000" : "https://qontinui.io/api"}
+                  className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                />
+              </label>
+            </div>
+
             {/* WebSocket URL */}
             <div className="space-y-2">
               <label className="block">
@@ -782,7 +1082,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
               <label className="block">
                 <div className="font-medium mb-1">JWT Token</div>
                 <div className="text-sm text-muted-foreground mb-3">
-                  Authentication token from qontinui.com
+                  Authentication token from qontinui.io
                 </div>
                 <input
                   type="password"
@@ -830,7 +1130,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
               <div className="p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg flex items-start gap-2">
                 <AlertCircle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
                 <div className="text-sm text-orange-300">
-                  Cloud sync is not enabled for your account. Enable it in your profile at qontinui.com.
+                  Automation streaming is not enabled for your account. Enable it on the "Connect Runner" page at qontinui.io.
                 </div>
               </div>
             )}
@@ -841,7 +1141,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
                 <div className="space-y-1">
                   <div className="font-medium">Send to Cloud</div>
                   <div className="text-sm text-muted-foreground">
-                    Upload automation data to qontinui.com for analysis and collaboration
+                    Upload automation data to qontinui.io for analysis and collaboration
                   </div>
                 </div>
                 <button

@@ -428,11 +428,11 @@ impl PythonBridge {
         mut cmd_rx: mpsc::Receiver<ExecutorCommand>,
     ) {
         while let Some(cmd) = cmd_rx.recv().await {
-            info!("Command sender received command: {}", cmd.command);
+            debug!("Command sender received command: {}", cmd.command);
             match serde_json::to_string(&cmd) {
                 Ok(json) => {
-                    info!("Serialized command to JSON, length: {} bytes", json.len());
-                    info!("JSON payload (first 200 chars): {}", &json.chars().take(200).collect::<String>());
+                    debug!("Serialized command to JSON, length: {} bytes", json.len());
+                    debug!("JSON payload (first 200 chars): {}", &json.chars().take(200).collect::<String>());
 
                     if let Err(e) = writeln!(stdin, "{}", json) {
                         error!("Failed to write command to stdin: {}", e);
@@ -444,7 +444,7 @@ impl PythonBridge {
                         break;
                     }
 
-                    info!("Successfully wrote command '{}' to Python stdin and flushed", cmd.command);
+                    debug!("Successfully wrote command '{}' to Python stdin and flushed", cmd.command);
                 }
                 Err(e) => {
                     error!("Failed to serialize command: {}", e);
