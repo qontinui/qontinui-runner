@@ -77,7 +77,8 @@ class UnifiedDataCollector:
     def __init__(
         self,
         state_memory: Any,
-        screenshot_service: Optional[Any] = None
+        screenshot_service: Optional[Any] = None,
+        record_created_callback: Optional[callable] = None
     ) -> None:
         """Initialize the UnifiedDataCollector.
 
@@ -87,6 +88,8 @@ class UnifiedDataCollector:
                          a list of active state names.
             screenshot_service: Optional ScreenshotService for storing screenshots.
                               If None, screenshot functionality is disabled.
+            record_created_callback: Optional callback function called when a record
+                                   is created. Signature: callback(record: ActionExecutionRecord)
 
         Example:
             >>> collector = UnifiedDataCollector(state_memory, screenshot_service)
@@ -94,6 +97,7 @@ class UnifiedDataCollector:
         """
         self.state_memory = state_memory
         self.screenshot_service = screenshot_service
+        self.record_created_callback = record_created_callback
         self._lock = threading.RLock()
 
         # Runtime buffer (cleared after each action)
@@ -523,6 +527,18 @@ class UnifiedDataCollector:
 
             # Clear runtime buffer
             self._clear_runtime_buffer()
+
+            # Notify callback if provided
+            if self.record_created_callback:
+                try:
+                    self.record_created_callback(record)
+                except Exception as e:
+                    # Log but don't raise - callbacks shouldn't break execution
+                    import logging
+                    logging.getLogger(__name__).error(
+                        f"Error in record_created_callback: {e}",
+                        exc_info=True
+                    )
 
             return record
 

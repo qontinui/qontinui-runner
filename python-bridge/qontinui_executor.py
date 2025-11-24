@@ -78,6 +78,7 @@ from services.unified_data_collector import UnifiedDataCollector
 from services.screenshot_service import ScreenshotService
 from services.tree_view_layer import TreeViewLayer
 from services.capture_tool_service import CaptureToolService, ScreenshotCaptureSettings, ManualClickListener
+from services.training_export_service import TrainingExportService, ExportConfig
 
 # WebSocket integration for qontinui-web
 try:
@@ -536,6 +537,7 @@ class QontinuiExecutor:
         # These services are created after we have a run directory and state_executor
         self.screenshot_service = None  # ScreenshotService for screenshot storage
         self.unified_data_collector = None  # UnifiedDataCollector for action execution data
+        self.training_export_service = None  # TrainingExportService for training data export
 
         # Screenshot capture tool for configuration builder (qontinui-web)
         self.capture_tool_service = CaptureToolService()  # Initially disabled, enabled via update_capture_settings
@@ -903,12 +905,40 @@ class QontinuiExecutor:
             # Adapter bridges this interface difference
             state_memory_adapter = StateMemoryAdapter(self.state_executor)
 
+            # Initialize TrainingExportService (if enabled via environment variable)
+            # This service automatically collects ActionExecutionRecords for training data export
+            export_enabled = os.getenv("QONTINUI_EXPORT_TRAINING_DATA", "false").lower() == "true"
+            export_dir = os.getenv("QONTINUI_EXPORT_DIR")
+
+            if export_enabled and export_dir:
+                export_config = ExportConfig(
+                    enabled=True,
+                    output_dir=Path(export_dir),
+                    dataset_version="1.0.0",
+                    export_mode="on_completion",  # Export when run completes
+                    filter_successful_only=False,  # Include all records
+                    filter_with_matches=False  # Include records without matches
+                )
+                self.training_export_service = TrainingExportService(
+                    config=export_config,
+                    storage_dir=run_dir
+                )
+                self._emit_log("info", f"TrainingExportService enabled: {export_dir}")
+            else:
+                self._emit_log("info", "TrainingExportService disabled")
+
             # Initialize UnifiedDataCollector
             # Pass state memory adapter for state snapshot capture
             # Pass screenshot_service for screenshot storage integration
+            # Pass callback for training data export (if enabled)
+            record_callback = None
+            if self.training_export_service:
+                record_callback = self.training_export_service.add_record
+
             self.unified_data_collector = UnifiedDataCollector(
                 state_memory=state_memory_adapter,
-                screenshot_service=self.screenshot_service
+                screenshot_service=self.screenshot_service,
+                record_created_callback=record_callback
             )
             self._emit_log("info", "UnifiedDataCollector initialized with StateExecutor adapter and ScreenshotService")
 
@@ -2369,6 +2399,22 @@ class QontinuiExecutor:
                 },
             )
 
+            # Export training data if enabled
+            if self.training_export_service:
+                try:
+                    stats = self.training_export_service.export_on_completion()
+                    if stats:
+                        self._emit_log("info",
+                            f"Training data exported: {stats.unique_images} images, "
+                            f"{stats.total_annotations} annotations"
+                        )
+                        # Also export to COCO format
+                        coco_path = self.training_export_service.config.output_dir / "dataset.json"
+                        if self.training_export_service.export_to_coco(coco_path):
+                            self._emit_log("info", f"COCO format exported: {coco_path}")
+                except Exception as e:
+                    self._emit_log("error", f"Failed to export training data: {e}")
+
             # End WebSocket session on success
             if self.ws_enabled and self.ws_client:
                 self._ws_end_session(status="completed")
@@ -2459,6 +2505,18 @@ class QontinuiExecutor:
             self._emit_event(
                 EventType.EXECUTION_COMPLETED, {"success": False, "reason": "User stopped"}
             )
+
+            # Export training data if enabled (even on manual stop)
+            if self.training_export_service:
+                try:
+                    stats = self.training_export_service.export_on_completion()
+                    if stats:
+                        self._emit_log("info",
+                            f"Training data exported on stop: {stats.unique_images} images, "
+                            f"{stats.total_annotations} annotations"
+                        )
+                except Exception as e:
+                    self._emit_log("error", f"Failed to export training data on stop: {e}")
 
     def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Handle command from Tauri."""
