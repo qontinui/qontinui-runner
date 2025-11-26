@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 const COMMAND_CHANNEL_CAPACITY: usize = 100;
 
@@ -92,24 +92,32 @@ impl PythonBridge {
             return Err("Python process already running".to_string());
         }
 
-        info!("Starting Python executor with type: {}", executor_type);
+        info!("Starting executor with type: {}", executor_type);
 
         // Load debug settings to send to Python
         let debug_settings = crate::settings::get_debug_settings();
 
-        // Determine script name
-        let script_name = match executor_type {
-            "minimal" => "minimal_bridge.py",
-            "real" => "qontinui_executor.py",
-            _ => "qontinui_bridge.py",
+        // Try bundled executor first, fall back to Python
+        let mut cmd = if let Some(bundled_path) = self.find_bundled_executor() {
+            info!("Using bundled executor mode");
+            self.build_bundled_command(&bundled_path)
+        } else {
+            info!("Using Python interpreter mode");
+
+            // Determine script name
+            let script_name = match executor_type {
+                "minimal" => "minimal_bridge.py",
+                "real" => "qontinui_executor.py",
+                _ => "qontinui_bridge.py",
+            };
+
+            // Find bridge script
+            let bridge_script = self.find_bridge_script(script_name)?;
+            info!("Using Python bridge script: {:?}", bridge_script);
+
+            // Build Python command
+            self.build_python_command(&bridge_script, executor_type)?
         };
-
-        // Find bridge script
-        let bridge_script = self.find_bridge_script(script_name)?;
-        info!("Using Python bridge script: {:?}", bridge_script);
-
-        // Build Python command
-        let mut cmd = self.build_python_command(&bridge_script, executor_type)?;
 
         // Add mock flag if not real mode
         if executor_type != "real" {
@@ -716,6 +724,106 @@ impl PythonBridge {
         };
 
         Ok(cmd)
+    }
+
+    /// Finds the bundled executor sidecar executable
+    /// Returns None if running in development mode (executable not found)
+    fn find_bundled_executor(&self) -> Option<PathBuf> {
+        // Get the platform-specific executable name
+        let exe_name = if cfg!(target_os = "windows") {
+            "qontinui-executor.exe"
+        } else {
+            "qontinui-executor"
+        };
+
+        // Get the target triple for this platform
+        let target_triple = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            "x86_64-pc-windows-msvc"
+        } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+            "aarch64-pc-windows-msvc"
+        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+            "x86_64-apple-darwin"
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            "aarch64-apple-darwin"
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            "x86_64-unknown-linux-gnu"
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            return None;
+        };
+
+        // Platform-specific sidecar name (Tauri convention)
+        let sidecar_name = if cfg!(target_os = "windows") {
+            format!("qontinui-executor-{}.exe", target_triple)
+        } else {
+            format!("qontinui-executor-{}", target_triple)
+        };
+
+        // Try to resolve using Tauri's resource directory
+        if let Ok(resource_dir) = self.app_handle.path().resource_dir() {
+            let sidecar_path = resource_dir.join(&sidecar_name);
+            debug!("Checking bundled sidecar at: {:?}", sidecar_path);
+            if sidecar_path.exists() {
+                info!("Found bundled executor at: {:?}", sidecar_path);
+                return Some(sidecar_path);
+            }
+        }
+
+        // Try relative paths for development/testing
+        let possible_paths = vec![
+            // In src-tauri/binaries (development)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .map(|p| p.join("binaries").join(&sidecar_name)),
+            // Relative to current directory
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.join("src-tauri").join("binaries").join(&sidecar_name)),
+            // Simple name without target triple (for manual testing)
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+                .map(|p| p.join("binaries").join(exe_name)),
+        ];
+
+        for path in possible_paths.into_iter().flatten() {
+            debug!("Checking sidecar path: {:?}, exists: {}", path, path.exists());
+            if path.exists() {
+                info!("Found bundled executor at: {:?}", path);
+                return Some(path);
+            }
+        }
+
+        debug!("Bundled executor not found, will use Python mode");
+        None
+    }
+
+    /// Builds a command for the bundled executor
+    fn build_bundled_command(&self, executor_path: &PathBuf) -> Command {
+        info!("Using bundled executor: {:?}", executor_path);
+        let mut cmd = Command::new(executor_path);
+
+        // The bundled executor doesn't need the script path since it's compiled in
+        // But it still accepts the same command-line arguments
+
+        cmd
+    }
+
+    /// Determines if we should use the bundled executor or Python
+    /// Returns true if bundled executor should be used
+    fn should_use_bundled(&self) -> bool {
+        // Check environment variable override
+        if let Ok(val) = std::env::var("QONTINUI_USE_PYTHON") {
+            if val == "1" || val.to_lowercase() == "true" {
+                info!("QONTINUI_USE_PYTHON set, forcing Python mode");
+                return false;
+            }
+        }
+
+        // Check if bundled executor exists
+        self.find_bundled_executor().is_some()
     }
 
     pub fn stop(&mut self) -> Result<(), String> {

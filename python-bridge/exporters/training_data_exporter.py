@@ -7,18 +7,38 @@ compatible with qontinui-train and qontinui-finetune. It supports:
 - Screenshot deduplication
 - Bounding box extraction from match results and click locations
 - Dataset versioning and metadata tracking
+
+Note: Bounding box inference from click locations uses the sophisticated
+analysis provided by qontinui.discovery.click_analysis, which detects
+actual element boundaries rather than using fixed-size boxes.
 """
 
 import json
 import hashlib
+import logging
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set, Tuple
+
+import numpy as np
 from PIL import Image
 
 from models.action_execution_record import ActionExecutionRecord
+
+# Import click analysis from qontinui library
+try:
+    from qontinui.discovery.click_analysis import (
+        ClickBoundingBoxInferrer,
+        InferenceConfig,
+        InferenceResult,
+    )
+    CLICK_ANALYSIS_AVAILABLE = True
+except ImportError:
+    CLICK_ANALYSIS_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -64,12 +84,21 @@ class TrainingDataExporter:
         >>> print(f"Exported {stats.total_annotations} annotations from {stats.unique_images} images")
     """
 
-    def __init__(self, output_dir: Path, dataset_version: str = "1.0.0"):
+    def __init__(
+        self,
+        output_dir: Path,
+        dataset_version: str = "1.0.0",
+        use_smart_bbox_inference: bool = True,
+        inference_config: Optional[Any] = None,
+    ):
         """Initialize the TrainingDataExporter.
 
         Args:
             output_dir: Directory where the training dataset will be created.
             dataset_version: Version string for this dataset (e.g., "1.0.0").
+            use_smart_bbox_inference: If True, use qontinui's click analysis to
+                infer accurate bounding boxes. If False, fall back to fixed-size boxes.
+            inference_config: Optional InferenceConfig for click analysis.
         """
         self.output_dir = output_dir
         self.dataset_version = dataset_version
@@ -84,6 +113,17 @@ class TrainingDataExporter:
 
         # Image deduplication
         self.image_hashes: Set[str] = set()
+
+        # Click analysis configuration
+        self.use_smart_bbox_inference = use_smart_bbox_inference and CLICK_ANALYSIS_AVAILABLE
+        self._bbox_inferrer: Optional[Any] = None
+        self._inference_config = inference_config
+
+        if use_smart_bbox_inference and not CLICK_ANALYSIS_AVAILABLE:
+            logger.warning(
+                "Smart bounding box inference requested but qontinui.discovery.click_analysis "
+                "is not available. Falling back to fixed-size boxes."
+            )
 
         # Create directory structure
         self._create_directories()
@@ -183,9 +223,13 @@ class TrainingDataExporter:
             self.image_hashes.add(img_hash)
             stats.unique_images += 1
 
-        # Get image dimensions
+        # Get image dimensions and load as numpy array if smart inference is enabled
         with Image.open(screenshot_path) as img:
             img_width, img_height = img.size
+            screenshot_array = None
+            if self.use_smart_bbox_inference and record.clicked_location:
+                # Convert to numpy array for click analysis
+                screenshot_array = np.array(img)
 
         # Build annotations for this image
         annotations = []
@@ -211,22 +255,33 @@ class TrainingDataExporter:
         # Annotation from clicked_location (human interaction - high confidence)
         if record.clicked_location:
             stats.records_with_clicks += 1
-            bbox = self._infer_bbox_from_click(
-                record.clicked_location,
-                img_width,
-                img_height
-            )
-            if bbox:
+
+            # Use smart inference if available, otherwise fall back to fixed-size
+            if self.use_smart_bbox_inference and screenshot_array is not None:
+                annotation = self._infer_bbox_smart(
+                    record.clicked_location,
+                    screenshot_array,
+                    record.click_target_type,
+                )
+            else:
+                bbox = self._infer_bbox_from_click(
+                    record.clicked_location,
+                    img_width,
+                    img_height
+                )
                 category_name = record.click_target_type or "click_target"
                 category_id = self._get_or_create_category_id(category_name)
-                annotations.append({
+                annotation = {
                     "bbox": bbox,
                     "category_id": category_id,
                     "category_name": category_name,
                     "confidence": 1.0,  # Human interaction is high confidence
                     "source": "user_click",
                     "verified": True,  # User clicks are pre-verified
-                })
+                }
+
+            if annotation:
+                annotations.append(annotation)
                 stats.total_annotations += 1
 
         # Save or update annotation file
@@ -271,10 +326,11 @@ class TrainingDataExporter:
         img_height: int,
         bbox_size: int = 50
     ) -> List[int]:
-        """Infer a bounding box from a click location.
+        """Infer a bounding box from a click location using fixed-size fallback.
 
-        Since clicks are point coordinates, we create a small bounding box
-        centered on the click location.
+        This is the simple fallback method that creates a fixed-size bounding box
+        centered on the click location. For more sophisticated detection, use
+        _infer_bbox_smart() with the qontinui library.
 
         Args:
             clicked_location: (x, y) tuple of click coordinates.
@@ -295,6 +351,96 @@ class TrainingDataExporter:
         bbox_h = min(bbox_size, img_height - bbox_y)
 
         return [bbox_x, bbox_y, bbox_w, bbox_h]
+
+    def _infer_bbox_smart(
+        self,
+        clicked_location: Tuple[int, int],
+        screenshot: np.ndarray,
+        click_target_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Infer bounding box using qontinui's sophisticated click analysis.
+
+        Uses multiple detection strategies (edge detection, contour detection,
+        color segmentation, flood fill) to find the actual element boundaries
+        at the click location rather than using a fixed-size box.
+
+        Args:
+            clicked_location: (x, y) tuple of click coordinates.
+            screenshot: Screenshot as numpy array (RGB or BGR).
+            click_target_type: Optional hint about the target type.
+
+        Returns:
+            Annotation dictionary with bbox, category, confidence, and metadata,
+            or None if detection failed.
+        """
+        if not CLICK_ANALYSIS_AVAILABLE:
+            return None
+
+        # Lazy initialization of the inferrer
+        if self._bbox_inferrer is None:
+            config = self._inference_config
+            if config is None:
+                config = InferenceConfig()
+            self._bbox_inferrer = ClickBoundingBoxInferrer(config)
+
+        try:
+            # Run inference
+            result: InferenceResult = self._bbox_inferrer.infer_bounding_box(
+                screenshot=screenshot,
+                click_location=clicked_location,
+            )
+
+            bbox = result.primary_bbox
+
+            # Determine category name
+            # Use detected element type if available, otherwise fall back to provided type
+            if bbox.element_type.value != "unknown":
+                category_name = f"{click_target_type or 'click_target'}_{bbox.element_type.value}"
+            else:
+                category_name = click_target_type or "click_target"
+
+            category_id = self._get_or_create_category_id(category_name)
+
+            # Build annotation with rich metadata
+            annotation = {
+                "bbox": bbox.as_bbox_list(),
+                "category_id": category_id,
+                "category_name": category_name,
+                "confidence": bbox.confidence,
+                "source": "smart_click_analysis",
+                "verified": True,  # User clicks are pre-verified
+                "inference_metadata": {
+                    "strategy_used": bbox.strategy_used.value,
+                    "element_type": bbox.element_type.value,
+                    "used_fallback": result.used_fallback,
+                    "processing_time_ms": result.processing_time_ms,
+                    "alternatives_count": len(result.alternative_candidates),
+                },
+            }
+
+            # Log if fallback was used
+            if result.used_fallback:
+                logger.debug(
+                    f"Click analysis fell back to fixed-size box at {clicked_location}"
+                )
+
+            return annotation
+
+        except Exception as e:
+            logger.warning(f"Smart bbox inference failed: {e}. Using fallback.")
+            # Fall back to fixed-size
+            img_height, img_width = screenshot.shape[:2]
+            bbox = self._infer_bbox_from_click(clicked_location, img_width, img_height)
+            category_name = click_target_type or "click_target"
+            category_id = self._get_or_create_category_id(category_name)
+            return {
+                "bbox": bbox,
+                "category_id": category_id,
+                "category_name": category_name,
+                "confidence": 1.0,
+                "source": "user_click_fallback",
+                "verified": True,
+            }
 
     def _save_annotations(
         self,
