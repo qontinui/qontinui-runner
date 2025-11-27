@@ -1,53 +1,30 @@
 use super::health::{HealthCheckTask, HealthMonitor};
-use super::lifecycle::{parse_executor_message, ExecutorLifecycle, ExecutorMessage};
+use super::lifecycle::ExecutorLifecycle;
+use super::output::OutputProcessor;
+use super::process::ProcessManager;
+use super::protocol::{ExecutorCommand, ProtocolHandler};
 use super::state::ExecutorState;
-use crate::commands::AppState;
-use crate::display::RawEvent;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::Arc;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
-const COMMAND_CHANNEL_CAPACITY: usize = 100;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutorCommand {
-    #[serde(rename = "type")]
-    pub cmd_type: String,
-    pub id: String,
-    pub command: String,
-    pub params: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutorResponse {
-    #[serde(rename = "type")]
-    pub resp_type: String,
-    pub id: String,
-    pub success: bool,
-    pub data: Option<Value>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutorEvent {
-    #[serde(rename = "type")]
-    pub event_type: String,
-    pub event: String,
-    pub timestamp: f64,
-    pub sequence: u32,
-    pub data: Value,
-}
+// Re-export protocol types for backward compatibility
+pub use super::protocol::{ExecutorEvent, ExecutorResponse};
 
 /// Python executor bridge with lifecycle management and health monitoring
+/// Acts as a facade that delegates to specialized handlers
 pub struct PythonBridge {
     /// Python process handle
     process: Option<Child>,
+
+    /// Process manager for spawning and configuring Python processes
+    process_manager: ProcessManager,
+
+    /// Protocol handler for command/response communication
+    protocol_handler: ProtocolHandler,
 
     /// Lifecycle manager
     lifecycle: Arc<RwLock<ExecutorLifecycle>>,
@@ -57,9 +34,6 @@ pub struct PythonBridge {
 
     /// Tauri app handle for emitting events
     app_handle: tauri::AppHandle,
-
-    /// Channel for sending commands to Python
-    command_tx: Option<mpsc::Sender<ExecutorCommand>>,
 
     /// Runtime for async tasks
     runtime: Arc<tokio::runtime::Runtime>,
@@ -73,10 +47,11 @@ impl PythonBridge {
 
         Self {
             process: None,
+            process_manager: ProcessManager::new(app_handle.clone()),
+            protocol_handler: ProtocolHandler::new(),
             lifecycle: Arc::new(RwLock::new(ExecutorLifecycle::new())),
             health_monitor: Arc::new(HealthMonitor::new()),
             app_handle,
-            command_tx: None,
             runtime,
         }
     }
@@ -97,54 +72,8 @@ impl PythonBridge {
         // Load debug settings to send to Python
         let debug_settings = crate::settings::get_debug_settings();
 
-        // Try bundled executor first, fall back to Python
-        let mut cmd = if let Some(bundled_path) = self.find_bundled_executor() {
-            info!("Using bundled executor mode");
-            self.build_bundled_command(&bundled_path)
-        } else {
-            info!("Using Python interpreter mode");
-
-            // Determine script name
-            let script_name = match executor_type {
-                "minimal" => "minimal_bridge.py",
-                "real" => "qontinui_executor.py",
-                _ => "qontinui_bridge.py",
-            };
-
-            // Find bridge script
-            let bridge_script = self.find_bridge_script(script_name)?;
-            info!("Using Python bridge script: {:?}", bridge_script);
-
-            // Build Python command
-            self.build_python_command(&bridge_script, executor_type)?
-        };
-
-        // Add mock flag if not real mode
-        if executor_type != "real" {
-            cmd.arg("--mock");
-        }
-
-        // CRITICAL: Disable console logging to prevent JSON parse errors
-        // The executor expects all stderr/stdout to be valid JSON messages
-        // Use command-line flag instead of environment variable for reliability
-        cmd.arg("--disable-console-logging");
-
-        // CRITICAL: Set environment variables AFTER building command
-        // These must be set on the final Command object that will be spawned
-
-        // Set PYTHONUNBUFFERED to force immediate output (more reliable than -u flag)
-        cmd.env("PYTHONUNBUFFERED", "1");
-
-        // Also set environment variable as backup (some code paths might check it)
-        cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
-
-        // Spawn Python process
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start Python process: {}", e))?;
+        // Spawn Python process using process manager
+        let mut child = self.process_manager.spawn_process(executor_type)?;
 
         info!("Python process spawned, waiting for READY signal");
 
@@ -152,9 +81,9 @@ impl PythonBridge {
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to capture stderr")?;
 
-        // Create command channel
-        let (cmd_tx, cmd_rx) = mpsc::channel::<ExecutorCommand>(COMMAND_CHANNEL_CAPACITY);
-        self.command_tx = Some(cmd_tx.clone());
+        // Create command channel using protocol handler
+        let (cmd_tx, cmd_rx) = ProtocolHandler::create_channel();
+        self.protocol_handler.set_sender(cmd_tx.clone());
 
         // Store stdin for command sending
         let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
@@ -165,14 +94,14 @@ impl PythonBridge {
         let app_handle = self.app_handle.clone();
         let runtime = Arc::clone(&self.runtime);
 
-        // Spawn stdout reader task
+        // Spawn stdout reader task using output processor
         let lifecycle_stdout = Arc::clone(&lifecycle);
         let app_handle_stdout = app_handle.clone();
         let health_monitor_stdout = Arc::clone(&health_monitor);
 
         std::thread::spawn(move || {
             runtime.block_on(async {
-                Self::stdout_reader_task(
+                OutputProcessor::stdout_reader_task(
                     stdout,
                     lifecycle_stdout,
                     health_monitor_stdout,
@@ -182,20 +111,16 @@ impl PythonBridge {
             });
         });
 
-        // Spawn stderr reader task with log level parsing
+        // Spawn stderr reader task using output processor
         std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                Self::log_python_stderr(&line);
-            }
-            info!("Stderr reader thread ending");
+            OutputProcessor::stderr_reader_task(stderr);
         });
 
-        // Spawn command sender task
+        // Spawn command sender task using protocol handler
         let runtime_cmd = Arc::clone(&self.runtime);
         std::thread::spawn(move || {
             runtime_cmd.block_on(async {
-                Self::command_sender_task(stdin, cmd_rx).await;
+                ProtocolHandler::command_sender_task(stdin, cmd_rx).await;
             });
         });
 
@@ -209,621 +134,95 @@ impl PythonBridge {
 
         // Start immediately without waiting (original behavior that worked)
         {
-                info!("Starting health monitoring");
+            info!("Starting health monitoring");
 
-                // Start health monitoring
-                self.runtime.block_on(async {
-                    self.health_monitor.start().await;
-                });
-
-                // Start health check task
-                let health_monitor_task = Arc::clone(&self.health_monitor);
-                let cmd_tx_health = cmd_tx.clone();
-                let (ping_tx, mut ping_rx) = mpsc::channel::<()>(10);
-
-                let runtime_health = Arc::clone(&self.runtime);
-                std::thread::spawn(move || {
-                    runtime_health.block_on(async {
-                        let task = HealthCheckTask::new(health_monitor_task, ping_tx);
-                        if let Err(e) = task.run().await {
-                            error!("Health check task error: {}", e);
-                        }
-                    });
-                });
-
-                // Spawn task to send ping commands
-                let runtime_ping = Arc::clone(&self.runtime);
-                std::thread::spawn(move || {
-                    runtime_ping.block_on(async {
-                        while let Some(()) = ping_rx.recv().await {
-                            let ping_cmd = ExecutorCommand {
-                                cmd_type: "command".to_string(),
-                                id: uuid::Uuid::new_v4().to_string(),
-                                command: "ping".to_string(),
-                                params: None,
-                            };
-
-                            if cmd_tx_health.send(ping_cmd).await.is_err() {
-                                break;
-                            }
-                        }
-                    });
-                });
-
-                // Send debug settings to Python executor
-                info!("Sending debug settings to Python executor: {:?}", debug_settings);
-                let debug_params = json!({
-                    "enable_image_debug": debug_settings.enable_image_debug,
-                    "top_matches_count": debug_settings.top_matches_count,
-                });
-
-                let debug_cmd = ExecutorCommand {
-                    cmd_type: "command".to_string(),
-                    id: uuid::Uuid::new_v4().to_string(),
-                    command: "set_debug_settings".to_string(),
-                    params: Some(debug_params),
-                };
-
-                if let Err(e) = self.runtime.block_on(async {
-                    cmd_tx.send(debug_cmd).await
-                }) {
-                    error!("Failed to send debug settings to Python: {}", e);
-                }
-
-                // Drain any queued events
-                let queued_events = self.runtime.block_on(async {
-                    self.lifecycle.read().await.drain_queued_events().await
-                });
-
-                for queued in queued_events {
-                    info!(
-                        "Processing queued event: {} (queued at {})",
-                        queued.event_type, queued.queued_at
-                    );
-                    let event = ExecutorEvent {
-                        event_type: "event".to_string(),
-                        event: queued.event_type,
-                        timestamp: queued.queued_at as f64 / 1000.0,
-                        sequence: 0,
-                        data: queued.data,
-                    };
-                    if let Err(e) = self.app_handle.emit("executor-event", &event) {
-                        error!("Failed to emit queued event: {}", e);
-                    }
-                }
-
-                Ok(())
-        }
-    }
-
-    /// Parse and log Python stderr output with appropriate log levels
-    fn log_python_stderr(line: &str) {
-        // Python structlog outputs in format: "YYYY-MM-DD HH:MM:SS [level    ] message"
-        // Also handle plain output like "[EventTranslator] message"
-
-        // Try to extract log level from structlog format
-        if let Some(start) = line.find('[') {
-            if let Some(end) = line[start..].find(']') {
-                let level_part = &line[start + 1..start + end];
-                let level = level_part.trim();
-
-                // Map Python log levels to Rust tracing levels
-                match level.to_lowercase().as_str() {
-                    "debug" => debug!("Python: {}", line),
-                    "info" => info!("Python: {}", line),
-                    "warning" | "warn" => tracing::warn!("Python: {}", line),
-                    "error" => error!("Python: {}", line),
-                    "critical" => error!("Python CRITICAL: {}", line),
-                    _ => {
-                        // Not a recognized log level, check if it's an info-level message
-                        // (like "[EventTranslator] message")
-                        if line.contains("event emitted") || line.contains("successfully") {
-                            info!("Python: {}", line);
-                        } else {
-                            // Default to debug for unknown bracketed content
-                            debug!("Python: {}", line);
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        // No brackets found, treat as info if it looks informational, debug otherwise
-        if line.contains("error") || line.contains("Error") || line.contains("ERROR") {
-            error!("Python: {}", line);
-        } else if line.contains("warning") || line.contains("Warning") || line.contains("WARN") {
-            tracing::warn!("Python: {}", line);
-        } else if !line.trim().is_empty() {
-            debug!("Python: {}", line);
-        }
-    }
-
-    /// Stdout reader task with lifecycle and health management
-    async fn stdout_reader_task(
-        stdout: std::process::ChildStdout,
-        lifecycle: Arc<RwLock<ExecutorLifecycle>>,
-        health_monitor: Arc<HealthMonitor>,
-        app_handle: tauri::AppHandle,
-    ) {
-        let reader = BufReader::new(stdout);
-
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    debug!("Python stdout: {}", line);
-
-                    // Parse message
-                    match parse_executor_message(&line) {
-                        Ok(message) => {
-                            debug!("Parsed message: {:?}", message);
-
-                            // Handle pong messages for health monitoring
-                            if matches!(message, ExecutorMessage::Pong { .. }) {
-                                health_monitor.record_pong().await;
-                                continue;
-                            }
-
-                            // Process message through lifecycle
-                            let mut lifecycle_guard = lifecycle.write().await;
-                            match lifecycle_guard.handle_message(message.clone()).await {
-                                Ok(Some(msg)) => {
-                                    // Forward message to frontend
-                                    Self::emit_message_to_frontend(&app_handle, msg).await;
-                                }
-                                Ok(None) => {
-                                    // Message was handled internally (e.g., queued)
-                                    debug!("Message handled internally");
-                                }
-                                Err(e) => {
-                                    error!("Error handling message: {}", e);
-
-                                    // Emit error to frontend
-                                    let error_event = json!({
-                                        "type": "error",
-                                        "error": "message_handling_error",
-                                        "message": e.to_string(),
-                                    });
-                                    let _ = app_handle.emit("executor-error", &error_event);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to parse executor message: {} - Line: {}", e, line);
-
-                            // Emit parse error to frontend with full context
-                            let error_event = json!({
-                                "type": "error",
-                                "error": "parse_error",
-                                "message": format!("Failed to parse executor output: {}", e),
-                                "raw_line": line,
-                                "timestamp": chrono::Utc::now().timestamp_millis(),
-                            });
-                            let _ = app_handle.emit("executor-error", &error_event);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Error reading stdout: {}", e);
-                    break;
-                }
-            }
-        }
-
-        info!("Stdout reader task ending");
-
-        // Mark as failed if not already in terminal state
-        let lifecycle_guard = lifecycle.write().await;
-        let state = lifecycle_guard.get_state().await;
-        if !state.is_terminal() {
-            let _ = lifecycle_guard
-                .mark_failed("Python process stdout closed unexpectedly".to_string())
-                .await;
-
-            // Emit error to frontend
-            let error_event = json!({
-                "type": "error",
-                "error": "executor_crashed",
-                "message": "Python executor process terminated unexpectedly",
+            // Start health monitoring
+            self.runtime.block_on(async {
+                self.health_monitor.start().await;
             });
-            let _ = app_handle.emit("executor-error", &error_event);
-        }
-    }
 
-    /// Command sender task
-    async fn command_sender_task(
-        mut stdin: std::process::ChildStdin,
-        mut cmd_rx: mpsc::Receiver<ExecutorCommand>,
-    ) {
-        while let Some(cmd) = cmd_rx.recv().await {
-            debug!("Command sender received command: {}", cmd.command);
-            match serde_json::to_string(&cmd) {
-                Ok(json) => {
-                    debug!("Serialized command to JSON, length: {} bytes", json.len());
-                    debug!("JSON payload (first 200 chars): {}", &json.chars().take(200).collect::<String>());
+            // Start health check task
+            let health_monitor_task = Arc::clone(&self.health_monitor);
+            let cmd_tx_health = cmd_tx.clone();
+            let (ping_tx, mut ping_rx) = mpsc::channel::<()>(10);
 
-                    if let Err(e) = writeln!(stdin, "{}", json) {
-                        error!("Failed to write command to stdin: {}", e);
-                        break;
+            let runtime_health = Arc::clone(&self.runtime);
+            std::thread::spawn(move || {
+                runtime_health.block_on(async {
+                    let task = HealthCheckTask::new(health_monitor_task, ping_tx);
+                    if let Err(e) = task.run().await {
+                        error!("Health check task error: {}", e);
                     }
+                });
+            });
 
-                    if let Err(e) = stdin.flush() {
-                        error!("Failed to flush stdin: {}", e);
-                        break;
+            // Spawn task to send ping commands
+            let runtime_ping = Arc::clone(&self.runtime);
+            std::thread::spawn(move || {
+                runtime_ping.block_on(async {
+                    while let Some(()) = ping_rx.recv().await {
+                        let ping_cmd = ExecutorCommand {
+                            cmd_type: "command".to_string(),
+                            id: uuid::Uuid::new_v4().to_string(),
+                            command: "ping".to_string(),
+                            params: None,
+                        };
+
+                        if cmd_tx_health.send(ping_cmd).await.is_err() {
+                            break;
+                        }
                     }
-
-                    debug!("Successfully wrote command '{}' to Python stdin and flushed", cmd.command);
-                }
-                Err(e) => {
-                    error!("Failed to serialize command: {}", e);
-                }
-            }
-        }
-
-        info!("Command sender task ending");
-    }
-
-    /// Emits a message to the Tauri frontend and feeds events to DisplayProcessor
-    async fn emit_message_to_frontend(app_handle: &tauri::AppHandle, message: ExecutorMessage) {
-        // Feed tree events to DisplayProcessor
-        if let ExecutorMessage::TreeEvent {
-            ref event_type,
-            ref node,
-            ref timestamp,
-            ref sequence,
-            ..
-        } = message
-        {
-            eprintln!("[PYTHON_BRIDGE] Received TreeEvent: type={}, seq={}", event_type, sequence);
-            eprintln!("[PYTHON_BRIDGE] Node data: {:?}", node);
-
-            // Get the AppState and add event to DisplayProcessor
-            if let Some(app_state) = app_handle.try_state::<AppState>() {
-                eprintln!("[PYTHON_BRIDGE] AppState found, creating RawEvent");
-
-                let raw_event = RawEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    event_type: event_type.clone(),
-                    timestamp: *timestamp,
-                    data: json!({
-                        "node": node.clone(),
-                    }),
-                    sequence: *sequence as u64,
-                };
-
-                eprintln!("[PYTHON_BRIDGE] RawEvent created: id={}, type={}", raw_event.id, raw_event.event_type);
-
-                let mut processor = app_state.display_processor.lock().await;
-                eprintln!("[PYTHON_BRIDGE] Got display_processor lock, calling add_event");
-                processor.event_log_mut().add_event(raw_event);
-                eprintln!("[PYTHON_BRIDGE] add_event completed");
-            } else {
-                eprintln!("[PYTHON_BRIDGE] AppState NOT available!");
-                debug!("AppState not available for feeding events to DisplayProcessor");
-            }
-        }
-
-        // Continue with normal event emission
-        match message {
-            ExecutorMessage::Event {
-                event,
-                data,
-                timestamp,
-                sequence,
-            } => {
-                let event_obj = ExecutorEvent {
-                    event_type: "event".to_string(),
-                    event,
-                    timestamp,
-                    sequence,
-                    data,
-                };
-                if let Err(e) = app_handle.emit("executor-event", &event_obj) {
-                    error!("Failed to emit event: {}", e);
-                }
-            }
-            ExecutorMessage::TreeEvent {
-                event_type,
-                node,
-                path,
-                timestamp,
-                sequence,
-            } => {
-                // Emit tree event with all data
-                let tree_event = json!({
-                    "type": "tree_event",
-                    "event_type": event_type,
-                    "node": node,
-                    "path": path,
-                    "timestamp": timestamp,
-                    "sequence": sequence,
                 });
-                if let Err(e) = app_handle.emit("executor-event", &tree_event) {
-                    error!("Failed to emit tree event: {}", e);
-                }
+            });
+
+            // Send debug settings to Python executor
+            info!(
+                "Sending debug settings to Python executor: {:?}",
+                debug_settings
+            );
+            let debug_params = json!({
+                "enable_image_debug": debug_settings.enable_image_debug,
+                "top_matches_count": debug_settings.top_matches_count,
+            });
+
+            let debug_cmd = ExecutorCommand {
+                cmd_type: "command".to_string(),
+                id: uuid::Uuid::new_v4().to_string(),
+                command: "set_debug_settings".to_string(),
+                params: Some(debug_params),
+            };
+
+            if let Err(e) = self
+                .runtime
+                .block_on(async { cmd_tx.send(debug_cmd).await })
+            {
+                error!("Failed to send debug settings to Python: {}", e);
             }
-            ExecutorMessage::Response {
-                id,
-                success,
-                data,
-                error,
-            } => {
-                let response = ExecutorResponse {
-                    resp_type: "response".to_string(),
-                    id,
-                    success,
-                    data,
-                    error,
-                };
-                if let Err(e) = app_handle.emit("executor-response", &response) {
-                    error!("Failed to emit response: {}", e);
-                }
-            }
-            ExecutorMessage::Error { message, details } => {
-                let error_event = json!({
-                    "type": "error",
-                    "error": "executor_error",
-                    "message": message,
-                    "details": details,
-                });
-                if let Err(e) = app_handle.emit("executor-error", &error_event) {
-                    error!("Failed to emit error: {}", e);
-                }
-            }
-            ExecutorMessage::ImageRecognition { data } => {
-                // Emit image recognition event with debug data
-                // Use "event" field to match frontend's expectation (data.event === "image_recognition")
-                let image_recognition_event = json!({
-                    "event": "image_recognition",
-                    "data": data,
-                });
-                if let Err(e) = app_handle.emit("executor-event", &image_recognition_event) {
-                    error!("Failed to emit image recognition event: {}", e);
-                }
-            }
-            _ => {
-                debug!("Unhandled message type: {:?}", message);
-            }
-        }
-    }
 
-    /// Finds the Python bridge script
-    fn find_bridge_script(&self, script_name: &str) -> Result<PathBuf, String> {
-        let possible_paths = vec![
-            // When running from src-tauri/target/debug or release
-            std::env::current_dir().ok().and_then(|p| {
-                if p.ends_with("debug") || p.ends_with("release") {
-                    p.parent()
-                        .and_then(|p| p.parent())
-                        .and_then(|p| p.parent())
-                        .map(|p| p.join("python-bridge").join(script_name))
-                } else if p.ends_with("src-tauri") {
-                    p.parent()
-                        .map(|p| p.join("python-bridge").join(script_name))
-                } else {
-                    None
-                }
-            }),
-            // When running from qontinui-runner directory
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.join("python-bridge").join(script_name)),
-            // When in src-tauri directory
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.join("..").join("python-bridge").join(script_name)),
-        ];
+            // Drain any queued events
+            let queued_events = self
+                .runtime
+                .block_on(async { self.lifecycle.read().await.drain_queued_events().await });
 
-        debug!("Current directory: {:?}", std::env::current_dir());
-
-        possible_paths
-            .into_iter()
-            .flatten()
-            .inspect(|p| {
-                debug!("Checking path: {:?}, exists: {}", p, p.exists());
-            })
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                format!(
-                    "Python bridge script {} not found in any expected location",
-                    script_name
-                )
-            })
-    }
-
-    /// Builds the Python command
-    fn build_python_command(
-        &self,
-        bridge_script: &PathBuf,
-        executor_type: &str,
-    ) -> Result<Command, String> {
-        let use_poetry = executor_type == "qontinui_executor" || executor_type == "qontinui";
-
-        // Check for Poetry and qontinui library
-        let poetry_available = if use_poetry {
-            let qontinui_path = bridge_script
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-                .map(|p| p.join("qontinui").join("pyproject.toml"));
-
-            if let Some(ref path) = qontinui_path {
-                debug!(
-                    "Checking for qontinui at: {:?}, exists: {}",
-                    path,
-                    path.exists()
+            for queued in queued_events {
+                info!(
+                    "Processing queued event: {} (queued at {})",
+                    queued.event_type, queued.queued_at
                 );
-                path.exists()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        let venv_python = bridge_script.parent().and_then(|p| {
-            // Try Windows-style venv first (Scripts/python.exe)
-            let venv_path_windows = p.join(".venv/Scripts/python.exe");
-            debug!(
-                "Checking Windows venv path: {:?}, exists: {}",
-                venv_path_windows,
-                venv_path_windows.exists()
-            );
-            if venv_path_windows.exists() {
-                return Some(venv_path_windows);
+                let event = ExecutorEvent {
+                    event_type: "event".to_string(),
+                    event: queued.event_type,
+                    timestamp: queued.queued_at as f64 / 1000.0,
+                    sequence: 0,
+                    data: queued.data,
+                };
+                if let Err(e) = self.app_handle.emit("executor-event", &event) {
+                    error!("Failed to emit queued event: {}", e);
+                }
             }
 
-            // Try Unix-style venv (bin/python)
-            let venv_path_unix = p.join(".venv/bin/python");
-            debug!(
-                "Checking Unix venv path: {:?}, exists: {}",
-                venv_path_unix,
-                venv_path_unix.exists()
-            );
-            if venv_path_unix.exists() {
-                return Some(venv_path_unix);
-            }
-
-            None
-        });
-
-        let cmd = if poetry_available && use_poetry {
-            info!("Using Poetry to run Python with qontinui library");
-            let qontinui_dir = bridge_script
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-                .map(|p| p.join("qontinui"))
-                .expect("Could not determine qontinui directory");
-
-            let mut poetry_cmd = Command::new("poetry");
-            poetry_cmd.current_dir(&qontinui_dir);
-            poetry_cmd.arg("run");
-            poetry_cmd.arg("python");
-            poetry_cmd.arg("-u"); // Unbuffered output
-            poetry_cmd.arg(bridge_script);
-            poetry_cmd
-        } else if let Some(venv_path) = venv_python {
-            info!("Using venv Python: {:?}", venv_path);
-            let mut python_cmd = Command::new(venv_path);
-            python_cmd.arg("-u"); // Unbuffered output
-            python_cmd.arg(bridge_script);
-            python_cmd
-        } else if cfg!(target_os = "windows") {
-            info!("Using system python");
-            let mut python_cmd = Command::new("python");
-            python_cmd.arg("-u"); // Unbuffered output
-            python_cmd.arg(bridge_script);
-            python_cmd
-        } else {
-            info!("Using system python3");
-            let mut python_cmd = Command::new("python3");
-            python_cmd.arg("-u"); // Unbuffered output
-            python_cmd.arg(bridge_script);
-            python_cmd
-        };
-
-        Ok(cmd)
-    }
-
-    /// Finds the bundled executor sidecar executable
-    /// Returns None if running in development mode (executable not found)
-    fn find_bundled_executor(&self) -> Option<PathBuf> {
-        // Get the platform-specific executable name
-        let exe_name = if cfg!(target_os = "windows") {
-            "qontinui-executor.exe"
-        } else {
-            "qontinui-executor"
-        };
-
-        // Get the target triple for this platform
-        let target_triple = if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
-            "x86_64-pc-windows-msvc"
-        } else if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-            "aarch64-pc-windows-msvc"
-        } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-            "x86_64-apple-darwin"
-        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            "aarch64-apple-darwin"
-        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "x86_64-unknown-linux-gnu"
-        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
-            "aarch64-unknown-linux-gnu"
-        } else {
-            return None;
-        };
-
-        // Platform-specific sidecar name (Tauri convention)
-        let sidecar_name = if cfg!(target_os = "windows") {
-            format!("qontinui-executor-{}.exe", target_triple)
-        } else {
-            format!("qontinui-executor-{}", target_triple)
-        };
-
-        // Try to resolve using Tauri's resource directory
-        if let Ok(resource_dir) = self.app_handle.path().resource_dir() {
-            let sidecar_path = resource_dir.join(&sidecar_name);
-            debug!("Checking bundled sidecar at: {:?}", sidecar_path);
-            if sidecar_path.exists() {
-                info!("Found bundled executor at: {:?}", sidecar_path);
-                return Some(sidecar_path);
-            }
+            Ok(())
         }
-
-        // Try relative paths for development/testing
-        let possible_paths = vec![
-            // In src-tauri/binaries (development)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                .map(|p| p.join("binaries").join(&sidecar_name)),
-            // Relative to current directory
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.join("src-tauri").join("binaries").join(&sidecar_name)),
-            // Simple name without target triple (for manual testing)
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-                .map(|p| p.join("binaries").join(exe_name)),
-        ];
-
-        for path in possible_paths.into_iter().flatten() {
-            debug!("Checking sidecar path: {:?}, exists: {}", path, path.exists());
-            if path.exists() {
-                info!("Found bundled executor at: {:?}", path);
-                return Some(path);
-            }
-        }
-
-        debug!("Bundled executor not found, will use Python mode");
-        None
-    }
-
-    /// Builds a command for the bundled executor
-    fn build_bundled_command(&self, executor_path: &PathBuf) -> Command {
-        info!("Using bundled executor: {:?}", executor_path);
-        let mut cmd = Command::new(executor_path);
-
-        // The bundled executor doesn't need the script path since it's compiled in
-        // But it still accepts the same command-line arguments
-
-        cmd
-    }
-
-    /// Determines if we should use the bundled executor or Python
-    /// Returns true if bundled executor should be used
-    fn should_use_bundled(&self) -> bool {
-        // Check environment variable override
-        if let Ok(val) = std::env::var("QONTINUI_USE_PYTHON") {
-            if val == "1" || val.to_lowercase() == "true" {
-                info!("QONTINUI_USE_PYTHON set, forcing Python mode");
-                return false;
-            }
-        }
-
-        // Check if bundled executor exists
-        self.find_bundled_executor().is_some()
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
@@ -864,7 +263,7 @@ impl PythonBridge {
             params,
         };
 
-        if let Some(ref tx) = self.command_tx {
+        if let Some(tx) = self.protocol_handler.get_sender() {
             self.runtime
                 .block_on(async { tx.send(cmd).await })
                 .map_err(|e| format!("Failed to send command: {}", e))?;
@@ -928,7 +327,7 @@ impl PythonBridge {
         &self,
         settings: crate::config::ScreenshotCaptureSettings,
     ) -> Result<(), String> {
-        if let Some(ref tx) = self.command_tx {
+        if let Some(tx) = self.protocol_handler.get_sender() {
             let cmd = ExecutorCommand {
                 cmd_type: "command".to_string(),
                 id: uuid::Uuid::new_v4().to_string(),
@@ -981,9 +380,8 @@ impl PythonBridge {
 
     #[allow(dead_code)]
     pub fn get_state(&self) -> ExecutorState {
-        self.runtime.block_on(async {
-            self.lifecycle.read().await.get_state().await
-        })
+        self.runtime
+            .block_on(async { self.lifecycle.read().await.get_state().await })
     }
 }
 

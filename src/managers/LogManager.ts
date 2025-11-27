@@ -1,53 +1,50 @@
 /**
  * LogManager
  *
- * Manages general logs and image recognition logs with filtering, deduplication,
- * and clipboard operations. Follows single responsibility principle.
+ * High-level coordinator for the logging system. Delegates responsibilities
+ * to specialized modules following the Single Responsibility Principle.
+ *
+ * Responsibilities:
+ * - Coordinate between specialized logging modules
+ * - Provide a unified API for the application
+ * - Handle deduplication of consecutive log messages
  */
 
-export interface LogEntry {
-  id: string;
-  timestamp: string;
-  level: "info" | "warning" | "error" | "debug" | "success";
-  message: string;
-}
+import {
+  LogStore,
+  LogFilter,
+  LogFormatter,
+  TimestampFormatter,
+  ImageLogHandler,
+} from "./logging";
+import type { LogEntry, ImageRecognitionEntry, ActionLogEntry } from "./logging";
 
-export interface ImageRecognitionEntry {
-  id: string;
-  timestamp: string;
-  screenshotTimestamp?: string;
-  node: string;
-  template: string;
-  confidence: number;
-  found: boolean;
-  threshold: number;
-  location?: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  };
-  gap?: number;
-  percentOff?: number;
-  bestMatchLocation?: string;
-  screenshotPath?: string;
-  screenshotData?: string; // Base64 encoded screenshot (when no file path)
-  visualDebugImage?: string; // Base64 encoded annotated screenshot with colored match boxes
-  templatePath?: string;
-  imageData?: string; // Base64 encoded template image
-  debug?: any; // Debug data with top_matches for displaying match details
-}
+// Re-export types for backward compatibility
+export type { LogEntry, ImageRecognitionEntry };
 
 type LogListener = () => void;
 
 /**
- * Singleton manager for application logs
+ * Singleton manager that coordinates the logging system.
+ * Delegates specific concerns to specialized modules.
  */
 class LogManager {
-  private generalLogs: LogEntry[] = [];
-  private imageLogs: ImageRecognitionEntry[] = [];
-  private listeners = new Set<LogListener>();
+  private logStore: LogStore;
+  private logFilter: LogFilter;
+  private logFormatter: LogFormatter;
+  private timestampFormatter: TimestampFormatter;
+  private imageLogHandler: ImageLogHandler;
+
+  // Deduplication state
   private lastLogMessage: string | null = null;
+
+  constructor() {
+    this.logStore = new LogStore();
+    this.logFilter = new LogFilter();
+    this.logFormatter = new LogFormatter();
+    this.timestampFormatter = new TimestampFormatter();
+    this.imageLogHandler = new ImageLogHandler(this.timestampFormatter);
+  }
 
   /**
    * Add a general log entry
@@ -61,67 +58,65 @@ class LogManager {
 
     const logEntry: LogEntry = {
       id: `log-${Date.now()}-${Math.random()}`,
-      timestamp: new Date().toLocaleTimeString("en-US", {
-        hour12: false,
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }),
+      timestamp: this.timestampFormatter.formatCurrentTime(),
       level,
       message,
     };
 
-    this.generalLogs.push(logEntry);
-    this.notifyListeners();
+    this.logStore.addGeneralLog(logEntry);
   }
 
   /**
    * Add an image recognition log entry
    */
   addImageLog(entry: ImageRecognitionEntry): void {
-    this.imageLogs.push(entry);
-    this.notifyListeners();
+    this.logStore.addImageLog(entry);
+  }
+
+  /**
+   * Process raw image recognition data and add as log entry
+   * This is a convenience method for EventHandlers
+   */
+  processImageRecognitionData(data: any): void {
+    const entry = this.imageLogHandler.processImageRecognitionData(data);
+    this.addImageLog(entry);
   }
 
   /**
    * Get all general logs
    */
   getGeneralLogs(): LogEntry[] {
-    return [...this.generalLogs];
+    return this.logStore.getGeneralLogs();
   }
 
   /**
    * Get filtered general logs by level
    */
   getFilteredLogs(level: string): LogEntry[] {
-    if (level === "all") {
-      return this.getGeneralLogs();
-    }
-    return this.generalLogs.filter((log) => log.level === level);
+    const allLogs = this.logStore.getGeneralLogs();
+    return this.logFilter.filterByLevel(allLogs, level);
   }
 
   /**
    * Get all image logs
    */
   getImageLogs(): ImageRecognitionEntry[] {
-    return [...this.imageLogs];
+    return this.logStore.getImageLogs();
   }
 
   /**
    * Clear general logs
    */
   clearGeneralLogs(): void {
-    this.generalLogs = [];
+    this.logStore.clearGeneralLogs();
     this.lastLogMessage = null;
-    this.notifyListeners();
   }
 
   /**
    * Clear image logs
    */
   clearImageLogs(): void {
-    this.imageLogs = [];
-    this.notifyListeners();
+    this.logStore.clearImageLogs();
   }
 
   /**
@@ -139,59 +134,21 @@ class LogManager {
    */
   async copyLogs(
     type: "general" | "image" | "actions",
-    actionLogs?: Array<{
-      action_type: string;
-      timestamp: number;
-      duration?: number | null;
-      status: string;
-      error?: string | null;
-      metadata?: any;
-    }>
+    actionLogs?: ActionLogEntry[]
   ): Promise<boolean> {
-    try {
-      let text = "";
+    let text = "";
 
-      if (type === "general") {
-        text = this.generalLogs
-          .map((log) => `[${log.timestamp}] [${log.level.toUpperCase()}] ${log.message}`)
-          .join("\n");
-      } else if (type === "image") {
-        text = this.imageLogs
-          .map(
-            (entry) =>
-              `[${entry.timestamp}] ${entry.node} - ${entry.template} - ` +
-              `${entry.found ? "FOUND" : "NOT FOUND"} (${(entry.confidence * 100).toFixed(1)}%)`
-          )
-          .join("\n");
-      } else if (type === "actions" && actionLogs) {
-        text = actionLogs
-          .map((action) => {
-            const timestamp = new Date(action.timestamp * 1000).toLocaleTimeString("en-US", {
-              hour12: false,
-              hour: "2-digit",
-              minute: "2-digit",
-              second: "2-digit",
-            });
-            const duration = action.duration
-              ? ` (${(action.duration * 1000).toFixed(0)}ms)`
-              : "";
-            const status = action.status.toUpperCase();
-            const error = action.error ? ` - ERROR: ${action.error}` : "";
-
-            return `[${timestamp}] ${action.action_type}${duration} - ${status}${error}`;
-          })
-          .join("\n");
-      }
-
-      if (text) {
-        await navigator.clipboard.writeText(text);
-        return true;
-      }
-      return false;
-    } catch (error) {
-      console.error("Failed to copy logs:", error);
-      return false;
+    if (type === "general") {
+      const logs = this.logStore.getGeneralLogs();
+      text = this.logFormatter.formatGeneralLogs(logs);
+    } else if (type === "image") {
+      const logs = this.logStore.getImageLogs();
+      text = this.logFormatter.formatImageLogs(logs);
+    } else if (type === "actions" && actionLogs) {
+      text = this.logFormatter.formatActionLogs(actionLogs);
     }
+
+    return await this.logFormatter.copyToClipboard(text);
   }
 
   /**
@@ -199,31 +156,21 @@ class LogManager {
    * @returns Unsubscribe function
    */
   subscribe(listener: LogListener): () => void {
-    this.listeners.add(listener);
-    return () => {
-      this.listeners.delete(listener);
-    };
-  }
-
-  /**
-   * Notify all listeners of changes
-   */
-  private notifyListeners(): void {
-    this.listeners.forEach((listener) => listener());
+    return this.logStore.subscribe(listener);
   }
 
   /**
    * Get log count
    */
   getLogCount(): number {
-    return this.generalLogs.length;
+    return this.logStore.getGeneralLogCount();
   }
 
   /**
    * Get image log count
    */
   getImageLogCount(): number {
-    return this.imageLogs.length;
+    return this.logStore.getImageLogCount();
   }
 }
 

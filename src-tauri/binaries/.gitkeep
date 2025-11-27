@@ -1,0 +1,12 @@
+# This directory contains bundled executables (sidecars) for distribution
+# The executables are built using PyInstaller from python-bridge/
+#
+# Expected files (platform-specific):
+# - qontinui-executor-x86_64-pc-windows-msvc.exe (Windows x64)
+# - qontinui-executor-aarch64-pc-windows-msvc.exe (Windows ARM64)
+# - qontinui-executor-x86_64-apple-darwin (macOS x64)
+# - qontinui-executor-aarch64-apple-darwin (macOS ARM64)
+# - qontinui-executor-x86_64-unknown-linux-gnu (Linux x64)
+# - qontinui-executor-aarch64-unknown-linux-gnu (Linux ARM64)
+#
+# Build with: cd python-bridge && python build_executor.py

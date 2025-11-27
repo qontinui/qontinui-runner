@@ -83,3 +83,5 @@ temp_dev/
 
 # Ignore CLAUDE notes file
 CLAUDE.md
+python-bridge/build/
+src-tauri/binaries/*.exe

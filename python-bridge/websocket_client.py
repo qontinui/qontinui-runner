@@ -132,8 +132,8 @@ class RunnerWebSocketClient:
             True if connection successful, False otherwise
         """
         try:
-            ws_url = f"{self.api_url}/api/v1/automation/ws/runner?token={self.token}"
-            logger.info(f"Connecting to qontinui-web: {self.api_url}")
+            ws_url = f"{self.api_url}/api/v1/automation/ws/automation/runner?token={self.token}"
+            logger.info(f"Connecting to qontinui-web: {ws_url}")
 
             self.ws = await websockets.connect(
                 ws_url,

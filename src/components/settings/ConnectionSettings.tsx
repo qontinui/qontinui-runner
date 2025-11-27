@@ -113,30 +113,124 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     }
   };
 
+  // Helper to wait for executor to be ready
+  const waitForExecutorReady = async (maxWaitMs: number = 5000): Promise<boolean> => {
+    const startTime = Date.now();
+    while (Date.now() - startTime < maxWaitMs) {
+      try {
+        const status: any = await invoke("get_executor_status");
+        // python_running is inside the data field of CommandResponse
+        if (status?.data?.python_running) {
+          return true;
+        }
+      } catch (err) {
+        console.warn('Error checking executor status:', err);
+      }
+      // Wait 100ms before checking again
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    return false;
+  };
+
   const handleQuickConnect = async (connectionStr?: string) => {
     setQuickConnectError(null);
     setQuickConnectSuccess(null);
     setQuickConnecting(true);
 
     const connStr = connectionStr || connectionString;
+    console.log('[QUICK_CONNECT] Starting Quick Connect...');
 
     try {
       const connInfo = parseConnectionString(connStr);
+      console.log('[QUICK_CONNECT] Parsed connection info:', {
+        url: connInfo.url,
+        backendUrl: connInfo.backendUrl,
+        userId: connInfo.userId,
+        projectId: connInfo.projectId,
+        tokenLength: connInfo.token?.length,
+        tokenPrefix: connInfo.token?.substring(0, 20) + '...',
+      });
+
+      // Wait for executor to be ready before proceeding
+      console.log('[QUICK_CONNECT] Waiting for executor to be ready...');
+      const executorReady = await waitForExecutorReady();
+      console.log('[QUICK_CONNECT] Executor ready:', executorReady);
+      if (!executorReady) {
+        throw new Error("Python executor is not ready. Please wait a moment and try again.");
+      }
 
       let cloudPermissionEnabled = false;
+      const isJWT = connInfo.token?.startsWith('eyJ');
+      console.log('[QUICK_CONNECT] Token type:', isJWT ? 'JWT' : 'Runner Token');
+
       try {
-        const permissionResponse = await fetch(`${connInfo.backendUrl}/api/v1/users/me/automation-streaming`, {
-          headers: {
-            'Authorization': `Bearer ${connInfo.token}`
+        if (isJWT) {
+          // Token is a JWT - use Authorization header
+          const jwtUrl = `${connInfo.backendUrl}/api/v1/users/me/automation-streaming`;
+          console.log('[QUICK_CONNECT] Trying JWT auth endpoint:', jwtUrl);
+          const permissionResponse = await fetch(jwtUrl, {
+            headers: {
+              'Authorization': `Bearer ${connInfo.token}`
+            }
+          });
+          console.log('[QUICK_CONNECT] JWT auth response status:', permissionResponse.status);
+
+          if (permissionResponse.ok) {
+            const data = await permissionResponse.json();
+            console.log('[QUICK_CONNECT] JWT auth response data:', data);
+            cloudPermissionEnabled = data.enabled;
+            console.log('[QUICK_CONNECT] cloudPermissionEnabled from JWT:', cloudPermissionEnabled);
+          } else if (permissionResponse.status === 401) {
+            // JWT is likely expired - try to decode and check
+            try {
+              const payload = JSON.parse(atob(connInfo.token.split('.')[1]));
+              const expTime = payload.exp * 1000;
+              const now = Date.now();
+              if (expTime < now) {
+                const expiredMinutes = Math.round((now - expTime) / 60000);
+                throw new Error(`Your session token has expired (${expiredMinutes} minutes ago). Please get a new connection string from qontinui.io/connect-runner.`);
+              }
+            } catch (decodeErr) {
+              if (decodeErr instanceof Error && decodeErr.message.includes('expired')) {
+                throw decodeErr;
+              }
+            }
+            throw new Error("Authentication failed. Your token may be invalid or expired. Please get a new connection string from qontinui.io/connect-runner.");
+          } else {
+            const errorText = await permissionResponse.text();
+            console.log('[QUICK_CONNECT] JWT auth failed with status', permissionResponse.status, ':', errorText);
+            throw new Error(`Authentication failed (${permissionResponse.status}). Please try again.`);
           }
-        });
-        if (permissionResponse.ok) {
-          const data = await permissionResponse.json();
-          cloudPermissionEnabled = data.enabled;
+        } else {
+          // Token is a runner token - use query param auth
+          console.log('[QUICK_CONNECT] Trying runner token auth...');
+          const testUrl = `${connInfo.backendUrl}/api/v1/runners/test-connection?token=${encodeURIComponent(connInfo.token)}`;
+          console.log('[QUICK_CONNECT] Test connection URL:', testUrl);
+          const testResponse = await fetch(testUrl, { method: 'POST' });
+          console.log('[QUICK_CONNECT] Test connection response status:', testResponse.status);
+
+          if (testResponse.ok) {
+            const testData = await testResponse.json();
+            console.log('[QUICK_CONNECT] Test connection response data:', testData);
+            // Runner token is valid - streaming is enabled by definition
+            cloudPermissionEnabled = true;
+            console.log('[QUICK_CONNECT] Runner token authentication successful');
+          } else {
+            const errorText = await testResponse.text();
+            console.log('[QUICK_CONNECT] Test connection failed:', errorText);
+            throw new Error("Invalid runner token. Please get a new connection string from qontinui.io/connect-runner.");
+          }
         }
       } catch (err) {
-        console.warn('Failed to check cloud permission:', err);
+        // Re-throw user-friendly errors
+        if (err instanceof Error && (err.message.includes('expired') || err.message.includes('Authentication failed') || err.message.includes('Invalid runner token'))) {
+          throw err;
+        }
+        console.warn('[QUICK_CONNECT] Failed to check cloud permission:', err);
+        throw new Error("Failed to verify connection. Please check your network and try again.");
       }
+
+      console.log('[QUICK_CONNECT] Final cloudPermissionEnabled:', cloudPermissionEnabled);
 
       const newSettings = {
         enabled: true,
@@ -155,6 +249,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
         sendVideos: false,
       };
 
+      console.log('[QUICK_CONNECT] New settings:', { ...newSettings, token: newSettings.token?.substring(0, 20) + '...' });
       setWsSettings(newSettings);
 
       if (!newSettings.url || !newSettings.token) {
@@ -166,6 +261,8 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
       }
 
       const projectId = newSettings.projectId ? parseInt(newSettings.projectId, 10) : null;
+      console.log('[QUICK_CONNECT] Configuring WebSocket with URL:', newSettings.url, 'projectId:', projectId);
+
       const configResult: any = await invoke("configure_websocket", {
         config: {
           enabled: newSettings.enabled,
@@ -174,19 +271,45 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
           project_id: projectId,
         },
       });
+      console.log('[QUICK_CONNECT] configure_websocket result:', configResult);
 
       if (!configResult || !configResult.success) {
         throw new Error(`Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`);
       }
 
+      console.log('[QUICK_CONNECT] Connecting WebSocket...');
       const connectResult: any = await invoke("connect_websocket");
+      console.log('[QUICK_CONNECT] connect_websocket result:', connectResult);
+
       if (!connectResult || !connectResult.success) {
         throw new Error(`Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`);
       }
 
+      console.log('[QUICK_CONNECT] WebSocket connected! Testing connection with backend...');
+
+      // Test connection with backend to confirm everything is working
+      let successMessage = 'Connected successfully! Your settings have been configured.';
+      try {
+        const testResponse = await fetch(
+          `${connInfo.backendUrl}/api/v1/runners/test-connection?token=${encodeURIComponent(connInfo.token)}`,
+          { method: 'POST' }
+        );
+        console.log('[QUICK_CONNECT] test-connection response status:', testResponse.status);
+        if (testResponse.ok) {
+          const testResult = await testResponse.json();
+          console.log('[QUICK_CONNECT] test-connection result:', testResult);
+          successMessage = testResult.message || successMessage;
+          onLog("success", `Quick Connect: Connection verified - ${testResult.auth_method === 'runner_token' ? `Token: ${testResult.token_name}` : 'JWT Auth'}`);
+        }
+      } catch (testErr) {
+        // Non-fatal - connection still works, just couldn't verify
+        console.warn('[QUICK_CONNECT] Failed to verify connection with backend:', testErr);
+      }
+
       setWsSettings(prev => ({ ...prev, connected: true }));
-      setQuickConnectSuccess('Connected successfully! Your settings have been configured.');
+      setQuickConnectSuccess(successMessage);
       setConnectionString('');
+      console.log('[QUICK_CONNECT] SUCCESS! Connection complete.');
       onLog("success", "Quick Connect: WebSocket connected successfully");
 
     } catch (err) {
