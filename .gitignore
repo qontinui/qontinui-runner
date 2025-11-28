@@ -85,3 +85,4 @@ temp_dev/
 CLAUDE.md
 python-bridge/build/
 src-tauri/binaries/*.exe
+.claude/

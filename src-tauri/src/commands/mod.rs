@@ -7,6 +7,7 @@
 //!
 //! - `config` - Configuration file loading and management
 //! - `execution` - Python executor lifecycle and workflow execution
+//! - `extraction` - Web GUI extraction and training data export
 //! - `state_machine` - State navigation and transition execution
 //! - `debug` - Debug settings management
 //! - `websocket` - WebSocket connectivity for remote monitoring
@@ -30,6 +31,7 @@ use tokio::sync::Mutex as TokioMutex;
 pub mod config;
 pub mod debug;
 pub mod execution;
+pub mod extraction;
 pub mod state_machine;
 pub mod storage;
 pub mod video;
@@ -45,6 +47,10 @@ pub use execution::{
     check_for_updates, get_executor_status, get_monitors, handle_error, open_folder,
     start_execution, start_python_executor, stop_execution, stop_python_executor,
     update_capture_settings,
+};
+pub use extraction::{
+    export_state_structure, export_training_data, get_extraction_status, list_extractions,
+    request_extraction_screenshot, start_web_extraction, stop_web_extraction,
 };
 pub use state_machine::{
     clear_action_log, execute_transition, get_action_log_view, get_active_states,

@@ -5,6 +5,7 @@ All automation logic is delegated to Qontinui's API.
 The library handles both real and mock execution modes.
 """
 
+import asyncio
 import json
 import sys
 
@@ -58,6 +59,13 @@ class EventType(Enum):
     DSL_EXECUTION_ERROR = "dsl_execution_error"
     # Health check
     PONG = "pong"
+    # Web extraction events
+    EXTRACTION_STARTED = "extraction_started"
+    EXTRACTION_PROGRESS = "extraction_progress"
+    EXTRACTION_STATE_DETECTED = "extraction_state_detected"
+    EXTRACTION_ELEMENT_DETECTED = "extraction_element_detected"
+    EXTRACTION_COMPLETE = "extraction_complete"
+    EXTRACTION_ERROR = "extraction_error"
 
 
 class QontinuiBridge:
@@ -75,6 +83,8 @@ class QontinuiBridge:
         self._scheduler_running = False
         self._dsl_parser = None  # Lazy-loaded when DSL is used
         self._dsl_executor = None  # Lazy-loaded when DSL is used
+        self._web_extraction_service = None  # Lazy-loaded when extraction is used
+        self._async_loop = None  # Event loop for async operations
         self._setup_callbacks()
 
         mode_str = "mock/simulation" if mock_mode else "real"
@@ -163,6 +173,21 @@ class QontinuiBridge:
                 return self._handle_scheduler_get_statistics()
             elif cmd_type == "execute_dsl":
                 return self._handle_execute_dsl(params)
+            # Web extraction commands
+            elif cmd_type == "start_web_extraction":
+                return self._handle_start_web_extraction(params)
+            elif cmd_type == "stop_web_extraction":
+                return self._handle_stop_web_extraction()
+            elif cmd_type == "get_extraction_status":
+                return self._handle_get_extraction_status()
+            elif cmd_type == "get_extraction_screenshot":
+                return self._handle_get_extraction_screenshot(params)
+            elif cmd_type == "export_training_data":
+                return self._handle_export_training_data(params)
+            elif cmd_type == "export_state_structure":
+                return self._handle_export_state_structure(params)
+            elif cmd_type == "list_extractions":
+                return self._handle_list_extractions()
             else:
                 return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -558,6 +583,204 @@ class QontinuiBridge:
                 "error": str(e),
                 "traceback": traceback.format_exc(),
             }
+
+    # =========================================================================
+    # Web Extraction Command Handlers
+    # =========================================================================
+
+    def _get_or_create_async_loop(self):
+        """Get or create an event loop for async operations."""
+        if self._async_loop is None or self._async_loop.is_closed():
+            self._async_loop = asyncio.new_event_loop()
+        return self._async_loop
+
+    def _get_web_extraction_service(self):
+        """Lazy-load the web extraction service."""
+        if self._web_extraction_service is None:
+            try:
+                from services.web_extraction_service import WebExtractionService
+
+                # Create an event manager wrapper for emitting events
+                class EventManagerBridge:
+                    def __init__(self, bridge):
+                        self._bridge = bridge
+
+                    def emit_event(self, event_type: str, data: dict[str, Any]):
+                        # Map string event types to EventType enum
+                        event_map = {
+                            "extraction_started": EventType.EXTRACTION_STARTED,
+                            "extraction_progress": EventType.EXTRACTION_PROGRESS,
+                            "extraction_state_detected": EventType.EXTRACTION_STATE_DETECTED,
+                            "extraction_element_detected": EventType.EXTRACTION_ELEMENT_DETECTED,
+                            "extraction_complete": EventType.EXTRACTION_COMPLETE,
+                            "extraction_error": EventType.EXTRACTION_ERROR,
+                        }
+                        enum_type = event_map.get(event_type, EventType.LOG)
+                        self._bridge._emit_event(enum_type, data)
+
+                self._web_extraction_service = WebExtractionService(
+                    event_manager=EventManagerBridge(self)
+                )
+            except ImportError as e:
+                self._emit_log("error", f"Web extraction service not available: {e}")
+                raise ImportError(f"Web extraction service not available: {e}")
+
+        return self._web_extraction_service
+
+    def _handle_start_web_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle start web extraction command."""
+        try:
+            service = self._get_web_extraction_service()
+            loop = self._get_or_create_async_loop()
+
+            # Run the async start_extraction in the event loop
+            config = params.get("config", {})
+            result = loop.run_until_complete(service.start_extraction(config))
+
+            if result.get("success"):
+                self._emit_event(
+                    EventType.EXTRACTION_STARTED,
+                    {
+                        "extraction_id": result.get("extraction_id"),
+                        "config": config,
+                    },
+                )
+
+            return result
+
+        except ImportError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            self._emit_log("error", f"Failed to start extraction: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_web_extraction(self) -> dict[str, Any]:
+        """Handle stop web extraction command."""
+        try:
+            if self._web_extraction_service is None:
+                return {"success": False, "error": "No extraction in progress"}
+
+            loop = self._get_or_create_async_loop()
+            result = loop.run_until_complete(
+                self._web_extraction_service.stop_extraction()
+            )
+            return result
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to stop extraction: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_extraction_status(self) -> dict[str, Any]:
+        """Handle get extraction status command."""
+        try:
+            if self._web_extraction_service is None:
+                return {
+                    "success": True,
+                    "is_running": False,
+                    "extraction_id": None,
+                }
+
+            status = self._web_extraction_service.get_status()
+            return {"success": True, **status}
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to get extraction status: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_extraction_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle get extraction screenshot command."""
+        try:
+            if self._web_extraction_service is None:
+                return {"success": False, "error": "Extraction service not initialized"}
+
+            screenshot_id = params.get("screenshot_id")
+            if not screenshot_id:
+                return {"success": False, "error": "screenshot_id is required"}
+
+            resolution = params.get("resolution", "thumbnail")
+            extraction_id = params.get("extraction_id")
+
+            result = self._web_extraction_service.get_screenshot(
+                screenshot_id=screenshot_id,
+                resolution=resolution,
+                extraction_id=extraction_id,
+            )
+            return result
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to get screenshot: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_export_training_data(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle export training data command."""
+        try:
+            if self._web_extraction_service is None:
+                return {"success": False, "error": "Extraction service not initialized"}
+
+            extraction_id = params.get("extraction_id")
+            if not extraction_id:
+                return {"success": False, "error": "extraction_id is required"}
+
+            export_format = params.get("format", "coco")
+            output_path = params.get("output_path")
+            if not output_path:
+                return {"success": False, "error": "output_path is required"}
+
+            annotations = params.get("annotations")
+            include_states = params.get("include_states", True)
+
+            result = self._web_extraction_service.export_training_data(
+                extraction_id=extraction_id,
+                format=export_format,
+                output_path=output_path,
+                annotations=annotations,
+                include_states=include_states,
+            )
+            return result
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to export training data: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_export_state_structure(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle export state structure command."""
+        try:
+            if self._web_extraction_service is None:
+                return {"success": False, "error": "Extraction service not initialized"}
+
+            extraction_id = params.get("extraction_id")
+            if not extraction_id:
+                return {"success": False, "error": "extraction_id is required"}
+
+            output_path = params.get("output_path")
+            if not output_path:
+                return {"success": False, "error": "output_path is required"}
+
+            include_screenshots = params.get("include_screenshots", True)
+
+            result = self._web_extraction_service.export_state_structure(
+                extraction_id=extraction_id,
+                output_path=output_path,
+                include_screenshots=include_screenshots,
+            )
+            return result
+
+        except Exception as e:
+            self._emit_log("error", f"Failed to export state structure: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_list_extractions(self) -> dict[str, Any]:
+        """Handle list extractions command."""
+        try:
+            service = self._get_web_extraction_service()
+            result = service.list_extractions()
+            return result
+
+        except ImportError as e:
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            self._emit_log("error", f"Failed to list extractions: {e}")
+            return {"success": False, "error": str(e)}
 
 
 def main():

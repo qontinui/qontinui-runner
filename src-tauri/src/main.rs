@@ -133,6 +133,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::storage::delete_old_sessions,
             commands::storage::clear_all_storage,
             commands::storage::get_storage_paths,
+            // Web extraction commands
+            commands::extraction::start_web_extraction,
+            commands::extraction::stop_web_extraction,
+            commands::extraction::get_extraction_status,
+            commands::extraction::request_extraction_screenshot,
+            commands::extraction::export_training_data,
+            commands::extraction::export_state_structure,
+            commands::extraction::list_extractions,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
