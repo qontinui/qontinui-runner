@@ -133,7 +133,8 @@ function formatActionDetails(node: DisplayNode): string {
       // Image ID is shown in main label as FIND, no need to repeat
       // Only show additional condition details if not image-based
       const target = config.target;
-      const hasImageCondition = (typeof target === 'object' && target !== null && target.imageId) || config.imageId;
+      const hasImageCondition =
+        (typeof target === "object" && target !== null && target.imageId) || config.imageId;
 
       if (!hasImageCondition && config.condition) {
         details.push(`${config.condition}`);
@@ -332,9 +333,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         const target = config.target;
         if (config.imageName) {
           return `FIND "${config.imageName}"`;
-        } else if (typeof target === 'object' && target !== null && target.imageName) {
+        } else if (typeof target === "object" && target !== null && target.imageName) {
           return `FIND "${target.imageName}"`;
-        } else if (typeof target === 'object' && target !== null && target.imageId) {
+        } else if (typeof target === "object" && target !== null && target.imageId) {
           return `FIND "${target.imageId}"`;
         } else if (config.imageId) {
           return `FIND "${config.imageId}"`;
@@ -409,7 +410,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
                   onToggle={onToggle}
                   expandedNodes={expandedNodes}
                   level={nestingLevel + 1}
-                />
+                />,
               ];
             }
 
@@ -418,11 +419,15 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
               const isInline = child.metadata.is_inline === true;
               const isUserWorkflow = child.metadata.is_expandable === true;
 
-              console.log(`[TreeNode] Child workflow ${child.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`);
+              console.log(
+                `[TreeNode] Child workflow ${child.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`,
+              );
 
               // Skip inline workflows (transition workflows) and render their children instead
               if (isInline && !isUserWorkflow) {
-                console.log(`[TreeNode] Skipping inline workflow wrapper: ${child.name}, rendering its children`);
+                console.log(
+                  `[TreeNode] Skipping inline workflow wrapper: ${child.name}, rendering its children`,
+                );
                 return child.children.map((grandchild) => (
                   <TreeNode
                     key={grandchild.id}
@@ -445,7 +450,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
                 onToggle={onToggle}
                 expandedNodes={expandedNodes}
                 level={nestingLevel + 1}
-              />
+              />,
             ];
           })}
         </div>

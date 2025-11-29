@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 use tracing::{error, info};
-use serde::{Deserialize, Serialize};
 
 const SETTINGS_FILE: &str = "settings.json";
 #[allow(dead_code)]

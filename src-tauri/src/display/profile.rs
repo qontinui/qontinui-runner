@@ -1,5 +1,5 @@
-use serde::Serialize;
 use crate::display::RawEvent;
+use serde::Serialize;
 
 /// Type of view this profile generates
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]

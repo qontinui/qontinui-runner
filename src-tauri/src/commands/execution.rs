@@ -69,16 +69,19 @@ pub fn start_python_executor(
     if has_config {
         // Get the last config path from settings
         if let Some(config_path) = settings::get_last_config_path() {
-            info!("Sending previously loaded configuration to Python executor: {}", config_path);
+            info!(
+                "Sending previously loaded configuration to Python executor: {}",
+                config_path
+            );
 
-        // Send debug settings first
-        let debug_settings = settings::get_debug_settings();
-        if let Err(e) = bridge.set_debug_settings(
-            debug_settings.enable_image_debug,
-            debug_settings.top_matches_count,
-        ) {
-            warn!("Failed to send debug settings: {}", e);
-        }
+            // Send debug settings first
+            let debug_settings = settings::get_debug_settings();
+            if let Err(e) = bridge.set_debug_settings(
+                debug_settings.enable_image_debug,
+                debug_settings.top_matches_count,
+            ) {
+                warn!("Failed to send debug settings: {}", e);
+            }
 
             // Send configuration
             if let Err(e) = bridge.load_configuration(&config_path) {
@@ -491,7 +494,10 @@ pub fn update_capture_settings(
     settings: ScreenshotCaptureSettings,
     state: State<AppState>,
 ) -> Result<CommandResponse, String> {
-    info!("Updating screenshot capture settings: enabled={}", settings.enabled);
+    info!(
+        "Updating screenshot capture settings: enabled={}",
+        settings.enabled
+    );
     let bridge_lock = state.python_bridge.lock().unwrap();
     if let Some(ref bridge) = *bridge_lock {
         if !bridge.is_running() {

@@ -92,9 +92,7 @@ interface SectionProps {
 function Section({ title, children, className }: SectionProps) {
   return (
     <div className={cn("space-y-2", className)}>
-      <h3 className="text-sm font-semibold text-foreground border-b border-border pb-1">
-        {title}
-      </h3>
+      <h3 className="text-sm font-semibold text-foreground border-b border-border pb-1">{title}</h3>
       <div className="text-sm">{children}</div>
     </div>
   );
@@ -165,7 +163,9 @@ function ScreenshotViewer({ screenshotPath, isOpen, onClose }: ScreenshotViewerP
 /**
  * Type guard to check if metadata has expected structure
  */
-function isActionMetadata(metadata: Record<string, unknown> | undefined): metadata is ActionMetadata {
+function isActionMetadata(
+  metadata: Record<string, unknown> | undefined,
+): metadata is ActionMetadata {
   return metadata !== undefined;
 }
 
@@ -174,7 +174,7 @@ function isActionMetadata(metadata: Record<string, unknown> | undefined): metada
  */
 function getRuntimeString(runtime: Record<string, unknown>, key: string): string | undefined {
   const value = runtime[key];
-  return typeof value === 'string' ? value : undefined;
+  return typeof value === "string" ? value : undefined;
 }
 
 /**
@@ -182,7 +182,7 @@ function getRuntimeString(runtime: Record<string, unknown>, key: string): string
  */
 function getRuntimeNumber(runtime: Record<string, unknown>, key: string): number | undefined {
   const value = runtime[key];
-  return typeof value === 'number' ? value : undefined;
+  return typeof value === "number" ? value : undefined;
 }
 
 /**
@@ -190,7 +190,7 @@ function getRuntimeNumber(runtime: Record<string, unknown>, key: string): number
  */
 function getRuntimeBoolean(runtime: Record<string, unknown>, key: string): boolean | undefined {
   const value = runtime[key];
-  return typeof value === 'boolean' ? value : undefined;
+  return typeof value === "boolean" ? value : undefined;
 }
 
 /**
@@ -210,7 +210,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
   if (!action) return null;
 
   // Get action name/type - compatible with both DisplayNode and ActionLogEntry
-  const actionName = ('name' in action ? action.name : action.action_type);
+  const actionName = "name" in action ? action.name : action.action_type;
 
   // Type guard the metadata
   const metadata = isActionMetadata(action.metadata) ? action.metadata : undefined;
@@ -223,8 +223,10 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
   const screenshotRef = metadata?.screenshot_reference;
   const visualDebugRef = metadata?.visual_debug_reference;
 
-  const hasMultipleMatches = Boolean(runtime.top_matches && Array.isArray(runtime.top_matches) && runtime.top_matches.length > 0);
-  const hasError = action.status === "failed" || (outcome?.error !== undefined);
+  const hasMultipleMatches = Boolean(
+    runtime.top_matches && Array.isArray(runtime.top_matches) && runtime.top_matches.length > 0,
+  );
+  const hasError = action.status === "failed" || outcome?.error !== undefined;
 
   return (
     <>
@@ -253,7 +255,8 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
             </div>
 
             <p id="action-detail-description" className="sr-only">
-              Detailed information about the {actionName} action including configuration, runtime results, and timing
+              Detailed information about the {actionName} action including configuration, runtime
+              results, and timing
             </p>
 
             {/* Scrollable Content */}
@@ -273,7 +276,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                         action.status === "success" && "text-green-500",
                         action.status === "failed" && "text-red-500",
                         action.status === "running" && "text-blue-500",
-                        action.status === "pending" && "text-yellow-500"
+                        action.status === "pending" && "text-yellow-500",
                       )}
                     >
                       {action.status === "success" && "✓ Success"}
@@ -299,7 +302,10 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
 
               {/* Error Display */}
               {hasError && (
-                <Section title="Error Details" className="bg-red-500/10 -m-4 p-4 border-l-4 border-red-500">
+                <Section
+                  title="Error Details"
+                  className="bg-red-500/10 -m-4 p-4 border-l-4 border-red-500"
+                >
                   <div className="space-y-2">
                     <div className="flex items-start gap-2">
                       <XCircle className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" />
@@ -335,38 +341,39 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                 <Section title="Runtime Results">
                   <div className="space-y-3">
                     {/* FIND action with multiple matches */}
-                    {hasMultipleMatches && (() => {
-                      const topMatches = getRuntimeArray(runtime, 'top_matches');
-                      if (!topMatches) return null;
+                    {hasMultipleMatches &&
+                      (() => {
+                        const topMatches = getRuntimeArray(runtime, "top_matches");
+                        if (!topMatches) return null;
 
-                      return (
-                        <div>
-                          <div className="font-medium mb-2">
-                            Match Results ({topMatches.length} found):
+                        return (
+                          <div>
+                            <div className="font-medium mb-2">
+                              Match Results ({topMatches.length} found):
+                            </div>
+                            <div className="space-y-1 pl-4">
+                              {topMatches.map((match: any, idx: number) => (
+                                <div
+                                  key={idx}
+                                  className="text-xs font-mono bg-muted/20 p-2 rounded border border-border"
+                                >
+                                  <span className="text-muted-foreground">{idx + 1}.</span> [
+                                  {match.location.x}, {match.location.y}, {match.dimensions.w},{" "}
+                                  {match.dimensions.h}]{" "}
+                                  <span className="text-green-400">
+                                    confidence: {(match.confidence * 100).toFixed(1)}%
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
                           </div>
-                          <div className="space-y-1 pl-4">
-                            {topMatches.map((match: any, idx: number) => (
-                              <div
-                                key={idx}
-                                className="text-xs font-mono bg-muted/20 p-2 rounded border border-border"
-                              >
-                                <span className="text-muted-foreground">{idx + 1}.</span>{" "}
-                                [{match.location.x}, {match.location.y}, {match.dimensions.w},{" "}
-                                {match.dimensions.h}]{" "}
-                                <span className="text-green-400">
-                                  confidence: {(match.confidence * 100).toFixed(1)}%
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ) as React.ReactNode;
-                    })()}
+                        ) as React.ReactNode;
+                      })()}
 
                     {/* Single FIND result */}
                     {(() => {
-                      const found = getRuntimeBoolean(runtime, 'found');
-                      const confidence = getRuntimeNumber(runtime, 'confidence');
+                      const found = getRuntimeBoolean(runtime, "found");
+                      const confidence = getRuntimeNumber(runtime, "confidence");
                       const location = runtime.location;
                       const dimensions = runtime.dimensions;
 
@@ -377,20 +384,23 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                           <div className="font-medium mb-1">Find Result:</div>
                           <div className="pl-4 space-y-1 text-xs">
                             <div>
-                              Found: <span className={found ? "text-green-400" : "text-red-400"}>
+                              Found:{" "}
+                              <span className={found ? "text-green-400" : "text-red-400"}>
                                 {found ? "Yes" : "No"}
                               </span>
                             </div>
                             {confidence !== undefined && (
                               <div>
-                                Confidence: <span className="text-green-400">
+                                Confidence:{" "}
+                                <span className="text-green-400">
                                   {(confidence * 100).toFixed(1)}%
                                 </span>
                               </div>
                             )}
                             {(() => {
-                              if (!location || typeof location !== 'object' || location === null) return null;
-                              if (!('x' in location) || !('y' in location)) return null;
+                              if (!location || typeof location !== "object" || location === null)
+                                return null;
+                              if (!("x" in location) || !("y" in location)) return null;
                               return (
                                 <div>
                                   Location: ({(location as any).x}, {(location as any).y})
@@ -398,8 +408,13 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                               ) as React.ReactNode;
                             })()}
                             {(() => {
-                              if (!dimensions || typeof dimensions !== 'object' || dimensions === null) return null;
-                              if (!('w' in dimensions) || !('h' in dimensions)) return null;
+                              if (
+                                !dimensions ||
+                                typeof dimensions !== "object" ||
+                                dimensions === null
+                              )
+                                return null;
+                              if (!("w" in dimensions) || !("h" in dimensions)) return null;
                               return (
                                 <div>
                                   Dimensions: {(dimensions as any).w} x {(dimensions as any).h}
@@ -413,8 +428,8 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
 
                     {/* TYPE action result */}
                     {(() => {
-                      const typedText = getRuntimeString(runtime, 'typed_text');
-                      const charCount = getRuntimeNumber(runtime, 'character_count');
+                      const typedText = getRuntimeString(runtime, "typed_text");
+                      const charCount = getRuntimeNumber(runtime, "character_count");
 
                       if (!typedText) return null;
 
@@ -436,10 +451,16 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                     {/* CLICK action result */}
                     {(() => {
                       const clickedAt = runtime.clicked_at;
-                      const button = getRuntimeString(runtime, 'button');
-                      const targetType = getRuntimeString(runtime, 'target_type');
+                      const button = getRuntimeString(runtime, "button");
+                      const targetType = getRuntimeString(runtime, "target_type");
 
-                      if (!clickedAt || typeof clickedAt !== 'object' || clickedAt === null || !('x' in clickedAt) || !('y' in clickedAt)) {
+                      if (
+                        !clickedAt ||
+                        typeof clickedAt !== "object" ||
+                        clickedAt === null ||
+                        !("x" in clickedAt) ||
+                        !("y" in clickedAt)
+                      ) {
                         return null;
                       }
 
@@ -459,11 +480,11 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
 
                     {/* GO_TO_STATE action result */}
                     {(() => {
-                      const targetStates = getRuntimeArray(runtime, 'target_states');
-                      const sourceStates = getRuntimeArray(runtime, 'source_states');
-                      const targetsReached = getRuntimeArray(runtime, 'targets_reached');
-                      const transitionsExecuted = getRuntimeArray(runtime, 'transitions_executed');
-                      const alreadyAtTarget = getRuntimeBoolean(runtime, 'already_at_target');
+                      const targetStates = getRuntimeArray(runtime, "target_states");
+                      const sourceStates = getRuntimeArray(runtime, "source_states");
+                      const targetsReached = getRuntimeArray(runtime, "targets_reached");
+                      const transitionsExecuted = getRuntimeArray(runtime, "transitions_executed");
+                      const alreadyAtTarget = getRuntimeBoolean(runtime, "already_at_target");
 
                       if (!targetStates) return null;
 
@@ -481,16 +502,16 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                             </div>
                             {targetsReached && (
                               <div>
-                                Reached: <span className="font-mono text-green-400">
+                                Reached:{" "}
+                                <span className="font-mono text-green-400">
                                   {targetsReached.join(", ")}
                                 </span>
                               </div>
                             )}
                             {transitionsExecuted && (
                               <div>
-                                Transitions: <span className="font-mono">
-                                  {transitionsExecuted.join(", ")}
-                                </span>
+                                Transitions:{" "}
+                                <span className="font-mono">{transitionsExecuted.join(", ")}</span>
                               </div>
                             )}
                             {alreadyAtTarget && (
@@ -503,12 +524,17 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
 
                     {/* RUN_WORKFLOW action result */}
                     {(() => {
-                      const workflowName = getRuntimeString(runtime, 'workflow_name');
-                      const workflowStatus = getRuntimeString(runtime, 'workflow_status');
-                      const configWorkflowName = typeof config.workflowName === 'string' ? config.workflowName : undefined;
-                      const configWorkflowId = typeof config.workflowId === 'string' ? config.workflowId : undefined;
+                      const workflowName = getRuntimeString(runtime, "workflow_name");
+                      const workflowStatus = getRuntimeString(runtime, "workflow_status");
+                      const configWorkflowName =
+                        typeof config.workflowName === "string" ? config.workflowName : undefined;
+                      const configWorkflowId =
+                        typeof config.workflowId === "string" ? config.workflowId : undefined;
 
-                      if (actionName !== "RUN_WORKFLOW" || !(workflowName || configWorkflowName || configWorkflowId)) {
+                      if (
+                        actionName !== "RUN_WORKFLOW" ||
+                        !(workflowName || configWorkflowName || configWorkflowId)
+                      ) {
                         return null;
                       }
 
@@ -517,13 +543,19 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                           <div className="font-medium mb-1">Workflow Details:</div>
                           <div className="pl-4 space-y-1 text-xs">
                             <div>
-                              Workflow: <span className="font-mono">
+                              Workflow:{" "}
+                              <span className="font-mono">
                                 {workflowName || configWorkflowName || configWorkflowId}
                               </span>
                             </div>
                             {workflowStatus && (
                               <div>
-                                Status: <span className={workflowStatus === "success" ? "text-green-400" : "text-red-400"}>
+                                Status:{" "}
+                                <span
+                                  className={
+                                    workflowStatus === "success" ? "text-green-400" : "text-red-400"
+                                  }
+                                >
                                   {workflowStatus}
                                 </span>
                               </div>
@@ -535,8 +567,8 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
 
                     {/* IF action result */}
                     {(() => {
-                      const conditionPassed = getRuntimeBoolean(runtime, 'condition_passed');
-                      const branchTaken = getRuntimeString(runtime, 'branch_taken');
+                      const conditionPassed = getRuntimeBoolean(runtime, "condition_passed");
+                      const branchTaken = getRuntimeString(runtime, "branch_taken");
 
                       if (conditionPassed === undefined) return null;
 
@@ -545,7 +577,8 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                           <div className="font-medium mb-1">Condition Result:</div>
                           <div className="pl-4 space-y-1 text-xs">
                             <div>
-                              Passed: <span className={conditionPassed ? "text-green-400" : "text-red-400"}>
+                              Passed:{" "}
+                              <span className={conditionPassed ? "text-green-400" : "text-red-400"}>
                                 {conditionPassed ? "Yes" : "No"}
                               </span>
                             </div>
@@ -672,7 +705,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
               {(screenshotRef || visualDebugRef) && (
                 <Section title="Screenshot">
                   <div className="space-y-3">
-                    {screenshotRef && typeof screenshotRef === 'string' && (
+                    {screenshotRef && typeof screenshotRef === "string" && (
                       <div>
                         <div className="text-xs text-muted-foreground mb-2">Action Screenshot:</div>
                         <div className="relative group">
@@ -696,7 +729,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                       </div>
                     )}
 
-                    {visualDebugRef && typeof visualDebugRef === 'string' && (
+                    {visualDebugRef && typeof visualDebugRef === "string" && (
                       <div>
                         <div className="text-xs text-muted-foreground mb-2">Visual Debug:</div>
                         <div className="relative group">
@@ -730,7 +763,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
       </Dialog.Root>
 
       {/* Screenshot Viewer */}
-      {screenshotRef && typeof screenshotRef === 'string' && (
+      {screenshotRef && typeof screenshotRef === "string" && (
         <ScreenshotViewer
           screenshotPath={screenshotRef}
           isOpen={screenshotViewerOpen}

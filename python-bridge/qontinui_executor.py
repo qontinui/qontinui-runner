@@ -78,6 +78,7 @@ from capture_manager import CaptureManager
 from training_export import TrainingExportCoordinator
 from executor_core import ExecutorCore
 from gui_automation import GUIAutomation
+from services.web_extraction_service import WebExtractionService
 
 # Check if qontinui library is available
 try:
@@ -141,9 +142,10 @@ class QontinuiExecutor:
         # Initialize EventManager first (other modules depend on it)
         self.event_manager = EventManager()
 
-        # Initialize WebSocketHandler
+        # Initialize WebSocketHandler with command handler
         self.websocket_handler = WebSocketHandler(
-            emit_log_fn=self.event_manager.emit_log
+            emit_log_fn=self.event_manager.emit_log,
+            on_command_fn=self._handle_websocket_command
         )
 
         # Initialize CaptureManager
@@ -172,6 +174,9 @@ class QontinuiExecutor:
 
         # GUIAutomation (initialized after config load)
         self.gui_automation = None
+
+        # Web extraction service (lazy-loaded when needed)
+        self._web_extraction_service = None
 
         # EventTranslator for library callbacks (initialized if library available)
         if QONTINUI_AVAILABLE:
@@ -588,6 +593,73 @@ class QontinuiExecutor:
 
             return {"success": False, "error": str(e)}
 
+    def _handle_websocket_command(self, message: Dict[str, Any]) -> None:
+        """
+        Handle incoming command from WebSocket backend.
+
+        This is called when the backend sends a command to the runner.
+        Commands from the web frontend are forwarded through the backend's
+        Redis pub/sub system to the runner's WebSocket connection.
+
+        Args:
+            message: Command message with format:
+                     {"type": "command", "command": "...", "params": {...}}
+        """
+        import sys
+        print(f"[info    ] EXECUTOR: Received WebSocket command: {message}", file=sys.stderr, flush=True)
+
+        try:
+            command_name = message.get("command")
+            params = message.get("params", {})
+
+            if not command_name:
+                print(f"[error   ] EXECUTOR: No command name in message", file=sys.stderr, flush=True)
+                return
+
+            # Route the command through our normal command handler
+            # by constructing a command dict that handle_command expects
+            command_dict = {
+                "command": command_name,
+                "params": params,
+            }
+
+            print(f"[info    ] EXECUTOR: Routing to handle_command: {command_name}", file=sys.stderr, flush=True)
+            result = self.handle_command(command_dict)
+            print(f"[info    ] EXECUTOR: Command result: {result}", file=sys.stderr, flush=True)
+
+            # Send result back through WebSocket to frontend
+            if self.websocket_handler and self.websocket_handler.is_connected:
+                import json
+                response_message = {
+                    "type": "command_response",
+                    "data": {
+                        "command": command_name,
+                        "result": result,
+                    },
+                }
+                self.websocket_handler.send_message(json.dumps(response_message))
+                print(f"[info    ] EXECUTOR: Sent command response via WebSocket", file=sys.stderr, flush=True)
+            else:
+                print(f"[warning ] EXECUTOR: WebSocket not connected, cannot send response", file=sys.stderr, flush=True)
+
+        except Exception as e:
+            print(f"[error   ] EXECUTOR: Error handling WebSocket command: {e}", file=sys.stderr, flush=True)
+            import traceback
+            print(f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+
+            # Send error response back through WebSocket
+            if self.websocket_handler and self.websocket_handler.is_connected:
+                import json
+                error_response = {
+                    "type": "command_response",
+                    "data": {
+                        "command": message.get("command", "unknown"),
+                        "result": {"success": False, "error": str(e)},
+                    },
+                }
+                self.websocket_handler.send_message(json.dumps(error_response))
+                print(f"[info    ] EXECUTOR: Sent error response via WebSocket", file=sys.stderr, flush=True)
+
     def handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Handle command from Rust bridge."""
         cmd_type = command.get("command")
@@ -634,25 +706,26 @@ class QontinuiExecutor:
             }
 
         elif cmd_type == "ws_configure":
-            # Direct stderr output for debugging (bypasses event system)
+            # Direct stderr output for debugging (use [info] format so Rust logs at info level)
             import sys
-            print(f"[PYTHON_WS_DEBUG] ws_configure received! NEW CODE IS RUNNING!", file=sys.stderr, flush=True)
+            print(f"[info    ] WS_DEBUG: ws_configure received! NEW CODE IS RUNNING!", file=sys.stderr, flush=True)
             enabled = params.get("enabled", False)
             api_url = params.get("api_url", "")
             token = params.get("jwt_token", "")
             project_id = params.get("project_id")
-            print(f"[PYTHON_WS_DEBUG] enabled={enabled}, api_url={api_url}, project_id={project_id}, token_len={len(token) if token else 0}", file=sys.stderr, flush=True)
-            self.event_manager.emit_log("info", f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, token_len={len(token) if token else 0}")
-            success = self.websocket_handler.configure(enabled, api_url, token, project_id)
-            print(f"[PYTHON_WS_DEBUG] configure result: success={success}", file=sys.stderr, flush=True)
+            runner_name = params.get("runner_name")
+            print(f"[info    ] WS_DEBUG: enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}", file=sys.stderr, flush=True)
+            self.event_manager.emit_log("info", f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}")
+            success = self.websocket_handler.configure(enabled, api_url, token, project_id, runner_name)
+            print(f"[info    ] WS_DEBUG: configure result: success={success}", file=sys.stderr, flush=True)
             self.event_manager.emit_log("info", f"[WS_CONFIGURE] Result: success={success}")
             return {"success": success}
 
         elif cmd_type == "ws_connect":
             import sys
-            print(f"[PYTHON_WS_DEBUG] ws_connect received!", file=sys.stderr, flush=True)
+            print(f"[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
             success = self.websocket_handler.connect()
-            print(f"[PYTHON_WS_DEBUG] ws_connect result: success={success}", file=sys.stderr, flush=True)
+            print(f"[info    ] WS_DEBUG: ws_connect result: success={success}", file=sys.stderr, flush=True)
             return {"success": success}
 
         elif cmd_type == "ws_disconnect":
@@ -687,8 +760,113 @@ class QontinuiExecutor:
         elif cmd_type == "navigate_to_state":
             return self.navigate_to_state(params.get("state_id"))
 
+        # Web extraction commands
+        elif cmd_type == "start_web_extraction":
+            return self._handle_start_web_extraction(params)
+
+        elif cmd_type == "stop_web_extraction":
+            return self._handle_stop_web_extraction()
+
+        elif cmd_type == "get_extraction_status":
+            return self._handle_get_extraction_status()
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
+
+    def _get_web_extraction_service(self) -> WebExtractionService:
+        """Get or create the web extraction service."""
+        if self._web_extraction_service is None:
+            self._web_extraction_service = WebExtractionService(
+                event_manager=self.event_manager,
+                websocket_handler=self.websocket_handler,
+            )
+        return self._web_extraction_service
+
+    def _handle_start_web_extraction(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle start web extraction command."""
+        import asyncio
+        import sys
+        print(f"[info    ] EXECUTOR: _handle_start_web_extraction called with params: {params}", file=sys.stderr, flush=True)
+
+        try:
+            service = self._get_web_extraction_service()
+
+            # Get or create event loop
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            # Run the async start_extraction in the event loop
+            config = params.get("config", params)  # Support both nested and flat config
+            print(f"[info    ] EXECUTOR: Starting extraction with config: {config}", file=sys.stderr, flush=True)
+            result = loop.run_until_complete(service.start_extraction(config))
+
+            if result.get("success"):
+                self.event_manager.emit_event(
+                    EventType.EXTRACTION_STARTED,
+                    {
+                        "extraction_id": result.get("extraction_id"),
+                        "config": config,
+                    },
+                )
+
+            print(f"[info    ] EXECUTOR: start_extraction result: {result}", file=sys.stderr, flush=True)
+            return result
+
+        except Exception as e:
+            print(f"[error   ] EXECUTOR: Failed to start extraction: {e}", file=sys.stderr, flush=True)
+            import traceback
+            print(f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+            self.event_manager.emit_log("error", f"Failed to start extraction: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_web_extraction(self) -> Dict[str, Any]:
+        """Handle stop web extraction command."""
+        import asyncio
+        try:
+            if self._web_extraction_service is None:
+                return {"success": False, "error": "No extraction in progress"}
+
+            # Get or create event loop
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(
+                self._web_extraction_service.stop_extraction()
+            )
+            return result
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to stop extraction: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_extraction_status(self) -> Dict[str, Any]:
+        """Handle get extraction status command."""
+        try:
+            if self._web_extraction_service is None:
+                return {
+                    "success": True,
+                    "is_running": False,
+                    "extraction_id": None,
+                }
+
+            status = self._web_extraction_service.get_status()
+            return {"success": True, **status}
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to get extraction status: {e}")
+            return {"success": False, "error": str(e)}
 
     def __del__(self):
         """Clean up resources on exit."""

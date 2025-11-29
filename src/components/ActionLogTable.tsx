@@ -250,16 +250,25 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
             return (
               <span className="text-green-500">
                 <span className="mr-1">✓</span>
-                found [{matchResult.x},{matchResult.y},{matchResult.w},{matchResult.h}] {(matchResult.confidence * 100).toFixed(1)}%
+                found [{matchResult.x},{matchResult.y},{matchResult.w},{matchResult.h}]{" "}
+                {(matchResult.confidence * 100).toFixed(1)}%
               </span>
             );
           }
         }
-        return <span className="text-green-500"><span className="mr-1">✓</span>found</span>;
+        return (
+          <span className="text-green-500">
+            <span className="mr-1">✓</span>found
+          </span>
+        );
 
       case "TYPE":
         // Text is already shown in Target column, just show success indicator
-        return <span className="text-green-500"><span className="mr-1">✓</span>typed</span>;
+        return (
+          <span className="text-green-500">
+            <span className="mr-1">✓</span>typed
+          </span>
+        );
 
       case "CLICK":
         const clickPosition = action.metadata?.clickPosition as any;
@@ -271,21 +280,32 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
             </span>
           );
         }
-        return <span className="text-green-500"><span className="mr-1">✓</span>clicked</span>;
+        return (
+          <span className="text-green-500">
+            <span className="mr-1">✓</span>clicked
+          </span>
+        );
 
       case "GO_TO_STATE":
         if (config.stateNames && Array.isArray(config.stateNames)) {
           return (
             <span className="text-green-500">
-              <span className="mr-1">✓</span>
-              → {config.stateNames.join(", ")}
+              <span className="mr-1">✓</span>→ {config.stateNames.join(", ")}
             </span>
           );
         }
-        return <span className="text-green-500"><span className="mr-1">✓</span>state activated</span>;
+        return (
+          <span className="text-green-500">
+            <span className="mr-1">✓</span>state activated
+          </span>
+        );
 
       default:
-        return <span className="text-green-500"><span className="mr-1">✓</span>success</span>;
+        return (
+          <span className="text-green-500">
+            <span className="mr-1">✓</span>success
+          </span>
+        );
     }
   }
 
@@ -365,17 +385,17 @@ function getLevelColor(level: number): { bg: string; text: string } {
 
   // Map level to explicit Tailwind classes (JIT requires explicit class names)
   const colorMap: { bg: string; text: string }[] = [
-    { bg: "bg-gray-100", text: "text-gray-900" },  // Level 0
-    { bg: "bg-gray-200", text: "text-gray-900" },  // Level 1
-    { bg: "bg-gray-300", text: "text-gray-900" },  // Level 2
-    { bg: "bg-gray-400", text: "text-gray-900" },  // Level 3
-    { bg: "bg-gray-500", text: "text-gray-900" },  // Level 4
-    { bg: "bg-gray-600", text: "text-white" },      // Level 5
-    { bg: "bg-gray-700", text: "text-white" },      // Level 6
-    { bg: "bg-gray-800", text: "text-white" },      // Level 7
-    { bg: "bg-gray-900", text: "text-white" },      // Level 8
-    { bg: "bg-gray-950", text: "text-white" },      // Level 9
-    { bg: "bg-gray-950", text: "text-white" },      // Level 10+
+    { bg: "bg-gray-100", text: "text-gray-900" }, // Level 0
+    { bg: "bg-gray-200", text: "text-gray-900" }, // Level 1
+    { bg: "bg-gray-300", text: "text-gray-900" }, // Level 2
+    { bg: "bg-gray-400", text: "text-gray-900" }, // Level 3
+    { bg: "bg-gray-500", text: "text-gray-900" }, // Level 4
+    { bg: "bg-gray-600", text: "text-white" }, // Level 5
+    { bg: "bg-gray-700", text: "text-white" }, // Level 6
+    { bg: "bg-gray-800", text: "text-white" }, // Level 7
+    { bg: "bg-gray-900", text: "text-white" }, // Level 8
+    { bg: "bg-gray-950", text: "text-white" }, // Level 9
+    { bg: "bg-gray-950", text: "text-white" }, // Level 10+
   ];
 
   return colorMap[clampedLevel];
@@ -397,7 +417,7 @@ function calculateDepth(action: ActionLogEntry, actions: ActionLogEntry[]): numb
 
   while (currentParentId) {
     depth++;
-    const parent = actions.find(a => a.id === currentParentId);
+    const parent = actions.find((a) => a.id === currentParentId);
     currentParentId = parent?.parent_action_id || null;
   }
 
@@ -411,7 +431,7 @@ function getTreePrefix(
   action: ActionLogEntry,
   actions: ActionLogEntry[],
   parentChildMap: Map<string, string[]>,
-  visibleActions: ActionLogEntry[]
+  visibleActions: ActionLogEntry[],
 ): string {
   if (!action.parent_action_id) {
     // Root level - no prefix
@@ -425,7 +445,7 @@ function getTreePrefix(
   let current: ActionLogEntry | undefined = action;
 
   while (current && current.parent_action_id) {
-    const parent = actions.find(a => a.id === current.parent_action_id);
+    const parent = actions.find((a) => a.id === current.parent_action_id);
     if (parent) {
       ancestors.unshift(parent);
     }
@@ -440,8 +460,8 @@ function getTreePrefix(
     const siblings = parentChildMap.get(ancestorParentId) || [];
 
     // Filter siblings to only include visible ones
-    const visibleSiblings = siblings.filter(sibId =>
-      visibleActions.some(a => a && a.id === sibId)
+    const visibleSiblings = siblings.filter((sibId) =>
+      visibleActions.some((a) => a && a.id === sibId),
     );
 
     const isLastSibling = visibleSiblings.indexOf(ancestor.id) === visibleSiblings.length - 1;
@@ -458,8 +478,8 @@ function getTreePrefix(
 
   const parent = ancestors[ancestors.length - 1];
   const ourSiblings = parentChildMap.get(parent.id) || [];
-  const visibleOurSiblings = ourSiblings.filter(sibId =>
-    visibleActions.some(a => a && a.id === sibId)
+  const visibleOurSiblings = ourSiblings.filter((sibId) =>
+    visibleActions.some((a) => a && a.id === sibId),
   );
   const isLastChild = visibleOurSiblings.indexOf(action.id) === visibleOurSiblings.length - 1;
   prefix += isLastChild ? "└─ " : "├─ ";
@@ -472,7 +492,7 @@ function getTreePrefix(
  */
 function calculateTypeColumnWidth(
   actions: ActionLogEntry[],
-  parentChildMap: Map<string, string[]>
+  parentChildMap: Map<string, string[]>,
 ): number {
   let maxWidth = 0;
 
@@ -509,7 +529,7 @@ export default function ActionLogTable({
 
   // Toggle expand/collapse for an action
   const toggleExpand = (actionId: string) => {
-    setCollapsedActions(prev => {
+    setCollapsedActions((prev) => {
       const next = new Set(prev);
       if (next.has(actionId)) {
         next.delete(actionId);
@@ -543,8 +563,8 @@ export default function ActionLogTable({
       const children = parentChildMap.get(action.id) || [];
 
       // Check if this action is at maxLevel and has children beyond maxLevel
-      const hasChildrenBeyondMax = children.some(childId => {
-        const child = actions.find(a => a.id === childId);
+      const hasChildrenBeyondMax = children.some((childId) => {
+        const child = actions.find((a) => a.id === childId);
         return child && getNestingLevel(child) > maxLevel;
       });
 
@@ -555,10 +575,9 @@ export default function ActionLogTable({
     }
 
     // Only update if the ideal state differs from current state
-    setCollapsedActions(prev => {
+    setCollapsedActions((prev) => {
       const needsUpdate =
-        idealCollapsed.size !== prev.size ||
-        Array.from(idealCollapsed).some(id => !prev.has(id));
+        idealCollapsed.size !== prev.size || Array.from(idealCollapsed).some((id) => !prev.has(id));
 
       return needsUpdate ? idealCollapsed : prev;
     });
@@ -582,7 +601,7 @@ export default function ActionLogTable({
       // Track all ancestors
       const ancestorChain: ActionLogEntry[] = [];
       while (currentParent) {
-        const parentAction = actions.find(a => a.id === currentParent);
+        const parentAction = actions.find((a) => a.id === currentParent);
         if (!parentAction) break;
 
         ancestorChain.unshift(parentAction);
@@ -604,14 +623,14 @@ export default function ActionLogTable({
       // Check if immediate parent is at maxLevel and has been expanded to show deeper children
       let parentAtMaxLevelIsExpanded = false;
       if (action.parent_action_id && level > maxLevel) {
-        const parent = actions.find(a => a.id === action.parent_action_id);
+        const parent = actions.find((a) => a.id === action.parent_action_id);
         if (parent && getNestingLevel(parent) === maxLevel) {
           // Parent is at maxLevel - only show if NOT in collapsedActions
           // (NOT in collapsedActions means user clicked to expand)
           parentAtMaxLevelIsExpanded = !collapsedActions.has(action.parent_action_id);
         } else if (parent && getNestingLevel(parent) > maxLevel) {
           // Parent is also beyond maxLevel - check if it's visible (recursive)
-          parentAtMaxLevelIsExpanded = visible.some(v => v.id === action.parent_action_id);
+          parentAtMaxLevelIsExpanded = visible.some((v) => v.id === action.parent_action_id);
         }
       }
 
@@ -633,7 +652,7 @@ export default function ActionLogTable({
 
   // Get the maximum level present in the data
   const maxAvailableLevel = useMemo(() => {
-    return Math.max(...actions.map(a => getNestingLevel(a)));
+    return Math.max(...actions.map((a) => getNestingLevel(a)));
   }, [actions]);
 
   if (actions.length === 0) {
@@ -663,9 +682,7 @@ export default function ActionLogTable({
             </option>
           ))}
         </select>
-        <span className="text-xs text-gray-500">
-          (Showing levels 0-{maxLevel})
-        </span>
+        <span className="text-xs text-gray-500">(Showing levels 0-{maxLevel})</span>
       </div>
 
       <table className="w-full border-collapse">
@@ -717,24 +734,26 @@ export default function ActionLogTable({
             const hasAnyChildren = children.length > 0;
 
             // Check if children are currently visible in the table
-            const hasVisibleChildren = children.some(childId =>
-              visibleActions.some(a => a.id === childId)
+            const hasVisibleChildren = children.some((childId) =>
+              visibleActions.some((a) => a.id === childId),
             );
 
             // Check if this action is at maxLevel (children would be filtered by default)
             const isAtMaxLevel = level === maxLevel;
 
             // Check if children are beyond maxLevel (would need manual expand to see)
-            const hasChildrenBeyondMaxLevel = children.some(childId => {
-              const child = actions.find(a => a.id === childId);
+            const hasChildrenBeyondMaxLevel = children.some((childId) => {
+              const child = actions.find((a) => a.id === childId);
               return child && getNestingLevel(child) > maxLevel;
             });
 
             // An action/workflow should show a toggle button if:
             // 1. It has children (regardless of whether they're filtered by maxLevel), AND
             // 2. It's marked as expandable or is a transition
-            const isTransition = action.action_type === "Outgoing Transition" || action.action_type === "Incoming Transition";
-            const isExpandable = ((action.is_expandable || isTransition) && hasAnyChildren);
+            const isTransition =
+              action.action_type === "Outgoing Transition" ||
+              action.action_type === "Incoming Transition";
+            const isExpandable = (action.is_expandable || isTransition) && hasAnyChildren;
 
             // Button shows:
             // - "+" (green) when children exist but are NOT currently visible
@@ -750,7 +769,7 @@ export default function ActionLogTable({
                 className={`
                   cursor-pointer transition-colors
                   hover:bg-blue-500/10
-                  ${isEven ? 'bg-gray-900/20' : 'bg-gray-900/5'}
+                  ${isEven ? "bg-gray-900/20" : "bg-gray-900/5"}
                 `}
               >
                 {/* Level Badge */}
@@ -779,12 +798,13 @@ export default function ActionLogTable({
                         w-3 h-3 flex items-center justify-center rounded-full
                         text-white font-bold leading-none
                         transition-all hover:scale-125 hover:opacity-100
-                        ${childrenAreHidden
-                          ? 'bg-green-700/40 hover:bg-green-600/60'
-                          : 'bg-red-700/40 hover:bg-red-600/60'
+                        ${
+                          childrenAreHidden
+                            ? "bg-green-700/40 hover:bg-green-600/60"
+                            : "bg-red-700/40 hover:bg-red-600/60"
                         }
                       `}
-                      style={{ fontSize: '8px' }}
+                      style={{ fontSize: "8px" }}
                       title={childrenAreHidden ? "Expand children" : "Collapse children"}
                     >
                       {childrenAreHidden ? "+" : "−"}
@@ -799,7 +819,9 @@ export default function ActionLogTable({
                   style={{ maxWidth: `${typeColumnWidth}rem` }}
                   title={`${treePrefix}${action.action_type}`}
                 >
-                  <span className="text-gray-500" style={{ whiteSpace: 'pre' }}>{treePrefix}</span>
+                  <span className="text-gray-500" style={{ whiteSpace: "pre" }}>
+                    {treePrefix}
+                  </span>
                   {action.action_type}
                 </td>
 
@@ -814,17 +836,26 @@ export default function ActionLogTable({
                 </td>
 
                 {/* Active States */}
-                <td className="px-3 py-1 text-sm font-mono text-gray-400" onClick={() => onRowClick(action)}>
+                <td
+                  className="px-3 py-1 text-sm font-mono text-gray-400"
+                  onClick={() => onRowClick(action)}
+                >
                   {formatActiveStates(action)}
                 </td>
 
                 {/* Timestamp */}
-                <td className="px-3 py-1 text-sm font-mono text-right text-gray-400" onClick={() => onRowClick(action)}>
+                <td
+                  className="px-3 py-1 text-sm font-mono text-right text-gray-400"
+                  onClick={() => onRowClick(action)}
+                >
                   {formatTimestamp(action.timestamp, workflowStartTime)}
                 </td>
 
                 {/* Duration */}
-                <td className="px-3 py-1 text-sm font-mono text-right text-gray-400" onClick={() => onRowClick(action)}>
+                <td
+                  className="px-3 py-1 text-sm font-mono text-right text-gray-400"
+                  onClick={() => onRowClick(action)}
+                >
                   {formatDuration(action.duration)}
                 </td>
               </tr>

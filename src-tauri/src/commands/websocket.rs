@@ -17,13 +17,16 @@ pub struct WebSocketConfig {
     pub enabled: bool,
     pub url: String,
     pub token: String,
-    pub project_id: Option<i32>,
+    /// Project ID as UUID string (e.g., "fb93478d-98bd-4e40-99f4-0f2c08c1fd5a")
+    pub project_id: Option<String>,
+    /// Custom user-defined name for this runner (e.g., "My Laptop")
+    pub runner_name: Option<String>,
 }
 
 /// Configure WebSocket connection parameters.
 ///
 /// Sets up the WebSocket configuration including URL, authentication token,
-/// and optional project ID for the Python executor.
+/// optional project ID, and optional runner name for the Python executor.
 ///
 /// # Arguments
 /// * `config` - WebSocket configuration parameters
@@ -37,23 +40,31 @@ pub fn configure_websocket(
     config: WebSocketConfig,
     state: State<AppState>,
 ) -> Result<CommandResponse, String> {
-    info!("Configuring WebSocket: enabled={}, url={}", config.enabled, config.url);
+    info!(
+        "Configuring WebSocket: enabled={}, url={}, runner_name={:?}",
+        config.enabled, config.url, config.runner_name
+    );
 
     let mut bridge_lock = state.python_bridge.lock().unwrap();
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
-            return Err("Python executor is not running. Please start the executor first.".to_string());
+            return Err(
+                "Python executor is not running. Please start the executor first.".to_string(),
+            );
         }
 
-        bridge.configure_websocket(
-            config.enabled,
-            config.url,
-            config.token,
-            config.project_id,
-        ).map_err(|e| {
-            error!("Failed to configure WebSocket: {}", e);
-            format!("Failed to configure WebSocket: {}", e)
-        })?;
+        bridge
+            .configure_websocket(
+                config.enabled,
+                config.url,
+                config.token,
+                config.project_id,
+                config.runner_name,
+            )
+            .map_err(|e| {
+                error!("Failed to configure WebSocket: {}", e);
+                format!("Failed to configure WebSocket: {}", e)
+            })?;
 
         Ok(CommandResponse {
             success: true,
@@ -82,7 +93,9 @@ pub fn connect_websocket(state: State<AppState>) -> Result<CommandResponse, Stri
     let mut bridge_lock = state.python_bridge.lock().unwrap();
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
-            return Err("Python executor is not running. Please start the executor first.".to_string());
+            return Err(
+                "Python executor is not running. Please start the executor first.".to_string(),
+            );
         }
 
         bridge.connect_websocket().map_err(|e| {
@@ -117,7 +130,9 @@ pub fn disconnect_websocket(state: State<AppState>) -> Result<CommandResponse, S
     let mut bridge_lock = state.python_bridge.lock().unwrap();
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
-            return Err("Python executor is not running. Please start the executor first.".to_string());
+            return Err(
+                "Python executor is not running. Please start the executor first.".to_string(),
+            );
         }
 
         bridge.disconnect_websocket().map_err(|e| {

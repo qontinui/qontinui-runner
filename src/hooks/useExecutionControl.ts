@@ -34,7 +34,7 @@ interface UseExecutionControlReturn {
  * Hook to manage execution control
  */
 export function useExecutionControl(
-  options: UseExecutionControlOptions = {}
+  options: UseExecutionControlOptions = {},
 ): UseExecutionControlReturn {
   const { onLog, onConfigurationPanelCollapse, onExecutionPanelCollapse } = options;
 
@@ -80,7 +80,7 @@ export function useExecutionControl(
           "[EXECUTION_CONTROL] Auto-minimize check: autoMinimize=",
           autoMinimize,
           "monitors=",
-          availableMonitors.length
+          availableMonitors.length,
         );
         if (autoMinimize && availableMonitors.length === 1) {
           console.log("[EXECUTION_CONTROL] Minimizing window...");
@@ -113,7 +113,7 @@ export function useExecutionControl(
         onLog?.("error", `Failed to start execution: ${error}`);
       }
     },
-    [autoMinimize, onLog, onConfigurationPanelCollapse, onExecutionPanelCollapse]
+    [autoMinimize, onLog, onConfigurationPanelCollapse, onExecutionPanelCollapse],
   );
 
   /**

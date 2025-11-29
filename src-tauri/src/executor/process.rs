@@ -273,7 +273,11 @@ impl ProcessManager {
         ];
 
         for path in possible_paths.into_iter().flatten() {
-            debug!("Checking sidecar path: {:?}, exists: {}", path, path.exists());
+            debug!(
+                "Checking sidecar path: {:?}, exists: {}",
+                path,
+                path.exists()
+            );
             if path.exists() {
                 info!("Found bundled executor at: {:?}", path);
                 return Some(path);

@@ -99,7 +99,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
           console.log("All workflows loaded:", allWorkflows.length);
           allWorkflows.forEach((w: any) => {
             console.log(
-              `Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}", Visibility: "${w.visibility || "public"}"`
+              `Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}", Visibility: "${w.visibility || "public"}"`,
             );
           });
 
@@ -108,7 +108,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
             (w: any) =>
               w.category &&
               w.category.toLowerCase() === "main" &&
-              (!w.visibility || w.visibility !== "internal")
+              (!w.visibility || w.visibility !== "internal"),
           );
 
           console.log("Filtered main workflows:", mainWorkflows.length);
@@ -154,12 +154,12 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
             if (internalCount > 0) {
               onLog?.(
                 "info",
-                `Loaded ${mainWorkflows.length} public workflows (${internalCount} internal workflows hidden)`
+                `Loaded ${mainWorkflows.length} public workflows (${internalCount} internal workflows hidden)`,
               );
             } else if (mainWorkflows.length !== allWorkflows.length) {
               onLog?.(
                 "info",
-                `Loaded ${mainWorkflows.length} workflows from "Main" category (${allWorkflows.length} total)`
+                `Loaded ${mainWorkflows.length} workflows from "Main" category (${allWorkflows.length} total)`,
               );
             } else {
               onLog?.("info", `Loaded ${mainWorkflows.length} workflows`);
@@ -168,7 +168,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
             if (mainWorkflows.length === 0) {
               onLog?.(
                 "warning",
-                "No workflows found with 'Main' category. Check your config categories."
+                "No workflows found with 'Main' category. Check your config categories.",
               );
             }
           }
@@ -185,7 +185,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
         throw error;
       }
     },
-    [onLog, onPythonStart]
+    [onLog, onPythonStart],
   );
 
   /**

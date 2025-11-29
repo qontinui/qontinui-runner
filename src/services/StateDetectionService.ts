@@ -155,11 +155,7 @@ export class StateDetectionError extends Error {
   public readonly type: StateDetectionErrorType;
   public readonly details?: unknown;
 
-  constructor(
-    type: StateDetectionErrorType,
-    message: string,
-    details?: unknown
-  ) {
+  constructor(type: StateDetectionErrorType, message: string, details?: unknown) {
     super(message);
     this.name = "StateDetectionError";
     this.type = type;
@@ -237,7 +233,7 @@ export class StateDetectionService {
    */
   async processSession(
     sessionPath: string,
-    config?: StateDetectionConfig
+    config?: StateDetectionConfig,
   ): Promise<StateDetectionResult> {
     const startTime = Date.now();
     const processId = `process_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -251,27 +247,21 @@ export class StateDetectionService {
       variance_threshold: config?.varianceThreshold || 10.0,
       min_screenshots_present: config?.minScreenshotsPresent || 2,
       processing_mode: config?.processingMode || "full",
-      enable_rectangle_decomposition:
-        config?.enableRectangleDecomposition ?? true,
-      enable_cooccurrence_analysis:
-        config?.enableCooccurrenceAnalysis ?? true,
+      enable_rectangle_decomposition: config?.enableRectangleDecomposition ?? true,
+      enable_cooccurrence_analysis: config?.enableCooccurrenceAnalysis ?? true,
       similarity_threshold: config?.similarityThreshold || 0.95,
       region: config?.region || null,
     };
 
     try {
       // Spawn Python process
-      const process = await this.spawnPythonBridge(
-        sessionPath,
-        analysisConfig,
-        processId
-      );
+      const process = await this.spawnPythonBridge(sessionPath, analysisConfig, processId);
 
       // Wait for process to complete and collect output
       const output = await this.waitForCompletion(
         process,
         processId,
-        config?.timeout || this.defaultTimeout
+        config?.timeout || this.defaultTimeout,
       );
 
       // Parse and validate output
@@ -292,7 +282,7 @@ export class StateDetectionService {
       throw new StateDetectionError(
         StateDetectionErrorType.UNKNOWN,
         `Unexpected error during state detection: ${error instanceof Error ? error.message : String(error)}`,
-        error
+        error,
       );
     }
   }
@@ -305,15 +295,11 @@ export class StateDetectionService {
   private spawnPythonBridge(
     sessionPath: string,
     config: Record<string, unknown>,
-    processId: string
+    processId: string,
   ): Promise<ChildProcess> {
     return new Promise((resolve, reject) => {
       try {
-        const args = [
-          this.bridgeScriptPath,
-          sessionPath,
-          JSON.stringify(config),
-        ];
+        const args = [this.bridgeScriptPath, sessionPath, JSON.stringify(config)];
 
         const process = spawn(this.pythonPath, args, {
           stdio: ["pipe", "pipe", "pipe"],
@@ -327,8 +313,8 @@ export class StateDetectionService {
             new StateDetectionError(
               StateDetectionErrorType.PROCESS_SPAWN_FAILED,
               `Failed to spawn Python process: ${error.message}`,
-              error
-            )
+              error,
+            ),
           );
         });
 
@@ -340,8 +326,8 @@ export class StateDetectionService {
             reject(
               new StateDetectionError(
                 StateDetectionErrorType.PROCESS_SPAWN_FAILED,
-                "Python process failed to start"
-              )
+                "Python process failed to start",
+              ),
             );
           }
         }, 100);
@@ -350,8 +336,8 @@ export class StateDetectionService {
           new StateDetectionError(
             StateDetectionErrorType.PROCESS_SPAWN_FAILED,
             `Failed to spawn Python process: ${error instanceof Error ? error.message : String(error)}`,
-            error
-          )
+            error,
+          ),
         );
       }
     });
@@ -365,7 +351,7 @@ export class StateDetectionService {
   private waitForCompletion(
     process: ChildProcess,
     processId: string,
-    timeout: number
+    timeout: number,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
       let stdout = "";
@@ -379,8 +365,8 @@ export class StateDetectionService {
           new StateDetectionError(
             StateDetectionErrorType.TIMEOUT,
             `State detection timed out after ${timeout}ms`,
-            { stdout, stderr }
-          )
+            { stdout, stderr },
+          ),
         );
       }, timeout);
 
@@ -411,8 +397,8 @@ export class StateDetectionService {
             new StateDetectionError(
               StateDetectionErrorType.PROCESS_CRASHED,
               `Python process exited with code ${code}`,
-              { stdout, stderr, exitCode: code }
-            )
+              { stdout, stderr, exitCode: code },
+            ),
           );
         }
       });
@@ -429,8 +415,8 @@ export class StateDetectionService {
           new StateDetectionError(
             StateDetectionErrorType.PROCESS_CRASHED,
             `Python process error: ${error.message}`,
-            { error, stdout, stderr }
-          )
+            { error, stdout, stderr },
+          ),
         );
       });
     });
@@ -469,7 +455,7 @@ export class StateDetectionService {
         throw new StateDetectionError(
           StateDetectionErrorType.ANALYSIS_FAILED,
           rawData.error || "Analysis failed without error message",
-          rawData
+          rawData,
         );
       }
 
@@ -492,7 +478,7 @@ export class StateDetectionService {
       throw new StateDetectionError(
         StateDetectionErrorType.INVALID_JSON,
         `Failed to parse Python bridge output: ${error instanceof Error ? error.message : String(error)}`,
-        { output, error }
+        { output, error },
       );
     }
   }
@@ -502,9 +488,7 @@ export class StateDetectionService {
    *
    * @private
    */
-  private parseStateImages(
-    rawImages: Array<Record<string, unknown>>
-  ): StateImageInfo[] {
+  private parseStateImages(rawImages: Array<Record<string, unknown>>): StateImageInfo[] {
     return rawImages.map((img) => ({
       id: String(img.id || ""),
       name: String(img.name || ""),
@@ -516,9 +500,7 @@ export class StateDetectionService {
       height: Number(img.height || 0),
       pixelHash: String(img.pixel_hash || img.pixelHash || ""),
       frequency: Number(img.frequency || 0),
-      screenshots: Array.isArray(img.screenshots)
-        ? img.screenshots.map(String)
-        : [],
+      screenshots: Array.isArray(img.screenshots) ? img.screenshots.map(String) : [],
       tags: Array.isArray(img.tags) ? img.tags.map(String) : [],
       darkPixelPercentage:
         img.dark_pixel_percentage !== undefined
@@ -542,9 +524,7 @@ export class StateDetectionService {
    *
    * @private
    */
-  private parseStates(
-    rawStates: Array<Record<string, unknown>>
-  ): DetectedState[] {
+  private parseStates(rawStates: Array<Record<string, unknown>>): DetectedState[] {
     return rawStates.map((state) => ({
       id: String(state.id || ""),
       name: String(state.name || ""),
@@ -553,9 +533,7 @@ export class StateDetectionService {
         : Array.isArray(state.stateImageIds)
           ? state.stateImageIds.map(String)
           : [],
-      screenshots: Array.isArray(state.screenshots)
-        ? state.screenshots.map(String)
-        : [],
+      screenshots: Array.isArray(state.screenshots) ? state.screenshots.map(String) : [],
       confidence: Number(state.confidence || 0),
       metadata: (state.metadata as Record<string, unknown>) || {},
     }));

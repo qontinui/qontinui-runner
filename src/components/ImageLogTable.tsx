@@ -16,9 +16,7 @@ interface ImageLogTableProps {
 export default function ImageLogTable({ imageLogs, onRowClick }: ImageLogTableProps) {
   if (imageLogs.length === 0) {
     return (
-      <div className="text-center text-muted-foreground py-8">
-        No image recognition logs yet.
-      </div>
+      <div className="text-center text-muted-foreground py-8">No image recognition logs yet.</div>
     );
   }
 
@@ -27,24 +25,14 @@ export default function ImageLogTable({ imageLogs, onRowClick }: ImageLogTablePr
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border">
-            <th className="text-left py-2 px-3 font-medium text-muted-foreground">
-              Time
-            </th>
+            <th className="text-left py-2 px-3 font-medium text-muted-foreground">Time</th>
             <th className="text-left py-2 px-3 font-medium text-muted-foreground w-[60px]">
               Preview
             </th>
-            <th className="text-left py-2 px-3 font-medium text-muted-foreground">
-              Template
-            </th>
-            <th className="text-left py-2 px-3 font-medium text-muted-foreground">
-              Result
-            </th>
-            <th className="text-left py-2 px-3 font-medium text-muted-foreground">
-              Confidence
-            </th>
-            <th className="text-left py-2 px-3 font-medium text-muted-foreground">
-              Location
-            </th>
+            <th className="text-left py-2 px-3 font-medium text-muted-foreground">Template</th>
+            <th className="text-left py-2 px-3 font-medium text-muted-foreground">Result</th>
+            <th className="text-left py-2 px-3 font-medium text-muted-foreground">Confidence</th>
+            <th className="text-left py-2 px-3 font-medium text-muted-foreground">Location</th>
           </tr>
         </thead>
         <tbody>
@@ -60,7 +48,11 @@ export default function ImageLogTable({ imageLogs, onRowClick }: ImageLogTablePr
               <td className="py-2 px-3">
                 {(entry.imageData || entry.templatePath) && (
                   <img
-                    src={entry.imageData ? `data:image/png;base64,${entry.imageData}` : `file://${entry.templatePath}`}
+                    src={
+                      entry.imageData
+                        ? `data:image/png;base64,${entry.imageData}`
+                        : `file://${entry.templatePath}`
+                    }
                     alt={entry.template}
                     className="w-12 h-8 object-contain border border-border rounded"
                   />

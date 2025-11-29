@@ -39,8 +39,4 @@ export {
 } from "./state-machine";
 
 // Display profile types for the new architecture
-export type {
-  ActionLogViewData,
-  ActionLogEntry,
-  CommandResponse,
-} from "./displayProfile";
+export type { ActionLogViewData, ActionLogEntry, CommandResponse } from "./displayProfile";

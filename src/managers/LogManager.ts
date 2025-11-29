@@ -10,13 +10,7 @@
  * - Handle deduplication of consecutive log messages
  */
 
-import {
-  LogStore,
-  LogFilter,
-  LogFormatter,
-  TimestampFormatter,
-  ImageLogHandler,
-} from "./logging";
+import { LogStore, LogFilter, LogFormatter, TimestampFormatter, ImageLogHandler } from "./logging";
 import type { LogEntry, ImageRecognitionEntry, ActionLogEntry } from "./logging";
 
 // Re-export types for backward compatibility
@@ -134,7 +128,7 @@ class LogManager {
    */
   async copyLogs(
     type: "general" | "image" | "actions",
-    actionLogs?: ActionLogEntry[]
+    actionLogs?: ActionLogEntry[],
   ): Promise<boolean> {
     let text = "";
 

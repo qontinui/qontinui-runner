@@ -13,9 +13,9 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
   const [captureSettings, setCaptureSettings] = useState<ScreenshotCaptureSettings>({
     enabled: false,
     manualClicksEnabled: false,
-    outputFolder: '',
-    baseImageName: 'screenshot',
-    screens: { type: 'primary' },
+    outputFolder: "",
+    baseImageName: "screenshot",
+    screens: { type: "primary" },
     captureTimings: [0],
   });
   const [monitors, setMonitors] = useState<MonitorType[]>([]);
@@ -30,12 +30,12 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
 
   // Auto-select primary screen when monitors load
   useEffect(() => {
-    if (monitors.length > 0 && captureSettings.screens.type === 'primary') {
-      const primary = monitors.find(m => m.is_primary);
+    if (monitors.length > 0 && captureSettings.screens.type === "primary") {
+      const primary = monitors.find((m) => m.is_primary);
       if (primary) {
-        setCaptureSettings(prev => ({
+        setCaptureSettings((prev) => ({
           ...prev,
-          screens: { type: 'specific', indices: [primary.index] },
+          screens: { type: "specific", indices: [primary.index] },
         }));
       }
     }
@@ -45,9 +45,9 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
   useEffect(() => {
     let unlisten: any;
 
-    listen('executor-event', (event: any) => {
+    listen("executor-event", (event: any) => {
       const data = event.payload?.data;
-      if (data?.message === 'capture_status_update') {
+      if (data?.message === "capture_status_update") {
         setManualCaptureRunning(data.manual_capture_running || false);
       }
     }).then((fn) => {
@@ -79,14 +79,14 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
 
   const handleFolderSelect = async () => {
     try {
-      const { open } = await import('@tauri-apps/plugin-dialog');
+      const { open } = await import("@tauri-apps/plugin-dialog");
       const selected = await open({
         directory: true,
         multiple: false,
-        title: 'Select Output Folder',
+        title: "Select Output Folder",
       });
 
-      if (selected && typeof selected === 'string') {
+      if (selected && typeof selected === "string") {
         setCaptureSettings((prev) => ({
           ...prev,
           outputFolder: selected,
@@ -98,16 +98,16 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
     }
   };
 
-  const handleScreenSelectionChange = (type: 'all' | 'primary' | 'specific', index?: number) => {
-    if (type === 'specific' && index !== undefined) {
+  const handleScreenSelectionChange = (type: "all" | "primary" | "specific", index?: number) => {
+    if (type === "specific" && index !== undefined) {
       setCaptureSettings((prev) => ({
         ...prev,
-        screens: { type: 'specific', indices: [index] },
+        screens: { type: "specific", indices: [index] },
       }));
     } else {
       setCaptureSettings((prev) => ({
         ...prev,
-        screens: type === 'specific' ? { type, indices: [] } : { type },
+        screens: type === "specific" ? { type, indices: [] } : { type },
       }));
     }
   };
@@ -129,7 +129,7 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
   const handleTimingChange = (index: number, value: number) => {
     setCaptureSettings((prev) => ({
       ...prev,
-      captureTimings: prev.captureTimings.map((t, i) => i === index ? Math.max(0, value) : t),
+      captureTimings: prev.captureTimings.map((t, i) => (i === index ? Math.max(0, value) : t)),
     }));
   };
 
@@ -170,7 +170,7 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
 
       if (result && result.success) {
         setManualCaptureRunning(result.manual_capture_running || false);
-        setCaptureSettings(prev => ({ ...prev, enabled: true, manualClicksEnabled: true }));
+        setCaptureSettings((prev) => ({ ...prev, enabled: true, manualClicksEnabled: true }));
         onLog("success", "Manual capture started");
       } else {
         const errorMsg = result?.message || "Unknown error";
@@ -190,7 +190,7 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
 
       if (result && result.success) {
         setManualCaptureRunning(result.manual_capture_running || false);
-        setCaptureSettings(prev => ({ ...prev, manualClicksEnabled: false }));
+        setCaptureSettings((prev) => ({ ...prev, manualClicksEnabled: false }));
         onLog("info", "Manual capture stopped");
       } else {
         const errorMsg = result?.message || "Unknown error";
@@ -257,7 +257,8 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
           <div>
             <div className="font-medium mb-1">Manual Click Capture</div>
             <div className="text-sm text-muted-foreground">
-              Capture screenshots when you physically click on the screen (for collecting initial training data before automation exists)
+              Capture screenshots when you physically click on the screen (for collecting initial
+              training data before automation exists)
             </div>
           </div>
 
@@ -267,7 +268,13 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
                 onClick={handleStartManualCapture}
                 disabled={!captureSettings.enabled || !captureSettings.outputFolder}
                 className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white rounded transition-colors"
-                title={!captureSettings.enabled ? "Enable capture tool first" : !captureSettings.outputFolder ? "Set output folder first" : "Start capturing screenshots on mouse clicks"}
+                title={
+                  !captureSettings.enabled
+                    ? "Enable capture tool first"
+                    : !captureSettings.outputFolder
+                      ? "Set output folder first"
+                      : "Start capturing screenshots on mouse clicks"
+                }
               >
                 Start Manual Capture
               </button>
@@ -299,7 +306,9 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
               <input
                 type="text"
                 value={captureSettings.outputFolder}
-                onChange={(e) => setCaptureSettings(prev => ({ ...prev, outputFolder: e.target.value }))}
+                onChange={(e) =>
+                  setCaptureSettings((prev) => ({ ...prev, outputFolder: e.target.value }))
+                }
                 placeholder="/path/to/screenshots"
                 className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
               />
@@ -323,7 +332,9 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
             <input
               type="text"
               value={captureSettings.baseImageName}
-              onChange={(e) => setCaptureSettings(prev => ({ ...prev, baseImageName: e.target.value }))}
+              onChange={(e) =>
+                setCaptureSettings((prev) => ({ ...prev, baseImageName: e.target.value }))
+              }
               placeholder="screenshot"
               className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
             />
@@ -335,26 +346,26 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
             <Monitor className="w-4 h-4" />
             Screen Selection
           </div>
-          <div className="text-sm text-muted-foreground mb-3">
-            Choose which screens to capture
-          </div>
+          <div className="text-sm text-muted-foreground mb-3">Choose which screens to capture</div>
           <div className="flex flex-col gap-2">
             {monitors.length > 0 ? (
               <>
                 {monitors.map((monitor) => {
-                  const position = monitor.x < 0 ? 'left' : monitor.x > 0 ? 'right' : 'center';
-                  const isSelected = captureSettings.screens.type === 'specific' &&
-                                   captureSettings.screens.indices?.includes(monitor.index);
+                  const position = monitor.x < 0 ? "left" : monitor.x > 0 ? "right" : "center";
+                  const isSelected =
+                    captureSettings.screens.type === "specific" &&
+                    captureSettings.screens.indices?.includes(monitor.index);
                   return (
                     <label key={monitor.index} className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="radio"
                         checked={isSelected}
-                        onChange={() => handleScreenSelectionChange('specific', monitor.index)}
+                        onChange={() => handleScreenSelectionChange("specific", monitor.index)}
                         className="w-4 h-4 accent-primary"
                       />
                       <span>
-                        Screen #{monitor.index + 1} {monitor.is_primary && <span className="text-primary">(primary)</span>}
+                        Screen #{monitor.index + 1}{" "}
+                        {monitor.is_primary && <span className="text-primary">(primary)</span>}
                         <span className="text-xs text-muted-foreground ml-2">
                           {position}, {monitor.width}x{monitor.height}
                         </span>
@@ -365,11 +376,16 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="radio"
-                    checked={captureSettings.screens.type === 'all'}
-                    onChange={() => handleScreenSelectionChange('all')}
+                    checked={captureSettings.screens.type === "all"}
+                    onChange={() => handleScreenSelectionChange("all")}
                     className="w-4 h-4 accent-primary"
                   />
-                  <span>All screens <span className="text-xs text-muted-foreground">({monitors.length} detected)</span></span>
+                  <span>
+                    All screens{" "}
+                    <span className="text-xs text-muted-foreground">
+                      ({monitors.length} detected)
+                    </span>
+                  </span>
                 </label>
               </>
             ) : (
@@ -419,9 +435,9 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
 
         <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
           <div className="text-sm text-muted-foreground">
-            <strong className="text-foreground">Note:</strong> Screenshots are captured using the same
-            tool used for pattern matching during automation. They will be numbered automatically based
-            on existing files in the output folder.
+            <strong className="text-foreground">Note:</strong> Screenshots are captured using the
+            same tool used for pattern matching during automation. They will be numbered
+            automatically based on existing files in the output folder.
           </div>
         </div>
 

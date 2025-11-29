@@ -11,10 +11,7 @@ pub struct EventForwarder;
 
 impl EventForwarder {
     /// Emits a message to the Tauri frontend and feeds events to DisplayProcessor
-    pub async fn emit_message_to_frontend(
-        app_handle: &tauri::AppHandle,
-        message: ExecutorMessage,
-    ) {
+    pub async fn emit_message_to_frontend(app_handle: &tauri::AppHandle, message: ExecutorMessage) {
         // Feed tree events to DisplayProcessor
         if let ExecutorMessage::TreeEvent {
             ref event_type,

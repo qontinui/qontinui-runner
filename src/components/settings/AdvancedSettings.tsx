@@ -132,7 +132,8 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             <div className="space-y-1">
               <div className="font-medium">Enable Image Match Debug Mode</div>
               <div className="text-sm text-muted-foreground">
-                Collect and display detailed match information in the Images tab, including top match candidates, confidence scores, and failure diagnostics
+                Collect and display detailed match information in the Images tab, including top
+                match candidates, confidence scores, and failure diagnostics
               </div>
             </div>
             <button

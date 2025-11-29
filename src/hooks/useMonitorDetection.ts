@@ -24,7 +24,7 @@ interface UseMonitorDetectionReturn {
  * Hook to manage monitor detection and selection
  */
 export function useMonitorDetection(
-  options: UseMonitorDetectionOptions = {}
+  options: UseMonitorDetectionOptions = {},
 ): UseMonitorDetectionReturn {
   const { onLog, detectOnMount = true } = options;
 

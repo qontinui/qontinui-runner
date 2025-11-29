@@ -1,6 +1,6 @@
+use crate::display::{DisplayProfile, RawEvent, ViewType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use crate::display::{DisplayProfile, RawEvent, ViewType};
 
 /// Configuration for Action Log profile
 #[derive(Debug, Clone)]
@@ -32,7 +32,7 @@ impl Default for ActionLogConfig {
         Self {
             include_actions,
             exclude_actions,
-            exclude_inline_workflows: false,  // Include helper workflows
+            exclude_inline_workflows: false, // Include helper workflows
             flatten_hierarchy: true,
         }
     }
@@ -89,14 +89,19 @@ impl ActionLogProfile {
         let status = node.get("status").and_then(|v| v.as_str())?.to_string();
 
         // Get both metadata and execution_record (execution_record has runtime data)
-        let mut metadata = node.get("metadata").and_then(|m| m.as_object()).cloned().unwrap_or_default();
+        let mut metadata = node
+            .get("metadata")
+            .and_then(|m| m.as_object())
+            .cloned()
+            .unwrap_or_default();
 
         // Merge execution_record into metadata if it exists
-        if let Some(exec_record) = node.get("metadata")
+        if let Some(exec_record) = node
+            .get("metadata")
             .and_then(|m| m.as_object())
             .and_then(|m| m.get("execution_record"))
-            .and_then(|er| er.as_object()) {
-
+            .and_then(|er| er.as_object())
+        {
             // Copy runtime data from execution_record.metadata.runtime (nested!)
             if let Some(exec_meta) = exec_record.get("metadata").and_then(|m| m.as_object()) {
                 if let Some(runtime) = exec_meta.get("runtime") {
@@ -115,13 +120,20 @@ impl ActionLogProfile {
             metadata.insert("level".to_string(), level.clone());
         }
 
-        let parent_id = node.get("parent_id").and_then(|p| p.as_str()).map(|s| s.to_string());
+        let parent_id = node
+            .get("parent_id")
+            .and_then(|p| p.as_str())
+            .map(|s| s.to_string());
         let end_timestamp = node.get("end_timestamp").and_then(|t| t.as_f64());
         let duration = node.get("duration").and_then(|d| d.as_f64());
-        let error = node.get("error").and_then(|e| e.as_str()).map(|s| s.to_string());
+        let error = node
+            .get("error")
+            .and_then(|e| e.as_str())
+            .map(|s| s.to_string());
 
         // Check if this is from an inline workflow
-        let is_inline_workflow = node.get("metadata")
+        let is_inline_workflow = node
+            .get("metadata")
             .and_then(|m| m.as_object())
             .and_then(|m| m.get("is_inline"))
             .and_then(|v| v.as_bool())
@@ -136,7 +148,11 @@ impl ActionLogProfile {
             status,
             error,
             parent_id,
-            metadata: if metadata.is_empty() { None } else { Some(metadata) },
+            metadata: if metadata.is_empty() {
+                None
+            } else {
+                Some(metadata)
+            },
             is_inline_workflow,
         })
     }
@@ -211,7 +227,7 @@ impl DisplayProfile for ActionLogProfile {
 
     fn process(&self, events: &[RawEvent]) -> ActionLogViewData {
         let mut actions_map: HashMap<String, ActionInfo> = HashMap::new();
-        let mut workflow_parents: HashMap<String, String> = HashMap::new();  // workflow_id -> parent_id
+        let mut workflow_parents: HashMap<String, String> = HashMap::new(); // workflow_id -> parent_id
         let mut workflow_start_time: Option<f64> = None;
 
         // First pass: Collect all action events
@@ -348,7 +364,10 @@ impl DisplayProfile for ActionLogProfile {
         for (action_id, action_info) in fixed_actions.iter_mut() {
             if let Some(&correct_level) = level_map.get(action_id) {
                 if let Some(metadata) = &mut action_info.metadata {
-                    metadata.insert("level".to_string(), serde_json::Value::Number(correct_level.into()));
+                    metadata.insert(
+                        "level".to_string(),
+                        serde_json::Value::Number(correct_level.into()),
+                    );
                 }
             }
         }
@@ -361,32 +380,38 @@ impl DisplayProfile for ActionLogProfile {
                 self.is_visible_action(&info.action_type, info.is_inline_workflow)
             })
             .map(|info| {
-                let is_expandable = info.metadata
+                let is_expandable = info
+                    .metadata
                     .as_ref()
                     .and_then(|m| m.get("is_expandable"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                let mut metadata: HashMap<String, serde_json::Value> = info.metadata
+                let mut metadata: HashMap<String, serde_json::Value> = info
+                    .metadata
                     .as_ref()
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect()
-                    })
+                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     .unwrap_or_default();
 
                 // Only transform helper workflows - all other action types stay as-is
                 let is_helper_find_workflow = info.action_type.starts_with("wf-helper-find-any");
 
-                let action_type = if info.action_type.starts_with("wf-helper-") && !is_helper_find_workflow {
+                let action_type = if info.action_type.starts_with("wf-helper-")
+                    && !is_helper_find_workflow
+                {
                     // Only transform NON-find-any helper workflows to FIND actions
                     // Extract the state name from "wf-helper-StateName"
-                    let state_name = info.action_type.strip_prefix("wf-helper-").unwrap_or(&info.action_type);
+                    let state_name = info
+                        .action_type
+                        .strip_prefix("wf-helper-")
+                        .unwrap_or(&info.action_type);
 
                     // Add the state name to metadata as the target
                     let mut config_map = serde_json::Map::new();
-                    config_map.insert("target".to_string(), serde_json::Value::String(state_name.to_string()));
+                    config_map.insert(
+                        "target".to_string(),
+                        serde_json::Value::String(state_name.to_string()),
+                    );
                     metadata.insert("config".to_string(), serde_json::Value::Object(config_map));
 
                     "FIND".to_string()
@@ -401,8 +426,14 @@ impl DisplayProfile for ActionLogProfile {
                                 // Extract just the readable part from image IDs like "stateimage-123456-abc"
                                 // For now, just use the imageId as-is; we could look up the actual name from state_map
                                 let mut config_map = config.clone();
-                                config_map.insert("target".to_string(), serde_json::Value::String(image_id.to_string()));
-                                metadata.insert("config".to_string(), serde_json::Value::Object(config_map));
+                                config_map.insert(
+                                    "target".to_string(),
+                                    serde_json::Value::String(image_id.to_string()),
+                                );
+                                metadata.insert(
+                                    "config".to_string(),
+                                    serde_json::Value::Object(config_map),
+                                );
                             }
                         }
                     }
@@ -427,7 +458,11 @@ impl DisplayProfile for ActionLogProfile {
             .collect();
 
         // Sort by timestamp
-        actions.sort_by(|a, b| a.timestamp.partial_cmp(&b.timestamp).unwrap_or(std::cmp::Ordering::Equal));
+        actions.sort_by(|a, b| {
+            a.timestamp
+                .partial_cmp(&b.timestamp)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let visible_count = actions.len();
         let total_count = actions_map.len(); // Count unique actions, not events

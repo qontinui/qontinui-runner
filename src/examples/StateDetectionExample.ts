@@ -39,7 +39,7 @@ async function basicExample() {
     console.log("\nDetected UI Elements:");
     result.stateImages.slice(0, 5).forEach((img, index) => {
       console.log(
-        `  ${index + 1}. ${img.name} - ${img.width}x${img.height} at (${img.x}, ${img.y})`
+        `  ${index + 1}. ${img.name} - ${img.width}x${img.height} at (${img.x}, ${img.y})`,
       );
       console.log(`     Tags: ${img.tags.join(", ")}`);
       console.log(`     Frequency: ${(img.frequency * 100).toFixed(1)}%`);
@@ -49,7 +49,7 @@ async function basicExample() {
     console.log("\nDetected States:");
     result.states.forEach((state, index) => {
       console.log(
-        `  ${index + 1}. ${state.name} - Confidence: ${(state.confidence * 100).toFixed(1)}%`
+        `  ${index + 1}. ${state.name} - Confidence: ${(state.confidence * 100).toFixed(1)}%`,
       );
       console.log(`     Elements: ${state.stateImageIds.length}`);
       console.log(`     Screenshots: ${state.screenshots.length}`);
@@ -120,24 +120,14 @@ async function advancedExample() {
     console.log(`\nAnalysis complete in ${result.processingTime}ms`);
 
     // Filter results by criteria
-    const buttons = result.stateImages.filter((img) =>
-      img.tags.includes("button")
-    );
+    const buttons = result.stateImages.filter((img) => img.tags.includes("button"));
     console.log(`\nFound ${buttons.length} buttons`);
 
-    const highFrequencyElements = result.stateImages.filter(
-      (img) => img.frequency > 0.8
-    );
-    console.log(
-      `Found ${highFrequencyElements.length} high-frequency elements (>80%)`
-    );
+    const highFrequencyElements = result.stateImages.filter((img) => img.frequency > 0.8);
+    console.log(`Found ${highFrequencyElements.length} high-frequency elements (>80%)`);
 
-    const highConfidenceStates = result.states.filter(
-      (state) => state.confidence > 0.9
-    );
-    console.log(
-      `Found ${highConfidenceStates.length} high-confidence states (>90%)`
-    );
+    const highConfidenceStates = result.states.filter((state) => state.confidence > 0.9);
+    console.log(`Found ${highConfidenceStates.length} high-confidence states (>90%)`);
   } catch (error) {
     if (error instanceof StateDetectionError) {
       handleDetectionError(error);
@@ -206,11 +196,7 @@ async function batchExample() {
 
   const service = new StateDetectionService();
 
-  const sessionPaths = [
-    "/path/to/session_1",
-    "/path/to/session_2",
-    "/path/to/session_3",
-  ];
+  const sessionPaths = ["/path/to/session_1", "/path/to/session_2", "/path/to/session_3"];
 
   const results: StateDetectionResult[] = [];
 
@@ -226,7 +212,7 @@ async function batchExample() {
       results.push(result);
 
       console.log(
-        `  ✓ Complete - ${result.stateImages.length} elements, ${result.states.length} states`
+        `  ✓ Complete - ${result.stateImages.length} elements, ${result.states.length} states`,
       );
     } catch (error) {
       console.error(`  ✗ Failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -235,15 +221,9 @@ async function batchExample() {
   }
 
   // Aggregate results
-  const totalElements = results.reduce(
-    (sum, r) => sum + r.stateImages.length,
-    0
-  );
+  const totalElements = results.reduce((sum, r) => sum + r.stateImages.length, 0);
   const totalStates = results.reduce((sum, r) => sum + r.states.length, 0);
-  const totalScreenshots = results.reduce(
-    (sum, r) => sum + r.totalScreenshots,
-    0
-  );
+  const totalScreenshots = results.reduce((sum, r) => sum + r.totalScreenshots, 0);
 
   console.log("\n=== Batch Summary ===");
   console.log(`Sessions analyzed: ${results.length}/${sessionPaths.length}`);
@@ -275,18 +255,14 @@ function analyzeResults(result: StateDetectionResult) {
   });
 
   // Find overlay elements (high frequency, indicating UI that's always visible)
-  const overlayElements = result.stateImages.filter(
-    (img) => img.frequency > 0.9
-  );
+  const overlayElements = result.stateImages.filter((img) => img.frequency > 0.9);
   console.log(`\nPersistent overlay elements: ${overlayElements.length}`);
 
   // Find state-specific elements (lower frequency)
   const stateSpecificElements = result.stateImages.filter(
-    (img) => img.frequency < 0.5 && img.frequency > 0.1
+    (img) => img.frequency < 0.5 && img.frequency > 0.1,
   );
-  console.log(
-    `State-specific elements: ${stateSpecificElements.length}`
-  );
+  console.log(`State-specific elements: ${stateSpecificElements.length}`);
 
   // Analyze state composition
   console.log("\nState composition:");
@@ -300,9 +276,7 @@ function analyzeResults(result: StateDetectionResult) {
 
     console.log(`  ${state.name}:`);
     console.log(`    Elements: ${elementCount}`);
-    console.log(
-      `    Avg element frequency: ${(avgElementFreq * 100).toFixed(1)}%`
-    );
+    console.log(`    Avg element frequency: ${(avgElementFreq * 100).toFixed(1)}%`);
     console.log(`    Confidence: ${(state.confidence * 100).toFixed(1)}%`);
   });
 
@@ -321,7 +295,7 @@ function analyzeResults(result: StateDetectionResult) {
         img.x >= region.x &&
         img.x < region.x + region.width &&
         img.y >= region.y &&
-        img.y < region.y + region.height
+        img.y < region.y + region.height,
     );
     console.log(`  ${name}: ${elementsInRegion.length} elements`);
   });
@@ -342,19 +316,11 @@ async function runAllExamples() {
   // await batchExample();
 
   console.log("\n\nExamples complete!");
-  console.log(
-    "To run these examples, update the session paths and uncomment the function calls."
-  );
+  console.log("To run these examples, update the session paths and uncomment the function calls.");
 }
 
 // Export examples
-export {
-  basicExample,
-  advancedExample,
-  batchExample,
-  analyzeResults,
-  handleDetectionError,
-};
+export { basicExample, advancedExample, batchExample, analyzeResults, handleDetectionError };
 
 // Run examples if this file is executed directly
 if (require.main === module) {

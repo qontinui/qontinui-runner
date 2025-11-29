@@ -23,8 +23,8 @@
  * ```
  */
 
-import { useCallback, useRef } from 'react';
-import { videoRecorder, VideoRecordingConfig } from '../services/VideoRecordingService';
+import { useCallback, useRef } from "react";
+import { videoRecorder, VideoRecordingConfig } from "../services/VideoRecordingService";
 
 export interface UseVideoRecordingOptions extends VideoRecordingConfig {
   onRecordingStart?: () => void;
@@ -46,41 +46,46 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
    * Start recording for an automation execution
    * @param sessionId Unique identifier for this execution session
    */
-  const startRecordingForExecution = useCallback(async (sessionId: string) => {
-    if (!options.enabled) {
-      console.log('[VideoRecording] Recording disabled, skipping');
-      return;
-    }
-
-    try {
-      console.log(`[VideoRecording] Starting recording for session: ${sessionId}`);
-
-      const config: VideoRecordingConfig = {
-        enabled: options.enabled,
-        startDelaySeconds: options.startDelaySeconds,
-        maxDurationSeconds: options.maxDurationSeconds,
-        fps: options.fps,
-        quality: options.quality,
-        codec: options.codec,
-      };
-
-      await videoRecorder.startRecording(sessionId, config);
-      isRecordingRef.current = true;
-
-      if (options.onRecordingStart) {
-        options.onRecordingStart();
+  const startRecordingForExecution = useCallback(
+    async (sessionId: string) => {
+      if (!options.enabled) {
+        console.log("[VideoRecording] Recording disabled, skipping");
+        return;
       }
 
-      console.log(`[VideoRecording] Recording started successfully with ${options.startDelaySeconds}s delay`);
-    } catch (error) {
-      console.error('[VideoRecording] Failed to start recording:', error);
-      isRecordingRef.current = false;
+      try {
+        console.log(`[VideoRecording] Starting recording for session: ${sessionId}`);
 
-      if (options.onRecordingError) {
-        options.onRecordingError(error as Error);
+        const config: VideoRecordingConfig = {
+          enabled: options.enabled,
+          startDelaySeconds: options.startDelaySeconds,
+          maxDurationSeconds: options.maxDurationSeconds,
+          fps: options.fps,
+          quality: options.quality,
+          codec: options.codec,
+        };
+
+        await videoRecorder.startRecording(sessionId, config);
+        isRecordingRef.current = true;
+
+        if (options.onRecordingStart) {
+          options.onRecordingStart();
+        }
+
+        console.log(
+          `[VideoRecording] Recording started successfully with ${options.startDelaySeconds}s delay`,
+        );
+      } catch (error) {
+        console.error("[VideoRecording] Failed to start recording:", error);
+        isRecordingRef.current = false;
+
+        if (options.onRecordingError) {
+          options.onRecordingError(error as Error);
+        }
       }
-    }
-  }, [options]);
+    },
+    [options],
+  );
 
   /**
    * Stop the current recording
@@ -88,12 +93,12 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
    */
   const stopRecording = useCallback(async (): Promise<string | null> => {
     if (!isRecordingRef.current) {
-      console.log('[VideoRecording] Not currently recording, skipping stop');
+      console.log("[VideoRecording] Not currently recording, skipping stop");
       return null;
     }
 
     try {
-      console.log('[VideoRecording] Stopping recording...');
+      console.log("[VideoRecording] Stopping recording...");
       const videoPath = await videoRecorder.stopRecording();
       isRecordingRef.current = false;
 
@@ -104,7 +109,7 @@ export function useVideoRecording(options: UseVideoRecordingOptions): UseVideoRe
       console.log(`[VideoRecording] Recording stopped. Video saved to: ${videoPath}`);
       return videoPath;
     } catch (error) {
-      console.error('[VideoRecording] Failed to stop recording:', error);
+      console.error("[VideoRecording] Failed to stop recording:", error);
       isRecordingRef.current = false;
 
       if (options.onRecordingError) {

@@ -29,9 +29,7 @@ interface SectionProps {
 function Section({ title, children, className }: SectionProps) {
   return (
     <div className={cn("space-y-2", className)}>
-      <h3 className="text-sm font-semibold text-foreground border-b border-border pb-1">
-        {title}
-      </h3>
+      <h3 className="text-sm font-semibold text-foreground border-b border-border pb-1">{title}</h3>
       <div className="text-sm">{children}</div>
     </div>
   );
@@ -116,7 +114,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                     "p-2 rounded-lg",
                     entry.found
                       ? "bg-green-100 dark:bg-green-900/30"
-                      : "bg-red-100 dark:bg-red-900/30"
+                      : "bg-red-100 dark:bg-red-900/30",
                   )}
                 >
                   {entry.found ? (
@@ -161,7 +159,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                           "inline-flex items-center px-3 py-1 rounded-full text-sm font-medium",
                           entry.found
                             ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
-                            : "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400"
+                            : "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
                         )}
                       >
                         {entry.found ? "FOUND" : "NOT FOUND"}
@@ -176,7 +174,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                           "font-semibold",
                           entry.confidence >= entry.threshold
                             ? "text-green-600 dark:text-green-400"
-                            : "text-red-600 dark:text-red-400"
+                            : "text-red-600 dark:text-red-400",
                         )}
                       >
                         {(entry.confidence * 100).toFixed(2)}%
@@ -191,9 +189,8 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                     <div className="font-mono text-sm">
                       {entry.location ? (
                         <div className="flex items-center gap-2">
-                          <Target className="w-4 h-4 text-muted-foreground" />
-                          ({entry.location.x}, {entry.location.y}) - {entry.location.width}x
-                          {entry.location.height}
+                          <Target className="w-4 h-4 text-muted-foreground" />({entry.location.x},{" "}
+                          {entry.location.y}) - {entry.location.width}x{entry.location.height}
                         </div>
                       ) : (
                         <span className="text-muted-foreground">No location</span>
@@ -225,18 +222,26 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
               )}
 
               {/* Visual Data Section */}
-              {(entry.screenshotPath || entry.screenshotData || entry.visualDebugImage || entry.templatePath || entry.imageData) && (
+              {(entry.screenshotPath ||
+                entry.screenshotData ||
+                entry.visualDebugImage ||
+                entry.templatePath ||
+                entry.imageData) && (
                 <Section title="Visual Data">
                   <div className="space-y-4">
                     {/* Template (above screenshot, thumbnail) */}
-                    {(entry.templatePath || entry.imageData) ? (
+                    {entry.templatePath || entry.imageData ? (
                       <div className="space-y-2">
                         <div className="text-xs text-muted-foreground font-medium">
                           Template Image
                         </div>
                         <div className="relative group inline-block">
                           <img
-                            src={entry.imageData ? `data:image/png;base64,${entry.imageData}` : `file://${entry.templatePath}`}
+                            src={
+                              entry.imageData
+                                ? `data:image/png;base64,${entry.imageData}`
+                                : `file://${entry.templatePath}`
+                            }
                             alt="Template"
                             className="max-w-[200px] max-h-[200px] object-contain rounded-lg border border-border cursor-pointer hover:border-primary transition-colors"
                             onClick={() => setTemplateViewerOpen(true)}
@@ -253,14 +258,12 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                     ) : null}
 
                     {/* Screenshot with annotations (full width) */}
-                    {(entry.visualDebugImage || entry.screenshotPath || entry.screenshotData) ? (
+                    {entry.visualDebugImage || entry.screenshotPath || entry.screenshotData ? (
                       <div className="space-y-2">
                         <div className="text-xs text-muted-foreground font-medium">
                           Screenshot
                           {entry.screenshotTimestamp && (
-                            <span className="ml-2 font-normal">
-                              ({entry.screenshotTimestamp})
-                            </span>
+                            <span className="ml-2 font-normal">({entry.screenshotTimestamp})</span>
                           )}
                         </div>
                         <div className="relative group">
@@ -287,9 +290,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                       </div>
                     ) : (
                       <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground font-medium">
-                          Screenshot
-                        </div>
+                        <div className="text-xs text-muted-foreground font-medium">Screenshot</div>
                         <div className="w-full h-32 rounded-lg border border-border bg-muted/20 flex items-center justify-center">
                           <span className="text-xs text-muted-foreground">
                             Screenshot not available
@@ -317,14 +318,18 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                                   "p-2 rounded border font-mono",
                                   meetsThreshold
                                     ? "bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800"
-                                    : "bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800"
+                                    : "bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800",
                                 )}
                               >
                                 <div className="flex items-center justify-between">
-                                  <span className={cn(
-                                    "font-semibold",
-                                    meetsThreshold ? "text-green-700 dark:text-green-400" : "text-red-700 dark:text-red-400"
-                                  )}>
+                                  <span
+                                    className={cn(
+                                      "font-semibold",
+                                      meetsThreshold
+                                        ? "text-green-700 dark:text-green-400"
+                                        : "text-red-700 dark:text-red-400",
+                                    )}
+                                  >
                                     #{idx + 1}: {(confidence * 100).toFixed(2)}%
                                   </span>
                                   <span className="text-muted-foreground">
@@ -333,7 +338,8 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                                 </div>
                                 {!meetsThreshold && (
                                   <div className="text-xs text-muted-foreground mt-1">
-                                    Below threshold by {((entry.threshold - confidence) * 100).toFixed(2)}%
+                                    Below threshold by{" "}
+                                    {((entry.threshold - confidence) * 100).toFixed(2)}%
                                   </div>
                                 )}
                               </div>

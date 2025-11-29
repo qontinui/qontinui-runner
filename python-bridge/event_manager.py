@@ -34,6 +34,13 @@ class EventType(Enum):
     SCREENSHOT_TAKEN = "screenshot_taken"
     IMAGE_RECOGNITION = "image_recognition"
     ACTION_EXECUTION = "action_execution"
+    # Web extraction events
+    EXTRACTION_STARTED = "extraction_started"
+    EXTRACTION_PROGRESS = "extraction_progress"
+    EXTRACTION_STATE_DETECTED = "extraction_state_detected"
+    EXTRACTION_ELEMENT_DETECTED = "extraction_element_detected"
+    EXTRACTION_COMPLETE = "extraction_complete"
+    EXTRACTION_ERROR = "extraction_error"
 
 
 class EventManager:

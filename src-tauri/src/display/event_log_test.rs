@@ -3,9 +3,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::display::{EventLog, RawEvent};
-    use crate::display::profiles::ActionLogProfile;
     use crate::display::profile::DisplayProfile;
+    use crate::display::profiles::ActionLogProfile;
+    use crate::display::{EventLog, RawEvent};
     use serde_json::json;
 
     #[test]
@@ -94,8 +94,14 @@ mod tests {
         let view_data = profile.process(events);
 
         // Verify CLICK action appears in view data
-        assert!(view_data.visible_count > 0, "ActionLogProfile should return visible actions");
-        assert!(view_data.actions.len() > 0, "ActionLogProfile should return action entries");
+        assert!(
+            view_data.visible_count > 0,
+            "ActionLogProfile should return visible actions"
+        );
+        assert!(
+            view_data.actions.len() > 0,
+            "ActionLogProfile should return action entries"
+        );
 
         let first_action = &view_data.actions[0];
         assert_eq!(first_action.action_type, "CLICK");
@@ -104,7 +110,10 @@ mod tests {
 
         println!("✓ PASS: ActionLogProfile processes CLICK action correctly");
         println!("  Actions returned: {}", view_data.actions.len());
-        println!("  First action: type={}, status={}", first_action.action_type, first_action.status);
+        println!(
+            "  First action: type={}, status={}",
+            first_action.action_type, first_action.status
+        );
     }
 
     #[test]
@@ -189,8 +198,14 @@ mod tests {
         let view_data = profile.process(events);
 
         // Verify IF action is excluded, CLICK action is included
-        assert_eq!(view_data.visible_count, 1, "Should have 1 visible action (CLICK)");
-        assert_eq!(view_data.total_count, 2, "Should have 2 total actions (IF + CLICK)");
+        assert_eq!(
+            view_data.visible_count, 1,
+            "Should have 1 visible action (CLICK)"
+        );
+        assert_eq!(
+            view_data.total_count, 2,
+            "Should have 2 total actions (IF + CLICK)"
+        );
         assert_eq!(view_data.actions.len(), 1, "Should return 1 action (CLICK)");
         assert_eq!(view_data.actions[0].action_type, "CLICK");
 
@@ -247,7 +262,10 @@ mod tests {
 
         // Verify WAIT action is excluded
         assert_eq!(view_data.visible_count, 0, "Should have 0 visible actions");
-        assert_eq!(view_data.total_count, 1, "Should have 1 total action (WAIT)");
+        assert_eq!(
+            view_data.total_count, 1,
+            "Should have 1 total action (WAIT)"
+        );
 
         println!("✓ PASS: ActionLogProfile correctly excludes WAIT actions");
     }
@@ -300,7 +318,10 @@ mod tests {
 
         // Verify workflow appears
         assert!(view_data.visible_count > 0, "Workflows should be visible");
-        assert!(view_data.actions.len() > 0, "Should return workflow entries");
+        assert!(
+            view_data.actions.len() > 0,
+            "Should return workflow entries"
+        );
 
         println!("✓ PASS: ActionLogProfile includes workflows");
     }

@@ -9,8 +9,8 @@
 // - DisplayProcessor: Applies profiles to events
 
 pub mod event_log;
-pub mod profile;
 pub mod processor;
+pub mod profile;
 pub mod profiles;
 
 // Tests
@@ -18,5 +18,5 @@ pub mod profiles;
 mod event_log_test;
 
 pub use event_log::{EventLog, RawEvent};
-pub use profile::{DisplayProfile, ViewType};
 pub use processor::DisplayProcessor;
+pub use profile::{DisplayProfile, ViewType};

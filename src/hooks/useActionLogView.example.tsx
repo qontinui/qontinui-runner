@@ -148,10 +148,7 @@ export function ActionTimelineExample() {
     <div>
       <h2>Action Timeline</h2>
       {viewData.workflow_start_time && (
-        <p>
-          Started:{" "}
-          {new Date(viewData.workflow_start_time * 1000).toLocaleTimeString()}
-        </p>
+        <p>Started: {new Date(viewData.workflow_start_time * 1000).toLocaleTimeString()}</p>
       )}
 
       <div>
@@ -169,8 +166,7 @@ export function ActionTimelineExample() {
               </div>
             )}
             <div>
-              Status:{" "}
-              <StatusBadge status={action.status} error={action.error} />
+              Status: <StatusBadge status={action.status} error={action.error} />
             </div>
           </div>
         ))}
@@ -193,8 +189,7 @@ export function FilterableActionLogExample() {
 
     return viewData.actions.filter((action) => {
       const typeMatch = filterType === "all" || action.action_type === filterType;
-      const statusMatch =
-        filterStatus === "all" || action.status === filterStatus;
+      const statusMatch = filterStatus === "all" || action.status === filterStatus;
       return typeMatch && statusMatch;
     });
   }, [viewData, filterType, filterStatus]);
@@ -223,10 +218,7 @@ export function FilterableActionLogExample() {
 
         <label style={{ marginLeft: "10px" }}>
           Status:
-          <select
-            value={filterStatus}
-            onChange={(e) => setFilterStatus(e.target.value)}
-          >
+          <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
             <option value="all">All Statuses</option>
             <option value="pending">Pending</option>
             <option value="running">Running</option>
@@ -288,9 +280,7 @@ function ActionList({ actions }: { actions: ActionLogEntry[] }) {
             <StatusBadge status={action.status} error={action.error} />
           </div>
           {action.error && (
-            <div style={{ color: "red", fontSize: "0.9em", marginTop: "5px" }}>
-              {action.error}
-            </div>
+            <div style={{ color: "red", fontSize: "0.9em", marginTop: "5px" }}>{action.error}</div>
           )}
         </div>
       ))}
@@ -298,13 +288,7 @@ function ActionList({ actions }: { actions: ActionLogEntry[] }) {
   );
 }
 
-function StatusBadge({
-  status,
-  error,
-}: {
-  status: string;
-  error: string | null;
-}) {
+function StatusBadge({ status, error }: { status: string; error: string | null }) {
   const getStatusColor = () => {
     switch (status) {
       case "success":

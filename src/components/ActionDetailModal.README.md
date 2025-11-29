@@ -21,9 +21,9 @@ A comprehensive modal component for displaying detailed action information from 
 
 ```typescript
 interface ActionDetailModalProps {
-  action: DisplayNode | null;  // The action node to display (null closes modal)
-  isOpen: boolean;              // Controls modal visibility
-  onClose: () => void;          // Callback when modal is closed
+  action: DisplayNode | null; // The action node to display (null closes modal)
+  isOpen: boolean; // Controls modal visibility
+  onClose: () => void; // Callback when modal is closed
 }
 ```
 
@@ -258,6 +258,7 @@ The modal displays screenshots if available:
 ```
 
 Screenshots are displayed as thumbnails with the ability to:
+
 - Click to view full size
 - Hover to show expand button
 - See full file path below the image
@@ -265,6 +266,7 @@ Screenshots are displayed as thumbnails with the ability to:
 ## Styling
 
 The component uses:
+
 - **Radix UI Dialog**: For accessible modal behavior
 - **Tailwind CSS**: For styling with design system colors
 - **Lucide Icons**: For consistent iconography
@@ -286,6 +288,7 @@ The component uses:
 ## Accessibility
 
 The modal includes:
+
 - Proper ARIA labels for all interactive elements
 - Screen reader descriptions
 - Keyboard navigation support (Escape to close)
@@ -295,6 +298,7 @@ The modal includes:
 ## Dependencies
 
 Required packages:
+
 ```json
 {
   "@radix-ui/react-dialog": "^2.x",
@@ -309,6 +313,7 @@ Required packages:
 ## Future Enhancements
 
 Potential improvements:
+
 - Export action details as JSON
 - Copy to clipboard functionality
 - Link to view screenshots in Images tab

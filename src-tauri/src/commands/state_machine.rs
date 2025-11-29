@@ -53,7 +53,10 @@ pub async fn execute_transition(
 
         Ok(CommandResponse {
             success: true,
-            message: Some(format!("Transition {} execution command sent", transition_id)),
+            message: Some(format!(
+                "Transition {} execution command sent",
+                transition_id
+            )),
             data: None,
         })
     } else {
@@ -140,7 +143,10 @@ pub async fn navigate_to_multiple_states(
 
         Ok(CommandResponse {
             success: true,
-            message: Some(format!("Navigate to {} states command sent", state_ids.len())),
+            message: Some(format!(
+                "Navigate to {} states command sent",
+                state_ids.len()
+            )),
             data: None,
         })
     } else {
@@ -239,17 +245,14 @@ pub async fn get_available_transitions(
 /// * `Ok(serde_json::Value)` - Action log view data as JSON
 /// * `Err(String)` - Error message if view cannot be retrieved
 #[tauri::command]
-pub async fn get_action_log_view(
-    state: State<'_, AppState>,
-) -> Result<CommandResponse, String> {
+pub async fn get_action_log_view(state: State<'_, AppState>) -> Result<CommandResponse, String> {
     info!("Getting action log view");
 
     let processor = state.display_processor.lock().await;
-    let view_data = processor.get_view("action_log")
-        .map_err(|e| {
-            error!("Failed to get action log view: {}", e);
-            format!("Failed to get action log view: {}", e)
-        })?;
+    let view_data = processor.get_view("action_log").map_err(|e| {
+        error!("Failed to get action log view: {}", e);
+        format!("Failed to get action log view: {}", e)
+    })?;
 
     info!("Action log view retrieved successfully");
     Ok(CommandResponse {
@@ -271,9 +274,7 @@ pub async fn get_action_log_view(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error message if clear fails
 #[tauri::command]
-pub async fn clear_action_log(
-    state: State<'_, AppState>,
-) -> Result<CommandResponse, String> {
+pub async fn clear_action_log(state: State<'_, AppState>) -> Result<CommandResponse, String> {
     info!("Clearing action log");
 
     let mut processor = state.display_processor.lock().await;

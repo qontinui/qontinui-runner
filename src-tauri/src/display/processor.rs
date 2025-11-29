@@ -1,7 +1,7 @@
+use crate::display::{DisplayProfile, EventLog, ViewType};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use serde::Serialize;
-use crate::display::{DisplayProfile, EventLog, ViewType};
 
 /// Central processor that applies display profiles to event data
 pub struct DisplayProcessor {
@@ -9,7 +9,8 @@ pub struct DisplayProcessor {
     event_log: EventLog,
 
     /// Registered display profiles
-    profiles: HashMap<String, Arc<dyn DisplayProfile<Output = Box<dyn erased_serde::Serialize + Send>>>>,
+    profiles:
+        HashMap<String, Arc<dyn DisplayProfile<Output = Box<dyn erased_serde::Serialize + Send>>>>,
 }
 
 impl DisplayProcessor {
@@ -56,7 +57,8 @@ impl DisplayProcessor {
             }
         }
 
-        self.profiles.insert(name, Arc::new(ProfileWrapper(profile)));
+        self.profiles
+            .insert(name, Arc::new(ProfileWrapper(profile)));
         self
     }
 
@@ -73,28 +75,28 @@ impl DisplayProcessor {
 
     /// Get view data for a specific profile
     pub fn get_view(&self, profile_name: &str) -> Result<serde_json::Value, String> {
-        let profile = self.profiles
+        let profile = self
+            .profiles
             .get(profile_name)
             .ok_or_else(|| format!("Profile not found: {}", profile_name))?;
 
         let output = profile.process(self.event_log.events());
 
-        serde_json::to_value(&output)
-            .map_err(|e| format!("Failed to serialize view data: {}", e))
+        serde_json::to_value(&output).map_err(|e| format!("Failed to serialize view data: {}", e))
     }
 
     /// Get view data by view type
     #[allow(dead_code)]
     pub fn get_view_by_type(&self, view_type: ViewType) -> Result<serde_json::Value, String> {
-        let profile = self.profiles
+        let profile = self
+            .profiles
             .values()
             .find(|p| p.view_type() == view_type)
             .ok_or_else(|| format!("No profile found for view type: {:?}", view_type))?;
 
         let output = profile.process(self.event_log.events());
 
-        serde_json::to_value(&output)
-            .map_err(|e| format!("Failed to serialize view data: {}", e))
+        serde_json::to_value(&output).map_err(|e| format!("Failed to serialize view data: {}", e))
     }
 
     /// List all registered profiles

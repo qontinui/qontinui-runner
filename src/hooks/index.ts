@@ -5,10 +5,7 @@
  */
 
 export { useActionLogView } from "./useActionLogView";
-export type {
-  UseActionLogViewOptions,
-  UseActionLogViewResult,
-} from "./useActionLogView";
+export type { UseActionLogViewOptions, UseActionLogViewResult } from "./useActionLogView";
 
 export { useLogManager } from "./useLogManager";
 export type { UseLogManagerResult } from "./useLogManager";

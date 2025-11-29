@@ -37,7 +37,7 @@ export class LogFormatter {
       .map(
         (entry) =>
           `[${entry.timestamp}] ${entry.node} - ${entry.template} - ` +
-          `${entry.found ? "FOUND" : "NOT FOUND"} (${(entry.confidence * 100).toFixed(1)}%)`
+          `${entry.found ? "FOUND" : "NOT FOUND"} (${(entry.confidence * 100).toFixed(1)}%)`,
       )
       .join("\n");
   }
@@ -54,9 +54,7 @@ export class LogFormatter {
           minute: "2-digit",
           second: "2-digit",
         });
-        const duration = action.duration
-          ? ` (${(action.duration * 1000).toFixed(0)}ms)`
-          : "";
+        const duration = action.duration ? ` (${(action.duration * 1000).toFixed(0)}ms)` : "";
         const status = action.status.toUpperCase();
         const error = action.error ? ` - ERROR: ${action.error}` : "";
 

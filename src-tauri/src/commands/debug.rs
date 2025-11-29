@@ -28,8 +28,10 @@ pub fn get_debug_settings() -> Result<CommandResponse, String> {
     Ok(CommandResponse {
         success: true,
         message: Some("Debug settings retrieved".to_string()),
-        data: Some(serde_json::to_value(&debug_settings)
-            .map_err(|e| format!("Failed to serialize debug settings: {}", e))?),
+        data: Some(
+            serde_json::to_value(&debug_settings)
+                .map_err(|e| format!("Failed to serialize debug settings: {}", e))?,
+        ),
     })
 }
 

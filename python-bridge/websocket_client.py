@@ -55,6 +55,7 @@ class RunnerWebSocketClient:
         token: str,
         project_id: str,
         runner_version: str = "0.1.0",
+        runner_name: Optional[str] = None,
         auto_reconnect: bool = True,
         heartbeat_interval: int = 30,
         max_reconnect_attempts: int = 5,
@@ -70,6 +71,7 @@ class RunnerWebSocketClient:
             token: JWT authentication token
             project_id: Project UUID
             runner_version: Version of qontinui-runner
+            runner_name: Custom user-defined name for this runner
             auto_reconnect: Enable automatic reconnection on disconnect
             heartbeat_interval: Seconds between heartbeat messages
             max_reconnect_attempts: Maximum reconnection attempts
@@ -84,6 +86,7 @@ class RunnerWebSocketClient:
         self.token = token
         self.project_id = project_id
         self.runner_version = runner_version
+        self.runner_name = runner_name
         self.auto_reconnect = auto_reconnect
         self.heartbeat_interval = heartbeat_interval
         self.max_reconnect_attempts = max_reconnect_attempts
@@ -92,6 +95,7 @@ class RunnerWebSocketClient:
         self.on_connected = on_connected
         self.on_disconnected = on_disconnected
         self.on_error = on_error
+        self.on_command: Optional[Callable[[Dict[str, Any]], None]] = None
 
         # Connection state
         self.ws: Optional[WebSocketClientProtocol] = None
@@ -103,6 +107,7 @@ class RunnerWebSocketClient:
         # Tasks
         self.heartbeat_task: Optional[asyncio.Task] = None
         self.reconnect_task: Optional[asyncio.Task] = None
+        self.listener_task: Optional[asyncio.Task] = None
 
         # System info
         self.runner_os = self._get_os_info()
@@ -148,6 +153,14 @@ class RunnerWebSocketClient:
 
             logger.info("WebSocket connection established")
 
+            # Send runner info immediately after connection
+            # This allows the backend to update the connection record with the runner name
+            await self._send_runner_info()
+
+            # Start listener task to receive incoming commands
+            if self.listener_task is None or self.listener_task.done():
+                self.listener_task = asyncio.create_task(self._message_listener())
+
             if self.on_connected:
                 try:
                     self.on_connected()
@@ -178,6 +191,14 @@ class RunnerWebSocketClient:
             self.heartbeat_task.cancel()
             try:
                 await self.heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+        # Cancel listener task
+        if self.listener_task and not self.listener_task.done():
+            self.listener_task.cancel()
+            try:
+                await self.listener_task
             except asyncio.CancelledError:
                 pass
 
@@ -250,6 +271,68 @@ class RunnerWebSocketClient:
             logger.error(f"Error sending message: {e}")
             return None
 
+    async def send_message(self, message: Dict[str, Any]) -> bool:
+        """
+        Send message to WebSocket server without waiting for response.
+
+        This is used for sending arbitrary message types like extraction events
+        where we don't need to wait for a specific response.
+
+        Args:
+            message: Message dictionary
+
+        Returns:
+            True if message sent successfully, False otherwise
+        """
+        if not self.is_connected or not self.ws:
+            logger.error("Cannot send message: Not connected")
+            return False
+
+        try:
+            await self.ws.send(json.dumps(message))
+            logger.debug(f"Message sent: type={message.get('type')}")
+            return True
+        except ConnectionClosed:
+            logger.error("Connection closed while sending message")
+            self.is_connected = False
+            if self.auto_reconnect:
+                asyncio.create_task(self._reconnect())
+            return False
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            return False
+
+    async def _send_runner_info(self) -> bool:
+        """
+        Send runner information immediately after connection.
+
+        This allows the backend to update the connection record with
+        the custom runner name and other metadata.
+
+        Returns:
+            True if info sent successfully, False otherwise
+        """
+        message = {
+            "type": "runner_info",
+            "runner_name": self.runner_name,
+            "runner_version": self.runner_version,
+            "runner_os": self.runner_os,
+            "runner_hostname": self.runner_hostname,
+            "timestamp": self._get_timestamp(),
+        }
+
+        logger.info(f"Sending runner info: name={self.runner_name}")
+
+        try:
+            if self.ws and self.is_connected:
+                await self.ws.send(json.dumps(message))
+                logger.info("Runner info sent successfully")
+                return True
+        except Exception as e:
+            logger.error(f"Error sending runner info: {e}")
+
+        return False
+
     async def start_session(
         self,
         configuration_snapshot: Optional[Dict[str, Any]] = None
@@ -269,6 +352,7 @@ class RunnerWebSocketClient:
             "runner_version": self.runner_version,
             "runner_os": self.runner_os,
             "runner_hostname": self.runner_hostname,
+            "runner_name": self.runner_name,
             "configuration_snapshot": configuration_snapshot,
             "timestamp": self._get_timestamp(),
         }
@@ -507,6 +591,92 @@ class RunnerWebSocketClient:
             logger.info("Heartbeat loop cancelled")
         except Exception as e:
             logger.error(f"Error in heartbeat loop: {e}")
+
+    async def _message_listener(self):
+        """
+        Background task to listen for incoming messages from the server.
+
+        This handles commands sent from the frontend through the backend.
+        Commands have the format: {"type": "command", "command": "...", "params": {...}}
+        """
+        logger.info("Starting message listener loop")
+
+        try:
+            while self.is_running and self.is_connected and self.ws:
+                try:
+                    # Wait for incoming message
+                    message_raw = await self.ws.recv()
+                    message = json.loads(message_raw)
+
+                    message_type = message.get("type")
+                    logger.debug(f"Received message: type={message_type}")
+
+                    if message_type == "command":
+                        # Handle command from frontend
+                        command = message.get("command")
+                        params = message.get("params", {})
+                        logger.info(f"Received command: {command}")
+
+                        if self.on_command:
+                            try:
+                                self.on_command(message)
+                            except Exception as e:
+                                logger.error(f"Error in on_command callback: {e}")
+                        else:
+                            logger.warning(f"No on_command handler registered for command: {command}")
+
+                    elif message_type == "ping":
+                        # Respond to server ping
+                        try:
+                            await self.ws.send(json.dumps({
+                                "type": "pong",
+                                "timestamp": self._get_timestamp(),
+                            }))
+                        except Exception as e:
+                            logger.error(f"Error sending pong: {e}")
+
+                    elif message_type in ["heartbeat_ack", "session_started", "session_ended",
+                                          "log_received", "screenshot_stored", "connected", "pong",
+                                          "runner_info_ack"]:
+                        # These are responses to messages we sent - ignore in listener
+                        # They are handled by _send_message
+                        pass
+
+                    elif message_type == "error":
+                        error_msg = message.get("message", "Unknown error")
+                        logger.error(f"Server error: {error_msg}")
+                        if self.on_error:
+                            try:
+                                self.on_error(error_msg)
+                            except Exception as e:
+                                logger.error(f"Error in on_error callback: {e}")
+
+                    else:
+                        logger.debug(f"Unhandled message type: {message_type}")
+
+                except asyncio.TimeoutError:
+                    # No message received, continue loop
+                    continue
+
+                except ConnectionClosed:
+                    logger.warning("Connection closed in listener")
+                    self.is_connected = False
+                    if self.auto_reconnect and self.is_running:
+                        asyncio.create_task(self._reconnect())
+                    break
+
+                except Exception as e:
+                    logger.error(f"Error in message listener: {e}")
+                    if not self.is_running:
+                        break
+                    await asyncio.sleep(0.1)  # Brief pause before retrying
+
+        except asyncio.CancelledError:
+            logger.info("Message listener cancelled")
+        except Exception as e:
+            logger.error(f"Fatal error in message listener: {e}")
+
+        logger.info("Message listener stopped")
 
     async def _reconnect(self):
         """Attempt to reconnect to WebSocket server."""

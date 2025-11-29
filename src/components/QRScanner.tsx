@@ -112,12 +112,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
         };
 
         // Start scanning
-        await html5QrCodeRef.current.start(
-          selectedCamera,
-          config,
-          onScanSuccess,
-          onScanFailure
-        );
+        await html5QrCodeRef.current.start(selectedCamera, config, onScanSuccess, onScanFailure);
 
         setScanning(true);
         setStatusMessage("Position QR code in front of camera");
@@ -167,9 +162,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
       {/* Camera Selection */}
       {cameras.length > 1 && !scanSuccess && (
         <div className="space-y-2">
-          <label className="block text-sm font-medium text-foreground">
-            Select Camera
-          </label>
+          <label className="block text-sm font-medium text-foreground">Select Camera</label>
           <select
             value={selectedCamera}
             onChange={(e) => handleCameraChange(e.target.value)}

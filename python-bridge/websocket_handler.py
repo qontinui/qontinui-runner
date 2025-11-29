@@ -14,6 +14,7 @@ import threading
 import time
 import traceback
 from typing import Any, Callable, Dict, Optional
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +40,16 @@ class WebSocketHandler:
     - Run event loop in background thread
     """
 
-    def __init__(self, emit_log_fn: Callable[[str, str], None]):
+    def __init__(self, emit_log_fn: Callable[[str, str], None], on_command_fn: Optional[Callable[[Dict[str, Any]], None]] = None):
         """
         Initialize WebSocket handler.
 
         Args:
             emit_log_fn: Function to emit log messages (level, message)
+            on_command_fn: Optional callback for handling incoming commands from backend
         """
         self.emit_log = emit_log_fn
+        self.on_command_fn = on_command_fn
         self.ws_client: Optional[RunnerWebSocketClient] = None
         self.ws_config: Optional[WebSocketConfig] = None
         self.ws_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -62,7 +65,14 @@ class WebSocketHandler:
             except Exception as e:
                 self.emit_log("error", f"Failed to load WebSocket config: {e}")
 
-    def configure(self, enabled: bool, api_url: str, token: str, project_id: Optional[str] = None) -> bool:
+    def configure(
+        self,
+        enabled: bool,
+        api_url: str,
+        token: str,
+        project_id: Optional[str] = None,
+        runner_name: Optional[str] = None,
+    ) -> bool:
         """
         Configure WebSocket connection settings.
 
@@ -71,11 +81,12 @@ class WebSocketHandler:
             api_url: WebSocket API URL (e.g., ws://localhost:8000)
             token: JWT authentication token
             project_id: Optional project ID
+            runner_name: Optional custom name for this runner
 
         Returns:
             True if configuration successful, False otherwise
         """
-        self.emit_log("info", f"[WS_HANDLER] configure called: enabled={enabled}, url={api_url}, project_id={project_id}")
+        self.emit_log("info", f"[WS_HANDLER] configure called: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}")
         self.emit_log("info", f"[WS_HANDLER] WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}")
 
         if not WEBSOCKET_AVAILABLE:
@@ -89,12 +100,13 @@ class WebSocketHandler:
                 api_url=api_url,
                 token=token,
                 project_id=str(project_id) if project_id else None,
+                runner_name=runner_name,
                 auto_reconnect=True,
                 heartbeat_interval=30,
                 max_reconnect_attempts=5,
             )
 
-            self.emit_log("info", f"[WS_HANDLER] WebSocket configured successfully: enabled={enabled}, url={api_url}, project_id={project_id}")
+            self.emit_log("info", f"[WS_HANDLER] WebSocket configured successfully: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}")
             return True
 
         except Exception as e:
@@ -122,30 +134,32 @@ class WebSocketHandler:
         Returns:
             True if connection successful, False otherwise
         """
-        self.emit_log("info", "[WS_HANDLER] connect() called")
-        self.emit_log("info", f"[WS_HANDLER] WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}")
-        self.emit_log("info", f"[WS_HANDLER] ws_config exists: {self.ws_config is not None}")
+        import sys
+        print(f"[info    ] WS_HANDLER: connect() called", file=sys.stderr, flush=True)
+        print(f"[info    ] WS_HANDLER: WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}", file=sys.stderr, flush=True)
+        print(f"[info    ] WS_HANDLER: ws_config exists: {self.ws_config is not None}", file=sys.stderr, flush=True)
 
         if not WEBSOCKET_AVAILABLE:
-            self.emit_log("error", "[WS_HANDLER] WebSocket libraries not available")
+            print(f"[error   ] WS_HANDLER: WebSocket libraries not available", file=sys.stderr, flush=True)
             return False
 
         if not self.ws_config:
-            self.emit_log("error", "[WS_HANDLER] WebSocket configuration not set - call configure() first")
+            print(f"[error   ] WS_HANDLER: WebSocket configuration not set", file=sys.stderr, flush=True)
             return False
 
-        self.emit_log("info", f"[WS_HANDLER] ws_config.enabled={self.ws_config.enabled}, api_url={self.ws_config.api_url}")
+        print(f"[info    ] WS_HANDLER: ws_config.enabled={self.ws_config.enabled}, api_url={self.ws_config.api_url}", file=sys.stderr, flush=True)
 
         # Validate config
         is_valid, error = self.ws_config.validate()
         if not is_valid:
-            self.emit_log("error", f"[WS_HANDLER] Invalid WebSocket config: {error}")
+            print(f"[error   ] WS_HANDLER: Invalid WebSocket config: {error}", file=sys.stderr, flush=True)
             return False
 
-        self.emit_log("info", "[WS_HANDLER] Config validation passed, starting connection...")
+        print(f"[info    ] WS_HANDLER: Config validation passed, starting connection...", file=sys.stderr, flush=True)
 
         try:
             # Start event loop in background thread
+            print(f"[info    ] WS_HANDLER: Starting event loop thread...", file=sys.stderr, flush=True)
             if not self.ws_thread or not self.ws_thread.is_alive():
                 self.ws_thread = threading.Thread(target=self._start_event_loop, daemon=True)
                 self.ws_thread.start()
@@ -157,13 +171,16 @@ class WebSocketHandler:
                     time.sleep(0.1)
 
                 if not self.ws_loop:
-                    self.emit_log("error", "WebSocket event loop failed to start")
+                    print(f"[error   ] WS_HANDLER: Event loop failed to start", file=sys.stderr, flush=True)
                     return False
+
+            print(f"[info    ] WS_HANDLER: Event loop ready", file=sys.stderr, flush=True)
 
             # Get or refresh token
             token = self.ws_config.token
+            print(f"[info    ] WS_HANDLER: token_len={len(token) if token else 0}", file=sys.stderr, flush=True)
             if not token and self.ws_config.email and self.ws_config.password:
-                self.emit_log("info", "Authenticating with qontinui-web...")
+                print(f"[info    ] WS_HANDLER: Authenticating with qontinui-web...", file=sys.stderr, flush=True)
                 # Convert ws:// to http:// for auth
                 auth_url = self.ws_config.api_url.replace("ws://", "http://").replace("wss://", "https://")
 
@@ -175,45 +192,54 @@ class WebSocketHandler:
                 token = future.result(timeout=10)
 
                 if not token:
-                    self.emit_log("error", "Authentication failed")
+                    print(f"[error   ] WS_HANDLER: Authentication failed", file=sys.stderr, flush=True)
                     return False
 
                 self.ws_config.token = token
-                self.emit_log("info", "Authentication successful")
+                print(f"[info    ] WS_HANDLER: Authentication successful", file=sys.stderr, flush=True)
 
             # Create WebSocket client
+            print(f"[info    ] WS_HANDLER: Creating WebSocket client...", file=sys.stderr, flush=True)
+            print(f"[info    ] WS_HANDLER: api_url={self.ws_config.api_url}, project_id={self.ws_config.project_id}, runner_name={self.ws_config.runner_name}", file=sys.stderr, flush=True)
             self.ws_client = RunnerWebSocketClient(
                 api_url=self.ws_config.api_url,
                 token=token,
                 project_id=self.ws_config.project_id,
                 runner_version=self.ws_config.runner_version,
+                runner_name=self.ws_config.runner_name,
                 auto_reconnect=self.ws_config.auto_reconnect,
                 heartbeat_interval=self.ws_config.heartbeat_interval,
                 max_reconnect_attempts=self.ws_config.max_reconnect_attempts,
-                on_connected=lambda: self.emit_log("info", "WebSocket connected"),
-                on_disconnected=lambda: self.emit_log("warning", "WebSocket disconnected"),
-                on_error=lambda msg: self.emit_log("error", f"WebSocket error: {msg}"),
+                on_connected=lambda: print(f"[info    ] WS_HANDLER: WebSocket connected callback", file=sys.stderr, flush=True),
+                on_disconnected=lambda: print(f"[warning ] WS_HANDLER: WebSocket disconnected callback", file=sys.stderr, flush=True),
+                on_error=lambda msg: print(f"[error   ] WS_HANDLER: WebSocket error callback: {msg}", file=sys.stderr, flush=True),
             )
 
+            # Set command handler for incoming commands from backend
+            if self.on_command_fn:
+                self.ws_client.on_command = self._handle_command
+                print(f"[info    ] WS_HANDLER: Command handler registered", file=sys.stderr, flush=True)
+
             # Connect
-            self.emit_log("info", f"Connecting to WebSocket: {self.ws_config.api_url}")
+            print(f"[info    ] WS_HANDLER: Calling ws_client.connect()...", file=sys.stderr, flush=True)
             future = asyncio.run_coroutine_threadsafe(
                 self.ws_client.connect(),
                 self.ws_loop
             )
             success = future.result(timeout=10)
+            print(f"[info    ] WS_HANDLER: ws_client.connect() returned: {success}", file=sys.stderr, flush=True)
 
             if success:
                 self.ws_enabled = True
-                self.emit_log("info", "WebSocket connection established")
+                print(f"[info    ] WS_HANDLER: WebSocket connection established!", file=sys.stderr, flush=True)
                 return True
             else:
-                self.emit_log("error", "WebSocket connection failed")
+                print(f"[error   ] WS_HANDLER: WebSocket connection failed", file=sys.stderr, flush=True)
                 return False
 
         except Exception as e:
-            self.emit_log("error", f"WebSocket connection error: {e}")
-            logger.error(f"WebSocket connection error: {traceback.format_exc()}")
+            print(f"[error   ] WS_HANDLER: Exception: {e}", file=sys.stderr, flush=True)
+            print(f"[error   ] WS_HANDLER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
             return False
 
     def disconnect(self):
@@ -365,3 +391,67 @@ class WebSocketHandler:
             True if WebSocket is enabled, False otherwise
         """
         return self.ws_enabled
+
+    @property
+    def is_connected(self) -> bool:
+        """
+        Check if WebSocket is connected.
+
+        Returns:
+            True if WebSocket is connected, False otherwise
+        """
+        return self.ws_enabled and self.ws_client is not None and self.ws_client.is_connected
+
+    def send_message(self, message: str) -> bool:
+        """
+        Send a generic message to the WebSocket server.
+
+        This is used for sending arbitrary message types like extraction events.
+
+        Args:
+            message: JSON-encoded message string
+
+        Returns:
+            True if message sent successfully, False otherwise
+        """
+        if not self.ws_enabled or not self.ws_client or not self.ws_loop:
+            return False
+
+        try:
+            # Parse the message to ensure it's valid JSON
+            import json
+            parsed = json.loads(message)
+
+            # Schedule coroutine in WebSocket event loop
+            asyncio.run_coroutine_threadsafe(
+                self.ws_client.send_message(parsed),
+                self.ws_loop
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error sending message to WebSocket: {e}")
+            return False
+
+    def _handle_command(self, message: Dict[str, Any]) -> None:
+        """
+        Handle incoming command from backend.
+
+        This is called from the WebSocket client's message listener
+        when a command message is received.
+
+        Args:
+            message: Command message with format:
+                     {"type": "command", "command": "...", "params": {...}}
+        """
+        print(f"[info    ] WS_HANDLER: Received command: {message}", file=sys.stderr, flush=True)
+
+        if self.on_command_fn:
+            try:
+                # Extract command details and forward to the bridge
+                self.on_command_fn(message)
+            except Exception as e:
+                print(f"[error   ] WS_HANDLER: Error handling command: {e}", file=sys.stderr, flush=True)
+                import traceback
+                print(f"[error   ] WS_HANDLER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+        else:
+            print(f"[warning ] WS_HANDLER: No command handler registered", file=sys.stderr, flush=True)

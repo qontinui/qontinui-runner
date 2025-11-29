@@ -74,8 +74,10 @@ pub fn load_configuration(path: String, state: State<AppState>) -> Result<Comman
             ) {
                 warn!("Failed to send debug settings before config load: {}", e);
             } else {
-                info!("Debug settings sent before config load: enable={}, top_matches={}",
-                      debug_settings.enable_image_debug, debug_settings.top_matches_count);
+                info!(
+                    "Debug settings sent before config load: enable={}, top_matches={}",
+                    debug_settings.enable_image_debug, debug_settings.top_matches_count
+                );
             }
 
             bridge.load_configuration(&path).map_err(|e| {
@@ -135,7 +137,10 @@ pub fn get_last_config_path() -> Result<CommandResponse, String> {
                 })),
             })
         } else {
-            info!("Last config path exists in settings but file not found: {}", path);
+            info!(
+                "Last config path exists in settings but file not found: {}",
+                path
+            );
             Ok(CommandResponse {
                 success: false,
                 message: Some("Last config file not found".to_string()),
@@ -208,7 +213,10 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<CommandResponse, Stri
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Auto-load last config {}", if enabled { "enabled" } else { "disabled" })),
+        message: Some(format!(
+            "Auto-load last config {}",
+            if enabled { "enabled" } else { "disabled" }
+        )),
         data: None,
     })
 }

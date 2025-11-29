@@ -15,7 +15,7 @@ function renderNodeTree(
   node: DisplayNode,
   expandedNodes: Set<string>,
   onToggle: (id: string) => void,
-  skipRootWorkflows: boolean = false
+  skipRootWorkflows: boolean = false,
 ): React.ReactNode[] {
   // Skip workflow nodes that are just wrappers
   if (node.type === "workflow") {
@@ -23,15 +23,17 @@ function renderNodeTree(
       isRoot: node.parent === null,
       skipRootWorkflows,
       metadata: node.metadata,
-      childCount: node.children.length
+      childCount: node.children.length,
     });
 
     // If this is a root workflow, skip it and render children
     // (user already knows which workflow they ran)
     if (skipRootWorkflows && node.parent === null) {
-      console.log(`[HierarchicalActionLog] Skipping root workflow: ${node.name}, children count: ${node.children.length}`);
+      console.log(
+        `[HierarchicalActionLog] Skipping root workflow: ${node.name}, children count: ${node.children.length}`,
+      );
       const result = node.children.flatMap((child) =>
-        renderNodeTree(child, expandedNodes, onToggle, false)
+        renderNodeTree(child, expandedNodes, onToggle, false),
       );
       console.log(`[HierarchicalActionLog] Returning ${result.length} child nodes instead of root`);
       return result;
@@ -45,12 +47,14 @@ function renderNodeTree(
       const isInline = node.metadata.is_inline === true;
       const isUserWorkflow = node.metadata.is_expandable === true;
 
-      console.log(`[HierarchicalActionLog] Workflow ${node.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`);
+      console.log(
+        `[HierarchicalActionLog] Workflow ${node.name}: isInline=${isInline}, isUserWorkflow=${isUserWorkflow}`,
+      );
 
       if (isInline && !isUserWorkflow) {
         console.log(`[HierarchicalActionLog] Skipping inline workflow: ${node.name}`);
         return node.children.flatMap((child) =>
-          renderNodeTree(child, expandedNodes, onToggle, false)
+          renderNodeTree(child, expandedNodes, onToggle, false),
         );
       }
     }
@@ -64,7 +68,7 @@ function renderNodeTree(
       isExpanded={expandedNodes.has(node.id)}
       onToggle={onToggle}
       expandedNodes={expandedNodes}
-    />
+    />,
   ];
 }
 
@@ -103,9 +107,7 @@ export default function HierarchicalActionLog({
         </div>
       ) : (
         <div className="space-y-1">
-          {treeRoots.flatMap((node) =>
-            renderNodeTree(node, expandedNodes, handleToggleNode, true)
-          )}
+          {treeRoots.flatMap((node) => renderNodeTree(node, expandedNodes, handleToggleNode, true))}
         </div>
       )}
     </div>

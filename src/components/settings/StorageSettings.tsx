@@ -59,7 +59,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
     }
   };
 
-  const handleDeleteOldSessions = async (type: 'screenshots' | 'videos', days: number) => {
+  const handleDeleteOldSessions = async (type: "screenshots" | "videos", days: number) => {
     try {
       const result: any = await invoke("delete_old_sessions", {
         storageType: type,
@@ -79,7 +79,9 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
   };
 
   const handleClearAllStorage = async () => {
-    if (!confirm("Are you sure you want to delete all screenshots and videos? This cannot be undone.")) {
+    if (
+      !confirm("Are you sure you want to delete all screenshots and videos? This cannot be undone.")
+    ) {
       return;
     }
 
@@ -98,9 +100,9 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
     }
   };
 
-  const handleOpenStorageFolder = async (type: 'screenshots' | 'videos') => {
+  const handleOpenStorageFolder = async (type: "screenshots" | "videos") => {
     try {
-      const path = type === 'screenshots' ? storagePaths.screenshot_path : storagePaths.video_path;
+      const path = type === "screenshots" ? storagePaths.screenshot_path : storagePaths.video_path;
       await invoke("open_folder", { path });
     } catch (err) {
       console.error("Failed to open folder:", err);
@@ -131,8 +133,8 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Screenshots</span>
                 <span className="font-medium">
-                  {storageUsage.screenshots.toFixed(2)} MB / {storagePaths.max_screenshot_mb} MB
-                  ({storageUsage.screenshotCount} files)
+                  {storageUsage.screenshots.toFixed(2)} MB / {storagePaths.max_screenshot_mb} MB (
+                  {storageUsage.screenshotCount} files)
                 </span>
               </div>
               <div className="w-full bg-muted rounded-full h-2">
@@ -141,7 +143,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
                   style={{
                     width: `${Math.min(
                       100,
-                      (storageUsage.screenshots / storagePaths.max_screenshot_mb) * 100
+                      (storageUsage.screenshots / storagePaths.max_screenshot_mb) * 100,
                     )}%`,
                   }}
                 ></div>
@@ -153,8 +155,8 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
               <div className="flex items-center justify-between text-sm">
                 <span className="text-muted-foreground">Videos</span>
                 <span className="font-medium">
-                  {storageUsage.videos.toFixed(2)} MB / {storagePaths.max_video_mb} MB
-                  ({storageUsage.videoCount} files)
+                  {storageUsage.videos.toFixed(2)} MB / {storagePaths.max_video_mb} MB (
+                  {storageUsage.videoCount} files)
                 </span>
               </div>
               <div className="w-full bg-muted rounded-full h-2">
@@ -163,7 +165,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
                   style={{
                     width: `${Math.min(
                       100,
-                      (storageUsage.videos / storagePaths.max_video_mb) * 100
+                      (storageUsage.videos / storagePaths.max_video_mb) * 100,
                     )}%`,
                   }}
                 ></div>
@@ -182,7 +184,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
                     {storagePaths.screenshot_path || "~/qontinui/screenshots/"}
                   </code>
                   <button
-                    onClick={() => handleOpenStorageFolder('screenshots')}
+                    onClick={() => handleOpenStorageFolder("screenshots")}
                     className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
                     title="Open folder"
                   >
@@ -197,7 +199,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
                     {storagePaths.video_path || "~/qontinui/videos/"}
                   </code>
                   <button
-                    onClick={() => handleOpenStorageFolder('videos')}
+                    onClick={() => handleOpenStorageFolder("videos")}
                     className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
                     title="Open folder"
                   >
@@ -213,14 +215,14 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
             <div className="font-medium">Storage Cleanup</div>
             <div className="flex flex-wrap gap-2">
               <button
-                onClick={() => handleDeleteOldSessions('screenshots', 30)}
+                onClick={() => handleDeleteOldSessions("screenshots", 30)}
                 className="px-3 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 rounded-md transition-colors flex items-center gap-2 text-sm"
               >
                 <Trash2 className="w-4 h-4" />
                 Delete Screenshots (30+ days)
               </button>
               <button
-                onClick={() => handleDeleteOldSessions('videos', 30)}
+                onClick={() => handleDeleteOldSessions("videos", 30)}
                 className="px-3 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 rounded-md transition-colors flex items-center gap-2 text-sm"
               >
                 <Trash2 className="w-4 h-4" />
@@ -239,8 +241,8 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
           <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
             <div className="text-sm text-muted-foreground">
               <strong className="text-foreground">Storage Info:</strong> Screenshots and videos are
-              organized by session. Auto-cleanup removes oldest sessions when storage limits are reached.
-              Files are stored locally on your machine at the paths shown above.
+              organized by session. Auto-cleanup removes oldest sessions when storage limits are
+              reached. Files are stored locally on your machine at the paths shown above.
             </div>
           </div>
         </div>

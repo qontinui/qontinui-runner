@@ -41,9 +41,8 @@ pub struct PythonBridge {
 
 impl PythonBridge {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
-        let runtime = Arc::new(
-            tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"),
-        );
+        let runtime =
+            Arc::new(tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime"));
 
         Self {
             process: None,
@@ -350,7 +349,8 @@ impl PythonBridge {
         enabled: bool,
         url: String,
         token: String,
-        project_id: Option<i32>,
+        project_id: Option<String>,
+        runner_name: Option<String>,
     ) -> Result<(), String> {
         self.send_command(
             "ws_configure",
@@ -359,6 +359,7 @@ impl PythonBridge {
                 "api_url": url,
                 "jwt_token": token,
                 "project_id": project_id,
+                "runner_name": runner_name,
             })),
         )
     }

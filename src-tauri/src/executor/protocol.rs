@@ -50,7 +50,10 @@ impl ProtocolHandler {
     }
 
     /// Creates a command channel and returns sender and receiver
-    pub fn create_channel() -> (mpsc::Sender<ExecutorCommand>, mpsc::Receiver<ExecutorCommand>) {
+    pub fn create_channel() -> (
+        mpsc::Sender<ExecutorCommand>,
+        mpsc::Receiver<ExecutorCommand>,
+    ) {
         mpsc::channel::<ExecutorCommand>(COMMAND_CHANNEL_CAPACITY)
     }
 

@@ -17,6 +17,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     projectId: "",
     connected: false,
     backendUrl: import.meta.env.DEV ? "http://localhost:8000" : "https://qontinui.io/api",
+    runnerName: "",
     cloudPermissionEnabled: false,
     sessionsLimit: null,
     sessionsUsed: 0,
@@ -28,7 +29,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
   });
 
   // Quick Connect state
-  const [connectionString, setConnectionString] = useState('');
+  const [connectionString, setConnectionString] = useState("");
   const [quickConnectError, setQuickConnectError] = useState<string | null>(null);
   const [quickConnectSuccess, setQuickConnectSuccess] = useState<string | null>(null);
   const [quickConnecting, setQuickConnecting] = useState(false);
@@ -40,14 +41,17 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     const checkCloudPermission = async () => {
       if (wsSettings.token) {
         try {
-          const response = await fetch(`${wsSettings.backendUrl}/api/v1/users/me/automation-streaming`, {
-            headers: {
-              'Authorization': `Bearer ${wsSettings.token}`
-            }
-          });
+          const response = await fetch(
+            `${wsSettings.backendUrl}/api/v1/users/me/automation-streaming`,
+            {
+              headers: {
+                Authorization: `Bearer ${wsSettings.token}`,
+              },
+            },
+          );
           if (response.ok) {
             const data = await response.json();
-            setWsSettings(prev => ({
+            setWsSettings((prev) => ({
               ...prev,
               cloudPermissionEnabled: data.enabled,
               sessionsLimit: data.sessions_limit,
@@ -55,20 +59,20 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
               sessionsResetAt: data.sessions_reset_at,
             }));
           } else {
-            setWsSettings(prev => ({
+            setWsSettings((prev) => ({
               ...prev,
               cloudPermissionEnabled: false,
             }));
           }
         } catch (error) {
-          console.error('Failed to check cloud permission:', error);
-          setWsSettings(prev => ({
+          console.error("Failed to check cloud permission:", error);
+          setWsSettings((prev) => ({
             ...prev,
             cloudPermissionEnabled: false,
           }));
         }
       } else {
-        setWsSettings(prev => ({
+        setWsSettings((prev) => ({
           ...prev,
           cloudPermissionEnabled: false,
         }));
@@ -81,19 +85,21 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
   const parseConnectionString = (jsonString: string): ConnectionInfo => {
     try {
       const parsed = JSON.parse(jsonString);
-      const requiredFields = ['version', 'url', 'token', 'userId', 'createdAt'];
-      const missingFields = requiredFields.filter(field => !(field in parsed));
+      const requiredFields = ["version", "url", "token", "userId", "createdAt"];
+      const missingFields = requiredFields.filter((field) => !(field in parsed));
 
       if (missingFields.length > 0) {
-        throw new Error(`Connection string is missing required fields: ${missingFields.join(', ')}`);
+        throw new Error(
+          `Connection string is missing required fields: ${missingFields.join(", ")}`,
+        );
       }
 
-      if (!parsed.url.startsWith('ws://') && !parsed.url.startsWith('wss://')) {
-        throw new Error('Invalid WebSocket URL format (must start with ws:// or wss://)');
+      if (!parsed.url.startsWith("ws://") && !parsed.url.startsWith("wss://")) {
+        throw new Error("Invalid WebSocket URL format (must start with ws:// or wss://)");
       }
 
-      if (!parsed.token || parsed.token.trim() === '') {
-        throw new Error('Token cannot be empty');
+      if (!parsed.token || parsed.token.trim() === "") {
+        throw new Error("Token cannot be empty");
       }
 
       return {
@@ -103,11 +109,11 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
         userId: parsed.userId,
         projectId: parsed.projectId || null,
         createdAt: parsed.createdAt,
-        backendUrl: parsed.backendUrl || 'http://localhost:8000',
+        backendUrl: parsed.backendUrl || "http://localhost:8000",
       };
     } catch (err) {
       if (err instanceof SyntaxError) {
-        throw new Error('Invalid connection string format (must be valid JSON)');
+        throw new Error("Invalid connection string format (must be valid JSON)");
       }
       throw err;
     }
@@ -124,10 +130,10 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
           return true;
         }
       } catch (err) {
-        console.warn('Error checking executor status:', err);
+        console.warn("Error checking executor status:", err);
       }
       // Wait 100ms before checking again
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
     return false;
   };
@@ -138,105 +144,123 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     setQuickConnecting(true);
 
     const connStr = connectionStr || connectionString;
-    console.log('[QUICK_CONNECT] Starting Quick Connect...');
+    console.log("[QUICK_CONNECT] Starting Quick Connect...");
 
     try {
       const connInfo = parseConnectionString(connStr);
-      console.log('[QUICK_CONNECT] Parsed connection info:', {
+      console.log("[QUICK_CONNECT] Parsed connection info:", {
         url: connInfo.url,
         backendUrl: connInfo.backendUrl,
         userId: connInfo.userId,
         projectId: connInfo.projectId,
         tokenLength: connInfo.token?.length,
-        tokenPrefix: connInfo.token?.substring(0, 20) + '...',
+        tokenPrefix: connInfo.token?.substring(0, 20) + "...",
       });
 
       // Wait for executor to be ready before proceeding
-      console.log('[QUICK_CONNECT] Waiting for executor to be ready...');
+      console.log("[QUICK_CONNECT] Waiting for executor to be ready...");
       const executorReady = await waitForExecutorReady();
-      console.log('[QUICK_CONNECT] Executor ready:', executorReady);
+      console.log("[QUICK_CONNECT] Executor ready:", executorReady);
       if (!executorReady) {
         throw new Error("Python executor is not ready. Please wait a moment and try again.");
       }
 
       let cloudPermissionEnabled = false;
-      const isJWT = connInfo.token?.startsWith('eyJ');
-      console.log('[QUICK_CONNECT] Token type:', isJWT ? 'JWT' : 'Runner Token');
+      const isJWT = connInfo.token?.startsWith("eyJ");
+      console.log("[QUICK_CONNECT] Token type:", isJWT ? "JWT" : "Runner Token");
 
       try {
         if (isJWT) {
           // Token is a JWT - use Authorization header
           const jwtUrl = `${connInfo.backendUrl}/api/v1/users/me/automation-streaming`;
-          console.log('[QUICK_CONNECT] Trying JWT auth endpoint:', jwtUrl);
+          console.log("[QUICK_CONNECT] Trying JWT auth endpoint:", jwtUrl);
           const permissionResponse = await fetch(jwtUrl, {
             headers: {
-              'Authorization': `Bearer ${connInfo.token}`
-            }
+              Authorization: `Bearer ${connInfo.token}`,
+            },
           });
-          console.log('[QUICK_CONNECT] JWT auth response status:', permissionResponse.status);
+          console.log("[QUICK_CONNECT] JWT auth response status:", permissionResponse.status);
 
           if (permissionResponse.ok) {
             const data = await permissionResponse.json();
-            console.log('[QUICK_CONNECT] JWT auth response data:', data);
+            console.log("[QUICK_CONNECT] JWT auth response data:", data);
             cloudPermissionEnabled = data.enabled;
-            console.log('[QUICK_CONNECT] cloudPermissionEnabled from JWT:', cloudPermissionEnabled);
+            console.log("[QUICK_CONNECT] cloudPermissionEnabled from JWT:", cloudPermissionEnabled);
           } else if (permissionResponse.status === 401) {
             // JWT is likely expired - try to decode and check
             try {
-              const payload = JSON.parse(atob(connInfo.token.split('.')[1]));
+              const payload = JSON.parse(atob(connInfo.token.split(".")[1]));
               const expTime = payload.exp * 1000;
               const now = Date.now();
               if (expTime < now) {
                 const expiredMinutes = Math.round((now - expTime) / 60000);
-                throw new Error(`Your session token has expired (${expiredMinutes} minutes ago). Please get a new connection string from qontinui.io/connect-runner.`);
+                throw new Error(
+                  `Your session token has expired (${expiredMinutes} minutes ago). Please get a new connection string from qontinui.io/connect-runner.`,
+                );
               }
             } catch (decodeErr) {
-              if (decodeErr instanceof Error && decodeErr.message.includes('expired')) {
+              if (decodeErr instanceof Error && decodeErr.message.includes("expired")) {
                 throw decodeErr;
               }
             }
-            throw new Error("Authentication failed. Your token may be invalid or expired. Please get a new connection string from qontinui.io/connect-runner.");
+            throw new Error(
+              "Authentication failed. Your token may be invalid or expired. Please get a new connection string from qontinui.io/connect-runner.",
+            );
           } else {
             const errorText = await permissionResponse.text();
-            console.log('[QUICK_CONNECT] JWT auth failed with status', permissionResponse.status, ':', errorText);
-            throw new Error(`Authentication failed (${permissionResponse.status}). Please try again.`);
+            console.log(
+              "[QUICK_CONNECT] JWT auth failed with status",
+              permissionResponse.status,
+              ":",
+              errorText,
+            );
+            throw new Error(
+              `Authentication failed (${permissionResponse.status}). Please try again.`,
+            );
           }
         } else {
           // Token is a runner token - use query param auth
-          console.log('[QUICK_CONNECT] Trying runner token auth...');
+          console.log("[QUICK_CONNECT] Trying runner token auth...");
           const testUrl = `${connInfo.backendUrl}/api/v1/runners/test-connection?token=${encodeURIComponent(connInfo.token)}`;
-          console.log('[QUICK_CONNECT] Test connection URL:', testUrl);
-          const testResponse = await fetch(testUrl, { method: 'POST' });
-          console.log('[QUICK_CONNECT] Test connection response status:', testResponse.status);
+          console.log("[QUICK_CONNECT] Test connection URL:", testUrl);
+          const testResponse = await fetch(testUrl, { method: "POST" });
+          console.log("[QUICK_CONNECT] Test connection response status:", testResponse.status);
 
           if (testResponse.ok) {
             const testData = await testResponse.json();
-            console.log('[QUICK_CONNECT] Test connection response data:', testData);
+            console.log("[QUICK_CONNECT] Test connection response data:", testData);
             // Runner token is valid - streaming is enabled by definition
             cloudPermissionEnabled = true;
-            console.log('[QUICK_CONNECT] Runner token authentication successful');
+            console.log("[QUICK_CONNECT] Runner token authentication successful");
           } else {
             const errorText = await testResponse.text();
-            console.log('[QUICK_CONNECT] Test connection failed:', errorText);
-            throw new Error("Invalid runner token. Please get a new connection string from qontinui.io/connect-runner.");
+            console.log("[QUICK_CONNECT] Test connection failed:", errorText);
+            throw new Error(
+              "Invalid runner token. Please get a new connection string from qontinui.io/connect-runner.",
+            );
           }
         }
       } catch (err) {
         // Re-throw user-friendly errors
-        if (err instanceof Error && (err.message.includes('expired') || err.message.includes('Authentication failed') || err.message.includes('Invalid runner token'))) {
+        if (
+          err instanceof Error &&
+          (err.message.includes("expired") ||
+            err.message.includes("Authentication failed") ||
+            err.message.includes("Invalid runner token"))
+        ) {
           throw err;
         }
-        console.warn('[QUICK_CONNECT] Failed to check cloud permission:', err);
+        console.warn("[QUICK_CONNECT] Failed to check cloud permission:", err);
         throw new Error("Failed to verify connection. Please check your network and try again.");
       }
 
-      console.log('[QUICK_CONNECT] Final cloudPermissionEnabled:', cloudPermissionEnabled);
+      console.log("[QUICK_CONNECT] Final cloudPermissionEnabled:", cloudPermissionEnabled);
 
       const newSettings = {
         enabled: true,
         url: connInfo.url,
         token: connInfo.token,
-        projectId: connInfo.projectId !== null ? connInfo.projectId.toString() : '',
+        projectId: connInfo.projectId !== null ? connInfo.projectId.toString() : "",
         connected: false,
         backendUrl: connInfo.backendUrl,
         cloudPermissionEnabled,
@@ -249,7 +273,10 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
         sendVideos: false,
       };
 
-      console.log('[QUICK_CONNECT] New settings:', { ...newSettings, token: newSettings.token?.substring(0, 20) + '...' });
+      console.log("[QUICK_CONNECT] New settings:", {
+        ...newSettings,
+        token: newSettings.token?.substring(0, 20) + "...",
+      });
       setWsSettings(newSettings);
 
       if (!newSettings.url || !newSettings.token) {
@@ -257,11 +284,22 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
       }
 
       if (!cloudPermissionEnabled) {
-        throw new Error("Automation streaming is not enabled for your account. Enable it on the \"Connect Runner\" page at qontinui.io.");
+        throw new Error(
+          'Automation streaming is not enabled for your account. Enable it on the "Connect Runner" page at qontinui.io.',
+        );
       }
 
-      const projectId = newSettings.projectId ? parseInt(newSettings.projectId, 10) : null;
-      console.log('[QUICK_CONNECT] Configuring WebSocket with URL:', newSettings.url, 'projectId:', projectId);
+      // projectId is now a UUID string, no parsing needed
+      const projectId = newSettings.projectId || null;
+      const runnerName = newSettings.runnerName || null;
+      console.log(
+        "[QUICK_CONNECT] Configuring WebSocket with URL:",
+        newSettings.url,
+        "projectId:",
+        projectId,
+        "runnerName:",
+        runnerName,
+      );
 
       const configResult: any = await invoke("configure_websocket", {
         config: {
@@ -269,49 +307,56 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
           url: newSettings.url,
           token: newSettings.token,
           project_id: projectId,
+          runner_name: runnerName,
         },
       });
-      console.log('[QUICK_CONNECT] configure_websocket result:', configResult);
+      console.log("[QUICK_CONNECT] configure_websocket result:", configResult);
 
       if (!configResult || !configResult.success) {
-        throw new Error(`Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`);
+        throw new Error(
+          `Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`,
+        );
       }
 
-      console.log('[QUICK_CONNECT] Connecting WebSocket...');
+      console.log("[QUICK_CONNECT] Connecting WebSocket...");
       const connectResult: any = await invoke("connect_websocket");
-      console.log('[QUICK_CONNECT] connect_websocket result:', connectResult);
+      console.log("[QUICK_CONNECT] connect_websocket result:", connectResult);
 
       if (!connectResult || !connectResult.success) {
-        throw new Error(`Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`);
+        throw new Error(
+          `Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`,
+        );
       }
 
-      console.log('[QUICK_CONNECT] WebSocket connected! Testing connection with backend...');
+      console.log("[QUICK_CONNECT] WebSocket connected! Testing connection with backend...");
 
       // Test connection with backend to confirm everything is working
-      let successMessage = 'Connected successfully! Your settings have been configured.';
+      let successMessage = "Connected successfully! Your settings have been configured.";
       try {
         const testResponse = await fetch(
           `${connInfo.backendUrl}/api/v1/runners/test-connection?token=${encodeURIComponent(connInfo.token)}`,
-          { method: 'POST' }
+          { method: "POST" },
         );
-        console.log('[QUICK_CONNECT] test-connection response status:', testResponse.status);
+        console.log("[QUICK_CONNECT] test-connection response status:", testResponse.status);
         if (testResponse.ok) {
           const testResult = await testResponse.json();
-          console.log('[QUICK_CONNECT] test-connection result:', testResult);
+          console.log("[QUICK_CONNECT] test-connection result:", testResult);
           successMessage = testResult.message || successMessage;
-          onLog("success", `Quick Connect: Connection verified - ${testResult.auth_method === 'runner_token' ? `Token: ${testResult.token_name}` : 'JWT Auth'}`);
+          onLog(
+            "success",
+            `Quick Connect: Connection verified - ${testResult.auth_method === "runner_token" ? `Token: ${testResult.token_name}` : "JWT Auth"}`,
+          );
         }
       } catch (testErr) {
         // Non-fatal - connection still works, just couldn't verify
-        console.warn('[QUICK_CONNECT] Failed to verify connection with backend:', testErr);
+        console.warn("[QUICK_CONNECT] Failed to verify connection with backend:", testErr);
       }
 
-      setWsSettings(prev => ({ ...prev, connected: true }));
+      setWsSettings((prev) => ({ ...prev, connected: true }));
       setQuickConnectSuccess(successMessage);
-      setConnectionString('');
-      console.log('[QUICK_CONNECT] SUCCESS! Connection complete.');
+      setConnectionString("");
+      console.log("[QUICK_CONNECT] SUCCESS! Connection complete.");
       onLog("success", "Quick Connect: WebSocket connected successfully");
-
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       setQuickConnectError(errorMessage);
@@ -340,8 +385,13 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     }
 
     if (!wsSettings.cloudPermissionEnabled) {
-      onLog("error", "Automation streaming is not enabled. Enable it on the \"Connect Runner\" page at qontinui.io.");
-      setError("Automation streaming is not enabled. Enable it on the \"Connect Runner\" page at qontinui.io.");
+      onLog(
+        "error",
+        'Automation streaming is not enabled. Enable it on the "Connect Runner" page at qontinui.io.',
+      );
+      setError(
+        'Automation streaming is not enabled. Enable it on the "Connect Runner" page at qontinui.io.',
+      );
       return;
     }
 
@@ -351,7 +401,9 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     }
 
     try {
-      const projectId = wsSettings.projectId ? parseInt(wsSettings.projectId, 10) : null;
+      // projectId is now a UUID string, no parsing needed
+      const projectId = wsSettings.projectId || null;
+      const runnerName = wsSettings.runnerName || null;
 
       const configResult: any = await invoke("configure_websocket", {
         config: {
@@ -359,6 +411,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
           url: wsSettings.url,
           token: wsSettings.token,
           project_id: projectId,
+          runner_name: runnerName,
         },
       });
 
@@ -367,13 +420,19 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
 
         const connectResult: any = await invoke("connect_websocket");
         if (connectResult && connectResult.success) {
-          setWsSettings(prev => ({ ...prev, connected: true }));
+          setWsSettings((prev) => ({ ...prev, connected: true }));
           onLog("success", "WebSocket connected successfully");
         } else {
-          onLog("error", `Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`);
+          onLog(
+            "error",
+            `Failed to connect WebSocket: ${connectResult?.message || "Unknown error"}`,
+          );
         }
       } else {
-        onLog("error", `Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`);
+        onLog(
+          "error",
+          `Failed to configure WebSocket: ${configResult?.message || "Unknown error"}`,
+        );
       }
     } catch (err) {
       console.error("Failed to apply WebSocket settings:", err);
@@ -386,7 +445,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
     try {
       const result: any = await invoke("disconnect_websocket");
       if (result && result.success) {
-        setWsSettings(prev => ({ ...prev, connected: false }));
+        setWsSettings((prev) => ({ ...prev, connected: false }));
         onLog("success", "WebSocket disconnected");
       } else {
         onLog("error", `Failed to disconnect WebSocket: ${result?.message || "Unknown error"}`);
@@ -430,7 +489,8 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
         </div>
 
         <div className="text-sm text-muted-foreground">
-          Paste connection details from <strong>qontinui.io/connect-runner</strong> to connect instantly
+          Paste connection details from <strong>qontinui.io/connect-runner</strong> to connect
+          instantly
         </div>
 
         {quickConnectError && (
@@ -446,6 +506,23 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
             <span className="text-green-400 text-sm">{quickConnectSuccess}</span>
           </div>
         )}
+
+        <div className="space-y-2">
+          <label className="block">
+            <div className="font-medium mb-1">Runner Name</div>
+            <div className="text-sm text-muted-foreground mb-3">
+              Give this runner a name to identify it on qontinui.io (e.g., "My Laptop", "Work
+              Desktop")
+            </div>
+            <input
+              type="text"
+              value={wsSettings.runnerName}
+              onChange={(e) => setWsSettings((prev) => ({ ...prev, runnerName: e.target.value }))}
+              placeholder="My Runner"
+              className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+            />
+          </label>
+        </div>
 
         <div className="space-y-2">
           <label className="block">
@@ -491,7 +568,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
           {connectionString.trim() && (
             <button
               onClick={() => {
-                setConnectionString('');
+                setConnectionString("");
                 setQuickConnectError(null);
                 setQuickConnectSuccess(null);
               }}
@@ -511,14 +588,13 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
         </div>
       </div>
 
-      <QRScannerDialog
-        open={qrScannerOpen}
-        onOpenChange={setQrScannerOpen}
-        onScan={handleQRScan}
-      />
+      <QRScannerDialog open={qrScannerOpen} onOpenChange={setQrScannerOpen} onScan={handleQRScan} />
 
       {/* Cloud Sync Settings */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6" data-section="cloud-sync">
+      <div
+        className="space-y-6 bg-card rounded-lg border border-border/50 p-6"
+        data-section="cloud-sync"
+      >
         <div className="flex items-center gap-3">
           <Cloud className="w-5 h-5 text-primary" />
           <h4 className="font-semibold text-lg">Cloud Sync</h4>
@@ -539,7 +615,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
               </div>
             </div>
             <button
-              onClick={() => setWsSettings(prev => ({ ...prev, enabled: !prev.enabled }))}
+              onClick={() => setWsSettings((prev) => ({ ...prev, enabled: !prev.enabled }))}
               className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
                 wsSettings.enabled ? "bg-primary" : "bg-muted"
               }`}
@@ -575,8 +651,12 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                 <input
                   type="text"
                   value={wsSettings.backendUrl}
-                  onChange={(e) => setWsSettings(prev => ({ ...prev, backendUrl: e.target.value }))}
-                  placeholder={import.meta.env.DEV ? "http://localhost:8000" : "https://qontinui.io/api"}
+                  onChange={(e) =>
+                    setWsSettings((prev) => ({ ...prev, backendUrl: e.target.value }))
+                  }
+                  placeholder={
+                    import.meta.env.DEV ? "http://localhost:8000" : "https://qontinui.io/api"
+                  }
                   className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
                 />
               </label>
@@ -591,7 +671,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                 <input
                   type="text"
                   value={wsSettings.url}
-                  onChange={(e) => setWsSettings(prev => ({ ...prev, url: e.target.value }))}
+                  onChange={(e) => setWsSettings((prev) => ({ ...prev, url: e.target.value }))}
                   placeholder="ws://localhost:8001"
                   className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
                 />
@@ -607,7 +687,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                 <input
                   type="password"
                   value={wsSettings.token}
-                  onChange={(e) => setWsSettings(prev => ({ ...prev, token: e.target.value }))}
+                  onChange={(e) => setWsSettings((prev) => ({ ...prev, token: e.target.value }))}
                   placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6..."
                   className="w-full px-3 py-2 bg-input border border-border/50 rounded-md font-mono text-sm"
                 />
@@ -623,7 +703,9 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                 <input
                   type="text"
                   value={wsSettings.projectId}
-                  onChange={(e) => setWsSettings(prev => ({ ...prev, projectId: e.target.value }))}
+                  onChange={(e) =>
+                    setWsSettings((prev) => ({ ...prev, projectId: e.target.value }))
+                  }
                   placeholder="1"
                   className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
                 />
@@ -637,8 +719,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                   <p className="text-muted-foreground mt-1">
                     {wsSettings.sessionsLimit
                       ? `${wsSettings.sessionsUsed} of ${wsSettings.sessionsLimit} sessions used this month`
-                      : 'Unlimited sessions available'
-                    }
+                      : "Unlimited sessions available"}
                   </p>
                 </div>
               </div>
@@ -648,7 +729,8 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
               <div className="p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg flex items-start gap-2">
                 <AlertCircle className="h-4 w-4 text-orange-400 shrink-0 mt-0.5" />
                 <div className="text-sm text-orange-300">
-                  Automation streaming is not enabled for your account. Enable it on the "Connect Runner" page at qontinui.io.
+                  Automation streaming is not enabled for your account. Enable it on the "Connect
+                  Runner" page at qontinui.io.
                 </div>
               </div>
             )}
@@ -685,7 +767,9 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                   <input
                     type="checkbox"
                     checked={wsSettings.sendLogs}
-                    onChange={(e) => setWsSettings(prev => ({ ...prev, sendLogs: e.target.checked }))}
+                    onChange={(e) =>
+                      setWsSettings((prev) => ({ ...prev, sendLogs: e.target.checked }))
+                    }
                     className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
                   />
                   <span className="text-sm">Logs & Events (required for analysis)</span>
@@ -695,7 +779,9 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                   <input
                     type="checkbox"
                     checked={wsSettings.sendScreenshots}
-                    onChange={(e) => setWsSettings(prev => ({ ...prev, sendScreenshots: e.target.checked }))}
+                    onChange={(e) =>
+                      setWsSettings((prev) => ({ ...prev, sendScreenshots: e.target.checked }))
+                    }
                     className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
                   />
                   <span className="text-sm">Screenshots (required for State Discovery)</span>
@@ -705,7 +791,9 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
                   <input
                     type="checkbox"
                     checked={wsSettings.sendVideos}
-                    onChange={(e) => setWsSettings(prev => ({ ...prev, sendVideos: e.target.checked }))}
+                    onChange={(e) =>
+                      setWsSettings((prev) => ({ ...prev, sendVideos: e.target.checked }))
+                    }
                     className="w-4 h-4 rounded border-gray-300 text-primary focus:ring-primary"
                   />
                   <span className="text-sm">Videos (optional, large files)</span>
@@ -715,8 +803,8 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
 
             <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
               <div className="text-sm text-muted-foreground">
-                <strong className="text-foreground">Note:</strong> Cloud sync requires both account permission
-                and your consent. You can control exactly what data is uploaded.
+                <strong className="text-foreground">Note:</strong> Cloud sync requires both account
+                permission and your consent. You can control exactly what data is uploaded.
               </div>
             </div>
 

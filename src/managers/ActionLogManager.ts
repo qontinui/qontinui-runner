@@ -29,7 +29,7 @@ class ActionLogManager {
    */
   triggerRefresh(): void {
     console.log(
-      `[ACTION_LOG_MGR] triggerRefresh called, notifying ${this.refreshCallbacks.size} callbacks`
+      `[ACTION_LOG_MGR] triggerRefresh called, notifying ${this.refreshCallbacks.size} callbacks`,
     );
     this.refreshCallbacks.forEach((cb) => {
       try {

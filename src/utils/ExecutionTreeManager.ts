@@ -267,10 +267,7 @@ export class ExecutionTreeManager {
    * @param incoming - New metadata from update event
    * @returns Merged metadata object
    */
-  private deepMergeMetadata(
-    existing: NodeMetadata,
-    incoming: NodeMetadata,
-  ): NodeMetadata {
+  private deepMergeMetadata(existing: NodeMetadata, incoming: NodeMetadata): NodeMetadata {
     const merged = { ...existing };
 
     // Merge each field from incoming metadata

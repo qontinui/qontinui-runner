@@ -78,8 +78,10 @@ impl LocalStorage {
     ) -> Result<PathBuf> {
         // Create session directory
         let session_dir = self.config.screenshot_path.join(session_id);
-        fs::create_dir_all(&session_dir)
-            .context(format!("Failed to create session directory: {:?}", session_dir))?;
+        fs::create_dir_all(&session_dir).context(format!(
+            "Failed to create session directory: {:?}",
+            session_dir
+        ))?;
 
         // Create file path
         let file_path = session_dir.join(format!("{}.png", screenshot_id));
@@ -121,8 +123,7 @@ impl LocalStorage {
         }
 
         // Write file
-        fs::write(&file_path, data)
-            .context(format!("Failed to write video to {:?}", file_path))?;
+        fs::write(&file_path, data).context(format!("Failed to write video to {:?}", file_path))?;
 
         info!(
             "Saved video: session={}, size={} bytes",
@@ -225,7 +226,9 @@ impl LocalStorage {
 
         // Clear screenshots
         if self.config.screenshot_path.exists() {
-            let size = self.calculate_directory_size(&self.config.screenshot_path)?.0;
+            let size = self
+                .calculate_directory_size(&self.config.screenshot_path)?
+                .0;
             fs::remove_dir_all(&self.config.screenshot_path)?;
             fs::create_dir_all(&self.config.screenshot_path)?;
             total_deleted += size;

@@ -14,7 +14,8 @@ export interface ConnectionInfo {
   url: string;
   token: string;
   userId: string;
-  projectId: number | null;
+  /** Project ID as UUID string (e.g., "fb93478d-98bd-4e40-99f4-0f2c08c1fd5a") */
+  projectId: string | null;
   createdAt: string;
   backendUrl: string;
 }
@@ -27,6 +28,8 @@ export interface WebSocketSettings {
   projectId: string;
   connected: boolean;
   backendUrl: string;
+  /** Custom user-defined name for this runner (e.g., "My Laptop") */
+  runnerName: string;
 
   // Cloud permission status (read-only, from API)
   cloudPermissionEnabled: boolean;
@@ -42,9 +45,9 @@ export interface WebSocketSettings {
 }
 
 export type ScreenSelectionType =
-  | { type: 'all' }
-  | { type: 'primary' }
-  | { type: 'specific'; indices: number[] };
+  | { type: "all" }
+  | { type: "primary" }
+  | { type: "specific"; indices: number[] };
 
 export interface ScreenshotCaptureSettings {
   enabled: boolean;
@@ -79,4 +82,7 @@ export interface StoragePaths {
   auto_cleanup: boolean;
 }
 
-export type LogFunction = (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
+export type LogFunction = (
+  level: "info" | "warning" | "error" | "debug" | "success",
+  message: string,
+) => void;

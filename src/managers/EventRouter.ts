@@ -52,7 +52,7 @@ class EventRouter {
     }
 
     console.log(
-      `[EVENT_ROUTER] Routing event type: ${eventType}, handler count: ${this.handlers.get(eventType)?.size || 0}`
+      `[EVENT_ROUTER] Routing event type: ${eventType}, handler count: ${this.handlers.get(eventType)?.size || 0}`,
     );
 
     // Get handlers for this event type

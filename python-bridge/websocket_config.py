@@ -32,6 +32,7 @@ class WebSocketConfig:
 
     # Runner info
     runner_version: str = "0.1.0"
+    runner_name: Optional[str] = None  # Custom user-defined runner name
 
     @classmethod
     def from_env(cls) -> "WebSocketConfig":
@@ -46,6 +47,7 @@ class WebSocketConfig:
         - QONTINUI_WS_TOKEN: JWT token (if already authenticated)
         - QONTINUI_WS_PROJECT_ID: Project UUID
         - QONTINUI_WS_HEARTBEAT_INTERVAL: Heartbeat interval in seconds (default: 30)
+        - QONTINUI_RUNNER_NAME: Custom name for this runner (e.g., "My Laptop")
 
         Returns:
             WebSocketConfig instance
@@ -61,6 +63,7 @@ class WebSocketConfig:
             auto_reconnect=os.getenv("QONTINUI_WS_AUTO_RECONNECT", "true").lower() == "true",
             max_reconnect_attempts=int(os.getenv("QONTINUI_WS_MAX_RECONNECT", "5")),
             runner_version=os.getenv("QONTINUI_RUNNER_VERSION", "0.1.0"),
+            runner_name=os.getenv("QONTINUI_RUNNER_NAME"),
         )
 
     @classmethod
@@ -85,6 +88,7 @@ class WebSocketConfig:
             auto_reconnect=data.get("auto_reconnect", True),
             max_reconnect_attempts=data.get("max_reconnect_attempts", 5),
             runner_version=data.get("runner_version", "0.1.0"),
+            runner_name=data.get("runner_name"),
         )
 
     def validate(self) -> tuple[bool, Optional[str]]:
@@ -103,8 +107,8 @@ class WebSocketConfig:
         if not self.token and not (self.email and self.password):
             return False, "Either token or email/password is required for authentication"
 
-        if not self.project_id:
-            return False, "Project ID is required"
+        # project_id is optional - runner can connect without a project
+        # and projects are assigned later via the web UI
 
         if self.heartbeat_interval < 10:
             return False, "Heartbeat interval must be at least 10 seconds"
@@ -129,4 +133,5 @@ class WebSocketConfig:
             "auto_reconnect": self.auto_reconnect,
             "max_reconnect_attempts": self.max_reconnect_attempts,
             "runner_version": self.runner_version,
+            "runner_name": self.runner_name,
         }

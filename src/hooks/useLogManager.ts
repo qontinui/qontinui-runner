@@ -105,9 +105,12 @@ export function useLogManager(): UseLogManagerResult {
     logManager.clearAllLogs();
   }, []);
 
-  const copyLogs = useCallback(async (type: "general" | "image" | "actions", actionLogs?: any[]) => {
-    return await logManager.copyLogs(type, actionLogs);
-  }, []);
+  const copyLogs = useCallback(
+    async (type: "general" | "image" | "actions", actionLogs?: any[]) => {
+      return await logManager.copyLogs(type, actionLogs);
+    },
+    [],
+  );
 
   return {
     logs,

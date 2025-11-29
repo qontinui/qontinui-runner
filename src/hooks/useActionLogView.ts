@@ -67,9 +67,7 @@ export interface UseActionLogViewResult {
  * @param options - Configuration options for the hook
  * @returns Object containing view data, loading state, error state, and refresh function
  */
-export function useActionLogView(
-  options: UseActionLogViewOptions = {}
-): UseActionLogViewResult {
+export function useActionLogView(options: UseActionLogViewOptions = {}): UseActionLogViewResult {
   const { autoRefreshInterval, fetchOnMount = true } = options;
 
   const [viewData, setViewData] = useState<ActionLogViewData | null>(null);
@@ -96,9 +94,7 @@ export function useActionLogView(
     setError(null);
 
     try {
-      const response = await invoke<CommandResponse<ActionLogViewData>>(
-        "get_action_log_view"
-      );
+      const response = await invoke<CommandResponse<ActionLogViewData>>("get_action_log_view");
 
       console.log("[HOOK] Response received:", response);
 
@@ -112,8 +108,7 @@ export function useActionLogView(
         setViewData(response.data);
         setError(null);
       } else {
-        const errorMessage =
-          response.message || "Failed to fetch action log view";
+        const errorMessage = response.message || "Failed to fetch action log view";
         console.log("[HOOK] Error - response not successful:", errorMessage);
         setError(errorMessage);
         console.error("get_action_log_view failed:", errorMessage);
@@ -124,8 +119,7 @@ export function useActionLogView(
         return;
       }
 
-      const errorMessage =
-        err instanceof Error ? err.message : "Unknown error occurred";
+      const errorMessage = err instanceof Error ? err.message : "Unknown error occurred";
       console.log("[HOOK] Exception caught:", errorMessage);
       setError(errorMessage);
       console.error("Failed to fetch action log view:", err);

@@ -65,7 +65,7 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
         return false;
       }
     },
-    [pythonStatus]
+    [pythonStatus],
   );
 
   /**

@@ -88,11 +88,7 @@ export function SimpleExample() {
         View Action Details
       </button>
 
-      <ActionDetailModal
-        action={selectedAction}
-        isOpen={isModalOpen}
-        onClose={handleClose}
-      />
+      <ActionDetailModal action={selectedAction} isOpen={isModalOpen} onClose={handleClose} />
     </div>
   );
 }
@@ -165,11 +161,7 @@ function TreeNodeExample({
  * 3. Use in HierarchicalActionLog:
  */
 
-export function HierarchicalActionLogExample({
-  treeRoots,
-}: {
-  treeRoots: DisplayNode[];
-}) {
+export function HierarchicalActionLogExample({ treeRoots }: { treeRoots: DisplayNode[] }) {
   const [selectedAction, setSelectedAction] = useState<DisplayNode | null>(null);
   const [isDetailModalOpen, setIsDetailModalOpen] = useState(false);
   const [expandedNodes] = useState<Set<string>>(new Set());
@@ -283,18 +275,11 @@ export function ContextMenuExample({ node }: { node: DisplayNode }) {
 
   return (
     <>
-      <div
-        onContextMenu={handleContextMenu}
-        className="p-2 hover:bg-accent cursor-pointer"
-      >
+      <div onContextMenu={handleContextMenu} className="p-2 hover:bg-accent cursor-pointer">
         {node.name}
       </div>
 
-      <ActionDetailModal
-        action={node}
-        isOpen={isModalOpen}
-        onClose={() => setIsModalOpen(false)}
-      />
+      <ActionDetailModal action={node} isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} />
     </>
   );
 }

@@ -39,8 +39,8 @@ pub mod websocket;
 
 // Re-export all command functions for easy access in main.rs
 pub use config::{
-    get_auto_load_last_config, get_current_configuration, get_last_config_path,
-    load_configuration, save_auto_load_last_config, save_last_workflow_id,
+    get_auto_load_last_config, get_current_configuration, get_last_config_path, load_configuration,
+    save_auto_load_last_config, save_last_workflow_id,
 };
 pub use debug::{get_debug_settings, set_debug_settings};
 pub use execution::{
@@ -61,7 +61,9 @@ pub use storage::{
     save_screenshot_to_disk, save_video_to_disk,
 };
 pub use video::{get_video_recording_status, start_video_recording, stop_video_recording};
-pub use websocket::{configure_websocket, connect_websocket, disconnect_websocket, WebSocketConfig};
+pub use websocket::{
+    configure_websocket, connect_websocket, disconnect_websocket, WebSocketConfig,
+};
 
 /// Application state shared across all commands.
 ///

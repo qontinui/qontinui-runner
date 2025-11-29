@@ -17,6 +17,7 @@ logging/
 ## Responsibilities
 
 ### LogStore
+
 **Single Responsibility:** Managing in-memory storage of log entries
 
 - Stores general logs and image recognition logs
@@ -25,6 +26,7 @@ logging/
 - Handles log counts
 
 ### LogFilter
+
 **Single Responsibility:** Filtering log entries by criteria
 
 - Filters logs by level (info, warning, error, debug, success)
@@ -32,6 +34,7 @@ logging/
 - Pure function approach - no side effects
 
 ### LogFormatter
+
 **Single Responsibility:** Formatting logs for output
 
 - Formats general logs as text
@@ -41,6 +44,7 @@ logging/
 - Supports multiple log types (general, image, actions)
 
 ### TimestampFormatter
+
 **Single Responsibility:** Formatting timestamps consistently
 
 - Formats current time as HH:MM:SS
@@ -48,6 +52,7 @@ logging/
 - Ensures consistent timestamp format across the system
 
 ### ImageLogHandler
+
 **Single Responsibility:** Processing image recognition events
 
 - Parses raw image recognition data
@@ -59,6 +64,7 @@ logging/
 ## LogManager (Coordinator)
 
 The `LogManager` in the parent directory acts as a **facade** that:
+
 - Coordinates between all specialized modules
 - Provides a unified public API
 - Handles log deduplication
@@ -75,16 +81,16 @@ The `LogManager` in the parent directory acts as a **facade** that:
 ## Usage Example
 
 ```typescript
-import { logManager } from './managers';
+import { logManager } from "./managers";
 
 // Add a log (LogManager delegates to LogStore and TimestampFormatter)
-logManager.addLog('info', 'Application started');
+logManager.addLog("info", "Application started");
 
 // Get filtered logs (LogManager delegates to LogStore and LogFilter)
-const errorLogs = logManager.getFilteredLogs('error');
+const errorLogs = logManager.getFilteredLogs("error");
 
 // Copy logs (LogManager delegates to LogStore and LogFormatter)
-await logManager.copyLogs('general');
+await logManager.copyLogs("general");
 
 // Process image recognition (LogManager delegates to ImageLogHandler)
 logManager.processImageRecognitionData(eventData);
@@ -93,6 +99,7 @@ logManager.processImageRecognitionData(eventData);
 ## Public API Stability
 
 The public API exposed by `LogManager` remains unchanged, ensuring:
+
 - Existing hooks (`useLogManager`) continue to work
 - No breaking changes to components
 - Backward compatibility with all consumers

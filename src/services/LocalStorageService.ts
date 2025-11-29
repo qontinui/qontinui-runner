@@ -45,7 +45,7 @@ export class LocalStorageService {
   async saveScreenshot(
     sessionId: string,
     screenshotId: string,
-    data: string | Uint8Array
+    data: string | Uint8Array,
   ): Promise<string> {
     try {
       const result: CommandResponse = await invoke("save_screenshot_to_disk", {
@@ -118,10 +118,7 @@ export class LocalStorageService {
    * @param type The type of storage to clean ('screenshots' or 'videos')
    * @param olderThanDays Delete sessions older than this many days
    */
-  async deleteOldSessions(
-    type: "screenshots" | "videos",
-    olderThanDays: number
-  ): Promise<void> {
+  async deleteOldSessions(type: "screenshots" | "videos", olderThanDays: number): Promise<void> {
     try {
       const result: CommandResponse = await invoke("delete_old_sessions", {
         storageType: type,
@@ -143,10 +140,7 @@ export class LocalStorageService {
    * @param sizeBytes The size in bytes to check
    * @returns True if space is available
    */
-  async hasSpaceAvailable(
-    type: "screenshots" | "videos",
-    sizeBytes: number
-  ): Promise<boolean> {
+  async hasSpaceAvailable(type: "screenshots" | "videos", sizeBytes: number): Promise<boolean> {
     try {
       const usage = await this.getStorageUsage();
       const sizeMB = sizeBytes / (1024 * 1024);

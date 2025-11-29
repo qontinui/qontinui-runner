@@ -13,7 +13,7 @@
  * - Responsive layout with accessible markup
  */
 
-import React, { useState } from 'react';
+import React, { useState } from "react";
 
 // ============================================================================
 // Type Definitions
@@ -105,15 +105,11 @@ interface StateViewerProps {
  *
  * Displays a list of detected states with selection and detailed view capabilities.
  */
-export const StateViewer: React.FC<StateViewerProps> = ({
-  states,
-  onStateEdit,
-  onExport,
-}) => {
+export const StateViewer: React.FC<StateViewerProps> = ({ states, onStateEdit, onExport }) => {
   const [selectedStateId, setSelectedStateId] = useState<string | null>(null);
 
   // Get the currently selected state
-  const selectedState = states.find(state => state.id === selectedStateId);
+  const selectedState = states.find((state) => state.id === selectedStateId);
 
   // Calculate statistics for a state
   const getStateStats = (state: DetectedState) => ({
@@ -178,13 +174,13 @@ export const StateViewer: React.FC<StateViewerProps> = ({
                 return (
                   <div
                     key={state.id}
-                    className={`state-list-item ${isSelected ? 'selected' : ''}`}
+                    className={`state-list-item ${isSelected ? "selected" : ""}`}
                     onClick={() => handleStateClick(state.id)}
                     role="button"
                     tabIndex={0}
                     aria-pressed={isSelected}
                     onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
+                      if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
                         handleStateClick(state.id);
                       }
@@ -257,8 +253,12 @@ export const StateViewer: React.FC<StateViewerProps> = ({
                         <li key={image.id} className="element-item">
                           <div className="element-name">{image.name}</div>
                           <div className="element-details">
-                            <span>Position: ({image.x}, {image.y})</span>
-                            <span>Size: {image.width}x{image.height}</span>
+                            <span>
+                              Position: ({image.x}, {image.y})
+                            </span>
+                            <span>
+                              Size: {image.width}x{image.height}
+                            </span>
                             <span>Stability: {(image.stabilityScore * 100).toFixed(1)}%</span>
                           </div>
                         </li>
@@ -278,8 +278,12 @@ export const StateViewer: React.FC<StateViewerProps> = ({
                         <li key={region.id} className="element-item">
                           <div className="element-name">{region.name}</div>
                           <div className="element-details">
-                            <span>Position: ({region.x}, {region.y})</span>
-                            <span>Size: {region.width}x{region.height}</span>
+                            <span>
+                              Position: ({region.x}, {region.y})
+                            </span>
+                            <span>
+                              Size: {region.width}x{region.height}
+                            </span>
                             {region.isSearchRegion && (
                               <span className="badge-search">Search Region</span>
                             )}
@@ -301,7 +305,9 @@ export const StateViewer: React.FC<StateViewerProps> = ({
                         <li key={location.id} className="element-item">
                           <div className="element-name">{location.name}</div>
                           <div className="element-details">
-                            <span>Position: ({location.x}, {location.y})</span>
+                            <span>
+                              Position: ({location.x}, {location.y})
+                            </span>
                             {location.fixed && <span className="badge-fixed">Fixed</span>}
                             {location.anchor && <span className="badge-anchor">Anchor</span>}
                           </div>

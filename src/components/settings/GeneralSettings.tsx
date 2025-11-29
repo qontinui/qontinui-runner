@@ -74,7 +74,8 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
             <div className="space-y-1">
               <div className="font-medium">Auto-load Last Configuration on Startup</div>
               <div className="text-sm text-muted-foreground">
-                Automatically load the last used configuration file and workflow when the application starts
+                Automatically load the last used configuration file and workflow when the
+                application starts
               </div>
             </div>
             <button
@@ -94,8 +95,9 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
 
         <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
           <div className="text-sm text-muted-foreground">
-            <strong className="text-foreground">Tip:</strong> When enabled, the runner will automatically
-            load your last configuration and selected workflow, saving time when you restart the application.
+            <strong className="text-foreground">Tip:</strong> When enabled, the runner will
+            automatically load your last configuration and selected workflow, saving time when you
+            restart the application.
           </div>
         </div>
       </div>

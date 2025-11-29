@@ -36,10 +36,7 @@ export class VideoRecordingService {
    * @param sessionId Unique identifier for this recording session
    * @param config Recording configuration
    */
-  public async startRecording(
-    sessionId: string,
-    config: VideoRecordingConfig
-  ): Promise<void> {
+  public async startRecording(sessionId: string, config: VideoRecordingConfig): Promise<void> {
     try {
       // Validate configuration
       if (config.startDelaySeconds < 0 || config.startDelaySeconds > 60) {
@@ -56,20 +53,17 @@ export class VideoRecordingService {
 
       this.currentSessionId = sessionId;
 
-      const result = await invoke<{ success: boolean; message?: string }>(
-        "start_video_recording",
-        {
-          sessionId,
-          config,
-        }
-      );
+      const result = await invoke<{ success: boolean; message?: string }>("start_video_recording", {
+        sessionId,
+        config,
+      });
 
       if (!result.success) {
         throw new Error(result.message || "Failed to start recording");
       }
 
       console.log(
-        `Video recording started for session: ${sessionId} with delay: ${config.startDelaySeconds}s`
+        `Video recording started for session: ${sessionId} with delay: ${config.startDelaySeconds}s`,
       );
     } catch (error) {
       console.error("Failed to start video recording:", error);

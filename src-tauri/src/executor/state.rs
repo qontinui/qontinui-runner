@@ -79,12 +79,18 @@ impl ExecutorState {
 
     /// Returns true if the executor can accept commands in this state
     pub fn can_accept_commands(&self) -> bool {
-        matches!(self, ExecutorState::Ready { .. } | ExecutorState::Running { .. })
+        matches!(
+            self,
+            ExecutorState::Ready { .. } | ExecutorState::Running { .. }
+        )
     }
 
     /// Returns true if the executor is in a terminal state (Failed or Shutdown)
     pub fn is_terminal(&self) -> bool {
-        matches!(self, ExecutorState::Failed { .. } | ExecutorState::Shutdown { .. })
+        matches!(
+            self,
+            ExecutorState::Failed { .. } | ExecutorState::Shutdown { .. }
+        )
     }
 
     /// Returns true if the executor is initializing

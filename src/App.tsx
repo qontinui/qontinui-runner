@@ -16,11 +16,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { FileText } from "lucide-react";
 
 // Contexts
-import {
-  ExecutionProvider,
-  useExecution,
-  EventManagerProvider,
-} from "./contexts";
+import { ExecutionProvider, useExecution, EventManagerProvider } from "./contexts";
 
 // Managers
 import { setupEventHandlers, eventRouter } from "./managers";
@@ -107,7 +103,6 @@ function AppContent() {
     });
 
     return cleanup;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Empty deps - run only on mount to prevent duplicate event handlers
 
   // Refresh action log when switching to Actions tab
@@ -131,10 +126,15 @@ function AppContent() {
   };
 
   const handleCopyLogs = async () => {
-    const logType = uiState.activeLogTab === "general" ? "general" : uiState.activeLogTab === "image" ? "image" : "actions";
+    const logType =
+      uiState.activeLogTab === "general"
+        ? "general"
+        : uiState.activeLogTab === "image"
+          ? "image"
+          : "actions";
     const success = await copyLogs(
       logType,
-      logType === "actions" ? actionLogViewData?.actions : undefined
+      logType === "actions" ? actionLogViewData?.actions : undefined,
     );
     if (success) {
       uiState.showCopySuccessFeedback();

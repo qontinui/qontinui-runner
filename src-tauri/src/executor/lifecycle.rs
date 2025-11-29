@@ -136,9 +136,9 @@ impl ExecutorLifecycle {
         let mut state = self.state.write().await;
 
         // Validate transition
-        state.can_transition_to(&new_state).map_err(|e| {
-            AppError::StateError(format!("Invalid state transition: {}", e))
-        })?;
+        state
+            .can_transition_to(&new_state)
+            .map_err(|e| AppError::StateError(format!("Invalid state transition: {}", e)))?;
 
         let old_state = state.clone();
         *state = new_state.clone();
@@ -260,7 +260,10 @@ impl ExecutorLifecycle {
                 }
             }
 
-            ExecutorMessage::Error { message: msg, details } => {
+            ExecutorMessage::Error {
+                message: msg,
+                details,
+            } => {
                 error!("Executor error: {} - {:?}", msg, details);
 
                 // Transition to failed state
@@ -289,7 +292,9 @@ impl ExecutorLifecycle {
 
                 if state.is_initializing() {
                     // Queue event for later processing
-                    warn!("Received image recognition event during initialization, queuing for later");
+                    warn!(
+                        "Received image recognition event during initialization, queuing for later"
+                    );
                     self.queue_event(message.clone()).await;
                     Ok(None)
                 } else if state.can_accept_commands() {
@@ -388,7 +393,10 @@ impl ExecutorLifecycle {
         let state = self.state.read().await;
 
         if !state.is_running() {
-            warn!("mark_execution_completed called but state is {}", state.name());
+            warn!(
+                "mark_execution_completed called but state is {}",
+                state.name()
+            );
         }
 
         drop(state); // Release read lock

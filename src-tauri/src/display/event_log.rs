@@ -50,8 +50,14 @@ impl EventLog {
 
     /// Add a new event to the log
     pub fn add_event(&mut self, event: RawEvent) {
-        eprintln!("[EVENT_LOG] add_event called: id={}, type={}, sequence={}", event.id, event.event_type, event.sequence);
-        eprintln!("[EVENT_LOG] Event data keys: {:?}", event.data.as_object().map(|o| o.keys().collect::<Vec<_>>()));
+        eprintln!(
+            "[EVENT_LOG] add_event called: id={}, type={}, sequence={}",
+            event.id, event.event_type, event.sequence
+        );
+        eprintln!(
+            "[EVENT_LOG] Event data keys: {:?}",
+            event.data.as_object().map(|o| o.keys().collect::<Vec<_>>())
+        );
 
         let event_idx = self.events.len();
 
@@ -62,7 +68,12 @@ impl EventLog {
             .push(event_idx);
 
         // Add to node index if event has a node_id
-        if let Some(node_id) = event.data.get("node").and_then(|n| n.get("id")).and_then(|id| id.as_str()) {
+        if let Some(node_id) = event
+            .data
+            .get("node")
+            .and_then(|n| n.get("id"))
+            .and_then(|id| id.as_str())
+        {
             eprintln!("[EVENT_LOG] Found node_id in event: {}", node_id);
             self.node_index
                 .entry(node_id.to_string())
@@ -73,7 +84,10 @@ impl EventLog {
         }
 
         self.events.push(event);
-        eprintln!("[EVENT_LOG] Event added. Total events now: {}", self.events.len());
+        eprintln!(
+            "[EVENT_LOG] Event added. Total events now: {}",
+            self.events.len()
+        );
     }
 
     /// Get all events
@@ -87,7 +101,8 @@ impl EventLog {
         self.type_index
             .get(event_type)
             .map(|indices| {
-                indices.iter()
+                indices
+                    .iter()
                     .filter_map(|&idx| self.events.get(idx))
                     .collect()
             })
@@ -100,7 +115,8 @@ impl EventLog {
         self.node_index
             .get(node_id)
             .map(|indices| {
-                indices.iter()
+                indices
+                    .iter()
                     .filter_map(|&idx| self.events.get(idx))
                     .collect()
             })

@@ -27,9 +27,7 @@ export class ImageLogHandler {
 
     let screenshotTimestamp: string | undefined;
     if (data.screenshot_timestamp) {
-      screenshotTimestamp = this.timestampFormatter.formatUnixTimestamp(
-        data.screenshot_timestamp
-      );
+      screenshotTimestamp = this.timestampFormatter.formatUnixTimestamp(data.screenshot_timestamp);
     }
 
     // Format location - backend can send location as string "(x, y)" or object
@@ -67,7 +65,7 @@ export class ImageLogHandler {
    * Parse location from various formats
    */
   private parseLocation(
-    location: any
+    location: any,
   ): { x: number; y: number; width: number; height: number } | undefined {
     if (!location) {
       return undefined;

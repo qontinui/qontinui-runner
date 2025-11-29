@@ -90,7 +90,8 @@ impl VideoRecordingService {
 
         // Generate output filename
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let output_path = self.get_output_directory()
+        let output_path = self
+            .get_output_directory()
             .join(format!("qontinui_{}_{}.mp4", session_id, timestamp));
 
         // Store config and prepare state
@@ -220,9 +221,12 @@ impl VideoRecordingService {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let process = command
-            .spawn()
-            .map_err(|e| format!("Failed to start FFmpeg: {}. Make sure FFmpeg is installed and in PATH.", e))?;
+        let process = command.spawn().map_err(|e| {
+            format!(
+                "Failed to start FFmpeg: {}. Make sure FFmpeg is installed and in PATH.",
+                e
+            )
+        })?;
 
         state_guard.process = Some(process);
         state_guard.start_time = Some(Instant::now());
@@ -237,9 +241,7 @@ impl VideoRecordingService {
                 thread::sleep(Duration::from_secs(duration as u64));
                 info!("Max duration reached, stopping recording");
 
-                let service = VideoRecordingService {
-                    state: state_clone,
-                };
+                let service = VideoRecordingService { state: state_clone };
 
                 if let Err(e) = service.stop_recording() {
                     error!("Failed to auto-stop recording: {}", e);
@@ -300,10 +302,10 @@ impl VideoRecordingService {
 
         // Quality settings (CRF for h264/h265)
         let crf = match config.quality.as_str() {
-            "low" => "28",      // Lower quality, smaller file
-            "medium" => "23",   // Balanced
-            "high" => "18",     // Higher quality, larger file
-            _ => "23",          // Default to medium
+            "low" => "28",    // Lower quality, smaller file
+            "medium" => "23", // Balanced
+            "high" => "18",   // Higher quality, larger file
+            _ => "23",        // Default to medium
         };
         args.push("-crf".to_string());
         args.push(crf.to_string());
