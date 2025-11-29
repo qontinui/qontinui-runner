@@ -138,7 +138,9 @@ def example_basic_detection(frames: List[Frame]):
         logger.info(f"      Frames: {len(state.frame_indices)}")
         logger.info(f"      Duration: {state.metadata.get('duration_ms', 0)}ms")
         logger.info(f"      First occurrence: {state.metadata.get('first_occurrence_ms', 0)}ms")
-        logger.info(f"      Representative frame: {state.metadata.get('representative_frame_index', -1)}")
+        logger.info(
+            f"      Representative frame: {state.metadata.get('representative_frame_index', -1)}"
+        )
 
 
 def example_custom_config(frames: List[Frame]):

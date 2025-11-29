@@ -12,6 +12,7 @@ import sys
 # CRITICAL: Check for --disable-console-logging flag BEFORE any qontinui imports
 # This prevents logging from outputting to stderr/stdout
 import os
+
 if "--disable-console-logging" in sys.argv:
     os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
     sys.argv.remove("--disable-console-logging")
@@ -472,6 +473,7 @@ class QontinuiBridge:
             if self._dsl_parser is None:
                 try:
                     from qontinui.runner import DSLParser, ExecutionError, StatementExecutor
+
                     self._dsl_parser = DSLParser()
                     self._ExecutionError = ExecutionError
                     self._StatementExecutor = StatementExecutor
@@ -661,9 +663,7 @@ class QontinuiBridge:
                 return {"success": False, "error": "No extraction in progress"}
 
             loop = self._get_or_create_async_loop()
-            result = loop.run_until_complete(
-                self._web_extraction_service.stop_extraction()
-            )
+            result = loop.run_until_complete(self._web_extraction_service.stop_extraction())
             return result
 
         except Exception as e:

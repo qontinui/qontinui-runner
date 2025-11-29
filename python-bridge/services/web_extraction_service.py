@@ -86,10 +86,37 @@ class WebExtractionService:
             self._current_extraction_id = self._extractor.extraction_id
             self._is_running = True
 
-            logger.info(f"Starting extraction {self._current_extraction_id}")
+            import sys
 
-            # Start extraction in background
-            asyncio.create_task(self._run_extraction())
+            logger.info(f"Starting extraction {self._current_extraction_id}")
+            print(
+                f"[info    ] WEB_EXTRACTION: Creating background task for extraction {self._current_extraction_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            # Start extraction in background with error handler
+            task = asyncio.create_task(self._run_extraction())
+
+            # Add callback to log any unhandled exceptions
+            def handle_task_exception(t):
+                try:
+                    exc = t.exception()
+                    if exc:
+                        print(
+                            f"[error   ] WEB_EXTRACTION: Task exception: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                except asyncio.CancelledError:
+                    print(
+                        f"[info    ] WEB_EXTRACTION: Task was cancelled",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            task.add_done_callback(handle_task_exception)
+            print(f"[info    ] WEB_EXTRACTION: Task created: {task}", file=sys.stderr, flush=True)
 
             return {
                 "success": True,
@@ -111,36 +138,68 @@ class WebExtractionService:
 
     async def _run_extraction(self) -> None:
         """Run the extraction process."""
+        import sys
+
+        print(f"[info    ] WEB_EXTRACTION: _run_extraction started", file=sys.stderr, flush=True)
+
         if not self._extractor:
+            print(
+                f"[error   ] WEB_EXTRACTION: No extractor available!", file=sys.stderr, flush=True
+            )
             return
 
         try:
-            result = await self._extractor.start(
-                progress_callback=self._handle_progress
+            print(
+                f"[info    ] WEB_EXTRACTION: Calling extractor.start()...",
+                file=sys.stderr,
+                flush=True,
+            )
+            result = await self._extractor.start(progress_callback=self._handle_progress)
+            print(
+                f"[info    ] WEB_EXTRACTION: extractor.start() completed",
+                file=sys.stderr,
+                flush=True,
             )
 
             # Store results
             self._extraction_results[result.extraction_id] = result
 
             # Emit completion event
-            await self._emit_event("extraction_complete", {
-                "extraction_id": result.extraction_id,
-                "summary": {
-                    "total_pages": len(result.page_extractions),
-                    "total_states": len(result.states),
-                    "total_elements": len(result.elements),
-                    "total_transitions": len(result.transitions),
+            await self._emit_event(
+                "extraction_complete",
+                {
+                    "extraction_id": result.extraction_id,
+                    "summary": {
+                        "total_pages": len(result.page_extractions),
+                        "total_states": len(result.states),
+                        "total_elements": len(result.elements),
+                        "total_transitions": len(result.transitions),
+                    },
                 },
-            })
+            )
 
         except Exception as e:
+            import traceback
+
+            print(f"[error   ] WEB_EXTRACTION: Extraction failed: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] WEB_EXTRACTION: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
             logger.error(f"Extraction failed: {e}")
-            await self._emit_event("extraction_error", {
-                "extraction_id": self._current_extraction_id,
-                "error": str(e),
-            })
+            await self._emit_event(
+                "extraction_error",
+                {
+                    "extraction_id": self._current_extraction_id,
+                    "error": str(e),
+                },
+            )
 
         finally:
+            print(
+                f"[info    ] WEB_EXTRACTION: _run_extraction finished", file=sys.stderr, flush=True
+            )
             self._is_running = False
             self._extractor = None
 
@@ -149,8 +208,9 @@ class WebExtractionService:
         event_type = data.get("type", "extraction_progress")
 
         # Forward to event manager (Rust bridge)
+        # Use emit_event_wrapper since event_type is a string, not an EventType enum
         if self.event_manager:
-            self.event_manager.emit_event(event_type, data)
+            self.event_manager.emit_event_wrapper(event_type, data)
 
         # Forward to websocket (web backend)
         if self.websocket_handler and self.websocket_handler.is_connected:
@@ -158,8 +218,9 @@ class WebExtractionService:
 
     async def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Emit an event to both Rust bridge and websocket."""
+        # Use emit_event_wrapper since event_type is a string, not an EventType enum
         if self.event_manager:
-            self.event_manager.emit_event(event_type, data)
+            self.event_manager.emit_event_wrapper(event_type, data)
 
         if self.websocket_handler and self.websocket_handler.is_connected:
             await self._send_to_websocket(event_type, data)
@@ -204,12 +265,16 @@ class WebExtractionService:
         return {
             "is_running": True,
             "extraction_id": self._current_extraction_id,
-            "stats": {
-                "pages_extracted": len(result.page_extractions) if result else 0,
-                "states_found": len(result.states) if result else 0,
-                "elements_found": len(result.elements) if result else 0,
-                "transitions_found": len(result.transitions) if result else 0,
-            } if result else None,
+            "stats": (
+                {
+                    "pages_extracted": len(result.page_extractions) if result else 0,
+                    "states_found": len(result.states) if result else 0,
+                    "elements_found": len(result.elements) if result else 0,
+                    "transitions_found": len(result.transitions) if result else 0,
+                }
+                if result
+                else None
+            ),
         }
 
     def get_screenshot(
@@ -384,18 +449,24 @@ class WebExtractionService:
                     try:
                         with open(metadata_file) as f:
                             metadata = json.load(f)
-                        extractions.append({
-                            "extraction_id": ext_dir.name,
-                            **metadata,
-                        })
+                        extractions.append(
+                            {
+                                "extraction_id": ext_dir.name,
+                                **metadata,
+                            }
+                        )
                     except Exception:
-                        extractions.append({
-                            "extraction_id": ext_dir.name,
-                        })
+                        extractions.append(
+                            {
+                                "extraction_id": ext_dir.name,
+                            }
+                        )
                 else:
-                    extractions.append({
-                        "extraction_id": ext_dir.name,
-                    })
+                    extractions.append(
+                        {
+                            "extraction_id": ext_dir.name,
+                        }
+                    )
 
         return {
             "success": True,

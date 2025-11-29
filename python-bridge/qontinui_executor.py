@@ -28,9 +28,7 @@ from typing import Any, Dict, List, Optional
 
 # CRITICAL: Configure logging to use stderr FIRST before any other imports
 logging.basicConfig(
-    stream=sys.stderr,
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s'
+    stream=sys.stderr, level=logging.DEBUG, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 
 # CRITICAL: Check for --disable-console-logging flag BEFORE any imports
@@ -44,15 +42,22 @@ try:
     with open(debug_log_path, "a", encoding="utf-8") as f:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         f.write(f"[{timestamp}] EXECUTOR STARTED - qontinui_executor.py is running\n")
-        f.write(f"[{timestamp}] Console logging disabled: {os.getenv('QONTINUI_DISABLE_CONSOLE_LOGGING') == '1'}\n")
+        f.write(
+            f"[{timestamp}] Console logging disabled: {os.getenv('QONTINUI_DISABLE_CONSOLE_LOGGING') == '1'}\n"
+        )
 except Exception:
     pass
 
 # CRITICAL: Send READY signal IMMEDIATELY to prevent timeout
-sys.stdout.write(json.dumps({
-    "type": "ready",
-    "data": {"message": "Python executor starting", "library_available": None}
-}) + "\n")
+sys.stdout.write(
+    json.dumps(
+        {
+            "type": "ready",
+            "data": {"message": "Python executor starting", "library_available": None},
+        }
+    )
+    + "\n"
+)
 sys.stdout.flush()
 
 # Set up logging
@@ -62,7 +67,9 @@ logger = logging.getLogger(__name__)
 qontinui_src_path = Path(__file__).parent.parent.parent / "qontinui" / "src"
 sys.path.insert(0, str(qontinui_src_path))
 
-logger.debug(f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})")
+logger.debug(
+    f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
+)
 
 # CRITICAL: Import local python-bridge modules BEFORE qontinui library
 from event_translator import EventTranslator
@@ -85,6 +92,7 @@ try:
     from qontinui import Find, Image, Location, navigation_api, registry
     from qontinui.config import get_settings
     from qontinui.reporting import register_callback, EventType as QontinuiEventType
+
     QONTINUI_AVAILABLE = True
 except ImportError as e:
     QONTINUI_AVAILABLE = False
@@ -144,25 +152,20 @@ class QontinuiExecutor:
 
         # Initialize WebSocketHandler with command handler
         self.websocket_handler = WebSocketHandler(
-            emit_log_fn=self.event_manager.emit_log,
-            on_command_fn=self._handle_websocket_command
+            emit_log_fn=self.event_manager.emit_log, on_command_fn=self._handle_websocket_command
         )
 
         # Initialize CaptureManager
         self.capture_manager = CaptureManager(
-            emit_log_fn=self.event_manager.emit_log,
-            emit_event_fn=self.event_manager.emit_event
+            emit_log_fn=self.event_manager.emit_log, emit_event_fn=self.event_manager.emit_event
         )
 
         # Initialize TrainingExportCoordinator
-        self.training_export = TrainingExportCoordinator(
-            emit_log_fn=self.event_manager.emit_log
-        )
+        self.training_export = TrainingExportCoordinator(emit_log_fn=self.event_manager.emit_log)
 
         # Initialize ExecutorCore
         self.executor_core = ExecutorCore(
-            emit_log_fn=self.event_manager.emit_log,
-            emit_event_fn=self.event_manager.emit_event
+            emit_log_fn=self.event_manager.emit_log, emit_event_fn=self.event_manager.emit_event
         )
 
         # Execution tree for hierarchical tracking
@@ -178,18 +181,24 @@ class QontinuiExecutor:
         # Web extraction service (lazy-loaded when needed)
         self._web_extraction_service = None
 
+        # Dedicated event loop for async operations (avoids conflicts with WebSocket thread's loop)
+        # Runs in a background thread to allow run_coroutine_threadsafe()
+        self._async_loop = None
+        self._async_thread = None
+
         # EventTranslator for library callbacks (initialized if library available)
         if QONTINUI_AVAILABLE:
             self.event_translator = EventTranslator(
                 self._emit_event_wrapper,
                 state_lookup=self._get_state_for_image,
                 hierarchy_lookup=self._get_current_hierarchy,
-                image_data_lookup=self._get_image_data
+                image_data_lookup=self._get_image_data,
             )
             self.event_translator.register_all_callbacks()
 
             # Verify callbacks were registered
             from qontinui.reporting import get_event_registry
+
             event_registry = get_event_registry()
             logger.debug(f"[INIT] Event registry has_listeners: {event_registry.has_listeners}")
             logger.debug(f"[INIT] EventTranslator initialized and callbacks registered")
@@ -228,7 +237,7 @@ class QontinuiExecutor:
                 self.websocket_handler.send_screenshot(
                     image=screenshot_base64,
                     name=f"match_{data.get('image_id', 'unknown')}_{int(time.time())}",
-                    metadata=metadata
+                    metadata=metadata,
                 )
 
             self.websocket_handler.send_log(
@@ -239,7 +248,7 @@ class QontinuiExecutor:
                     "image_id": data.get("image_id"),
                     "found": data.get("found"),
                     "confidence": data.get("confidence"),
-                }
+                },
             )
             return
 
@@ -259,7 +268,7 @@ class QontinuiExecutor:
             message = f"Action started: {data.get('action_type', 'unknown')}"
         elif event_type == "action_completed":
             success = data.get("success", True)
-            action_type = data.get("action_type", 'unknown')
+            action_type = data.get("action_type", "unknown")
             message = f"Action {'completed' if success else 'failed'}: {action_type}"
             if not success:
                 level = "error"
@@ -271,12 +280,7 @@ class QontinuiExecutor:
             message = data.get("message", f"Event: {event_type}")
 
         self.websocket_handler.send_log(
-            level=level,
-            message=message,
-            log_data={
-                "event_type": event_type,
-                **data
-            }
+            level=level, message=message, log_data={"event_type": event_type, **data}
         )
 
     def _get_current_hierarchy(self) -> Dict[str, Any]:
@@ -353,10 +357,7 @@ class QontinuiExecutor:
             run_dir.mkdir(parents=True, exist_ok=True)
 
             # Initialize ScreenshotService
-            self.screenshot_service = ScreenshotService(
-                storage_dir=run_dir,
-                enabled=True
-            )
+            self.screenshot_service = ScreenshotService(storage_dir=run_dir, enabled=True)
             self.event_manager.emit_log("info", f"ScreenshotService initialized: {run_dir}")
 
             # Create state memory adapter
@@ -371,14 +372,16 @@ class QontinuiExecutor:
             self.unified_data_collector = UnifiedDataCollector(
                 state_memory=state_memory_adapter,
                 screenshot_service=self.screenshot_service,
-                record_created_callback=record_callback
+                record_created_callback=record_callback,
             )
             self.event_manager.emit_log("info", "UnifiedDataCollector initialized")
 
             # Connect UnifiedDataCollector to EventTranslator
-            if hasattr(self, 'event_translator') and self.event_translator:
+            if hasattr(self, "event_translator") and self.event_translator:
                 self.event_translator.collector = self.unified_data_collector
-                self.event_manager.emit_log("info", "EventTranslator connected to UnifiedDataCollector")
+                self.event_manager.emit_log(
+                    "info", "EventTranslator connected to UnifiedDataCollector"
+                )
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to initialize unified data services: {e}")
@@ -416,7 +419,7 @@ class QontinuiExecutor:
                 workflows=self.executor_core.workflows,
                 images=self.executor_core.images,
                 get_image_name_fn=self._get_image_name,
-                get_action_definition_fn=get_action_definition
+                get_action_definition_fn=get_action_definition,
             )
 
             # Inject self as workflow executor for navigation
@@ -426,7 +429,9 @@ class QontinuiExecutor:
 
         return success
 
-    def execute_workflow(self, workflow_id: str, transition_context: Optional[Dict] = None) -> Dict[str, Any]:
+    def execute_workflow(
+        self, workflow_id: str, transition_context: Optional[Dict] = None
+    ) -> Dict[str, Any]:
         """
         Execute a workflow.
 
@@ -440,14 +445,14 @@ class QontinuiExecutor:
             Dict with 'success' key
         """
         if not self.gui_automation:
-            return {'success': False, 'error': 'GUI automation not initialized'}
+            return {"success": False, "error": "GUI automation not initialized"}
 
         try:
             success = self.gui_automation.execute_workflow(workflow_id, transition_context)
-            return {'success': success}
+            return {"success": success}
         except Exception as e:
             self.event_manager.emit_log("error", f"Workflow execution failed: {e}")
-            return {'success': False, 'error': str(e)}
+            return {"success": False, "error": str(e)}
 
     def start_execution(self, workflow_id: str) -> bool:
         """Start workflow execution in background thread."""
@@ -456,7 +461,9 @@ class QontinuiExecutor:
             return False
 
         if not self.gui_automation:
-            self.event_manager.emit_log("error", "GUI automation not initialized - load config first")
+            self.event_manager.emit_log(
+                "error", "GUI automation not initialized - load config first"
+            )
             return False
 
         self.is_running = True
@@ -471,8 +478,7 @@ class QontinuiExecutor:
         thread.start()
 
         self.event_manager.emit_event(
-            EventType.EXECUTION_STARTED,
-            {"workflow_id": workflow_id, "timestamp": time.time()}
+            EventType.EXECUTION_STARTED, {"workflow_id": workflow_id, "timestamp": time.time()}
         )
 
         return True
@@ -499,9 +505,7 @@ class QontinuiExecutor:
 
             # End WebSocket session
             if self.websocket_handler.is_enabled():
-                self.websocket_handler.end_session(
-                    status="completed" if success else "failed"
-                )
+                self.websocket_handler.end_session(status="completed" if success else "failed")
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Workflow execution error: {e}")
@@ -534,8 +538,7 @@ class QontinuiExecutor:
                 self.gui_automation.set_running(False)
 
             self.event_manager.emit_event(
-                EventType.EXECUTION_COMPLETED,
-                {"success": False, "reason": "User stopped"}
+                EventType.EXECUTION_COMPLETED, {"success": False, "reason": "User stopped"}
             )
 
             # Export training data if enabled
@@ -545,7 +548,9 @@ class QontinuiExecutor:
 
     def navigate_to_state(self, target_state_id: str) -> Dict[str, Any]:
         """Navigate to a target state via navigation API."""
-        self.event_manager.emit_log("info", f"[NAVIGATE] navigate_to_state called: {target_state_id}")
+        self.event_manager.emit_log(
+            "info", f"[NAVIGATE] navigate_to_state called: {target_state_id}"
+        )
 
         if not QONTINUI_AVAILABLE:
             return {"success": False, "error": "Qontinui library not available"}
@@ -558,7 +563,7 @@ class QontinuiExecutor:
                 name=f"Navigate to {target_state_id}",
                 timestamp=time.time(),
                 metadata={"target_state": target_state_id},
-                parent=None
+                parent=None,
             )
             self._navigation_sequence += 1
 
@@ -572,21 +577,31 @@ class QontinuiExecutor:
             success = result.get("success", False) if isinstance(result, dict) else result
             nav_node.status = "completed" if success else "failed"
             if not success:
-                nav_node.error = result.get("error", "Navigation failed") if isinstance(result, dict) else "Navigation failed"
+                nav_node.error = (
+                    result.get("error", "Navigation failed")
+                    if isinstance(result, dict)
+                    else "Navigation failed"
+                )
 
             # Emit completion
-            self.event_manager.emit_tree_event("workflow_completed" if success else "workflow_failed", nav_node, None)
+            self.event_manager.emit_tree_event(
+                "workflow_completed" if success else "workflow_failed", nav_node, None
+            )
 
             return {
                 "success": success,
                 "target_state": target_state_id,
-                "active_states": self.executor_core.state_executor.get_active_states() if self.executor_core.state_executor else [],
-                "path": result.get("path", []) if isinstance(result, dict) else []
+                "active_states": (
+                    self.executor_core.state_executor.get_active_states()
+                    if self.executor_core.state_executor
+                    else []
+                ),
+                "path": result.get("path", []) if isinstance(result, dict) else [],
             }
         except Exception as e:
             logger.error(f"Failed to navigate to state {target_state_id}: {e}")
 
-            if 'nav_node' in locals():
+            if "nav_node" in locals():
                 nav_node.status = "failed"
                 nav_node.error = str(e)
                 self.event_manager.emit_tree_event("workflow_failed", nav_node, None)
@@ -606,14 +621,21 @@ class QontinuiExecutor:
                      {"type": "command", "command": "...", "params": {...}}
         """
         import sys
-        print(f"[info    ] EXECUTOR: Received WebSocket command: {message}", file=sys.stderr, flush=True)
+
+        print(
+            f"[info    ] EXECUTOR: Received WebSocket command: {message}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         try:
             command_name = message.get("command")
             params = message.get("params", {})
 
             if not command_name:
-                print(f"[error   ] EXECUTOR: No command name in message", file=sys.stderr, flush=True)
+                print(
+                    f"[error   ] EXECUTOR: No command name in message", file=sys.stderr, flush=True
+                )
                 return
 
             # Route the command through our normal command handler
@@ -623,13 +645,18 @@ class QontinuiExecutor:
                 "params": params,
             }
 
-            print(f"[info    ] EXECUTOR: Routing to handle_command: {command_name}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] EXECUTOR: Routing to handle_command: {command_name}",
+                file=sys.stderr,
+                flush=True,
+            )
             result = self.handle_command(command_dict)
             print(f"[info    ] EXECUTOR: Command result: {result}", file=sys.stderr, flush=True)
 
             # Send result back through WebSocket to frontend
             if self.websocket_handler and self.websocket_handler.is_connected:
                 import json
+
                 response_message = {
                     "type": "command_response",
                     "data": {
@@ -638,18 +665,36 @@ class QontinuiExecutor:
                     },
                 }
                 self.websocket_handler.send_message(json.dumps(response_message))
-                print(f"[info    ] EXECUTOR: Sent command response via WebSocket", file=sys.stderr, flush=True)
+                print(
+                    f"[info    ] EXECUTOR: Sent command response via WebSocket",
+                    file=sys.stderr,
+                    flush=True,
+                )
             else:
-                print(f"[warning ] EXECUTOR: WebSocket not connected, cannot send response", file=sys.stderr, flush=True)
+                print(
+                    f"[warning ] EXECUTOR: WebSocket not connected, cannot send response",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         except Exception as e:
-            print(f"[error   ] EXECUTOR: Error handling WebSocket command: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] EXECUTOR: Error handling WebSocket command: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
             import traceback
-            print(f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
 
             # Send error response back through WebSocket
             if self.websocket_handler and self.websocket_handler.is_connected:
                 import json
+
                 error_response = {
                     "type": "command_response",
                     "data": {
@@ -658,14 +703,18 @@ class QontinuiExecutor:
                     },
                 }
                 self.websocket_handler.send_message(json.dumps(error_response))
-                print(f"[info    ] EXECUTOR: Sent error response via WebSocket", file=sys.stderr, flush=True)
+                print(
+                    f"[info    ] EXECUTOR: Sent error response via WebSocket",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
         """Handle command from Rust bridge."""
         cmd_type = command.get("command")
         params = command.get("params", {})
 
-        if cmd_type != 'ping':
+        if cmd_type != "ping":
             self.event_manager.emit_log("info", f"handle_command: received '{cmd_type}'")
 
         if cmd_type == "load":
@@ -700,32 +749,52 @@ class QontinuiExecutor:
             return self.capture_manager.update_settings(settings)
 
         elif cmd_type == "manual_capture_status":
-            return {
-                "success": True,
-                "is_running": self.capture_manager.is_manual_capture_running()
-            }
+            return {"success": True, "is_running": self.capture_manager.is_manual_capture_running()}
 
         elif cmd_type == "ws_configure":
             # Direct stderr output for debugging (use [info] format so Rust logs at info level)
             import sys
-            print(f"[info    ] WS_DEBUG: ws_configure received! NEW CODE IS RUNNING!", file=sys.stderr, flush=True)
+
+            print(
+                f"[info    ] WS_DEBUG: ws_configure received! NEW CODE IS RUNNING!",
+                file=sys.stderr,
+                flush=True,
+            )
             enabled = params.get("enabled", False)
             api_url = params.get("api_url", "")
             token = params.get("jwt_token", "")
             project_id = params.get("project_id")
             runner_name = params.get("runner_name")
-            print(f"[info    ] WS_DEBUG: enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}", file=sys.stderr, flush=True)
-            self.event_manager.emit_log("info", f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}")
-            success = self.websocket_handler.configure(enabled, api_url, token, project_id, runner_name)
-            print(f"[info    ] WS_DEBUG: configure result: success={success}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] WS_DEBUG: enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log(
+                "info",
+                f"[WS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}, runner_name={runner_name}, token_len={len(token) if token else 0}",
+            )
+            success = self.websocket_handler.configure(
+                enabled, api_url, token, project_id, runner_name
+            )
+            print(
+                f"[info    ] WS_DEBUG: configure result: success={success}",
+                file=sys.stderr,
+                flush=True,
+            )
             self.event_manager.emit_log("info", f"[WS_CONFIGURE] Result: success={success}")
             return {"success": success}
 
         elif cmd_type == "ws_connect":
             import sys
+
             print(f"[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
             success = self.websocket_handler.connect()
-            print(f"[info    ] WS_DEBUG: ws_connect result: success={success}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] WS_DEBUG: ws_connect result: success={success}",
+                file=sys.stderr,
+                flush=True,
+            )
             return {"success": success}
 
         elif cmd_type == "ws_disconnect":
@@ -744,16 +813,10 @@ class QontinuiExecutor:
             return {"success": success}
 
         elif cmd_type == "ws_status":
-            return {
-                "success": True,
-                "enabled": self.websocket_handler.is_enabled()
-            }
+            return {"success": True, "enabled": self.websocket_handler.is_enabled()}
 
         elif cmd_type == "ping":
-            pong_message = {
-                "type": "pong",
-                "timestamp": time.time()
-            }
+            pong_message = {"type": "pong", "timestamp": time.time()}
             print(json.dumps(pong_message), flush=True)
             return {"success": True}
 
@@ -782,29 +845,75 @@ class QontinuiExecutor:
             )
         return self._web_extraction_service
 
+    def _start_async_loop(self):
+        """Start the async event loop in a background thread."""
+        import asyncio
+
+        self._async_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._async_loop)
+        self._async_loop.run_forever()
+
+    def _get_or_create_async_loop(self):
+        """
+        Get or create a dedicated event loop for async operations.
+
+        This runs an event loop in a background thread, allowing us to use
+        asyncio.run_coroutine_threadsafe() to schedule coroutines from any thread
+        (including from within the WebSocket handler's event loop).
+
+        Returns:
+            asyncio.AbstractEventLoop: A dedicated event loop for this executor.
+        """
+        import asyncio
+        import threading
+        import time
+
+        # Start background thread if needed
+        if self._async_thread is None or not self._async_thread.is_alive():
+            self._async_loop = None  # Reset loop since thread died
+            self._async_thread = threading.Thread(target=self._start_async_loop, daemon=True)
+            self._async_thread.start()
+
+            # Wait for loop to be ready
+            timeout = 5
+            start_time = time.time()
+            while self._async_loop is None and time.time() - start_time < timeout:
+                time.sleep(0.05)
+
+            if self._async_loop is None:
+                raise RuntimeError("Failed to start async event loop")
+
+        return self._async_loop
+
     def _handle_start_web_extraction(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle start web extraction command."""
         import asyncio
         import sys
-        print(f"[info    ] EXECUTOR: _handle_start_web_extraction called with params: {params}", file=sys.stderr, flush=True)
+
+        print(
+            f"[info    ] EXECUTOR: _handle_start_web_extraction called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         try:
             service = self._get_web_extraction_service()
 
-            # Get or create event loop
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            # Get dedicated event loop running in background thread
+            loop = self._get_or_create_async_loop()
 
-            # Run the async start_extraction in the event loop
+            # Schedule the async operation on the background loop using run_coroutine_threadsafe
+            # This is required because we may be called from within an already-running event loop
             config = params.get("config", params)  # Support both nested and flat config
-            print(f"[info    ] EXECUTOR: Starting extraction with config: {config}", file=sys.stderr, flush=True)
-            result = loop.run_until_complete(service.start_extraction(config))
+            print(
+                f"[info    ] EXECUTOR: Starting extraction with config: {config}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+            future = asyncio.run_coroutine_threadsafe(service.start_extraction(config), loop)
+            # Wait for result with timeout (extraction may take a while to initialize)
+            result = future.result(timeout=60)
 
             if result.get("success"):
                 self.event_manager.emit_event(
@@ -815,36 +924,43 @@ class QontinuiExecutor:
                     },
                 )
 
-            print(f"[info    ] EXECUTOR: start_extraction result: {result}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] EXECUTOR: start_extraction result: {result}",
+                file=sys.stderr,
+                flush=True,
+            )
             return result
 
         except Exception as e:
-            print(f"[error   ] EXECUTOR: Failed to start extraction: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] EXECUTOR: Failed to start extraction: {e}", file=sys.stderr, flush=True
+            )
             import traceback
-            print(f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
             self.event_manager.emit_log("error", f"Failed to start extraction: {e}")
             return {"success": False, "error": str(e)}
 
     def _handle_stop_web_extraction(self) -> Dict[str, Any]:
         """Handle stop web extraction command."""
         import asyncio
+
         try:
             if self._web_extraction_service is None:
                 return {"success": False, "error": "No extraction in progress"}
 
-            # Get or create event loop
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_closed():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
+            # Get dedicated event loop running in background thread
+            loop = self._get_or_create_async_loop()
 
-            result = loop.run_until_complete(
-                self._web_extraction_service.stop_extraction()
+            # Schedule the async operation on the background loop using run_coroutine_threadsafe
+            future = asyncio.run_coroutine_threadsafe(
+                self._web_extraction_service.stop_extraction(), loop
             )
+            result = future.result(timeout=30)
             return result
 
         except Exception as e:
@@ -871,7 +987,7 @@ class QontinuiExecutor:
     def __del__(self):
         """Clean up resources on exit."""
         # Stop capture manager
-        if hasattr(self, 'capture_manager') and self.capture_manager:
+        if hasattr(self, "capture_manager") and self.capture_manager:
             if self.capture_manager.manual_click_listener:
                 try:
                     self.capture_manager.manual_click_listener.cleanup()
@@ -879,7 +995,7 @@ class QontinuiExecutor:
                     pass
 
         # Clean up executor core
-        if hasattr(self, 'executor_core') and self.executor_core:
+        if hasattr(self, "executor_core") and self.executor_core:
             self.executor_core.cleanup()
 
 
@@ -887,15 +1003,17 @@ def main():
     """Main entry point for the Qontinui executor."""
     executor = QontinuiExecutor()
 
-    executor.event_manager.emit_log("info", "Python executor main loop started, waiting for commands")
+    executor.event_manager.emit_log(
+        "info", "Python executor main loop started, waiting for commands"
+    )
 
     # Read commands from stdin
     for line in sys.stdin:
         try:
             command = json.loads(line.strip())
-            cmd_name = command.get('command', 'unknown')
+            cmd_name = command.get("command", "unknown")
 
-            if cmd_name != 'ping':
+            if cmd_name != "ping":
                 executor.event_manager.emit_log("info", f"Received command: {cmd_name}")
 
             if command.get("type") == "command":

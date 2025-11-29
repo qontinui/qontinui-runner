@@ -35,10 +35,14 @@ def create_sample_screenshot(width=800, height=600, text="State", color=(255, 25
 
     # Add a title bar
     cv2.rectangle(img, (0, 0), (width, 50), (100, 100, 100), -1)
-    cv2.putText(img, "Application Title", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    cv2.putText(
+        img, "Application Title", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
+    )
 
     # Add main text
-    cv2.putText(img, text, (width // 2 - 100, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3)
+    cv2.putText(
+        img, text, (width // 2 - 100, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 0), 3
+    )
 
     # Add some buttons
     button_y = height - 100

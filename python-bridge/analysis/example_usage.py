@@ -17,10 +17,7 @@ from analysis import ImageExtractionConfig, StateImageExtractor, save_state_imag
 
 
 # Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -159,8 +156,9 @@ def example_basic_extraction():
         # Draw some UI elements
         cv2.rectangle(image, (50, 50), (150, 150), (255, 0, 0), -1)
         cv2.circle(image, (100, 100), 30, (0, 255, 0), -1)
-        cv2.putText(image, "Frame {}".format(i), (200, 100),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(
+            image, "Frame {}".format(i), (200, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
+        )
 
         frame = Frame(
             image=image,
@@ -195,7 +193,11 @@ def example_basic_extraction():
     for img in extracted_images:
         logger.info(
             "  - %s: bbox=%s, position=%s, type=%s, method=%s",
-            img.name, img.bbox, img.position, img.position_type, img.extraction_method
+            img.name,
+            img.bbox,
+            img.position,
+            img.position_type,
+            img.extraction_method,
         )
 
     return extracted_images
@@ -214,8 +216,7 @@ def example_contour_detection():
     cv2.rectangle(image, (50, 50), (150, 150), (100, 100, 255), 2)  # Red box
     cv2.rectangle(image, (200, 50), (300, 150), (255, 100, 100), -1)  # Filled blue
     cv2.circle(image, (400, 100), 50, (100, 255, 100), 2)  # Green circle
-    cv2.putText(image, "Button", (500, 100), cv2.FONT_HERSHEY_SIMPLEX,
-               1, (0, 0, 0), 2)
+    cv2.putText(image, "Button", (500, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
 
     frame = Frame(
         image=image,
@@ -305,6 +306,7 @@ def example_save_and_load():
 
     # Load back
     from analysis import load_state_image
+
     loaded_image = load_state_image(file_path)
     logger.info("Loaded image: %s", loaded_image.name)
     logger.info("  - bbox: %s", loaded_image.bbox)
@@ -444,6 +446,7 @@ def main():
             except Exception as e:
                 logger.error("Error processing real data: %s", e)
                 import traceback
+
                 traceback.print_exc()
         else:
             logger.warning("Invalid paths provided for real data")

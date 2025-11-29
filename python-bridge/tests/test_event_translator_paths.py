@@ -42,11 +42,11 @@ def sample_png_base64():
     """Return a minimal valid PNG image as base64."""
     # 1x1 transparent PNG
     png_bytes = (
-        b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
-        b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01'
-        b'\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
     )
-    return base64.b64encode(png_bytes).decode('utf-8')
+    return base64.b64encode(png_bytes).decode("utf-8")
 
 
 class TestEventTranslatorPathIntegration:
@@ -61,7 +61,7 @@ class TestEventTranslatorPathIntegration:
             collector=mock_collector,
             state_lookup=None,
             hierarchy_lookup=None,
-            image_data_lookup=None
+            image_data_lookup=None,
         )
 
         # Simulate MATCH_ATTEMPTED event from library
@@ -107,7 +107,7 @@ class TestEventTranslatorPathIntegration:
             collector=None,  # No collector
             state_lookup=None,
             hierarchy_lookup=None,
-            image_data_lookup=None
+            image_data_lookup=None,
         )
 
         library_event = {
@@ -142,7 +142,7 @@ class TestEventTranslatorPathIntegration:
             collector=mock_collector,
             state_lookup=None,
             hierarchy_lookup=None,
-            image_data_lookup=None
+            image_data_lookup=None,
         )
 
         # Make collector raise an error
@@ -174,6 +174,7 @@ class TestEventTranslatorPathIntegration:
         self, mock_collector, mock_emitter, sample_png_base64
     ):
         """Test that image_data_lookup is still called for template base64."""
+
         def image_data_lookup(image_id):
             if image_id == "button.png":
                 return sample_png_base64
@@ -184,7 +185,7 @@ class TestEventTranslatorPathIntegration:
             collector=mock_collector,
             state_lookup=None,
             hierarchy_lookup=None,
-            image_data_lookup=image_data_lookup
+            image_data_lookup=image_data_lookup,
         )
 
         library_event = {

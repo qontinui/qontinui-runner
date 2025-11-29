@@ -29,7 +29,6 @@ __all__ = [
     # Core execution models
     "ActionExecutionRecord",
     "HistoricalCapture",
-
     # Video capture architecture models
     "ExtractedFrame",
     "DetectedState",
@@ -39,7 +38,6 @@ __all__ = [
     "ProcessingResult",
     "ProcessingLog",
     "ProcessingStep",
-
     # Legacy/compatibility models
     "InputEvent",
     "InputMonitorEvent",

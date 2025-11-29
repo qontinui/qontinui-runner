@@ -36,6 +36,7 @@ def _set_windows_dpi_awareness_once() -> None:
     global _dpi_awareness_set
 
     import sys
+
     if sys.platform != "win32":
         return
 
@@ -53,14 +54,22 @@ def _set_windows_dpi_awareness_once() -> None:
         # S_OK = 0, E_ACCESSDENIED = -2147024891 (already set by another component)
         if result == 0 or result == -2147024891:
             _dpi_awareness_set = True
-            print(f"[DPI] DPI awareness set successfully (result={result})", file=sys.stderr, flush=True)
+            print(
+                f"[DPI] DPI awareness set successfully (result={result})",
+                file=sys.stderr,
+                flush=True,
+            )
         else:
             print(f"[DPI] DPI awareness unexpected result: {result}", file=sys.stderr, flush=True)
             _dpi_awareness_set = True  # Mark as attempted
 
     except Exception as e:
         # Don't let DPI awareness failures crash the process
-        print(f"[DPI] Warning: Failed to set DPI awareness: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        print(
+            f"[DPI] Warning: Failed to set DPI awareness: {type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
         _dpi_awareness_set = True  # Mark as attempted to avoid retry
 
 
@@ -68,7 +77,7 @@ def _set_windows_dpi_awareness_once() -> None:
 class ScreenSelection:
     """Defines which screen(s) to capture."""
 
-    type: Literal['all', 'primary', 'specific']
+    type: Literal["all", "primary", "specific"]
     indices: Optional[List[int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -79,12 +88,9 @@ class ScreenSelection:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ScreenSelection':
+    def from_dict(cls, data: Dict[str, Any]) -> "ScreenSelection":
         """Create from dictionary."""
-        return cls(
-            type=data["type"],
-            indices=data.get("indices")
-        )
+        return cls(type=data["type"], indices=data.get("indices"))
 
 
 @dataclass
@@ -106,11 +112,11 @@ class ScreenshotCaptureSettings:
             "outputFolder": self.output_folder,
             "baseImageName": self.base_image_name,
             "screens": self.screens.to_dict(),
-            "captureTimings": self.capture_timings
+            "captureTimings": self.capture_timings,
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ScreenshotCaptureSettings':
+    def from_dict(cls, data: Dict[str, Any]) -> "ScreenshotCaptureSettings":
         """Create from dictionary.
 
         Expects camelCase field names to match Rust serialization:
@@ -125,7 +131,7 @@ class ScreenshotCaptureSettings:
             output_folder=data["outputFolder"],
             base_image_name=data["baseImageName"],
             screens=ScreenSelection.from_dict(data["screens"]),
-            capture_timings=data["captureTimings"]
+            capture_timings=data["captureTimings"],
         )
 
 
@@ -155,7 +161,7 @@ class CaptureToolService:
     def __init__(
         self,
         settings: Optional[ScreenshotCaptureSettings] = None,
-        mss_capture: Optional[Any] = None
+        mss_capture: Optional[Any] = None,
     ) -> None:
         """Initialize the CaptureToolService.
 
@@ -233,25 +239,47 @@ class CaptureToolService:
             from qontinui.hal.implementations.mss_capture import MSSScreenCapture
             from qontinui.hal.config import HALConfig
 
-            print("[CaptureService] Imports successful, creating HALConfig...", file=sys.stderr, flush=True)
+            print(
+                "[CaptureService] Imports successful, creating HALConfig...",
+                file=sys.stderr,
+                flush=True,
+            )
 
             # Create MSS instance
             config = HALConfig()
             config.capture_cache_enabled = False  # Don't cache for capture tool
 
-            print("[CaptureService] Creating MSSScreenCapture instance...", file=sys.stderr, flush=True)
+            print(
+                "[CaptureService] Creating MSSScreenCapture instance...",
+                file=sys.stderr,
+                flush=True,
+            )
             self.mss_capture = MSSScreenCapture(config)
 
-            print(f"[CaptureService] ✓ MSS initialized successfully, found {len(self.mss_capture.get_monitors())} monitors", file=sys.stderr, flush=True)
+            print(
+                f"[CaptureService] ✓ MSS initialized successfully, found {len(self.mss_capture.get_monitors())} monitors",
+                file=sys.stderr,
+                flush=True,
+            )
 
         except ImportError as e:
-            print(f"[CaptureService] ✗ Failed to import qontinui MSS capture: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[CaptureService] ✗ Failed to import qontinui MSS capture: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
             import traceback
+
             traceback.print_exc(file=sys.stderr)
             self.mss_capture = None
         except Exception as e:
-            print(f"[CaptureService] ✗ Failed to initialize MSS capture: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[CaptureService] ✗ Failed to initialize MSS capture: {type(e).__name__}: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
             import traceback
+
             traceback.print_exc(file=sys.stderr)
             self.mss_capture = None
 
@@ -280,22 +308,34 @@ class CaptureToolService:
         """
         images = []
 
-        if self.settings.screens.type == 'all':
+        if self.settings.screens.type == "all":
             # Capture all monitors
             monitors = self.mss_capture.get_monitors()
             for monitor in monitors:
-                print(f"[CaptureService] Capturing monitor {monitor.index}: expected {monitor.width}x{monitor.height}", file=sys.stderr, flush=True)
+                print(
+                    f"[CaptureService] Capturing monitor {monitor.index}: expected {monitor.width}x{monitor.height}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 image = self.mss_capture.capture_screen(monitor.index)
-                print(f"[CaptureService] Captured monitor {monitor.index}: actual {image.width}x{image.height}", file=sys.stderr, flush=True)
+                print(
+                    f"[CaptureService] Captured monitor {monitor.index}: actual {image.width}x{image.height}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 images.append(image)
 
-        elif self.settings.screens.type == 'primary':
+        elif self.settings.screens.type == "primary":
             # Capture primary monitor only
             image = self.mss_capture.capture_screen(None)
-            print(f"[CaptureService] Captured primary monitor: {image.width}x{image.height}", file=sys.stderr, flush=True)
+            print(
+                f"[CaptureService] Captured primary monitor: {image.width}x{image.height}",
+                file=sys.stderr,
+                flush=True,
+            )
             images.append(image)
 
-        elif self.settings.screens.type == 'specific':
+        elif self.settings.screens.type == "specific":
             # Capture specific monitors
             if self.settings.screens.indices:
                 for monitor_index in self.settings.screens.indices:
@@ -303,12 +343,24 @@ class CaptureToolService:
                         monitors = self.mss_capture.get_monitors()
                         monitor = monitors[monitor_index] if monitor_index < len(monitors) else None
                         if monitor:
-                            print(f"[CaptureService] Capturing monitor {monitor_index}: expected {monitor.width}x{monitor.height}", file=sys.stderr, flush=True)
+                            print(
+                                f"[CaptureService] Capturing monitor {monitor_index}: expected {monitor.width}x{monitor.height}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                         image = self.mss_capture.capture_screen(monitor_index)
-                        print(f"[CaptureService] Captured monitor {monitor_index}: actual {image.width}x{image.height}", file=sys.stderr, flush=True)
+                        print(
+                            f"[CaptureService] Captured monitor {monitor_index}: actual {image.width}x{image.height}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         images.append(image)
                     except Exception as e:
-                        print(f"Failed to capture monitor {monitor_index}: {e}", file=sys.stderr, flush=True)
+                        print(
+                            f"Failed to capture monitor {monitor_index}: {e}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
 
         return images
 
@@ -330,7 +382,7 @@ class CaptureToolService:
         filepath = output_dir / filename
 
         # Save image
-        image.save(filepath, format='PNG')
+        image.save(filepath, format="PNG")
 
         print(f"Screenshot saved: {filepath}", file=sys.stderr, flush=True)
 
@@ -359,10 +411,7 @@ class CaptureToolService:
         numbers = []
         for file in existing_files:
             # Match pattern: {base_name}_{number}.png
-            match = re.match(
-                rf"{re.escape(self.settings.base_image_name)}_(\d+)\.png",
-                file.name
-            )
+            match = re.match(rf"{re.escape(self.settings.base_image_name)}_(\d+)\.png", file.name)
             if match:
                 numbers.append(int(match.group(1)))
 
@@ -435,56 +484,99 @@ class ManualClickListener:
             self.capture_service._initialize_mss()
 
         if self.capture_service.mss_capture is None:
-            print(f"[ManualClickListener] Failed to initialize MSS capture", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener] Failed to initialize MSS capture",
+                file=sys.stderr,
+                flush=True,
+            )
             return []
 
         try:
             monitors = self.capture_service.mss_capture.get_monitors()
-            print(f"[ManualClickListener] Found {len(monitors)} monitors", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener] Found {len(monitors)} monitors", file=sys.stderr, flush=True
+            )
 
-            if settings.screens.type == 'all':
+            if settings.screens.type == "all":
                 # All monitors
                 print(f"[ManualClickListener] Screen selection: ALL", file=sys.stderr, flush=True)
                 for monitor in monitors:
-                    bounds.append({
-                        'x': monitor.x,
-                        'y': monitor.y,
-                        'width': monitor.width,
-                        'height': monitor.height
-                    })
-                    print(f"[ManualClickListener]   Monitor {monitor.index}: x={monitor.x}, y={monitor.y}, w={monitor.width}, h={monitor.height}, primary={monitor.is_primary}", file=sys.stderr, flush=True)
-            elif settings.screens.type == 'primary':
+                    bounds.append(
+                        {
+                            "x": monitor.x,
+                            "y": monitor.y,
+                            "width": monitor.width,
+                            "height": monitor.height,
+                        }
+                    )
+                    print(
+                        f"[ManualClickListener]   Monitor {monitor.index}: x={monitor.x}, y={monitor.y}, w={monitor.width}, h={monitor.height}, primary={monitor.is_primary}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            elif settings.screens.type == "primary":
                 # Primary monitor only
-                print(f"[ManualClickListener] Screen selection: PRIMARY", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] Screen selection: PRIMARY", file=sys.stderr, flush=True
+                )
                 for monitor in monitors:
-                    print(f"[ManualClickListener]   Checking monitor {monitor.index}: primary={monitor.is_primary}", file=sys.stderr, flush=True)
+                    print(
+                        f"[ManualClickListener]   Checking monitor {monitor.index}: primary={monitor.is_primary}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     if monitor.is_primary:
-                        bounds.append({
-                            'x': monitor.x,
-                            'y': monitor.y,
-                            'width': monitor.width,
-                            'height': monitor.height
-                        })
-                        print(f"[ManualClickListener]   Primary monitor found: x={monitor.x}, y={monitor.y}, w={monitor.width}, h={monitor.height}", file=sys.stderr, flush=True)
+                        bounds.append(
+                            {
+                                "x": monitor.x,
+                                "y": monitor.y,
+                                "width": monitor.width,
+                                "height": monitor.height,
+                            }
+                        )
+                        print(
+                            f"[ManualClickListener]   Primary monitor found: x={monitor.x}, y={monitor.y}, w={monitor.width}, h={monitor.height}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                         break
-            elif settings.screens.type == 'specific' and settings.screens.indices:
+            elif settings.screens.type == "specific" and settings.screens.indices:
                 # Specific monitors
-                print(f"[ManualClickListener] Screen selection: SPECIFIC {settings.screens.indices}", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] Screen selection: SPECIFIC {settings.screens.indices}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 for monitor in monitors:
                     if monitor.index in settings.screens.indices:
-                        bounds.append({
-                            'x': monitor.x,
-                            'y': monitor.y,
-                            'width': monitor.width,
-                            'height': monitor.height
-                        })
-                        print(f"[ManualClickListener]   Monitor {monitor.index}: x={monitor.x}, y={monitor.y}, w={monitor.width}, h={monitor.height}", file=sys.stderr, flush=True)
+                        bounds.append(
+                            {
+                                "x": monitor.x,
+                                "y": monitor.y,
+                                "width": monitor.width,
+                                "height": monitor.height,
+                            }
+                        )
+                        print(
+                            f"[ManualClickListener]   Monitor {monitor.index}: x={monitor.x}, y={monitor.y}, w={monitor.width}, h={monitor.height}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
         except Exception as e:
-            print(f"[ManualClickListener] Error getting screen bounds: {e}", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener] Error getting screen bounds: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
             import traceback
+
             traceback.print_exc()
 
-        print(f"[ManualClickListener] Total screen bounds configured: {len(bounds)}", file=sys.stderr, flush=True)
+        print(
+            f"[ManualClickListener] Total screen bounds configured: {len(bounds)}",
+            file=sys.stderr,
+            flush=True,
+        )
         return bounds
 
     def _is_click_in_bounds(self, x: int, y: int) -> bool:
@@ -505,8 +597,10 @@ class ManualClickListener:
 
         for screen in bounds:
             # Check if click is within this screen's bounds
-            if (screen['x'] <= x < screen['x'] + screen['width'] and
-                screen['y'] <= y < screen['y'] + screen['height']):
+            if (
+                screen["x"] <= x < screen["x"] + screen["width"]
+                and screen["y"] <= y < screen["y"] + screen["height"]
+            ):
                 return True
 
         return False
@@ -527,30 +621,53 @@ class ManualClickListener:
         # Only capture left clicks by default
         try:
             from pynput.mouse import Button
+
             if button != Button.left:
-                print(f"[ManualClickListener] Non-left button click ignored at ({x}, {y})", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] Non-left button click ignored at ({x}, {y})",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return
         except Exception:
             # If we can't check button type, proceed anyway
             pass
 
-        print(f"[ManualClickListener] Left click detected at ({x}, {y})", file=sys.stderr, flush=True)
+        print(
+            f"[ManualClickListener] Left click detected at ({x}, {y})", file=sys.stderr, flush=True
+        )
 
         # Check if capture is enabled
         if not self.capture_service.is_enabled():
-            print(f"[ManualClickListener] Capture service not enabled, ignoring click", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener] Capture service not enabled, ignoring click",
+                file=sys.stderr,
+                flush=True,
+            )
             return
 
         # Check if click is within configured screen bounds
         bounds = self._get_screen_bounds()
-        print(f"[ManualClickListener] Checking click against {len(bounds)} screen bounds", file=sys.stderr, flush=True)
+        print(
+            f"[ManualClickListener] Checking click against {len(bounds)} screen bounds",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if not self._is_click_in_bounds(x, y):
-            print(f"[ManualClickListener] Click at ({x}, {y}) is outside configured screen bounds, ignoring", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener] Click at ({x}, {y}) is outside configured screen bounds, ignoring",
+                file=sys.stderr,
+                flush=True,
+            )
             return
 
         # Trigger screenshot capture
-        print(f"[ManualClickListener] Click at ({x}, {y}) is within bounds, capturing screenshot...", file=sys.stderr, flush=True)
+        print(
+            f"[ManualClickListener] Click at ({x}, {y}) is within bounds, capturing screenshot...",
+            file=sys.stderr,
+            flush=True,
+        )
         self.capture_service.on_click(x, y, "left")
 
     def start(self) -> bool:
@@ -559,7 +676,11 @@ class ManualClickListener:
         Returns:
             True if started successfully, False otherwise
         """
-        print(f"[ManualClickListener] ========== start() called ==========", file=sys.stderr, flush=True)
+        print(
+            f"[ManualClickListener] ========== start() called ==========",
+            file=sys.stderr,
+            flush=True,
+        )
 
         # CRITICAL: Set DPI awareness before starting mouse listener
         # This ensures pynput receives correct coordinates on high-DPI monitors
@@ -568,11 +689,24 @@ class ManualClickListener:
         # First check if pynput is available
         try:
             import pynput
-            print(f"[ManualClickListener] pynput is installed (version: {pynput.__version__ if hasattr(pynput, '__version__') else 'unknown'})", file=sys.stderr, flush=True)
+
+            print(
+                f"[ManualClickListener] pynput is installed (version: {pynput.__version__ if hasattr(pynput, '__version__') else 'unknown'})",
+                file=sys.stderr,
+                flush=True,
+            )
         except ImportError as e:
-            print(f"[ManualClickListener] ERROR: pynput is NOT installed!", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener] ERROR: pynput is NOT installed!",
+                file=sys.stderr,
+                flush=True,
+            )
             print(f"[ManualClickListener]   ImportError: {e}", file=sys.stderr, flush=True)
-            print(f"[ManualClickListener]   Install it with: pip install pynput", file=sys.stderr, flush=True)
+            print(
+                f"[ManualClickListener]   Install it with: pip install pynput",
+                file=sys.stderr,
+                flush=True,
+            )
             return False
 
         with self._lock:
@@ -581,33 +715,76 @@ class ManualClickListener:
                 return False
 
             if not self.capture_service.is_enabled():
-                print("[ManualClickListener] Cannot start: capture service not enabled", file=sys.stderr, flush=True)
-                print(f"[ManualClickListener]   settings: {self.capture_service.settings}", file=sys.stderr, flush=True)
+                print(
+                    "[ManualClickListener] Cannot start: capture service not enabled",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[ManualClickListener]   settings: {self.capture_service.settings}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return False
 
             try:
                 from pynput import mouse
 
                 # Create and start listener
-                print(f"[ManualClickListener] Creating mouse.Listener...", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] Creating mouse.Listener...", file=sys.stderr, flush=True
+                )
                 self._listener = mouse.Listener(on_click=self._on_click)
-                print(f"[ManualClickListener] Calling listener.start()...", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] Calling listener.start()...",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self._listener.start()
                 self._is_running = True
 
-                print("[ManualClickListener] ✓✓✓ Started successfully and listening for clicks ✓✓✓", file=sys.stderr, flush=True)
-                print(f"[ManualClickListener]   Capture settings: enabled={self.capture_service.settings.enabled}", file=sys.stderr, flush=True)
-                print(f"[ManualClickListener]   Screen selection: {self.capture_service.settings.screens.to_dict()}", file=sys.stderr, flush=True)
-                print(f"[ManualClickListener]   Output folder: {self.capture_service.settings.output_folder}", file=sys.stderr, flush=True)
-                print(f"[ManualClickListener] ===============================================", file=sys.stderr, flush=True)
+                print(
+                    "[ManualClickListener] ✓✓✓ Started successfully and listening for clicks ✓✓✓",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[ManualClickListener]   Capture settings: enabled={self.capture_service.settings.enabled}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[ManualClickListener]   Screen selection: {self.capture_service.settings.screens.to_dict()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[ManualClickListener]   Output folder: {self.capture_service.settings.output_folder}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                print(
+                    f"[ManualClickListener] ===============================================",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return True
 
             except ImportError as e:
-                print(f"[ManualClickListener] ERROR: Failed to import pynput.mouse: {e}", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] ERROR: Failed to import pynput.mouse: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return False
             except Exception as e:
-                print(f"[ManualClickListener] ERROR: Failed to start: {e}", file=sys.stderr, flush=True)
+                print(
+                    f"[ManualClickListener] ERROR: Failed to start: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 import traceback
+
                 traceback.print_exc()
                 return False
 

@@ -9,7 +9,7 @@ use std::process::Child;
 use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 // Re-export protocol types for backward compatibility
 pub use super::protocol::{ExecutorEvent, ExecutorResponse};
@@ -373,16 +373,26 @@ impl PythonBridge {
     }
 
     pub fn is_running(&self) -> bool {
-        self.runtime.block_on(async {
+        debug!("[PYTHON_BRIDGE] is_running() called");
+        let result = self.runtime.block_on(async {
+            debug!("[PYTHON_BRIDGE] is_running() - getting lifecycle read lock");
             let state = self.lifecycle.read().await.get_state().await;
-            state.can_accept_commands()
-        })
+            debug!("[PYTHON_BRIDGE] is_running() - got state: {}", state.name());
+            let can_accept = state.can_accept_commands();
+            debug!("[PYTHON_BRIDGE] is_running() - can_accept_commands: {}", can_accept);
+            can_accept
+        });
+        debug!("[PYTHON_BRIDGE] is_running() returning: {}", result);
+        result
     }
 
     #[allow(dead_code)]
     pub fn get_state(&self) -> ExecutorState {
-        self.runtime
-            .block_on(async { self.lifecycle.read().await.get_state().await })
+        debug!("[PYTHON_BRIDGE] get_state() called");
+        let state = self.runtime
+            .block_on(async { self.lifecycle.read().await.get_state().await });
+        debug!("[PYTHON_BRIDGE] get_state() returning: {}", state.name());
+        state
     }
 }
 

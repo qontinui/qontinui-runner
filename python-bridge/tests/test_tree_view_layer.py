@@ -28,7 +28,7 @@ class TestTreeNodeSerialization:
             type="action",
             label="Click Button",
             data={"status": "success"},
-            metadata={"workflow_id": "workflow-001"}
+            metadata={"workflow_id": "workflow-001"},
         )
 
         node_dict = node.to_dict()
@@ -42,17 +42,10 @@ class TestTreeNodeSerialization:
 
     def test_to_dict_with_children(self):
         """Test TreeNode serialization with nested children."""
-        child = TreeNode(
-            id="child-001",
-            type="action",
-            label="Child Action"
-        )
+        child = TreeNode(id="child-001", type="action", label="Child Action")
 
         parent = TreeNode(
-            id="parent-001",
-            type="workflow",
-            label="Parent Workflow",
-            children=[child]
+            id="parent-001", type="workflow", label="Parent Workflow", children=[child]
         )
 
         parent_dict = parent.to_dict()
@@ -84,9 +77,7 @@ class TestExecutionTreeView:
     def test_execution_tree_view_single_action(self, action_record_builder):
         """Test execution_tree_view with single action."""
         record = action_record_builder(
-            action_id="action-001",
-            action_type="CLICK",
-            workflow_id="workflow-001"
+            action_id="action-001", action_type="CLICK", workflow_id="workflow-001"
         )
 
         result = TreeViewLayer.execution_tree_view([record])
@@ -101,9 +92,7 @@ class TestExecutionTreeView:
     def test_execution_tree_view_parent_child_relationship(self, action_record_builder):
         """Test execution_tree_view builds parent-child hierarchy."""
         parent = action_record_builder(
-            action_id="parent-001",
-            action_type="COMPLEX",
-            workflow_id="workflow-001"
+            action_id="parent-001", action_type="COMPLEX", workflow_id="workflow-001"
         )
 
         child = action_record_builder(
@@ -111,7 +100,7 @@ class TestExecutionTreeView:
             action_type="CLICK",
             parent_action_id="parent-001",
             workflow_id="workflow-001",
-            nesting_level=1
+            nesting_level=1,
         )
 
         result = TreeViewLayer.execution_tree_view([parent, child])
@@ -124,15 +113,9 @@ class TestExecutionTreeView:
 
     def test_execution_tree_view_multiple_workflows(self, action_record_builder):
         """Test execution_tree_view with multiple workflows."""
-        action1 = action_record_builder(
-            action_id="action-001",
-            workflow_id="workflow-A"
-        )
+        action1 = action_record_builder(action_id="action-001", workflow_id="workflow-A")
 
-        action2 = action_record_builder(
-            action_id="action-002",
-            workflow_id="workflow-B"
-        )
+        action2 = action_record_builder(action_id="action-002", workflow_id="workflow-B")
 
         result = TreeViewLayer.execution_tree_view([action1, action2])
 
@@ -149,7 +132,7 @@ class TestExecutionTreeView:
             workflow_id="workflow-001",
             nesting_level=2,
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Dashboard"])
+            active_states_after=frozenset(["Dashboard"]),
         )
 
         result = TreeViewLayer.execution_tree_view([record])
@@ -171,15 +154,10 @@ class TestActionOnlyTreeView:
 
     def test_action_only_tree_view_flattens_hierarchy(self, action_record_builder):
         """Test that action_only_tree_view creates flat list."""
-        parent = action_record_builder(
-            action_id="parent-001",
-            start_time=100.0
-        )
+        parent = action_record_builder(action_id="parent-001", start_time=100.0)
 
         child = action_record_builder(
-            action_id="child-001",
-            parent_action_id="parent-001",
-            start_time=101.0
+            action_id="child-001", parent_action_id="parent-001", start_time=101.0
         )
 
         result = TreeViewLayer.action_only_tree_view([parent, child])
@@ -207,10 +185,7 @@ class TestActionOnlyTreeView:
 
     def test_action_only_tree_view_includes_parent_id(self, action_record_builder):
         """Test that metadata includes parent_action_id."""
-        child = action_record_builder(
-            action_id="child-001",
-            parent_action_id="parent-001"
-        )
+        child = action_record_builder(action_id="child-001", parent_action_id="parent-001")
 
         result = TreeViewLayer.action_only_tree_view([child])
 
@@ -231,7 +206,7 @@ class TestStateTransitionTreeView:
         record = action_record_builder(
             action_id="action-001",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login", "Dashboard"])
+            active_states_after=frozenset(["Login", "Dashboard"]),
         )
 
         result = TreeViewLayer.state_transition_tree_view([record])
@@ -251,7 +226,7 @@ class TestStateTransitionTreeView:
         record = action_record_builder(
             action_id="action-001",
             active_states_before=frozenset(["Login", "Form"]),
-            active_states_after=frozenset(["Login"])
+            active_states_after=frozenset(["Login"]),
         )
 
         result = TreeViewLayer.state_transition_tree_view([record])
@@ -270,7 +245,7 @@ class TestStateTransitionTreeView:
         record = action_record_builder(
             action_id="action-001",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login"])
+            active_states_after=frozenset(["Login"]),
         )
 
         result = TreeViewLayer.state_transition_tree_view([record])
@@ -286,22 +261,19 @@ class TestStateTransitionTreeView:
         record1 = action_record_builder(
             action_id="action-001",
             active_states_before=frozenset(),
-            active_states_after=frozenset(["Dashboard"])
+            active_states_after=frozenset(["Dashboard"]),
         )
 
         record2 = action_record_builder(
             action_id="action-002",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login", "Dashboard"])
+            active_states_after=frozenset(["Login", "Dashboard"]),
         )
 
         result = TreeViewLayer.state_transition_tree_view([record1, record2])
 
         entered_group = next(node for node in result if node.id == "state_entered")
-        dashboard_node = next(
-            node for node in entered_group.children
-            if "Dashboard" in node.label
-        )
+        dashboard_node = next(node for node in entered_group.children if "Dashboard" in node.label)
 
         # Both actions should be under Dashboard state
         assert len(dashboard_node.children) == 2
@@ -320,15 +292,9 @@ class TestTimelineTreeView:
         """Test that timeline view adds relative timestamps."""
         base_time = time.time()
 
-        record1 = action_record_builder(
-            action_id="action-001",
-            start_time=base_time
-        )
+        record1 = action_record_builder(action_id="action-001", start_time=base_time)
 
-        record2 = action_record_builder(
-            action_id="action-002",
-            start_time=base_time + 1.5
-        )
+        record2 = action_record_builder(action_id="action-002", start_time=base_time + 1.5)
 
         result = TreeViewLayer.timeline_tree_view([record1, record2])
 
@@ -343,9 +309,7 @@ class TestTimelineTreeView:
         base_time = time.time()
 
         record = action_record_builder(
-            action_id="action-001",
-            action_type="CLICK",
-            start_time=base_time
+            action_id="action-001", action_type="CLICK", start_time=base_time
         )
 
         result = TreeViewLayer.timeline_tree_view([record])
@@ -357,15 +321,10 @@ class TestTimelineTreeView:
         """Test that timeline view maintains parent-child relationships."""
         base_time = time.time()
 
-        parent = action_record_builder(
-            action_id="parent-001",
-            start_time=base_time
-        )
+        parent = action_record_builder(action_id="parent-001", start_time=base_time)
 
         child = action_record_builder(
-            action_id="child-001",
-            parent_action_id="parent-001",
-            start_time=base_time + 0.5
+            action_id="child-001", parent_action_id="parent-001", start_time=base_time + 0.5
         )
 
         result = TreeViewLayer.timeline_tree_view([parent, child])
@@ -389,18 +348,15 @@ class TestStateGroupedTreeView:
     def test_state_grouped_tree_view_groups_by_active_states(self, action_record_builder):
         """Test grouping by active state sets."""
         record1 = action_record_builder(
-            action_id="action-001",
-            active_states_after=frozenset(["Login", "MainMenu"])
+            action_id="action-001", active_states_after=frozenset(["Login", "MainMenu"])
         )
 
         record2 = action_record_builder(
-            action_id="action-002",
-            active_states_after=frozenset(["Login", "MainMenu"])
+            action_id="action-002", active_states_after=frozenset(["Login", "MainMenu"])
         )
 
         record3 = action_record_builder(
-            action_id="action-003",
-            active_states_after=frozenset(["Dashboard"])
+            action_id="action-003", active_states_after=frozenset(["Dashboard"])
         )
 
         result = TreeViewLayer.state_grouped_tree_view([record1, record2, record3])
@@ -416,10 +372,7 @@ class TestStateGroupedTreeView:
 
     def test_state_grouped_tree_view_empty_state_set(self, action_record_builder):
         """Test handling of empty active state set."""
-        record = action_record_builder(
-            action_id="action-001",
-            active_states_after=frozenset()
-        )
+        record = action_record_builder(action_id="action-001", active_states_after=frozenset())
 
         result = TreeViewLayer.state_grouped_tree_view([record])
 
@@ -430,16 +383,12 @@ class TestStateGroupedTreeView:
         """Test that state groups are sorted by first action timestamp."""
         # Group A: starts at 200
         action_a = action_record_builder(
-            action_id="action-a",
-            start_time=200.0,
-            active_states_after=frozenset(["StateA"])
+            action_id="action-a", start_time=200.0, active_states_after=frozenset(["StateA"])
         )
 
         # Group B: starts at 100
         action_b = action_record_builder(
-            action_id="action-b",
-            start_time=100.0,
-            active_states_after=frozenset(["StateB"])
+            action_id="action-b", start_time=100.0, active_states_after=frozenset(["StateB"])
         )
 
         result = TreeViewLayer.state_grouped_tree_view([action_a, action_b])
@@ -453,7 +402,7 @@ class TestStateGroupedTreeView:
         record = action_record_builder(
             action_id="action-001",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login", "Dashboard"])
+            active_states_after=frozenset(["Login", "Dashboard"]),
         )
 
         result = TreeViewLayer.state_grouped_tree_view([record])
@@ -469,11 +418,7 @@ class TestFormatActionLabel:
 
     def test_format_action_label_success(self, action_record_builder):
         """Test label formatting for successful action."""
-        record = action_record_builder(
-            action_type="CLICK",
-            success=True,
-            duration_ms=500.0
-        )
+        record = action_record_builder(action_type="CLICK", success=True, duration_ms=500.0)
 
         label = TreeViewLayer._format_action_label(record)
 
@@ -483,11 +428,7 @@ class TestFormatActionLabel:
 
     def test_format_action_label_failed(self, action_record_builder):
         """Test label formatting for failed action."""
-        record = action_record_builder(
-            action_type="FIND",
-            success=False,
-            end_time=time.time()
-        )
+        record = action_record_builder(action_type="FIND", success=False, end_time=time.time())
 
         label = TreeViewLayer._format_action_label(record)
 
@@ -496,10 +437,7 @@ class TestFormatActionLabel:
 
     def test_format_action_label_running(self, action_record_builder):
         """Test label formatting for running action."""
-        record = action_record_builder(
-            action_type="WAIT",
-            end_time=None
-        )
+        record = action_record_builder(action_type="WAIT", end_time=None)
 
         label = TreeViewLayer._format_action_label(record)
 
@@ -511,7 +449,7 @@ class TestFormatActionLabel:
         record = action_record_builder(
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Dashboard", "Settings"])
+            active_states_after=frozenset(["Dashboard", "Settings"]),
         )
 
         label = TreeViewLayer._format_action_label(record)
@@ -523,10 +461,7 @@ class TestFormatActionLabel:
 
     def test_format_action_label_no_duration(self, action_record_builder):
         """Test label formatting when duration is not available."""
-        record = action_record_builder(
-            action_type="CLICK",
-            duration_ms=None
-        )
+        record = action_record_builder(action_type="CLICK", duration_ms=None)
 
         label = TreeViewLayer._format_action_label(record)
 
@@ -537,7 +472,7 @@ class TestFormatActionLabel:
         record = action_record_builder(
             action_type="CLICK",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login"])
+            active_states_after=frozenset(["Login"]),
         )
 
         label = TreeViewLayer._format_action_label(record)
@@ -570,11 +505,7 @@ class TestFormatTimelineLabel:
 
     def test_format_timeline_label_includes_action_label(self, action_record_builder):
         """Test that timeline label includes full action label."""
-        record = action_record_builder(
-            action_type="FIND",
-            success=True,
-            duration_ms=500.0
-        )
+        record = action_record_builder(action_type="FIND", success=True, duration_ms=500.0)
 
         label = TreeViewLayer._format_timeline_label(record, 2.5)
 
@@ -591,7 +522,7 @@ class TestFormatStateChange:
         """Test state change formatting with actual changes."""
         record = action_record_builder(
             active_states_before=frozenset(["Login", "Form"]),
-            active_states_after=frozenset(["Dashboard", "Settings"])
+            active_states_after=frozenset(["Dashboard", "Settings"]),
         )
 
         state_change_str = TreeViewLayer._format_state_change(record)
@@ -605,8 +536,7 @@ class TestFormatStateChange:
     def test_format_state_change_no_changes(self, action_record_builder):
         """Test state change formatting with no changes."""
         record = action_record_builder(
-            active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login"])
+            active_states_before=frozenset(["Login"]), active_states_after=frozenset(["Login"])
         )
 
         state_change_str = TreeViewLayer._format_state_change(record)
@@ -616,8 +546,7 @@ class TestFormatStateChange:
     def test_format_state_change_only_entered(self, action_record_builder):
         """Test state change formatting with only entered states."""
         record = action_record_builder(
-            active_states_before=frozenset(),
-            active_states_after=frozenset(["Login"])
+            active_states_before=frozenset(), active_states_after=frozenset(["Login"])
         )
 
         state_change_str = TreeViewLayer._format_state_change(record)
@@ -629,8 +558,7 @@ class TestFormatStateChange:
     def test_format_state_change_only_exited(self, action_record_builder):
         """Test state change formatting with only exited states."""
         record = action_record_builder(
-            active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset()
+            active_states_before=frozenset(["Login"]), active_states_after=frozenset()
         )
 
         state_change_str = TreeViewLayer._format_state_change(record)
@@ -646,9 +574,7 @@ class TestComplexScenarios:
     def test_complex_workflow_hierarchy(self, action_record_builder):
         """Test complex workflow with multiple levels of nesting."""
         workflow_action = action_record_builder(
-            action_id="workflow-001",
-            action_type="WORKFLOW",
-            workflow_id="main-workflow"
+            action_id="workflow-001", action_type="WORKFLOW", workflow_id="main-workflow"
         )
 
         parent_action = action_record_builder(
@@ -656,7 +582,7 @@ class TestComplexScenarios:
             action_type="COMPLEX",
             parent_action_id="workflow-001",
             workflow_id="main-workflow",
-            nesting_level=1
+            nesting_level=1,
         )
 
         child1 = action_record_builder(
@@ -664,7 +590,7 @@ class TestComplexScenarios:
             action_type="CLICK",
             parent_action_id="parent-001",
             workflow_id="main-workflow",
-            nesting_level=2
+            nesting_level=2,
         )
 
         child2 = action_record_builder(
@@ -672,7 +598,7 @@ class TestComplexScenarios:
             action_type="TYPE",
             parent_action_id="parent-001",
             workflow_id="main-workflow",
-            nesting_level=2
+            nesting_level=2,
         )
 
         records = [workflow_action, parent_action, child1, child2]
@@ -693,15 +619,11 @@ class TestComplexScenarios:
         """Test that different views can process the same data."""
         records = [
             action_record_builder(
-                action_id="action-001",
-                start_time=100.0,
-                active_states_after=frozenset(["StateA"])
+                action_id="action-001", start_time=100.0, active_states_after=frozenset(["StateA"])
             ),
             action_record_builder(
-                action_id="action-002",
-                start_time=200.0,
-                active_states_after=frozenset(["StateB"])
-            )
+                action_id="action-002", start_time=200.0, active_states_after=frozenset(["StateB"])
+            ),
         ]
 
         # All views should handle the same data

@@ -28,6 +28,7 @@ try:
     from qontinui.json_executor.config_parser import ConfigParser
     from qontinui.json_executor.state_executor import StateExecutor
     from qontinui.config.schema import Workflow, WorkflowVisibility
+
     QONTINUI_AVAILABLE = True
 except ImportError:
     QONTINUI_AVAILABLE = False
@@ -77,10 +78,7 @@ class ExecutorCore:
         self.state_executor = None
 
         # Debug settings
-        self.debug_settings = {
-            'enable_image_debug': False,
-            'top_matches_count': 5
-        }
+        self.debug_settings = {"enable_image_debug": False, "top_matches_count": 5}
 
         # Initialize framework settings if available
         if QONTINUI_AVAILABLE:
@@ -133,6 +131,7 @@ class ExecutorCore:
 
             # Emit config loaded event
             from event_manager import EventType
+
             config_info = {
                 "path": config_path,
                 "version": self.config.get("version", "unknown"),
@@ -150,6 +149,7 @@ class ExecutorCore:
 
         except Exception as e:
             from event_manager import EventType
+
             self.emit_event(
                 EventType.ERROR,
                 {
@@ -182,7 +182,10 @@ class ExecutorCore:
                     self.emit_log("error", f"Image {img_id} failed to load - PIL image is empty")
                     self.emit_log("error", f"Check if base64 data is valid for image: {img_name}")
                 else:
-                    self.emit_log("debug", f"Loaded image: {img_id} -> {img_path} ({image_obj.width}x{image_obj.height})")
+                    self.emit_log(
+                        "debug",
+                        f"Loaded image: {img_id} -> {img_path} ({image_obj.width}x{image_obj.height})",
+                    )
 
                 self.images[img_id] = image_obj
                 # Register image in library's registry
@@ -221,14 +224,21 @@ class ExecutorCore:
                                 state_image_id,
                                 self.images[underlying_image_id],
                                 file_path=underlying_metadata.get("file_path"),
-                                name=underlying_metadata.get("name")
+                                name=underlying_metadata.get("name"),
                             )
                         else:
-                            registry.register_image(state_image_id, self.images[underlying_image_id])
+                            registry.register_image(
+                                state_image_id, self.images[underlying_image_id]
+                            )
 
-                        self.emit_log("debug", f"Mapped state image {state_image_id} -> {underlying_image_id}")
+                        self.emit_log(
+                            "debug", f"Mapped state image {state_image_id} -> {underlying_image_id}"
+                        )
                     else:
-                        self.emit_log("warning", f"State image {state_image_id} references missing image {underlying_image_id}")
+                        self.emit_log(
+                            "warning",
+                            f"State image {state_image_id} references missing image {underlying_image_id}",
+                        )
                 else:
                     self.emit_log("warning", f"State image {state_image_id} has no patterns")
 
@@ -257,14 +267,19 @@ class ExecutorCore:
                 self.emit_log("info", "Real execution mode enabled")
 
         except Exception as e:
-            self.emit_log("warning", f"Failed to initialize execution mode: {e}. Defaulting to REAL mode.")
+            self.emit_log(
+                "warning", f"Failed to initialize execution mode: {e}. Defaulting to REAL mode."
+            )
             self.mock_mode = "real"
             disable_mock_mode()
 
         # Check for graph execution setting
         self.use_graph_execution = False
         if execution_settings.get("useGraphExecution", False):
-            self.emit_log("warning", "Graph execution requested but not available. Using sequential execution.")
+            self.emit_log(
+                "warning",
+                "Graph execution requested but not available. Using sequential execution.",
+            )
 
     def _process_workflows(self):
         """Process workflows and register in library."""
@@ -275,10 +290,7 @@ class ExecutorCore:
             actions = workflow.get("actions", [])
 
             # Store both actions and name
-            self.workflows[workflow_id] = {
-                "actions": actions,
-                "name": workflow_name
-            }
+            self.workflows[workflow_id] = {"actions": actions, "name": workflow_name}
 
             # Register workflow in library's registry
             registry.register_workflow(workflow_id, actions, workflow_name)
@@ -291,7 +303,9 @@ class ExecutorCore:
             if success:
                 self.emit_log("info", "Navigation system initialized with states and transitions")
             else:
-                self.emit_log("error", "Failed to initialize navigation system - check configuration")
+                self.emit_log(
+                    "error", "Failed to initialize navigation system - check configuration"
+                )
 
         except Exception as e:
             self.emit_log("warning", f"Failed to initialize navigation: {e}")
@@ -303,7 +317,10 @@ class ExecutorCore:
             # Parse JSON config into QontinuiConfig object
             config_parser = ConfigParser()
             self.qontinui_config = config_parser.parse_config(self.config)
-            self.emit_log("info", f"Parsed config: {len(self.qontinui_config.workflows)} workflows, {len(self.qontinui_config.states)} states")
+            self.emit_log(
+                "info",
+                f"Parsed config: {len(self.qontinui_config.workflows)} workflows, {len(self.qontinui_config.states)} states",
+            )
 
             # Sync inline workflows from registry to workflow_map
             self._sync_inline_workflows()
@@ -338,7 +355,7 @@ class ExecutorCore:
                 # This is an inline workflow
                 workflow_def = registry.get_workflow_definition(workflow_id)
                 if workflow_def:
-                    workflow_def['visibility'] = WorkflowVisibility.INTERNAL.value
+                    workflow_def["visibility"] = WorkflowVisibility.INTERNAL.value
                     try:
                         workflow_obj = Workflow(**workflow_def)
                         self.qontinui_config.workflow_map[workflow_id] = workflow_obj
@@ -366,9 +383,10 @@ class ExecutorCore:
         if QONTINUI_AVAILABLE and self.action_executor:
             try:
                 from qontinui.config.framework_settings import FrameworkSettings
+
                 fw_settings = FrameworkSettings.get_instance()
 
-                enable_debug = settings.get('enable_image_debug', False)
+                enable_debug = settings.get("enable_image_debug", False)
                 fw_settings.image_debug.emit_match_details = enable_debug
 
                 self.emit_log("info", f"Applied debug settings: emit_match_details={enable_debug}")
@@ -383,6 +401,7 @@ class ExecutorCore:
         """Clean up temporary resources."""
         if self.temp_dir and os.path.exists(self.temp_dir):
             import shutil
+
             try:
                 shutil.rmtree(self.temp_dir)
                 self.emit_log("debug", f"Cleaned up temp directory: {self.temp_dir}")

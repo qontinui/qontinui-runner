@@ -21,6 +21,7 @@ def verify_class_exists():
     """Verify RunnerOrchestrator class exists."""
     try:
         from qontinui_executor import RunnerOrchestrator
+
         print("✓ RunnerOrchestrator class exists")
         return True, RunnerOrchestrator
     except ImportError as e:
@@ -31,15 +32,15 @@ def verify_class_exists():
 def verify_methods(cls):
     """Verify all required methods exist."""
     required_methods = [
-        '__init__',
-        '_load_config',
-        '_initialize_hal',
-        'execute_transition',
-        'navigate_to_state',
-        'navigate_to_multiple_states',
-        'get_active_states',
-        'get_available_transitions',
-        '_emit_to_tauri',
+        "__init__",
+        "_load_config",
+        "_initialize_hal",
+        "execute_transition",
+        "navigate_to_state",
+        "navigate_to_multiple_states",
+        "get_active_states",
+        "get_available_transitions",
+        "_emit_to_tauri",
     ]
 
     missing = []
@@ -58,11 +59,11 @@ def verify_methods(cls):
 def verify_type_hints(cls):
     """Verify methods have type hints."""
     methods_to_check = [
-        'execute_transition',
-        'navigate_to_state',
-        'navigate_to_multiple_states',
-        'get_active_states',
-        'get_available_transitions',
+        "execute_transition",
+        "navigate_to_state",
+        "navigate_to_multiple_states",
+        "get_active_states",
+        "get_available_transitions",
     ]
 
     issues = []
@@ -76,7 +77,7 @@ def verify_type_hints(cls):
 
         # Check parameter annotations
         for param_name, param in sig.parameters.items():
-            if param_name == 'self':
+            if param_name == "self":
                 continue
             if param.annotation == inspect.Parameter.empty:
                 issues.append(f"{method_name} parameter '{param_name}' missing type hint")
@@ -103,6 +104,7 @@ def verify_command_bindings():
             get_active_states,
             get_available_transitions,
         )
+
         print("✓ All command binding functions exist")
         return True
     except ImportError as e:
@@ -112,7 +114,7 @@ def verify_command_bindings():
 
 def verify_docstrings(cls):
     """Verify all public methods have docstrings."""
-    public_methods = [name for name in dir(cls) if not name.startswith('_') or name == '__init__']
+    public_methods = [name for name in dir(cls) if not name.startswith("_") or name == "__init__"]
     missing_docs = []
 
     for method_name in public_methods:

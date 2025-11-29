@@ -128,7 +128,7 @@ def sample_action_record():
         workflow_id="test-workflow",
         nesting_level=0,
         screenshot_reference="screenshots/screenshot-0001.png",
-        metadata={"test": "data"}
+        metadata={"test": "data"},
     )
 
 
@@ -156,12 +156,12 @@ def sample_failed_action_record():
             "confidence": 0.45,
             "threshold": 0.8,
             "found": False,
-            "location": None
+            "location": None,
         },
         parent_action_id=None,
         workflow_id="test-workflow",
         nesting_level=0,
-        metadata={}
+        metadata={},
     )
 
 
@@ -185,7 +185,7 @@ def sample_running_action_record():
         parent_action_id=None,
         workflow_id="test-workflow",
         nesting_level=0,
-        metadata={}
+        metadata={},
     )
 
 
@@ -233,7 +233,7 @@ def create_action_record(**kwargs: Any) -> ActionExecutionRecord:
         "nesting_level": 0,
         "screenshot_reference": None,
         "visual_debug_reference": None,
-        "metadata": {}
+        "metadata": {},
     }
 
     # Merge kwargs with defaults
@@ -276,7 +276,7 @@ def sample_png_bytes():
     """
     # Minimal valid PNG file (1x1 pixel, transparent)
     return (
-        b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
-        b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01'
-        b'\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
     )

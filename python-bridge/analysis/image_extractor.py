@@ -26,8 +26,7 @@ from models import DetectedState, Frame, InputEvent, StateImage
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s'
+    level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -126,13 +125,14 @@ class StateImageExtractor:
                             extracted_images.append(state_image)
                             logger.debug(
                                 "Extracted image at click location (%d, %d) from frame %d",
-                                click_x, click_y, frame.frame_index
+                                click_x,
+                                click_y,
+                                frame.frame_index,
                             )
                             break  # Only extract from first frame
                     except Exception as e:
                         logger.error(
-                            "Error extracting at location (%d, %d): %s",
-                            click_x, click_y, e
+                            "Error extracting at location (%d, %d): %s", click_x, click_y, e
                         )
 
         # Step 4: Detect additional UI elements via contour analysis
@@ -145,10 +145,7 @@ class StateImageExtractor:
                     click_locations,
                 )
                 extracted_images.extend(contour_images)
-                logger.debug(
-                    "Extracted %d images from contour analysis",
-                    len(contour_images)
-                )
+                logger.debug("Extracted %d images from contour analysis", len(contour_images))
             except Exception as e:
                 logger.error("Error in contour analysis: %s", e)
 
@@ -161,16 +158,15 @@ class StateImageExtractor:
                 state_image.metadata["occurrences_count"] = len(occurrences)
                 logger.debug(
                     "Image %s classified as %s position (found in %d frames)",
-                    state_image.name, state_image.position_type, len(occurrences)
+                    state_image.name,
+                    state_image.position_type,
+                    len(occurrences),
                 )
             except Exception as e:
                 logger.error("Error determining position type for %s: %s", state_image.name, e)
                 state_image.position_type = "unknown"
 
-        logger.info(
-            "Extracted %d total images from state %s",
-            len(extracted_images), state.name
-        )
+        logger.info("Extracted %d total images from state %s", len(extracted_images), state.name)
         return extracted_images
 
     def extract_at_location(
@@ -299,8 +295,12 @@ class StateImageExtractor:
                 x, y, w, h = cv2.boundingRect(contour)
 
                 # Filter by size
-                if (w < self.config.min_size[0] or h < self.config.min_size[1] or
-                    w > self.config.max_size[0] or h > self.config.max_size[1]):
+                if (
+                    w < self.config.min_size[0]
+                    or h < self.config.min_size[1]
+                    or w > self.config.max_size[0]
+                    or h > self.config.max_size[1]
+                ):
                     continue
 
                 bboxes.append((x, y, w, h))
@@ -348,7 +348,10 @@ class StateImageExtractor:
 
         logger.debug(
             "Position analysis for %s: %d occurrences, max distance: %.2f, fixed: %s",
-            image.name, len(occurrences), max_distance, is_fixed
+            image.name,
+            len(occurrences),
+            max_distance,
+            is_fixed,
         )
 
         return is_fixed
@@ -374,7 +377,7 @@ class StateImageExtractor:
             x, y, w, h = region
 
             # Extract region
-            roi = frame[y:y+h, x:x+w]
+            roi = frame[y : y + h, x : x + w]
 
             # Convert to grayscale
             gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -406,15 +409,15 @@ class StateImageExtractor:
                 rh = min(h - ry, rh + 2 * padding)
 
                 # Extract refined region
-                refined = roi[ry:ry+rh, rx:rx+rw].copy()
+                refined = roi[ry : ry + rh, rx : rx + rw].copy()
 
                 # Create StateImage with refined boundaries
                 state_image = StateImage(
                     name=f"refined_{x+rx}_{y+ry}",
                     image=refined,
-                    bbox=(x+rx, y+ry, rw, rh),
+                    bbox=(x + rx, y + ry, rw, rh),
                     position_type="unknown",
-                    position=(x+rx, y+ry),
+                    position=(x + rx, y + ry),
                     similarity_threshold=self.config.similarity_threshold,
                     context_image=roi.copy(),
                     source_frame_index=None,
@@ -450,7 +453,7 @@ class StateImageExtractor:
             logger.error("Error finding best crop for region %s: %s", region, e)
             # Return original region as fallback
             x, y, w, h = region
-            roi = frame[y:y+h, x:x+w].copy()
+            roi = frame[y : y + h, x : x + w].copy()
             return StateImage(
                 name=f"fallback_{x}_{y}",
                 image=roi,
@@ -489,7 +492,8 @@ class StateImageExtractor:
         else:
             # Use start/end range
             return [
-                f for f in frames
+                f
+                for f in frames
                 if state.start_frame_index <= f.frame_index <= state.end_frame_index
             ]
 
@@ -553,7 +557,7 @@ class StateImageExtractor:
                 # Check if too close to any click location
                 too_close = False
                 for click_x, click_y in exclude_locations:
-                    distance = np.sqrt((center_x - click_x)**2 + (center_y - click_y)**2)
+                    distance = np.sqrt((center_x - click_x) ** 2 + (center_y - click_y) ** 2)
                     if distance < self.config.click_region_padding * 2:
                         too_close = True
                         break
@@ -562,7 +566,7 @@ class StateImageExtractor:
                     filtered_bboxes.append(bbox)
 
             # Extract images from filtered bboxes
-            for i, bbox in enumerate(filtered_bboxes[:self.config.max_contours]):
+            for i, bbox in enumerate(filtered_bboxes[: self.config.max_contours]):
                 x, y, w, h = bbox
 
                 try:
@@ -690,7 +694,7 @@ def load_state_image(file_path: Path, metadata_path: Optional[Path] = None) -> S
     # Load metadata if available
     metadata = {}
     if metadata_path and metadata_path.exists():
-        with open(metadata_path, 'r') as f:
+        with open(metadata_path, "r") as f:
             metadata = json.load(f)
 
     # Extract bbox from image dimensions

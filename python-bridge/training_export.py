@@ -20,6 +20,7 @@ try:
     from services.training_export_service import TrainingExportService, ExportConfig
     from services.screenshot_service import ScreenshotService
     from services.unified_data_collector import UnifiedDataCollector
+
     EXPORT_AVAILABLE = True
 except ImportError:
     EXPORT_AVAILABLE = False
@@ -66,13 +67,17 @@ class TrainingExportCoordinator:
         self.export_enabled = export_enabled_str == "true"
 
         if not self.export_enabled:
-            self.emit_log("info", "TrainingExportService disabled (QONTINUI_EXPORT_TRAINING_DATA not set)")
+            self.emit_log(
+                "info", "TrainingExportService disabled (QONTINUI_EXPORT_TRAINING_DATA not set)"
+            )
             return False
 
         # Get export directory from environment
         export_dir = os.getenv("QONTINUI_EXPORT_DIR")
         if not export_dir:
-            self.emit_log("warning", "TrainingExportService enabled but QONTINUI_EXPORT_DIR not set")
+            self.emit_log(
+                "warning", "TrainingExportService enabled but QONTINUI_EXPORT_DIR not set"
+            )
             return False
 
         try:
@@ -82,13 +87,10 @@ class TrainingExportCoordinator:
                 dataset_version="1.0.0",
                 export_mode="on_completion",  # Export when run completes
                 filter_successful_only=False,  # Include all records
-                filter_with_matches=False  # Include records without matches
+                filter_with_matches=False,  # Include records without matches
             )
 
-            self.export_service = TrainingExportService(
-                config=export_config,
-                storage_dir=run_dir
-            )
+            self.export_service = TrainingExportService(config=export_config, storage_dir=run_dir)
 
             self.emit_log("info", f"TrainingExportService enabled: {export_dir}")
             return True
@@ -96,6 +98,7 @@ class TrainingExportCoordinator:
         except Exception as e:
             self.emit_log("error", f"Failed to initialize training export: {e}")
             import traceback
+
             self.emit_log("debug", f"Traceback: {traceback.format_exc()}")
             return False
 

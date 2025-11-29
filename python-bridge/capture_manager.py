@@ -14,8 +14,13 @@ from typing import Any, Callable, Dict
 logger = logging.getLogger(__name__)
 
 try:
-    from services.capture_tool_service import CaptureToolService, ScreenshotCaptureSettings, ManualClickListener
+    from services.capture_tool_service import (
+        CaptureToolService,
+        ScreenshotCaptureSettings,
+        ManualClickListener,
+    )
     from qontinui.reporting import register_callback, EventType as QontinuiEventType
+
     CAPTURE_AVAILABLE = True
 except ImportError:
     CAPTURE_AVAILABLE = False
@@ -33,7 +38,9 @@ class CaptureManager:
     - Handle mouse click events
     """
 
-    def __init__(self, emit_log_fn: Callable[[str, str], None], emit_event_fn: Callable[[Any, Dict], None]):
+    def __init__(
+        self, emit_log_fn: Callable[[str, str], None], emit_event_fn: Callable[[Any, Dict], None]
+    ):
         """
         Initialize capture manager.
 
@@ -48,7 +55,9 @@ class CaptureManager:
 
         if CAPTURE_AVAILABLE:
             # Screenshot capture tool for configuration builder (qontinui-web)
-            self.capture_tool_service = CaptureToolService()  # Initially disabled, enabled via update_settings
+            self.capture_tool_service = (
+                CaptureToolService()
+            )  # Initially disabled, enabled via update_settings
 
             # Manual click listener for capture tool (captures user clicks, not automation clicks)
             self.manual_click_listener = ManualClickListener(self.capture_tool_service)
@@ -65,8 +74,8 @@ class CaptureManager:
         Args:
             event: Mouse clicked event from qontinui library
         """
-        if self.capture_tool_service and hasattr(event, 'x') and hasattr(event, 'y'):
-            button = getattr(event, 'button', 'left')
+        if self.capture_tool_service and hasattr(event, "x") and hasattr(event, "y"):
+            button = getattr(event, "button", "left")
             self.capture_tool_service.on_click(event.x, event.y, button)
 
     def update_settings(self, settings_dict: Dict[str, Any]) -> Dict[str, Any]:
@@ -90,11 +99,17 @@ class CaptureManager:
         if not CAPTURE_AVAILABLE:
             return {"success": False, "error": "Capture tools not available"}
 
-        self.emit_log("info", f"update_capture_settings called: enabled={settings_dict.get('enabled')}, manualClicksEnabled={settings_dict.get('manualClicksEnabled')}")
+        self.emit_log(
+            "info",
+            f"update_capture_settings called: enabled={settings_dict.get('enabled')}, manualClicksEnabled={settings_dict.get('manualClicksEnabled')}",
+        )
 
         try:
             settings = ScreenshotCaptureSettings.from_dict(settings_dict)
-            self.emit_log("info", f"Parsed settings: enabled={settings.enabled}, manual_clicks_enabled={settings.manual_clicks_enabled}")
+            self.emit_log(
+                "info",
+                f"Parsed settings: enabled={settings.enabled}, manual_clicks_enabled={settings.manual_clicks_enabled}",
+            )
             self.emit_log("info", f"Output folder: {settings.output_folder}")
 
             self.capture_tool_service.update_settings(settings)
@@ -124,16 +139,21 @@ class CaptureManager:
 
             # Emit event with manual capture status for frontend
             from event_manager import EventType
-            self.emit_event(EventType.LOG, {
-                "level": "info",
-                "message": "capture_status_update",
-                "manual_capture_running": is_running
-            })
+
+            self.emit_event(
+                EventType.LOG,
+                {
+                    "level": "info",
+                    "message": "capture_status_update",
+                    "manual_capture_running": is_running,
+                },
+            )
 
             return {"success": True, "manual_capture_running": is_running}
         except Exception as e:
             self.emit_log("error", f"update_capture_settings failed: {e}")
             import traceback
+
             self.emit_log("error", f"Traceback: {traceback.format_exc()}")
             return {"success": False, "error": str(e)}
 

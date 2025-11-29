@@ -80,7 +80,9 @@ class RunnerWebSocketClient:
             on_error: Callback for errors
         """
         if websockets is None:
-            raise ImportError("websockets library not installed. Install with: pip install websockets")
+            raise ImportError(
+                "websockets library not installed. Install with: pip install websockets"
+            )
 
         self.api_url = api_url
         self.token = token
@@ -312,13 +314,16 @@ class RunnerWebSocketClient:
         Returns:
             True if info sent successfully, False otherwise
         """
+        # Message format must match WSMessage schema: {type, data}
         message = {
             "type": "runner_info",
-            "runner_name": self.runner_name,
-            "runner_version": self.runner_version,
-            "runner_os": self.runner_os,
-            "runner_hostname": self.runner_hostname,
-            "timestamp": self._get_timestamp(),
+            "data": {
+                "runner_name": self.runner_name,
+                "runner_version": self.runner_version,
+                "runner_os": self.runner_os,
+                "runner_hostname": self.runner_hostname,
+                "timestamp": self._get_timestamp(),
+            },
         }
 
         logger.info(f"Sending runner info: name={self.runner_name}")
@@ -333,10 +338,7 @@ class RunnerWebSocketClient:
 
         return False
 
-    async def start_session(
-        self,
-        configuration_snapshot: Optional[Dict[str, Any]] = None
-    ) -> bool:
+    async def start_session(self, configuration_snapshot: Optional[Dict[str, Any]] = None) -> bool:
         """
         Start automation session.
 
@@ -375,9 +377,7 @@ class RunnerWebSocketClient:
             return False
 
     async def end_session(
-        self,
-        status: str = "completed",
-        error_message: Optional[str] = None
+        self, status: str = "completed", error_message: Optional[str] = None
     ) -> bool:
         """
         End automation session.
@@ -425,10 +425,7 @@ class RunnerWebSocketClient:
         return success
 
     async def send_screenshot(
-        self,
-        image,
-        name: str,
-        metadata: Optional[Dict[str, Any]] = None
+        self, image, name: str, metadata: Optional[Dict[str, Any]] = None
     ) -> Optional[str]:
         """
         Send screenshot to server.
@@ -451,12 +448,12 @@ class RunnerWebSocketClient:
                 # PIL Image
                 buffer = BytesIO()
                 image.save(buffer, format="PNG")
-                base64_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+                base64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
                 width, height = image.size
                 content_type = "image/png"
             elif isinstance(image, bytes):
                 # Raw bytes
-                base64_data = base64.b64encode(image).decode('utf-8')
+                base64_data = base64.b64encode(image).decode("utf-8")
                 # Try to get dimensions from PIL
                 if Image:
                     img = Image.open(BytesIO(image))
@@ -502,10 +499,7 @@ class RunnerWebSocketClient:
             return None
 
     async def send_log(
-        self,
-        level: str,
-        message: str,
-        log_data: Optional[Dict[str, Any]] = None
+        self, level: str, message: str, log_data: Optional[Dict[str, Any]] = None
     ) -> bool:
         """
         Send log entry to server.
@@ -623,21 +617,34 @@ class RunnerWebSocketClient:
                             except Exception as e:
                                 logger.error(f"Error in on_command callback: {e}")
                         else:
-                            logger.warning(f"No on_command handler registered for command: {command}")
+                            logger.warning(
+                                f"No on_command handler registered for command: {command}"
+                            )
 
                     elif message_type == "ping":
                         # Respond to server ping
                         try:
-                            await self.ws.send(json.dumps({
-                                "type": "pong",
-                                "timestamp": self._get_timestamp(),
-                            }))
+                            await self.ws.send(
+                                json.dumps(
+                                    {
+                                        "type": "pong",
+                                        "timestamp": self._get_timestamp(),
+                                    }
+                                )
+                            )
                         except Exception as e:
                             logger.error(f"Error sending pong: {e}")
 
-                    elif message_type in ["heartbeat_ack", "session_started", "session_ended",
-                                          "log_received", "screenshot_stored", "connected", "pong",
-                                          "runner_info_ack"]:
+                    elif message_type in [
+                        "heartbeat_ack",
+                        "session_started",
+                        "session_ended",
+                        "log_received",
+                        "screenshot_stored",
+                        "connected",
+                        "pong",
+                        "runner_info_ack",
+                    ]:
                         # These are responses to messages we sent - ignore in listener
                         # They are handled by _send_message
                         pass
@@ -688,10 +695,12 @@ class RunnerWebSocketClient:
 
         while self.reconnect_attempts < self.max_reconnect_attempts:
             self.reconnect_attempts += 1
-            wait_time = min(2 ** self.reconnect_attempts, 60)  # Exponential backoff
+            wait_time = min(2**self.reconnect_attempts, 60)  # Exponential backoff
 
-            logger.info(f"Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts} "
-                       f"in {wait_time}s...")
+            logger.info(
+                f"Reconnection attempt {self.reconnect_attempts}/{self.max_reconnect_attempts} "
+                f"in {wait_time}s..."
+            )
 
             await asyncio.sleep(wait_time)
 

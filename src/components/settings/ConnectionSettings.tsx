@@ -122,19 +122,30 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
   // Helper to wait for executor to be ready
   const waitForExecutorReady = async (maxWaitMs: number = 5000): Promise<boolean> => {
     const startTime = Date.now();
+    let checkCount = 0;
+    console.log("[QUICK_CONNECT] waitForExecutorReady starting, maxWaitMs:", maxWaitMs);
     while (Date.now() - startTime < maxWaitMs) {
+      checkCount++;
       try {
         const status: any = await invoke("get_executor_status");
+        console.log(`[QUICK_CONNECT] Check #${checkCount} - Full status response:`, JSON.stringify(status, null, 2));
+        console.log(`[QUICK_CONNECT] Check #${checkCount} - status.success:`, status?.success);
+        console.log(`[QUICK_CONNECT] Check #${checkCount} - status.data:`, JSON.stringify(status?.data));
+        console.log(`[QUICK_CONNECT] Check #${checkCount} - python_running:`, status?.data?.python_running);
+        console.log(`[QUICK_CONNECT] Check #${checkCount} - config_loaded:`, status?.data?.config_loaded);
         // python_running is inside the data field of CommandResponse
         if (status?.data?.python_running) {
+          console.log("[QUICK_CONNECT] Executor is ready! python_running = true");
           return true;
         }
+        console.log("[QUICK_CONNECT] Executor not ready yet, python_running =", status?.data?.python_running);
       } catch (err) {
-        console.warn("Error checking executor status:", err);
+        console.warn(`[QUICK_CONNECT] Check #${checkCount} - Error checking executor status:`, err);
       }
       // Wait 100ms before checking again
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    console.log(`[QUICK_CONNECT] Timeout after ${checkCount} checks (${maxWaitMs}ms) - executor never became ready`);
     return false;
   };
 
@@ -263,6 +274,7 @@ export function ConnectionSettings({ onLog }: ConnectionSettingsProps) {
         projectId: connInfo.projectId !== null ? connInfo.projectId.toString() : "",
         connected: false,
         backendUrl: connInfo.backendUrl,
+        runnerName: wsSettings.runnerName, // Preserve the runner name from current state
         cloudPermissionEnabled,
         sessionsLimit: null,
         sessionsUsed: 0,

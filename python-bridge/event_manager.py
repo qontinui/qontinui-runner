@@ -90,7 +90,9 @@ class EventManager:
         """
         self.emit_event(EventType.LOG, {"level": level, "message": message})
 
-    def emit_tree_event(self, event_type: str, node: Any, extra_data: Optional[Dict] = None) -> None:
+    def emit_tree_event(
+        self, event_type: str, node: Any, extra_data: Optional[Dict] = None
+    ) -> None:
         """
         Emit a tree-based event with full tree context.
 
@@ -164,6 +166,16 @@ class EventManager:
             "match_found": EventType.MATCH_FOUND,
             "screenshot_taken": EventType.SCREENSHOT_TAKEN,
             "log": EventType.LOG,
+            # Web extraction events (both prefixed and raw names from qontinui library)
+            "extraction_started": EventType.EXTRACTION_STARTED,
+            "extraction_progress": EventType.EXTRACTION_PROGRESS,
+            "extraction_state_detected": EventType.EXTRACTION_STATE_DETECTED,
+            "extraction_element_detected": EventType.EXTRACTION_ELEMENT_DETECTED,
+            "extraction_complete": EventType.EXTRACTION_COMPLETE,
+            "extraction_error": EventType.EXTRACTION_ERROR,
+            # Raw event names from qontinui library (map to same EventType)
+            "state_detected": EventType.EXTRACTION_STATE_DETECTED,
+            "element_detected": EventType.EXTRACTION_ELEMENT_DETECTED,
         }
 
         # Get the EventType enum value, defaulting to LOG if not found
@@ -177,9 +189,13 @@ class EventManager:
         self.emit_event(enum_event_type, data)
 
     def emit_image_recognition_event(
-        self, image_id: str, matches: list, threshold: float = 0.9,
-        best_match_info: Optional[Dict] = None, image_obj: Any = None,
-        get_state_for_image_fn: Any = None
+        self,
+        image_id: str,
+        matches: list,
+        threshold: float = 0.9,
+        best_match_info: Optional[Dict] = None,
+        image_obj: Any = None,
+        get_state_for_image_fn: Any = None,
     ) -> None:
         """
         Emit image recognition event with detailed information.
@@ -207,8 +223,10 @@ class EventManager:
                 if hasattr(image_obj, "mat") and image_obj.mat is not None:
                     # OpenCV mat format: (height, width, channels)
                     template_size = f"{image_obj.mat.shape[1]}, {image_obj.mat.shape[0]}"
-                elif hasattr(image_obj, '_pattern') and hasattr(image_obj._pattern, 'mat'):
-                    template_size = f"{image_obj._pattern.mat.shape[1]}, {image_obj._pattern.mat.shape[0]}"
+                elif hasattr(image_obj, "_pattern") and hasattr(image_obj._pattern, "mat"):
+                    template_size = (
+                        f"{image_obj._pattern.mat.shape[1]}, {image_obj._pattern.mat.shape[0]}"
+                    )
                 elif hasattr(image_obj, "width") and hasattr(image_obj, "height"):
                     template_size = f"{image_obj.width}, {image_obj.height}"
             except Exception:
@@ -218,6 +236,7 @@ class EventManager:
         screenshot_size = "1920, 1080"  # Default from screen capture
         try:
             from PIL import ImageGrab
+
             screenshot = ImageGrab.grab()
             screenshot_size = f"{screenshot.width}, {screenshot.height}"
         except Exception:

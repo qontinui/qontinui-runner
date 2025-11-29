@@ -40,9 +40,9 @@ def sample_png_bytes():
     """Return a minimal valid PNG image as bytes."""
     # 1x1 transparent PNG
     return (
-        b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
-        b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01'
-        b'\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+        b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
     )
 
 
@@ -54,22 +54,17 @@ class TestUnifiedDataCollectorPathReturn:
     ):
         """Test that record_match_result returns dict with both paths."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
-        match_summary = {
-            "image_id": "button.png",
-            "confidence": 0.95,
-            "found": True
-        }
+        match_summary = {"image_id": "button.png", "confidence": 0.95, "found": True}
 
         # Call record_match_result with screenshot and debug visual
         result = collector.record_match_result(
             match_summary=match_summary,
             screenshot_data=sample_png_bytes,
-            debug_visual_data=sample_png_bytes
+            debug_visual_data=sample_png_bytes,
         )
 
         # Verify result is a dict
@@ -93,8 +88,7 @@ class TestUnifiedDataCollectorPathReturn:
     ):
         """Test that paths are None when no screenshot data provided."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
@@ -102,9 +96,7 @@ class TestUnifiedDataCollectorPathReturn:
 
         # Call without screenshot data
         result = collector.record_match_result(
-            match_summary=match_summary,
-            screenshot_data=None,
-            debug_visual_data=None
+            match_summary=match_summary, screenshot_data=None, debug_visual_data=None
         )
 
         # Verify result has None values
@@ -116,8 +108,7 @@ class TestUnifiedDataCollectorPathReturn:
     ):
         """Test that only provided images get paths."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
@@ -125,9 +116,7 @@ class TestUnifiedDataCollectorPathReturn:
 
         # Call with only screenshot data (no debug visual)
         result = collector.record_match_result(
-            match_summary=match_summary,
-            screenshot_data=sample_png_bytes,
-            debug_visual_data=None
+            match_summary=match_summary, screenshot_data=sample_png_bytes, debug_visual_data=None
         )
 
         # Verify only screenshot path is set
@@ -139,8 +128,7 @@ class TestUnifiedDataCollectorPathReturn:
     ):
         """Test that None values returned when no screenshot service."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=None  # No screenshot service
+            state_memory=mock_state_memory, screenshot_service=None  # No screenshot service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
@@ -150,7 +138,7 @@ class TestUnifiedDataCollectorPathReturn:
         result = collector.record_match_result(
             match_summary=match_summary,
             screenshot_data=sample_png_bytes,
-            debug_visual_data=sample_png_bytes
+            debug_visual_data=sample_png_bytes,
         )
 
         # Verify paths are None when service unavailable
@@ -166,8 +154,7 @@ class TestUnifiedDataCollectorPathReturn:
         mock_screenshot_service.store_debug_visual.return_value = None
 
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
@@ -176,7 +163,7 @@ class TestUnifiedDataCollectorPathReturn:
         result = collector.record_match_result(
             match_summary=match_summary,
             screenshot_data=sample_png_bytes,
-            debug_visual_data=sample_png_bytes
+            debug_visual_data=sample_png_bytes,
         )
 
         # Verify paths are None when service fails
@@ -198,8 +185,7 @@ class TestUnifiedDataCollectorPathReturn:
         ]
 
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
@@ -207,14 +193,14 @@ class TestUnifiedDataCollectorPathReturn:
         result1 = collector.record_match_result(
             match_summary={"image_id": "first.png", "found": True},
             screenshot_data=sample_png_bytes,
-            debug_visual_data=sample_png_bytes
+            debug_visual_data=sample_png_bytes,
         )
 
         # Second match
         result2 = collector.record_match_result(
             match_summary={"image_id": "second.png", "found": True},
             screenshot_data=sample_png_bytes,
-            debug_visual_data=sample_png_bytes
+            debug_visual_data=sample_png_bytes,
         )
 
         # Verify paths are different

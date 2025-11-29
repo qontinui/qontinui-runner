@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExportConfig:
     """Configuration for training data export."""
+
     enabled: bool = False
     output_dir: Optional[Path] = None
     dataset_version: str = "1.0.0"
@@ -56,11 +57,7 @@ class TrainingExportService:
         >>> stats = service.export_now()
     """
 
-    def __init__(
-        self,
-        config: ExportConfig,
-        storage_dir: Path
-    ):
+    def __init__(self, config: ExportConfig, storage_dir: Path):
         """Initialize the TrainingExportService.
 
         Args:
@@ -77,8 +74,7 @@ class TrainingExportService:
         self.exporter: Optional[TrainingDataExporter] = None
         if config.enabled and config.output_dir:
             self.exporter = TrainingDataExporter(
-                output_dir=config.output_dir,
-                dataset_version=config.dataset_version
+                output_dir=config.output_dir, dataset_version=config.dataset_version
             )
             logger.info(f"TrainingExportService initialized: {config.output_dir}")
         else:
@@ -102,9 +98,7 @@ class TrainingExportService:
         if self.config.export_mode == "incremental":
             if len(self.records_buffer) >= self.config.batch_size:
                 self._export_buffered_records()
-                logger.info(
-                    f"Incremental export triggered: {len(self.records_buffer)} records"
-                )
+                logger.info(f"Incremental export triggered: {len(self.records_buffer)} records")
 
     def _export_buffered_records(self) -> Optional[ExportStatistics]:
         """Export buffered records and clear the buffer.
@@ -126,8 +120,7 @@ class TrainingExportService:
         # Export
         try:
             stats = self.exporter.export_records(
-                records=records_to_export,
-                storage_dir=self.storage_dir
+                records=records_to_export, storage_dir=self.storage_dir
             )
             self.total_records_exported += stats.records_with_screenshots
             logger.info(
@@ -143,10 +136,7 @@ class TrainingExportService:
             logger.error(f"Failed to export records: {e}", exc_info=True)
             return None
 
-    def _filter_records(
-        self,
-        records: List[ActionExecutionRecord]
-    ) -> List[ActionExecutionRecord]:
+    def _filter_records(self, records: List[ActionExecutionRecord]) -> List[ActionExecutionRecord]:
         """Apply configured filters to records.
 
         Args:
@@ -178,9 +168,7 @@ class TrainingExportService:
         if not self.config.enabled:
             return None
 
-        logger.info(
-            f"Exporting on completion: {len(self.records_buffer)} records buffered"
-        )
+        logger.info(f"Exporting on completion: {len(self.records_buffer)} records buffered")
         return self._export_buffered_records()
 
     def export_now(self) -> Optional[ExportStatistics]:

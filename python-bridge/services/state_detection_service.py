@@ -371,9 +371,7 @@ class LocalStateDetectionService:
 
         return transitions
 
-    def _build_states(
-        self, screenshots: List[np.ndarray], transitions: List
-    ) -> List[Any]:
+    def _build_states(self, screenshots: List[np.ndarray], transitions: List) -> List[Any]:
         """Build State objects using qontinui StateBuilder.
 
         This method uses the qontinui library's StateBuilder to analyze
@@ -515,7 +513,9 @@ class LocalStateDetectionService:
 def main():
     """CLI entry point for state detection service."""
     if len(sys.argv) != 4:
-        print("Usage: python3 state_detection_service.py <screenshots_dir> <events.json> <output.json>")
+        print(
+            "Usage: python3 state_detection_service.py <screenshots_dir> <events.json> <output.json>"
+        )
         print()
         print("Arguments:")
         print("  screenshots_dir  Directory containing PNG screenshots")
@@ -523,7 +523,9 @@ def main():
         print("  output.json      Output file for detected states")
         print()
         print("Example:")
-        print("  python3 state_detection_service.py ./captures/session1 ./captures/session1/events.json ./output/states.json")
+        print(
+            "  python3 state_detection_service.py ./captures/session1 ./captures/session1/events.json ./output/states.json"
+        )
         sys.exit(1)
 
     screenshots_dir = Path(sys.argv[1])

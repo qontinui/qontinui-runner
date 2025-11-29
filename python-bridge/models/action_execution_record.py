@@ -206,7 +206,7 @@ class ActionExecutionRecord:
                 "state_changed": self.state_changed,
                 "states_activated": sorted(self.states_activated),
                 "states_deactivated": sorted(self.states_deactivated),
-            }
+            },
         }
 
     def _format_runtime_for_display(self) -> Dict[str, Any]:
@@ -229,7 +229,7 @@ class ActionExecutionRecord:
         if self.clicked_location is not None:
             runtime["clicked_location"] = {
                 "x": self.clicked_location[0],
-                "y": self.clicked_location[1]
+                "y": self.clicked_location[1],
             }
 
         if self.click_button is not None:

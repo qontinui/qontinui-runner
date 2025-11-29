@@ -94,7 +94,7 @@ def complete_recording_workflow_example():
         event_types=["mouse_click"],
         buttons=["left", "right"],
         include_after_delay_ms=50,  # Capture visual feedback
-        max_count=20
+        max_count=20,
     )
 
     click_frames = extractor.extract_at_events(video_path, events, click_filter)
@@ -104,18 +104,13 @@ def complete_recording_workflow_example():
     if click_frames:
         click_dir = storage_dir / "click_frames"
         extractor.save_frames_batch(
-            click_frames,
-            str(click_dir),
-            filename_pattern="click_{frame_number:05d}",
-            format="png"
+            click_frames, str(click_dir), filename_pattern="click_{frame_number:05d}", format="png"
         )
         print(f"    Saved to: {click_dir}")
 
     # Filter: Extract frames at keyboard shortcuts
     shortcut_filter = EventFilter(
-        event_types=["key_press"],
-        modifiers=["ctrl"],
-        include_after_delay_ms=100
+        event_types=["key_press"], modifiers=["ctrl"], include_after_delay_ms=100
     )
 
     shortcut_frames = extractor.extract_at_events(video_path, events, shortcut_filter)
@@ -127,7 +122,7 @@ def complete_recording_workflow_example():
             shortcut_frames,
             str(shortcut_dir),
             filename_pattern="shortcut_{frame_number:05d}",
-            format="png"
+            format="png",
         )
         print(f"    Saved to: {shortcut_dir}")
 
@@ -135,9 +130,7 @@ def complete_recording_workflow_example():
     print("\n[6] Creating video overview thumbnails...")
 
     thumbnail_frames = extractor.extract_at_interval(
-        video_path,
-        interval_ms=1000,  # One frame per second
-        max_count=10
+        video_path, interval_ms=1000, max_count=10  # One frame per second
     )
     print(f"    Created {len(thumbnail_frames)} thumbnails")
 
@@ -147,7 +140,7 @@ def complete_recording_workflow_example():
             thumbnail_frames,
             str(thumb_dir),
             filename_pattern="thumb_{timestamp:.1f}s",
-            format="jpg"
+            format="jpg",
         )
         print(f"    Saved to: {thumb_dir}")
 
@@ -194,21 +187,10 @@ def event_based_analysis_example():
     print("\n[3] Analyzing event patterns...")
 
     analyses = {
-        "left_clicks": EventFilter(
-            event_types=["mouse_click"],
-            buttons=["left"]
-        ),
-        "right_clicks": EventFilter(
-            event_types=["mouse_click"],
-            buttons=["right"]
-        ),
-        "key_presses": EventFilter(
-            event_types=["key_press"]
-        ),
-        "ctrl_shortcuts": EventFilter(
-            event_types=["key_press"],
-            modifiers=["ctrl"]
-        ),
+        "left_clicks": EventFilter(event_types=["mouse_click"], buttons=["left"]),
+        "right_clicks": EventFilter(event_types=["mouse_click"], buttons=["right"]),
+        "key_presses": EventFilter(event_types=["key_press"]),
+        "ctrl_shortcuts": EventFilter(event_types=["key_press"], modifiers=["ctrl"]),
     }
 
     for name, event_filter in analyses.items():
@@ -246,7 +228,7 @@ def create_sample_events() -> List[InputMonitorEvent]:
                 event_type="mouse_click",
                 x=100 + i * 20,
                 y=200 + i * 15,
-                button="left" if i % 2 == 0 else "right"
+                button="left" if i % 2 == 0 else "right",
             )
         elif i % 3 == 1:
             # Key press
@@ -255,7 +237,7 @@ def create_sample_events() -> List[InputMonitorEvent]:
                 frame_number=i * 60,
                 event_type="key_press",
                 key=["a", "enter", "space", "s"][i % 4],
-                modifiers=["ctrl"] if i % 4 == 1 else []
+                modifiers=["ctrl"] if i % 4 == 1 else [],
             )
         else:
             # Mouse move
@@ -264,7 +246,7 @@ def create_sample_events() -> List[InputMonitorEvent]:
                 frame_number=i * 60,
                 event_type="mouse_move",
                 x=150 + i * 25,
-                y=250 + i * 20
+                y=250 + i * 20,
             )
 
         events.append(event)
@@ -291,7 +273,7 @@ def batch_processing_example():
     timestamp_sets = {
         "intro": [0.0, 0.5, 1.0, 1.5, 2.0],
         "main_action": [10.0, 10.5, 11.0, 11.5, 12.0],
-        "conclusion": [28.0, 28.5, 29.0, 29.5, 30.0]
+        "conclusion": [28.0, 28.5, 29.0, 29.5, 30.0],
     }
 
     print("\n[2] Extracting frames in batches...")

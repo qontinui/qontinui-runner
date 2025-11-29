@@ -33,7 +33,7 @@ class TestRuntimeMetadataFlow:
             action_id="type-001",
             parent_action_id=None,
             workflow_id="test-workflow",
-            nesting_level=0
+            nesting_level=0,
         )
 
         # Library emits TEXT_TYPED event -> EventTranslator calls record_text_typed
@@ -47,15 +47,12 @@ class TestRuntimeMetadataFlow:
         record = collector.create_record(
             action_type="TYPE",
             config={
-                "textSource": {
-                    "stateId": "Main",
-                    "stringIds": ["string-123"]
-                },
-                "typing_delay": 50
+                "textSource": {"stateId": "Main", "stringIds": ["string-123"]},
+                "typing_delay": 50,
             },
             start_time=start_time,
             end_time=end_time,
-            success=True
+            success=True,
         )
 
         # Verify record has typed_text
@@ -88,15 +85,14 @@ class TestRuntimeMetadataFlow:
             action_id="run-workflow-001",
             parent_action_id=None,
             workflow_id="parent-workflow",
-            nesting_level=0
+            nesting_level=0,
         )
 
         # Record workflow execution (called by qontinui_executor.py)
         workflow_name = "Login Flow"
         workflow_status = "success"
         collector.record_workflow_execution(
-            workflow_name=workflow_name,
-            workflow_status=workflow_status
+            workflow_name=workflow_name, workflow_status=workflow_status
         )
 
         # Create record
@@ -105,12 +101,10 @@ class TestRuntimeMetadataFlow:
 
         record = collector.create_record(
             action_type="RUN_WORKFLOW",
-            config={
-                "workflowId": "workflow-456"
-            },
+            config={"workflowId": "workflow-456"},
             start_time=start_time,
             end_time=end_time,
-            success=True
+            success=True,
         )
 
         # Verify record has workflow metadata
@@ -146,7 +140,7 @@ class TestRuntimeMetadataFlow:
             config={"textSource": {"stateId": "Main", "stringIds": ["str-1"]}},
             start_time=start,
             end_time=start + 0.5,
-            success=True
+            success=True,
         )
 
         # Convert to tree event data
@@ -159,18 +153,15 @@ class TestRuntimeMetadataFlow:
             name="TYPE",
             timestamp=start,
             end_timestamp=start + 0.5,
-            metadata={
-                "config": record.config,
-                "execution_record": event_data
-            },
-            status="success"
+            metadata={"config": record.config, "execution_record": event_data},
+            status="success",
         )
 
         # Simulate tree event emission (what qontinui_executor._emit_tree_event does)
         tree_event = {
             "type": "tree_event",
             "event_type": "action_completed",
-            "node": node.to_dict(include_children=False)
+            "node": node.to_dict(include_children=False),
         }
 
         # Serialize to JSON (what gets sent to Tauri)
@@ -183,7 +174,10 @@ class TestRuntimeMetadataFlow:
         assert parsed["type"] == "tree_event"
         assert parsed["event_type"] == "action_completed"
         assert parsed["node"]["name"] == "TYPE"
-        assert parsed["node"]["metadata"]["execution_record"]["metadata"]["runtime"]["typed_text"] == "test123"
+        assert (
+            parsed["node"]["metadata"]["execution_record"]["metadata"]["runtime"]["typed_text"]
+            == "test123"
+        )
 
         print("✓ Tree event JSON serialization successful")
         print(f"  Sample output: {json_output[:200]}...")
@@ -209,9 +203,9 @@ class TestRuntimeMetadataFlow:
             "textSource": {
                 "stateId": "Main",
                 "stringIds": ["string-1759325036257"],
-                "useAll": False
+                "useAll": False,
             },
-            "typing_delay": 50
+            "typing_delay": 50,
         }
 
         start_time = time.time()
@@ -222,7 +216,7 @@ class TestRuntimeMetadataFlow:
             config=config,
             start_time=start_time,
             end_time=end_time,
-            success=True
+            success=True,
         )
 
         # 5. Convert to tree event data
@@ -235,18 +229,15 @@ class TestRuntimeMetadataFlow:
             name="TYPE",
             timestamp=start_time,
             end_timestamp=end_time,
-            metadata={
-                "config": config,
-                "execution_record": tree_data
-            },
-            status="success"
+            metadata={"config": config, "execution_record": tree_data},
+            status="success",
         )
 
         # 7. Build final tree event (what gets printed to stdout for Tauri)
         tree_event = {
             "type": "tree_event",
             "event_type": "action_completed",
-            "node": node.to_dict(include_children=False)
+            "node": node.to_dict(include_children=False),
         }
 
         # 8. Verify the JSON that Tauri receives
@@ -257,13 +248,15 @@ class TestRuntimeMetadataFlow:
         runtime = parsed["node"]["metadata"]["execution_record"]["metadata"]["runtime"]
         config_received = parsed["node"]["metadata"]["config"]
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("COMPLETE TYPE ACTION FLOW TEST")
-        print("="*60)
+        print("=" * 60)
 
         # Verify typed text is in runtime
         assert "typed_text" in runtime, "Runtime must include typed_text"
-        assert runtime["typed_text"] == "l", f"Expected typed_text='l', got '{runtime.get('typed_text')}'"
+        assert (
+            runtime["typed_text"] == "l"
+        ), f"Expected typed_text='l', got '{runtime.get('typed_text')}'"
         print(f"✓ Typed text in runtime: '{runtime['typed_text']}'")
 
         # Verify config is complete
@@ -274,15 +267,21 @@ class TestRuntimeMetadataFlow:
 
         # Verify frontend can access the data
         print(f"\n✓ Frontend access paths:")
-        print(f"  - node.metadata.config.textSource.stateId = '{config_received['textSource']['stateId']}'")
-        print(f"  - node.metadata.execution_record.metadata.runtime.typed_text = '{runtime['typed_text']}'")
+        print(
+            f"  - node.metadata.config.textSource.stateId = '{config_received['textSource']['stateId']}'"
+        )
+        print(
+            f"  - node.metadata.execution_record.metadata.runtime.typed_text = '{runtime['typed_text']}'"
+        )
         print(f"  - OR node.metadata.runtime.typed_text = (if nested)")
 
         # Check if runtime is directly in metadata (it should be in execution_record.metadata)
         if "runtime" in parsed["node"]["metadata"]:
-            print(f"  - Direct: node.metadata.runtime.typed_text = '{parsed['node']['metadata']['runtime'].get('typed_text')}'")
+            print(
+                f"  - Direct: node.metadata.runtime.typed_text = '{parsed['node']['metadata']['runtime'].get('typed_text')}'"
+            )
 
-        print("="*60 + "\n")
+        print("=" * 60 + "\n")
 
         return tree_event
 
@@ -300,7 +299,7 @@ class TestRuntimeMetadataFlow:
             config={"textSource": {"stateId": "Main"}},
             start_time=time.time(),
             end_time=time.time() + 0.1,
-            success=True
+            success=True,
         )
 
         tree_data = record.to_tree_event_data()
@@ -321,9 +320,9 @@ if __name__ == "__main__":
     """Run tests manually for debugging."""
     test = TestRuntimeMetadataFlow()
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Running Runtime Metadata Flow Tests")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     try:
         test.test_type_action_runtime_metadata()
@@ -345,12 +344,13 @@ if __name__ == "__main__":
 
         test.test_missing_typed_text_detection()
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("ALL TESTS PASSED ✓")
-        print("="*60)
+        print("=" * 60)
 
     except AssertionError as e:
         print(f"\n✗ TEST FAILED: {e}")
         import traceback
+
         traceback.print_exc()
         sys.exit(1)

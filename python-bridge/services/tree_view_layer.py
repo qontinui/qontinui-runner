@@ -34,7 +34,7 @@ class TreeNode:
     type: str
     label: str
     data: Dict[str, Any] = field(default_factory=dict)
-    children: List['TreeNode'] = field(default_factory=list)
+    children: List["TreeNode"] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -268,7 +268,9 @@ class TreeViewLayer:
                 )
 
                 for record in sorted(state_records, key=lambda r: r.start_time):
-                    status = "success" if record.success else "failed" if record.end_time else "running"
+                    status = (
+                        "success" if record.success else "failed" if record.end_time else "running"
+                    )
                     action_node = TreeNode(
                         id=record.action_id,
                         type="action",
@@ -303,7 +305,9 @@ class TreeViewLayer:
                 )
 
                 for record in sorted(state_records, key=lambda r: r.start_time):
-                    status = "success" if record.success else "failed" if record.end_time else "running"
+                    status = (
+                        "success" if record.success else "failed" if record.end_time else "running"
+                    )
                     action_node = TreeNode(
                         id=record.action_id,
                         type="action",
@@ -449,8 +453,7 @@ class TreeViewLayer:
 
         # Sort groups by first action timestamp
         sorted_groups = sorted(
-            state_groups.items(),
-            key=lambda item: min(r.start_time for r in item[1])
+            state_groups.items(), key=lambda item: min(r.start_time for r in item[1])
         )
 
         for state_set, group_records in sorted_groups:

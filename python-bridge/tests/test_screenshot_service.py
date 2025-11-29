@@ -65,7 +65,7 @@ class TestStoreScreenshot:
             screenshot_data=sample_png_bytes,
             action_id="action-001",
             active_states=["Login", "MainMenu"],
-            metadata={"test": "data"}
+            metadata={"test": "data"},
         )
 
         assert reference == "screenshots/screenshot-0001.png"
@@ -83,7 +83,7 @@ class TestStoreScreenshot:
             screenshot_data=sample_png_bytes,
             action_id="action-001",
             active_states=["Login"],
-            metadata={"action_type": "CLICK", "success": True}
+            metadata={"action_type": "CLICK", "success": True},
         )
 
         # Verify metadata file exists
@@ -117,9 +117,7 @@ class TestStoreScreenshot:
         service = ScreenshotService(temp_storage_dir, enabled=False)
 
         reference = service.store_screenshot(
-            screenshot_data=sample_png_bytes,
-            action_id="action-001",
-            active_states=[]
+            screenshot_data=sample_png_bytes, action_id="action-001", active_states=[]
         )
 
         assert reference is None
@@ -132,7 +130,7 @@ class TestStoreScreenshot:
             screenshot_data=sample_png_bytes,
             action_id="action-001",
             active_states=[],
-            metadata=None
+            metadata=None,
         )
 
         assert reference == "screenshots/screenshot-0001.png"
@@ -149,9 +147,7 @@ class TestStoreScreenshot:
         service = ScreenshotService(temp_storage_dir, enabled=True)
 
         service.store_screenshot(
-            screenshot_data=sample_png_bytes,
-            action_id="action-001",
-            active_states=[]
+            screenshot_data=sample_png_bytes, action_id="action-001", active_states=[]
         )
 
         metadata_path = temp_storage_dir / "screenshots" / "screenshot-0001.json"
@@ -171,13 +167,11 @@ class TestStoreDebugVisual:
             "threshold": 0.8,
             "location": {"x": 100, "y": 200},
             "template_name": "button.png",
-            "found": True
+            "found": True,
         }
 
         reference = service.store_debug_visual(
-            debug_image_data=sample_png_bytes,
-            action_id="find-button-001",
-            match_info=match_info
+            debug_image_data=sample_png_bytes, action_id="find-button-001", match_info=match_info
         )
 
         assert reference == "debug_visuals/debug-0001-action-find-button-001.png"
@@ -191,16 +185,10 @@ class TestStoreDebugVisual:
         """Test that debug visual storage creates metadata."""
         service = ScreenshotService(temp_storage_dir, enabled=True)
 
-        match_info = {
-            "confidence": 0.95,
-            "found": True,
-            "location": {"x": 100, "y": 200}
-        }
+        match_info = {"confidence": 0.95, "found": True, "location": {"x": 100, "y": 200}}
 
         service.store_debug_visual(
-            debug_image_data=sample_png_bytes,
-            action_id="action-001",
-            match_info=match_info
+            debug_image_data=sample_png_bytes, action_id="action-001", match_info=match_info
         )
 
         # Verify metadata file exists
@@ -223,7 +211,7 @@ class TestStoreDebugVisual:
         reference = service.store_debug_visual(
             debug_image_data=sample_png_bytes,
             action_id="action/with:special*chars?",
-            match_info={"found": True}
+            match_info={"found": True},
         )
 
         # Special characters should be replaced with hyphens
@@ -250,9 +238,7 @@ class TestStoreDebugVisual:
         service = ScreenshotService(temp_storage_dir, enabled=False)
 
         reference = service.store_debug_visual(
-            debug_image_data=sample_png_bytes,
-            action_id="action-001",
-            match_info={}
+            debug_image_data=sample_png_bytes, action_id="action-001", match_info={}
         )
 
         assert reference is None

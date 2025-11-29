@@ -147,13 +147,12 @@ class FrameExtractorService:
         if self.enabled:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"FrameExtractorService initialized: storage_dir={storage_dir}, enabled={enabled}")
+        logger.info(
+            f"FrameExtractorService initialized: storage_dir={storage_dir}, enabled={enabled}"
+        )
 
     def extract_at_timestamp(
-        self,
-        video_path: str,
-        timestamp: float,
-        frame_number: Optional[int] = None
+        self, video_path: str, timestamp: float, frame_number: Optional[int] = None
     ) -> Optional[ExtractedFrame]:
         """Extract single frame at exact timestamp using FFmpeg.
 
@@ -191,12 +190,16 @@ class FrameExtractorService:
             # -vframes 1 extracts exactly one frame
             cmd = [
                 "ffmpeg",
-                "-ss", str(timestamp),
-                "-i", str(video_path_obj),
-                "-vframes", "1",
-                "-f", "image2",
+                "-ss",
+                str(timestamp),
+                "-i",
+                str(video_path_obj),
+                "-vframes",
+                "1",
+                "-f",
+                "image2",
                 "-y",  # Overwrite output file
-                tmp_path
+                tmp_path,
             ]
 
             logger.debug(f"Extracting frame at {timestamp}s from {video_path}")
@@ -206,11 +209,11 @@ class FrameExtractorService:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
 
             if result.returncode != 0:
-                error_msg = result.stderr.decode('utf-8', errors='ignore')
+                error_msg = result.stderr.decode("utf-8", errors="ignore")
                 logger.error(f"FFmpeg extraction failed: {error_msg}")
                 Path(tmp_path).unlink(missing_ok=True)
                 return None
@@ -238,7 +241,7 @@ class FrameExtractorService:
                 frame_number=frame_number,
                 image=image,
                 source_event=None,
-                path=None
+                path=None,
             )
 
         except FileNotFoundError:
@@ -249,10 +252,7 @@ class FrameExtractorService:
             return None
 
     def extract_at_events(
-        self,
-        video_path: str,
-        events: List[InputMonitorEvent],
-        filter: Optional[EventFilter] = None
+        self, video_path: str, events: List[InputMonitorEvent], filter: Optional[EventFilter] = None
     ) -> List[ExtractedFrame]:
         """Extract frames at filtered input events.
 
@@ -310,11 +310,7 @@ class FrameExtractorService:
 
         return frames
 
-    def extract_batch(
-        self,
-        video_path: str,
-        timestamps: List[float]
-    ) -> List[ExtractedFrame]:
+    def extract_batch(self, video_path: str, timestamps: List[float]) -> List[ExtractedFrame]:
         """Batch extract frames at multiple timestamps efficiently.
 
         This method performs a single FFmpeg pass to extract multiple frames,
@@ -365,12 +361,16 @@ class FrameExtractorService:
                 output_pattern = str(tmp_path / "frame_%04d.png")
                 cmd = [
                     "ffmpeg",
-                    "-i", str(video_path_obj),
-                    "-vf", f"select='{select_expr}'",
-                    "-vsync", "0",  # Don't duplicate or drop frames
-                    "-f", "image2",
+                    "-i",
+                    str(video_path_obj),
+                    "-vf",
+                    f"select='{select_expr}'",
+                    "-vsync",
+                    "0",  # Don't duplicate or drop frames
+                    "-f",
+                    "image2",
                     "-y",
-                    output_pattern
+                    output_pattern,
                 ]
 
                 logger.debug(f"FFmpeg batch command: {' '.join(cmd)}")
@@ -380,11 +380,11 @@ class FrameExtractorService:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
 
                 if result.returncode != 0:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')
+                    error_msg = result.stderr.decode("utf-8", errors="ignore")
                     logger.error(f"FFmpeg batch extraction failed: {error_msg}")
                     return []
 
@@ -403,13 +403,15 @@ class FrameExtractorService:
                             # Copy to memory before file is deleted
                             image = image.copy()
 
-                            frames.append(ExtractedFrame(
-                                timestamp=ts,
-                                frame_number=fn,
-                                image=image,
-                                source_event=None,
-                                path=None
-                            ))
+                            frames.append(
+                                ExtractedFrame(
+                                    timestamp=ts,
+                                    frame_number=fn,
+                                    image=image,
+                                    source_event=None,
+                                    path=None,
+                                )
+                            )
                         except Exception as e:
                             logger.error(f"Failed to load frame {i}: {e}")
                     else:
@@ -461,12 +463,16 @@ class FrameExtractorService:
                 # -skip_frame nokey: Skip all frames except keyframes
                 cmd = [
                     "ffmpeg",
-                    "-skip_frame", "nokey",
-                    "-i", str(video_path_obj),
-                    "-vsync", "0",
-                    "-f", "image2",
+                    "-skip_frame",
+                    "nokey",
+                    "-i",
+                    str(video_path_obj),
+                    "-vsync",
+                    "0",
+                    "-f",
+                    "image2",
                     "-y",
-                    output_pattern
+                    output_pattern,
                 ]
 
                 # Execute FFmpeg
@@ -474,11 +480,11 @@ class FrameExtractorService:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
 
                 if result.returncode != 0:
-                    error_msg = result.stderr.decode('utf-8', errors='ignore')
+                    error_msg = result.stderr.decode("utf-8", errors="ignore")
                     logger.error(f"Keyframe extraction failed: {error_msg}")
                     return []
 
@@ -496,14 +502,16 @@ class FrameExtractorService:
                         # This is an approximation
                         timestamp = i / fps
 
-                        frames.append(ExtractedFrame(
-                            timestamp=timestamp,
-                            frame_number=i,
-                            image=image,
-                            source_event=None,
-                            path=None,
-                            metadata={"is_keyframe": True}
-                        ))
+                        frames.append(
+                            ExtractedFrame(
+                                timestamp=timestamp,
+                                frame_number=i,
+                                image=image,
+                                source_event=None,
+                                path=None,
+                                metadata={"is_keyframe": True},
+                            )
+                        )
                     except Exception as e:
                         logger.error(f"Failed to load keyframe {i}: {e}")
 
@@ -518,10 +526,7 @@ class FrameExtractorService:
             return []
 
     def extract_at_interval(
-        self,
-        video_path: str,
-        interval_ms: int,
-        max_count: Optional[int] = None
+        self, video_path: str, interval_ms: int, max_count: Optional[int] = None
     ) -> List[ExtractedFrame]:
         """Extract frames at regular intervals.
 
@@ -573,12 +578,7 @@ class FrameExtractorService:
         # Use batch extraction
         return self.extract_batch(video_path, timestamps)
 
-    def save_frame(
-        self,
-        frame: ExtractedFrame,
-        output_path: str,
-        format: str = "png"
-    ) -> str:
+    def save_frame(self, frame: ExtractedFrame, output_path: str, format: str = "png") -> str:
         """Save extracted frame to disk.
 
         Args:
@@ -616,7 +616,7 @@ class FrameExtractorService:
         frames: List[ExtractedFrame],
         output_dir: str,
         filename_pattern: str = "frame_{frame_number:04d}",
-        format: str = "png"
+        format: str = "png",
     ) -> List[str]:
         """Save multiple frames to disk efficiently.
 
@@ -649,8 +649,7 @@ class FrameExtractorService:
 
             # Format filename
             filename = filename_pattern.format(
-                frame_number=frame.frame_number,
-                timestamp=frame.timestamp
+                frame_number=frame.frame_number, timestamp=frame.timestamp
             )
             filename = f"{filename}.{format.lower()}"
             output_path = output_dir_obj / filename
@@ -676,25 +675,29 @@ class FrameExtractorService:
         try:
             cmd = [
                 "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=r_frame_rate",
-                "-of", "json",
-                video_path
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=r_frame_rate",
+                "-of",
+                "json",
+                video_path,
             ]
 
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
 
             if result.returncode == 0:
-                output = json.loads(result.stdout.decode('utf-8'))
+                output = json.loads(result.stdout.decode("utf-8"))
                 fps_str = output["streams"][0]["r_frame_rate"]
                 # Parse fraction (e.g., "30000/1001" or "30/1")
-                num, den = map(int, fps_str.split('/'))
+                num, den = map(int, fps_str.split("/"))
                 return num / den
 
         except Exception as e:
@@ -715,22 +718,26 @@ class FrameExtractorService:
         try:
             cmd = [
                 "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "format=duration",
-                "-of", "json",
-                video_path
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "json",
+                video_path,
             ]
 
             result = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
 
             if result.returncode == 0:
-                output = json.loads(result.stdout.decode('utf-8'))
+                output = json.loads(result.stdout.decode("utf-8"))
                 return float(output["format"]["duration"])
 
         except Exception as e:

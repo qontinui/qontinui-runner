@@ -12,15 +12,17 @@ import numpy as np
 import pytest
 
 # Mock qontinui imports before importing
-sys.modules['qontinui.reporting'] = Mock()
-sys.modules['qontinui.reporting.EventType'] = Mock()
-sys.modules['qontinui.reporting.emit_event'] = Mock()
+sys.modules["qontinui.reporting"] = Mock()
+sys.modules["qontinui.reporting.EventType"] = Mock()
+sys.modules["qontinui.reporting.emit_event"] = Mock()
 
 
 def test_library_emits_match_attempted_event():
     """Test that FindImageOrchestrator emits MATCH_ATTEMPTED event."""
     # Import after mocking
-    from qontinui.actions.basic.find.implementations.find_image.find_image_orchestrator import FindImageOrchestrator
+    from qontinui.actions.basic.find.implementations.find_image.find_image_orchestrator import (
+        FindImageOrchestrator,
+    )
     from qontinui.reporting import emit_event, EventType
 
     # Create orchestrator
@@ -54,7 +56,7 @@ def test_library_emits_match_attempted_event():
         template=template,
         screenshot=screenshot,
         options=mock_options,
-        matches=mock_matches
+        matches=mock_matches,
     )
 
     # Verify emit_event was called
@@ -64,20 +66,22 @@ def test_library_emits_match_attempted_event():
     call_args = emit_event.call_args
     assert call_args[0][0] == EventType.MATCH_ATTEMPTED
 
-    event_data = call_args[1]['data']
-    assert event_data['image_id'] == 'test_button.png'
-    assert event_data['template_dimensions'] == {'width': 100, 'height': 50}
-    assert event_data['screenshot_dimensions'] == {'width': 1920, 'height': 1080}
-    assert event_data['similarity_threshold'] == 0.8
-    assert event_data['best_match_confidence'] == 0.0  # No match
-    assert event_data['threshold_passed'] is False
-    assert event_data['match_method'] == 'CCOEFF_NORMED'
-    assert event_data['find_all_mode'] is False
+    event_data = call_args[1]["data"]
+    assert event_data["image_id"] == "test_button.png"
+    assert event_data["template_dimensions"] == {"width": 100, "height": 50}
+    assert event_data["screenshot_dimensions"] == {"width": 1920, "height": 1080}
+    assert event_data["similarity_threshold"] == 0.8
+    assert event_data["best_match_confidence"] == 0.0  # No match
+    assert event_data["threshold_passed"] is False
+    assert event_data["match_method"] == "CCOEFF_NORMED"
+    assert event_data["find_all_mode"] is False
 
 
 def test_library_emits_event_with_match_found():
     """Test event emission when match is found."""
-    from qontinui.actions.basic.find.implementations.find_image.find_image_orchestrator import FindImageOrchestrator
+    from qontinui.actions.basic.find.implementations.find_image.find_image_orchestrator import (
+        FindImageOrchestrator,
+    )
     from qontinui.reporting import emit_event, EventType
 
     orchestrator = FindImageOrchestrator()
@@ -117,7 +121,7 @@ def test_library_emits_event_with_match_found():
         template=template,
         screenshot=screenshot,
         options=mock_options,
-        matches=mock_matches
+        matches=mock_matches,
     )
 
     # Verify emit_event was called
@@ -125,12 +129,12 @@ def test_library_emits_event_with_match_found():
 
     # Verify the call arguments
     call_args = emit_event.call_args
-    event_data = call_args[1]['data']
+    event_data = call_args[1]["data"]
 
-    assert event_data['image_id'] == 'found_icon.png'
-    assert event_data['best_match_confidence'] == 0.95
-    assert event_data['best_match_location'] == {'x': 500, 'y': 300}
-    assert event_data['threshold_passed'] is True  # 0.95 > 0.8
+    assert event_data["image_id"] == "found_icon.png"
+    assert event_data["best_match_confidence"] == 0.95
+    assert event_data["best_match_location"] == {"x": 500, "y": 300}
+    assert event_data["threshold_passed"] is True  # 0.95 > 0.8
 
 
 if __name__ == "__main__":

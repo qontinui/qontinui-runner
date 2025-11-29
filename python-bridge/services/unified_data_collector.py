@@ -78,7 +78,7 @@ class UnifiedDataCollector:
         self,
         state_memory: Any,
         screenshot_service: Optional[Any] = None,
-        record_created_callback: Optional[callable] = None
+        record_created_callback: Optional[callable] = None,
     ) -> None:
         """Initialize the UnifiedDataCollector.
 
@@ -118,11 +118,7 @@ class UnifiedDataCollector:
         self._workflow_status: Optional[str] = None
 
     def start_action(
-        self,
-        action_id: str,
-        parent_action_id: Optional[str],
-        workflow_id: str,
-        nesting_level: int
+        self, action_id: str, parent_action_id: Optional[str], workflow_id: str, nesting_level: int
     ) -> None:
         """Start collecting data for a new action.
 
@@ -188,7 +184,7 @@ class UnifiedDataCollector:
         self,
         match_summary: dict[str, Any],
         screenshot_data: Optional[bytes] = None,
-        debug_visual_data: Optional[bytes] = None
+        debug_visual_data: Optional[bytes] = None,
     ) -> dict[str, Optional[str]]:
         """Record an image recognition match result.
 
@@ -242,7 +238,7 @@ class UnifiedDataCollector:
                         "event_type": "match_attempt",
                         "image_id": match_summary.get("image_id", "unknown"),
                         "found": match_summary.get("found", False),
-                    }
+                    },
                 )
                 if screenshot_ref:
                     self._screenshot_paths.append(screenshot_ref)
@@ -256,11 +252,13 @@ class UnifiedDataCollector:
                 debug_visual_ref = self.screenshot_service.store_debug_visual(
                     debug_image_data=debug_visual_data,
                     action_id=self._current_action_id or "unknown",
-                    match_info=match_summary
+                    match_info=match_summary,
                 )
                 if debug_visual_ref:
                     # Convert relative path to absolute path for frontend
-                    debug_visual_abs_path = str(self.screenshot_service.storage_dir / debug_visual_ref)
+                    debug_visual_abs_path = str(
+                        self.screenshot_service.storage_dir / debug_visual_ref
+                    )
                 # Debug visuals are stored separately and not included in screenshot_paths
 
             # Build match result entry
@@ -278,13 +276,7 @@ class UnifiedDataCollector:
                 "debug_visual_path": debug_visual_abs_path,
             }
 
-    def record_click(
-        self,
-        x: int,
-        y: int,
-        button: str,
-        target_type: str = "unknown"
-    ) -> None:
+    def record_click(self, x: int, y: int, button: str, target_type: str = "unknown") -> None:
         """Record a click event.
 
         Thread-safe: Protected by internal lock.
@@ -389,7 +381,7 @@ class UnifiedDataCollector:
         success: bool = True,
         error_message: Optional[str] = None,
         retry_count: int = 0,
-        metadata: Optional[dict[str, Any]] = None
+        metadata: Optional[dict[str, Any]] = None,
     ) -> ActionExecutionRecord:
         """Create an immutable ActionExecutionRecord from buffered data.
 
@@ -535,9 +527,9 @@ class UnifiedDataCollector:
                 except Exception as e:
                     # Log but don't raise - callbacks shouldn't break execution
                     import logging
+
                     logging.getLogger(__name__).error(
-                        f"Error in record_created_callback: {e}",
-                        exc_info=True
+                        f"Error in record_created_callback: {e}", exc_info=True
                     )
 
             return record

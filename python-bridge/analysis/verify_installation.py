@@ -36,12 +36,15 @@ def check_dependencies():
             if module == "dataclasses":
                 # Built-in for Python 3.7+
                 import dataclasses
+
                 print(f"  ✓ {package}")
             elif module == "numpy":
                 import numpy as np
+
                 print(f"  ✓ {package} (version {np.__version__})")
             elif module == "cv2":
                 import cv2
+
                 print(f"  ✓ {package} (version {cv2.__version__})")
             else:
                 __import__(module)
@@ -59,6 +62,7 @@ def check_models():
 
     try:
         from models import DetectedState, Frame, InputEvent, StateImage
+
         print("  ✓ models.DetectedState")
         print("  ✓ models.Frame")
         print("  ✓ models.InputEvent")
@@ -80,6 +84,7 @@ def check_analysis_module():
             save_state_image,
             load_state_image,
         )
+
         print("  ✓ analysis.ImageExtractionConfig")
         print("  ✓ analysis.StateImageExtractor")
         print("  ✓ analysis.save_state_image")
@@ -171,6 +176,7 @@ def run_basic_test():
     except Exception as e:
         print(f"  ✗ Basic test failed: {e}")
         import traceback
+
         traceback.print_exc()
         return False
 

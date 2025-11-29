@@ -15,7 +15,7 @@ use serde_json;
 use std::process::Command;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{AppState, CommandResponse};
 
@@ -232,31 +232,50 @@ pub fn stop_execution(state: State<AppState>) -> Result<CommandResponse, String>
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
 pub fn get_executor_status(state: State<AppState>) -> Result<CommandResponse, String> {
+    debug!("[GET_EXECUTOR_STATUS] Called - checking bridge lock...");
     let mut bridge_lock = state.python_bridge.lock().unwrap();
+    debug!("[GET_EXECUTOR_STATUS] Got bridge lock");
 
     if let Some(ref mut bridge) = *bridge_lock {
+        debug!("[GET_EXECUTOR_STATUS] Bridge exists, checking is_running()...");
         let is_running = bridge.is_running();
+        debug!("[GET_EXECUTOR_STATUS] is_running() = {}", is_running);
+
+        // Also get the actual state name for debugging
+        let state_name = bridge.get_state().name();
+        debug!("[GET_EXECUTOR_STATUS] Current state: {}", state_name);
 
         if is_running {
+            debug!("[GET_EXECUTOR_STATUS] Calling bridge.get_status()...");
             bridge
                 .get_status()
                 .map_err(|e| format!("Failed to get status: {}", e))?;
+            debug!("[GET_EXECUTOR_STATUS] get_status() completed");
         }
+
+        let config_loaded = state.current_config.lock().unwrap().is_some();
+        debug!("[GET_EXECUTOR_STATUS] config_loaded = {}", config_loaded);
+        info!("[GET_EXECUTOR_STATUS] Returning: python_running={}, state={}, config_loaded={}",
+              is_running, state_name, config_loaded);
 
         Ok(CommandResponse {
             success: true,
             message: None,
             data: Some(serde_json::json!({
                 "python_running": is_running,
-                "config_loaded": state.current_config.lock().unwrap().is_some()
+                "executor_state": state_name,
+                "config_loaded": config_loaded
             })),
         })
     } else {
+        debug!("[GET_EXECUTOR_STATUS] Bridge is None - Python not started");
+        info!("[GET_EXECUTOR_STATUS] Returning: python_running=false (no bridge)");
         Ok(CommandResponse {
             success: true,
             message: None,
             data: Some(serde_json::json!({
                 "python_running": false,
+                "executor_state": "not_started",
                 "config_loaded": state.current_config.lock().unwrap().is_some()
             })),
         })

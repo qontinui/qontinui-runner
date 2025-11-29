@@ -29,6 +29,7 @@ from dataclasses import replace
 
 try:
     from pynput import mouse, keyboard
+
     PYNPUT_AVAILABLE = True
 except ImportError:
     PYNPUT_AVAILABLE = False
@@ -164,11 +165,10 @@ class InputMonitorService:
             self._mouse_listener = mouse.Listener(
                 on_move=self._on_mouse_move,
                 on_click=self._on_mouse_click,
-                on_scroll=self._on_mouse_scroll
+                on_scroll=self._on_mouse_scroll,
             )
             self._keyboard_listener = keyboard.Listener(
-                on_press=self._on_key_press,
-                on_release=self._on_key_release
+                on_press=self._on_key_press, on_release=self._on_key_release
             )
 
             self._mouse_listener.start()
@@ -239,11 +239,7 @@ class InputMonitorService:
         with self._events_lock:
             return self._events.copy()
 
-    def get_events_in_range(
-        self,
-        start_time: float,
-        end_time: float
-    ) -> List[InputMonitorEvent]:
+    def get_events_in_range(self, start_time: float, end_time: float) -> List[InputMonitorEvent]:
         """Get input events within a specific time range.
 
         Args:
@@ -254,10 +250,7 @@ class InputMonitorService:
             List of InputMonitorEvent objects within the specified time range
         """
         with self._events_lock:
-            return [
-                event for event in self._events
-                if start_time <= event.timestamp <= end_time
-            ]
+            return [event for event in self._events if start_time <= event.timestamp <= end_time]
 
     def _add_event(self, event: InputMonitorEvent) -> None:
         """Add an event to the events list and write to JSONL file.
@@ -273,8 +266,8 @@ class InputMonitorService:
             # Write to JSONL file
             if self._events_file:
                 try:
-                    with open(self._events_file, 'a', encoding='utf-8') as f:
-                        f.write(event.to_jsonl() + '\n')
+                    with open(self._events_file, "a", encoding="utf-8") as f:
+                        f.write(event.to_jsonl() + "\n")
                 except Exception as e:
                     logger.error(f"Failed to write event to file: {e}", exc_info=True)
 
@@ -318,11 +311,7 @@ class InputMonitorService:
             frame_number = self._calculate_frame_number(timestamp)
 
             event = InputMonitorEvent(
-                timestamp=timestamp,
-                frame_number=frame_number,
-                event_type="mouse_move",
-                x=x,
-                y=y
+                timestamp=timestamp, frame_number=frame_number, event_type="mouse_move", x=x, y=y
             )
             self._add_event(event)
             self._last_mouse_move_time = current_time
@@ -360,8 +349,8 @@ class InputMonitorService:
 
                 # Check if this was a drag (moved while button held)
                 if self._is_dragging or (
-                    len(self._drag_positions) > 1 and
-                    self._has_significant_movement(self._mouse_press_position, (x, y))
+                    len(self._drag_positions) > 1
+                    and self._has_significant_movement(self._mouse_press_position, (x, y))
                 ):
                     # Create drag event
                     self._finalize_drag_event(end_position=(x, y), end_time=timestamp)
@@ -375,7 +364,7 @@ class InputMonitorService:
                         x=x,
                         y=y,
                         button=button_name,
-                        duration=duration
+                        duration=duration,
                     )
                     self._add_event(event)
 
@@ -409,14 +398,12 @@ class InputMonitorService:
             x=x,
             y=y,
             scroll_delta=int(dy),
-            metadata={"horizontal_delta": int(dx)}
+            metadata={"horizontal_delta": int(dx)},
         )
         self._add_event(event)
 
     def _finalize_drag_event(
-        self,
-        end_position: Optional[Tuple[int, int]] = None,
-        end_time: Optional[float] = None
+        self, end_position: Optional[Tuple[int, int]] = None, end_time: Optional[float] = None
     ) -> None:
         """Finalize and record a drag event.
 
@@ -431,8 +418,10 @@ class InputMonitorService:
         frame_number = self._calculate_frame_number(timestamp)
         duration = (timestamp - self._mouse_press_time) * 1000  # Convert to ms
 
-        end_pos = end_position if end_position else (
-            self._drag_positions[-1] if self._drag_positions else self._mouse_press_position
+        end_pos = (
+            end_position
+            if end_position
+            else (self._drag_positions[-1] if self._drag_positions else self._mouse_press_position)
         )
 
         event = InputMonitorEvent(
@@ -445,7 +434,7 @@ class InputMonitorService:
             drag_start=self._mouse_press_position,
             drag_end=end_pos,
             duration=duration,
-            metadata={"path_length": len(self._drag_positions)}
+            metadata={"path_length": len(self._drag_positions)},
         )
         self._add_event(event)
 
@@ -478,7 +467,7 @@ class InputMonitorService:
             event_type="key_press",
             key=key_str,
             key_code=self._get_key_code(key),
-            modifiers=self._current_modifiers.copy()
+            modifiers=self._current_modifiers.copy(),
         )
         self._add_event(event)
 
@@ -512,7 +501,7 @@ class InputMonitorService:
             key=key_str,
             key_code=self._get_key_code(key),
             modifiers=self._current_modifiers.copy(),
-            duration=duration
+            duration=duration,
         )
         self._add_event(event)
 
@@ -548,9 +537,9 @@ class InputMonitorService:
             String representation of the key
         """
         try:
-            if hasattr(key, 'char') and key.char is not None:
+            if hasattr(key, "char") and key.char is not None:
                 return key.char
-            elif hasattr(key, 'name'):
+            elif hasattr(key, "name"):
                 return key.name
             else:
                 return str(key)
@@ -568,7 +557,7 @@ class InputMonitorService:
             Key code if available, None otherwise
         """
         try:
-            if hasattr(key, 'vk'):
+            if hasattr(key, "vk"):
                 return key.vk
         except Exception:
             pass
@@ -584,15 +573,25 @@ class InputMonitorService:
         Returns:
             True if key is a modifier (ctrl, shift, alt, cmd), False otherwise
         """
-        modifiers = {'ctrl', 'shift', 'alt', 'cmd', 'ctrl_l', 'ctrl_r',
-                     'shift_l', 'shift_r', 'alt_l', 'alt_r', 'cmd_l', 'cmd_r'}
+        modifiers = {
+            "ctrl",
+            "shift",
+            "alt",
+            "cmd",
+            "ctrl_l",
+            "ctrl_r",
+            "shift_l",
+            "shift_r",
+            "alt_l",
+            "alt_r",
+            "cmd_l",
+            "cmd_r",
+        }
         return key_str.lower() in modifiers
 
     @staticmethod
     def _has_significant_movement(
-        start: Tuple[int, int],
-        end: Tuple[int, int],
-        threshold: int = 5
+        start: Tuple[int, int], end: Tuple[int, int], threshold: int = 5
     ) -> bool:
         """Check if mouse movement is significant enough to be considered a drag.
 

@@ -179,9 +179,12 @@ class Transition:
             action_location = tuple(action_location)
 
         # Remove computed properties that shouldn't be in constructor
-        data_copy = {k: v for k, v in data.items() if k not in [
-            "is_state_change", "is_simple_transition", "frame_count", "has_action_target"
-        ]}
+        data_copy = {
+            k: v
+            for k, v in data.items()
+            if k
+            not in ["is_state_change", "is_simple_transition", "frame_count", "has_action_target"]
+        }
 
         return cls(
             id=data_copy["id"],

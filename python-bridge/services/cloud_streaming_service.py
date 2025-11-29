@@ -128,7 +128,7 @@ class StreamedData:
             "data_type": self.data_type,
             "session_id": self.session_id,
             "timestamp": self.timestamp,
-            "data": base64.b64encode(self.data).decode('utf-8'),
+            "data": base64.b64encode(self.data).decode("utf-8"),
             "metadata": self.metadata,
         }
 
@@ -364,7 +364,7 @@ class CloudStreamingService:
         message_type: str,
         payload: Dict[str, Any],
         wait_for_response: bool = False,
-        timeout: float = 10.0
+        timeout: float = 10.0,
     ) -> Optional[Dict[str, Any]]:
         """Send message to cloud WebSocket server.
 
@@ -382,11 +382,7 @@ class CloudStreamingService:
             return None
 
         try:
-            message = {
-                "type": message_type,
-                "timestamp": self._get_timestamp(),
-                **payload
-            }
+            message = {"type": message_type, "timestamp": self._get_timestamp(), **payload}
 
             # Send message
             await self.ws.send(json.dumps(message))
@@ -433,7 +429,7 @@ class CloudStreamingService:
         chunk: bytes,
         timestamp: float,
         chunk_index: Optional[int] = None,
-        frame_number: Optional[int] = None
+        frame_number: Optional[int] = None,
     ) -> bool:
         """Stream a compressed video chunk to cloud.
 
@@ -463,7 +459,7 @@ class CloudStreamingService:
                     "resolution": self.config.video_resolution,
                     "bitrate": self.config.video_bitrate,
                     "size_kb": len(chunk) / 1024.0,
-                }
+                },
             )
 
             payload = streamed_data.to_dict()
@@ -485,11 +481,7 @@ class CloudStreamingService:
             logger.error(f"Error streaming video chunk: {e}")
             return False
 
-    async def stream_events(
-        self,
-        session_id: str,
-        events: List[InputMonitorEvent]
-    ) -> bool:
+    async def stream_events(self, session_id: str, events: List[InputMonitorEvent]) -> bool:
         """Stream input events to cloud (compressed as JSONL).
 
         Events are serialized to JSONL format and optionally gzipped for efficient
@@ -510,7 +502,7 @@ class CloudStreamingService:
             # Convert events to JSONL format
             jsonl_lines = [event.to_jsonl() for event in events]
             jsonl_data = "\n".join(jsonl_lines)
-            jsonl_bytes = jsonl_data.encode('utf-8')
+            jsonl_bytes = jsonl_data.encode("utf-8")
 
             # Optionally compress with gzip
             if self.config.compress_events:
@@ -531,8 +523,10 @@ class CloudStreamingService:
                     "compression": compression_method,
                     "original_size": len(jsonl_bytes),
                     "compressed_size": len(data_to_send),
-                    "compression_ratio": len(jsonl_bytes) / len(data_to_send) if len(data_to_send) > 0 else 1.0,
-                }
+                    "compression_ratio": (
+                        len(jsonl_bytes) / len(data_to_send) if len(data_to_send) > 0 else 1.0
+                    ),
+                },
             )
 
             payload = streamed_data.to_dict()
@@ -556,11 +550,7 @@ class CloudStreamingService:
             return False
 
     async def stream_thumbnail(
-        self,
-        session_id: str,
-        frame_number: int,
-        image: bytes,
-        timestamp: Optional[float] = None
+        self, session_id: str, frame_number: int, image: bytes, timestamp: Optional[float] = None
     ) -> bool:
         """Stream a thumbnail image to cloud.
 
@@ -593,11 +583,8 @@ class CloudStreamingService:
 
             # Convert to JPEG with compression
             buffer = BytesIO()
-            img.convert('RGB').save(
-                buffer,
-                format='JPEG',
-                quality=self.config.thumbnail_quality,
-                optimize=True
+            img.convert("RGB").save(
+                buffer, format="JPEG", quality=self.config.thumbnail_quality, optimize=True
             )
             thumbnail_bytes = buffer.getvalue()
 
@@ -611,7 +598,7 @@ class CloudStreamingService:
                     "thumbnail_size": self.config.thumbnail_size,
                     "jpeg_quality": self.config.thumbnail_quality,
                     "size_kb": len(thumbnail_bytes) / 1024.0,
-                }
+                },
             )
 
             payload = streamed_data.to_dict()
@@ -621,8 +608,7 @@ class CloudStreamingService:
                 self.thumbnails_sent += 1
                 self.bytes_sent += len(thumbnail_bytes)
                 logger.debug(
-                    f"Thumbnail sent: frame={frame_number}, "
-                    f"size={len(thumbnail_bytes)} bytes"
+                    f"Thumbnail sent: frame={frame_number}, " f"size={len(thumbnail_bytes)} bytes"
                 )
                 return True
             else:
@@ -633,11 +619,7 @@ class CloudStreamingService:
             logger.error(f"Error streaming thumbnail: {e}")
             return False
 
-    async def stream_processed_data(
-        self,
-        session_id: str,
-        data: ProcessingResult
-    ) -> bool:
+    async def stream_processed_data(self, session_id: str, data: ProcessingResult) -> bool:
         """Stream processed states and transitions to cloud.
 
         Sends the complete ProcessingResult including detected states, transitions,
@@ -653,8 +635,8 @@ class CloudStreamingService:
         try:
             # Convert ProcessingResult to JSON
             result_dict = data.to_dict()
-            result_json = json.dumps(result_dict, separators=(',', ':'))
-            result_bytes = result_json.encode('utf-8')
+            result_json = json.dumps(result_dict, separators=(",", ":"))
+            result_bytes = result_json.encode("utf-8")
 
             # Optionally compress
             if self.config.compress_events:
@@ -679,7 +661,7 @@ class CloudStreamingService:
                     "original_size": len(result_bytes),
                     "compressed_size": len(data_to_send),
                     "size_kb": len(data_to_send) / 1024.0,
-                }
+                },
             )
 
             payload = streamed_data.to_dict()
@@ -702,9 +684,7 @@ class CloudStreamingService:
             return False
 
     async def handle_screenshot_request(
-        self,
-        request_id: str,
-        filter_params: Dict[str, Any]
+        self, request_id: str, filter_params: Dict[str, Any]
     ) -> bool:
         """Handle request for full-size screenshots from cloud.
 
@@ -726,7 +706,7 @@ class CloudStreamingService:
             self.screenshot_requests[request_id] = {
                 "filter_params": filter_params,
                 "timestamp": time.time(),
-                "status": "pending"
+                "status": "pending",
             }
 
             logger.info(f"Screenshot request registered: {request_id}")
@@ -737,10 +717,7 @@ class CloudStreamingService:
             return False
 
     async def upload_screenshots(
-        self,
-        session_id: str,
-        screenshots: List[str],
-        request_id: Optional[str] = None
+        self, session_id: str, screenshots: List[str], request_id: Optional[str] = None
     ) -> bool:
         """Upload full-size screenshots to cloud on demand.
 
@@ -781,7 +758,7 @@ class CloudStreamingService:
                             "request_id": request_id,
                             "filename": path.name,
                             "size_kb": len(screenshot_bytes) / 1024.0,
-                        }
+                        },
                     )
 
                     payload = streamed_data.to_dict()
@@ -820,15 +797,10 @@ class CloudStreamingService:
             return False
 
         try:
-            payload = {
-                "stats": self.get_stats()
-            }
+            payload = {"stats": self.get_stats()}
 
             response = await self._send_message(
-                "heartbeat",
-                payload,
-                wait_for_response=True,
-                timeout=5.0
+                "heartbeat", payload, wait_for_response=True, timeout=5.0
             )
 
             if response and response.get("success"):
@@ -845,9 +817,7 @@ class CloudStreamingService:
 
     async def _heartbeat_loop(self):
         """Background task to send heartbeats periodically."""
-        logger.info(
-            f"Starting heartbeat loop (interval: {self.config.heartbeat_interval}s)"
-        )
+        logger.info(f"Starting heartbeat loop (interval: {self.config.heartbeat_interval}s)")
 
         try:
             while self.is_running and self.is_connected:
@@ -874,8 +844,7 @@ class CloudStreamingService:
         while self.reconnect_attempts < self.config.max_reconnect_attempts:
             self.reconnect_attempts += 1
             wait_time = min(
-                self.config.reconnect_delay * (2 ** self.reconnect_attempts),
-                60
+                self.config.reconnect_delay * (2**self.reconnect_attempts), 60
             )  # Exponential backoff, max 60s
 
             logger.info(
@@ -891,9 +860,7 @@ class CloudStreamingService:
                     logger.info("Reconnection successful")
                     return
 
-        logger.error(
-            f"Failed to reconnect after {self.config.max_reconnect_attempts} attempts"
-        )
+        logger.error(f"Failed to reconnect after {self.config.max_reconnect_attempts} attempts")
 
         if self.on_error:
             try:

@@ -422,9 +422,7 @@ class StateBoundaryDetector:
                 gray2 = gray2[:h, :w]
 
             # Compute dense optical flow
-            flow = cv2.calcOpticalFlowFarneback(
-                gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
+            flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
 
             # Calculate magnitude
             magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
@@ -521,8 +519,7 @@ class StateBoundaryDetector:
             return self._cluster_kmeans(distance_matrix)
         else:
             logger.warning(
-                f"Unknown clustering algorithm: {self.config.clustering_algorithm}, "
-                "using DBSCAN"
+                f"Unknown clustering algorithm: {self.config.clustering_algorithm}, " "using DBSCAN"
             )
             return self._cluster_dbscan(distance_matrix)
 
@@ -647,9 +644,7 @@ class StateBoundaryDetector:
 
         return states
 
-    def _find_representative_frame(
-        self, cluster_indices: List[int], frames: List[Frame]
-    ) -> int:
+    def _find_representative_frame(self, cluster_indices: List[int], frames: List[Frame]) -> int:
         """Find the most representative frame in a cluster.
 
         This finds the frame that is most similar to all other frames in the cluster,

@@ -107,9 +107,9 @@ class ProcessingStep:
             New ProcessingStep instance
         """
         # Remove computed properties
-        data_copy = {k: v for k, v in data.items() if k not in [
-            "duration", "duration_ms", "throughput"
-        ]}
+        data_copy = {
+            k: v for k, v in data.items() if k not in ["duration", "duration_ms", "throughput"]
+        }
 
         return cls(
             name=data_copy["name"],

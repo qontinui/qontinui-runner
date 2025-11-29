@@ -46,6 +46,7 @@ class VideoCaptureConfig:
         resolution: Resolution setting (default: native)
         audio: Whether to capture audio (default: False)
     """
+
     fps: int = 30
     codec: str = "h264"
     quality: str = "high"  # high, medium, low
@@ -64,7 +65,7 @@ class VideoCaptureConfig:
         quality_map = {
             "high": {"local": 18, "stream": 28},
             "medium": {"local": 23, "stream": 30},
-            "low": {"local": 28, "stream": 32}
+            "low": {"local": 28, "stream": 32},
         }
         return quality_map.get(self.quality, quality_map["high"])[stream_type]
 
@@ -78,6 +79,7 @@ class CompressedStreamConfig:
         resolution: Target resolution as (width, height) tuple (default: 1280x720)
         bitrate: Target bitrate (default: 1M)
     """
+
     fps: int = 10
     resolution: Tuple[int, int] = (1280, 720)
     bitrate: str = "1M"
@@ -97,6 +99,7 @@ class VideoRecordingSession:
         frame_timestamps: List of frame timestamps for correlation
         config: Video capture configuration used
     """
+
     session_id: str
     start_time: float
     local_output_path: Path
@@ -156,7 +159,7 @@ class VideoCaptureService:
         self,
         session_id: str,
         config: Optional[VideoCaptureConfig] = None,
-        stream_config: Optional[CompressedStreamConfig] = None
+        stream_config: Optional[CompressedStreamConfig] = None,
     ) -> bool:
         """Start a new video recording session.
 
@@ -205,7 +208,7 @@ class VideoCaptureService:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     stdin=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
 
                 # Wait a moment to check if process started successfully
@@ -213,7 +216,7 @@ class VideoCaptureService:
                 if process.poll() is not None:
                     # Process terminated immediately - capture error
                     _, stderr = process.communicate()
-                    error_msg = stderr.decode('utf-8', errors='ignore')
+                    error_msg = stderr.decode("utf-8", errors="ignore")
                     logger.error(f"FFmpeg failed to start: {error_msg}")
                     return False
 
@@ -225,7 +228,7 @@ class VideoCaptureService:
                     stream_output_path=stream_path,
                     metadata_path=metadata_path,
                     process=process,
-                    config=config
+                    config=config,
                 )
 
                 # Start timestamp tracking thread
@@ -243,6 +246,7 @@ class VideoCaptureService:
             except Exception as e:
                 logger.error(f"Failed to start recording: {type(e).__name__}: {e}")
                 import traceback
+
                 traceback.print_exc(file=sys.stderr)
                 return False
 
@@ -272,7 +276,7 @@ class VideoCaptureService:
                 # Send 'q' to FFmpeg to gracefully stop
                 if session.process and session.process.poll() is None:
                     try:
-                        session.process.stdin.write(b'q')
+                        session.process.stdin.write(b"q")
                         session.process.stdin.flush()
                     except Exception as e:
                         logger.warning(f"Failed to send quit command to FFmpeg: {e}")
@@ -300,6 +304,7 @@ class VideoCaptureService:
             except Exception as e:
                 logger.error(f"Error stopping recording: {type(e).__name__}: {e}")
                 import traceback
+
                 traceback.print_exc(file=sys.stderr)
                 return None
 
@@ -357,7 +362,7 @@ class VideoCaptureService:
                 "frame_count": len(session.frame_timestamps),
                 "local_output": str(session.local_output_path),
                 "stream_output": str(session.stream_output_path),
-                "is_running": self.is_recording()
+                "is_running": self.is_recording(),
             }
 
     def cleanup(self) -> None:
@@ -371,7 +376,7 @@ class VideoCaptureService:
         local_path: Path,
         stream_path: Path,
         config: VideoCaptureConfig,
-        stream_config: CompressedStreamConfig
+        stream_config: CompressedStreamConfig,
     ) -> List[str]:
         """Build the FFmpeg command for dual-output recording.
 
@@ -389,26 +394,25 @@ class VideoCaptureService:
         # Platform-specific input configuration
         if self._platform == "Windows":
             # Windows: gdigrab
-            cmd.extend([
-                "-f", "gdigrab",
-                "-framerate", str(config.fps),
-                "-i", "desktop"
-            ])
+            cmd.extend(["-f", "gdigrab", "-framerate", str(config.fps), "-i", "desktop"])
         elif self._platform == "Darwin":
             # macOS: avfoundation
             # Note: May require screen recording permissions
-            cmd.extend([
-                "-f", "avfoundation",
-                "-framerate", str(config.fps),
-                "-i", "1:none"  # Capture screen 1, no audio
-            ])
+            cmd.extend(
+                [
+                    "-f",
+                    "avfoundation",
+                    "-framerate",
+                    str(config.fps),
+                    "-i",
+                    "1:none",  # Capture screen 1, no audio
+                ]
+            )
         elif self._platform == "Linux":
             # Linux: x11grab
-            cmd.extend([
-                "-f", "x11grab",
-                "-framerate", str(config.fps),
-                "-i", ":0.0"  # Display :0.0
-            ])
+            cmd.extend(
+                ["-f", "x11grab", "-framerate", str(config.fps), "-i", ":0.0"]  # Display :0.0
+            )
         else:
             raise RuntimeError(f"Unsupported platform: {self._platform}")
 
@@ -423,35 +427,46 @@ class VideoCaptureService:
         stream_crf = config.get_crf_value("stream")
 
         # Local output: full quality
-        cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "ultrafast",  # Faster encoding for real-time
-            "-crf", str(local_crf),
-            "-pix_fmt", "yuv420p",
-            str(local_path)
-        ])
+        cmd.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",  # Faster encoding for real-time
+                "-crf",
+                str(local_crf),
+                "-pix_fmt",
+                "yuv420p",
+                str(local_path),
+            ]
+        )
 
         # Compressed stream output: lower quality/resolution
         stream_width, stream_height = stream_config.resolution
-        cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "ultrafast",
-            "-crf", str(stream_crf),
-            "-vf", f"fps={stream_config.fps},scale={stream_width}:{stream_height}",
-            "-b:v", stream_config.bitrate,
-            "-pix_fmt", "yuv420p",
-            str(stream_path)
-        ])
+        cmd.extend(
+            [
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-crf",
+                str(stream_crf),
+                "-vf",
+                f"fps={stream_config.fps},scale={stream_width}:{stream_height}",
+                "-b:v",
+                stream_config.bitrate,
+                "-pix_fmt",
+                "yuv420p",
+                str(stream_path),
+            ]
+        )
 
         return cmd
 
     def _start_timestamp_tracking(self) -> None:
         """Start background thread to track frame timestamps."""
         self._stop_timestamp_tracking.clear()
-        self._timestamp_thread = threading.Thread(
-            target=self._track_timestamps,
-            daemon=True
-        )
+        self._timestamp_thread = threading.Thread(target=self._track_timestamps, daemon=True)
         self._timestamp_thread.start()
 
     def _track_timestamps(self) -> None:
@@ -502,8 +517,8 @@ class VideoCaptureService:
                 "codec": session.config.codec if session.config else "h264",
                 "quality": session.config.quality if session.config else "high",
                 "resolution": session.config.resolution if session.config else "native",
-                "audio": session.config.audio if session.config else False
-            }
+                "audio": session.config.audio if session.config else False,
+            },
         }
 
         if end_time is not None:
@@ -513,8 +528,7 @@ class VideoCaptureService:
 
         try:
             session.metadata_path.write_text(
-                json.dumps(metadata, indent=2, ensure_ascii=False),
-                encoding="utf-8"
+                json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
             )
         except Exception as e:
             logger.error(f"Failed to write metadata: {e}")

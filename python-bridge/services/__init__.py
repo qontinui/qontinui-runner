@@ -14,5 +14,5 @@ __all__ = [
     "VideoCaptureService",
     "InputMonitorService",
     "FrameExtractorService",
-    "EventFilter"
+    "EventFilter",
 ]

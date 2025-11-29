@@ -25,8 +25,7 @@ from models import InputMonitorEvent, ProcessingResult
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -45,7 +44,7 @@ class CloudStreamingSession:
         jwt_token: str,
         session_id: str,
         storage_dir: Path,
-        config: Optional[StreamConfig] = None
+        config: Optional[StreamConfig] = None,
     ):
         """Initialize cloud streaming session.
 
@@ -140,11 +139,11 @@ class CloudStreamingSession:
 
         # Add session-specific stats
         session_duration = time.time() - self.start_time if self.start_time else 0
-        stats['session_id'] = self.session_id
-        stats['session_duration_seconds'] = session_duration
-        stats['session_duration_minutes'] = session_duration / 60.0
-        stats['errors'] = len(self.errors)
-        stats['error_messages'] = self.errors
+        stats["session_id"] = self.session_id
+        stats["session_duration_seconds"] = session_duration
+        stats["session_duration_minutes"] = session_duration / 60.0
+        stats["errors"] = len(self.errors)
+        stats["error_messages"] = self.errors
 
         # Disconnect from cloud
         await self.cloud_service.disconnect()
@@ -174,7 +173,7 @@ class CloudStreamingSession:
                 chunk=chunk,
                 timestamp=timestamp,
                 chunk_index=self.chunk_index,
-                frame_number=frame_number
+                frame_number=frame_number,
             )
 
             if success:
@@ -214,14 +213,11 @@ class CloudStreamingSession:
 
         try:
             success = await self.cloud_service.stream_events(
-                session_id=self.session_id,
-                events=self.event_buffer
+                session_id=self.session_id, events=self.event_buffer
             )
 
             if success:
-                logger.debug(
-                    f"[{self.session_id}] Streamed {len(self.event_buffer)} events"
-                )
+                logger.debug(f"[{self.session_id}] Streamed {len(self.event_buffer)} events")
                 self.event_buffer.clear()
             else:
                 logger.error(f"[{self.session_id}] Failed to stream events")
@@ -247,7 +243,7 @@ class CloudStreamingSession:
                 session_id=self.session_id,
                 frame_number=frame_number,
                 image=image,
-                timestamp=time.time()
+                timestamp=time.time(),
             )
 
             if success:
@@ -275,8 +271,7 @@ class CloudStreamingSession:
 
         try:
             success = await self.cloud_service.stream_processed_data(
-                session_id=self.session_id,
-                data=data
+                session_id=self.session_id, data=data
             )
 
             if success:
@@ -294,9 +289,7 @@ class CloudStreamingSession:
             return False
 
     async def upload_screenshots(
-        self,
-        screenshot_paths: List[str],
-        request_id: Optional[str] = None
+        self, screenshot_paths: List[str], request_id: Optional[str] = None
     ) -> bool:
         """Upload full-size screenshots to cloud.
 
@@ -309,15 +302,11 @@ class CloudStreamingSession:
         """
         try:
             success = await self.cloud_service.upload_screenshots(
-                session_id=self.session_id,
-                screenshots=screenshot_paths,
-                request_id=request_id
+                session_id=self.session_id, screenshots=screenshot_paths, request_id=request_id
             )
 
             if success:
-                logger.info(
-                    f"[{self.session_id}] Uploaded {len(screenshot_paths)} screenshots"
-                )
+                logger.info(f"[{self.session_id}] Uploaded {len(screenshot_paths)} screenshots")
             else:
                 logger.error(f"[{self.session_id}] Failed to upload screenshots")
 
@@ -337,10 +326,10 @@ class CloudStreamingSession:
 
         # Add session-specific stats
         if self.start_time:
-            stats['session_duration_seconds'] = time.time() - self.start_time
+            stats["session_duration_seconds"] = time.time() - self.start_time
 
-        stats['event_buffer_size'] = len(self.event_buffer)
-        stats['error_count'] = len(self.errors)
+        stats["event_buffer_size"] = len(self.event_buffer)
+        stats["error_count"] = len(self.errors)
 
         return stats
 
@@ -375,7 +364,7 @@ async def example_complete_session():
         jwt_token=JWT_TOKEN,
         session_id=SESSION_ID,
         storage_dir=STORAGE_DIR,
-        config=config
+        config=config,
     )
 
     # Start session
@@ -393,10 +382,7 @@ async def example_complete_session():
         for second in range(duration):
             # Stream video chunk (simulated)
             video_chunk = b"VIDEO_DATA" * 12800  # ~125 KB
-            await session.stream_video_chunk(
-                chunk=video_chunk,
-                frame_number=second * 10
-            )
+            await session.stream_video_chunk(chunk=video_chunk, frame_number=second * 10)
 
             # Add simulated events
             for i in range(10):
@@ -405,17 +391,14 @@ async def example_complete_session():
                     frame_number=second * 10 + i,
                     event_type="mouse_move",
                     x=100 + i * 10,
-                    y=200 + i * 5
+                    y=200 + i * 5,
                 )
                 await session.add_event(event)
 
             # Stream thumbnail every 10 seconds
             if second % 10 == 0:
                 thumbnail_image = b"THUMBNAIL_DATA" * 1000  # ~10 KB
-                await session.stream_thumbnail(
-                    image=thumbnail_image,
-                    frame_number=second * 10
-                )
+                await session.stream_thumbnail(image=thumbnail_image, frame_number=second * 10)
 
             # Log statistics every 10 seconds
             if second % 10 == 0:
@@ -481,7 +464,7 @@ async def example_error_recovery():
         websocket_url="wss://api.example.com/ws/stream",
         on_connected=on_connected,
         on_disconnected=on_disconnected,
-        on_error=on_error
+        on_error=on_error,
     )
 
     # Attempt connection (will fail without real server)

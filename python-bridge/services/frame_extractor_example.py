@@ -29,7 +29,7 @@ def load_events_from_jsonl(jsonl_path: str) -> List[InputMonitorEvent]:
         List of InputMonitorEvent objects
     """
     events = []
-    with open(jsonl_path, 'r') as f:
+    with open(jsonl_path, "r") as f:
         for line in f:
             if line.strip():
                 data = json.loads(line)
@@ -41,7 +41,7 @@ def create_training_dataset(
     video_path: str,
     events: List[InputMonitorEvent],
     output_dir: Path,
-    filter_config: Dict[str, Any]
+    filter_config: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Create a training dataset from video and events.
 
@@ -73,7 +73,7 @@ def create_training_dataset(
         include_after_delay_ms=filter_config.get("delay_ms", 0),
         max_count=filter_config.get("max_count"),
         time_range=filter_config.get("time_range"),
-        modifiers=filter_config.get("modifiers")
+        modifiers=filter_config.get("modifiers"),
     )
 
     print(f"\nFilter configuration:")
@@ -97,10 +97,7 @@ def create_training_dataset(
     print(f"\nSaving frames...")
     frames_dir = output_dir / "frames"
     saved_paths = extractor.save_frames_batch(
-        frames,
-        str(frames_dir),
-        filename_pattern="frame_{frame_number:05d}",
-        format="png"
+        frames, str(frames_dir), filename_pattern="frame_{frame_number:05d}", format="png"
     )
 
     # Create manifest with metadata
@@ -109,7 +106,7 @@ def create_training_dataset(
         "total_events": len(events),
         "filtered_events": len(frames),
         "filter_config": filter_config,
-        "frames": []
+        "frames": [],
     }
 
     for frame, path in zip(frames, saved_paths):
@@ -118,13 +115,13 @@ def create_training_dataset(
             "timestamp": frame.timestamp,
             "frame_number": frame.frame_number,
             "source_event": frame.source_event,
-            "metadata": frame.metadata
+            "metadata": frame.metadata,
         }
         manifest["frames"].append(frame_info)
 
     # Save manifest
     manifest_path = output_dir / "dataset_manifest.json"
-    with open(manifest_path, 'w') as f:
+    with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
     print(f"\nDataset created successfully!")
@@ -134,14 +131,12 @@ def create_training_dataset(
     return {
         "frame_count": len(frames),
         "manifest_path": str(manifest_path),
-        "frames_dir": str(frames_dir)
+        "frames_dir": str(frames_dir),
     }
 
 
 def analyze_click_patterns(
-    video_path: str,
-    events: List[InputMonitorEvent],
-    output_dir: Path
+    video_path: str, events: List[InputMonitorEvent], output_dir: Path
 ) -> None:
     """Analyze and visualize click patterns from video.
 
@@ -165,7 +160,7 @@ def analyze_click_patterns(
         filter = EventFilter(
             event_types=["mouse_click"],
             buttons=[button],
-            include_after_delay_ms=50  # Capture 50ms after click for visual feedback
+            include_after_delay_ms=50,  # Capture 50ms after click for visual feedback
         )
 
         frames = extractor.extract_at_events(video_path, events, filter)
@@ -176,7 +171,7 @@ def analyze_click_patterns(
                 frames,
                 str(button_dir),
                 filename_pattern=f"{button}_{{frame_number:04d}}",
-                format="jpg"
+                format="jpg",
             )
             print(f"  Saved {len(saved_paths)} {button} click frames")
 
@@ -187,20 +182,18 @@ def analyze_click_patterns(
                 "timestamps": [f.timestamp for f in frames],
                 "positions": [
                     {"x": f.source_event.get("x"), "y": f.source_event.get("y")}
-                    for f in frames if f.source_event
-                ]
+                    for f in frames
+                    if f.source_event
+                ],
             }
 
             summary_path = button_dir / "summary.json"
-            with open(summary_path, 'w') as f:
+            with open(summary_path, "w") as f:
                 json.dump(summary, f, indent=2)
 
 
 def create_video_thumbnail_strip(
-    video_path: str,
-    output_dir: Path,
-    interval_sec: float = 1.0,
-    max_frames: int = 10
+    video_path: str, output_dir: Path, interval_sec: float = 1.0, max_frames: int = 10
 ) -> None:
     """Create a thumbnail strip from video.
 
@@ -219,27 +212,18 @@ def create_video_thumbnail_strip(
 
     # Extract at intervals
     frames = extractor.extract_at_interval(
-        video_path,
-        interval_ms=int(interval_sec * 1000),
-        max_count=max_frames
+        video_path, interval_ms=int(interval_sec * 1000), max_count=max_frames
     )
 
     if frames:
         thumbnails_dir = output_dir / "thumbnails"
         saved_paths = extractor.save_frames_batch(
-            frames,
-            str(thumbnails_dir),
-            filename_pattern="thumb_{timestamp:.1f}s",
-            format="jpg"
+            frames, str(thumbnails_dir), filename_pattern="thumb_{timestamp:.1f}s", format="jpg"
         )
         print(f"Created {len(saved_paths)} thumbnails in {thumbnails_dir}")
 
 
-def extract_key_moments(
-    video_path: str,
-    events: List[InputMonitorEvent],
-    output_dir: Path
-) -> None:
+def extract_key_moments(video_path: str, events: List[InputMonitorEvent], output_dir: Path) -> None:
     """Extract frames at key moments based on event patterns.
 
     Identifies "key moments" such as:
@@ -258,43 +242,34 @@ def extract_key_moments(
 
     # Key moment 1: Keyboard shortcuts with Ctrl
     print("\n1. Keyboard shortcuts (Ctrl+Key)...")
-    filter1 = EventFilter(
-        event_types=["key_press"],
-        modifiers=["ctrl"],
-        include_after_delay_ms=200
-    )
+    filter1 = EventFilter(event_types=["key_press"], modifiers=["ctrl"], include_after_delay_ms=200)
     shortcut_frames = extractor.extract_at_events(video_path, events, filter1)
     if shortcut_frames:
         extractor.save_frames_batch(
             shortcut_frames,
             str(output_dir / "shortcuts"),
             filename_pattern="shortcut_{frame_number:04d}",
-            format="png"
+            format="png",
         )
         print(f"   Found {len(shortcut_frames)} keyboard shortcuts")
 
     # Key moment 2: First 5 clicks
     print("\n2. First 5 clicks...")
-    filter2 = EventFilter(
-        event_types=["mouse_click"],
-        max_count=5
-    )
+    filter2 = EventFilter(event_types=["mouse_click"], max_count=5)
     first_clicks = extractor.extract_at_events(video_path, events, filter2)
     if first_clicks:
         extractor.save_frames_batch(
             first_clicks,
             str(output_dir / "first_clicks"),
             filename_pattern="click_{frame_number:04d}",
-            format="png"
+            format="png",
         )
         print(f"   Saved {len(first_clicks)} initial clicks")
 
     # Key moment 3: Right clicks (context menu actions)
     print("\n3. Right clicks (context menus)...")
     filter3 = EventFilter(
-        event_types=["mouse_click"],
-        buttons=["right"],
-        include_after_delay_ms=100
+        event_types=["mouse_click"], buttons=["right"], include_after_delay_ms=100
     )
     context_frames = extractor.extract_at_events(video_path, events, filter3)
     if context_frames:
@@ -302,7 +277,7 @@ def extract_key_moments(
             context_frames,
             str(output_dir / "context_menus"),
             filename_pattern="context_{frame_number:04d}",
-            format="png"
+            format="png",
         )
         print(f"   Found {len(context_frames)} context menu actions")
 
@@ -326,16 +301,13 @@ def main():
     # Simulate having events
     sample_events = [
         InputMonitorEvent(
-            timestamp=1.0, frame_number=30, event_type="mouse_click",
-            x=100, y=200, button="left"
+            timestamp=1.0, frame_number=30, event_type="mouse_click", x=100, y=200, button="left"
         ),
         InputMonitorEvent(
-            timestamp=2.0, frame_number=60, event_type="mouse_click",
-            x=150, y=250, button="left"
+            timestamp=2.0, frame_number=60, event_type="mouse_click", x=150, y=250, button="left"
         ),
         InputMonitorEvent(
-            timestamp=3.0, frame_number=90, event_type="key_press",
-            key="enter", modifiers=["ctrl"]
+            timestamp=3.0, frame_number=90, event_type="key_press", key="enter", modifiers=["ctrl"]
         ),
     ]
 
@@ -343,7 +315,7 @@ def main():
         "event_types": ["mouse_click", "key_press"],
         "buttons": ["left", "right"],
         "delay_ms": 100,
-        "max_count": 50
+        "max_count": 50,
     }
 
     # Note: Uncomment to run with actual video file

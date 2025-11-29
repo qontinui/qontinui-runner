@@ -23,8 +23,7 @@ import numpy as np
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s'
+    level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(name)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -80,7 +79,7 @@ def create_mock_session() -> CaptureSession:
         metadata={
             "description": "Mock session for demonstration",
             "app_name": "Demo Application",
-        }
+        },
     )
 
     logger.info("Created mock session: %d frames, %d events", len(frames), len(events))
@@ -120,7 +119,7 @@ def example_basic_usage():
             step.input_count,
             step.output_count,
             step.duration_ms,
-            "SUCCESS" if step.success else "FAILED"
+            "SUCCESS" if step.success else "FAILED",
         )
 
     # Print state details
@@ -133,7 +132,7 @@ def example_basic_usage():
                 state.start_frame_index,
                 state.end_frame_index,
                 len(state.frame_indices),
-                len(state.state_images)
+                len(state.state_images),
             )
 
     # Print transition details
@@ -145,7 +144,7 @@ def example_basic_usage():
                 transition.id,
                 transition.get_primary_source_state(),
                 transition.get_primary_target_state(),
-                transition.action_type
+                transition.action_type,
             )
 
     return result
@@ -163,13 +162,11 @@ def example_custom_configuration():
         state_similarity_threshold=0.95,
         min_state_duration_ms=300,
         clustering_algorithm="hierarchical",
-
         # More aggressive image extraction
         extract_at_clicks=True,
         click_region_padding=30,
         extract_from_contours=True,
         max_contours=100,
-
         # Wider event correlation window
         event_correlation_window_ms=1500,
     )
@@ -293,8 +290,9 @@ def example_rerun_with_new_config():
     logger.info("Initial run with default configuration...")
     pipeline = AnalysisPipeline()
     result1 = pipeline.analyze_session(session)
-    logger.info("Initial results: %d states, %d transitions",
-               len(result1.states), len(result1.transitions))
+    logger.info(
+        "Initial results: %d states, %d transitions", len(result1.states), len(result1.transitions)
+    )
 
     # Create new configuration
     new_config = PipelineConfig(
@@ -307,14 +305,17 @@ def example_rerun_with_new_config():
     # Re-run with new configuration
     logger.info("\nRe-running with updated configuration...")
     result2 = pipeline.rerun_with_config(session, new_config)
-    logger.info("Updated results: %d states, %d transitions",
-               len(result2.states), len(result2.transitions))
+    logger.info(
+        "Updated results: %d states, %d transitions", len(result2.states), len(result2.transitions)
+    )
 
     # Compare
     comparison = pipeline.compare_results(result1, result2)
-    logger.info("\nDifference: %+d states, %+d transitions",
-               comparison["differences"]["states_delta"],
-               comparison["differences"]["transitions_delta"])
+    logger.info(
+        "\nDifference: %+d states, %+d transitions",
+        comparison["differences"]["states_delta"],
+        comparison["differences"]["transitions_delta"],
+    )
 
     return result1, result2
 

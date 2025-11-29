@@ -22,10 +22,7 @@ class TestActionExecutionRecordCreation:
 
     def test_create_with_minimal_fields(self):
         """Test creating record with only required fields."""
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK"
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK")
 
         assert record.action_id == "test-001"
         assert record.action_type == "CLICK"
@@ -66,7 +63,7 @@ class TestActionExecutionRecordCreation:
             nesting_level=1,
             screenshot_reference="screenshots/test.png",
             visual_debug_reference="debug/test.png",
-            metadata={"custom": "data"}
+            metadata={"custom": "data"},
         )
 
         assert record.action_id == "test-002"
@@ -92,31 +89,21 @@ class TestActionExecutionRecordImmutability:
 
     def test_cannot_modify_action_id(self):
         """Test that action_id cannot be modified after creation."""
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK"
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK")
 
         with pytest.raises(FrozenInstanceError):
             record.action_id = "new-id"
 
     def test_cannot_modify_action_type(self):
         """Test that action_type cannot be modified after creation."""
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK"
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK")
 
         with pytest.raises(FrozenInstanceError):
             record.action_type = "TYPE"
 
     def test_cannot_modify_success(self):
         """Test that success flag cannot be modified after creation."""
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK",
-            success=True
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK", success=True)
 
         with pytest.raises(FrozenInstanceError):
             record.success = False
@@ -124,9 +111,7 @@ class TestActionExecutionRecordImmutability:
     def test_cannot_modify_active_states(self):
         """Test that active states cannot be modified after creation."""
         record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK",
-            active_states_before=frozenset(["Login"])
+            action_id="test-001", action_type="CLICK", active_states_before=frozenset(["Login"])
         )
 
         with pytest.raises(FrozenInstanceError):
@@ -135,11 +120,7 @@ class TestActionExecutionRecordImmutability:
     def test_config_dict_is_separate_instance(self):
         """Test that modifying source dict doesn't affect record."""
         config = {"x": 100, "y": 200}
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK",
-            config=config
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK", config=config)
 
         # Modify source dict
         config["x"] = 500
@@ -154,30 +135,20 @@ class TestComputedProperties:
     def test_duration_seconds_with_duration_ms(self):
         """Test duration_seconds calculation from duration_ms."""
         record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK",
-            duration_ms=1500.0
+            action_id="test-001", action_type="CLICK", duration_ms=1500.0
         )
 
         assert record.duration_seconds == 1.5
 
     def test_duration_seconds_without_duration_ms(self):
         """Test duration_seconds returns None when duration_ms is None."""
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK",
-            duration_ms=None
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK", duration_ms=None)
 
         assert record.duration_seconds is None
 
     def test_duration_seconds_zero(self):
         """Test duration_seconds with zero duration."""
-        record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="CLICK",
-            duration_ms=0.0
-        )
+        record = ActionExecutionRecord(action_id="test-001", action_type="CLICK", duration_ms=0.0)
 
         assert record.duration_seconds == 0.0
 
@@ -187,7 +158,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Dashboard"])
+            active_states_after=frozenset(["Dashboard"]),
         )
 
         assert record.state_changed is True
@@ -198,7 +169,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="CLICK",
             active_states_before=frozenset(["Login", "MainMenu"]),
-            active_states_after=frozenset(["Login", "MainMenu"])
+            active_states_after=frozenset(["Login", "MainMenu"]),
         )
 
         assert record.state_changed is False
@@ -209,7 +180,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="CLICK",
             active_states_before=frozenset(),
-            active_states_after=frozenset()
+            active_states_after=frozenset(),
         )
 
         assert record.state_changed is False
@@ -220,7 +191,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login", "Dashboard"])
+            active_states_after=frozenset(["Login", "Dashboard"]),
         )
 
         assert record.states_activated == frozenset(["Dashboard"])
@@ -231,7 +202,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login", "Dashboard", "Settings"])
+            active_states_after=frozenset(["Login", "Dashboard", "Settings"]),
         )
 
         assert record.states_activated == frozenset(["Dashboard", "Settings"])
@@ -242,7 +213,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="CLICK",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login"])
+            active_states_after=frozenset(["Login"]),
         )
 
         assert record.states_activated == frozenset()
@@ -253,7 +224,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login", "Dashboard"]),
-            active_states_after=frozenset(["Dashboard"])
+            active_states_after=frozenset(["Dashboard"]),
         )
 
         assert record.states_deactivated == frozenset(["Login"])
@@ -264,7 +235,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login", "Dashboard", "Settings"]),
-            active_states_after=frozenset(["Dashboard"])
+            active_states_after=frozenset(["Dashboard"]),
         )
 
         assert record.states_deactivated == frozenset(["Login", "Settings"])
@@ -275,7 +246,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="CLICK",
             active_states_before=frozenset(["Login"]),
-            active_states_after=frozenset(["Login"])
+            active_states_after=frozenset(["Login"]),
         )
 
         assert record.states_deactivated == frozenset()
@@ -286,7 +257,7 @@ class TestComputedProperties:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login", "Form"]),
-            active_states_after=frozenset(["Dashboard", "Settings"])
+            active_states_after=frozenset(["Dashboard", "Settings"]),
         )
 
         assert record.state_changed is True
@@ -316,7 +287,7 @@ class TestToTreeEventData:
             workflow_id="workflow-001",
             nesting_level=1,
             screenshot_reference="screenshots/test.png",
-            metadata={"custom": "data"}
+            metadata={"custom": "data"},
         )
 
         event_data = record.to_tree_event_data()
@@ -349,7 +320,7 @@ class TestToTreeEventData:
             duration_ms=1000.0,
             success=False,
             error_message="Image not found",
-            retry_count=3
+            retry_count=3,
         )
 
         event_data = record.to_tree_event_data()
@@ -368,7 +339,7 @@ class TestToTreeEventData:
             start_time=start,
             end_time=None,
             duration_ms=None,
-            success=True
+            success=True,
         )
 
         event_data = record.to_tree_event_data()
@@ -383,7 +354,7 @@ class TestToTreeEventData:
             action_id="test-004",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login", "Form"]),
-            active_states_after=frozenset(["Dashboard", "Settings"])
+            active_states_after=frozenset(["Dashboard", "Settings"]),
         )
 
         event_data = record.to_tree_event_data()
@@ -402,9 +373,7 @@ class TestFormatRuntimeForDisplay:
     def test_format_runtime_typed_text(self):
         """Test runtime formatting for TYPE action with typed text."""
         record = ActionExecutionRecord(
-            action_id="test-001",
-            action_type="TYPE",
-            typed_text="hello@example.com"
+            action_id="test-001", action_type="TYPE", typed_text="hello@example.com"
         )
 
         runtime = record._format_runtime_for_display()
@@ -422,8 +391,8 @@ class TestFormatRuntimeForDisplay:
                 "confidence": 0.95,
                 "threshold": 0.8,
                 "found": True,
-                "location": {"x": 100, "y": 200}
-            }
+                "location": {"x": 100, "y": 200},
+            },
         )
 
         runtime = record._format_runtime_for_display()
@@ -439,7 +408,7 @@ class TestFormatRuntimeForDisplay:
             action_type="CLICK",
             clicked_location=(150, 250),
             click_button="left",
-            click_target_type="button"
+            click_target_type="button",
         )
 
         runtime = record._format_runtime_for_display()
@@ -457,8 +426,8 @@ class TestFormatRuntimeForDisplay:
             transition_data={
                 "from_state": "Login",
                 "to_state": "Dashboard",
-                "transition_type": "navigation"
-            }
+                "transition_type": "navigation",
+            },
         )
 
         runtime = record._format_runtime_for_display()
@@ -469,10 +438,7 @@ class TestFormatRuntimeForDisplay:
     def test_format_runtime_condition_result(self):
         """Test runtime formatting for IF action with condition result."""
         record = ActionExecutionRecord(
-            action_id="test-005",
-            action_type="IF",
-            condition_result=True,
-            branch_taken="then"
+            action_id="test-005", action_type="IF", condition_result=True, branch_taken="then"
         )
 
         runtime = record._format_runtime_for_display()
@@ -482,10 +448,7 @@ class TestFormatRuntimeForDisplay:
 
     def test_format_runtime_empty_when_no_data(self):
         """Test runtime formatting returns empty dict when no runtime data."""
-        record = ActionExecutionRecord(
-            action_id="test-006",
-            action_type="WAIT"
-        )
+        record = ActionExecutionRecord(action_id="test-006", action_type="WAIT")
 
         runtime = record._format_runtime_for_display()
 
@@ -499,7 +462,7 @@ class TestFormatRuntimeForDisplay:
             typed_text="test",
             clicked_location=(100, 200),
             click_button="left",
-            match_summary={"found": True}
+            match_summary={"found": True},
         )
 
         runtime = record._format_runtime_for_display()
@@ -519,7 +482,7 @@ class TestStateChangeDetection:
             action_id="test-001",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(),
-            active_states_after=frozenset(["Login"])
+            active_states_after=frozenset(["Login"]),
         )
 
         assert record.state_changed is True
@@ -532,7 +495,7 @@ class TestStateChangeDetection:
             action_id="test-002",
             action_type="RESET",
             active_states_before=frozenset(["Login", "Dashboard"]),
-            active_states_after=frozenset()
+            active_states_after=frozenset(),
         )
 
         assert record.state_changed is True
@@ -547,7 +510,7 @@ class TestStateChangeDetection:
             action_id="test-003",
             action_type="CLICK",
             active_states_before=states,
-            active_states_after=states
+            active_states_after=states,
         )
 
         assert record.state_changed is False
@@ -560,7 +523,7 @@ class TestStateChangeDetection:
             action_id="test-004",
             action_type="GO_TO_STATE",
             active_states_before=frozenset(["Login", "MainMenu"]),
-            active_states_after=frozenset(["MainMenu", "Dashboard"])
+            active_states_after=frozenset(["MainMenu", "Dashboard"]),
         )
 
         assert record.state_changed is True

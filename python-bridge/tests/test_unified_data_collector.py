@@ -29,10 +29,7 @@ class TestUnifiedDataCollectorInitialization:
 
     def test_init_with_state_memory(self, mock_state_memory):
         """Test initialization with state_memory."""
-        collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=None
-        )
+        collector = UnifiedDataCollector(state_memory=mock_state_memory, screenshot_service=None)
 
         assert collector.state_memory is mock_state_memory
         assert collector.screenshot_service is None
@@ -41,8 +38,7 @@ class TestUnifiedDataCollectorInitialization:
     def test_init_with_screenshot_service(self, mock_state_memory, mock_screenshot_service):
         """Test initialization with screenshot_service."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
 
         assert collector.state_memory is mock_state_memory
@@ -50,10 +46,7 @@ class TestUnifiedDataCollectorInitialization:
 
     def test_init_without_services(self):
         """Test initialization with None services."""
-        collector = UnifiedDataCollector(
-            state_memory=None,
-            screenshot_service=None
-        )
+        collector = UnifiedDataCollector(state_memory=None, screenshot_service=None)
 
         assert collector.state_memory is None
         assert collector.screenshot_service is None
@@ -71,7 +64,7 @@ class TestStartAction:
             action_id="action-001",
             parent_action_id=None,
             workflow_id="workflow-001",
-            nesting_level=0
+            nesting_level=0,
         )
 
         assert collector._current_action_id == "action-001"
@@ -101,7 +94,7 @@ class TestStartAction:
             action_id="action-child",
             parent_action_id="action-parent",
             workflow_id="workflow-001",
-            nesting_level=2
+            nesting_level=2,
         )
 
         assert collector._current_action_id == "action-child"
@@ -162,7 +155,7 @@ class TestRecordMatchResult:
             "confidence": 0.95,
             "threshold": 0.8,
             "found": True,
-            "location": {"x": 100, "y": 200}
+            "location": {"x": 100, "y": 200},
         }
 
         collector.record_match_result(match_summary)
@@ -176,21 +169,13 @@ class TestRecordMatchResult:
     ):
         """Test recording match result with screenshot data."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
-        match_summary = {
-            "image_id": "button.png",
-            "confidence": 0.95,
-            "found": True
-        }
+        match_summary = {"image_id": "button.png", "confidence": 0.95, "found": True}
 
-        collector.record_match_result(
-            match_summary=match_summary,
-            screenshot_data=sample_png_bytes
-        )
+        collector.record_match_result(match_summary=match_summary, screenshot_data=sample_png_bytes)
 
         # Verify screenshot service was called
         mock_screenshot_service.store_screenshot.assert_called_once()
@@ -204,16 +189,14 @@ class TestRecordMatchResult:
     ):
         """Test recording match result with debug visual data."""
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
         match_summary = {"image_id": "button.png", "found": True}
 
         collector.record_match_result(
-            match_summary=match_summary,
-            debug_visual_data=sample_png_bytes
+            match_summary=match_summary, debug_visual_data=sample_png_bytes
         )
 
         # Verify debug visual service was called
@@ -286,7 +269,7 @@ class TestRecordTransition:
             "from_state": "Login",
             "to_state": "Dashboard",
             "transition_type": "navigation",
-            "success": True
+            "success": True,
         }
 
         collector.record_transition(transition_data)
@@ -349,7 +332,7 @@ class TestCreateRecord:
             config={"x": 100, "y": 200},
             start_time=start,
             end_time=end,
-            success=True
+            success=True,
         )
 
         assert isinstance(record, ActionExecutionRecord)
@@ -366,6 +349,7 @@ class TestCreateRecord:
 
         # Verify record is frozen
         from dataclasses import FrozenInstanceError
+
         with pytest.raises(FrozenInstanceError):
             record.action_id = "new-id"
 
@@ -403,7 +387,7 @@ class TestCreateRecord:
             "confidence": 0.95,
             "threshold": 0.8,
             "found": True,
-            "location": {"x": 100, "y": 200}
+            "location": {"x": 100, "y": 200},
         }
 
         collector.record_match_result(match_summary)
@@ -454,11 +438,7 @@ class TestCreateRecord:
         start = time.time()
         end = start + 0.5
 
-        record = collector.create_record(
-            action_type="CLICK",
-            start_time=start,
-            end_time=end
-        )
+        record = collector.create_record(action_type="CLICK", start_time=start, end_time=end)
 
         assert record.duration_ms == pytest.approx(500.0, rel=1e-6)
 
@@ -468,10 +448,7 @@ class TestCreateRecord:
         collector.start_action("action-001", None, "workflow-001", 0)
 
         record = collector.create_record(
-            action_type="FIND",
-            success=False,
-            error_message="Image not found",
-            retry_count=3
+            action_type="FIND", success=False, error_message="Image not found", retry_count=3
         )
 
         assert record.success is False
@@ -489,16 +466,12 @@ class TestScreenshotServiceIntegration:
         mock_screenshot_service.store_screenshot.return_value = "screenshots/test-0001.png"
 
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
         match_summary = {"image_id": "button.png", "found": True}
-        collector.record_match_result(
-            match_summary=match_summary,
-            screenshot_data=sample_png_bytes
-        )
+        collector.record_match_result(match_summary=match_summary, screenshot_data=sample_png_bytes)
 
         record = collector.create_record(action_type="FIND")
 
@@ -511,15 +484,13 @@ class TestScreenshotServiceIntegration:
         mock_screenshot_service.store_debug_visual.return_value = "debug/test-0001.png"
 
         collector = UnifiedDataCollector(
-            state_memory=mock_state_memory,
-            screenshot_service=mock_screenshot_service
+            state_memory=mock_state_memory, screenshot_service=mock_screenshot_service
         )
         collector.start_action("action-001", None, "workflow-001", 0)
 
         match_summary = {"image_id": "button.png", "found": True}
         collector.record_match_result(
-            match_summary=match_summary,
-            debug_visual_data=sample_png_bytes
+            match_summary=match_summary, debug_visual_data=sample_png_bytes
         )
 
         record = collector.create_record(action_type="FIND")
@@ -544,7 +515,7 @@ class TestThreadSafety:
         threads = [
             threading.Thread(target=record_text, args=("text1",)),
             threading.Thread(target=record_text, args=("text2",)),
-            threading.Thread(target=record_text, args=("text3",))
+            threading.Thread(target=record_text, args=("text3",)),
         ]
 
         for thread in threads:
@@ -565,10 +536,7 @@ class TestThreadSafety:
             for i in range(10):
                 collector.record_click(i, i * 10, "left")
 
-        threads = [
-            threading.Thread(target=record_click),
-            threading.Thread(target=record_click)
-        ]
+        threads = [threading.Thread(target=record_click), threading.Thread(target=record_click)]
 
         for thread in threads:
             thread.start()

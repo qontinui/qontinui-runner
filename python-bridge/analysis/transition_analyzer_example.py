@@ -10,8 +10,7 @@ import numpy as np
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
 from analysis.transition_analyzer import (
@@ -180,7 +179,7 @@ def example_auto_builder():
             "session_id": "example_session_1",
             "application": "DemoApp",
             "capture_date": "2024-01-01",
-        }
+        },
     )
 
     print(f"Capture session:")
@@ -227,6 +226,7 @@ def example_export_to_json():
     # Display JSON structure
     if transition_data:
         import json
+
         print("Transition JSON structure:")
         print(json.dumps(transition_data[0], indent=2, default=str))
         print()
@@ -241,9 +241,9 @@ def example_custom_configuration():
 
     # Create analyzer with tight timing requirements
     strict_analyzer = TransitionAnalyzer(
-        event_correlation_window_ms=200,   # Very tight window
-        click_proximity_threshold=25,       # Precise click matching
-        min_visual_change_score=0.3,        # Higher change threshold
+        event_correlation_window_ms=200,  # Very tight window
+        click_proximity_threshold=25,  # Precise click matching
+        min_visual_change_score=0.3,  # Higher change threshold
     )
 
     print("Strict analyzer configuration:")
@@ -263,8 +263,8 @@ def example_custom_configuration():
     # Create analyzer with relaxed requirements
     relaxed_analyzer = TransitionAnalyzer(
         event_correlation_window_ms=2000,  # Wide window
-        click_proximity_threshold=100,      # Large click area
-        min_visual_change_score=0.05,       # Low change threshold
+        click_proximity_threshold=100,  # Large click area
+        min_visual_change_score=0.05,  # Low change threshold
     )
 
     print("Relaxed analyzer configuration:")
@@ -301,6 +301,7 @@ def main():
     except Exception as e:
         print(f"\nError running examples: {e}")
         import traceback
+
         traceback.print_exc()
 
 

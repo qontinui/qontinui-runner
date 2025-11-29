@@ -91,8 +91,11 @@ def main():
     print("First 10 events:")
     print("-" * 70)
     for i, event in enumerate(events[:10]):
-        print(f"{i+1}. Frame {event.frame_number:4d} ({event.timestamp:.3f}s): "
-              f"{event.event_type:15s}", end="")
+        print(
+            f"{i+1}. Frame {event.frame_number:4d} ({event.timestamp:.3f}s): "
+            f"{event.event_type:15s}",
+            end="",
+        )
 
         if event.event_type.startswith("mouse"):
             print(f" at ({event.x:4d}, {event.y:4d})", end="")
@@ -127,7 +130,7 @@ def main():
     print("-" * 70)
     import json
 
-    with open(events_file, 'r') as f:
+    with open(events_file, "r") as f:
         lines = f.readlines()
         print(f"File contains {len(lines)} lines")
         print(f"First line: {lines[0][:100]}..." if lines else "File is empty")
@@ -153,4 +156,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nError: {e}")
         import traceback
+
         traceback.print_exc()

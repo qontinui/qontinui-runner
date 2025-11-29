@@ -20,6 +20,7 @@ from typing import List
 
 try:
     from PIL import Image
+
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -48,6 +49,7 @@ except ImportError:
     )
     import sys
     from pathlib import Path
+
     sys.path.append(str(Path(__file__).parent.parent))
     from models import (
         InputMonitorEvent,
@@ -83,23 +85,20 @@ def create_test_image(width: int = 1920, height: int = 1080) -> bytes:
     """
     if not PIL_AVAILABLE:
         # Return a dummy PNG header for testing
-        return b'\x89PNG\r\n\x1a\n' + b'\x00' * 1024
+        return b"\x89PNG\r\n\x1a\n" + b"\x00" * 1024
 
     # Create a simple gradient image
-    img = Image.new('RGB', (width, height))
+    img = Image.new("RGB", (width, height))
     pixels = img.load()
 
     for y in range(height):
         for x in range(width):
-            pixels[x, y] = (
-                int(255 * x / width),
-                int(255 * y / height),
-                128
-            )
+            pixels[x, y] = (int(255 * x / width), int(255 * y / height), 128)
 
     from io import BytesIO
+
     buffer = BytesIO()
-    img.save(buffer, format='PNG')
+    img.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
@@ -273,8 +272,7 @@ async def test_connection():
     print("\n=== Testing Connection ===")
 
     service = CloudStreamingService(
-        websocket_url="wss://localhost:8001/ws/stream",
-        api_url="https://localhost:8001"
+        websocket_url="wss://localhost:8001/ws/stream", api_url="https://localhost:8001"
     )
 
     # Test connection (will fail without real server, but demonstrates usage)
@@ -330,7 +328,7 @@ async def test_video_streaming():
                 "frame_number": i * 10,
                 "fps": 10,
                 "size_kb": len(chunk) / 1024.0,
-            }
+            },
         )
 
         print(f"  Size: {streamed_data.get_size_kb():.2f} KB")
@@ -353,7 +351,7 @@ async def test_event_streaming():
     # Convert to JSONL and compress
     jsonl_lines = [event.to_jsonl() for event in events]
     jsonl_data = "\n".join(jsonl_lines)
-    jsonl_bytes = jsonl_data.encode('utf-8')
+    jsonl_bytes = jsonl_data.encode("utf-8")
     compressed_data = gzip.compress(jsonl_bytes, compresslevel=6)
 
     print(f"Original size: {len(jsonl_bytes)} bytes ({len(jsonl_bytes) / 1024:.2f} KB)")
@@ -373,10 +371,7 @@ async def test_thumbnail_streaming():
         return
 
     service = CloudStreamingService(
-        config=StreamConfig(
-            thumbnail_size=(320, 180),
-            thumbnail_quality=85
-        )
+        config=StreamConfig(thumbnail_size=(320, 180), thumbnail_quality=85)
     )
     session_id = "test-session-001"
 
@@ -389,8 +384,9 @@ async def test_thumbnail_streaming():
     img.thumbnail((320, 180), Image.LANCZOS)
 
     from io import BytesIO
+
     buffer = BytesIO()
-    img.convert('RGB').save(buffer, format='JPEG', quality=85, optimize=True)
+    img.convert("RGB").save(buffer, format="JPEG", quality=85, optimize=True)
     thumbnail_bytes = buffer.getvalue()
 
     print(f"Thumbnail size: {len(thumbnail_bytes)} bytes ({len(thumbnail_bytes) / 1024:.2f} KB)")
@@ -423,8 +419,8 @@ async def test_processed_data_streaming():
 
     # Convert to JSON and compress
     result_dict = result.to_dict()
-    result_json = json.dumps(result_dict, separators=(',', ':'))
-    result_bytes = result_json.encode('utf-8')
+    result_json = json.dumps(result_dict, separators=(",", ":"))
+    result_bytes = result_json.encode("utf-8")
     compressed_data = gzip.compress(result_bytes, compresslevel=6)
 
     print(f"\nData sizes:")
@@ -445,10 +441,7 @@ async def test_screenshot_upload():
 
     # Register screenshot request
     request_id = "request-001"
-    filter_params = {
-        "frame_numbers": [10, 20, 30],
-        "max_count": 5
-    }
+    filter_params = {"frame_numbers": [10, 20, 30], "max_count": 5}
 
     await service.handle_screenshot_request(request_id, filter_params)
     print(f"Screenshot request registered: {request_id}")

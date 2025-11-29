@@ -91,9 +91,9 @@ class InputMonitorEvent:
 
         # Convert tuples to lists for JSON serialization
         if self.drag_start is not None:
-            event_dict['drag_start'] = list(self.drag_start)
+            event_dict["drag_start"] = list(self.drag_start)
         if self.drag_end is not None:
-            event_dict['drag_end'] = list(self.drag_end)
+            event_dict["drag_end"] = list(self.drag_end)
 
         return event_dict
 
@@ -114,10 +114,10 @@ class InputMonitorEvent:
         Returns:
             JSONL line (JSON string without newline)
         """
-        return json.dumps(self.to_dict(), separators=(',', ':'))
+        return json.dumps(self.to_dict(), separators=(",", ":"))
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'InputMonitorEvent':
+    def from_dict(cls, data: Dict[str, Any]) -> "InputMonitorEvent":
         """Create an InputMonitorEvent from a dictionary.
 
         Args:
@@ -127,15 +127,15 @@ class InputMonitorEvent:
             InputMonitorEvent instance
         """
         # Convert lists back to tuples for drag coordinates
-        if 'drag_start' in data and data['drag_start'] is not None:
-            data['drag_start'] = tuple(data['drag_start'])
-        if 'drag_end' in data and data['drag_end'] is not None:
-            data['drag_end'] = tuple(data['drag_end'])
+        if "drag_start" in data and data["drag_start"] is not None:
+            data["drag_start"] = tuple(data["drag_start"])
+        if "drag_end" in data and data["drag_end"] is not None:
+            data["drag_end"] = tuple(data["drag_end"])
 
         return cls(**data)
 
     @classmethod
-    def from_json(cls, json_str: str) -> 'InputMonitorEvent':
+    def from_json(cls, json_str: str) -> "InputMonitorEvent":
         """Create an InputMonitorEvent from a JSON string.
 
         Args:

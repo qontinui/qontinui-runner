@@ -254,7 +254,9 @@ class TestStateImageExtractor:
         # Should extract some images (at least from click locations)
         assert len(extracted) > 0
 
-    def test_extract_from_state_with_click_locations(self, sample_state, sample_frames, sample_events):
+    def test_extract_from_state_with_click_locations(
+        self, sample_state, sample_frames, sample_events
+    ):
         """Test extraction with click locations enabled."""
         config = ImageExtractionConfig(
             extract_at_click_locations=True,
@@ -272,7 +274,9 @@ class TestStateImageExtractor:
         click_images = [img for img in extracted if img.extraction_method == "click_location"]
         assert len(click_images) > 0
 
-    def test_extract_from_state_without_click_locations(self, sample_state, sample_frames, sample_events):
+    def test_extract_from_state_without_click_locations(
+        self, sample_state, sample_frames, sample_events
+    ):
         """Test extraction with click locations disabled."""
         config = ImageExtractionConfig(
             extract_at_click_locations=False,
@@ -299,7 +303,9 @@ class TestStateImageExtractor:
 
         assert extracted == []
 
-    def test_extract_from_state_position_classification(self, sample_state, sample_frames, sample_events):
+    def test_extract_from_state_position_classification(
+        self, sample_state, sample_frames, sample_events
+    ):
         """Test that position types are classified."""
         config = ImageExtractionConfig(
             extract_at_click_locations=True,
@@ -366,10 +372,7 @@ class TestHelperFunctions:
 
     def test_get_state_frames_with_frame_indices(self):
         """Test getting state frames using explicit indices."""
-        frames = [
-            Frame(np.zeros((100, 100, 3), dtype=np.uint8), 0.0, i, None)
-            for i in range(10)
-        ]
+        frames = [Frame(np.zeros((100, 100, 3), dtype=np.uint8), 0.0, i, None) for i in range(10)]
 
         state = DetectedState(
             name="test",
@@ -388,10 +391,7 @@ class TestHelperFunctions:
 
     def test_get_state_frames_with_range(self):
         """Test getting state frames using start/end range."""
-        frames = [
-            Frame(np.zeros((100, 100, 3), dtype=np.uint8), 0.0, i, None)
-            for i in range(10)
-        ]
+        frames = [Frame(np.zeros((100, 100, 3), dtype=np.uint8), 0.0, i, None) for i in range(10)]
 
         state = DetectedState(
             name="test",

@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 try:
     from websocket_client import RunnerWebSocketClient, authenticate
     from websocket_config import WebSocketConfig
+
     WEBSOCKET_AVAILABLE = True
 except ImportError:
     WEBSOCKET_AVAILABLE = False
@@ -40,7 +41,11 @@ class WebSocketHandler:
     - Run event loop in background thread
     """
 
-    def __init__(self, emit_log_fn: Callable[[str, str], None], on_command_fn: Optional[Callable[[Dict[str, Any]], None]] = None):
+    def __init__(
+        self,
+        emit_log_fn: Callable[[str, str], None],
+        on_command_fn: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
         """
         Initialize WebSocket handler.
 
@@ -86,11 +91,17 @@ class WebSocketHandler:
         Returns:
             True if configuration successful, False otherwise
         """
-        self.emit_log("info", f"[WS_HANDLER] configure called: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}")
+        self.emit_log(
+            "info",
+            f"[WS_HANDLER] configure called: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}",
+        )
         self.emit_log("info", f"[WS_HANDLER] WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}")
 
         if not WEBSOCKET_AVAILABLE:
-            self.emit_log("error", "[WS_HANDLER] WebSocket libraries not available - check websocket_client.py import")
+            self.emit_log(
+                "error",
+                "[WS_HANDLER] WebSocket libraries not available - check websocket_client.py import",
+            )
             return False
 
         try:
@@ -106,12 +117,16 @@ class WebSocketHandler:
                 max_reconnect_attempts=5,
             )
 
-            self.emit_log("info", f"[WS_HANDLER] WebSocket configured successfully: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}")
+            self.emit_log(
+                "info",
+                f"[WS_HANDLER] WebSocket configured successfully: enabled={enabled}, url={api_url}, project_id={project_id}, runner_name={runner_name}",
+            )
             return True
 
         except Exception as e:
             self.emit_log("error", f"[WS_HANDLER] Failed to configure WebSocket: {e}")
             import traceback
+
             self.emit_log("error", f"[WS_HANDLER] Traceback: {traceback.format_exc()}")
             return False
 
@@ -135,31 +150,62 @@ class WebSocketHandler:
             True if connection successful, False otherwise
         """
         import sys
+
         print(f"[info    ] WS_HANDLER: connect() called", file=sys.stderr, flush=True)
-        print(f"[info    ] WS_HANDLER: WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}", file=sys.stderr, flush=True)
-        print(f"[info    ] WS_HANDLER: ws_config exists: {self.ws_config is not None}", file=sys.stderr, flush=True)
+        print(
+            f"[info    ] WS_HANDLER: WEBSOCKET_AVAILABLE={WEBSOCKET_AVAILABLE}",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"[info    ] WS_HANDLER: ws_config exists: {self.ws_config is not None}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         if not WEBSOCKET_AVAILABLE:
-            print(f"[error   ] WS_HANDLER: WebSocket libraries not available", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] WS_HANDLER: WebSocket libraries not available",
+                file=sys.stderr,
+                flush=True,
+            )
             return False
 
         if not self.ws_config:
-            print(f"[error   ] WS_HANDLER: WebSocket configuration not set", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] WS_HANDLER: WebSocket configuration not set",
+                file=sys.stderr,
+                flush=True,
+            )
             return False
 
-        print(f"[info    ] WS_HANDLER: ws_config.enabled={self.ws_config.enabled}, api_url={self.ws_config.api_url}", file=sys.stderr, flush=True)
+        print(
+            f"[info    ] WS_HANDLER: ws_config.enabled={self.ws_config.enabled}, api_url={self.ws_config.api_url}",
+            file=sys.stderr,
+            flush=True,
+        )
 
         # Validate config
         is_valid, error = self.ws_config.validate()
         if not is_valid:
-            print(f"[error   ] WS_HANDLER: Invalid WebSocket config: {error}", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] WS_HANDLER: Invalid WebSocket config: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
             return False
 
-        print(f"[info    ] WS_HANDLER: Config validation passed, starting connection...", file=sys.stderr, flush=True)
+        print(
+            f"[info    ] WS_HANDLER: Config validation passed, starting connection...",
+            file=sys.stderr,
+            flush=True,
+        )
 
         try:
             # Start event loop in background thread
-            print(f"[info    ] WS_HANDLER: Starting event loop thread...", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] WS_HANDLER: Starting event loop thread...", file=sys.stderr, flush=True
+            )
             if not self.ws_thread or not self.ws_thread.is_alive():
                 self.ws_thread = threading.Thread(target=self._start_event_loop, daemon=True)
                 self.ws_thread.start()
@@ -171,36 +217,60 @@ class WebSocketHandler:
                     time.sleep(0.1)
 
                 if not self.ws_loop:
-                    print(f"[error   ] WS_HANDLER: Event loop failed to start", file=sys.stderr, flush=True)
+                    print(
+                        f"[error   ] WS_HANDLER: Event loop failed to start",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     return False
 
             print(f"[info    ] WS_HANDLER: Event loop ready", file=sys.stderr, flush=True)
 
             # Get or refresh token
             token = self.ws_config.token
-            print(f"[info    ] WS_HANDLER: token_len={len(token) if token else 0}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] WS_HANDLER: token_len={len(token) if token else 0}",
+                file=sys.stderr,
+                flush=True,
+            )
             if not token and self.ws_config.email and self.ws_config.password:
-                print(f"[info    ] WS_HANDLER: Authenticating with qontinui-web...", file=sys.stderr, flush=True)
+                print(
+                    f"[info    ] WS_HANDLER: Authenticating with qontinui-web...",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 # Convert ws:// to http:// for auth
-                auth_url = self.ws_config.api_url.replace("ws://", "http://").replace("wss://", "https://")
+                auth_url = self.ws_config.api_url.replace("ws://", "http://").replace(
+                    "wss://", "https://"
+                )
 
                 # Run auth in event loop
                 future = asyncio.run_coroutine_threadsafe(
                     authenticate(auth_url, self.ws_config.email, self.ws_config.password),
-                    self.ws_loop
+                    self.ws_loop,
                 )
                 token = future.result(timeout=10)
 
                 if not token:
-                    print(f"[error   ] WS_HANDLER: Authentication failed", file=sys.stderr, flush=True)
+                    print(
+                        f"[error   ] WS_HANDLER: Authentication failed", file=sys.stderr, flush=True
+                    )
                     return False
 
                 self.ws_config.token = token
-                print(f"[info    ] WS_HANDLER: Authentication successful", file=sys.stderr, flush=True)
+                print(
+                    f"[info    ] WS_HANDLER: Authentication successful", file=sys.stderr, flush=True
+                )
 
             # Create WebSocket client
-            print(f"[info    ] WS_HANDLER: Creating WebSocket client...", file=sys.stderr, flush=True)
-            print(f"[info    ] WS_HANDLER: api_url={self.ws_config.api_url}, project_id={self.ws_config.project_id}, runner_name={self.ws_config.runner_name}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] WS_HANDLER: Creating WebSocket client...", file=sys.stderr, flush=True
+            )
+            print(
+                f"[info    ] WS_HANDLER: api_url={self.ws_config.api_url}, project_id={self.ws_config.project_id}, runner_name={self.ws_config.runner_name}",
+                file=sys.stderr,
+                flush=True,
+            )
             self.ws_client = RunnerWebSocketClient(
                 api_url=self.ws_config.api_url,
                 token=token,
@@ -210,36 +280,69 @@ class WebSocketHandler:
                 auto_reconnect=self.ws_config.auto_reconnect,
                 heartbeat_interval=self.ws_config.heartbeat_interval,
                 max_reconnect_attempts=self.ws_config.max_reconnect_attempts,
-                on_connected=lambda: print(f"[info    ] WS_HANDLER: WebSocket connected callback", file=sys.stderr, flush=True),
-                on_disconnected=lambda: print(f"[warning ] WS_HANDLER: WebSocket disconnected callback", file=sys.stderr, flush=True),
-                on_error=lambda msg: print(f"[error   ] WS_HANDLER: WebSocket error callback: {msg}", file=sys.stderr, flush=True),
+                on_connected=lambda: print(
+                    f"[info    ] WS_HANDLER: WebSocket connected callback",
+                    file=sys.stderr,
+                    flush=True,
+                ),
+                on_disconnected=lambda: print(
+                    f"[warning ] WS_HANDLER: WebSocket disconnected callback",
+                    file=sys.stderr,
+                    flush=True,
+                ),
+                on_error=lambda msg: print(
+                    f"[error   ] WS_HANDLER: WebSocket error callback: {msg}",
+                    file=sys.stderr,
+                    flush=True,
+                ),
             )
 
             # Set command handler for incoming commands from backend
             if self.on_command_fn:
                 self.ws_client.on_command = self._handle_command
-                print(f"[info    ] WS_HANDLER: Command handler registered", file=sys.stderr, flush=True)
+                print(
+                    f"[info    ] WS_HANDLER: Command handler registered",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
             # Connect
-            print(f"[info    ] WS_HANDLER: Calling ws_client.connect()...", file=sys.stderr, flush=True)
-            future = asyncio.run_coroutine_threadsafe(
-                self.ws_client.connect(),
-                self.ws_loop
+            print(
+                f"[info    ] WS_HANDLER: Calling ws_client.connect()...",
+                file=sys.stderr,
+                flush=True,
             )
+            future = asyncio.run_coroutine_threadsafe(self.ws_client.connect(), self.ws_loop)
             success = future.result(timeout=10)
-            print(f"[info    ] WS_HANDLER: ws_client.connect() returned: {success}", file=sys.stderr, flush=True)
+            print(
+                f"[info    ] WS_HANDLER: ws_client.connect() returned: {success}",
+                file=sys.stderr,
+                flush=True,
+            )
 
             if success:
                 self.ws_enabled = True
-                print(f"[info    ] WS_HANDLER: WebSocket connection established!", file=sys.stderr, flush=True)
+                print(
+                    f"[info    ] WS_HANDLER: WebSocket connection established!",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return True
             else:
-                print(f"[error   ] WS_HANDLER: WebSocket connection failed", file=sys.stderr, flush=True)
+                print(
+                    f"[error   ] WS_HANDLER: WebSocket connection failed",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 return False
 
         except Exception as e:
             print(f"[error   ] WS_HANDLER: Exception: {e}", file=sys.stderr, flush=True)
-            print(f"[error   ] WS_HANDLER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+            print(
+                f"[error   ] WS_HANDLER: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
             return False
 
     def disconnect(self):
@@ -252,10 +355,7 @@ class WebSocketHandler:
 
             # Disconnect client
             if self.ws_loop and self.ws_client:
-                future = asyncio.run_coroutine_threadsafe(
-                    self.ws_client.disconnect(),
-                    self.ws_loop
-                )
+                future = asyncio.run_coroutine_threadsafe(self.ws_client.disconnect(), self.ws_loop)
                 future.result(timeout=5)
 
             # Stop event loop
@@ -289,8 +389,7 @@ class WebSocketHandler:
             self.emit_log("info", "Starting WebSocket session...")
 
             future = asyncio.run_coroutine_threadsafe(
-                self.ws_client.start_session(config_snapshot),
-                self.ws_loop
+                self.ws_client.start_session(config_snapshot), self.ws_loop
             )
             success = future.result(timeout=10)
 
@@ -324,8 +423,7 @@ class WebSocketHandler:
             self.emit_log("info", f"Ending WebSocket session with status: {status}")
 
             future = asyncio.run_coroutine_threadsafe(
-                self.ws_client.end_session(status, error),
-                self.ws_loop
+                self.ws_client.end_session(status, error), self.ws_loop
             )
             success = future.result(timeout=10)
 
@@ -356,8 +454,7 @@ class WebSocketHandler:
         try:
             # Schedule coroutine in WebSocket event loop
             asyncio.run_coroutine_threadsafe(
-                self.ws_client.send_log(level, message, log_data),
-                self.ws_loop
+                self.ws_client.send_log(level, message, log_data), self.ws_loop
             )
         except Exception as e:
             logger.error(f"Error sending log to WebSocket: {e}")
@@ -377,8 +474,7 @@ class WebSocketHandler:
         try:
             # Schedule coroutine in WebSocket event loop
             asyncio.run_coroutine_threadsafe(
-                self.ws_client.send_screenshot(image, name, metadata),
-                self.ws_loop
+                self.ws_client.send_screenshot(image, name, metadata), self.ws_loop
             )
         except Exception as e:
             logger.error(f"Error sending screenshot to WebSocket: {e}")
@@ -420,13 +516,11 @@ class WebSocketHandler:
         try:
             # Parse the message to ensure it's valid JSON
             import json
+
             parsed = json.loads(message)
 
             # Schedule coroutine in WebSocket event loop
-            asyncio.run_coroutine_threadsafe(
-                self.ws_client.send_message(parsed),
-                self.ws_loop
-            )
+            asyncio.run_coroutine_threadsafe(self.ws_client.send_message(parsed), self.ws_loop)
             return True
         except Exception as e:
             logger.error(f"Error sending message to WebSocket: {e}")
@@ -450,8 +544,19 @@ class WebSocketHandler:
                 # Extract command details and forward to the bridge
                 self.on_command_fn(message)
             except Exception as e:
-                print(f"[error   ] WS_HANDLER: Error handling command: {e}", file=sys.stderr, flush=True)
+                print(
+                    f"[error   ] WS_HANDLER: Error handling command: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 import traceback
-                print(f"[error   ] WS_HANDLER: Traceback: {traceback.format_exc()}", file=sys.stderr, flush=True)
+
+                print(
+                    f"[error   ] WS_HANDLER: Traceback: {traceback.format_exc()}",
+                    file=sys.stderr,
+                    flush=True,
+                )
         else:
-            print(f"[warning ] WS_HANDLER: No command handler registered", file=sys.stderr, flush=True)
+            print(
+                f"[warning ] WS_HANDLER: No command handler registered", file=sys.stderr, flush=True
+            )

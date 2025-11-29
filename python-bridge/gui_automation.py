@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 try:
     from qontinui.config.schema import Action
     from qontinui import navigation_api, registry, Location
+
     QONTINUI_AVAILABLE = True
 except ImportError:
     QONTINUI_AVAILABLE = False
@@ -47,7 +48,7 @@ class GUIAutomation:
         workflows: Dict,
         images: Dict,
         get_image_name_fn: Callable[[str], Optional[str]],
-        get_action_definition_fn: Callable[[str], Any]
+        get_action_definition_fn: Callable[[str], Any],
     ):
         """
         Initialize GUI automation module.
@@ -103,7 +104,7 @@ class GUIAutomation:
                 action_id=action_id,
                 parent_action_id=hierarchy_context["parent_action_id"],
                 workflow_id=hierarchy_context["workflow_id"],
-                nesting_level=hierarchy_context["nesting_level"]
+                nesting_level=hierarchy_context["nesting_level"],
             )
 
         # Start action in execution tree with metadata
@@ -113,8 +114,8 @@ class GUIAutomation:
             metadata={
                 "config": config,
                 "is_expandable": action_def.is_expandable,
-                "action_definition": action_def.to_dict()
-            }
+                "action_definition": action_def.to_dict(),
+            },
         )
         self.emit_tree_event("action_started", node, None)
 
@@ -128,7 +129,9 @@ class GUIAutomation:
 
             # Handle missing action executor
             if not QONTINUI_AVAILABLE or not self.action_executor:
-                self.emit_log("warning", f"Simulating action: {action_type} (ActionExecutor not available)")
+                self.emit_log(
+                    "warning", f"Simulating action: {action_type} (ActionExecutor not available)"
+                )
                 time.sleep(0.5)  # Simulate action delay
                 success = True
                 self.execution_tree.end_action(action_id, success=True)
@@ -137,10 +140,7 @@ class GUIAutomation:
 
             # Convert action_data to Action object for library
             action = Action(
-                id=action_id,
-                type=action_type,
-                config=config,
-                base=action_data.get("base")
+                id=action_id, type=action_type, config=config, base=action_data.get("base")
             )
 
             # Handle RUN_WORKFLOW specially - execute workflow via runner's execute_workflow
@@ -156,10 +156,15 @@ class GUIAutomation:
                 success = self.action_executor.execute_action(action)
 
             # Sync last_find_location from library if available
-            if hasattr(self.action_executor, 'last_find_location') and self.action_executor.last_find_location:
+            if (
+                hasattr(self.action_executor, "last_find_location")
+                and self.action_executor.last_find_location
+            ):
                 loc = self.action_executor.last_find_location
                 self._last_find_location = Location(loc[0], loc[1])
-                self.emit_log("debug", f"Synced last_find_location from library: {self._last_find_location}")
+                self.emit_log(
+                    "debug", f"Synced last_find_location from library: {self._last_find_location}"
+                )
 
             # Handle GO_TO_STATE actions - record transition data
             if action_type == "GO_TO_STATE" and self.unified_data_collector:
@@ -170,7 +175,7 @@ class GUIAutomation:
                     "from_state": from_state,
                     "to_state": target_state,
                     "transition_type": "navigation",
-                    "success": success
+                    "success": success,
                 }
                 self.unified_data_collector.record_transition(transition_data)
 
@@ -186,7 +191,7 @@ class GUIAutomation:
 
                     self.unified_data_collector.record_workflow_execution(
                         workflow_name=workflow_name,
-                        workflow_status="success" if success else "failed"
+                        workflow_status="success" if success else "failed",
                     )
 
         except Exception as e:
@@ -213,15 +218,11 @@ class GUIAutomation:
                     success=success,
                     error_message=error_message,
                     retry_count=0,
-                    metadata={
-                        "action_definition": action_def.to_dict()
-                    }
+                    metadata={"action_definition": action_def.to_dict()},
                 )
 
                 # Enrich ExecutionNode metadata with record data
-                node.metadata.update({
-                    "execution_record": record.to_tree_event_data()
-                })
+                node.metadata.update({"execution_record": record.to_tree_event_data()})
 
             # End action in execution tree
             self.execution_tree.end_action(action_id, success=success, error=error_message)
@@ -245,19 +246,19 @@ class GUIAutomation:
         try:
             # If transition context provided, create a transition node
             if transition_context:
-                transition_id = transition_context.get('transition_id', f"transition-{time.time()}")
-                transition_name = transition_context.get('transition_name', 'Transition')
+                transition_id = transition_context.get("transition_id", f"transition-{time.time()}")
+                transition_name = transition_context.get("transition_name", "Transition")
 
                 # Start transition node
                 trans_node = self.execution_tree.start_transition(
                     transition_id,
                     transition_name,
                     metadata={
-                        'transition_type': transition_context.get('transition_type'),
-                        'target_states': transition_context.get('target_states', []),
-                        'source_state': transition_context.get('source_state'),
-                        'is_expandable': True
-                    }
+                        "transition_type": transition_context.get("transition_type"),
+                        "target_states": transition_context.get("target_states", []),
+                        "source_state": transition_context.get("source_state"),
+                        "is_expandable": True,
+                    },
                 )
                 self.emit_tree_event("transition_started", trans_node, None)
 
@@ -267,7 +268,9 @@ class GUIAutomation:
 
                     # End transition node
                     self.execution_tree.end_transition(transition_id, success=success)
-                    self.emit_tree_event("transition_completed" if success else "transition_failed", trans_node, None)
+                    self.emit_tree_event(
+                        "transition_completed" if success else "transition_failed", trans_node, None
+                    )
 
                     return success
                 except Exception as e:
@@ -317,13 +320,14 @@ class GUIAutomation:
             if actions is None:
                 self.emit_log("error", f"Workflow {workflow_id} not found")
                 return False
-            workflow_name = registry.get_workflow_name(workflow_id) if hasattr(registry, 'get_workflow_name') else workflow_id
+            workflow_name = (
+                registry.get_workflow_name(workflow_id)
+                if hasattr(registry, "get_workflow_name")
+                else workflow_id
+            )
             is_inline = True
             # Cache it locally
-            self.workflows[workflow_id] = {
-                "actions": actions,
-                "name": workflow_name
-            }
+            self.workflows[workflow_id] = {"actions": actions, "name": workflow_name}
             self.emit_log("debug", f"Loaded inline workflow {workflow_id} from registry")
         else:
             self.emit_log("error", f"Workflow {workflow_id} not found")
@@ -345,7 +349,9 @@ class GUIAutomation:
 
                 if not action_success:
                     success = False
-                    self.emit_log("debug", f"Action failed, continuing workflow (resilient automation)")
+                    self.emit_log(
+                        "debug", f"Action failed, continuing workflow (resilient automation)"
+                    )
 
                 # Small delay between actions
                 time.sleep(0.5)
@@ -370,11 +376,7 @@ class GUIAutomation:
             Dictionary with parent_action_id, workflow_id, nesting_level
         """
         if not self.execution_tree or not self.execution_tree.current:
-            return {
-                "parent_action_id": None,
-                "workflow_id": None,
-                "nesting_level": 0
-            }
+            return {"parent_action_id": None, "workflow_id": None, "nesting_level": 0}
 
         current = self.execution_tree.current
         parent_action_id = current.id
@@ -393,7 +395,7 @@ class GUIAutomation:
         return {
             "parent_action_id": parent_action_id,
             "workflow_id": workflow_id,
-            "nesting_level": nesting_level
+            "nesting_level": nesting_level,
         }
 
     def _enrich_find_action_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -424,7 +426,11 @@ class GUIAutomation:
                 image_name = self.get_image_name(image_id)
                 if image_name:
                     config_copy = config.copy() if config_copy is None else config_copy
-                    target_copy = config_copy.get("target", {}).copy() if isinstance(config_copy.get("target"), dict) else {}
+                    target_copy = (
+                        config_copy.get("target", {}).copy()
+                        if isinstance(config_copy.get("target"), dict)
+                        else {}
+                    )
                     target_copy["imageName"] = image_name
                     config_copy["target"] = target_copy
                     config_copy["imageName"] = image_name
@@ -436,7 +442,11 @@ class GUIAutomation:
                 image_names = [name for name in image_names if name]
                 if image_names:
                     config_copy = config.copy() if config_copy is None else config_copy
-                    target_copy = config_copy.get("target", {}).copy() if isinstance(config_copy.get("target"), dict) else {}
+                    target_copy = (
+                        config_copy.get("target", {}).copy()
+                        if isinstance(config_copy.get("target"), dict)
+                        else {}
+                    )
                     target_copy["imageNames"] = image_names
                     config_copy["target"] = target_copy
                     config_copy["imageNames"] = image_names

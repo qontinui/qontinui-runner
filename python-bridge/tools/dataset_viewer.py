@@ -34,6 +34,7 @@ import logging
 # Try to import PIL for image viewing
 try:
     from PIL import Image, ImageDraw, ImageFont
+
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -70,7 +71,7 @@ class DatasetViewer:
         if not self.reviews_path.exists():
             return
 
-        with open(self.reviews_path, 'r') as f:
+        with open(self.reviews_path, "r") as f:
             for line in f:
                 review = json.loads(line)
                 self.reviews[review["image_id"]] = review
@@ -91,8 +92,8 @@ class DatasetViewer:
         self.reviews[image_id] = review
 
         # Append to reviews file
-        with open(self.reviews_path, 'a') as f:
-            f.write(json.dumps(review) + '\n')
+        with open(self.reviews_path, "a") as f:
+            f.write(json.dumps(review) + "\n")
 
     def show_summary(self) -> None:
         """Show dataset summary statistics."""
@@ -100,14 +101,14 @@ class DatasetViewer:
             print("Error: No metadata.json found")
             return
 
-        with open(self.metadata_path, 'r') as f:
+        with open(self.metadata_path, "r") as f:
             metadata = json.load(f)
 
         # Count manifest entries
         manifest_count = 0
         reviewed_count = 0
         if self.manifest_path.exists():
-            with open(self.manifest_path, 'r') as f:
+            with open(self.manifest_path, "r") as f:
                 for line in f:
                     manifest_count += 1
                     entry = json.loads(line)
@@ -130,12 +131,12 @@ class DatasetViewer:
 
         # Category breakdown
         print("Categories:")
-        for cat in metadata.get('categories', []):
+        for cat in metadata.get("categories", []):
             print(f"  [{cat['id']}] {cat['name']}")
         print()
 
         # Statistics
-        stats = metadata.get('statistics', {})
+        stats = metadata.get("statistics", {})
         if stats:
             print("Processing Statistics:")
             print(f"  Total Records: {stats.get('total_records_processed', 0)}")
@@ -161,7 +162,7 @@ class DatasetViewer:
         print("=" * 60)
 
         count = 0
-        with open(self.manifest_path, 'r') as f:
+        with open(self.manifest_path, "r") as f:
             for line in f:
                 if count >= limit:
                     break
@@ -175,7 +176,7 @@ class DatasetViewer:
                 if not ann_path.exists():
                     continue
 
-                with open(ann_path, 'r') as af:
+                with open(ann_path, "r") as af:
                     ann_data = json.load(af)
 
                 # Display info
@@ -185,16 +186,20 @@ class DatasetViewer:
                 print(f"  Timestamp: {entry['timestamp']}")
                 print(f"  Annotations: {len(ann_data['annotations'])}")
 
-                for i, ann in enumerate(ann_data['annotations']):
-                    bbox = ann['bbox']
-                    print(f"    [{i+1}] {ann['category_name']} @ [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]")
-                    print(f"        Confidence: {ann['confidence']:.2f}, Source: {ann['source']}, Verified: {ann['verified']}")
+                for i, ann in enumerate(ann_data["annotations"]):
+                    bbox = ann["bbox"]
+                    print(
+                        f"    [{i+1}] {ann['category_name']} @ [{bbox[0]}, {bbox[1]}, {bbox[2]}, {bbox[3]}]"
+                    )
+                    print(
+                        f"        Confidence: {ann['confidence']:.2f}, Source: {ann['source']}, Verified: {ann['verified']}"
+                    )
 
                 # Review status
                 if image_id in self.reviews:
                     review = self.reviews[image_id]
                     print(f"  Review: {review['status'].upper()}")
-                    if review['notes']:
+                    if review["notes"]:
                         print(f"  Notes: {review['notes']}")
 
                 count += 1
@@ -235,7 +240,7 @@ class DatasetViewer:
             ann_path = self.dataset_dir / entry["annotations"]
 
             # Load annotations
-            with open(ann_path, 'r') as f:
+            with open(ann_path, "r") as f:
                 ann_data = json.load(f)
 
             # Show image info
@@ -248,15 +253,15 @@ class DatasetViewer:
                 img = Image.open(image_path)
                 draw = ImageDraw.Draw(img)
 
-                for ann in ann_data['annotations']:
-                    bbox = ann['bbox']
+                for ann in ann_data["annotations"]:
+                    bbox = ann["bbox"]
                     x, y, w, h = bbox
-                    color = "green" if ann['verified'] else "yellow"
-                    draw.rectangle([x, y, x+w, y+h], outline=color, width=3)
+                    color = "green" if ann["verified"] else "yellow"
+                    draw.rectangle([x, y, x + w, y + h], outline=color, width=3)
 
                     # Draw label
                     label = f"{ann['category_name']} ({ann['confidence']:.2f})"
-                    draw.text((x, y-15), label, fill=color)
+                    draw.text((x, y - 15), label, fill=color)
 
                 # Show image
                 img.show()
@@ -266,21 +271,21 @@ class DatasetViewer:
             # Get user input
             while True:
                 cmd = input("Review (g/b/s/q): ").strip().lower()
-                if cmd in ['g', 'b', 's', 'q']:
+                if cmd in ["g", "b", "s", "q"]:
                     break
                 print("Invalid command")
 
-            if cmd == 'q':
+            if cmd == "q":
                 print("Exiting validation mode")
                 break
-            elif cmd == 'g':
+            elif cmd == "g":
                 self._save_review(image_id, "good")
                 print("✓ Marked as GOOD")
-            elif cmd == 'b':
+            elif cmd == "b":
                 notes = input("Notes (optional): ").strip()
                 self._save_review(image_id, "bad", notes)
                 print("✗ Marked as BAD")
-            elif cmd == 's':
+            elif cmd == "s":
                 print("○ Skipped")
 
         print("\nValidation session complete")
@@ -293,7 +298,7 @@ class DatasetViewer:
             List of manifest entries.
         """
         entries = []
-        with open(self.manifest_path, 'r') as f:
+        with open(self.manifest_path, "r") as f:
             for line in f:
                 entries.append(json.loads(line))
         return entries
@@ -305,7 +310,7 @@ class DatasetViewer:
             Number of entries.
         """
         count = 0
-        with open(self.manifest_path, 'r') as f:
+        with open(self.manifest_path, "r") as f:
             for _ in f:
                 count += 1
         return count
@@ -345,7 +350,7 @@ class DatasetViewer:
         filtered_count = 0
 
         entries = self._load_manifest()
-        with open(filtered_manifest, 'w') as out_f:
+        with open(filtered_manifest, "w") as out_f:
             for entry in entries:
                 image_id = entry["id"]
                 if image_id not in self.reviews:
@@ -362,11 +367,12 @@ class DatasetViewer:
                 dst_ann = output_annotations_dir / src_ann.name
 
                 import shutil
+
                 shutil.copy(src_image, dst_image)
                 shutil.copy(src_ann, dst_ann)
 
                 # Write to filtered manifest
-                out_f.write(json.dumps(entry) + '\n')
+                out_f.write(json.dumps(entry) + "\n")
                 filtered_count += 1
 
         print(f"\nExported {filtered_count} images to: {output_dir}")
@@ -378,35 +384,22 @@ def main():
     parser = argparse.ArgumentParser(
         description="View and validate training datasets",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__
+        epilog=__doc__,
     )
-    parser.add_argument(
-        "dataset_dir",
-        type=Path,
-        help="Path to dataset directory"
-    )
+    parser.add_argument("dataset_dir", type=Path, help="Path to dataset directory")
     parser.add_argument(
         "--mode",
         choices=["summary", "browse", "validate", "export"],
         default="summary",
-        help="Viewing mode (default: summary)"
+        help="Viewing mode (default: summary)",
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=10,
-        help="Limit for browse mode (default: 10)"
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Output directory for export mode"
-    )
+    parser.add_argument("--limit", type=int, default=10, help="Limit for browse mode (default: 10)")
+    parser.add_argument("--output", type=Path, help="Output directory for export mode")
     parser.add_argument(
         "--filter",
         choices=["good", "bad", "skip"],
         default="good",
-        help="Filter for export mode (default: good)"
+        help="Filter for export mode (default: good)",
     )
 
     args = parser.parse_args()

@@ -41,9 +41,9 @@ def create_fake_png_data(size: int = 1000) -> bytes:
         Fake PNG image data as bytes
     """
     # Standard PNG header (8 bytes)
-    png_header = b'\x89PNG\r\n\x1a\n'
+    png_header = b"\x89PNG\r\n\x1a\n"
     # Fill rest with dummy data
-    return png_header + b'X' * (size - len(png_header))
+    return png_header + b"X" * (size - len(png_header))
 
 
 def verify_screenshot_exists(storage_dir: Path, screenshot_ref: str) -> bool:
@@ -57,7 +57,7 @@ def verify_screenshot_exists(storage_dir: Path, screenshot_ref: str) -> bool:
         True if both screenshot and metadata exist
     """
     screenshot_path = storage_dir / screenshot_ref
-    metadata_path = screenshot_path.with_suffix('.json')
+    metadata_path = screenshot_path.with_suffix(".json")
 
     return screenshot_path.exists() and metadata_path.exists()
 
@@ -111,7 +111,9 @@ def data_collector(mock_state_memory, screenshot_service):
 # ============================================================================
 
 
-def test_full_action_recording_flow(data_collector, mock_state_memory, screenshot_service, temp_storage):
+def test_full_action_recording_flow(
+    data_collector, mock_state_memory, screenshot_service, temp_storage
+):
     """Test complete action recording flow with all components.
 
     Scenario:
@@ -129,22 +131,14 @@ def test_full_action_recording_flow(data_collector, mock_state_memory, screensho
     # Step 1: Start action
     start_time = time.time()
     data_collector.start_action(
-        action_id="action-001",
-        parent_action_id=None,
-        workflow_id="login-workflow",
-        nesting_level=0
+        action_id="action-001", parent_action_id=None, workflow_id="login-workflow", nesting_level=0
     )
 
     # Step 2: Record text typed
     data_collector.record_text_typed("user@example.com")
 
     # Step 3: Record click event
-    data_collector.record_click(
-        x=250,
-        y=450,
-        button="left",
-        target_type="submit_button"
-    )
+    data_collector.record_click(x=250, y=450, button="left", target_type="submit_button")
 
     # Simulate state change
     mock_state_memory.add_state("Dashboard")
@@ -158,7 +152,7 @@ def test_full_action_recording_flow(data_collector, mock_state_memory, screensho
         start_time=start_time,
         end_time=end_time,
         success=True,
-        metadata={"description": "Login form submission"}
+        metadata={"description": "Login form submission"},
     )
 
     # Verify record identity
@@ -227,20 +221,14 @@ def test_multiple_actions_sequential(data_collector, mock_state_memory):
     # Action 1: Root level action
     start_time_1 = time.time()
     data_collector.start_action(
-        action_id="action-001",
-        parent_action_id=None,
-        workflow_id="test-workflow",
-        nesting_level=0
+        action_id="action-001", parent_action_id=None, workflow_id="test-workflow", nesting_level=0
     )
     data_collector.record_text_typed("action 1 text")
     mock_state_memory.add_state("StateA")
     end_time_1 = time.time()
 
     record_1 = data_collector.create_record(
-        action_type="ACTION_1",
-        start_time=start_time_1,
-        end_time=end_time_1,
-        success=True
+        action_type="ACTION_1", start_time=start_time_1, end_time=end_time_1, success=True
     )
 
     # Verify action 1
@@ -258,17 +246,14 @@ def test_multiple_actions_sequential(data_collector, mock_state_memory):
         action_id="action-002",
         parent_action_id="action-001",
         workflow_id="test-workflow",
-        nesting_level=1
+        nesting_level=1,
     )
     data_collector.record_text_typed("action 2 text")
     mock_state_memory.add_state("StateB")
     end_time_2 = time.time()
 
     record_2 = data_collector.create_record(
-        action_type="ACTION_2",
-        start_time=start_time_2,
-        end_time=end_time_2,
-        success=True
+        action_type="ACTION_2", start_time=start_time_2, end_time=end_time_2, success=True
     )
 
     # Verify action 2
@@ -289,17 +274,14 @@ def test_multiple_actions_sequential(data_collector, mock_state_memory):
         action_id="action-003",
         parent_action_id="action-002",
         workflow_id="test-workflow",
-        nesting_level=2
+        nesting_level=2,
     )
     # No text typed in action 3
     mock_state_memory.remove_state("StateA")
     end_time_3 = time.time()
 
     record_3 = data_collector.create_record(
-        action_type="ACTION_3",
-        start_time=start_time_3,
-        end_time=end_time_3,
-        success=True
+        action_type="ACTION_3", start_time=start_time_3, end_time=end_time_3, success=True
     )
 
     # Verify action 3
@@ -343,7 +325,7 @@ def test_state_transition_recording(data_collector, mock_state_memory):
         action_id="transition-001",
         parent_action_id=None,
         workflow_id="navigation-workflow",
-        nesting_level=0
+        nesting_level=0,
     )
 
     # Record transition
@@ -352,7 +334,7 @@ def test_state_transition_recording(data_collector, mock_state_memory):
         "to_state": "Dashboard",
         "transition_type": "navigation",
         "success": True,
-        "method": "click_logo"
+        "method": "click_logo",
     }
     data_collector.record_transition(transition_info)
 
@@ -369,7 +351,7 @@ def test_state_transition_recording(data_collector, mock_state_memory):
         config={"target_state": "Dashboard"},
         start_time=start_time,
         end_time=end_time,
-        success=True
+        success=True,
     )
 
     # Verify transition data
@@ -424,7 +406,7 @@ def test_screenshot_integration(temp_storage, mock_state_memory):
         action_id="screenshot-action-001",
         parent_action_id=None,
         workflow_id="test-workflow",
-        nesting_level=0
+        nesting_level=0,
     )
 
     # Record match with screenshot
@@ -434,13 +416,10 @@ def test_screenshot_integration(temp_storage, mock_state_memory):
         "confidence": 0.95,
         "threshold": 0.8,
         "found": True,
-        "location": {"x": 100, "y": 200}
+        "location": {"x": 100, "y": 200},
     }
 
-    collector.record_match_result(
-        match_summary=match_summary,
-        screenshot_data=fake_screenshot
-    )
+    collector.record_match_result(match_summary=match_summary, screenshot_data=fake_screenshot)
 
     # Create record
     end_time = time.time()
@@ -449,7 +428,7 @@ def test_screenshot_integration(temp_storage, mock_state_memory):
         config={"image": "login_button.png"},
         start_time=start_time,
         end_time=end_time,
-        success=True
+        success=True,
     )
 
     # Verify screenshot reference is set
@@ -466,7 +445,7 @@ def test_screenshot_integration(temp_storage, mock_state_memory):
     assert verify_screenshot_exists(temp_storage, record.screenshot_reference)
 
     # Read and verify metadata
-    metadata_path = temp_storage / record.screenshot_reference.replace('.png', '.json')
+    metadata_path = temp_storage / record.screenshot_reference.replace(".png", ".json")
     metadata = json.loads(metadata_path.read_text())
     assert metadata["action_id"] == "screenshot-action-001"
     assert metadata["active_states"] == ["Login"]
@@ -499,10 +478,7 @@ def test_tree_view_from_recorded_actions(data_collector, mock_state_memory):
     data_collector.start_action("action-001", None, "workflow-1", 0)
     mock_state_memory.add_state("StateA")
     record_1 = data_collector.create_record(
-        action_type="ACTION_1",
-        start_time=start_time,
-        end_time=start_time + 0.1,
-        success=True
+        action_type="ACTION_1", start_time=start_time, end_time=start_time + 0.1, success=True
     )
     records.append(record_1)
 
@@ -511,10 +487,7 @@ def test_tree_view_from_recorded_actions(data_collector, mock_state_memory):
     data_collector.start_action("action-002", "action-001", "workflow-1", 1)
     mock_state_memory.add_state("StateB")
     record_2 = data_collector.create_record(
-        action_type="ACTION_2",
-        start_time=start_time,
-        end_time=start_time + 0.1,
-        success=True
+        action_type="ACTION_2", start_time=start_time, end_time=start_time + 0.1, success=True
     )
     records.append(record_2)
 
@@ -522,10 +495,7 @@ def test_tree_view_from_recorded_actions(data_collector, mock_state_memory):
     start_time = time.time()
     data_collector.start_action("action-003", "action-002", "workflow-1", 2)
     record_3 = data_collector.create_record(
-        action_type="ACTION_3",
-        start_time=start_time,
-        end_time=start_time + 0.1,
-        success=True
+        action_type="ACTION_3", start_time=start_time, end_time=start_time + 0.1, success=True
     )
     records.append(record_3)
 
@@ -534,10 +504,7 @@ def test_tree_view_from_recorded_actions(data_collector, mock_state_memory):
     data_collector.start_action("action-004", None, "workflow-2", 0)
     mock_state_memory.remove_state("StateA")
     record_4 = data_collector.create_record(
-        action_type="ACTION_4",
-        start_time=start_time,
-        end_time=start_time + 0.1,
-        success=True
+        action_type="ACTION_4", start_time=start_time, end_time=start_time + 0.1, success=True
     )
     records.append(record_4)
 
@@ -589,7 +556,13 @@ def test_tree_view_from_recorded_actions(data_collector, mock_state_memory):
     assert all(node.type == "state_group" for node in state_grouped_tree)
 
     # Test serialization
-    for tree in [execution_tree, action_tree, state_transition_tree, timeline_tree, state_grouped_tree]:
+    for tree in [
+        execution_tree,
+        action_tree,
+        state_transition_tree,
+        timeline_tree,
+        state_grouped_tree,
+    ]:
         tree_dict = [node.to_dict() for node in tree]
         assert isinstance(tree_dict, list)
         if tree_dict:
@@ -626,7 +599,7 @@ def test_match_result_with_screenshot(temp_storage, mock_state_memory):
         action_id="match-action-001",
         parent_action_id=None,
         workflow_id="search-workflow",
-        nesting_level=0
+        nesting_level=0,
     )
 
     # Create fake screenshot and debug visual
@@ -639,13 +612,13 @@ def test_match_result_with_screenshot(temp_storage, mock_state_memory):
         "confidence": 0.89,
         "threshold": 0.75,
         "found": True,
-        "location": {"x": 450, "y": 120}
+        "location": {"x": 450, "y": 120},
     }
 
     collector.record_match_result(
         match_summary=match_summary,
         screenshot_data=fake_screenshot,
-        debug_visual_data=fake_debug_visual
+        debug_visual_data=fake_debug_visual,
     )
 
     # Create record
@@ -655,7 +628,7 @@ def test_match_result_with_screenshot(temp_storage, mock_state_memory):
         config={"image": "search_icon.png", "threshold": 0.75},
         start_time=start_time,
         end_time=end_time,
-        success=True
+        success=True,
     )
 
     # Verify match_summary in record
@@ -675,7 +648,7 @@ def test_match_result_with_screenshot(temp_storage, mock_state_memory):
     assert retrieved_screenshot == fake_screenshot
 
     # Verify screenshot metadata
-    screenshot_metadata_path = temp_storage / record.screenshot_reference.replace('.png', '.json')
+    screenshot_metadata_path = temp_storage / record.screenshot_reference.replace(".png", ".json")
     screenshot_metadata = json.loads(screenshot_metadata_path.read_text())
     assert screenshot_metadata["action_id"] == "match-action-001"
     assert screenshot_metadata["active_states"] == ["SearchPage"]
@@ -694,7 +667,7 @@ def test_match_result_with_screenshot(temp_storage, mock_state_memory):
     assert retrieved_debug == fake_debug_visual
 
     # Verify debug visual metadata
-    debug_metadata_path = debug_path.with_suffix('.json')
+    debug_metadata_path = debug_path.with_suffix(".json")
     assert debug_metadata_path.exists()
     debug_metadata = json.loads(debug_metadata_path.read_text())
     assert debug_metadata["action_id"] == "match-action-001"
@@ -723,7 +696,7 @@ def test_failed_action_recording(data_collector, mock_state_memory):
         end_time=end_time,
         success=False,
         error_message="Element not found at coordinates",
-        retry_count=3
+        retry_count=3,
     )
 
     # Verify failure data
@@ -746,7 +719,7 @@ def test_action_without_state_change(data_collector, mock_state_memory):
         config={"duration_ms": 1000},
         start_time=start_time,
         end_time=end_time,
-        success=True
+        success=True,
     )
 
     # Verify no state change
@@ -769,15 +742,12 @@ def test_collector_without_screenshot_service(mock_state_memory):
     # Try to record match with screenshot (should not error)
     collector.record_match_result(
         match_summary={"image_id": "test.png", "found": True},
-        screenshot_data=create_fake_png_data()
+        screenshot_data=create_fake_png_data(),
     )
 
     end_time = time.time()
     record = collector.create_record(
-        action_type="FIND",
-        start_time=start_time,
-        end_time=end_time,
-        success=True
+        action_type="FIND", start_time=start_time, end_time=end_time, success=True
     )
 
     # Verify match_summary exists but no screenshot reference
@@ -839,7 +809,7 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
         config={"target": "login_link"},
         start_time=start_time,
         end_time=time.time(),
-        success=True
+        success=True,
     )
     records.append(record)
 
@@ -849,14 +819,14 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
     collector.record_text_typed("testuser@example.com")
     collector.record_match_result(
         match_summary={"image_id": "username_field.png", "found": True, "confidence": 0.95},
-        screenshot_data=create_fake_png_data()
+        screenshot_data=create_fake_png_data(),
     )
     record = collector.create_record(
         action_type="TYPE",
         config={"text": "testuser@example.com"},
         start_time=start_time,
         end_time=time.time(),
-        success=True
+        success=True,
     )
     records.append(record)
 
@@ -866,14 +836,14 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
     collector.record_text_typed("********")
     collector.record_match_result(
         match_summary={"image_id": "password_field.png", "found": True, "confidence": 0.92},
-        screenshot_data=create_fake_png_data()
+        screenshot_data=create_fake_png_data(),
     )
     record = collector.create_record(
         action_type="TYPE",
         config={"text": "********"},
         start_time=start_time,
         end_time=time.time(),
-        success=True
+        success=True,
     )
     records.append(record)
 
@@ -881,12 +851,14 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
     start_time = time.time()
     collector.start_action("submit-004", "nav-login-001", "login-flow", 1)
     collector.record_click(250, 400, "left", "submit_button")
-    collector.record_transition({
-        "from_state": "LoginPage",
-        "to_state": "Dashboard",
-        "transition_type": "login_success",
-        "success": True
-    })
+    collector.record_transition(
+        {
+            "from_state": "LoginPage",
+            "to_state": "Dashboard",
+            "transition_type": "login_success",
+            "success": True,
+        }
+    )
     state_memory.remove_state("LoginPage")
     state_memory.add_state("Dashboard")
     record = collector.create_record(
@@ -894,7 +866,7 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
         config={"target": "submit_button"},
         start_time=start_time,
         end_time=time.time(),
-        success=True
+        success=True,
     )
     records.append(record)
 
@@ -909,7 +881,7 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
         end_time=time.time(),
         success=False,
         error_message="Search field not found",
-        retry_count=1
+        retry_count=1,
     )
     records.append(record)
 
@@ -919,7 +891,7 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
     collector.record_text_typed("test query")
     collector.record_match_result(
         match_summary={"image_id": "search_field.png", "found": True, "confidence": 0.88},
-        screenshot_data=create_fake_png_data()
+        screenshot_data=create_fake_png_data(),
     )
     state_memory.add_state("SearchResults")
     record = collector.create_record(
@@ -927,7 +899,7 @@ def test_complex_workflow_integration(temp_storage, mock_state_memory):
         config={"text": "test query"},
         start_time=start_time,
         end_time=time.time(),
-        success=True
+        success=True,
     )
     records.append(record)
 

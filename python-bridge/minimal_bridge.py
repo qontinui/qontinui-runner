@@ -15,11 +15,7 @@ from typing import Any
 # Check for --disable-console-logging flag
 if "--disable-console-logging" in sys.argv:
     # Disable all logging output
-    logging.basicConfig(
-        level=logging.CRITICAL + 1,
-        handlers=[logging.NullHandler()],
-        force=True
-    )
+    logging.basicConfig(level=logging.CRITICAL + 1, handlers=[logging.NullHandler()], force=True)
     sys.argv.remove("--disable-console-logging")
 else:
     # Configure logging to stderr to avoid print statements

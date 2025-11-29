@@ -34,6 +34,7 @@ try:
         InferenceConfig,
         InferenceResult,
     )
+
     CLICK_ANALYSIS_AVAILABLE = True
 except ImportError:
     CLICK_ANALYSIS_AVAILABLE = False
@@ -44,6 +45,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ExportStatistics:
     """Statistics for an export operation."""
+
     total_records: int = 0
     records_with_screenshots: int = 0
     records_with_matches: int = 0
@@ -140,7 +142,7 @@ class TrainingDataExporter:
     def _load_existing_state(self) -> None:
         """Load existing category mappings and image hashes if resuming."""
         if self.metadata_path.exists():
-            with open(self.metadata_path, 'r') as f:
+            with open(self.metadata_path, "r") as f:
                 metadata = json.load(f)
                 self.category_id_map = metadata.get("category_map", {})
                 self.next_category_id = len(self.category_id_map)
@@ -153,7 +155,7 @@ class TrainingDataExporter:
         self,
         records: List[ActionExecutionRecord],
         storage_dir: Path,
-        filter_fn: Optional[callable] = None
+        filter_fn: Optional[callable] = None,
     ) -> ExportStatistics:
         """Export a list of ActionExecutionRecords to training format.
 
@@ -191,10 +193,7 @@ class TrainingDataExporter:
         return stats
 
     def _export_single_record(
-        self,
-        record: ActionExecutionRecord,
-        storage_dir: Path,
-        stats: ExportStatistics
+        self, record: ActionExecutionRecord, storage_dir: Path, stats: ExportStatistics
     ) -> None:
         """Export a single ActionExecutionRecord.
 
@@ -242,14 +241,16 @@ class TrainingDataExporter:
                 category_id = self._get_or_create_category_id(
                     record.match_summary.get("image_id", "unknown")
                 )
-                annotations.append({
-                    "bbox": bbox,
-                    "category_id": category_id,
-                    "category_name": record.match_summary.get("image_id", "unknown"),
-                    "confidence": record.match_summary.get("confidence", 0.0),
-                    "source": "template_matching",
-                    "verified": False,
-                })
+                annotations.append(
+                    {
+                        "bbox": bbox,
+                        "category_id": category_id,
+                        "category_name": record.match_summary.get("image_id", "unknown"),
+                        "confidence": record.match_summary.get("confidence", 0.0),
+                        "source": "template_matching",
+                        "verified": False,
+                    }
+                )
                 stats.total_annotations += 1
 
         # Annotation from clicked_location (human interaction - high confidence)
@@ -264,11 +265,7 @@ class TrainingDataExporter:
                     record.click_target_type,
                 )
             else:
-                bbox = self._infer_bbox_from_click(
-                    record.clicked_location,
-                    img_width,
-                    img_height
-                )
+                bbox = self._infer_bbox_from_click(record.clicked_location, img_width, img_height)
                 category_name = record.click_target_type or "click_target"
                 category_id = self._get_or_create_category_id(category_name)
                 annotation = {
@@ -324,7 +321,7 @@ class TrainingDataExporter:
         clicked_location: Tuple[int, int],
         img_width: int,
         img_height: int,
-        bbox_size: int = 50
+        bbox_size: int = 50,
     ) -> List[int]:
         """Infer a bounding box from a click location using fixed-size fallback.
 
@@ -420,9 +417,7 @@ class TrainingDataExporter:
 
             # Log if fallback was used
             if result.used_fallback:
-                logger.debug(
-                    f"Click analysis fell back to fixed-size box at {clicked_location}"
-                )
+                logger.debug(f"Click analysis fell back to fixed-size box at {clicked_location}")
 
             return annotation
 
@@ -448,7 +443,7 @@ class TrainingDataExporter:
         annotations: List[Dict[str, Any]],
         record: ActionExecutionRecord,
         img_width: int,
-        img_height: int
+        img_height: int,
     ) -> None:
         """Save annotations for an image.
 
@@ -464,7 +459,7 @@ class TrainingDataExporter:
         # Load existing annotations if file exists (for incremental updates)
         existing_annotations = []
         if annotation_file.exists():
-            with open(annotation_file, 'r') as f:
+            with open(annotation_file, "r") as f:
                 data = json.load(f)
                 existing_annotations = data.get("annotations", [])
 
@@ -490,13 +485,11 @@ class TrainingDataExporter:
             "version": self.dataset_version,
         }
 
-        with open(annotation_file, 'w') as f:
+        with open(annotation_file, "w") as f:
             json.dump(data, f, indent=2)
 
     def _annotation_exists(
-        self,
-        annotation: Dict[str, Any],
-        existing: List[Dict[str, Any]]
+        self, annotation: Dict[str, Any], existing: List[Dict[str, Any]]
     ) -> bool:
         """Check if an annotation already exists.
 
@@ -508,16 +501,15 @@ class TrainingDataExporter:
             True if a similar annotation exists.
         """
         for ann in existing:
-            if (ann["bbox"] == annotation["bbox"] and
-                ann["category_id"] == annotation["category_id"]):
+            if (
+                ann["bbox"] == annotation["bbox"]
+                and ann["category_id"] == annotation["category_id"]
+            ):
                 return True
         return False
 
     def _append_to_manifest(
-        self,
-        img_hash: str,
-        record: ActionExecutionRecord,
-        is_new: bool
+        self, img_hash: str, record: ActionExecutionRecord, is_new: bool
     ) -> None:
         """Append a record to the manifest file.
 
@@ -540,8 +532,8 @@ class TrainingDataExporter:
         }
 
         # Append to JSONL file (one line per entry)
-        with open(self.manifest_path, 'a') as f:
-            f.write(json.dumps(manifest_entry) + '\n')
+        with open(self.manifest_path, "a") as f:
+            f.write(json.dumps(manifest_entry) + "\n")
 
     def _hash_image(self, image_data: bytes) -> str:
         """Generate a hash for image data.
@@ -582,10 +574,7 @@ class TrainingDataExporter:
             "category_map": self.category_id_map,
             "categories": [
                 {"id": cat_id, "name": cat_name}
-                for cat_name, cat_id in sorted(
-                    self.category_id_map.items(),
-                    key=lambda x: x[1]
-                )
+                for cat_name, cat_id in sorted(self.category_id_map.items(), key=lambda x: x[1])
             ],
             "statistics": {
                 "total_records_processed": stats.total_records,
@@ -599,7 +588,7 @@ class TrainingDataExporter:
             "description": "Training dataset exported from qontinui-runner execution data",
         }
 
-        with open(self.metadata_path, 'w') as f:
+        with open(self.metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
     def export_to_coco(self, output_file: Path) -> None:
@@ -629,40 +618,44 @@ class TrainingDataExporter:
 
         # Read all annotation files
         for ann_file in sorted(self.annotations_dir.glob("*.json")):
-            with open(ann_file, 'r') as f:
+            with open(ann_file, "r") as f:
                 data = json.load(f)
 
             img_hash = data["image_id"]
 
             # Add image entry
-            coco_data["images"].append({
-                "id": img_hash,
-                "file_name": data["image_filename"],
-                "width": data["image_width"],
-                "height": data["image_height"],
-                "date_captured": data["context"].get("timestamp"),
-            })
+            coco_data["images"].append(
+                {
+                    "id": img_hash,
+                    "file_name": data["image_filename"],
+                    "width": data["image_width"],
+                    "height": data["image_height"],
+                    "date_captured": data["context"].get("timestamp"),
+                }
+            )
 
             # Add annotations
             for ann in data["annotations"]:
                 bbox = ann["bbox"]
                 area = bbox[2] * bbox[3]  # width * height
 
-                coco_data["annotations"].append({
-                    "id": annotation_id,
-                    "image_id": img_hash,
-                    "category_id": ann["category_id"],
-                    "bbox": bbox,
-                    "area": area,
-                    "iscrowd": 0,
-                    "confidence": ann.get("confidence", 1.0),
-                    "source": ann.get("source", "unknown"),
-                    "verified": ann.get("verified", False),
-                })
+                coco_data["annotations"].append(
+                    {
+                        "id": annotation_id,
+                        "image_id": img_hash,
+                        "category_id": ann["category_id"],
+                        "bbox": bbox,
+                        "area": area,
+                        "iscrowd": 0,
+                        "confidence": ann.get("confidence", 1.0),
+                        "source": ann.get("source", "unknown"),
+                        "verified": ann.get("verified", False),
+                    }
+                )
                 annotation_id += 1
 
         # Write COCO JSON
-        with open(output_file, 'w') as f:
+        with open(output_file, "w") as f:
             json.dump(coco_data, f, indent=2)
 
     def get_summary(self) -> Dict[str, Any]:
@@ -674,14 +667,14 @@ class TrainingDataExporter:
         if not self.metadata_path.exists():
             return {"error": "No metadata found. Dataset may be empty."}
 
-        with open(self.metadata_path, 'r') as f:
+        with open(self.metadata_path, "r") as f:
             metadata = json.load(f)
 
         # Count manifest entries
         manifest_count = 0
         reviewed_count = 0
         if self.manifest_path.exists():
-            with open(self.manifest_path, 'r') as f:
+            with open(self.manifest_path, "r") as f:
                 for line in f:
                     manifest_count += 1
                     entry = json.loads(line)

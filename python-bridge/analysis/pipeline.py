@@ -521,9 +521,7 @@ class AnalysisPipeline:
         """
         return self.processing_log
 
-    def compare_results(
-        self, result1: AnalysisResult, result2: AnalysisResult
-    ) -> Dict[str, Any]:
+    def compare_results(self, result1: AnalysisResult, result2: AnalysisResult) -> Dict[str, Any]:
         """Compare two analysis results for parameter tuning.
 
         This provides metrics to help evaluate which configuration produces
@@ -569,8 +567,12 @@ class AnalysisPipeline:
         }
 
         logger.info("Comparison complete:")
-        logger.info("  Result 1: %d states, %d transitions", len(result1.states), len(result1.transitions))
-        logger.info("  Result 2: %d states, %d transitions", len(result2.states), len(result2.transitions))
+        logger.info(
+            "  Result 1: %d states, %d transitions", len(result1.states), len(result1.transitions)
+        )
+        logger.info(
+            "  Result 2: %d states, %d transitions", len(result2.states), len(result2.transitions)
+        )
         logger.info("  Recommendation: %s", comparison["recommendation"])
 
         return comparison
@@ -637,8 +639,11 @@ class AnalysisPipeline:
 
             success = True
             error = None
-            logger.info("Session validation successful: %d frames, %d events",
-                       len(session.frames), len(session.events))
+            logger.info(
+                "Session validation successful: %d frames, %d events",
+                len(session.frames),
+                len(session.events),
+            )
 
         except Exception as e:
             success = False
@@ -733,9 +738,7 @@ class AnalysisPipeline:
 
         try:
             for state in states:
-                extracted_images = self.image_extractor.extract_from_state(
-                    state, frames, events
-                )
+                extracted_images = self.image_extractor.extract_from_state(state, frames, events)
                 state.state_images = extracted_images
                 total_images += len(extracted_images)
 
@@ -743,9 +746,7 @@ class AnalysisPipeline:
             logger.info("Image extraction complete: %d total images extracted", total_images)
 
             for state in states:
-                logger.debug(
-                    "  - %s: %d StateImages", state.name, len(state.state_images)
-                )
+                logger.debug("  - %s: %d StateImages", state.name, len(state.state_images))
 
         except Exception as e:
             error = str(e)
@@ -836,9 +837,7 @@ class AnalysisPipeline:
         success = False
 
         try:
-            transitions = self.transition_analyzer.analyze_transitions(
-                states, events, frames
-            )
+            transitions = self.transition_analyzer.analyze_transitions(states, events, frames)
             success = True
 
             logger.info("Transition analysis complete: %d transitions found", len(transitions))
@@ -922,9 +921,7 @@ class AnalysisPipeline:
 
         return scores
 
-    def _generate_recommendation(
-        self, result1: AnalysisResult, result2: AnalysisResult
-    ) -> str:
+    def _generate_recommendation(self, result1: AnalysisResult, result2: AnalysisResult) -> str:
         """Generate a recommendation on which result is better.
 
         Args:
@@ -959,9 +956,7 @@ class AnalysisPipeline:
 # ============================================================================
 
 
-def load_session_from_video(
-    video_path: str, events_path: str, fps: int = 30
-) -> CaptureSession:
+def load_session_from_video(video_path: str, events_path: str, fps: int = 30) -> CaptureSession:
     """Load a capture session from video and events files.
 
     Args:

@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Handles output processing from Python executor
 pub struct OutputProcessor;
@@ -62,17 +62,26 @@ impl OutputProcessor {
         health_monitor: Arc<HealthMonitor>,
         app_handle: tauri::AppHandle,
     ) {
+        info!("[OUTPUT_PROCESSOR] stdout_reader_task started");
         let reader = BufReader::new(stdout);
+        let mut line_count = 0;
 
         for line in reader.lines() {
+            line_count += 1;
             match line {
                 Ok(line) => {
-                    debug!("Python stdout: {}", line);
+                    info!("[OUTPUT_PROCESSOR] Line #{}: {}", line_count, line);
+
+                    // Check if this looks like a READY message
+                    if line.contains("\"type\"") && line.contains("ready") {
+                        info!("[OUTPUT_PROCESSOR] DETECTED READY MESSAGE: {}", line);
+                    }
 
                     // Parse message
                     match parse_executor_message(&line) {
                         Ok(message) => {
-                            debug!("Parsed message: {:?}", message);
+                            info!("[OUTPUT_PROCESSOR] Parsed message type: {:?}", std::mem::discriminant(&message));
+                            debug!("Parsed message full: {:?}", message);
 
                             // Handle pong messages for health monitoring
                             if matches!(message, ExecutorMessage::Pong { .. }) {

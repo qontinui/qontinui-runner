@@ -26,37 +26,37 @@ def get_platform_target():
     system = platform.system().lower()
     machine = platform.machine().lower()
 
-    if system == 'windows':
-        if machine in ('amd64', 'x86_64'):
-            return 'x86_64-pc-windows-msvc'
-        elif machine == 'arm64':
-            return 'aarch64-pc-windows-msvc'
-    elif system == 'darwin':
-        if machine == 'arm64':
-            return 'aarch64-apple-darwin'
+    if system == "windows":
+        if machine in ("amd64", "x86_64"):
+            return "x86_64-pc-windows-msvc"
+        elif machine == "arm64":
+            return "aarch64-pc-windows-msvc"
+    elif system == "darwin":
+        if machine == "arm64":
+            return "aarch64-apple-darwin"
         else:
-            return 'x86_64-apple-darwin'
-    elif system == 'linux':
-        if machine in ('amd64', 'x86_64'):
-            return 'x86_64-unknown-linux-gnu'
-        elif machine == 'aarch64':
-            return 'aarch64-unknown-linux-gnu'
+            return "x86_64-apple-darwin"
+    elif system == "linux":
+        if machine in ("amd64", "x86_64"):
+            return "x86_64-unknown-linux-gnu"
+        elif machine == "aarch64":
+            return "aarch64-unknown-linux-gnu"
 
     raise ValueError(f"Unsupported platform: {system}-{machine}")
 
 
 def get_executable_name():
     """Get the executable name for the current platform."""
-    if platform.system() == 'Windows':
-        return 'qontinui-executor.exe'
-    return 'qontinui-executor'
+    if platform.system() == "Windows":
+        return "qontinui-executor.exe"
+    return "qontinui-executor"
 
 
 def clean_build_artifacts(spec_dir: Path):
     """Clean PyInstaller build artifacts."""
     print("Cleaning build artifacts...")
 
-    dirs_to_clean = ['build', 'dist', '__pycache__']
+    dirs_to_clean = ["build", "dist", "__pycache__"]
     for dir_name in dirs_to_clean:
         dir_path = spec_dir / dir_name
         if dir_path.exists():
@@ -64,7 +64,7 @@ def clean_build_artifacts(spec_dir: Path):
             shutil.rmtree(dir_path)
 
     # Clean .pyc files
-    for pyc in spec_dir.rglob('*.pyc'):
+    for pyc in spec_dir.rglob("*.pyc"):
         pyc.unlink()
 
 
@@ -81,15 +81,17 @@ def build_executable(spec_dir: Path, include_cuda: bool, include_sam3: bool):
 
     # Set environment variables for the spec file
     env = os.environ.copy()
-    env['QONTINUI_INCLUDE_CUDA'] = '1' if include_cuda else '0'
-    env['QONTINUI_INCLUDE_SAM3'] = '1' if include_sam3 else '0'
+    env["QONTINUI_INCLUDE_CUDA"] = "1" if include_cuda else "0"
+    env["QONTINUI_INCLUDE_SAM3"] = "1" if include_sam3 else "0"
 
     # Run PyInstaller
-    spec_file = spec_dir / 'qontinui-executor.spec'
+    spec_file = spec_dir / "qontinui-executor.spec"
     cmd = [
-        sys.executable, '-m', 'PyInstaller',
-        '--clean',
-        '--noconfirm',
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--clean",
+        "--noconfirm",
         str(spec_file),
     ]
 
@@ -101,19 +103,19 @@ def build_executable(spec_dir: Path, include_cuda: bool, include_sam3: bool):
         sys.exit(1)
 
     print("\nBuild completed successfully!")
-    return spec_dir / 'dist' / get_executable_name()
+    return spec_dir / "dist" / get_executable_name()
 
 
 def copy_to_tauri_binaries(executable: Path, tauri_dir: Path):
     """Copy the executable to Tauri binaries directory with platform-specific naming."""
-    binaries_dir = tauri_dir / 'binaries'
+    binaries_dir = tauri_dir / "binaries"
     binaries_dir.mkdir(parents=True, exist_ok=True)
 
     target = get_platform_target()
-    if platform.system() == 'Windows':
-        dest_name = f'qontinui-executor-{target}.exe'
+    if platform.system() == "Windows":
+        dest_name = f"qontinui-executor-{target}.exe"
     else:
-        dest_name = f'qontinui-executor-{target}'
+        dest_name = f"qontinui-executor-{target}"
 
     dest_path = binaries_dir / dest_name
 
@@ -124,7 +126,7 @@ def copy_to_tauri_binaries(executable: Path, tauri_dir: Path):
     shutil.copy2(executable, dest_path)
 
     # Make executable on Unix
-    if platform.system() != 'Windows':
+    if platform.system() != "Windows":
         dest_path.chmod(0o755)
 
     print(f"\nExecutable ready at: {dest_path}")
@@ -132,16 +134,16 @@ def copy_to_tauri_binaries(executable: Path, tauri_dir: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Build qontinui-executor')
-    parser.add_argument('--cuda', action='store_true', help='Include CUDA support')
-    parser.add_argument('--no-sam3', action='store_true', help='Exclude SAM3')
-    parser.add_argument('--clean', action='store_true', help='Clean build artifacts first')
-    parser.add_argument('--skip-copy', action='store_true', help='Skip copying to Tauri binaries')
+    parser = argparse.ArgumentParser(description="Build qontinui-executor")
+    parser.add_argument("--cuda", action="store_true", help="Include CUDA support")
+    parser.add_argument("--no-sam3", action="store_true", help="Exclude SAM3")
+    parser.add_argument("--clean", action="store_true", help="Clean build artifacts first")
+    parser.add_argument("--skip-copy", action="store_true", help="Skip copying to Tauri binaries")
     args = parser.parse_args()
 
     # Paths
     spec_dir = Path(__file__).parent
-    tauri_dir = spec_dir.parent / 'src-tauri'
+    tauri_dir = spec_dir.parent / "src-tauri"
 
     # Clean if requested
     if args.clean:
@@ -170,5 +172,5 @@ def main():
     print("  3. Run 'npm run tauri build' to create the installer")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

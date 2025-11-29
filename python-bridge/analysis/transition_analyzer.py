@@ -126,15 +126,11 @@ class TransitionAnalyzer:
                 else None
             )
             to_state_id = (
-                list(change_point.states_appeared)[0]
-                if change_point.states_appeared
-                else None
+                list(change_point.states_appeared)[0] if change_point.states_appeared else None
             )
 
             if not from_state_id or not to_state_id:
-                logger.debug(
-                    f"Incomplete state transition at frame {change_point.frame_number}"
-                )
+                logger.debug(f"Incomplete state transition at frame {change_point.frame_number}")
                 continue
 
             # Get the actual state objects
@@ -148,21 +144,19 @@ class TransitionAnalyzer:
                 continue
 
             # Step 3: Identify action target (which StateImage was clicked)
-            frame = frames[change_point.frame_number] if change_point.frame_number < len(frames) else None
-            action_target_id = self.identify_action_target(
-                trigger_event, frame, from_state
+            frame = (
+                frames[change_point.frame_number]
+                if change_point.frame_number < len(frames)
+                else None
             )
+            action_target_id = self.identify_action_target(trigger_event, frame, from_state)
 
             # Step 4: Identify recognition images (which StateImages appeared in new state)
             recognition_ids = self.identify_recognition_images(to_state)
 
             # Step 5: Calculate visual change metrics
-            visual_change_score = self._calculate_visual_change_score(
-                change_point, frames
-            )
-            optical_flow = self._estimate_optical_flow_magnitude(
-                change_point, frames
-            )
+            visual_change_score = self._calculate_visual_change_score(change_point, frames)
+            optical_flow = self._estimate_optical_flow_magnitude(change_point, frames)
 
             # Step 6: Build transition object
             transition_id = f"t_{i}_{from_state_id}_to_{to_state_id}"
@@ -192,9 +186,7 @@ class TransitionAnalyzer:
                 timestamp=change_point.timestamp,
                 frame_before=change_point.frame_number,
                 frame_after=change_point.frame_number + 1,
-                duration_ms=self._estimate_transition_duration(
-                    change_point, frames
-                ),
+                duration_ms=self._estimate_transition_duration(change_point, frames),
                 # Metadata
                 metadata={
                     "auto_generated": True,
@@ -245,15 +237,10 @@ class TransitionAnalyzer:
             center_y = bbox_y + bbox_h // 2
 
             # Calculate distance from click to StateImage center
-            distance = math.sqrt(
-                (click_x - center_x) ** 2 + (click_y - center_y) ** 2
-            )
+            distance = math.sqrt((click_x - center_x) ** 2 + (click_y - center_y) ** 2)
 
             # Check if click is within the bounding box or close enough
-            in_bbox = (
-                bbox_x <= click_x <= bbox_x + bbox_w
-                and bbox_y <= click_y <= bbox_y + bbox_h
-            )
+            in_bbox = bbox_x <= click_x <= bbox_x + bbox_w and bbox_y <= click_y <= bbox_y + bbox_h
 
             if in_bbox or distance < self.click_proximity_threshold:
                 if distance < closest_distance:
@@ -355,9 +342,7 @@ class TransitionAnalyzer:
 
             if states_appeared or states_disappeared:
                 # Find the corresponding frame for timestamp
-                frame = next(
-                    (f for f in frames if f.frame_index == curr_frame_idx), None
-                )
+                frame = next((f for f in frames if f.frame_index == curr_frame_idx), None)
                 timestamp = frame.timestamp if frame else 0.0
 
                 change_point = StateChangePoint(

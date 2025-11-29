@@ -14,6 +14,7 @@ from typing import Any, Callable, Optional
 
 try:
     from qontinui.reporting import EventType as QontinuiEventType, register_callback
+
     QONTINUI_AVAILABLE = True
 except ImportError:
     QONTINUI_AVAILABLE = False
@@ -44,11 +45,14 @@ class EventTranslator:
         >>> # Now library events will be translated and emitted via emit_fn
     """
 
-    def __init__(self, emitter: Callable[[str, dict[str, Any]], None],
-                 state_lookup: Callable[[str], str | None] | None = None,
-                 hierarchy_lookup: Callable[[], dict[str, Any]] | None = None,
-                 image_data_lookup: Callable[[str], str | None] | None = None,
-                 collector: Optional[UnifiedDataCollector] = None):
+    def __init__(
+        self,
+        emitter: Callable[[str, dict[str, Any]], None],
+        state_lookup: Callable[[str], str | None] | None = None,
+        hierarchy_lookup: Callable[[], dict[str, Any]] | None = None,
+        image_data_lookup: Callable[[str], str | None] | None = None,
+        collector: Optional[UnifiedDataCollector] = None,
+    ):
         """Initialize the event translator.
 
         Args:
@@ -95,7 +99,9 @@ class EventTranslator:
         print("[EventTranslator] register_all_callbacks() starting...", file=sys.stderr, flush=True)
 
         # Register MATCH_ATTEMPTED callback for image recognition events
-        print("[EventTranslator] Registering MATCH_ATTEMPTED callback...", file=sys.stderr, flush=True)
+        print(
+            "[EventTranslator] Registering MATCH_ATTEMPTED callback...", file=sys.stderr, flush=True
+        )
         register_callback(QontinuiEventType.MATCH_ATTEMPTED, self.on_match_attempted)
         print("[EventTranslator] MATCH_ATTEMPTED callback registered", file=sys.stderr, flush=True)
 
@@ -105,7 +111,11 @@ class EventTranslator:
         print("[EventTranslator] TEXT_TYPED callback registered", file=sys.stderr, flush=True)
 
         # Register ACTION_COMPLETED callback to add hierarchy to library action events
-        print("[EventTranslator] Registering ACTION_COMPLETED callback...", file=sys.stderr, flush=True)
+        print(
+            "[EventTranslator] Registering ACTION_COMPLETED callback...",
+            file=sys.stderr,
+            flush=True,
+        )
         register_callback(QontinuiEventType.ACTION_COMPLETED, self.on_action_completed_library)
         print("[EventTranslator] ACTION_COMPLETED callback registered", file=sys.stderr, flush=True)
 
@@ -156,13 +166,18 @@ class EventTranslator:
         try:
             # PROMINENT DEBUG LOGGING - Verify callback is being called
             print(f"\n{'='*80}", file=sys.stderr, flush=True)
-            print(f"[EventTranslator] !!!!! MATCH_ATTEMPTED EVENT RECEIVED !!!!!", file=sys.stderr, flush=True)
+            print(
+                f"[EventTranslator] !!!!! MATCH_ATTEMPTED EVENT RECEIVED !!!!!",
+                file=sys.stderr,
+                flush=True,
+            )
             print(f"{'='*80}\n", file=sys.stderr, flush=True)
 
             # File-based debug logging (works even when stderr is disabled)
             import os
             import tempfile
             from datetime import datetime
+
             debug_log = os.path.join(tempfile.gettempdir(), "qontinui_event_emission.log")
             try:
                 with open(debug_log, "a", encoding="utf-8") as f:
@@ -197,7 +212,12 @@ class EventTranslator:
                     match_loc = location_data
                 elif isinstance(location_data, tuple):
                     # Fallback: tuple with (x, y) only
-                    match_loc = {"x": location_data[0], "y": location_data[1], "width": 0, "height": 0}
+                    match_loc = {
+                        "x": location_data[0],
+                        "y": location_data[1],
+                        "width": 0,
+                        "height": 0,
+                    }
                 else:
                     match_loc = {}
             else:
@@ -205,14 +225,20 @@ class EventTranslator:
                 match_loc = data.get("best_match_location", {})
 
             # Debug logging
-            print(f"[EventTranslator] Processing MATCH_ATTEMPTED: image_id={data.get('image_id')}, found={data.get('found')}", file=sys.stderr)
+            print(
+                f"[EventTranslator] Processing MATCH_ATTEMPTED: image_id={data.get('image_id')}, found={data.get('found')}",
+                file=sys.stderr,
+            )
 
             # Get threshold and confidence (NEW format: threshold/confidence, OLD format: similarity_threshold/best_match_confidence)
             threshold = data.get("threshold", data.get("similarity_threshold", 0))
             confidence = data.get("confidence", data.get("best_match_confidence", 0))
             found = data.get("found", data.get("threshold_passed", False))
 
-            print(f"[EventTranslator] Values from library: threshold={threshold}, confidence={confidence}, found={found}", file=sys.stderr)
+            print(
+                f"[EventTranslator] Values from library: threshold={threshold}, confidence={confidence}, found={found}",
+                file=sys.stderr,
+            )
 
             # --- INTEGRATION: Record match data to UnifiedDataCollector ---
             # When collector is available, record match result for execution tracking.
@@ -227,11 +253,23 @@ class EventTranslator:
                     "found": found,
                     "confidence": confidence,
                     "threshold": threshold,
-                    "location": {"x": match_loc.get("x", 0), "y": match_loc.get("y", 0)} if match_loc else None,
+                    "location": (
+                        {"x": match_loc.get("x", 0), "y": match_loc.get("y", 0)}
+                        if match_loc
+                        else None
+                    ),
                     "method": data.get("method", "template_matching"),
-                    "template_size": {"width": template_dims.get("width", 0), "height": template_dims.get("height", 0)},
-                    "screenshot_size": {"width": screenshot_dims.get("width", 0), "height": screenshot_dims.get("height", 0)},
-                    "search_region": data.get("search_region"),  # Optional: region where search was performed
+                    "template_size": {
+                        "width": template_dims.get("width", 0),
+                        "height": template_dims.get("height", 0),
+                    },
+                    "screenshot_size": {
+                        "width": screenshot_dims.get("width", 0),
+                        "height": screenshot_dims.get("height", 0),
+                    },
+                    "search_region": data.get(
+                        "search_region"
+                    ),  # Optional: region where search was performed
                 }
 
                 # Decode screenshot data if available (base64 -> bytes)
@@ -241,38 +279,60 @@ class EventTranslator:
                     try:
                         screenshot_data = base64.b64decode(screenshot_base64)
                     except Exception as e:
-                        print(f"[EventTranslator] Failed to decode screenshot_base64: {e}", file=sys.stderr)
+                        print(
+                            f"[EventTranslator] Failed to decode screenshot_base64: {e}",
+                            file=sys.stderr,
+                        )
 
                 # Decode debug visual data if available (base64 -> bytes)
                 # NEW: Library sends visual_debug_image, OLD: debug_visual_base64
                 debug_visual_data = None
-                debug_visual_base64 = data.get("visual_debug_image", data.get("debug_visual_base64"))
+                debug_visual_base64 = data.get(
+                    "visual_debug_image", data.get("debug_visual_base64")
+                )
                 if debug_visual_base64:
                     try:
                         debug_visual_data = base64.b64decode(debug_visual_base64)
-                        print(f"[EventTranslator] Decoded visual debug image, size={len(debug_visual_data)} bytes", file=sys.stderr)
+                        print(
+                            f"[EventTranslator] Decoded visual debug image, size={len(debug_visual_data)} bytes",
+                            file=sys.stderr,
+                        )
                     except Exception as e:
-                        print(f"[EventTranslator] Failed to decode visual_debug_image: {e}", file=sys.stderr)
+                        print(
+                            f"[EventTranslator] Failed to decode visual_debug_image: {e}",
+                            file=sys.stderr,
+                        )
 
                 # Record to collector (thread-safe) and get saved file paths
                 try:
                     paths = self.collector.record_match_result(
                         match_summary=match_summary,
                         screenshot_data=screenshot_data,
-                        debug_visual_data=debug_visual_data
+                        debug_visual_data=debug_visual_data,
                     )
                     screenshot_path = paths.get("screenshot_path")
                     debug_visual_path = paths.get("debug_visual_path")
-                    print(f"[EventTranslator] Match result recorded to collector: found={match_summary['found']}, screenshot={screenshot_path is not None}", file=sys.stderr)
+                    print(
+                        f"[EventTranslator] Match result recorded to collector: found={match_summary['found']}, screenshot={screenshot_path is not None}",
+                        file=sys.stderr,
+                    )
                 except Exception as e:
-                    print(f"[EventTranslator] Failed to record match to collector: {e}", file=sys.stderr)
+                    print(
+                        f"[EventTranslator] Failed to record match to collector: {e}",
+                        file=sys.stderr,
+                    )
                     import traceback
+
                     traceback.print_exc()
 
             # --- EXISTING: Build frontend-compatible event data ---
             frontend_data = {
-                "image_path": data.get("pattern_name", data.get("image_path", data.get("image_id", ""))),
-                "template_name": data.get("pattern_name", data.get("image_path", data.get("image_id", ""))),
+                "image_path": data.get(
+                    "pattern_name", data.get("image_path", data.get("image_id", ""))
+                ),
+                "template_name": data.get(
+                    "pattern_name", data.get("image_path", data.get("image_id", ""))
+                ),
                 # Format as "width, height" string for frontend display
                 "template_size": f"{template_dims.get('width', 0)}, {template_dims.get('height', 0)}",
                 "screenshot_size": f"{screenshot_dims.get('width', 0)}, {screenshot_dims.get('height', 0)}",
@@ -287,14 +347,14 @@ class EventTranslator:
                         "x": match_loc.get("x", 0),
                         "y": match_loc.get("y", 0),
                         "width": match_loc.get("width", 0),
-                        "height": match_loc.get("height", 0)
+                        "height": match_loc.get("height", 0),
                     }
-                    if match_loc else None
+                    if match_loc
+                    else None
                 ),
                 # Also send as string for convenience (used when match not found)
                 "best_match_location": (
-                    f"({match_loc.get('x', 0)}, {match_loc.get('y', 0)})"
-                    if match_loc else None
+                    f"({match_loc.get('x', 0)}, {match_loc.get('y', 0)})" if match_loc else None
                 ),
                 "event_type": "image_search",
                 "raw_message": f"Match attempt: {data.get('image_id', 'unknown')}",
@@ -311,7 +371,9 @@ class EventTranslator:
             # Add gap and percent_off calculations for failed matches
             if not found and confidence > 0:
                 frontend_data["gap"] = threshold - confidence
-                frontend_data["percent_off"] = ((threshold - confidence) / threshold) if threshold > 0 else 0
+                frontend_data["percent_off"] = (
+                    ((threshold - confidence) / threshold) if threshold > 0 else 0
+                )
 
             # Add state information if state_lookup callback is available
             if self.state_lookup:
@@ -335,17 +397,25 @@ class EventTranslator:
             if screenshot_path:
                 frontend_data["screenshot_path"] = screenshot_path
             if debug_visual_path:
-                frontend_data["template_path"] = debug_visual_path  # Use as template path for visualization
+                frontend_data["template_path"] = (
+                    debug_visual_path  # Use as template path for visualization
+                )
 
             # Pass through screenshot_base64 from library (for display when no file path)
             if data.get("screenshot_base64"):
                 frontend_data["screenshot_base64"] = data.get("screenshot_base64")
-                print(f"[EventTranslator] Including screenshot_base64 (length={len(data.get('screenshot_base64'))})", file=sys.stderr)
+                print(
+                    f"[EventTranslator] Including screenshot_base64 (length={len(data.get('screenshot_base64'))})",
+                    file=sys.stderr,
+                )
 
             # Pass through visual_debug_image (annotated screenshot with colored boxes)
             if data.get("visual_debug_image"):
                 frontend_data["visual_debug_image"] = data.get("visual_debug_image")
-                print(f"[EventTranslator] Including visual_debug_image (length={len(data.get('visual_debug_image'))})", file=sys.stderr)
+                print(
+                    f"[EventTranslator] Including visual_debug_image (length={len(data.get('visual_debug_image'))})",
+                    file=sys.stderr,
+                )
 
             # Pass through debug data for match details
             if data.get("debug"):
@@ -353,17 +423,23 @@ class EventTranslator:
                 print(f"[EventTranslator] Including debug data", file=sys.stderr)
 
             # Debug logging
-            print(f"[EventTranslator] Emitting IMAGE_RECOGNITION: found={frontend_data['found']}, confidence={frontend_data['confidence']}, screenshot_path={screenshot_path is not None}, screenshot_base64={data.get('screenshot_base64') is not None}, visual_debug={data.get('visual_debug_image') is not None}", file=sys.stderr)
+            print(
+                f"[EventTranslator] Emitting IMAGE_RECOGNITION: found={frontend_data['found']}, confidence={frontend_data['confidence']}, screenshot_path={screenshot_path is not None}, screenshot_base64={data.get('screenshot_base64') is not None}, visual_debug={data.get('visual_debug_image') is not None}",
+                file=sys.stderr,
+            )
 
             # Emit to frontend via the provided emitter callback
             self.emitter("image_recognition", frontend_data)
 
-            print(f"[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr)
+            print(
+                f"[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr
+            )
 
         except Exception as e:
             # Log exception to help debug translation failures
             print(f"[EventTranslator] ERROR translating MATCH_ATTEMPTED: {e}", file=sys.stderr)
             import traceback
+
             traceback.print_exc()
             # Re-raise so event registry can also log it
             raise
@@ -404,7 +480,11 @@ class EventTranslator:
         try:
             data = event.data
             text = data.get("text", "")
-            print(f"[EventTranslator] TEXT_TYPED event data: text='{text}'", file=sys.stderr, flush=True)
+            print(
+                f"[EventTranslator] TEXT_TYPED event data: text='{text}'",
+                file=sys.stderr,
+                flush=True,
+            )
 
             # --- INTEGRATION: Record text typed to UnifiedDataCollector ---
             # When collector is available, record the typed text for execution tracking.
@@ -413,10 +493,19 @@ class EventTranslator:
             if self.collector and text:
                 try:
                     self.collector.record_text_typed(text)
-                    print(f"[EventTranslator] Typed text recorded to collector: '{text}' ({len(text)} chars)", file=sys.stderr, flush=True)
+                    print(
+                        f"[EventTranslator] Typed text recorded to collector: '{text}' ({len(text)} chars)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 except Exception as e:
-                    print(f"[EventTranslator] Failed to record text to collector: {e}", file=sys.stderr, flush=True)
+                    print(
+                        f"[EventTranslator] Failed to record text to collector: {e}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     import traceback
+
                     traceback.print_exc()
 
             # --- EXISTING: Build frontend-compatible event data ---
@@ -434,11 +523,23 @@ class EventTranslator:
             if self.hierarchy_lookup:
                 hierarchy = self.hierarchy_lookup()
                 frontend_data["hierarchy"] = hierarchy
-                print(f"[EventTranslator] TYPE action hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}", file=sys.stderr, flush=True)
+                print(
+                    f"[EventTranslator] TYPE action hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
-            print(f"[EventTranslator] Emitting action_execution event for TYPE action", file=sys.stderr, flush=True)
+            print(
+                f"[EventTranslator] Emitting action_execution event for TYPE action",
+                file=sys.stderr,
+                flush=True,
+            )
             self.emitter("action_execution", frontend_data)
-            print(f"[EventTranslator] action_execution event emitted successfully", file=sys.stderr, flush=True)
+            print(
+                f"[EventTranslator] action_execution event emitted successfully",
+                file=sys.stderr,
+                flush=True,
+            )
 
         finally:
             sys.stdout = current_stdout
@@ -588,7 +689,10 @@ class EventTranslator:
             if self.hierarchy_lookup:
                 hierarchy = self.hierarchy_lookup()
                 frontend_data["hierarchy"] = hierarchy
-                print(f"[EventTranslator] Library action {action_type} completed with hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}", file=sys.stderr)
+                print(
+                    f"[EventTranslator] Library action {action_type} completed with hierarchy: parent={hierarchy.get('parent_id')}, level={hierarchy.get('nesting_level')}, workflow={hierarchy.get('workflow_name')}",
+                    file=sys.stderr,
+                )
 
             # Emit as action_execution event for frontend
             self.emitter("action_execution", frontend_data)
@@ -596,6 +700,7 @@ class EventTranslator:
         except Exception as e:
             print(f"[EventTranslator] ERROR in on_action_completed_library: {e}", file=sys.stderr)
             import traceback
+
             traceback.print_exc()
 
         finally:

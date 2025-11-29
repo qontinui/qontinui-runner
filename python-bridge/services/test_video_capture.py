@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from services.video_capture_service import (
     VideoCaptureService,
     VideoCaptureConfig,
-    CompressedStreamConfig
+    CompressedStreamConfig,
 )
 
 
@@ -37,22 +37,16 @@ def test_basic_recording():
 
     # Create configuration
     config = VideoCaptureConfig(
-        fps=30,
-        codec="h264",
-        quality="high",
-        resolution="native",
-        audio=False
+        fps=30, codec="h264", quality="high", resolution="native", audio=False
     )
 
-    stream_config = CompressedStreamConfig(
-        fps=10,
-        resolution=(1280, 720),
-        bitrate="1M"
-    )
+    stream_config = CompressedStreamConfig(fps=10, resolution=(1280, 720), bitrate="1M")
 
     print("Video Config:")
     print(f"  FPS: {config.fps}")
-    print(f"  Quality: {config.quality} (Local CRF: {config.get_crf_value('local')}, Stream CRF: {config.get_crf_value('stream')})")
+    print(
+        f"  Quality: {config.quality} (Local CRF: {config.get_crf_value('local')}, Stream CRF: {config.get_crf_value('stream')})"
+    )
     print(f"  Codec: {config.codec}")
     print(f"  Resolution: {config.resolution}")
     print(f"  Audio: {config.audio}\n")
@@ -91,7 +85,9 @@ def test_basic_recording():
     print("\nRecording for 5 seconds...")
     for i in range(5):
         time.sleep(1)
-        frame_count = len(service._current_session.frame_timestamps) if service._current_session else 0
+        frame_count = (
+            len(service._current_session.frame_timestamps) if service._current_session else 0
+        )
         print(f"  {i+1}s elapsed, {frame_count} frames captured")
 
     # Stop recording
@@ -197,4 +193,5 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nTest failed with error: {type(e).__name__}: {e}")
         import traceback
+
         traceback.print_exc()

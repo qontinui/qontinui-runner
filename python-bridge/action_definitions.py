@@ -25,6 +25,7 @@ class ActionDefinition:
         icon: Icon identifier for frontend display
         description: Human-readable description of what this action does
     """
+
     type: str
     is_expandable: bool
     requires_library: bool = True
@@ -56,7 +57,7 @@ ACTION_DEFINITIONS: Dict[str, ActionDefinition] = {
         requires_library=False,
         emits_children=True,
         icon="target",
-        description="Navigate to a specific application state by executing its entry workflow"
+        description="Navigate to a specific application state by executing its entry workflow",
     ),
     "RUN_WORKFLOW": ActionDefinition(
         type="RUN_WORKFLOW",
@@ -64,7 +65,7 @@ ACTION_DEFINITIONS: Dict[str, ActionDefinition] = {
         requires_library=False,
         emits_children=True,
         icon="workflow",
-        description="Execute a nested workflow"
+        description="Execute a nested workflow",
     ),
     "RUN_PROCESS": ActionDefinition(
         type="RUN_PROCESS",
@@ -72,7 +73,7 @@ ACTION_DEFINITIONS: Dict[str, ActionDefinition] = {
         requires_library=False,
         emits_children=True,
         icon="layers",
-        description="Execute a business process consisting of multiple workflows"
+        description="Execute a business process consisting of multiple workflows",
     ),
     "IF": ActionDefinition(
         type="IF",
@@ -80,42 +81,42 @@ ACTION_DEFINITIONS: Dict[str, ActionDefinition] = {
         requires_library=True,
         emits_children=False,
         icon="git-branch",
-        description="Conditional branching based on evaluation result"
+        description="Conditional branching based on evaluation result",
     ),
     "CLICK": ActionDefinition(
         type="CLICK",
         is_expandable=False,
         requires_library=True,
         icon="pointer",
-        description="Click at coordinates or image target"
+        description="Click at coordinates or image target",
     ),
     "TYPE": ActionDefinition(
         type="TYPE",
         is_expandable=False,
         requires_library=True,
         icon="keyboard",
-        description="Type text input"
+        description="Type text input",
     ),
     "FIND": ActionDefinition(
         type="FIND",
         is_expandable=False,
         requires_library=True,
         icon="search",
-        description="Find an element on screen"
+        description="Find an element on screen",
     ),
     "WAIT": ActionDefinition(
         type="WAIT",
         is_expandable=False,
         requires_library=True,
         icon="clock",
-        description="Wait for a specified duration or condition"
+        description="Wait for a specified duration or condition",
     ),
     "MOUSE_MOVE": ActionDefinition(
         type="MOUSE_MOVE",
         is_expandable=False,
         requires_library=True,
         icon="move",
-        description="Move mouse to coordinates or image target"
+        description="Move mouse to coordinates or image target",
     ),
 }
 
@@ -146,8 +147,8 @@ def get_action_definition(action_type: str) -> ActionDefinition:
             is_expandable=False,
             requires_library=True,
             icon="activity",
-            description=f"Unknown action type: {action_type}"
-        )
+            description=f"Unknown action type: {action_type}",
+        ),
     )
 
 

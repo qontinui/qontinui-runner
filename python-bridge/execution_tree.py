@@ -33,13 +33,14 @@ class ExecutionNode:
         status: Current execution status
         error: Error message if execution failed
     """
+
     id: str
     node_type: str  # "workflow" | "transition" | "action"
     name: str
     timestamp: float  # Start time (Unix timestamp)
     end_timestamp: Optional[float] = None  # End time (Unix timestamp)
-    parent: Optional['ExecutionNode'] = None
-    children: List['ExecutionNode'] = field(default_factory=list)
+    parent: Optional["ExecutionNode"] = None
+    children: List["ExecutionNode"] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     status: str = "pending"  # "pending" | "running" | "success" | "failed"
     error: Optional[str] = None
@@ -55,7 +56,7 @@ class ExecutionNode:
             return None
         return self.end_timestamp - self.timestamp
 
-    def add_child(self, child: 'ExecutionNode') -> 'ExecutionNode':
+    def add_child(self, child: "ExecutionNode") -> "ExecutionNode":
         """Add a child node and set its parent reference.
 
         Args:
@@ -115,11 +116,7 @@ class ExecutionNode:
         path = []
         node = self
         while node:
-            path.insert(0, {
-                "id": node.id,
-                "name": node.name,
-                "type": node.node_type
-            })
+            path.insert(0, {"id": node.id, "name": node.name, "type": node.node_type})
             node = node.parent
         return path
 
@@ -140,9 +137,13 @@ class ExecutionTree:
         self.current: Optional[ExecutionNode] = None
         self.node_map: Dict[str, ExecutionNode] = {}
 
-    def start_workflow(self, workflow_id: str, workflow_name: str,
-                      metadata: Optional[Dict[str, Any]] = None,
-                      is_inline: bool = False) -> ExecutionNode:
+    def start_workflow(
+        self,
+        workflow_id: str,
+        workflow_name: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_inline: bool = False,
+    ) -> ExecutionNode:
         """Start a new workflow (creates root or child workflow node).
 
         Args:
@@ -157,7 +158,7 @@ class ExecutionTree:
         """
         # Merge is_inline into metadata for frontend filtering
         merged_metadata = metadata or {}
-        merged_metadata['is_inline'] = is_inline
+        merged_metadata["is_inline"] = is_inline
 
         node = ExecutionNode(
             id=workflow_id,
@@ -165,7 +166,7 @@ class ExecutionTree:
             name=workflow_name,
             timestamp=time.time(),
             status="running",
-            metadata=merged_metadata
+            metadata=merged_metadata,
         )
         self.node_map[workflow_id] = node
 
@@ -180,8 +181,7 @@ class ExecutionTree:
 
         return node
 
-    def end_workflow(self, workflow_id: str, success: bool,
-                    error: Optional[str] = None) -> None:
+    def end_workflow(self, workflow_id: str, success: bool, error: Optional[str] = None) -> None:
         """Mark workflow as complete and move up the tree.
 
         Args:
@@ -198,8 +198,9 @@ class ExecutionTree:
             if node.parent:
                 self.current = node.parent
 
-    def start_transition(self, transition_id: str, transition_name: str,
-                        metadata: Optional[Dict[str, Any]] = None) -> ExecutionNode:
+    def start_transition(
+        self, transition_id: str, transition_name: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> ExecutionNode:
         """Start a transition under the current workflow.
 
         Args:
@@ -216,7 +217,7 @@ class ExecutionTree:
             name=transition_name,
             timestamp=time.time(),
             status="running",
-            metadata=metadata or {}
+            metadata=metadata or {},
         )
         self.node_map[transition_id] = node
 
@@ -227,8 +228,9 @@ class ExecutionTree:
 
         return node
 
-    def end_transition(self, transition_id: str, success: bool,
-                      error: Optional[str] = None) -> None:
+    def end_transition(
+        self, transition_id: str, success: bool, error: Optional[str] = None
+    ) -> None:
         """Mark transition as complete and move up the tree.
 
         Args:
@@ -245,8 +247,9 @@ class ExecutionTree:
             if node.parent:
                 self.current = node.parent
 
-    def start_action(self, action_id: str, action_type: str,
-                    metadata: Optional[Dict[str, Any]] = None) -> ExecutionNode:
+    def start_action(
+        self, action_id: str, action_type: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> ExecutionNode:
         """Start an action under the current workflow/action.
 
         Args:
@@ -263,7 +266,7 @@ class ExecutionTree:
             name=action_type,
             timestamp=time.time(),
             status="running",
-            metadata=metadata or {}
+            metadata=metadata or {},
         )
         self.node_map[action_id] = node
 
@@ -274,8 +277,7 @@ class ExecutionTree:
 
         return node
 
-    def end_action(self, action_id: str, success: bool,
-                  error: Optional[str] = None) -> None:
+    def end_action(self, action_id: str, success: bool, error: Optional[str] = None) -> None:
         """Mark action as complete and move up the tree.
 
         Args:
@@ -299,11 +301,7 @@ class ExecutionTree:
             Dictionary with parent_id, nesting_level, and workflow_name
         """
         if not self.current:
-            return {
-                "parent_id": None,
-                "nesting_level": 0,
-                "workflow_name": None
-            }
+            return {"parent_id": None, "nesting_level": 0, "workflow_name": None}
 
         # Calculate nesting level (depth from root)
         nesting_level = self.current.get_depth()
@@ -320,7 +318,7 @@ class ExecutionTree:
         return {
             "parent_id": self.current.id,
             "nesting_level": nesting_level + 1,  # +1 for the new child
-            "workflow_name": workflow_name
+            "workflow_name": workflow_name,
         }
 
     def get_node(self, node_id: str) -> Optional[ExecutionNode]:
@@ -343,5 +341,5 @@ class ExecutionTree:
         return {
             "root": self.root.to_dict() if self.root else None,
             "current_id": self.current.id if self.current else None,
-            "node_count": len(self.node_map)
+            "node_count": len(self.node_map),
         }

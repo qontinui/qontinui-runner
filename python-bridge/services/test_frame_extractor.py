@@ -42,7 +42,7 @@ def create_test_events(start_time: float, count: int = 10) -> List[InputMonitorE
                 event_type="mouse_click",
                 x=100 + (i * 10),
                 y=200 + (i * 10),
-                button="left" if i % 2 == 0 else "right"
+                button="left" if i % 2 == 0 else "right",
             )
         elif i % 3 == 1:
             # Key press
@@ -51,7 +51,7 @@ def create_test_events(start_time: float, count: int = 10) -> List[InputMonitorE
                 frame_number=int((timestamp - start_time) * 30),
                 event_type="key_press",
                 key="a" if i % 2 == 0 else "enter",
-                modifiers=["ctrl"] if i % 4 == 1 else []
+                modifiers=["ctrl"] if i % 4 == 1 else [],
             )
         else:
             # Mouse move
@@ -60,7 +60,7 @@ def create_test_events(start_time: float, count: int = 10) -> List[InputMonitorE
                 frame_number=int((timestamp - start_time) * 30),
                 event_type="mouse_move",
                 x=150 + (i * 15),
-                y=250 + (i * 15)
+                y=250 + (i * 15),
             )
 
         events.append(event)
@@ -109,24 +109,19 @@ def test_event_based_extraction(service: FrameExtractorService, video_path: str)
 
     # Test 1: Extract frames at left mouse clicks only
     print("\n  Filter 1: Left clicks only")
-    filter1 = EventFilter(
-        event_types=["mouse_click"],
-        buttons=["left"],
-        max_count=5
-    )
+    filter1 = EventFilter(event_types=["mouse_click"], buttons=["left"], max_count=5)
 
     frames = service.extract_at_events(video_path, events, filter1)
     print(f"    Extracted {len(frames)} frames")
     for i, frame in enumerate(frames[:3]):  # Show first 3
-        print(f"    Frame {i}: timestamp={frame.timestamp:.2f}s, "
-              f"event={frame.metadata.get('event_type')}")
+        print(
+            f"    Frame {i}: timestamp={frame.timestamp:.2f}s, "
+            f"event={frame.metadata.get('event_type')}"
+        )
 
     # Test 2: Extract frames at key presses with Ctrl modifier
     print("\n  Filter 2: Ctrl+Key presses")
-    filter2 = EventFilter(
-        event_types=["key_press"],
-        modifiers=["ctrl"]
-    )
+    filter2 = EventFilter(event_types=["key_press"], modifiers=["ctrl"])
 
     frames = service.extract_at_events(video_path, events, filter2)
     print(f"    Extracted {len(frames)} frames")
@@ -134,10 +129,7 @@ def test_event_based_extraction(service: FrameExtractorService, video_path: str)
     # Test 3: Extract with delay after events
     print("\n  Filter 3: Left clicks with 100ms delay")
     filter3 = EventFilter(
-        event_types=["mouse_click"],
-        buttons=["left"],
-        include_after_delay_ms=100,
-        max_count=3
+        event_types=["mouse_click"], buttons=["left"], include_after_delay_ms=100, max_count=3
     )
 
     frames = service.extract_at_events(video_path, events, filter3)
@@ -167,10 +159,7 @@ def test_batch_extraction(service: FrameExtractorService, video_path: str):
     # Save all frames
     output_dir = service.frames_dir / "batch_test"
     saved_paths = service.save_frames_batch(
-        frames,
-        str(output_dir),
-        filename_pattern="batch_frame_{frame_number:04d}",
-        format="png"
+        frames, str(output_dir), filename_pattern="batch_frame_{frame_number:04d}", format="png"
     )
     print(f"  Saved {len(saved_paths)} frames to {output_dir}")
 
@@ -196,10 +185,7 @@ def test_interval_extraction(service: FrameExtractorService, video_path: str):
         # Save frames
         output_dir = service.frames_dir / "interval_test"
         saved_paths = service.save_frames_batch(
-            frames,
-            str(output_dir),
-            filename_pattern="interval_{timestamp:.1f}s",
-            format="jpg"
+            frames, str(output_dir), filename_pattern="interval_{timestamp:.1f}s", format="jpg"
         )
         print(f"  Saved {len(saved_paths)} frames to {output_dir}")
 
@@ -227,7 +213,7 @@ def test_keyframe_extraction(service: FrameExtractorService, video_path: str):
             frames[:5],  # Save first 5 only
             str(output_dir),
             filename_pattern="keyframe_{frame_number:04d}",
-            format="png"
+            format="png",
         )
         print(f"  Saved {len(saved_paths)} keyframes to {output_dir}")
 
@@ -249,18 +235,21 @@ def create_test_video(output_path: Path) -> bool:
         # Create a 5-second test video with color bars
         cmd = [
             "ffmpeg",
-            "-f", "lavfi",
-            "-i", "testsrc=duration=5:size=640x480:rate=30",
-            "-pix_fmt", "yuv420p",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=duration=5:size=640x480:rate=30",
+            "-pix_fmt",
+            "yuv420p",
             "-y",
-            str(output_path)
+            str(output_path),
         ]
 
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
 
         if result.returncode == 0:
@@ -322,6 +311,7 @@ def main():
     except Exception as e:
         print(f"\nTest failed with error: {e}")
         import traceback
+
         traceback.print_exc()
 
 

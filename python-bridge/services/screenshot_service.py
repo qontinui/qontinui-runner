@@ -85,7 +85,7 @@ class ScreenshotService:
         screenshot_data: bytes,
         action_id: str,
         active_states: List[str],
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[str]:
         """Store a screenshot with associated metadata.
 
@@ -149,18 +149,14 @@ class ScreenshotService:
 
         # Write metadata
         metadata_path.write_text(
-            json.dumps(full_metadata, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            json.dumps(full_metadata, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
         # Return relative path
         return f"screenshots/{screenshot_filename}"
 
     def store_debug_visual(
-        self,
-        debug_image_data: bytes,
-        action_id: str,
-        match_info: Dict[str, Any]
+        self, debug_image_data: bytes, action_id: str, match_info: Dict[str, Any]
     ) -> Optional[str]:
         """Store a debug visualization image with match information.
 
@@ -232,8 +228,7 @@ class ScreenshotService:
 
         # Write metadata
         metadata_path.write_text(
-            json.dumps(full_metadata, indent=2, ensure_ascii=False),
-            encoding="utf-8"
+            json.dumps(full_metadata, indent=2, ensure_ascii=False), encoding="utf-8"
         )
 
         # Return relative path
@@ -303,16 +298,12 @@ class ScreenshotService:
 
         # Clean up regular screenshots
         deleted_count += self._cleanup_directory(
-            self.screenshots_dir,
-            pattern="screenshot-*.png",
-            keep_last_n=keep_last_n
+            self.screenshots_dir, pattern="screenshot-*.png", keep_last_n=keep_last_n
         )
 
         # Clean up debug visuals
         deleted_count += self._cleanup_directory(
-            self.debug_visuals_dir,
-            pattern="debug-*.png",
-            keep_last_n=keep_last_n
+            self.debug_visuals_dir, pattern="debug-*.png", keep_last_n=keep_last_n
         )
 
         return deleted_count
@@ -376,23 +367,18 @@ class ScreenshotService:
             Sanitized string safe for use in filenames.
         """
         # Replace spaces and special characters with hyphens
-        safe_name = re.sub(r'[^\w\-_]', '-', filename)
+        safe_name = re.sub(r"[^\w\-_]", "-", filename)
 
         # Remove consecutive hyphens
-        safe_name = re.sub(r'-+', '-', safe_name)
+        safe_name = re.sub(r"-+", "-", safe_name)
 
         # Remove leading/trailing hyphens
-        safe_name = safe_name.strip('-')
+        safe_name = safe_name.strip("-")
 
         # Limit length to reasonable size
         return safe_name[:100]
 
-    def _cleanup_directory(
-        self,
-        directory: Path,
-        pattern: str,
-        keep_last_n: int
-    ) -> int:
+    def _cleanup_directory(self, directory: Path, pattern: str, keep_last_n: int) -> int:
         """Clean up files in a directory based on retention policy.
 
         Args:
@@ -410,7 +396,7 @@ class ScreenshotService:
             return 0
 
         # Determine which files to delete
-        files_to_delete = files[:len(files) - keep_last_n]
+        files_to_delete = files[: len(files) - keep_last_n]
 
         deleted_count = 0
         for file_path in files_to_delete:
@@ -418,7 +404,7 @@ class ScreenshotService:
             file_path.unlink(missing_ok=True)
 
             # Delete the corresponding metadata file
-            metadata_path = file_path.with_suffix('.json')
+            metadata_path = file_path.with_suffix(".json")
             metadata_path.unlink(missing_ok=True)
 
             deleted_count += 1
