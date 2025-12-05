@@ -14,14 +14,14 @@ This module tests the UnifiedDataCollector service:
 - Thread safety with basic threading tests
 """
 
-import time
 import threading
+import time
 from unittest.mock import Mock
 
 import pytest
 
-from services.unified_data_collector import UnifiedDataCollector
 from models.action_execution_record import ActionExecutionRecord
+from services.unified_data_collector import UnifiedDataCollector
 
 
 class TestUnifiedDataCollectorInitialization:

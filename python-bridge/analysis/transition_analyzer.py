@@ -13,13 +13,12 @@ automatically build a complete transition graph for GUI automation.
 """
 
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Set, Dict, Any, Tuple
 import math
+from dataclasses import dataclass
+from typing import Any
 
-from models.transition import Transition, StateChangePoint
-from models.state_models import DetectedState, StateImage, Frame, InputEvent
-
+from models.state_models import DetectedState, Frame, InputEvent
+from models.transition import StateChangePoint, Transition
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +35,11 @@ class CaptureSession:
         metadata: Additional session metadata
     """
 
-    frames: List[Frame]
-    states: List[DetectedState]
-    events: List[InputEvent]
+    frames: list[Frame]
+    states: list[DetectedState]
+    events: list[InputEvent]
     fps: int = 30
-    metadata: Dict[str, Any] = None
+    metadata: dict[str, Any] = None
 
     def __post_init__(self):
         if self.metadata is None:
@@ -76,10 +75,10 @@ class TransitionAnalyzer:
 
     def analyze_transitions(
         self,
-        states: List[DetectedState],
-        events: List[InputEvent],
-        frames: List[Frame],
-    ) -> List[Transition]:
+        states: list[DetectedState],
+        events: list[InputEvent],
+        frames: list[Frame],
+    ) -> list[Transition]:
         """Analyze transitions from detected states and input events.
 
         This is the main entry point for transition analysis. It:
@@ -205,9 +204,9 @@ class TransitionAnalyzer:
     def identify_action_target(
         self,
         event: InputEvent,
-        frame: Optional[Frame],
+        frame: Frame | None,
         state: DetectedState,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Determine which StateImage was clicked/acted upon.
 
         This method analyzes the input event (typically a click) and the active
@@ -258,7 +257,7 @@ class TransitionAnalyzer:
 
         return closest_image_id
 
-    def identify_recognition_images(self, state: DetectedState) -> List[str]:
+    def identify_recognition_images(self, state: DetectedState) -> list[str]:
         """Identify StateImages that uniquely identify this state.
 
         This method selects the StateImages that should be used to recognize
@@ -297,8 +296,8 @@ class TransitionAnalyzer:
         return recognition_images
 
     def find_state_changes(
-        self, frames: List[Frame], states: List[DetectedState]
-    ) -> List[StateChangePoint]:
+        self, frames: list[Frame], states: list[DetectedState]
+    ) -> list[StateChangePoint]:
         """Find points where active states change.
 
         This method analyzes the frame sequence and state data to identify
@@ -317,7 +316,7 @@ class TransitionAnalyzer:
         change_points = []
 
         # Build a mapping of frame index to active state IDs
-        frame_to_states: Dict[int, Set[str]] = {}
+        frame_to_states: dict[int, set[str]] = {}
         for frame in frames:
             frame_to_states[frame.frame_index] = set()
 
@@ -363,8 +362,8 @@ class TransitionAnalyzer:
         return change_points
 
     def correlate_with_events(
-        self, change_point: StateChangePoint, events: List[InputEvent]
-    ) -> Optional[InputEvent]:
+        self, change_point: StateChangePoint, events: list[InputEvent]
+    ) -> InputEvent | None:
         """Find the input event that likely caused this state change.
 
         This method searches for an input event that occurred shortly before
@@ -405,7 +404,7 @@ class TransitionAnalyzer:
         return closest_event
 
     def _calculate_visual_change_score(
-        self, change_point: StateChangePoint, frames: List[Frame]
+        self, change_point: StateChangePoint, frames: list[Frame]
     ) -> float:
         """Calculate a visual change score for the transition.
 
@@ -426,7 +425,7 @@ class TransitionAnalyzer:
         return score
 
     def _estimate_optical_flow_magnitude(
-        self, change_point: StateChangePoint, frames: List[Frame]
+        self, change_point: StateChangePoint, frames: list[Frame]
     ) -> float:
         """Estimate the magnitude of optical flow during the transition.
 
@@ -444,7 +443,7 @@ class TransitionAnalyzer:
         return self._calculate_visual_change_score(change_point, frames) * 10.0
 
     def _estimate_transition_duration(
-        self, change_point: StateChangePoint, frames: List[Frame]
+        self, change_point: StateChangePoint, frames: list[Frame]
     ) -> int:
         """Estimate the duration of the transition animation.
 
@@ -470,7 +469,7 @@ class AutoTransitionBuilder:
     automatic naming.
     """
 
-    def __init__(self, analyzer: Optional[TransitionAnalyzer] = None):
+    def __init__(self, analyzer: TransitionAnalyzer | None = None):
         """Initialize the auto transition builder.
 
         Args:
@@ -478,7 +477,7 @@ class AutoTransitionBuilder:
         """
         self.analyzer = analyzer or TransitionAnalyzer()
 
-    def build_from_capture(self, session: CaptureSession) -> List[Transition]:
+    def build_from_capture(self, session: CaptureSession) -> list[Transition]:
         """Automatically create transitions from captured video.
 
         This method processes a complete capture session to extract all

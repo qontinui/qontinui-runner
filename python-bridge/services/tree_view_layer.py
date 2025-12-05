@@ -9,7 +9,7 @@ making them easy to test and reason about.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from models.action_execution_record import ActionExecutionRecord
 
@@ -33,11 +33,11 @@ class TreeNode:
     id: str
     type: str
     label: str
-    data: Dict[str, Any] = field(default_factory=dict)
-    children: List["TreeNode"] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    data: dict[str, Any] = field(default_factory=dict)
+    children: list["TreeNode"] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization.
 
         Returns:
@@ -64,7 +64,7 @@ class TreeViewLayer:
     """
 
     @staticmethod
-    def execution_tree_view(records: List[ActionExecutionRecord]) -> List[TreeNode]:
+    def execution_tree_view(records: list[ActionExecutionRecord]) -> list[TreeNode]:
         """Build hierarchical tree based on workflow and parent-child relationships.
 
         This view recreates the execution hierarchy as it happened, with workflows
@@ -89,8 +89,8 @@ class TreeViewLayer:
             return []
 
         # Build lookup maps
-        node_map: Dict[str, TreeNode] = {}
-        workflow_map: Dict[str, TreeNode] = {}
+        node_map: dict[str, TreeNode] = {}
+        workflow_map: dict[str, TreeNode] = {}
 
         # First pass: Create nodes for all records
         for record in records:
@@ -127,7 +127,7 @@ class TreeViewLayer:
                 workflow_map[record.workflow_id] = workflow_node
 
         # Second pass: Build hierarchy
-        roots: List[TreeNode] = []
+        roots: list[TreeNode] = []
 
         for record in records:
             node = node_map[record.action_id]
@@ -152,7 +152,7 @@ class TreeViewLayer:
         return roots
 
     @staticmethod
-    def action_only_tree_view(records: List[ActionExecutionRecord]) -> List[TreeNode]:
+    def action_only_tree_view(records: list[ActionExecutionRecord]) -> list[TreeNode]:
         """Build flat list of actions without hierarchy, chronologically ordered.
 
         This view shows all actions in execution order without nesting,
@@ -203,7 +203,7 @@ class TreeViewLayer:
         return nodes
 
     @staticmethod
-    def state_transition_tree_view(records: List[ActionExecutionRecord]) -> List[TreeNode]:
+    def state_transition_tree_view(records: list[ActionExecutionRecord]) -> list[TreeNode]:
         """Group actions by state changes they caused.
 
         This view organizes actions based on state transitions, making it easy
@@ -230,9 +230,9 @@ class TreeViewLayer:
             return []
 
         # Group by state changes
-        entered_states: Dict[str, List[ActionExecutionRecord]] = {}
-        exited_states: Dict[str, List[ActionExecutionRecord]] = {}
-        no_change_actions: List[ActionExecutionRecord] = []
+        entered_states: dict[str, list[ActionExecutionRecord]] = {}
+        exited_states: dict[str, list[ActionExecutionRecord]] = {}
+        no_change_actions: list[ActionExecutionRecord] = []
 
         for record in records:
             if record.state_changed:
@@ -352,7 +352,7 @@ class TreeViewLayer:
         return roots
 
     @staticmethod
-    def timeline_tree_view(records: List[ActionExecutionRecord]) -> List[TreeNode]:
+    def timeline_tree_view(records: list[ActionExecutionRecord]) -> list[TreeNode]:
         """Build chronological view with relative timestamps.
 
         This view presents actions in time order with formatted timestamps
@@ -380,8 +380,8 @@ class TreeViewLayer:
         start_time = sorted_records[0].start_time if sorted_records else 0
 
         # Build hierarchy similar to execution_tree_view but with timeline labels
-        node_map: Dict[str, TreeNode] = {}
-        roots: List[TreeNode] = []
+        node_map: dict[str, TreeNode] = {}
+        roots: list[TreeNode] = []
 
         for record in sorted_records:
             relative_time = record.start_time - start_time
@@ -415,7 +415,7 @@ class TreeViewLayer:
         return roots
 
     @staticmethod
-    def state_grouped_tree_view(records: List[ActionExecutionRecord]) -> List[TreeNode]:
+    def state_grouped_tree_view(records: list[ActionExecutionRecord]) -> list[TreeNode]:
         """Group actions by active state sets.
 
         This view groups actions by which combination of states were active
@@ -441,7 +441,7 @@ class TreeViewLayer:
             return []
 
         # Group by active state sets (active_states_after is the active set)
-        state_groups: Dict[frozenset, List[ActionExecutionRecord]] = {}
+        state_groups: dict[frozenset, list[ActionExecutionRecord]] = {}
 
         for record in records:
             state_set = record.active_states_after

@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import { Wifi, Settings as SettingsIcon, Camera, HardDrive, Wrench } from "lucide-react";
-import { ConnectionSettings } from "./ConnectionSettings";
+import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { CaptureSettings } from "./CaptureSettings";
 import { StorageSettings } from "./StorageSettings";
@@ -87,7 +87,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       {/* Content area */}
       <div className="flex-1 overflow-y-auto p-6">
         <Tabs.Content value="connection" className="outline-none">
-          <ConnectionSettings onLog={onLog} />
+          <AuthConnectionSettings onLog={onLog} />
         </Tabs.Content>
 
         <Tabs.Content value="general" className="outline-none">

@@ -22,13 +22,12 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import cv2
 import numpy as np
-
 
 # ============================================================================
 # Configuration and Data Models
@@ -50,11 +49,11 @@ class InputEvent:
 
     timestamp: float
     event_type: str  # 'click', 'key', 'move', etc.
-    x: Optional[int] = None
-    y: Optional[int] = None
-    button: Optional[str] = None
-    key: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    x: int | None = None
+    y: int | None = None
+    button: str | None = None
+    key: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -73,11 +72,11 @@ class DetectedState:
 
     name: str
     description: str
-    state_images: List[Dict[str, Any]]
-    state_regions: List[Dict[str, Any]]
-    state_locations: List[Dict[str, Any]]
-    boundary: Optional[Dict[str, Any]]
-    metadata: Dict[str, Any]
+    state_images: list[dict[str, Any]]
+    state_regions: list[dict[str, Any]]
+    state_locations: list[dict[str, Any]]
+    boundary: dict[str, Any] | None
+    metadata: dict[str, Any]
 
 
 # ============================================================================
@@ -122,7 +121,6 @@ class LocalStateDetectionService:
 
         except ImportError as e:
             # Try adding parent directory to path
-            import os
 
             qontinui_path = Path(__file__).parent.parent.parent.parent / "qontinui" / "src"
             if qontinui_path.exists():
@@ -158,7 +156,7 @@ class LocalStateDetectionService:
 
     def process_capture_session(
         self, screenshots_dir: Path, events_file: Path, output_file: Path
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Process a capture session to detect states.
 
         This is the main entry point for the service. It:
@@ -220,7 +218,7 @@ class LocalStateDetectionService:
 
         return result
 
-    def _load_screenshots(self, screenshots_dir: Path) -> Tuple[List[np.ndarray], List[Path]]:
+    def _load_screenshots(self, screenshots_dir: Path) -> tuple[list[np.ndarray], list[Path]]:
         """Load all PNG screenshots from a directory.
 
         Args:
@@ -252,7 +250,7 @@ class LocalStateDetectionService:
 
         return screenshots, valid_files
 
-    def _load_events(self, events_file: Path) -> List[InputEvent]:
+    def _load_events(self, events_file: Path) -> list[InputEvent]:
         """Load input events from JSON file.
 
         Expected JSON format:
@@ -275,7 +273,7 @@ class LocalStateDetectionService:
         Returns:
             List of InputEvent objects
         """
-        with open(events_file, "r") as f:
+        with open(events_file) as f:
             data = json.load(f)
 
         events = []
@@ -294,8 +292,8 @@ class LocalStateDetectionService:
         return events
 
     def _group_into_transitions(
-        self, screenshots: List[np.ndarray], screenshot_files: List[Path], events: List[InputEvent]
-    ) -> List:
+        self, screenshots: list[np.ndarray], screenshot_files: list[Path], events: list[InputEvent]
+    ) -> list:
         """Group screenshots and events into state transitions.
 
         A transition consists of:
@@ -371,7 +369,7 @@ class LocalStateDetectionService:
 
         return transitions
 
-    def _build_states(self, screenshots: List[np.ndarray], transitions: List) -> List[Any]:
+    def _build_states(self, screenshots: list[np.ndarray], transitions: list) -> list[Any]:
         """Build State objects using qontinui StateBuilder.
 
         This method uses the qontinui library's StateBuilder to analyze
@@ -414,8 +412,8 @@ class LocalStateDetectionService:
             return []
 
     def _serialize_states(
-        self, states: List[Any], transitions: List, screenshots_dir: Path
-    ) -> Dict[str, Any]:
+        self, states: list[Any], transitions: list, screenshots_dir: Path
+    ) -> dict[str, Any]:
         """Serialize State objects to JSON-compatible format.
 
         Args:

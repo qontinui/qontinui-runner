@@ -18,7 +18,7 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 
 class ScreenshotService:
@@ -84,9 +84,9 @@ class ScreenshotService:
         self,
         screenshot_data: bytes,
         action_id: str,
-        active_states: List[str],
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[str]:
+        active_states: list[str],
+        metadata: dict[str, Any] | None = None,
+    ) -> str | None:
         """Store a screenshot with associated metadata.
 
         This method:
@@ -156,8 +156,8 @@ class ScreenshotService:
         return f"screenshots/{screenshot_filename}"
 
     def store_debug_visual(
-        self, debug_image_data: bytes, action_id: str, match_info: Dict[str, Any]
-    ) -> Optional[str]:
+        self, debug_image_data: bytes, action_id: str, match_info: dict[str, Any]
+    ) -> str | None:
         """Store a debug visualization image with match information.
 
         Debug visuals are typically annotated screenshots showing where template
@@ -234,7 +234,7 @@ class ScreenshotService:
         # Return relative path
         return f"debug_visuals/{debug_filename}"
 
-    def get_screenshot(self, reference: str) -> Optional[bytes]:
+    def get_screenshot(self, reference: str) -> bytes | None:
         """Retrieve a screenshot by its reference path.
 
         Args:

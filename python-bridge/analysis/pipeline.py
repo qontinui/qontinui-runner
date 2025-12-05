@@ -15,14 +15,14 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import cv2
-import numpy as np
+
+from analysis.image_extractor import ImageExtractionConfig, StateImageExtractor
 
 # Import analysis components
-from analysis.state_boundary_detector import StateBoundaryDetector, StateBoundaryConfig
-from analysis.image_extractor import StateImageExtractor, ImageExtractionConfig
+from analysis.state_boundary_detector import StateBoundaryConfig, StateBoundaryDetector
 from analysis.transition_analyzer import TransitionAnalyzer
 
 # Import models
@@ -33,7 +33,6 @@ from models import (
     ProcessingLog,
     ProcessingResult,
     ProcessingStep,
-    StateImage,
     Transition,
 )
 
@@ -92,8 +91,8 @@ class PipelineConfig:
     # Image extraction
     extract_at_clicks: bool = True
     click_region_padding: int = 20
-    min_image_size: Tuple[int, int] = (20, 20)
-    max_image_size: Tuple[int, int] = (500, 500)
+    min_image_size: tuple[int, int] = (20, 20)
+    max_image_size: tuple[int, int] = (500, 500)
     extract_from_contours: bool = True
     max_contours: int = 50
 
@@ -107,7 +106,7 @@ class PipelineConfig:
     click_proximity_threshold: int = 50
     min_visual_change_score: float = 0.1
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert configuration to dictionary.
 
         Returns:
@@ -153,9 +152,9 @@ class CaptureSession:
     video_path: str
     events_path: str
     fps: int = 30
-    frames: List[Frame] = field(default_factory=list)
-    events: List[InputEvent] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    frames: list[Frame] = field(default_factory=list)
+    events: list[InputEvent] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize computed fields."""
@@ -185,12 +184,12 @@ class AnalysisResult:
     config: PipelineConfig
 
     @property
-    def states(self) -> List[DetectedState]:
+    def states(self) -> list[DetectedState]:
         """Get detected states."""
         return self.processing_result.states
 
     @property
-    def transitions(self) -> List[Transition]:
+    def transitions(self) -> list[Transition]:
         """Get detected transitions."""
         return self.processing_result.transitions
 
@@ -204,7 +203,7 @@ class AnalysisResult:
         """Check if analysis was successful."""
         return self.processing_result.processing_success
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -233,7 +232,7 @@ class AnalysisPipeline:
     - Result comparison for parameter tuning
     """
 
-    def __init__(self, config: Optional[PipelineConfig] = None):
+    def __init__(self, config: PipelineConfig | None = None):
         """Initialize the analysis pipeline.
 
         Args:
@@ -256,7 +255,7 @@ class AnalysisPipeline:
         )
 
         # Initialize processing log (will be reset for each analysis)
-        self.processing_log: Optional[ProcessingLog] = None
+        self.processing_log: ProcessingLog | None = None
 
     def analyze_session(self, session: CaptureSession) -> AnalysisResult:
         """Run the complete analysis pipeline on a capture session.
@@ -284,8 +283,8 @@ class AnalysisPipeline:
 
         # Initialize processing log
         start_time = time.time()
-        steps: List[ProcessingStep] = []
-        errors: List[str] = []
+        steps: list[ProcessingStep] = []
+        errors: list[str] = []
 
         try:
             # Phase 1: Validate session
@@ -513,7 +512,7 @@ class AnalysisPipeline:
         # Re-run analysis
         return self.analyze_session(session)
 
-    def get_processing_log(self) -> Optional[ProcessingLog]:
+    def get_processing_log(self) -> ProcessingLog | None:
         """Get the detailed processing log from the last analysis.
 
         Returns:
@@ -521,7 +520,7 @@ class AnalysisPipeline:
         """
         return self.processing_log
 
-    def compare_results(self, result1: AnalysisResult, result2: AnalysisResult) -> Dict[str, Any]:
+    def compare_results(self, result1: AnalysisResult, result2: AnalysisResult) -> dict[str, Any]:
         """Compare two analysis results for parameter tuning.
 
         This provides metrics to help evaluate which configuration produces
@@ -668,8 +667,8 @@ class AnalysisPipeline:
         )
 
     def _run_state_detection(
-        self, frames: List[Frame]
-    ) -> Tuple[List[DetectedState], ProcessingStep]:
+        self, frames: list[Frame]
+    ) -> tuple[list[DetectedState], ProcessingStep]:
         """Run state boundary detection phase.
 
         Args:
@@ -719,7 +718,7 @@ class AnalysisPipeline:
         )
 
     def _run_image_extraction(
-        self, states: List[DetectedState], frames: List[Frame], events: List[InputEvent]
+        self, states: list[DetectedState], frames: list[Frame], events: list[InputEvent]
     ) -> ProcessingStep:
         """Run StateImage extraction phase.
 
@@ -770,7 +769,7 @@ class AnalysisPipeline:
         )
 
     def _run_element_detection(
-        self, states: List[DetectedState], frames: List[Frame]
+        self, states: list[DetectedState], frames: list[Frame]
     ) -> ProcessingStep:
         """Run UI element detection phase.
 
@@ -819,8 +818,8 @@ class AnalysisPipeline:
         )
 
     def _run_transition_analysis(
-        self, states: List[DetectedState], events: List[InputEvent], frames: List[Frame]
-    ) -> Tuple[List[Transition], ProcessingStep]:
+        self, states: list[DetectedState], events: list[InputEvent], frames: list[Frame]
+    ) -> tuple[list[Transition], ProcessingStep]:
         """Run transition analysis phase.
 
         Args:
@@ -880,8 +879,8 @@ class AnalysisPipeline:
     # ========================================================================
 
     def _calculate_confidence_scores(
-        self, states: List[DetectedState], transitions: List[Transition]
-    ) -> Dict[str, float]:
+        self, states: list[DetectedState], transitions: list[Transition]
+    ) -> dict[str, float]:
         """Calculate confidence scores for the analysis.
 
         Args:
@@ -1004,7 +1003,7 @@ def load_session_from_video(video_path: str, events_path: str, fps: int = 30) ->
     # Load events
     events = []
     try:
-        with open(events_path, "r") as f:
+        with open(events_path) as f:
             events_data = json.load(f)
             for event_dict in events_data:
                 events.append(

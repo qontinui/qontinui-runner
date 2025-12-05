@@ -9,7 +9,7 @@ a capture session, enabling replay, analysis, and training data generation.
 """
 
 from dataclasses import dataclass, field
-from typing import Set, Dict, Any
+from typing import Any
 
 
 @dataclass
@@ -48,14 +48,14 @@ class HistoricalCapture:
     timestamp: float
     frame_before: int
     frame_after: int
-    active_states_before: Set[str]
+    active_states_before: set[str]
     action_type: str
     action_target: str
-    action_params: Dict[str, Any]
-    active_states_after: Set[str]
-    states_appeared: Set[str]
-    states_disappeared: Set[str]
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    action_params: dict[str, Any]
+    active_states_after: set[str]
+    states_appeared: set[str]
+    states_disappeared: set[str]
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_state_change(self) -> bool:
@@ -125,7 +125,7 @@ class HistoricalCapture:
         """
         return self.action_params.get(param_name, default)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -152,7 +152,7 @@ class HistoricalCapture:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "HistoricalCapture":
+    def from_dict(cls, data: dict[str, Any]) -> "HistoricalCapture":
         """Create HistoricalCapture from dictionary.
 
         Args:

@@ -15,8 +15,8 @@ The script will:
 
 import time
 from pathlib import Path
+
 from input_monitor_service import InputMonitorService
-from models.input_event import InputMonitorEvent
 
 
 def main():
@@ -40,7 +40,7 @@ def main():
     # Start monitoring
     session_id = f"example_session_{int(time.time())}"
     fps = 30
-    print(f"Starting monitoring...")
+    print("Starting monitoring...")
     print(f"  Session ID: {session_id}")
     print(f"  FPS: {fps}")
     print()
@@ -128,9 +128,8 @@ def main():
     # Demonstrate reading from JSONL file
     print("Reading events from JSONL file:")
     print("-" * 70)
-    import json
 
-    with open(events_file, "r") as f:
+    with open(events_file) as f:
         lines = f.readlines()
         print(f"File contains {len(lines)} lines")
         print(f"First line: {lines[0][:100]}..." if lines else "File is empty")

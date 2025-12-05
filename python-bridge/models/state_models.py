@@ -5,7 +5,8 @@ and image extraction pipeline.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
 import numpy as np
 
 
@@ -15,11 +16,11 @@ class InputEvent:
 
     timestamp: float
     event_type: str  # 'click', 'key', 'move', etc.
-    x: Optional[int] = None
-    y: Optional[int] = None
-    button: Optional[str] = None
-    key: Optional[str] = None
-    metadata: Optional[Dict[str, Any]] = None
+    x: int | None = None
+    y: int | None = None
+    button: str | None = None
+    key: str | None = None
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
@@ -29,8 +30,8 @@ class Frame:
     image: np.ndarray  # OpenCV image (BGR format)
     timestamp: float
     frame_index: int
-    file_path: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    file_path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -44,16 +45,16 @@ class StateImage:
 
     name: str
     image: np.ndarray  # The extracted image region (BGR format)
-    bbox: Tuple[int, int, int, int]  # (x, y, width, height)
+    bbox: tuple[int, int, int, int]  # (x, y, width, height)
     position_type: str  # "fixed" or "dynamic"
-    position: Tuple[int, int]  # (x, y) coordinates of top-left corner
+    position: tuple[int, int]  # (x, y) coordinates of top-left corner
     similarity_threshold: float = 0.85  # Match threshold for this image
-    context_image: Optional[np.ndarray] = None  # Larger context around the image
-    source_frame_index: Optional[int] = None  # Frame this was extracted from
+    context_image: np.ndarray | None = None  # Larger context around the image
+    source_frame_index: int | None = None  # Frame this was extracted from
     extraction_method: str = "manual"  # How this image was extracted
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dictionary (excluding image data)."""
         return {
             "name": self.name,
@@ -77,16 +78,16 @@ class DetectedState:
 
     name: str
     description: str
-    state_images: List[StateImage]
+    state_images: list[StateImage]
     start_frame_index: int
     end_frame_index: int
-    frame_indices: List[int] = field(default_factory=list)
-    boundary: Optional[Tuple[int, int, int, int]] = None  # (x, y, width, height)
-    click_locations: List[Tuple[int, int]] = field(default_factory=list)
-    transitions_to: List[str] = field(default_factory=list)  # State names
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    frame_indices: list[int] = field(default_factory=list)
+    boundary: tuple[int, int, int, int] | None = None  # (x, y, width, height)
+    click_locations: list[tuple[int, int]] = field(default_factory=list)
+    transitions_to: list[str] = field(default_factory=list)  # State names
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to JSON-serializable dictionary."""
         return {
             "name": self.name,

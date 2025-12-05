@@ -28,7 +28,6 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -81,7 +80,7 @@ class CompressedStreamConfig:
     """
 
     fps: int = 10
-    resolution: Tuple[int, int] = (1280, 720)
+    resolution: tuple[int, int] = (1280, 720)
     bitrate: str = "1M"
 
 
@@ -105,9 +104,9 @@ class VideoRecordingSession:
     local_output_path: Path
     stream_output_path: Path
     metadata_path: Path
-    process: Optional[subprocess.Popen] = None
-    frame_timestamps: List[float] = field(default_factory=list)
-    config: Optional[VideoCaptureConfig] = None
+    process: subprocess.Popen | None = None
+    frame_timestamps: list[float] = field(default_factory=list)
+    config: VideoCaptureConfig | None = None
 
 
 class VideoCaptureService:
@@ -142,9 +141,9 @@ class VideoCaptureService:
         self.storage_dir = storage_dir
         self.enabled = enabled
         self.recordings_dir = storage_dir / "recordings"
-        self._current_session: Optional[VideoRecordingSession] = None
+        self._current_session: VideoRecordingSession | None = None
         self._recording_lock = threading.Lock()
-        self._timestamp_thread: Optional[threading.Thread] = None
+        self._timestamp_thread: threading.Thread | None = None
         self._stop_timestamp_tracking = threading.Event()
 
         # Create directory structure if enabled
@@ -158,8 +157,8 @@ class VideoCaptureService:
     def start_recording(
         self,
         session_id: str,
-        config: Optional[VideoCaptureConfig] = None,
-        stream_config: Optional[CompressedStreamConfig] = None,
+        config: VideoCaptureConfig | None = None,
+        stream_config: CompressedStreamConfig | None = None,
     ) -> bool:
         """Start a new video recording session.
 
@@ -250,7 +249,7 @@ class VideoCaptureService:
                 traceback.print_exc(file=sys.stderr)
                 return False
 
-    def stop_recording(self) -> Optional[str]:
+    def stop_recording(self) -> str | None:
         """Stop the current recording session.
 
         This method gracefully stops the FFmpeg process and finalizes the recording.
@@ -308,7 +307,7 @@ class VideoCaptureService:
                 traceback.print_exc(file=sys.stderr)
                 return None
 
-    def get_frame_timestamp(self, frame_number: int) -> Optional[float]:
+    def get_frame_timestamp(self, frame_number: int) -> float | None:
         """Get the timestamp for a specific frame number.
 
         This method allows correlating video frames with input events
@@ -344,7 +343,7 @@ class VideoCaptureService:
 
             return False
 
-    def get_current_session_info(self) -> Optional[Dict[str, any]]:
+    def get_current_session_info(self) -> dict[str, any] | None:
         """Get information about the current recording session.
 
         Returns:
@@ -377,7 +376,7 @@ class VideoCaptureService:
         stream_path: Path,
         config: VideoCaptureConfig,
         stream_config: CompressedStreamConfig,
-    ) -> List[str]:
+    ) -> list[str]:
         """Build the FFmpeg command for dual-output recording.
 
         Args:
@@ -493,7 +492,7 @@ class VideoCaptureService:
 
         logger.debug("Timestamp tracking stopped")
 
-    def _write_metadata(self, end_time: Optional[float] = None) -> None:
+    def _write_metadata(self, end_time: float | None = None) -> None:
         """Write session metadata to JSON file.
 
         Args:

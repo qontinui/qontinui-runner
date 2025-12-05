@@ -10,9 +10,9 @@ Following the Single Responsibility Principle, this module:
 - Does NOT capture or monitor input events
 """
 
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Tuple, List, Dict, Any
 import json
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -62,23 +62,23 @@ class InputMonitorEvent:
     event_type: str
 
     # Mouse event fields
-    x: Optional[int] = None
-    y: Optional[int] = None
-    button: Optional[str] = None
-    scroll_delta: Optional[int] = None
-    drag_start: Optional[Tuple[int, int]] = None
-    drag_end: Optional[Tuple[int, int]] = None
+    x: int | None = None
+    y: int | None = None
+    button: str | None = None
+    scroll_delta: int | None = None
+    drag_start: tuple[int, int] | None = None
+    drag_end: tuple[int, int] | None = None
 
     # Keyboard event fields
-    key: Optional[str] = None
-    key_code: Optional[int] = None
-    modifiers: List[str] = field(default_factory=list)
+    key: str | None = None
+    key_code: int | None = None
+    modifiers: list[str] = field(default_factory=list)
 
     # Additional fields
-    duration: Optional[float] = None  # Duration in milliseconds
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    duration: float | None = None  # Duration in milliseconds
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert the InputMonitorEvent to a dictionary.
 
         This method converts the dataclass to a dictionary suitable for JSON
@@ -117,7 +117,7 @@ class InputMonitorEvent:
         return json.dumps(self.to_dict(), separators=(",", ":"))
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "InputMonitorEvent":
+    def from_dict(cls, data: dict[str, Any]) -> "InputMonitorEvent":
         """Create an InputMonitorEvent from a dictionary.
 
         Args:

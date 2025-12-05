@@ -14,11 +14,11 @@ Workflow:
 
 import time
 from pathlib import Path
-from typing import List
 
-from video_capture_service import VideoCaptureService, VideoCaptureConfig
+from frame_extractor_service import EventFilter, FrameExtractorService
 from input_monitor_service import InputMonitorService
-from frame_extractor_service import FrameExtractorService, EventFilter
+from video_capture_service import VideoCaptureConfig, VideoCaptureService
+
 from models.input_event import InputMonitorEvent
 
 
@@ -211,7 +211,7 @@ def event_based_analysis_example():
         #     print(f"      Saved to: {output_subdir}")
 
 
-def create_sample_events() -> List[InputMonitorEvent]:
+def create_sample_events() -> list[InputMonitorEvent]:
     """Create sample events for demonstration."""
     events = []
     base_time = time.time() - 100  # 100 seconds ago

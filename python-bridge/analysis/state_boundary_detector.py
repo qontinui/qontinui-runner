@@ -13,20 +13,20 @@ and transitions, enabling automated UI state mapping for testing and automation.
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
 import uuid
+from dataclasses import dataclass, field
+from typing import Any
 
 import cv2
 import imagehash
 import numpy as np
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
-from sklearn.cluster import DBSCAN, KMeans, AgglomerativeClustering
+from sklearn.cluster import DBSCAN, AgglomerativeClustering, KMeans
 from sklearn.preprocessing import StandardScaler
 
 # Import models from the models package
-from models.state_models import Frame, DetectedState, StateImage, InputEvent
+from models.state_models import DetectedState, Frame, InputEvent
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -69,7 +69,7 @@ class StateBoundaryConfig:
     dbscan_eps: float = 0.5
     dbscan_min_samples: int = 3
     hierarchical_distance_threshold: float = 1.5
-    kmeans_n_clusters: Optional[int] = None
+    kmeans_n_clusters: int | None = None
 
 
 # ============================================================================
@@ -96,11 +96,11 @@ class FrameFeatures:
     frame_index: int
     timestamp_ms: int
     phash: str
-    ssim_cache: Dict[int, float] = field(default_factory=dict)
-    keypoints: Optional[List] = None
-    descriptors: Optional[np.ndarray] = None
-    histogram: Optional[np.ndarray] = None
-    edges: Optional[np.ndarray] = None
+    ssim_cache: dict[int, float] = field(default_factory=dict)
+    keypoints: list | None = None
+    descriptors: np.ndarray | None = None
+    histogram: np.ndarray | None = None
+    edges: np.ndarray | None = None
     optical_flow_prev: float = 0.0
 
 
@@ -126,11 +126,11 @@ class TransitionPoint:
     to_state_id: str
     frame_index: int
     timestamp_ms: int
-    trigger_event_index: Optional[int] = None
+    trigger_event_index: int | None = None
     optical_flow_magnitude: float = 0.0
     visual_change_score: float = 0.0
     transition_duration_ms: int = 0
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -146,7 +146,7 @@ class StateBoundaryDetector:
     transitions between them.
     """
 
-    def __init__(self, config: Optional[StateBoundaryConfig] = None):
+    def __init__(self, config: StateBoundaryConfig | None = None):
         """Initialize the state boundary detector.
 
         Args:
@@ -177,7 +177,7 @@ class StateBoundaryDetector:
             logger.error(f"Failed to initialize feature detector: {e}, defaulting to ORB")
             self.feature_detector = cv2.ORB_create(nfeatures=self.config.feature_count)
 
-    def detect_states(self, frames: List[Frame]) -> List[DetectedState]:
+    def detect_states(self, frames: list[Frame]) -> list[DetectedState]:
         """Detect unique states from a sequence of frames.
 
         This is the main entry point for state detection. The process:
@@ -224,8 +224,8 @@ class StateBoundaryDetector:
         return states
 
     def identify_transitions(
-        self, frames: List[Frame], events: List[InputEvent]
-    ) -> List[TransitionPoint]:
+        self, frames: list[Frame], events: list[InputEvent]
+    ) -> list[TransitionPoint]:
         """Identify state transitions and correlate with input events.
 
         This method detects where visual changes occur in the frame sequence
@@ -327,7 +327,7 @@ class StateBoundaryDetector:
     # Private Methods - Feature Extraction
     # ========================================================================
 
-    def _extract_all_features(self, frames: List[Frame]) -> List[FrameFeatures]:
+    def _extract_all_features(self, frames: list[Frame]) -> list[FrameFeatures]:
         """Extract features from all frames.
 
         Args:
@@ -439,7 +439,7 @@ class StateBoundaryDetector:
     # ========================================================================
 
     def _compute_similarity_matrix(
-        self, frames: List[Frame], features_list: List[FrameFeatures]
+        self, frames: list[Frame], features_list: list[FrameFeatures]
     ) -> np.ndarray:
         """Compute pairwise similarity matrix for all frames.
 
@@ -497,7 +497,7 @@ class StateBoundaryDetector:
     # ========================================================================
 
     def _cluster_frames(
-        self, similarity_matrix: np.ndarray, features_list: List[FrameFeatures]
+        self, similarity_matrix: np.ndarray, features_list: list[FrameFeatures]
     ) -> np.ndarray:
         """Cluster frames based on similarity matrix.
 
@@ -589,8 +589,8 @@ class StateBoundaryDetector:
     # ========================================================================
 
     def _build_states_from_clusters(
-        self, frames: List[Frame], features_list: List[FrameFeatures], labels: np.ndarray
-    ) -> List[DetectedState]:
+        self, frames: list[Frame], features_list: list[FrameFeatures], labels: np.ndarray
+    ) -> list[DetectedState]:
         """Build DetectedState objects from cluster labels.
 
         Args:
@@ -644,7 +644,7 @@ class StateBoundaryDetector:
 
         return states
 
-    def _find_representative_frame(self, cluster_indices: List[int], frames: List[Frame]) -> int:
+    def _find_representative_frame(self, cluster_indices: list[int], frames: list[Frame]) -> int:
         """Find the most representative frame in a cluster.
 
         This finds the frame that is most similar to all other frames in the cluster,
@@ -678,7 +678,7 @@ class StateBoundaryDetector:
 
         return best_idx
 
-    def _filter_states_by_duration(self, states: List[DetectedState]) -> List[DetectedState]:
+    def _filter_states_by_duration(self, states: list[DetectedState]) -> list[DetectedState]:
         """Filter out states that are too short.
 
         Args:
@@ -709,8 +709,8 @@ class StateBoundaryDetector:
     # ========================================================================
 
     def _find_closest_event(
-        self, frame_timestamp: float, events: List[InputEvent]
-    ) -> Optional[int]:
+        self, frame_timestamp: float, events: list[InputEvent]
+    ) -> int | None:
         """Find the input event closest to a frame timestamp.
 
         Args:

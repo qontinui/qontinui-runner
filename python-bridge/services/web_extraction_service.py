@@ -92,7 +92,11 @@ class WebExtractionService:
 
             # Parse mode
             mode_str = config.get("mode", "black_box").upper()
-            mode = ExtractionMode[mode_str] if mode_str in ExtractionMode.__members__ else ExtractionMode.BLACK_BOX
+            mode = (
+                ExtractionMode[mode_str]
+                if mode_str in ExtractionMode.__members__
+                else ExtractionMode.BLACK_BOX
+            )
 
             # Build extraction target
             target_kwargs = {}
@@ -188,9 +192,7 @@ class WebExtractionService:
                 "error": str(e),
             }
 
-    async def start_multi_app_extraction(
-        self, configs: list[dict[str, Any]]
-    ) -> dict[str, Any]:
+    async def start_multi_app_extraction(self, configs: list[dict[str, Any]]) -> dict[str, Any]:
         """
         Start extraction for multiple applications, creating a CompositeStateStructure.
 
@@ -211,9 +213,7 @@ class WebExtractionService:
             for config in configs:
                 result = await self.start_extraction(config)
                 if not result["success"]:
-                    logger.warning(
-                        f"Failed to start extraction for config: {result.get('error')}"
-                    )
+                    logger.warning(f"Failed to start extraction for config: {result.get('error')}")
                     continue
                 extraction_ids.append(result["extraction_id"])
 
@@ -244,9 +244,7 @@ class WebExtractionService:
             logger.error(f"Failed to start multi-app extraction: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
-    async def add_to_composite(
-        self, composite_id: str, config: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def add_to_composite(self, composite_id: str, config: dict[str, Any]) -> dict[str, Any]:
         """
         Add another application to an existing composite structure.
 
@@ -479,8 +477,9 @@ class WebExtractionService:
         try:
             if resolution == "thumbnail":
                 # Generate thumbnail
-                from PIL import Image
                 import io
+
+                from PIL import Image
 
                 with Image.open(filepath) as img:
                     img.thumbnail((400, 300))
@@ -523,9 +522,7 @@ class WebExtractionService:
         try:
             # Check if it's a composite
             if extraction_id in self._composite_results:
-                return self._export_composite(
-                    extraction_id, output_path, include_screenshots
-                )
+                return self._export_composite(extraction_id, output_path, include_screenshots)
 
             # Single extraction
             if extraction_id not in self._extraction_results:
@@ -626,9 +623,7 @@ class WebExtractionService:
                         "framework": result.framework.value,
                         "mode": result.mode.value,
                         "states": [self._serialize_state(s) for s in result.states],
-                        "transitions": [
-                            self._serialize_transition(t) for t in result.transitions
-                        ],
+                        "transitions": [self._serialize_transition(t) for t in result.transitions],
                     }
                 )
 

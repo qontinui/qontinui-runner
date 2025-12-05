@@ -27,36 +27,37 @@ except ImportError:
 
 try:
     # When running as module
+    from ..models import (
+        DetectedState,
+        InputMonitorEvent,
+        ProcessingLog,
+        ProcessingResult,
+        ProcessingStep,
+        Transition,
+    )
     from .cloud_streaming_service import (
         CloudStreamingService,
         StreamConfig,
         StreamedData,
     )
-    from ..models import (
-        InputMonitorEvent,
-        ProcessingResult,
-        ProcessingLog,
-        ProcessingStep,
-        DetectedState,
-        Transition,
-    )
 except ImportError:
     # When running directly
+    import sys
+    from pathlib import Path
+
     from cloud_streaming_service import (
         CloudStreamingService,
         StreamConfig,
         StreamedData,
     )
-    import sys
-    from pathlib import Path
 
     sys.path.append(str(Path(__file__).parent.parent))
     from models import (
-        InputMonitorEvent,
-        ProcessingResult,
-        ProcessingLog,
-        ProcessingStep,
         DetectedState,
+        InputMonitorEvent,
+        ProcessingLog,
+        ProcessingResult,
+        ProcessingStep,
         Transition,
     )
 
@@ -272,7 +273,7 @@ async def test_connection():
     print("\n=== Testing Connection ===")
 
     service = CloudStreamingService(
-        websocket_url="wss://localhost:8001/ws/stream", api_url="https://localhost:8001"
+        websocket_url="wss://localhost:8000/ws/stream", api_url="https://localhost:8000"
     )
 
     # Test connection (will fail without real server, but demonstrates usage)

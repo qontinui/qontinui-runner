@@ -11,9 +11,7 @@ use crate::config::ScreenshotCaptureSettings;
 use crate::error::UserFacingError;
 use crate::executor::PythonBridge;
 use crate::settings;
-use serde_json;
 use std::process::Command;
-use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{debug, error, info, warn};
 
@@ -23,7 +21,7 @@ use super::{AppState, CommandResponse};
 ///
 /// This command:
 /// 1. Creates a new Python bridge instance
-/// 2. Starts the Python process in "real" mode
+/// 2. Starts the Python process
 /// 3. Sends previously loaded configuration if available
 /// 4. Applies current debug settings
 ///
@@ -54,9 +52,9 @@ pub fn start_python_executor(
         }
     }
 
-    // Create and start new bridge (always uses real mode)
+    // Create and start new bridge
     let mut bridge = PythonBridge::new(app_handle);
-    bridge.start_with_executor("real").map_err(|e| {
+    bridge.start().map_err(|e| {
         error!("Failed to start Python executor: {}", e);
         format!("Failed to start Python executor: {}", e)
     })?;
@@ -255,8 +253,10 @@ pub fn get_executor_status(state: State<AppState>) -> Result<CommandResponse, St
 
         let config_loaded = state.current_config.lock().unwrap().is_some();
         debug!("[GET_EXECUTOR_STATUS] config_loaded = {}", config_loaded);
-        info!("[GET_EXECUTOR_STATUS] Returning: python_running={}, state={}, config_loaded={}",
-              is_running, state_name, config_loaded);
+        info!(
+            "[GET_EXECUTOR_STATUS] Returning: python_running={}, state={}, config_loaded={}",
+            is_running, state_name, config_loaded
+        );
 
         Ok(CommandResponse {
             success: true,

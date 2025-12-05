@@ -9,8 +9,7 @@ Following the Single Responsibility Principle, this module:
 - Does NOT execute actions or manage execution state
 """
 
-from dataclasses import dataclass, field
-from typing import Dict
+from dataclasses import dataclass
 
 
 @dataclass
@@ -33,7 +32,7 @@ class ActionDefinition:
     icon: str = "activity"
     description: str = ""
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization.
 
         Returns:
@@ -50,7 +49,7 @@ class ActionDefinition:
 
 
 # Single source of truth for action metadata
-ACTION_DEFINITIONS: Dict[str, ActionDefinition] = {
+ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
     "GO_TO_STATE": ActionDefinition(
         type="GO_TO_STATE",
         is_expandable=True,

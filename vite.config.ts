@@ -8,6 +8,7 @@ export default defineConfig({
   // Vite options tailored for Tauri development
   clearScreen: false,
   server: {
+    host: '0.0.0.0', // Listen on all network interfaces (needed for WSL2 access)
     port: 1420,
     strictPort: true,
   },

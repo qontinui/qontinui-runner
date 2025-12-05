@@ -9,7 +9,7 @@ and defining the actions needed to navigate between them.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Any
 
 
 @dataclass
@@ -49,19 +49,19 @@ class Transition:
     """
 
     id: str
-    source_states: List[str]
-    target_states: List[str]
-    states_appeared: List[str]
-    states_disappeared: List[str]
+    source_states: list[str]
+    target_states: list[str]
+    states_appeared: list[str]
+    states_disappeared: list[str]
 
     # Outgoing (Action)
     action_type: str
-    action_target: Optional[str] = None
-    action_location: Optional[Tuple[int, int]] = None
-    action_data: Dict[str, Any] = field(default_factory=dict)
+    action_target: str | None = None
+    action_location: tuple[int, int] | None = None
+    action_data: dict[str, Any] = field(default_factory=dict)
 
     # Incoming (Recognition)
-    recognition_images: List[str] = field(default_factory=list)
+    recognition_images: list[str] = field(default_factory=list)
     recognition_confidence: float = 0.0
 
     # Timing
@@ -70,7 +70,7 @@ class Transition:
     frame_after: int = 0
     duration_ms: int = 0
 
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def is_state_change(self) -> bool:
@@ -108,7 +108,7 @@ class Transition:
         """
         return self.action_target is not None or self.action_location is not None
 
-    def get_primary_source_state(self) -> Optional[str]:
+    def get_primary_source_state(self) -> str | None:
         """Get the primary source state ID.
 
         For simple transitions, returns the single source state.
@@ -121,7 +121,7 @@ class Transition:
             return self.states_disappeared[0]
         return None
 
-    def get_primary_target_state(self) -> Optional[str]:
+    def get_primary_target_state(self) -> str | None:
         """Get the primary target state ID.
 
         For simple transitions, returns the single target state.
@@ -134,7 +134,7 @@ class Transition:
             return self.states_appeared[0]
         return None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -164,7 +164,7 @@ class Transition:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Transition":
+    def from_dict(cls, data: dict[str, Any]) -> "Transition":
         """Create Transition from dictionary.
 
         Args:
@@ -249,7 +249,7 @@ class StateChangePoint:
         """Get the magnitude of the state change (number of states changed)."""
         return len(self.states_appeared) + len(self.states_disappeared)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
         return {
             "frame_number": self.frame_number,

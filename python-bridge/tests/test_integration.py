@@ -25,7 +25,6 @@ from services.screenshot_service import ScreenshotService
 from services.tree_view_layer import TreeViewLayer
 from services.unified_data_collector import UnifiedDataCollector
 
-
 # ============================================================================
 # Helper Functions
 # ============================================================================

@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod auth;
 mod commands;
 mod config;
 mod display;
@@ -89,6 +90,16 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             video_recorder,
         })
         .invoke_handler(tauri::generate_handler![
+            // Authentication commands
+            commands::auth::login,
+            commands::auth::logout,
+            commands::auth::check_auth_status,
+            commands::auth::get_device_info,
+            commands::auth::get_connection_info,
+            commands::auth::get_user_projects,
+            commands::auth::refresh_token,
+            commands::auth::get_access_token_for_websocket,
+            commands::auth::send_device_heartbeat,
             // Configuration commands
             commands::config::load_configuration,
             commands::config::get_current_configuration,
@@ -141,23 +152,60 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::extraction::export_training_data,
             commands::extraction::export_state_structure,
             commands::extraction::list_extractions,
+            // Screenshot capture commands
+            commands::screenshot::get_screenshot_monitors,
+            commands::screenshot::capture_screenshot,
+            commands::screenshot::capture_and_upload_screenshot,
+            commands::screenshot::capture_screenshot_via_python,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
 
-            // Position window at top-center of screen
+            // Position window at top-center of screen and maximize height
             if let Some(window) = app.get_webview_window("main") {
                 if let Ok(monitor) = window.current_monitor() {
                     if let Some(monitor) = monitor {
                         let monitor_size = monitor.size();
                         let monitor_pos = monitor.position();
+                        let scale_factor = monitor.scale_factor();
 
                         if let Ok(window_size) = window.outer_size() {
-                            // Calculate center X position
+                            // Calculate optimal height: use most of screen with margins
+                            // Top margin: 20px, Bottom margin: 60px (for taskbar)
+                            let top_margin: u32 = 20;
+                            let bottom_margin: u32 = 60;
+                            let total_margin = top_margin + bottom_margin;
+
+                            // Calculate new height (leave room for margins)
+                            let new_height = if monitor_size.height > total_margin {
+                                monitor_size.height - total_margin
+                            } else {
+                                monitor_size.height
+                            };
+
+                            // Keep width the same, maximize height
+                            let new_width = window_size.width;
+
+                            // Set the new window size
+                            if let Err(e) = window.set_size(tauri::Size::Physical(
+                                tauri::PhysicalSize {
+                                    width: new_width,
+                                    height: new_height,
+                                },
+                            )) {
+                                error!("Failed to set window size: {}", e);
+                            } else {
+                                info!(
+                                    "Window resized to {}x{} (monitor: {}x{}, scale: {:.2})",
+                                    new_width, new_height, monitor_size.width, monitor_size.height, scale_factor
+                                );
+                            }
+
+                            // Calculate center X position using new width
                             let x = monitor_pos.x
-                                + ((monitor_size.width as i32 - window_size.width as i32) / 2);
+                                + ((monitor_size.width as i32 - new_width as i32) / 2);
                             // Position at top (with small margin)
-                            let y = monitor_pos.y + 20;
+                            let y = monitor_pos.y + top_margin as i32;
 
                             if let Err(e) = window.set_position(tauri::Position::Physical(
                                 tauri::PhysicalPosition { x, y },
@@ -180,7 +228,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             let app_state = app.state::<AppState>();
             let mut bridge_lock = app_state.python_bridge.lock().unwrap();
             let mut bridge = executor::PythonBridge::new(app.handle().clone());
-            match bridge.start_with_executor("real") {
+            match bridge.start() {
                 Ok(_) => {
                     info!("Python executor auto-started successfully");
                     *bridge_lock = Some(bridge);

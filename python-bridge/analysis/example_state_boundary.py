@@ -7,10 +7,8 @@ video frames and detect unique states and transitions.
 import logging
 import sys
 from pathlib import Path
-from typing import List
 
 import cv2
-import numpy as np
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -26,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def load_frames_from_directory(screenshots_dir: Path) -> List[Frame]:
+def load_frames_from_directory(screenshots_dir: Path) -> list[Frame]:
     """Load frames from a directory of screenshots.
 
     Args:
@@ -73,7 +71,7 @@ def load_frames_from_directory(screenshots_dir: Path) -> List[Frame]:
     return frames
 
 
-def load_input_events(events_file: Path) -> List[InputEvent]:
+def load_input_events(events_file: Path) -> list[InputEvent]:
     """Load input events from a JSON file.
 
     Args:
@@ -91,7 +89,7 @@ def load_input_events(events_file: Path) -> List[InputEvent]:
         return []
 
     try:
-        with open(events_file, "r") as f:
+        with open(events_file) as f:
             data = json.load(f)
 
         events = []
@@ -115,7 +113,7 @@ def load_input_events(events_file: Path) -> List[InputEvent]:
         return []
 
 
-def example_basic_detection(frames: List[Frame]):
+def example_basic_detection(frames: list[Frame]):
     """Example 1: Basic state detection with default configuration.
 
     Args:
@@ -143,7 +141,7 @@ def example_basic_detection(frames: List[Frame]):
         )
 
 
-def example_custom_config(frames: List[Frame]):
+def example_custom_config(frames: list[Frame]):
     """Example 2: State detection with custom configuration.
 
     Args:
@@ -175,7 +173,7 @@ def example_custom_config(frames: List[Frame]):
         logger.info(f"  - {state.name}: {len(state.frame_indices)} frames")
 
 
-def example_transition_detection(frames: List[Frame], events: List[InputEvent]):
+def example_transition_detection(frames: list[Frame], events: list[InputEvent]):
     """Example 3: Transition detection with event correlation.
 
     Args:
@@ -205,7 +203,7 @@ def example_transition_detection(frames: List[Frame], events: List[InputEvent]):
             logger.info(f"      Triggered by: {event.event_type} at ({event.x}, {event.y})")
 
 
-def example_frame_similarity(frames: List[Frame]):
+def example_frame_similarity(frames: list[Frame]):
     """Example 4: Computing similarity between specific frames.
 
     Args:
@@ -223,7 +221,7 @@ def example_frame_similarity(frames: List[Frame]):
 
     # Compare first frame with several others
     base_frame = frames[0]
-    logger.info(f"\nComparing frame 0 with other frames:")
+    logger.info("\nComparing frame 0 with other frames:")
 
     for i in [1, len(frames) // 4, len(frames) // 2, len(frames) - 1]:
         if i >= len(frames):
@@ -237,7 +235,7 @@ def example_frame_similarity(frames: List[Frame]):
         logger.info(f"      Perceptual hash: {phash}")
 
 
-def example_clustering_comparison(frames: List[Frame]):
+def example_clustering_comparison(frames: list[Frame]):
     """Example 5: Compare different clustering algorithms.
 
     Args:

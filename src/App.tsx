@@ -17,6 +17,7 @@ import { FileText } from "lucide-react";
 
 // Contexts
 import { ExecutionProvider, useExecution, EventManagerProvider } from "./contexts";
+import { AuthProvider, useAuth } from "./components/AuthProvider";
 
 // Managers
 import { setupEventHandlers, eventRouter } from "./managers";
@@ -43,6 +44,7 @@ import ActionLogTable from "./components/ActionLogTable";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
+import { LoginScreen } from "./components/LoginScreen";
 
 // Styles
 import "./index.css";
@@ -51,6 +53,9 @@ import "./index.css";
  * Main app content (inside providers)
  */
 function AppContent() {
+  // Auth state from context
+  const auth = useAuth();
+
   // Execution state from context
   const execution = useExecution();
 
@@ -155,6 +160,23 @@ function AppContent() {
     clearImageLogs();
     await clearActionLogs();
   };
+
+  // Show loading state while checking auth
+  if (auth.loading) {
+    return (
+      <div className="min-h-screen bg-background grid-dots flex items-center justify-center">
+        <div className="card p-8 text-center space-y-4">
+          <div className="inline-block w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+          <p className="text-muted-foreground">Checking authentication...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show login screen if not authenticated
+  if (!auth.authStatus?.authenticated) {
+    return <LoginScreen onLoginSuccess={auth.refreshAuth} />;
+  }
 
   return (
     <div className="min-h-screen bg-background grid-dots">
@@ -340,21 +362,23 @@ function AppContent() {
  */
 export default function App() {
   return (
-    <EventManagerProvider>
-      <ExecutionProvider
-        onLog={(level, message) => {
-          // Logs are now handled by LogManager through event handlers
-          console.log(`[LOG] ${level}: ${message}`);
-        }}
-        onConfigurationPanelCollapse={() => {
-          // Could be handled here if needed for other side effects
-        }}
-        onExecutionPanelCollapse={() => {
-          // Could be handled here if needed for other side effects
-        }}
-      >
-        <AppContent />
-      </ExecutionProvider>
-    </EventManagerProvider>
+    <AuthProvider>
+      <EventManagerProvider>
+        <ExecutionProvider
+          onLog={(level, message) => {
+            // Logs are now handled by LogManager through event handlers
+            console.log(`[LOG] ${level}: ${message}`);
+          }}
+          onConfigurationPanelCollapse={() => {
+            // Could be handled here if needed for other side effects
+          }}
+          onExecutionPanelCollapse={() => {
+            // Could be handled here if needed for other side effects
+          }}
+        >
+          <AppContent />
+        </ExecutionProvider>
+      </EventManagerProvider>
+    </AuthProvider>
   );
 }

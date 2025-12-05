@@ -1,11 +1,11 @@
 """Services for the Python bridge."""
 
-from .screenshot_service import ScreenshotService
-from .unified_data_collector import UnifiedDataCollector
-from .state_detection_service import LocalStateDetectionService
-from .video_capture_service import VideoCaptureService
+from .frame_extractor_service import EventFilter, FrameExtractorService
 from .input_monitor_service import InputMonitorService
-from .frame_extractor_service import FrameExtractorService, EventFilter
+from .screenshot_service import ScreenshotService
+from .state_detection_service import LocalStateDetectionService
+from .unified_data_collector import UnifiedDataCollector
+from .video_capture_service import VideoCaptureService
 
 __all__ = [
     "ScreenshotService",

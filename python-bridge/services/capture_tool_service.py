@@ -9,17 +9,14 @@ This module provides two types of click capture:
 2. Manual clicks: Captures screenshots when the user physically clicks their mouse
 """
 
-import json
 import re
 import sys
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from PIL import Image
-
 
 # Module-level flag to track if DPI awareness has been set
 _dpi_awareness_set = False
@@ -78,9 +75,9 @@ class ScreenSelection:
     """Defines which screen(s) to capture."""
 
     type: Literal["all", "primary", "specific"]
-    indices: Optional[List[int]] = None
+    indices: list[int] | None = None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         result = {"type": self.type}
         if self.indices is not None:
@@ -88,7 +85,7 @@ class ScreenSelection:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ScreenSelection":
+    def from_dict(cls, data: dict[str, Any]) -> "ScreenSelection":
         """Create from dictionary."""
         return cls(type=data["type"], indices=data.get("indices"))
 
@@ -102,9 +99,9 @@ class ScreenshotCaptureSettings:
     output_folder: str
     base_image_name: str
     screens: ScreenSelection
-    capture_timings: List[int]  # delays in ms (0 = immediate)
+    capture_timings: list[int]  # delays in ms (0 = immediate)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary with camelCase field names to match Rust."""
         return {
             "enabled": self.enabled,
@@ -116,7 +113,7 @@ class ScreenshotCaptureSettings:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ScreenshotCaptureSettings":
+    def from_dict(cls, data: dict[str, Any]) -> "ScreenshotCaptureSettings":
         """Create from dictionary.
 
         Expects camelCase field names to match Rust serialization:
@@ -160,8 +157,8 @@ class CaptureToolService:
 
     def __init__(
         self,
-        settings: Optional[ScreenshotCaptureSettings] = None,
-        mss_capture: Optional[Any] = None,
+        settings: ScreenshotCaptureSettings | None = None,
+        mss_capture: Any | None = None,
     ) -> None:
         """Initialize the CaptureToolService.
 
@@ -173,7 +170,7 @@ class CaptureToolService:
         self.settings = settings
         self.mss_capture = mss_capture
         self._capture_lock = threading.Lock()
-        self._pending_captures: List[threading.Timer] = []
+        self._pending_captures: list[threading.Timer] = []
 
     def update_settings(self, settings: ScreenshotCaptureSettings) -> None:
         """Update capture settings.
@@ -236,8 +233,8 @@ class CaptureToolService:
             _set_windows_dpi_awareness_once()
 
             # Import qontinui HAL
-            from qontinui.hal.implementations.mss_capture import MSSScreenCapture
             from qontinui.hal.config import HALConfig
+            from qontinui.hal.implementations.mss_capture import MSSScreenCapture
 
             print(
                 "[CaptureService] Imports successful, creating HALConfig...",
@@ -300,7 +297,7 @@ class CaptureToolService:
         except Exception as e:
             print(f"Error capturing screenshot: {e}", file=sys.stderr, flush=True)
 
-    def _capture_screens(self) -> List[Image.Image]:
+    def _capture_screens(self) -> list[Image.Image]:
         """Capture screen(s) based on settings.
 
         Returns:
@@ -465,14 +462,14 @@ class ManualClickListener:
         self._is_running = False
         self._lock = threading.Lock()
 
-    def _get_screen_bounds(self) -> List[Dict[str, int]]:
+    def _get_screen_bounds(self) -> list[dict[str, int]]:
         """Get bounds of screens to monitor for clicks.
 
         Returns:
             List of dicts with keys: x, y, width, height
         """
         if not self.capture_service.is_enabled():
-            print(f"[ManualClickListener] Capture service not enabled", file=sys.stderr, flush=True)
+            print("[ManualClickListener] Capture service not enabled", file=sys.stderr, flush=True)
             return []
 
         settings = self.capture_service.settings
@@ -480,12 +477,12 @@ class ManualClickListener:
 
         # Initialize MSS if needed to get monitor info
         if self.capture_service.mss_capture is None:
-            print(f"[ManualClickListener] Initializing MSS capture", file=sys.stderr, flush=True)
+            print("[ManualClickListener] Initializing MSS capture", file=sys.stderr, flush=True)
             self.capture_service._initialize_mss()
 
         if self.capture_service.mss_capture is None:
             print(
-                f"[ManualClickListener] Failed to initialize MSS capture",
+                "[ManualClickListener] Failed to initialize MSS capture",
                 file=sys.stderr,
                 flush=True,
             )
@@ -499,7 +496,7 @@ class ManualClickListener:
 
             if settings.screens.type == "all":
                 # All monitors
-                print(f"[ManualClickListener] Screen selection: ALL", file=sys.stderr, flush=True)
+                print("[ManualClickListener] Screen selection: ALL", file=sys.stderr, flush=True)
                 for monitor in monitors:
                     bounds.append(
                         {
@@ -517,7 +514,7 @@ class ManualClickListener:
             elif settings.screens.type == "primary":
                 # Primary monitor only
                 print(
-                    f"[ManualClickListener] Screen selection: PRIMARY", file=sys.stderr, flush=True
+                    "[ManualClickListener] Screen selection: PRIMARY", file=sys.stderr, flush=True
                 )
                 for monitor in monitors:
                     print(
@@ -640,7 +637,7 @@ class ManualClickListener:
         # Check if capture is enabled
         if not self.capture_service.is_enabled():
             print(
-                f"[ManualClickListener] Capture service not enabled, ignoring click",
+                "[ManualClickListener] Capture service not enabled, ignoring click",
                 file=sys.stderr,
                 flush=True,
             )
@@ -677,7 +674,7 @@ class ManualClickListener:
             True if started successfully, False otherwise
         """
         print(
-            f"[ManualClickListener] ========== start() called ==========",
+            "[ManualClickListener] ========== start() called ==========",
             file=sys.stderr,
             flush=True,
         )
@@ -697,13 +694,13 @@ class ManualClickListener:
             )
         except ImportError as e:
             print(
-                f"[ManualClickListener] ERROR: pynput is NOT installed!",
+                "[ManualClickListener] ERROR: pynput is NOT installed!",
                 file=sys.stderr,
                 flush=True,
             )
             print(f"[ManualClickListener]   ImportError: {e}", file=sys.stderr, flush=True)
             print(
-                f"[ManualClickListener]   Install it with: pip install pynput",
+                "[ManualClickListener]   Install it with: pip install pynput",
                 file=sys.stderr,
                 flush=True,
             )
@@ -732,11 +729,11 @@ class ManualClickListener:
 
                 # Create and start listener
                 print(
-                    f"[ManualClickListener] Creating mouse.Listener...", file=sys.stderr, flush=True
+                    "[ManualClickListener] Creating mouse.Listener...", file=sys.stderr, flush=True
                 )
                 self._listener = mouse.Listener(on_click=self._on_click)
                 print(
-                    f"[ManualClickListener] Calling listener.start()...",
+                    "[ManualClickListener] Calling listener.start()...",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -764,7 +761,7 @@ class ManualClickListener:
                     flush=True,
                 )
                 print(
-                    f"[ManualClickListener] ===============================================",
+                    "[ManualClickListener] ===============================================",
                     file=sys.stderr,
                     flush=True,
                 )

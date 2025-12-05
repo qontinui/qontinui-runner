@@ -129,7 +129,10 @@ impl ExecutorLifecycle {
     /// Returns the current state
     pub async fn get_state(&self) -> ExecutorState {
         let state = self.state.read().await.clone();
-        debug!("[LIFECYCLE] get_state() called, returning: {}", state.name());
+        debug!(
+            "[LIFECYCLE] get_state() called, returning: {}",
+            state.name()
+        );
         state
     }
 
@@ -206,14 +209,23 @@ impl ExecutorLifecycle {
     ) -> Result<Option<ExecutorMessage>, AppError> {
         match message {
             ExecutorMessage::Ready { data } => {
-                info!("[LIFECYCLE] Received READY message from executor: {:?}", data);
-                debug!("[LIFECYCLE] Current state before transition: {}", self.state.read().await.name());
+                info!(
+                    "[LIFECYCLE] Received READY message from executor: {:?}",
+                    data
+                );
+                debug!(
+                    "[LIFECYCLE] Current state before transition: {}",
+                    self.state.read().await.name()
+                );
 
                 // Transition to Ready state
                 debug!("[LIFECYCLE] Attempting transition to Ready state...");
                 self.set_state(ExecutorState::ready()).await?;
                 debug!("[LIFECYCLE] State transition to Ready completed successfully");
-                debug!("[LIFECYCLE] Current state after transition: {}", self.state.read().await.name());
+                debug!(
+                    "[LIFECYCLE] Current state after transition: {}",
+                    self.state.read().await.name()
+                );
 
                 // Notify ready channel if waiting
                 if let Some(tx) = self.ready_tx.take() {

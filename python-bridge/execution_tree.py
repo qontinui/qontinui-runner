@@ -10,9 +10,9 @@ Following the Single Responsibility Principle, this module:
 - Does NOT emit events or execute actions
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
 import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
 
 
 @dataclass
@@ -38,15 +38,15 @@ class ExecutionNode:
     node_type: str  # "workflow" | "transition" | "action"
     name: str
     timestamp: float  # Start time (Unix timestamp)
-    end_timestamp: Optional[float] = None  # End time (Unix timestamp)
+    end_timestamp: float | None = None  # End time (Unix timestamp)
     parent: Optional["ExecutionNode"] = None
-    children: List["ExecutionNode"] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    children: list["ExecutionNode"] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"  # "pending" | "running" | "success" | "failed"
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
-    def duration(self) -> Optional[float]:
+    def duration(self) -> float | None:
         """Calculate duration in seconds.
 
         Returns:
@@ -69,7 +69,7 @@ class ExecutionNode:
         self.children.append(child)
         return child
 
-    def to_dict(self, include_children: bool = True) -> Dict[str, Any]:
+    def to_dict(self, include_children: bool = True) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization.
 
         Args:
@@ -107,7 +107,7 @@ class ExecutionNode:
             node = node.parent
         return depth
 
-    def get_path_from_root(self) -> List[Dict[str, str]]:
+    def get_path_from_root(self) -> list[dict[str, str]]:
         """Get path from root to this node.
 
         Returns:
@@ -133,15 +133,15 @@ class ExecutionTree:
 
     def __init__(self):
         """Initialize an empty execution tree."""
-        self.root: Optional[ExecutionNode] = None
-        self.current: Optional[ExecutionNode] = None
-        self.node_map: Dict[str, ExecutionNode] = {}
+        self.root: ExecutionNode | None = None
+        self.current: ExecutionNode | None = None
+        self.node_map: dict[str, ExecutionNode] = {}
 
     def start_workflow(
         self,
         workflow_id: str,
         workflow_name: str,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
         is_inline: bool = False,
     ) -> ExecutionNode:
         """Start a new workflow (creates root or child workflow node).
@@ -181,7 +181,7 @@ class ExecutionTree:
 
         return node
 
-    def end_workflow(self, workflow_id: str, success: bool, error: Optional[str] = None) -> None:
+    def end_workflow(self, workflow_id: str, success: bool, error: str | None = None) -> None:
         """Mark workflow as complete and move up the tree.
 
         Args:
@@ -199,7 +199,7 @@ class ExecutionTree:
                 self.current = node.parent
 
     def start_transition(
-        self, transition_id: str, transition_name: str, metadata: Optional[Dict[str, Any]] = None
+        self, transition_id: str, transition_name: str, metadata: dict[str, Any] | None = None
     ) -> ExecutionNode:
         """Start a transition under the current workflow.
 
@@ -229,7 +229,7 @@ class ExecutionTree:
         return node
 
     def end_transition(
-        self, transition_id: str, success: bool, error: Optional[str] = None
+        self, transition_id: str, success: bool, error: str | None = None
     ) -> None:
         """Mark transition as complete and move up the tree.
 
@@ -248,7 +248,7 @@ class ExecutionTree:
                 self.current = node.parent
 
     def start_action(
-        self, action_id: str, action_type: str, metadata: Optional[Dict[str, Any]] = None
+        self, action_id: str, action_type: str, metadata: dict[str, Any] | None = None
     ) -> ExecutionNode:
         """Start an action under the current workflow/action.
 
@@ -277,7 +277,7 @@ class ExecutionTree:
 
         return node
 
-    def end_action(self, action_id: str, success: bool, error: Optional[str] = None) -> None:
+    def end_action(self, action_id: str, success: bool, error: str | None = None) -> None:
         """Mark action as complete and move up the tree.
 
         Args:
@@ -294,7 +294,7 @@ class ExecutionTree:
             if node.parent:
                 self.current = node.parent
 
-    def get_current_hierarchy(self) -> Dict[str, Any]:
+    def get_current_hierarchy(self) -> dict[str, Any]:
         """Get hierarchy metadata for the current position in the tree.
 
         Returns:
@@ -321,7 +321,7 @@ class ExecutionTree:
             "workflow_name": workflow_name,
         }
 
-    def get_node(self, node_id: str) -> Optional[ExecutionNode]:
+    def get_node(self, node_id: str) -> ExecutionNode | None:
         """Get a node by ID.
 
         Args:
@@ -332,7 +332,7 @@ class ExecutionTree:
         """
         return self.node_map.get(node_id)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Serialize entire tree to dictionary.
 
         Returns:

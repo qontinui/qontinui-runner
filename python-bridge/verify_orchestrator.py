@@ -9,8 +9,8 @@ This script verifies that:
 4. Type hints are correct
 """
 
-import sys
 import inspect
+import sys
 from pathlib import Path
 
 # Add current directory to path
@@ -83,12 +83,12 @@ def verify_type_hints(cls):
                 issues.append(f"{method_name} parameter '{param_name}' missing type hint")
 
     if issues:
-        print(f"✗ Type hint issues:")
+        print("✗ Type hint issues:")
         for issue in issues:
             print(f"  - {issue}")
         return False
     else:
-        print(f"✓ All methods have proper type hints")
+        print("✓ All methods have proper type hints")
         return True
 
 
@@ -96,13 +96,13 @@ def verify_command_bindings():
     """Verify command binding functions exist."""
     try:
         from qontinui_executor import (
-            initialize_orchestrator,
-            get_orchestrator,
             execute_transition,
-            navigate_to_state,
-            navigate_to_multiple_states,
             get_active_states,
             get_available_transitions,
+            get_orchestrator,
+            initialize_orchestrator,
+            navigate_to_multiple_states,
+            navigate_to_state,
         )
 
         print("✓ All command binding functions exist")

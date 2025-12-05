@@ -119,7 +119,7 @@ def copy_to_tauri_binaries(executable: Path, tauri_dir: Path):
 
     dest_path = binaries_dir / dest_name
 
-    print(f"\nCopying executable to Tauri binaries:")
+    print("\nCopying executable to Tauri binaries:")
     print(f"  From: {executable}")
     print(f"  To:   {dest_path}")
 

@@ -81,7 +81,7 @@ Configure WebSocket via environment variables:
 export QONTINUI_WS_ENABLED=true
 
 # WebSocket server URL
-export QONTINUI_WS_URL=ws://localhost:8001
+export QONTINUI_WS_URL=ws://localhost:8000  # Port 8000 is the main backend, NOT 8001
 
 # Authentication (option 1: email/password)
 export QONTINUI_WS_EMAIL=user@example.com
@@ -111,7 +111,7 @@ Configure via command interface:
   "params": {
     "config": {
       "enabled": true,
-      "api_url": "ws://localhost:8001",
+      "api_url": "ws://localhost:8000",
       "email": "user@example.com",
       "password": "password",
       "project_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -149,7 +149,7 @@ For more control, use the command interface:
   "params": {
     "config": {
       "enabled": true,
-      "api_url": "ws://localhost:8001",
+      "api_url": "ws://localhost:8000",
       "token": "your-jwt-token",
       "project_id": "project-uuid"
     }
@@ -262,7 +262,7 @@ Response:
   },
   "config": {
     "enabled": true,
-    "api_url": "ws://localhost:8001",
+    "api_url": "ws://localhost:8000",
     "project_id": "project-uuid",
     "heartbeat_interval": 30
   }
@@ -468,7 +468,7 @@ npm install -g wscat
 
 Connect to server:
 ```bash
-wscat -c "ws://localhost:8001/api/v1/automation/ws/runner?token=YOUR_JWT_TOKEN"
+wscat -c "ws://localhost:8000/api/v1/automation/ws/runner?token=YOUR_JWT_TOKEN"
 ```
 
 Send test message:
@@ -481,13 +481,13 @@ Send test message:
 1. **Start qontinui-web backend**:
    ```bash
    cd qontinui-web
-   uvicorn app.main:app --host 0.0.0.0 --port 8001
+   uvicorn app.main:app --host 0.0.0.0 --port 8000
    ```
 
 2. **Configure environment**:
    ```bash
    export QONTINUI_WS_ENABLED=true
-   export QONTINUI_WS_URL=ws://localhost:8001
+   export QONTINUI_WS_URL=ws://localhost:8000  # Port 8000 is the main backend, NOT 8001
    export QONTINUI_WS_EMAIL=test@example.com
    export QONTINUI_WS_PASSWORD=testpass
    export QONTINUI_WS_PROJECT_ID=your-project-uuid
@@ -528,7 +528,7 @@ Send test message:
 
 **Test auth endpoint**:
 ```bash
-curl -X POST http://localhost:8001/api/v1/auth/login \
+curl -X POST http://localhost:8000/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"user@example.com","password":"password"}'
 ```

@@ -11,7 +11,8 @@ A ProcessingResult contains:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any
+from typing import Any
+
 from .detected_state import DetectedState
 from .transition import Transition
 
@@ -41,10 +42,10 @@ class ProcessingStep:
     end_time: float
     input_count: int
     output_count: int
-    parameters: Dict[str, Any]
+    parameters: dict[str, Any]
     success: bool
-    error: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def duration(self) -> float:
@@ -75,7 +76,7 @@ class ProcessingStep:
             return 0.0
         return self.input_count / self.duration
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -97,7 +98,7 @@ class ProcessingStep:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ProcessingStep":
+    def from_dict(cls, data: dict[str, Any]) -> "ProcessingStep":
         """Create ProcessingStep from dictionary.
 
         Args:
@@ -142,13 +143,13 @@ class ProcessingLog:
         metadata: Additional processing metadata
     """
 
-    steps: List[ProcessingStep]
-    parameters_used: Dict[str, Any]
-    confidence_scores: Dict[str, float]
+    steps: list[ProcessingStep]
+    parameters_used: dict[str, Any]
+    confidence_scores: dict[str, float]
     start_time: float
     end_time: float
-    errors: List[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def total_duration(self) -> float:
@@ -186,7 +187,7 @@ class ProcessingLog:
         """
         return len(self.steps)
 
-    def get_step_by_name(self, name: str) -> Optional[ProcessingStep]:
+    def get_step_by_name(self, name: str) -> ProcessingStep | None:
         """Find a processing step by name.
 
         Args:
@@ -200,7 +201,7 @@ class ProcessingLog:
                 return step
         return None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -221,7 +222,7 @@ class ProcessingLog:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ProcessingLog":
+    def from_dict(cls, data: dict[str, Any]) -> "ProcessingLog":
         """Create ProcessingLog from dictionary.
 
         Args:
@@ -264,11 +265,11 @@ class ProcessingResult:
     """
 
     session_id: str
-    states: List[DetectedState]
-    transitions: List[Transition]
+    states: list[DetectedState]
+    transitions: list[Transition]
     processing_log: ProcessingLog
-    source_screenshots: List[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    source_screenshots: list[str] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def num_states(self) -> int:
@@ -306,7 +307,7 @@ class ProcessingResult:
         """
         return self.processing_log.success
 
-    def get_state_by_id(self, state_id: str) -> Optional[DetectedState]:
+    def get_state_by_id(self, state_id: str) -> DetectedState | None:
         """Find a state by its ID.
 
         Args:
@@ -320,7 +321,7 @@ class ProcessingResult:
                 return state
         return None
 
-    def get_transition_by_id(self, transition_id: str) -> Optional[Transition]:
+    def get_transition_by_id(self, transition_id: str) -> Transition | None:
         """Find a transition by its ID.
 
         Args:
@@ -334,7 +335,7 @@ class ProcessingResult:
                 return transition
         return None
 
-    def get_transitions_from_state(self, state_id: str) -> List[Transition]:
+    def get_transitions_from_state(self, state_id: str) -> list[Transition]:
         """Get all transitions originating from a specific state.
 
         Args:
@@ -345,7 +346,7 @@ class ProcessingResult:
         """
         return [t for t in self.transitions if state_id in t.source_states]
 
-    def get_transitions_to_state(self, state_id: str) -> List[Transition]:
+    def get_transitions_to_state(self, state_id: str) -> list[Transition]:
         """Get all transitions leading to a specific state.
 
         Args:
@@ -356,7 +357,7 @@ class ProcessingResult:
         """
         return [t for t in self.transitions if state_id in t.target_states]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -376,7 +377,7 @@ class ProcessingResult:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ProcessingResult":
+    def from_dict(cls, data: dict[str, Any]) -> "ProcessingResult":
         """Create ProcessingResult from dictionary.
 
         Args:

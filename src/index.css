@@ -119,4 +119,16 @@
       transform: translateY(0);
     }
   }
+
+  .gradient-text {
+    background: linear-gradient(
+      to right,
+      hsl(var(--primary)),
+      hsl(var(--secondary)),
+      hsl(var(--accent))
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
 }

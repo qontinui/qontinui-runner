@@ -9,11 +9,12 @@ the Tauri frontend.
 
 import base64
 import sys
-from io import StringIO
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 try:
-    from qontinui.reporting import EventType as QontinuiEventType, register_callback
+    from qontinui.reporting import EventType as QontinuiEventType
+    from qontinui.reporting import register_callback
 
     QONTINUI_AVAILABLE = True
 except ImportError:
@@ -51,7 +52,7 @@ class EventTranslator:
         state_lookup: Callable[[str], str | None] | None = None,
         hierarchy_lookup: Callable[[], dict[str, Any]] | None = None,
         image_data_lookup: Callable[[str], str | None] | None = None,
-        collector: Optional[UnifiedDataCollector] = None,
+        collector: UnifiedDataCollector | None = None,
     ):
         """Initialize the event translator.
 
@@ -167,7 +168,7 @@ class EventTranslator:
             # PROMINENT DEBUG LOGGING - Verify callback is being called
             print(f"\n{'='*80}", file=sys.stderr, flush=True)
             print(
-                f"[EventTranslator] !!!!! MATCH_ATTEMPTED EVENT RECEIVED !!!!!",
+                "[EventTranslator] !!!!! MATCH_ATTEMPTED EVENT RECEIVED !!!!!",
                 file=sys.stderr,
                 flush=True,
             )
@@ -420,7 +421,7 @@ class EventTranslator:
             # Pass through debug data for match details
             if data.get("debug"):
                 frontend_data["debug"] = data.get("debug")
-                print(f"[EventTranslator] Including debug data", file=sys.stderr)
+                print("[EventTranslator] Including debug data", file=sys.stderr)
 
             # Debug logging
             print(
@@ -432,7 +433,7 @@ class EventTranslator:
             self.emitter("image_recognition", frontend_data)
 
             print(
-                f"[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr
+                "[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr
             )
 
         except Exception as e:
@@ -530,13 +531,13 @@ class EventTranslator:
                 )
 
             print(
-                f"[EventTranslator] Emitting action_execution event for TYPE action",
+                "[EventTranslator] Emitting action_execution event for TYPE action",
                 file=sys.stderr,
                 flush=True,
             )
             self.emitter("action_execution", frontend_data)
             print(
-                f"[EventTranslator] action_execution event emitted successfully",
+                "[EventTranslator] action_execution event emitted successfully",
                 file=sys.stderr,
                 flush=True,
             )
@@ -749,7 +750,7 @@ class EventTranslator:
 
 # Convenience function for creating and registering translator
 def create_and_register_translator(
-    emitter: Callable[[str, dict[str, Any]], None]
+    emitter: Callable[[str, dict[str, Any]], None],
 ) -> EventTranslator:
     """Create an EventTranslator and register all callbacks.
 

@@ -6,13 +6,11 @@ qontinui-train. It integrates with UnifiedDataCollector to capture execution dat
 """
 
 import logging
-from pathlib import Path
-from typing import List, Optional, Callable
 from dataclasses import dataclass
+from pathlib import Path
 
+from exporters.training_data_exporter import ExportStatistics, TrainingDataExporter
 from models.action_execution_record import ActionExecutionRecord
-from exporters.training_data_exporter import TrainingDataExporter, ExportStatistics
-
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +20,7 @@ class ExportConfig:
     """Configuration for training data export."""
 
     enabled: bool = False
-    output_dir: Optional[Path] = None
+    output_dir: Path | None = None
     dataset_version: str = "1.0.0"
     export_mode: str = "on_completion"  # "on_completion", "incremental", "manual"
     batch_size: int = 50  # For incremental mode
@@ -66,12 +64,12 @@ class TrainingExportService:
         """
         self.config = config
         self.storage_dir = storage_dir
-        self.records_buffer: List[ActionExecutionRecord] = []
+        self.records_buffer: list[ActionExecutionRecord] = []
         self.total_records_added = 0
         self.total_records_exported = 0
 
         # Initialize exporter if enabled
-        self.exporter: Optional[TrainingDataExporter] = None
+        self.exporter: TrainingDataExporter | None = None
         if config.enabled and config.output_dir:
             self.exporter = TrainingDataExporter(
                 output_dir=config.output_dir, dataset_version=config.dataset_version
@@ -100,7 +98,7 @@ class TrainingExportService:
                 self._export_buffered_records()
                 logger.info(f"Incremental export triggered: {len(self.records_buffer)} records")
 
-    def _export_buffered_records(self) -> Optional[ExportStatistics]:
+    def _export_buffered_records(self) -> ExportStatistics | None:
         """Export buffered records and clear the buffer.
 
         Returns:
@@ -136,7 +134,7 @@ class TrainingExportService:
             logger.error(f"Failed to export records: {e}", exc_info=True)
             return None
 
-    def _filter_records(self, records: List[ActionExecutionRecord]) -> List[ActionExecutionRecord]:
+    def _filter_records(self, records: list[ActionExecutionRecord]) -> list[ActionExecutionRecord]:
         """Apply configured filters to records.
 
         Args:
@@ -157,7 +155,7 @@ class TrainingExportService:
 
         return filtered
 
-    def export_on_completion(self) -> Optional[ExportStatistics]:
+    def export_on_completion(self) -> ExportStatistics | None:
         """Export all buffered records on completion.
 
         This should be called when the automation run completes.
@@ -171,7 +169,7 @@ class TrainingExportService:
         logger.info(f"Exporting on completion: {len(self.records_buffer)} records buffered")
         return self._export_buffered_records()
 
-    def export_now(self) -> Optional[ExportStatistics]:
+    def export_now(self) -> ExportStatistics | None:
         """Manually trigger export of buffered records.
 
         Returns:

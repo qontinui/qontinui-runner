@@ -1,7 +1,18 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Check, X, Camera, FolderOpen, Monitor, Plus, Trash2 } from "lucide-react";
+import {
+  Check,
+  X,
+  Camera,
+  FolderOpen,
+  Monitor,
+  Plus,
+  Trash2,
+  Upload,
+  Loader2,
+  Cloud,
+} from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { ScreenshotCaptureSettings, Monitor as MonitorType, LogFunction } from "./types";
 
@@ -24,9 +35,40 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [manualCaptureRunning, setManualCaptureRunning] = useState(false);
 
+  // Capture to Web state
+  const [showCaptureToWebMenu, setShowCaptureToWebMenu] = useState(false);
+  const [isCapturingToWeb, setIsCapturingToWeb] = useState(false);
+  const [captureToWebSuccess, setCaptureToWebSuccess] = useState(false);
+  const [captureToWebError, setCaptureToWebError] = useState<string | null>(null);
+  const [userProjects, setUserProjects] = useState<Array<{ id: string; name: string }>>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState<string>("");
+  const [selectedCaptureMonitor, setSelectedCaptureMonitor] = useState<number>(0);
+  const captureToWebMenuRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     loadMonitors();
+    loadUserProjects();
   }, []);
+
+  // Close capture menu when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        captureToWebMenuRef.current &&
+        !captureToWebMenuRef.current.contains(event.target as Node)
+      ) {
+        setShowCaptureToWebMenu(false);
+      }
+    };
+
+    if (showCaptureToWebMenu) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showCaptureToWebMenu]);
 
   // Auto-select primary screen when monitors load
   useEffect(() => {
@@ -64,9 +106,66 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
       const result: any = await invoke("get_monitors");
       if (result && result.success && result.data && result.data.monitors) {
         setMonitors(result.data.monitors);
+        // Auto-select primary monitor for capture-to-web
+        const primary = result.data.monitors.find((m: MonitorType) => m.is_primary);
+        if (primary) {
+          setSelectedCaptureMonitor(primary.index);
+        }
       }
     } catch (err) {
       console.error("Failed to load monitors:", err);
+    }
+  };
+
+  const loadUserProjects = async () => {
+    try {
+      const result: any = await invoke("get_user_projects");
+      if (result && result.success && result.data && result.data.projects) {
+        setUserProjects(result.data.projects);
+        // Auto-select first project
+        if (result.data.projects.length > 0 && !selectedProjectId) {
+          setSelectedProjectId(result.data.projects[0].id);
+        }
+      }
+    } catch (err) {
+      console.error("Failed to load user projects:", err);
+    }
+  };
+
+  const handleCaptureAndUploadToWeb = async () => {
+    if (!selectedProjectId) {
+      setCaptureToWebError("Please select a project first");
+      return;
+    }
+
+    setIsCapturingToWeb(true);
+    setCaptureToWebError(null);
+    setCaptureToWebSuccess(false);
+
+    try {
+      const result: any = await invoke("capture_and_upload_screenshot", {
+        config: {
+          project_id: selectedProjectId,
+          monitor: selectedCaptureMonitor,
+        },
+      });
+
+      if (result && result.success) {
+        setCaptureToWebSuccess(true);
+        onLog("success", `Screenshot uploaded to project successfully`);
+        setTimeout(() => setCaptureToWebSuccess(false), 3000);
+        setShowCaptureToWebMenu(false);
+      } else {
+        const errorMsg = result?.error || "Unknown error";
+        setCaptureToWebError(errorMsg);
+        onLog("error", `Failed to capture and upload: ${errorMsg}`);
+      }
+    } catch (err) {
+      console.error("Failed to capture and upload:", err);
+      setCaptureToWebError(`Failed: ${err}`);
+      onLog("error", `Failed to capture and upload: ${err}`);
+    } finally {
+      setIsCapturingToWeb(false);
     }
   };
 
@@ -464,6 +563,126 @@ export function CaptureSettings({ onLog }: CaptureSettingsProps) {
               </>
             )}
           </button>
+        </div>
+      </div>
+
+      {/* Capture to Web Section */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <div className="flex items-center gap-3">
+          <Cloud className="w-5 h-5 text-primary" />
+          <h4 className="font-semibold text-lg">Capture to Web Project</h4>
+        </div>
+
+        <div className="text-sm text-muted-foreground">
+          Take a screenshot and upload it directly to your qontinui-web project. Screenshots are
+          captured at physical resolution.
+        </div>
+
+        {captureToWebError && (
+          <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
+            <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+            <span className="text-red-400 text-sm">{captureToWebError}</span>
+          </div>
+        )}
+
+        {captureToWebSuccess && (
+          <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
+            <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
+            <span className="text-green-400 text-sm">Screenshot uploaded successfully!</span>
+          </div>
+        )}
+
+        <div className="space-y-4">
+          {/* Project Selection */}
+          <div className="space-y-2">
+            <div className="font-medium mb-1">Target Project</div>
+            <div className="text-sm text-muted-foreground mb-3">
+              Select which qontinui-web project to upload the screenshot to
+            </div>
+            {userProjects.length > 0 ? (
+              <select
+                value={selectedProjectId}
+                onChange={(e) => setSelectedProjectId(e.target.value)}
+                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+              >
+                {userProjects.map((project) => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <div className="text-sm text-muted-foreground italic">
+                No projects available. Create a project in qontinui-web first.
+              </div>
+            )}
+          </div>
+
+          {/* Monitor Selection */}
+          <div className="space-y-2">
+            <div className="font-medium mb-1 flex items-center gap-2">
+              <Monitor className="w-4 h-4" />
+              Capture Screen
+            </div>
+            <div className="text-sm text-muted-foreground mb-3">
+              Select which monitor to capture
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {monitors.length > 0 ? (
+                monitors.map((monitor) => (
+                  <button
+                    key={monitor.index}
+                    onClick={() => setSelectedCaptureMonitor(monitor.index)}
+                    className={`px-3 py-2 rounded-md border transition-colors flex items-center gap-2 ${
+                      selectedCaptureMonitor === monitor.index
+                        ? "bg-primary/20 border-primary text-primary"
+                        : "bg-input border-border/50 hover:border-primary/50"
+                    }`}
+                  >
+                    <Monitor className="w-4 h-4" />
+                    <span>
+                      #{monitor.index + 1}
+                      {monitor.is_primary && " (primary)"}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      {monitor.width}x{monitor.height}
+                    </span>
+                  </button>
+                ))
+              ) : (
+                <div className="text-sm text-muted-foreground">Loading monitors...</div>
+              )}
+            </div>
+          </div>
+
+          {/* Capture Button */}
+          <div className="flex items-center gap-3" ref={captureToWebMenuRef}>
+            <button
+              onClick={handleCaptureAndUploadToWeb}
+              disabled={isCapturingToWeb || userProjects.length === 0}
+              className="px-6 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white rounded-md font-medium transition-colors flex items-center gap-2"
+            >
+              {isCapturingToWeb ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Capturing & Uploading...
+                </>
+              ) : (
+                <>
+                  <Upload className="w-4 h-4" />
+                  Capture & Upload to Web
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+
+        <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+          <div className="text-sm text-muted-foreground">
+            <strong className="text-foreground">Tip:</strong> Screenshots are captured at physical
+            resolution (e.g., 3840x2160 on 4K monitors), matching the resolution used by qontinui
+            automation.
+          </div>
         </div>
       </div>
     </div>

@@ -8,8 +8,7 @@ This module provides common fixtures and utilities used across all test modules:
 """
 
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -24,15 +23,15 @@ class MockStateMemory:
     that can be updated programmatically during tests.
     """
 
-    def __init__(self, initial_states: Optional[List[str]] = None):
+    def __init__(self, initial_states: list[str] | None = None):
         """Initialize mock state memory.
 
         Args:
             initial_states: Initial list of active state names. Defaults to empty list.
         """
-        self._active_states: List[str] = initial_states if initial_states else []
+        self._active_states: list[str] = initial_states if initial_states else []
 
-    def get_active_state_names(self) -> List[str]:
+    def get_active_state_names(self) -> list[str]:
         """Get current active state names.
 
         Returns:
@@ -40,7 +39,7 @@ class MockStateMemory:
         """
         return self._active_states.copy()
 
-    def set_active_states(self, states: List[str]) -> None:
+    def set_active_states(self, states: list[str]) -> None:
         """Set active states (for test control).
 
         Args:

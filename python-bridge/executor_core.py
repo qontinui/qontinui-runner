@@ -17,17 +17,16 @@ import logging
 import os
 import tempfile
 import traceback
-from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 try:
     from qontinui import Image, navigation_api, registry
-    from qontinui.config import get_settings, enable_mock_mode, disable_mock_mode
+    from qontinui.config import disable_mock_mode, enable_mock_mode, get_settings
+    from qontinui.config.schema import Workflow, WorkflowVisibility
     from qontinui.json_executor.config_parser import ConfigParser
     from qontinui.json_executor.state_executor import StateExecutor
-    from qontinui.config.schema import Workflow, WorkflowVisibility
 
     QONTINUI_AVAILABLE = True
 except ImportError:
@@ -370,7 +369,7 @@ class ExecutorCore:
         if failed_workflow_count > 0:
             self.emit_log("error", f"{failed_workflow_count} inline workflows failed validation")
 
-    def apply_debug_settings(self, settings: Dict[str, Any]):
+    def apply_debug_settings(self, settings: dict[str, Any]):
         """
         Apply debug settings to the framework.
 
@@ -393,7 +392,7 @@ class ExecutorCore:
             except Exception as e:
                 self.emit_log("error", f"Failed to apply debug settings: {e}")
 
-    def get_temp_dir(self) -> Optional[str]:
+    def get_temp_dir(self) -> str | None:
         """Get temporary directory for this execution."""
         return self.temp_dir
 

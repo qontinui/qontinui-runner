@@ -14,8 +14,8 @@ import time
 
 import pytest
 
-from services.tree_view_layer import TreeViewLayer, TreeNode
 from models.action_execution_record import ActionExecutionRecord
+from services.tree_view_layer import TreeNode, TreeViewLayer
 
 
 class TestTreeNodeSerialization:

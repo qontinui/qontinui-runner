@@ -11,13 +11,14 @@ Single Responsibility: Handle GUI interaction and action execution
 
 import logging
 import time
-from typing import Any, Callable, Dict, Optional
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 try:
+    from qontinui import Location, navigation_api, registry
     from qontinui.config.schema import Action
-    from qontinui import navigation_api, registry, Location
 
     QONTINUI_AVAILABLE = True
 except ImportError:
@@ -40,14 +41,14 @@ class GUIAutomation:
     def __init__(
         self,
         emit_log_fn: Callable[[str, str], None],
-        emit_tree_event_fn: Callable[[str, Any, Optional[Dict]], None],
+        emit_tree_event_fn: Callable[[str, Any, dict | None], None],
         execution_tree: Any,
         unified_data_collector: Any,
         action_executor: Any,
         state_executor: Any,
-        workflows: Dict,
-        images: Dict,
-        get_image_name_fn: Callable[[str], Optional[str]],
+        workflows: dict,
+        images: dict,
+        get_image_name_fn: Callable[[str], str | None],
         get_action_definition_fn: Callable[[str], Any],
     ):
         """
@@ -78,7 +79,7 @@ class GUIAutomation:
         self.is_running = False
         self._last_find_location = None
 
-    def execute_action(self, action_data: Dict[str, Any]) -> bool:
+    def execute_action(self, action_data: dict[str, Any]) -> bool:
         """
         Execute a single action using ExecutionTree and UnifiedDataCollector.
 
@@ -232,7 +233,7 @@ class GUIAutomation:
 
             return success
 
-    def execute_workflow(self, workflow_id: str, transition_context: Optional[Dict] = None) -> bool:
+    def execute_workflow(self, workflow_id: str, transition_context: dict | None = None) -> bool:
         """
         Execute a workflow and return success status.
 
@@ -350,7 +351,7 @@ class GUIAutomation:
                 if not action_success:
                     success = False
                     self.emit_log(
-                        "debug", f"Action failed, continuing workflow (resilient automation)"
+                        "debug", "Action failed, continuing workflow (resilient automation)"
                     )
 
                 # Small delay between actions
@@ -368,7 +369,7 @@ class GUIAutomation:
 
         return success
 
-    def _get_hierarchy_context(self) -> Dict[str, Any]:
+    def _get_hierarchy_context(self) -> dict[str, Any]:
         """
         Extract hierarchy context for data collection.
 
@@ -398,7 +399,7 @@ class GUIAutomation:
             "nesting_level": nesting_level,
         }
 
-    def _enrich_find_action_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+    def _enrich_find_action_config(self, config: dict[str, Any]) -> dict[str, Any]:
         """
         Enrich FIND action config with human-readable image names.
 
@@ -488,7 +489,7 @@ class GUIAutomation:
             self.emit_log("warning", f"Error resetting navigation state: {e}")
             return False
 
-    def get_last_find_location(self) -> Optional[Any]:
+    def get_last_find_location(self) -> Any | None:
         """
         Get location of most recent FIND result.
 

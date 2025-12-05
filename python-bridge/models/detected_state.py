@@ -9,11 +9,12 @@ A DetectedState represents a distinct visual state of an application, containing
 - UIElements: Interactive elements with bounding boxes and labels
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
-from PIL import Image
 import base64
+from dataclasses import dataclass, field
 from io import BytesIO
+from typing import Any
+
+from PIL import Image
 
 
 @dataclass
@@ -39,14 +40,14 @@ class StateImage:
 
     id: str
     name: str
-    image_data: Optional[bytes] = None
-    image: Optional[Image.Image] = None
-    position: Optional[Tuple[int, int]] = None
+    image_data: bytes | None = None
+    image: Image.Image | None = None
+    position: tuple[int, int] | None = None
     is_fixed_position: bool = False
-    source_region: Optional[Tuple[int, int, int, int]] = None
+    source_region: tuple[int, int, int, int] | None = None
     confidence: float = 0.0
     similarity_threshold: float = 0.85
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate that either image_data or image is provided."""
@@ -81,9 +82,9 @@ class StateImage:
             self.image = Image.open(BytesIO(self.image_data))
             return self.image
         except Exception as e:
-            raise IOError(f"Failed to load image from bytes: {e}")
+            raise OSError(f"Failed to load image from bytes: {e}")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -112,7 +113,7 @@ class StateImage:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "StateImage":
+    def from_dict(cls, data: dict[str, Any]) -> "StateImage":
         """Create StateImage from dictionary.
 
         Args:
@@ -161,15 +162,15 @@ class UIElement:
 
     id: str
     element_type: str
-    bounding_box: Tuple[int, int, int, int]
-    label: Optional[str] = None
+    bounding_box: tuple[int, int, int, int]
+    label: str | None = None
     confidence: float = 0.0
     clickable: bool = True
     interactable: bool = True
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def center(self) -> Tuple[int, int]:
+    def center(self) -> tuple[int, int]:
         """Calculate the center point of the element's bounding box.
 
         Returns:
@@ -188,7 +189,7 @@ class UIElement:
         _, _, w, h = self.bounding_box
         return w * h
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -208,7 +209,7 @@ class UIElement:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "UIElement":
+    def from_dict(cls, data: dict[str, Any]) -> "UIElement":
         """Create UIElement from dictionary.
 
         Args:
@@ -254,13 +255,13 @@ class DetectedState:
     id: str
     name: str
     representative_frame: int
-    frame_range: Tuple[int, int]
+    frame_range: tuple[int, int]
     similarity_score: float
-    images: List[StateImage] = field(default_factory=list)
-    elements: List[UIElement] = field(default_factory=list)
+    images: list[StateImage] = field(default_factory=list)
+    elements: list[UIElement] = field(default_factory=list)
     confidence: float = 0.0
-    description: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    description: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
     def frame_count(self) -> int:
@@ -290,7 +291,7 @@ class DetectedState:
         """
         return len(self.elements)
 
-    def get_image_by_id(self, image_id: str) -> Optional[StateImage]:
+    def get_image_by_id(self, image_id: str) -> StateImage | None:
         """Find a StateImage by its ID.
 
         Args:
@@ -304,7 +305,7 @@ class DetectedState:
                 return image
         return None
 
-    def get_element_by_id(self, element_id: str) -> Optional[UIElement]:
+    def get_element_by_id(self, element_id: str) -> UIElement | None:
         """Find a UIElement by its ID.
 
         Args:
@@ -318,7 +319,7 @@ class DetectedState:
                 return element
         return None
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         Returns:
@@ -341,7 +342,7 @@ class DetectedState:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DetectedState":
+    def from_dict(cls, data: dict[str, Any]) -> "DetectedState":
         """Create DetectedState from dictionary.
 
         Args:

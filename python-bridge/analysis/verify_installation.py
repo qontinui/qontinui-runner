@@ -81,8 +81,8 @@ def check_analysis_module():
         from analysis import (
             ImageExtractionConfig,
             StateImageExtractor,
-            save_state_image,
             load_state_image,
+            save_state_image,
         )
 
         print("  ✓ analysis.ImageExtractionConfig")
@@ -128,8 +128,9 @@ def run_basic_test():
 
     try:
         import numpy as np
-        from models import DetectedState, Frame, InputEvent
+
         from analysis import ImageExtractionConfig, StateImageExtractor
+        from models import DetectedState, Frame, InputEvent
 
         # Create test frame
         image = np.ones((600, 800, 3), dtype=np.uint8) * 240

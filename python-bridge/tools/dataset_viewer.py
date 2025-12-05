@@ -26,10 +26,10 @@ Examples:
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-import logging
+from typing import Any
 
 # Try to import PIL for image viewing
 try:
@@ -62,7 +62,7 @@ class DatasetViewer:
 
         # Validation results
         self.reviews_path = dataset_dir / "reviews.jsonl"
-        self.reviews: Dict[str, Dict[str, Any]] = {}
+        self.reviews: dict[str, dict[str, Any]] = {}
 
         self._load_reviews()
 
@@ -71,7 +71,7 @@ class DatasetViewer:
         if not self.reviews_path.exists():
             return
 
-        with open(self.reviews_path, "r") as f:
+        with open(self.reviews_path) as f:
             for line in f:
                 review = json.loads(line)
                 self.reviews[review["image_id"]] = review
@@ -101,14 +101,14 @@ class DatasetViewer:
             print("Error: No metadata.json found")
             return
 
-        with open(self.metadata_path, "r") as f:
+        with open(self.metadata_path) as f:
             metadata = json.load(f)
 
         # Count manifest entries
         manifest_count = 0
         reviewed_count = 0
         if self.manifest_path.exists():
-            with open(self.manifest_path, "r") as f:
+            with open(self.manifest_path) as f:
                 for line in f:
                     manifest_count += 1
                     entry = json.loads(line)
@@ -162,7 +162,7 @@ class DatasetViewer:
         print("=" * 60)
 
         count = 0
-        with open(self.manifest_path, "r") as f:
+        with open(self.manifest_path) as f:
             for line in f:
                 if count >= limit:
                     break
@@ -176,7 +176,7 @@ class DatasetViewer:
                 if not ann_path.exists():
                     continue
 
-                with open(ann_path, "r") as af:
+                with open(ann_path) as af:
                     ann_data = json.load(af)
 
                 # Display info
@@ -240,7 +240,7 @@ class DatasetViewer:
             ann_path = self.dataset_dir / entry["annotations"]
 
             # Load annotations
-            with open(ann_path, "r") as f:
+            with open(ann_path) as f:
                 ann_data = json.load(f)
 
             # Show image info
@@ -291,14 +291,14 @@ class DatasetViewer:
         print("\nValidation session complete")
         self._show_review_summary()
 
-    def _load_manifest(self) -> List[Dict[str, Any]]:
+    def _load_manifest(self) -> list[dict[str, Any]]:
         """Load all manifest entries.
 
         Returns:
             List of manifest entries.
         """
         entries = []
-        with open(self.manifest_path, "r") as f:
+        with open(self.manifest_path) as f:
             for line in f:
                 entries.append(json.loads(line))
         return entries
@@ -310,7 +310,7 @@ class DatasetViewer:
             Number of entries.
         """
         count = 0
-        with open(self.manifest_path, "r") as f:
+        with open(self.manifest_path) as f:
             for _ in f:
                 count += 1
         return count

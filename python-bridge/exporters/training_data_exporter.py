@@ -13,14 +13,14 @@ analysis provided by qontinui.discovery.click_analysis, which detects
 actual element boundaries rather than using fixed-size boxes.
 """
 
-import json
 import hashlib
+import json
 import logging
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set, Tuple
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -91,7 +91,7 @@ class TrainingDataExporter:
         output_dir: Path,
         dataset_version: str = "1.0.0",
         use_smart_bbox_inference: bool = True,
-        inference_config: Optional[Any] = None,
+        inference_config: Any | None = None,
     ):
         """Initialize the TrainingDataExporter.
 
@@ -110,15 +110,15 @@ class TrainingDataExporter:
         self.metadata_path = output_dir / "metadata.json"
 
         # Category tracking
-        self.category_id_map: Dict[str, int] = {}
+        self.category_id_map: dict[str, int] = {}
         self.next_category_id = 0
 
         # Image deduplication
-        self.image_hashes: Set[str] = set()
+        self.image_hashes: set[str] = set()
 
         # Click analysis configuration
         self.use_smart_bbox_inference = use_smart_bbox_inference and CLICK_ANALYSIS_AVAILABLE
-        self._bbox_inferrer: Optional[Any] = None
+        self._bbox_inferrer: Any | None = None
         self._inference_config = inference_config
 
         if use_smart_bbox_inference and not CLICK_ANALYSIS_AVAILABLE:
@@ -142,7 +142,7 @@ class TrainingDataExporter:
     def _load_existing_state(self) -> None:
         """Load existing category mappings and image hashes if resuming."""
         if self.metadata_path.exists():
-            with open(self.metadata_path, "r") as f:
+            with open(self.metadata_path) as f:
                 metadata = json.load(f)
                 self.category_id_map = metadata.get("category_map", {})
                 self.next_category_id = len(self.category_id_map)
@@ -153,9 +153,9 @@ class TrainingDataExporter:
 
     def export_records(
         self,
-        records: List[ActionExecutionRecord],
+        records: list[ActionExecutionRecord],
         storage_dir: Path,
-        filter_fn: Optional[callable] = None,
+        filter_fn: callable | None = None,
     ) -> ExportStatistics:
         """Export a list of ActionExecutionRecords to training format.
 
@@ -288,7 +288,7 @@ class TrainingDataExporter:
         # Append to manifest (incremental)
         self._append_to_manifest(img_hash, record, is_new_image)
 
-    def _extract_bbox_from_match(self, match_summary: Dict[str, Any]) -> Optional[List[int]]:
+    def _extract_bbox_from_match(self, match_summary: dict[str, Any]) -> list[int] | None:
         """Extract bounding box from match_summary.
 
         Args:
@@ -318,11 +318,11 @@ class TrainingDataExporter:
 
     def _infer_bbox_from_click(
         self,
-        clicked_location: Tuple[int, int],
+        clicked_location: tuple[int, int],
         img_width: int,
         img_height: int,
         bbox_size: int = 50,
-    ) -> List[int]:
+    ) -> list[int]:
         """Infer a bounding box from a click location using fixed-size fallback.
 
         This is the simple fallback method that creates a fixed-size bounding box
@@ -351,10 +351,10 @@ class TrainingDataExporter:
 
     def _infer_bbox_smart(
         self,
-        clicked_location: Tuple[int, int],
+        clicked_location: tuple[int, int],
         screenshot: np.ndarray,
-        click_target_type: Optional[str] = None,
-    ) -> Optional[Dict[str, Any]]:
+        click_target_type: str | None = None,
+    ) -> dict[str, Any] | None:
         """Infer bounding box using qontinui's sophisticated click analysis.
 
         Uses multiple detection strategies (edge detection, contour detection,
@@ -440,7 +440,7 @@ class TrainingDataExporter:
     def _save_annotations(
         self,
         img_hash: str,
-        annotations: List[Dict[str, Any]],
+        annotations: list[dict[str, Any]],
         record: ActionExecutionRecord,
         img_width: int,
         img_height: int,
@@ -459,7 +459,7 @@ class TrainingDataExporter:
         # Load existing annotations if file exists (for incremental updates)
         existing_annotations = []
         if annotation_file.exists():
-            with open(annotation_file, "r") as f:
+            with open(annotation_file) as f:
                 data = json.load(f)
                 existing_annotations = data.get("annotations", [])
 
@@ -489,7 +489,7 @@ class TrainingDataExporter:
             json.dump(data, f, indent=2)
 
     def _annotation_exists(
-        self, annotation: Dict[str, Any], existing: List[Dict[str, Any]]
+        self, annotation: dict[str, Any], existing: list[dict[str, Any]]
     ) -> bool:
         """Check if an annotation already exists.
 
@@ -618,7 +618,7 @@ class TrainingDataExporter:
 
         # Read all annotation files
         for ann_file in sorted(self.annotations_dir.glob("*.json")):
-            with open(ann_file, "r") as f:
+            with open(ann_file) as f:
                 data = json.load(f)
 
             img_hash = data["image_id"]
@@ -658,7 +658,7 @@ class TrainingDataExporter:
         with open(output_file, "w") as f:
             json.dump(coco_data, f, indent=2)
 
-    def get_summary(self) -> Dict[str, Any]:
+    def get_summary(self) -> dict[str, Any]:
         """Get a summary of the current dataset.
 
         Returns:
@@ -667,14 +667,14 @@ class TrainingDataExporter:
         if not self.metadata_path.exists():
             return {"error": "No metadata found. Dataset may be empty."}
 
-        with open(self.metadata_path, "r") as f:
+        with open(self.metadata_path) as f:
             metadata = json.load(f)
 
         # Count manifest entries
         manifest_count = 0
         reviewed_count = 0
         if self.manifest_path.exists():
-            with open(self.manifest_path, "r") as f:
+            with open(self.manifest_path) as f:
                 for line in f:
                     manifest_count += 1
                     entry = json.loads(line)

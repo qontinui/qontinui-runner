@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from "react";
-import { AlertCircle, Info, AlertTriangle, X, Wifi, WifiOff } from "lucide-react";
+import { AlertCircle, Info, AlertTriangle, X, Wifi, WifiOff, Tag } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+
+const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 
 interface ErrorEvent {
   title: string;
@@ -29,6 +31,9 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   >("disconnected");
   const [showError, setShowError] = useState(false);
   const [isBeta] = useState(true);
+  const [runnerName, setRunnerName] = useState<string>(() => {
+    return localStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
+  });
 
   useEffect(() => {
     const unlistenError = listen<ErrorEvent>("error", (event) => {
@@ -48,9 +53,16 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       },
     );
 
+    // Listen for runner name changes from settings
+    const handleRunnerNameChange = (event: CustomEvent<string>) => {
+      setRunnerName(event.detail);
+    };
+    window.addEventListener("runner-name-changed", handleRunnerNameChange as EventListener);
+
     return () => {
       unlistenError.then((fn) => fn());
       unlistenConnection.then((fn) => fn());
+      window.removeEventListener("runner-name-changed", handleRunnerNameChange as EventListener);
     };
   }, []);
 
@@ -97,6 +109,14 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 
       {/* Status Bar */}
       <div className="flex items-center gap-4 px-4 py-2 bg-gray-50 border-b border-gray-200">
+        {/* Runner Name */}
+        {runnerName && (
+          <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
+            <Tag className="w-4 h-4 text-primary" />
+            <span className="text-sm font-medium text-gray-800">{runnerName}</span>
+          </div>
+        )}
+
         <div className="flex items-center gap-2">
           <div
             className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-green-500" : "bg-gray-400"}`}

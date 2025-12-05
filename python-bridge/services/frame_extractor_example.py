@@ -13,13 +13,14 @@ Example workflow:
 
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import Any
 
-from frame_extractor_service import FrameExtractorService, EventFilter
+from frame_extractor_service import EventFilter, FrameExtractorService
+
 from models.input_event import InputMonitorEvent
 
 
-def load_events_from_jsonl(jsonl_path: str) -> List[InputMonitorEvent]:
+def load_events_from_jsonl(jsonl_path: str) -> list[InputMonitorEvent]:
     """Load input events from JSONL file.
 
     Args:
@@ -29,7 +30,7 @@ def load_events_from_jsonl(jsonl_path: str) -> List[InputMonitorEvent]:
         List of InputMonitorEvent objects
     """
     events = []
-    with open(jsonl_path, "r") as f:
+    with open(jsonl_path) as f:
         for line in f:
             if line.strip():
                 data = json.loads(line)
@@ -39,10 +40,10 @@ def load_events_from_jsonl(jsonl_path: str) -> List[InputMonitorEvent]:
 
 def create_training_dataset(
     video_path: str,
-    events: List[InputMonitorEvent],
+    events: list[InputMonitorEvent],
     output_dir: Path,
-    filter_config: Dict[str, Any],
-) -> Dict[str, Any]:
+    filter_config: dict[str, Any],
+) -> dict[str, Any]:
     """Create a training dataset from video and events.
 
     Extracts frames at filtered events and creates a manifest file
@@ -57,7 +58,7 @@ def create_training_dataset(
     Returns:
         Dictionary with dataset statistics
     """
-    print(f"\n=== Creating Training Dataset ===")
+    print("\n=== Creating Training Dataset ===")
     print(f"Video: {video_path}")
     print(f"Events: {len(events)} total")
     print(f"Output: {output_dir}")
@@ -76,7 +77,7 @@ def create_training_dataset(
         modifiers=filter_config.get("modifiers"),
     )
 
-    print(f"\nFilter configuration:")
+    print("\nFilter configuration:")
     print(f"  Event types: {event_filter.event_types}")
     print(f"  Buttons: {event_filter.buttons}")
     print(f"  Keys: {event_filter.keys}")
@@ -84,7 +85,7 @@ def create_training_dataset(
     print(f"  Max count: {event_filter.max_count}")
 
     # Extract frames at filtered events
-    print(f"\nExtracting frames...")
+    print("\nExtracting frames...")
     frames = extractor.extract_at_events(video_path, events, event_filter)
 
     if not frames:
@@ -94,7 +95,7 @@ def create_training_dataset(
     print(f"Extracted {len(frames)} frames")
 
     # Save frames
-    print(f"\nSaving frames...")
+    print("\nSaving frames...")
     frames_dir = output_dir / "frames"
     saved_paths = extractor.save_frames_batch(
         frames, str(frames_dir), filename_pattern="frame_{frame_number:05d}", format="png"
@@ -109,7 +110,7 @@ def create_training_dataset(
         "frames": [],
     }
 
-    for frame, path in zip(frames, saved_paths):
+    for frame, path in zip(frames, saved_paths, strict=False):
         frame_info = {
             "path": path,
             "timestamp": frame.timestamp,
@@ -124,7 +125,7 @@ def create_training_dataset(
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"\nDataset created successfully!")
+    print("\nDataset created successfully!")
     print(f"  Frames: {len(frames)}")
     print(f"  Manifest: {manifest_path}")
 
@@ -136,7 +137,7 @@ def create_training_dataset(
 
 
 def analyze_click_patterns(
-    video_path: str, events: List[InputMonitorEvent], output_dir: Path
+    video_path: str, events: list[InputMonitorEvent], output_dir: Path
 ) -> None:
     """Analyze and visualize click patterns from video.
 
@@ -147,7 +148,7 @@ def analyze_click_patterns(
         events: List of input events
         output_dir: Directory for output files
     """
-    print(f"\n=== Analyzing Click Patterns ===")
+    print("\n=== Analyzing Click Patterns ===")
 
     extractor = FrameExtractorService(output_dir, enabled=True)
 
@@ -205,7 +206,7 @@ def create_video_thumbnail_strip(
         interval_sec: Interval between frames in seconds
         max_frames: Maximum number of thumbnails
     """
-    print(f"\n=== Creating Video Thumbnail Strip ===")
+    print("\n=== Creating Video Thumbnail Strip ===")
     print(f"Interval: {interval_sec}s, Max frames: {max_frames}")
 
     extractor = FrameExtractorService(output_dir, enabled=True)
@@ -223,7 +224,7 @@ def create_video_thumbnail_strip(
         print(f"Created {len(saved_paths)} thumbnails in {thumbnails_dir}")
 
 
-def extract_key_moments(video_path: str, events: List[InputMonitorEvent], output_dir: Path) -> None:
+def extract_key_moments(video_path: str, events: list[InputMonitorEvent], output_dir: Path) -> None:
     """Extract frames at key moments based on event patterns.
 
     Identifies "key moments" such as:
@@ -236,7 +237,7 @@ def extract_key_moments(video_path: str, events: List[InputMonitorEvent], output
         events: List of input events
         output_dir: Directory for output files
     """
-    print(f"\n=== Extracting Key Moments ===")
+    print("\n=== Extracting Key Moments ===")
 
     extractor = FrameExtractorService(output_dir, enabled=True)
 

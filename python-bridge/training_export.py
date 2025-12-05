@@ -10,15 +10,13 @@ Single Responsibility: Coordinate training data export
 
 import logging
 import os
-import tempfile
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 try:
-    from services.training_export_service import TrainingExportService, ExportConfig
     from services.screenshot_service import ScreenshotService
+    from services.training_export_service import ExportConfig, TrainingExportService
     from services.unified_data_collector import UnifiedDataCollector
 
     EXPORT_AVAILABLE = True
@@ -45,7 +43,7 @@ class TrainingExportCoordinator:
             emit_log_fn: Function to emit log messages (level, message)
         """
         self.emit_log = emit_log_fn
-        self.export_service: Optional[TrainingExportService] = None
+        self.export_service: TrainingExportService | None = None
         self.export_enabled = False
 
     def initialize(self, run_dir: Path) -> bool:

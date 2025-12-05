@@ -20,7 +20,7 @@ Design Principles:
 """
 
 import threading
-from typing import Any, Optional
+from typing import Any
 
 from models.action_execution_record import ActionExecutionRecord
 
@@ -77,8 +77,8 @@ class UnifiedDataCollector:
     def __init__(
         self,
         state_memory: Any,
-        screenshot_service: Optional[Any] = None,
-        record_created_callback: Optional[callable] = None,
+        screenshot_service: Any | None = None,
+        record_created_callback: callable | None = None,
     ) -> None:
         """Initialize the UnifiedDataCollector.
 
@@ -101,24 +101,24 @@ class UnifiedDataCollector:
         self._lock = threading.RLock()
 
         # Runtime buffer (cleared after each action)
-        self._current_action_id: Optional[str] = None
-        self._current_parent_action_id: Optional[str] = None
-        self._current_workflow_id: Optional[str] = None
+        self._current_action_id: str | None = None
+        self._current_parent_action_id: str | None = None
+        self._current_workflow_id: str | None = None
         self._current_nesting_level: int = 0
 
         # Captured data
         self._active_states_before: list[str] = []
-        self._text_typed: Optional[str] = None
+        self._text_typed: str | None = None
         self._match_results: list[dict[str, Any]] = []
         self._clicks: list[dict[str, Any]] = []
         self._transitions: list[dict[str, Any]] = []
         self._conditions: list[dict[str, Any]] = []
         self._screenshot_paths: list[str] = []
-        self._workflow_name: Optional[str] = None
-        self._workflow_status: Optional[str] = None
+        self._workflow_name: str | None = None
+        self._workflow_status: str | None = None
 
     def start_action(
-        self, action_id: str, parent_action_id: Optional[str], workflow_id: str, nesting_level: int
+        self, action_id: str, parent_action_id: str | None, workflow_id: str, nesting_level: int
     ) -> None:
         """Start collecting data for a new action.
 
@@ -183,9 +183,9 @@ class UnifiedDataCollector:
     def record_match_result(
         self,
         match_summary: dict[str, Any],
-        screenshot_data: Optional[bytes] = None,
-        debug_visual_data: Optional[bytes] = None,
-    ) -> dict[str, Optional[str]]:
+        screenshot_data: bytes | None = None,
+        debug_visual_data: bytes | None = None,
+    ) -> dict[str, str | None]:
         """Record an image recognition match result.
 
         This method buffers match information and optionally stores screenshots
@@ -375,13 +375,13 @@ class UnifiedDataCollector:
     def create_record(
         self,
         action_type: str = "",
-        config: Optional[dict[str, Any]] = None,
-        start_time: Optional[float] = None,
-        end_time: Optional[float] = None,
+        config: dict[str, Any] | None = None,
+        start_time: float | None = None,
+        end_time: float | None = None,
         success: bool = True,
-        error_message: Optional[str] = None,
+        error_message: str | None = None,
         retry_count: int = 0,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> ActionExecutionRecord:
         """Create an immutable ActionExecutionRecord from buffered data.
 

@@ -7,21 +7,19 @@ identifying images from detected states.
 import json
 import logging
 from pathlib import Path
-from typing import List
 
 import cv2
 import numpy as np
 
-from models import DetectedState, Frame, InputEvent, StateImage
 from analysis import ImageExtractionConfig, StateImageExtractor, save_state_image
-
+from models import DetectedState, Frame, InputEvent, StateImage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def load_frames_from_directory(screenshots_dir: Path) -> List[Frame]:
+def load_frames_from_directory(screenshots_dir: Path) -> list[Frame]:
     """Load frames from a directory of screenshots.
 
     Args:
@@ -68,7 +66,7 @@ def load_frames_from_directory(screenshots_dir: Path) -> List[Frame]:
     return frames
 
 
-def load_events_from_json(events_file: Path) -> List[InputEvent]:
+def load_events_from_json(events_file: Path) -> list[InputEvent]:
     """Load input events from JSON file.
 
     Expected format:
@@ -93,7 +91,7 @@ def load_events_from_json(events_file: Path) -> List[InputEvent]:
     """
     logger.info("Loading events from %s", events_file)
 
-    with open(events_file, "r") as f:
+    with open(events_file) as f:
         data = json.load(f)
 
     events = []
@@ -113,7 +111,7 @@ def load_events_from_json(events_file: Path) -> List[InputEvent]:
     return events
 
 
-def create_sample_state(frames: List[Frame]) -> DetectedState:
+def create_sample_state(frames: list[Frame]) -> DetectedState:
     """Create a sample DetectedState for testing.
 
     Args:
@@ -157,7 +155,7 @@ def example_basic_extraction():
         cv2.rectangle(image, (50, 50), (150, 150), (255, 0, 0), -1)
         cv2.circle(image, (100, 100), 30, (0, 255, 0), -1)
         cv2.putText(
-            image, "Frame {}".format(i), (200, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
+            image, f"Frame {i}", (200, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
         )
 
         frame = Frame(

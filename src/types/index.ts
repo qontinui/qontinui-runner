@@ -40,3 +40,6 @@ export {
 
 // Display profile types for the new architecture
 export type { ActionLogViewData, ActionLogEntry, CommandResponse } from "./displayProfile";
+
+// Authentication types
+export type { User, DeviceInfo, LoginResponse, AuthStatus, AuthContextValue } from "./auth";

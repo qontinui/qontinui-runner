@@ -4,8 +4,8 @@ Qontinui executor that integrates with the actual Qontinui library.
 """
 
 import json
-import sys
 import logging
+import sys
 
 # CRITICAL: Configure logging to use stderr FIRST before any other imports
 # This ensures ALL debug logs go to stderr, keeping stdout clean for JSON events
@@ -18,6 +18,7 @@ logging.basicConfig(
 # CRITICAL: Check for --disable-console-logging flag BEFORE any imports
 # This prevents structlog from outputting to stderr/stdout
 import os
+
 if "--disable-console-logging" in sys.argv:
     os.environ["QONTINUI_DISABLE_CONSOLE_LOGGING"] = "1"
     # Remove the flag so it doesn't interfere with other parsing
@@ -26,6 +27,7 @@ if "--disable-console-logging" in sys.argv:
 # IMMEDIATE debug logging to verify executor is being invoked
 import tempfile
 from datetime import datetime
+
 debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_executor_startup.log")
 try:
     with open(debug_log_path, "a", encoding="utf-8") as f:
@@ -69,34 +71,40 @@ sys.path.insert(0, str(qontinui_src_path))
 # Debug: Log to stderr instead of stdout to avoid polluting JSON event stream
 logger.debug(f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})")
 
+from action_definitions import get_action_definition
+
 # CRITICAL: Import local python-bridge modules BEFORE qontinui library
 # These modules are always available and needed even if qontinui library fails to import
 from event_translator import EventTranslator
-from execution_tree import ExecutionTree, ExecutionNode
-from action_definitions import get_action_definition
-from services.unified_data_collector import UnifiedDataCollector
+from execution_tree import ExecutionNode, ExecutionTree
+from services.capture_tool_service import (
+    CaptureToolService,
+    ManualClickListener,
+    ScreenshotCaptureSettings,
+)
 from services.screenshot_service import ScreenshotService
+from services.training_export_service import ExportConfig, TrainingExportService
 from services.tree_view_layer import TreeViewLayer
-from services.capture_tool_service import CaptureToolService, ScreenshotCaptureSettings, ManualClickListener
-from services.training_export_service import TrainingExportService, ExportConfig
+from services.unified_data_collector import UnifiedDataCollector
 
 # WebSocket integration for qontinui-web
 try:
+    import asyncio
+
     from websocket_client import RunnerWebSocketClient, authenticate
     from websocket_config import WebSocketConfig
-    import asyncio
     WEBSOCKET_AVAILABLE = True
 except ImportError as e:
     WEBSOCKET_AVAILABLE = False
     logger.debug(f"WebSocket modules not available: {e}")
 
 try:
-    from qontinui import Find, Image, Location
-    from qontinui.config import get_settings, enable_mock_mode, disable_mock_mode
-    from qontinui import navigation_api, registry
-    from qontinui.reporting import register_callback, EventType as QontinuiEventType
+    from qontinui import Find, Image, Location, navigation_api, registry
     from qontinui.action_executors import DelegatingActionExecutor
+    from qontinui.config import disable_mock_mode, enable_mock_mode, get_settings
     from qontinui.json_executor.config_parser import ConfigParser, QontinuiConfig
+    from qontinui.reporting import EventType as QontinuiEventType
+    from qontinui.reporting import register_callback
 
     QONTINUI_AVAILABLE = True
 except ImportError as e:
@@ -225,8 +233,9 @@ class RunnerOrchestrator:
         if not QONTINUI_AVAILABLE:
             raise RuntimeError("Qontinui library not available")
 
-        from qontinui.json_executor.config_parser import ConfigParser
         import json
+
+        from qontinui.json_executor.config_parser import ConfigParser
 
         with open(config_path, 'r') as f:
             config_dict = json.load(f)
@@ -2008,7 +2017,8 @@ class QontinuiExecutor:
                 success = self.action_executor.execute_action(action)
 
                 # DEBUG: Log success value immediately after library returns
-                import os, tempfile
+                import os
+                import tempfile
                 from datetime import datetime
                 debug_log = os.path.join(tempfile.gettempdir(), "qontinui_action_success_trace.log")
                 try:
@@ -2062,7 +2072,8 @@ class QontinuiExecutor:
 
         except Exception as e:
             # DEBUG: Log exception details
-            import os, tempfile
+            import os
+            import tempfile
             from datetime import datetime
             debug_log = os.path.join(tempfile.gettempdir(), "qontinui_action_success_trace.log")
             try:
@@ -2177,7 +2188,8 @@ class QontinuiExecutor:
             self.execution_tree.end_action(action_id, success=success, error=error_message)
 
             # DEBUG: Log final success value before emitting to frontend
-            import os, tempfile
+            import os
+            import tempfile
             from datetime import datetime
             debug_log = os.path.join(tempfile.gettempdir(), "qontinui_action_success_trace.log")
             try:

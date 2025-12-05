@@ -14,7 +14,8 @@ import time
 from pathlib import Path
 from typing import List
 
-from frame_extractor_service import FrameExtractorService, EventFilter
+from frame_extractor_service import EventFilter, FrameExtractorService
+
 from models.input_event import InputMonitorEvent
 
 

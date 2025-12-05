@@ -11,9 +11,9 @@ Following the Single Responsibility Principle, this module:
 - Does NOT collect data or manage execution state
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, FrozenSet
 import time
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -79,48 +79,48 @@ class ActionExecutionRecord:
     action_type: str
 
     # Configuration
-    config: Dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
 
     # Timing
     start_time: float = field(default_factory=time.time)
-    end_time: Optional[float] = None
-    duration_ms: Optional[float] = None
+    end_time: float | None = None
+    duration_ms: float | None = None
 
     # State context
-    active_states_before: FrozenSet[str] = field(default_factory=frozenset)
-    active_states_after: FrozenSet[str] = field(default_factory=frozenset)
+    active_states_before: frozenset[str] = field(default_factory=frozenset)
+    active_states_after: frozenset[str] = field(default_factory=frozenset)
 
     # Outcome
     success: bool = True
-    error_message: Optional[str] = None
+    error_message: str | None = None
     retry_count: int = 0
 
     # Runtime data (action-specific)
-    typed_text: Optional[str] = None
-    match_summary: Optional[Dict[str, Any]] = None
-    clicked_location: Optional[tuple[int, int]] = None
-    click_button: Optional[str] = None
-    click_target_type: Optional[str] = None
-    transition_data: Optional[Dict[str, Any]] = None
-    condition_result: Optional[bool] = None
-    branch_taken: Optional[str] = None
-    workflow_name: Optional[str] = None  # For RUN_WORKFLOW actions
-    workflow_status: Optional[str] = None  # For RUN_WORKFLOW actions
+    typed_text: str | None = None
+    match_summary: dict[str, Any] | None = None
+    clicked_location: tuple[int, int] | None = None
+    click_button: str | None = None
+    click_target_type: str | None = None
+    transition_data: dict[str, Any] | None = None
+    condition_result: bool | None = None
+    branch_taken: str | None = None
+    workflow_name: str | None = None  # For RUN_WORKFLOW actions
+    workflow_status: str | None = None  # For RUN_WORKFLOW actions
 
     # Hierarchy
-    parent_action_id: Optional[str] = None
-    workflow_id: Optional[str] = None
+    parent_action_id: str | None = None
+    workflow_id: str | None = None
     nesting_level: int = 0
 
     # Visual references
-    screenshot_reference: Optional[str] = None
-    visual_debug_reference: Optional[str] = None
+    screenshot_reference: str | None = None
+    visual_debug_reference: str | None = None
 
     # Extensibility
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
-    def duration_seconds(self) -> Optional[float]:
+    def duration_seconds(self) -> float | None:
         """Calculate duration in seconds.
 
         Returns:
@@ -140,7 +140,7 @@ class ActionExecutionRecord:
         return self.active_states_before != self.active_states_after
 
     @property
-    def states_activated(self) -> FrozenSet[str]:
+    def states_activated(self) -> frozenset[str]:
         """Get states that were activated during action execution.
 
         Returns:
@@ -149,7 +149,7 @@ class ActionExecutionRecord:
         return self.active_states_after - self.active_states_before
 
     @property
-    def states_deactivated(self) -> FrozenSet[str]:
+    def states_deactivated(self) -> frozenset[str]:
         """Get states that were deactivated during action execution.
 
         Returns:
@@ -157,7 +157,7 @@ class ActionExecutionRecord:
         """
         return self.active_states_before - self.active_states_after
 
-    def to_tree_event_data(self) -> Dict[str, Any]:
+    def to_tree_event_data(self) -> dict[str, Any]:
         """Convert to tree event format for frontend consumption.
 
         This method transforms the record into the format expected by
@@ -209,7 +209,7 @@ class ActionExecutionRecord:
             },
         }
 
-    def _format_runtime_for_display(self) -> Dict[str, Any]:
+    def _format_runtime_for_display(self) -> dict[str, Any]:
         """Format runtime data for display in frontend.
 
         Collects all action-specific runtime data into a clean dictionary,
@@ -218,7 +218,7 @@ class ActionExecutionRecord:
         Returns:
             Dictionary containing only non-None runtime data fields
         """
-        runtime: Dict[str, Any] = {}
+        runtime: dict[str, Any] = {}
 
         if self.typed_text is not None:
             runtime["typed_text"] = self.typed_text

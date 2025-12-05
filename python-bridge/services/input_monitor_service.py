@@ -19,16 +19,13 @@ The service is designed to be:
 - Thread-safe: Proper locking for concurrent access
 """
 
-import json
 import logging
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
-from dataclasses import replace
 
 try:
-    from pynput import mouse, keyboard
+    from pynput import keyboard, mouse
 
     PYNPUT_AVAILABLE = True
 except ImportError:
@@ -36,7 +33,6 @@ except ImportError:
     logging.warning("pynput library not available. InputMonitorService will not function.")
 
 from models.input_event import InputMonitorEvent
-
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -91,29 +87,29 @@ class InputMonitorService:
 
         # Monitoring state
         self._monitoring = False
-        self._session_id: Optional[str] = None
-        self._start_time: Optional[float] = None
+        self._session_id: str | None = None
+        self._start_time: float | None = None
         self._fps: int = 30
-        self._events: List[InputMonitorEvent] = []
-        self._events_file: Optional[Path] = None
+        self._events: list[InputMonitorEvent] = []
+        self._events_file: Path | None = None
         self._events_lock = threading.Lock()
 
         # Mouse state tracking
-        self._mouse_pressed_button: Optional[str] = None
-        self._mouse_press_time: Optional[float] = None
-        self._mouse_press_position: Optional[Tuple[int, int]] = None
+        self._mouse_pressed_button: str | None = None
+        self._mouse_press_time: float | None = None
+        self._mouse_press_position: tuple[int, int] | None = None
         self._is_dragging = False
-        self._drag_positions: List[Tuple[int, int]] = []
+        self._drag_positions: list[tuple[int, int]] = []
         self._last_mouse_move_time: float = 0
         self._mouse_move_sample_interval = 0.1  # Sample mouse moves every 100ms
 
         # Keyboard state tracking
-        self._keys_pressed: Dict[str, float] = {}  # key -> press timestamp
-        self._current_modifiers: List[str] = []
+        self._keys_pressed: dict[str, float] = {}  # key -> press timestamp
+        self._current_modifiers: list[str] = []
 
         # pynput listeners
-        self._mouse_listener: Optional[mouse.Listener] = None
-        self._keyboard_listener: Optional[keyboard.Listener] = None
+        self._mouse_listener: mouse.Listener | None = None
+        self._keyboard_listener: keyboard.Listener | None = None
 
         logger.info(f"InputMonitorService initialized with storage_dir: {storage_dir}")
 
@@ -230,7 +226,7 @@ class InputMonitorService:
             self._monitoring = False
             raise
 
-    def get_events(self) -> List[InputMonitorEvent]:
+    def get_events(self) -> list[InputMonitorEvent]:
         """Get all captured input events.
 
         Returns:
@@ -239,7 +235,7 @@ class InputMonitorService:
         with self._events_lock:
             return self._events.copy()
 
-    def get_events_in_range(self, start_time: float, end_time: float) -> List[InputMonitorEvent]:
+    def get_events_in_range(self, start_time: float, end_time: float) -> list[InputMonitorEvent]:
         """Get input events within a specific time range.
 
         Args:
@@ -403,7 +399,7 @@ class InputMonitorService:
         self._add_event(event)
 
     def _finalize_drag_event(
-        self, end_position: Optional[Tuple[int, int]] = None, end_time: Optional[float] = None
+        self, end_position: tuple[int, int] | None = None, end_time: float | None = None
     ) -> None:
         """Finalize and record a drag event.
 
@@ -547,7 +543,7 @@ class InputMonitorService:
             return str(key)
 
     @staticmethod
-    def _get_key_code(key) -> Optional[int]:
+    def _get_key_code(key) -> int | None:
         """Get numeric key code from pynput key.
 
         Args:
@@ -591,7 +587,7 @@ class InputMonitorService:
 
     @staticmethod
     def _has_significant_movement(
-        start: Tuple[int, int], end: Tuple[int, int], threshold: int = 5
+        start: tuple[int, int], end: tuple[int, int], threshold: int = 5
     ) -> bool:
         """Check if mouse movement is significant enough to be considered a drag.
 

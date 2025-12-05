@@ -5,6 +5,7 @@
 //!
 //! # Module Organization
 //!
+//! - `auth` - Authentication and device management
 //! - `config` - Configuration file loading and management
 //! - `execution` - Python executor lifecycle and workflow execution
 //! - `extraction` - Web GUI extraction and training data export
@@ -28,16 +29,19 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
+pub mod auth;
 pub mod config;
 pub mod debug;
 pub mod execution;
 pub mod extraction;
+pub mod screenshot;
 pub mod state_machine;
 pub mod storage;
 pub mod video;
 pub mod websocket;
 
 // Re-export all command functions for easy access in main.rs
+pub use auth::{check_auth_status, get_device_info, login, logout};
 pub use config::{
     get_auto_load_last_config, get_current_configuration, get_last_config_path, load_configuration,
     save_auto_load_last_config, save_last_workflow_id,
@@ -51,6 +55,10 @@ pub use execution::{
 pub use extraction::{
     export_state_structure, export_training_data, get_extraction_status, list_extractions,
     request_extraction_screenshot, start_web_extraction, stop_web_extraction,
+};
+pub use screenshot::{
+    capture_and_upload_screenshot, capture_screenshot, capture_screenshot_via_python,
+    get_screenshot_monitors, ScreenshotUploadConfig,
 };
 pub use state_machine::{
     clear_action_log, execute_transition, get_action_log_view, get_active_states,

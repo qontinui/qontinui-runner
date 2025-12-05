@@ -8,16 +8,16 @@ This test verifies that:
 """
 
 import json
-import time
-from unittest.mock import Mock, MagicMock, patch
-from io import StringIO
 import sys
+import time
+from io import StringIO
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from services.unified_data_collector import UnifiedDataCollector
-from models.action_execution_record import ActionExecutionRecord
 from execution_tree import ExecutionNode, ExecutionTree
+from models.action_execution_record import ActionExecutionRecord
+from services.unified_data_collector import UnifiedDataCollector
 
 
 class TestRuntimeMetadataFlow:

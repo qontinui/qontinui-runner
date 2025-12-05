@@ -80,7 +80,10 @@ impl OutputProcessor {
                     // Parse message
                     match parse_executor_message(&line) {
                         Ok(message) => {
-                            info!("[OUTPUT_PROCESSOR] Parsed message type: {:?}", std::mem::discriminant(&message));
+                            info!(
+                                "[OUTPUT_PROCESSOR] Parsed message type: {:?}",
+                                std::mem::discriminant(&message)
+                            );
                             debug!("Parsed message full: {:?}", message);
 
                             // Handle pong messages for health monitoring

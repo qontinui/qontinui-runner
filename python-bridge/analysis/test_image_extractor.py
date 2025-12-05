@@ -3,12 +3,12 @@
 Run with: pytest analysis/test_image_extractor.py -v
 """
 
+import cv2
 import numpy as np
 import pytest
-import cv2
 
-from models import DetectedState, Frame, InputEvent, StateImage
 from analysis import ImageExtractionConfig, StateImageExtractor
+from models import DetectedState, Frame, InputEvent, StateImage
 
 
 class TestImageExtractionConfig:

@@ -7,13 +7,8 @@
 //! - Getting available transitions
 //! - Action log viewing and management
 
-use serde_json;
-use std::sync::Arc;
 use tauri::State;
-use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info};
-
-use crate::display::DisplayProcessor;
 
 use super::{AppState, CommandResponse};
 

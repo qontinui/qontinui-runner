@@ -9,14 +9,15 @@ This module provides real-time bidirectional communication for:
 """
 
 import asyncio
-import json
 import base64
+import json
 import logging
-from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Callable
-from io import BytesIO
 import platform
 import socket
+from collections.abc import Callable
+from datetime import UTC, datetime
+from io import BytesIO
+from typing import Any
 
 try:
     import websockets
@@ -55,19 +56,19 @@ class RunnerWebSocketClient:
         token: str,
         project_id: str,
         runner_version: str = "0.1.0",
-        runner_name: Optional[str] = None,
+        runner_name: str | None = None,
         auto_reconnect: bool = True,
         heartbeat_interval: int = 30,
         max_reconnect_attempts: int = 5,
-        on_connected: Optional[Callable] = None,
-        on_disconnected: Optional[Callable] = None,
-        on_error: Optional[Callable] = None,
+        on_connected: Callable | None = None,
+        on_disconnected: Callable | None = None,
+        on_error: Callable | None = None,
     ):
         """
         Initialize WebSocket client.
 
         Args:
-            api_url: WebSocket server URL (e.g., ws://localhost:8001)
+            api_url: WebSocket server URL (e.g., ws://localhost:8000)
             token: JWT authentication token
             project_id: Project UUID
             runner_version: Version of qontinui-runner
@@ -97,19 +98,19 @@ class RunnerWebSocketClient:
         self.on_connected = on_connected
         self.on_disconnected = on_disconnected
         self.on_error = on_error
-        self.on_command: Optional[Callable[[Dict[str, Any]], None]] = None
+        self.on_command: Callable[[dict[str, Any]], None] | None = None
 
         # Connection state
-        self.ws: Optional[WebSocketClientProtocol] = None
-        self.session_id: Optional[str] = None
+        self.ws: WebSocketClientProtocol | None = None
+        self.session_id: str | None = None
         self.log_sequence = 0
         self.is_connected = False
         self.is_running = False
 
         # Tasks
-        self.heartbeat_task: Optional[asyncio.Task] = None
-        self.reconnect_task: Optional[asyncio.Task] = None
-        self.listener_task: Optional[asyncio.Task] = None
+        self.heartbeat_task: asyncio.Task | None = None
+        self.reconnect_task: asyncio.Task | None = None
+        self.listener_task: asyncio.Task | None = None
 
         # System info
         self.runner_os = self._get_os_info()
@@ -129,7 +130,7 @@ class RunnerWebSocketClient:
 
     def _get_timestamp(self) -> str:
         """Get current UTC timestamp in ISO format."""
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     async def connect(self) -> bool:
         """
@@ -138,9 +139,44 @@ class RunnerWebSocketClient:
         Returns:
             True if connection successful, False otherwise
         """
+        # DEBUG: Write to file for visibility regardless of how runner is started
+        import os
+        from datetime import datetime
+
+        # Path: websocket_client.py -> python-bridge -> qontinui-runner -> qontinui_parent_directory
+        debug_log_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            ".dev-logs",
+            "python-ws-debug.log",
+        )
         try:
-            ws_url = f"{self.api_url}/api/v1/automation/ws/automation/runner?token={self.token}"
+            with open(debug_log_path, "a") as f:
+                f.write(f"\n[{datetime.now().isoformat()}] WebSocket connect() called\n")
+                f.write(f"  api_url: {self.api_url}\n")
+                f.write(f"  token_len: {len(self.token) if self.token else 0}\n")
+                f.flush()
+        except Exception as e:
+            logger.warning(f"Could not write debug log: {e}")
+
+        try:
+            # Extract just the host:port from api_url in case it already has a path
+            # This prevents URL duplication bugs if api_url is "ws://host:port/some/path"
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self.api_url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+            ws_url = f"{base_url}/api/v1/automation/ws/automation/runner?token={self.token}"
             logger.info(f"Connecting to qontinui-web: {ws_url}")
+
+            # DEBUG: Log the full URL being used
+            try:
+                with open(debug_log_path, "a") as f:
+                    f.write(f"  base_url (extracted): {base_url}\n")
+                    f.write(f"  full_ws_url: {ws_url[:120]}...\n")
+                    f.flush()
+            except Exception:
+                pass
 
             self.ws = await websockets.connect(
                 ws_url,
@@ -148,6 +184,14 @@ class RunnerWebSocketClient:
                 ping_timeout=10,
                 close_timeout=5,
             )
+
+            # DEBUG: Log successful connection
+            try:
+                with open(debug_log_path, "a") as f:
+                    f.write("  CONNECTION SUCCESS!\n")
+                    f.flush()
+            except Exception:
+                pass
 
             self.is_connected = True
             self.is_running = True
@@ -175,6 +219,15 @@ class RunnerWebSocketClient:
             logger.error(f"Failed to connect to WebSocket: {e}")
             self.is_connected = False
 
+            # DEBUG: Log connection failure
+            try:
+                with open(debug_log_path, "a") as f:
+                    f.write(f"  CONNECTION FAILED: {e}\n")
+                    f.write(f"  Error type: {type(e).__name__}\n")
+                    f.flush()
+            except Exception:
+                pass
+
             if self.on_error:
                 try:
                     self.on_error(f"Connection failed: {e}")
@@ -186,7 +239,19 @@ class RunnerWebSocketClient:
     async def disconnect(self):
         """Close WebSocket connection gracefully."""
         logger.info("Disconnecting WebSocket...")
+
+        # Disable auto-reconnect FIRST to prevent reconnection attempts
+        self.auto_reconnect = False
         self.is_running = False
+
+        # Cancel reconnect task if running
+        if self.reconnect_task and not self.reconnect_task.done():
+            self.reconnect_task.cancel()
+            try:
+                await self.reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self.reconnect_task = None
 
         # Cancel heartbeat task
         if self.heartbeat_task and not self.heartbeat_task.done():
@@ -222,7 +287,7 @@ class RunnerWebSocketClient:
 
         logger.info("WebSocket disconnected")
 
-    async def _send_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    async def _send_message(self, message: dict[str, Any]) -> dict[str, Any] | None:
         """
         Send message to WebSocket server and wait for response.
 
@@ -260,7 +325,7 @@ class RunnerWebSocketClient:
 
             return response
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Timeout waiting for server response")
             return None
         except ConnectionClosed:
@@ -273,7 +338,7 @@ class RunnerWebSocketClient:
             logger.error(f"Error sending message: {e}")
             return None
 
-    async def send_message(self, message: Dict[str, Any]) -> bool:
+    async def send_message(self, message: dict[str, Any]) -> bool:
         """
         Send message to WebSocket server without waiting for response.
 
@@ -338,7 +403,7 @@ class RunnerWebSocketClient:
 
         return False
 
-    async def start_session(self, configuration_snapshot: Optional[Dict[str, Any]] = None) -> bool:
+    async def start_session(self, configuration_snapshot: dict[str, Any] | None = None) -> bool:
         """
         Start automation session.
 
@@ -377,7 +442,7 @@ class RunnerWebSocketClient:
             return False
 
     async def end_session(
-        self, status: str = "completed", error_message: Optional[str] = None
+        self, status: str = "completed", error_message: str | None = None
     ) -> bool:
         """
         End automation session.
@@ -425,8 +490,8 @@ class RunnerWebSocketClient:
         return success
 
     async def send_screenshot(
-        self, image, name: str, metadata: Optional[Dict[str, Any]] = None
-    ) -> Optional[str]:
+        self, image, name: str, metadata: dict[str, Any] | None = None
+    ) -> str | None:
         """
         Send screenshot to server.
 
@@ -499,7 +564,7 @@ class RunnerWebSocketClient:
             return None
 
     async def send_log(
-        self, level: str, message: str, log_data: Optional[Dict[str, Any]] = None
+        self, level: str, message: str, log_data: dict[str, Any] | None = None
     ) -> bool:
         """
         Send log entry to server.
@@ -661,7 +726,7 @@ class RunnerWebSocketClient:
                     else:
                         logger.debug(f"Unhandled message type: {message_type}")
 
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # No message received, continue loop
                     continue
 
@@ -687,13 +752,18 @@ class RunnerWebSocketClient:
 
     async def _reconnect(self):
         """Attempt to reconnect to WebSocket server."""
+        # Don't reconnect if explicitly stopped
+        if not self.is_running or not self.auto_reconnect:
+            logger.info("Reconnection skipped - client is stopped or auto-reconnect disabled")
+            return
+
         if self.reconnect_task and not self.reconnect_task.done():
             # Already reconnecting
             return
 
         logger.info("Attempting to reconnect...")
 
-        while self.reconnect_attempts < self.max_reconnect_attempts:
+        while self.reconnect_attempts < self.max_reconnect_attempts and self.is_running:
             self.reconnect_attempts += 1
             wait_time = min(2**self.reconnect_attempts, 60)  # Exponential backoff
 
@@ -703,6 +773,11 @@ class RunnerWebSocketClient:
             )
 
             await asyncio.sleep(wait_time)
+
+            # Check again after sleep in case disconnect was called
+            if not self.is_running or not self.auto_reconnect:
+                logger.info("Reconnection cancelled during wait")
+                return
 
             success = await self.connect()
             if success:
@@ -726,7 +801,7 @@ class RunnerWebSocketClient:
             except Exception as e:
                 logger.error(f"Error in on_error callback: {e}")
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """
         Get client statistics.
 
@@ -744,7 +819,7 @@ class RunnerWebSocketClient:
 
 
 # Helper function for authentication
-async def authenticate(api_url: str, email: str, password: str) -> Optional[str]:
+async def authenticate(api_url: str, email: str, password: str) -> str | None:
     """
     Authenticate with qontinui-web and get JWT token.
 

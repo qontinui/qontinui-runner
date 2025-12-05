@@ -5,7 +5,6 @@ Manages settings for connecting to qontinui-web backend.
 """
 
 import os
-from typing import Optional
 from dataclasses import dataclass
 
 
@@ -14,15 +13,16 @@ class WebSocketConfig:
     """Configuration for WebSocket client."""
 
     # WebSocket endpoint
-    api_url: str = "ws://localhost:8001"
+    # IMPORTANT: WebSocket endpoint is on main backend (port 8000), NOT qontinui-api (port 8001)
+    api_url: str = "ws://localhost:8000"
 
     # Authentication
-    email: Optional[str] = None
-    password: Optional[str] = None
-    token: Optional[str] = None
+    email: str | None = None
+    password: str | None = None
+    token: str | None = None
 
     # Project
-    project_id: Optional[str] = None
+    project_id: str | None = None
 
     # Connection settings
     enabled: bool = False
@@ -32,7 +32,7 @@ class WebSocketConfig:
 
     # Runner info
     runner_version: str = "0.1.0"
-    runner_name: Optional[str] = None  # Custom user-defined runner name
+    runner_name: str | None = None  # Custom user-defined runner name
 
     @classmethod
     def from_env(cls) -> "WebSocketConfig":
@@ -41,7 +41,7 @@ class WebSocketConfig:
 
         Environment variables:
         - QONTINUI_WS_ENABLED: Enable WebSocket (true/false)
-        - QONTINUI_WS_URL: WebSocket API URL (default: ws://localhost:8001)
+        - QONTINUI_WS_URL: WebSocket API URL (default: ws://localhost:8000)
         - QONTINUI_WS_EMAIL: User email for authentication
         - QONTINUI_WS_PASSWORD: User password for authentication
         - QONTINUI_WS_TOKEN: JWT token (if already authenticated)
@@ -54,7 +54,7 @@ class WebSocketConfig:
         """
         return cls(
             enabled=os.getenv("QONTINUI_WS_ENABLED", "false").lower() == "true",
-            api_url=os.getenv("QONTINUI_WS_URL", "ws://localhost:8001"),
+            api_url=os.getenv("QONTINUI_WS_URL", "ws://localhost:8000"),
             email=os.getenv("QONTINUI_WS_EMAIL"),
             password=os.getenv("QONTINUI_WS_PASSWORD"),
             token=os.getenv("QONTINUI_WS_TOKEN"),
@@ -79,7 +79,7 @@ class WebSocketConfig:
         """
         return cls(
             enabled=data.get("enabled", False),
-            api_url=data.get("api_url", "ws://localhost:8001"),
+            api_url=data.get("api_url", "ws://localhost:8000"),
             email=data.get("email"),
             password=data.get("password"),
             token=data.get("token"),
@@ -91,7 +91,7 @@ class WebSocketConfig:
             runner_name=data.get("runner_name"),
         )
 
-    def validate(self) -> tuple[bool, Optional[str]]:
+    def validate(self) -> tuple[bool, str | None]:
         """
         Validate configuration.
 

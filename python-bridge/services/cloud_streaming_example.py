@@ -18,9 +18,10 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import Any
 
 from cloud_streaming_service import CloudStreamingService, StreamConfig
+
 from models import InputMonitorEvent, ProcessingResult
 
 # Configure logging
@@ -44,7 +45,7 @@ class CloudStreamingSession:
         jwt_token: str,
         session_id: str,
         storage_dir: Path,
-        config: Optional[StreamConfig] = None,
+        config: StreamConfig | None = None,
     ):
         """Initialize cloud streaming session.
 
@@ -75,10 +76,10 @@ class CloudStreamingSession:
 
         # Session state
         self.is_streaming = False
-        self.start_time: Optional[float] = None
+        self.start_time: float | None = None
         self.chunk_index = 0
-        self.event_buffer: List[InputMonitorEvent] = []
-        self.errors: List[str] = []
+        self.event_buffer: list[InputMonitorEvent] = []
+        self.errors: list[str] = []
 
         # Configuration
         self.event_batch_size = 100  # Stream events in batches of 100
@@ -120,7 +121,7 @@ class CloudStreamingSession:
         logger.info(f"[{self.session_id}] Session started at {self.start_time}")
         return True
 
-    async def stop(self) -> Dict[str, Any]:
+    async def stop(self) -> dict[str, Any]:
         """Stop the cloud streaming session.
 
         Returns:
@@ -289,7 +290,7 @@ class CloudStreamingSession:
             return False
 
     async def upload_screenshots(
-        self, screenshot_paths: List[str], request_id: Optional[str] = None
+        self, screenshot_paths: list[str], request_id: str | None = None
     ) -> bool:
         """Upload full-size screenshots to cloud.
 
@@ -316,7 +317,7 @@ class CloudStreamingSession:
             logger.error(f"[{self.session_id}] Error uploading screenshots: {e}")
             return False
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get current streaming statistics.
 
         Returns:

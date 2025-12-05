@@ -9,11 +9,10 @@ Single Responsibility: Handle all event emission and translation
 """
 
 import json
-import sys
 import threading
 import time
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class EventType(Enum):
@@ -60,7 +59,7 @@ class EventManager:
         self._sequence = 0
         self._output_lock = threading.Lock()
 
-    def emit_event(self, event_type: EventType, data: Dict[str, Any]) -> None:
+    def emit_event(self, event_type: EventType, data: dict[str, Any]) -> None:
         """
         Emit event to Tauri through stdout (thread-safe).
 
@@ -91,7 +90,7 @@ class EventManager:
         self.emit_event(EventType.LOG, {"level": level, "message": message})
 
     def emit_tree_event(
-        self, event_type: str, node: Any, extra_data: Optional[Dict] = None
+        self, event_type: str, node: Any, extra_data: dict | None = None
     ) -> None:
         """
         Emit a tree-based event with full tree context.
@@ -136,7 +135,7 @@ class EventManager:
         with self._output_lock:
             print(json.dumps(event_data), flush=True)
 
-    def emit_event_wrapper(self, event_type: str, data: Dict[str, Any]) -> None:
+    def emit_event_wrapper(self, event_type: str, data: dict[str, Any]) -> None:
         """
         Wrapper for EventTranslator to convert string event names to EventType enum.
 
@@ -193,7 +192,7 @@ class EventManager:
         image_id: str,
         matches: list,
         threshold: float = 0.9,
-        best_match_info: Optional[Dict] = None,
+        best_match_info: dict | None = None,
         image_obj: Any = None,
         get_state_for_image_fn: Any = None,
     ) -> None:

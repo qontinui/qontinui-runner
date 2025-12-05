@@ -35,7 +35,6 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple, Dict, Any
 
 from PIL import Image
 
@@ -60,13 +59,13 @@ class EventFilter:
         modifiers: List of required modifier keys (e.g., ["ctrl", "shift"])
     """
 
-    event_types: List[str] = field(default_factory=lambda: ["mouse_click"])
-    buttons: List[str] = field(default_factory=lambda: ["left"])
-    keys: Optional[List[str]] = None
+    event_types: list[str] = field(default_factory=lambda: ["mouse_click"])
+    buttons: list[str] = field(default_factory=lambda: ["left"])
+    keys: list[str] | None = None
     include_after_delay_ms: int = 0
-    max_count: Optional[int] = None
-    time_range: Optional[Tuple[float, float]] = None
-    modifiers: Optional[List[str]] = None
+    max_count: int | None = None
+    time_range: tuple[float, float] | None = None
+    modifiers: list[str] | None = None
 
     def matches_event(self, event: InputMonitorEvent) -> bool:
         """Check if an event matches this filter.
@@ -152,8 +151,8 @@ class FrameExtractorService:
         )
 
     def extract_at_timestamp(
-        self, video_path: str, timestamp: float, frame_number: Optional[int] = None
-    ) -> Optional[ExtractedFrame]:
+        self, video_path: str, timestamp: float, frame_number: int | None = None
+    ) -> ExtractedFrame | None:
         """Extract single frame at exact timestamp using FFmpeg.
 
         This method uses FFmpeg's seek functionality to extract a single frame
@@ -252,8 +251,8 @@ class FrameExtractorService:
             return None
 
     def extract_at_events(
-        self, video_path: str, events: List[InputMonitorEvent], filter: Optional[EventFilter] = None
-    ) -> List[ExtractedFrame]:
+        self, video_path: str, events: list[InputMonitorEvent], filter: EventFilter | None = None
+    ) -> list[ExtractedFrame]:
         """Extract frames at filtered input events.
 
         This method filters events based on the provided criteria and extracts
@@ -302,7 +301,7 @@ class FrameExtractorService:
         frames = self.extract_batch(video_path, timestamps)
 
         # Associate events with frames
-        for frame, event in zip(frames, filtered_events):
+        for frame, event in zip(frames, filtered_events, strict=False):
             frame.source_event = event.to_dict()
             frame.metadata["event_type"] = event.event_type
             frame.metadata["event_button"] = event.button
@@ -310,7 +309,7 @@ class FrameExtractorService:
 
         return frames
 
-    def extract_batch(self, video_path: str, timestamps: List[float]) -> List[ExtractedFrame]:
+    def extract_batch(self, video_path: str, timestamps: list[float]) -> list[ExtractedFrame]:
         """Batch extract frames at multiple timestamps efficiently.
 
         This method performs a single FFmpeg pass to extract multiple frames,
@@ -396,7 +395,7 @@ class FrameExtractorService:
                         f"Expected {len(timestamps)} frames but got {len(extracted_files)}"
                     )
 
-                for i, (ts, fn) in enumerate(zip(timestamps, frame_numbers)):
+                for i, (ts, fn) in enumerate(zip(timestamps, frame_numbers, strict=False)):
                     if i < len(extracted_files):
                         try:
                             image = Image.open(extracted_files[i])
@@ -427,7 +426,7 @@ class FrameExtractorService:
         logger.info(f"Successfully extracted {len(frames)} frames")
         return frames
 
-    def extract_keyframes(self, video_path: str) -> List[ExtractedFrame]:
+    def extract_keyframes(self, video_path: str) -> list[ExtractedFrame]:
         """Extract all keyframes (I-frames) from video.
 
         Keyframes are frames that don't depend on other frames for decoding.
@@ -526,8 +525,8 @@ class FrameExtractorService:
             return []
 
     def extract_at_interval(
-        self, video_path: str, interval_ms: int, max_count: Optional[int] = None
-    ) -> List[ExtractedFrame]:
+        self, video_path: str, interval_ms: int, max_count: int | None = None
+    ) -> list[ExtractedFrame]:
         """Extract frames at regular intervals.
 
         This method extracts frames at a fixed interval throughout the video,
@@ -609,15 +608,15 @@ class FrameExtractorService:
             return str(output_path_obj.absolute())
         except Exception as e:
             logger.error(f"Failed to save frame: {e}")
-            raise IOError(f"Failed to save frame to {output_path}: {e}")
+            raise OSError(f"Failed to save frame to {output_path}: {e}")
 
     def save_frames_batch(
         self,
-        frames: List[ExtractedFrame],
+        frames: list[ExtractedFrame],
         output_dir: str,
         filename_pattern: str = "frame_{frame_number:04d}",
         format: str = "png",
-    ) -> List[str]:
+    ) -> list[str]:
         """Save multiple frames to disk efficiently.
 
         Args:
@@ -706,7 +705,7 @@ class FrameExtractorService:
         # Default to 30 FPS
         return 30.0
 
-    def _get_video_duration(self, video_path: str) -> Optional[float]:
+    def _get_video_duration(self, video_path: str) -> float | None:
         """Get the duration of a video file in seconds.
 
         Args:

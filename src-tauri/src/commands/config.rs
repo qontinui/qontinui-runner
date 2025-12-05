@@ -9,8 +9,6 @@
 use crate::config::{ConfigLoader, QontinuiConfig};
 use crate::error::AppError;
 use crate::settings;
-use serde_json;
-use std::sync::Mutex;
 use tauri::State;
 use tracing::{error, info, warn};
 

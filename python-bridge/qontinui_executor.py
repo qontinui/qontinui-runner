@@ -15,16 +15,16 @@ the same stdin/stdout protocol for Rust bridge communication.
 """
 
 import json
-import sys
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 # CRITICAL: Configure logging to use stderr FIRST before any other imports
 logging.basicConfig(
@@ -71,27 +71,29 @@ logger.debug(
     f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
 )
 
-# CRITICAL: Import local python-bridge modules BEFORE qontinui library
-from event_translator import EventTranslator
-from execution_tree import ExecutionTree, ExecutionNode
 from action_definitions import get_action_definition
-from services.unified_data_collector import UnifiedDataCollector
-from services.screenshot_service import ScreenshotService
+from capture_manager import CaptureManager
 
 # Import our specialized modules
 from event_manager import EventManager, EventType
-from websocket_handler import WebSocketHandler
-from capture_manager import CaptureManager
-from training_export import TrainingExportCoordinator
+
+# CRITICAL: Import local python-bridge modules BEFORE qontinui library
+from event_translator import EventTranslator
+from execution_tree import ExecutionNode, ExecutionTree
 from executor_core import ExecutorCore
 from gui_automation import GUIAutomation
+from services.screenshot_service import ScreenshotService
+from services.unified_data_collector import UnifiedDataCollector
 from services.web_extraction_service import WebExtractionService
+from training_export import TrainingExportCoordinator
+from websocket_handler import WebSocketHandler
 
 # Check if qontinui library is available
 try:
     from qontinui import Find, Image, Location, navigation_api, registry
     from qontinui.config import get_settings
-    from qontinui.reporting import register_callback, EventType as QontinuiEventType
+    from qontinui.reporting import EventType as QontinuiEventType
+    from qontinui.reporting import register_callback
 
     QONTINUI_AVAILABLE = True
 except ImportError as e:
@@ -201,11 +203,11 @@ class QontinuiExecutor:
 
             event_registry = get_event_registry()
             logger.debug(f"[INIT] Event registry has_listeners: {event_registry.has_listeners}")
-            logger.debug(f"[INIT] EventTranslator initialized and callbacks registered")
+            logger.debug("[INIT] EventTranslator initialized and callbacks registered")
 
         logger.info(f"QontinuiExecutor initialized (library_available={QONTINUI_AVAILABLE})")
 
-    def _emit_event_wrapper(self, event_type: str, data: Dict[str, Any]):
+    def _emit_event_wrapper(self, event_type: str, data: dict[str, Any]):
         """
         Wrapper for EventTranslator to emit events.
 
@@ -218,7 +220,7 @@ class QontinuiExecutor:
         if self.websocket_handler.is_enabled():
             self._forward_to_websocket(event_type, data)
 
-    def _forward_to_websocket(self, event_type: str, data: Dict[str, Any]):
+    def _forward_to_websocket(self, event_type: str, data: dict[str, Any]):
         """Forward events to WebSocket backend."""
         # Handle image recognition events
         if event_type == "image_recognition":
@@ -283,11 +285,11 @@ class QontinuiExecutor:
             level=level, message=message, log_data={"event_type": event_type, **data}
         )
 
-    def _get_current_hierarchy(self) -> Dict[str, Any]:
+    def _get_current_hierarchy(self) -> dict[str, Any]:
         """Get current execution hierarchy from execution tree."""
         return self.execution_tree.get_current_hierarchy()
 
-    def _get_state_for_image(self, image_id: str) -> Optional[str]:
+    def _get_state_for_image(self, image_id: str) -> str | None:
         """Find which state an image belongs to."""
         if not self.config:
             return None
@@ -310,7 +312,7 @@ class QontinuiExecutor:
 
         return None
 
-    def _get_image_name(self, image_id: str) -> Optional[str]:
+    def _get_image_name(self, image_id: str) -> str | None:
         """Get the human-readable name for an image ID."""
         if not self.config:
             return None
@@ -329,7 +331,7 @@ class QontinuiExecutor:
 
         return None
 
-    def _get_image_data(self, image_id: str) -> Optional[str]:
+    def _get_image_data(self, image_id: str) -> str | None:
         """Get base64 image data for an image ID."""
         if not self.config:
             return None
@@ -430,8 +432,8 @@ class QontinuiExecutor:
         return success
 
     def execute_workflow(
-        self, workflow_id: str, transition_context: Optional[Dict] = None
-    ) -> Dict[str, Any]:
+        self, workflow_id: str, transition_context: dict | None = None
+    ) -> dict[str, Any]:
         """
         Execute a workflow.
 
@@ -546,7 +548,7 @@ class QontinuiExecutor:
                 self.event_manager.emit_log("info", "Exporting training data on stop...")
                 self.training_export.export_data()
 
-    def navigate_to_state(self, target_state_id: str) -> Dict[str, Any]:
+    def navigate_to_state(self, target_state_id: str) -> dict[str, Any]:
         """Navigate to a target state via navigation API."""
         self.event_manager.emit_log(
             "info", f"[NAVIGATE] navigate_to_state called: {target_state_id}"
@@ -608,7 +610,7 @@ class QontinuiExecutor:
 
             return {"success": False, "error": str(e)}
 
-    def _handle_websocket_command(self, message: Dict[str, Any]) -> None:
+    def _handle_websocket_command(self, message: dict[str, Any]) -> None:
         """
         Handle incoming command from WebSocket backend.
 
@@ -634,7 +636,7 @@ class QontinuiExecutor:
 
             if not command_name:
                 print(
-                    f"[error   ] EXECUTOR: No command name in message", file=sys.stderr, flush=True
+                    "[error   ] EXECUTOR: No command name in message", file=sys.stderr, flush=True
                 )
                 return
 
@@ -666,13 +668,13 @@ class QontinuiExecutor:
                 }
                 self.websocket_handler.send_message(json.dumps(response_message))
                 print(
-                    f"[info    ] EXECUTOR: Sent command response via WebSocket",
+                    "[info    ] EXECUTOR: Sent command response via WebSocket",
                     file=sys.stderr,
                     flush=True,
                 )
             else:
                 print(
-                    f"[warning ] EXECUTOR: WebSocket not connected, cannot send response",
+                    "[warning ] EXECUTOR: WebSocket not connected, cannot send response",
                     file=sys.stderr,
                     flush=True,
                 )
@@ -704,12 +706,12 @@ class QontinuiExecutor:
                 }
                 self.websocket_handler.send_message(json.dumps(error_response))
                 print(
-                    f"[info    ] EXECUTOR: Sent error response via WebSocket",
+                    "[info    ] EXECUTOR: Sent error response via WebSocket",
                     file=sys.stderr,
                     flush=True,
                 )
 
-    def handle_command(self, command: Dict[str, Any]) -> Dict[str, Any]:
+    def handle_command(self, command: dict[str, Any]) -> dict[str, Any]:
         """Handle command from Rust bridge."""
         cmd_type = command.get("command")
         params = command.get("params", {})
@@ -756,7 +758,7 @@ class QontinuiExecutor:
             import sys
 
             print(
-                f"[info    ] WS_DEBUG: ws_configure received! NEW CODE IS RUNNING!",
+                "[info    ] WS_DEBUG: ws_configure received! NEW CODE IS RUNNING!",
                 file=sys.stderr,
                 flush=True,
             )
@@ -788,7 +790,7 @@ class QontinuiExecutor:
         elif cmd_type == "ws_connect":
             import sys
 
-            print(f"[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
+            print("[info    ] WS_DEBUG: ws_connect received!", file=sys.stderr, flush=True)
             success = self.websocket_handler.connect()
             print(
                 f"[info    ] WS_DEBUG: ws_connect result: success={success}",
@@ -813,7 +815,11 @@ class QontinuiExecutor:
             return {"success": success}
 
         elif cmd_type == "ws_status":
-            return {"success": True, "enabled": self.websocket_handler.is_enabled()}
+            return {
+                "success": True,
+                "enabled": self.websocket_handler.is_enabled(),
+                "connected": self.websocket_handler.is_connected,
+            }
 
         elif cmd_type == "ping":
             pong_message = {"type": "pong", "timestamp": time.time()}
@@ -833,8 +839,117 @@ class QontinuiExecutor:
         elif cmd_type == "get_extraction_status":
             return self._handle_get_extraction_status()
 
+        # Remote workflow execution from web app
+        elif cmd_type == "execute_workflow":
+            return self._handle_execute_workflow(params)
+
+        # Screenshot capture command (for direct capture via Python)
+        elif cmd_type == "capture_screenshot":
+            return self._handle_capture_screenshot(params)
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
+
+    def _handle_capture_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle screenshot capture command.
+
+        This captures a screenshot using the qontinui library's HAL layer,
+        which captures at physical pixel resolution (not logical/scaled).
+
+        Args:
+            params: Command parameters:
+                - monitor: Monitor index (0-based), None for all monitors
+                - format: Image format ("png" or "jpeg"), defaults to "png"
+
+        Returns:
+            Dictionary with:
+                - success: Whether capture succeeded
+                - screenshot_base64: Base64 encoded image data (if success)
+                - width: Image width in pixels
+                - height: Image height in pixels
+                - error: Error message (if failed)
+        """
+        import base64
+        import io
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_capture_screenshot called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            from qontinui.hal.factory import HALFactory
+
+            screen_capture = HALFactory.get_screen_capture()
+            monitor = params.get("monitor")
+
+            # Capture the screenshot
+            pil_image = screen_capture.capture_screen(monitor=monitor)
+
+            # Convert to PNG bytes
+            buffer = io.BytesIO()
+            image_format = params.get("format", "png").upper()
+            if image_format == "JPEG":
+                # Convert RGBA to RGB for JPEG
+                if pil_image.mode == "RGBA":
+                    pil_image = pil_image.convert("RGB")
+                pil_image.save(buffer, format="JPEG", quality=95)
+            else:
+                pil_image.save(buffer, format="PNG", compress_level=6)
+            buffer.seek(0)
+
+            # Encode as base64
+            screenshot_base64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+            self.event_manager.emit_log(
+                "info",
+                f"Screenshot captured: {pil_image.width}x{pil_image.height} pixels",
+            )
+
+            # Emit the screenshot as an event for the Rust bridge
+            self.event_manager.emit_event(
+                "screenshot_captured",
+                {
+                    "screenshot_base64": screenshot_base64,
+                    "width": pil_image.width,
+                    "height": pil_image.height,
+                    "monitor": monitor,
+                    "format": image_format.lower(),
+                },
+            )
+
+            return {
+                "success": True,
+                "screenshot_base64": screenshot_base64,
+                "width": pil_image.width,
+                "height": pil_image.height,
+                "monitor": monitor,
+                "format": image_format.lower(),
+            }
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to capture screenshot: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            import traceback
+
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to capture screenshot: {e}")
+            return {"success": False, "error": str(e)}
 
     def _get_web_extraction_service(self) -> WebExtractionService:
         """Get or create the web extraction service."""
@@ -864,7 +979,6 @@ class QontinuiExecutor:
         Returns:
             asyncio.AbstractEventLoop: A dedicated event loop for this executor.
         """
-        import asyncio
         import threading
         import time
 
@@ -885,7 +999,7 @@ class QontinuiExecutor:
 
         return self._async_loop
 
-    def _handle_start_web_extraction(self, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _handle_start_web_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle start web extraction command."""
         import asyncio
         import sys
@@ -945,7 +1059,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to start extraction: {e}")
             return {"success": False, "error": str(e)}
 
-    def _handle_stop_web_extraction(self) -> Dict[str, Any]:
+    def _handle_stop_web_extraction(self) -> dict[str, Any]:
         """Handle stop web extraction command."""
         import asyncio
 
@@ -967,7 +1081,7 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Failed to stop extraction: {e}")
             return {"success": False, "error": str(e)}
 
-    def _handle_get_extraction_status(self) -> Dict[str, Any]:
+    def _handle_get_extraction_status(self) -> dict[str, Any]:
         """Handle get extraction status command."""
         try:
             if self._web_extraction_service is None:
@@ -982,6 +1096,144 @@ class QontinuiExecutor:
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to get extraction status: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_execute_workflow(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Handle execute_workflow command from web app.
+
+        This command receives a full workflow configuration from the web app,
+        writes it to a temporary file, loads it, and starts execution.
+
+        Args:
+            params: Dictionary containing:
+                - execution_id: Unique ID for tracking this execution
+                - workflow: Full workflow configuration (as exported from web app)
+                - variables: Optional variables to pass to workflow
+
+        Returns:
+            Dictionary with success status and execution details
+        """
+        import os
+        import sys
+        import tempfile
+
+        execution_id = params.get("execution_id")
+        workflow = params.get("workflow")
+        variables = params.get("variables", {})
+
+        print(
+            f"[info    ] EXECUTOR: _handle_execute_workflow called with execution_id={execution_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        if not workflow:
+            return {"success": False, "error": "No workflow configuration provided"}
+
+        if not execution_id:
+            return {"success": False, "error": "No execution_id provided"}
+
+        try:
+            # Stop any existing execution
+            if self.is_running:
+                self.event_manager.emit_log(
+                    "info", "Stopping current execution before starting new workflow"
+                )
+                self.stop_execution()
+
+            # Write workflow to temporary file
+            # The workflow from the web app is the full export format, which includes
+            # the configuration structure that load_configuration expects
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, f"qontinui_remote_{execution_id}.json")
+
+            # If workflow is the export format, it may be the full config
+            # If it's just the workflow, wrap it in the expected format
+            if "workflows" not in workflow and "stateMachine" not in workflow:
+                # Workflow is probably just a single workflow, wrap it
+                config_data = {
+                    "version": workflow.get("version", "1.0.0"),
+                    "workflows": [workflow] if isinstance(workflow, dict) else workflow,
+                    "images": [],
+                    "settings": {},
+                }
+            else:
+                # It's already in the full config format
+                config_data = workflow
+
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=2)
+
+            self.event_manager.emit_log("info", f"Workflow configuration written to {temp_file}")
+
+            # Load the configuration
+            load_success = self.load_configuration(temp_file)
+            if not load_success:
+                # Clean up temp file
+                try:
+                    os.unlink(temp_file)
+                except Exception:
+                    pass
+                return {"success": False, "error": "Failed to load workflow configuration"}
+
+            # Apply any variables if provided
+            if variables:
+                self.event_manager.emit_log("info", f"Applying variables: {list(variables.keys())}")
+                # TODO: Apply variables to the loaded configuration
+
+            # Get the workflow ID to execute (first workflow if not specified)
+            workflow_id = None
+            if self.config and "workflows" in self.config:
+                workflows = self.config.get("workflows", [])
+                if workflows:
+                    workflow_id = workflows[0].get("id")
+
+            if not workflow_id:
+                return {"success": False, "error": "No workflow found in configuration"}
+
+            # Start execution
+            self.event_manager.emit_log(
+                "info", f"Starting remote workflow execution: {workflow_id}"
+            )
+            start_success = self.start_execution(workflow_id)
+
+            if start_success:
+                # Send execution started event through WebSocket
+                if self.websocket_handler and self.websocket_handler.is_connected:
+                    execution_event = {
+                        "type": "execution_started",
+                        "data": {
+                            "execution_id": execution_id,
+                            "workflow_id": workflow_id,
+                            "workflow_name": workflow.get("name", "Unknown"),
+                        },
+                    }
+                    self.websocket_handler.send_message(json.dumps(execution_event))
+
+                return {
+                    "success": True,
+                    "execution_id": execution_id,
+                    "workflow_id": workflow_id,
+                    "message": "Workflow execution started",
+                }
+            else:
+                return {"success": False, "error": "Failed to start workflow execution"}
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to execute workflow: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            import traceback
+
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to execute workflow: {e}")
             return {"success": False, "error": str(e)}
 
     def __del__(self):

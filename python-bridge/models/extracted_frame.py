@@ -9,7 +9,8 @@ transition analysis in the qontinui-runner capture workflow.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Any
+
 from PIL import Image
 
 
@@ -33,10 +34,10 @@ class ExtractedFrame:
 
     timestamp: float
     frame_number: int
-    image: Optional[Image.Image] = None
-    source_event: Optional[Dict[str, Any]] = None  # Serialized InputEvent
-    path: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    image: Image.Image | None = None
+    source_event: dict[str, Any] | None = None  # Serialized InputEvent
+    path: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate that either image or path is provided."""
@@ -84,9 +85,9 @@ class ExtractedFrame:
         except FileNotFoundError:
             raise FileNotFoundError(f"Image file not found: {self.path}")
         except Exception as e:
-            raise IOError(f"Failed to load image from {self.path}: {e}")
+            raise OSError(f"Failed to load image from {self.path}: {e}")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
 
         The image data itself is not serialized - only the path is included.
@@ -105,7 +106,7 @@ class ExtractedFrame:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "ExtractedFrame":
+    def from_dict(cls, data: dict[str, Any]) -> "ExtractedFrame":
         """Create ExtractedFrame from dictionary.
 
         Args:
@@ -127,7 +128,7 @@ class ExtractedFrame:
             metadata=data.get("metadata", {}),
         )
 
-    def save_image(self, path: str, format: Optional[str] = None) -> None:
+    def save_image(self, path: str, format: str | None = None) -> None:
         """Save the frame image to disk.
 
         Args:
@@ -145,7 +146,7 @@ class ExtractedFrame:
             self.image.save(path, format=format)
             self.path = path
         except Exception as e:
-            raise IOError(f"Failed to save image to {path}: {e}")
+            raise OSError(f"Failed to save image to {path}: {e}")
 
     def __repr__(self) -> str:
         """String representation for debugging."""

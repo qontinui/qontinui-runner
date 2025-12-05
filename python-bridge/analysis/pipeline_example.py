@@ -11,15 +11,15 @@ from pathlib import Path
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import numpy as np
+
 from analysis.pipeline import (
     AnalysisPipeline,
-    PipelineConfig,
     CaptureSession,
-    load_session_from_video,
+    PipelineConfig,
     save_analysis_result,
 )
 from models import Frame, InputEvent
-import numpy as np
 
 # Configure logging
 logging.basicConfig(

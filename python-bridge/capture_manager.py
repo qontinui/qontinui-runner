@@ -9,17 +9,20 @@ Single Responsibility: Handle screenshot and video capture
 """
 
 import logging
-from typing import Any, Callable, Dict
+from collections.abc import Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 try:
+    from qontinui.reporting import EventType as QontinuiEventType
+    from qontinui.reporting import register_callback
+
     from services.capture_tool_service import (
         CaptureToolService,
-        ScreenshotCaptureSettings,
         ManualClickListener,
+        ScreenshotCaptureSettings,
     )
-    from qontinui.reporting import register_callback, EventType as QontinuiEventType
 
     CAPTURE_AVAILABLE = True
 except ImportError:
@@ -39,7 +42,7 @@ class CaptureManager:
     """
 
     def __init__(
-        self, emit_log_fn: Callable[[str, str], None], emit_event_fn: Callable[[Any, Dict], None]
+        self, emit_log_fn: Callable[[str, str], None], emit_event_fn: Callable[[Any, dict], None]
     ):
         """
         Initialize capture manager.
@@ -78,7 +81,7 @@ class CaptureManager:
             button = getattr(event, "button", "left")
             self.capture_tool_service.on_click(event.x, event.y, button)
 
-    def update_settings(self, settings_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def update_settings(self, settings_dict: dict[str, Any]) -> dict[str, Any]:
         """
         Update screenshot capture tool settings.
 
@@ -128,7 +131,7 @@ class CaptureManager:
                 else:
                     self.emit_log("info", "Listener already running")
             else:
-                self.emit_log("info", f"Manual clicks disabled or capture disabled")
+                self.emit_log("info", "Manual clicks disabled or capture disabled")
                 if self.manual_click_listener.is_running():
                     self.emit_log("info", "Stopping listener")
                     self.manual_click_listener.stop()

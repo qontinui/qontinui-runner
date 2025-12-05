@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -35,8 +34,8 @@ logger = logging.getLogger(__name__)
 class ImageExtractionConfig:
     """Configuration for image extraction."""
 
-    min_size: Tuple[int, int] = (20, 20)
-    max_size: Tuple[int, int] = (500, 500)
+    min_size: tuple[int, int] = (20, 20)
+    max_size: tuple[int, int] = (500, 500)
     edge_detection: str = "canny"  # "canny", "sobel", "laplacian"
     contour_approximation: float = 0.02
     extract_at_click_locations: bool = True
@@ -56,7 +55,7 @@ class StateImageExtractor:
     elements that can be used to recognize and distinguish that state.
     """
 
-    def __init__(self, config: Optional[ImageExtractionConfig] = None):
+    def __init__(self, config: ImageExtractionConfig | None = None):
         """Initialize the StateImage extractor.
 
         Args:
@@ -68,9 +67,9 @@ class StateImageExtractor:
     def extract_from_state(
         self,
         state: DetectedState,
-        frames: List[Frame],
-        events: List[InputEvent],
-    ) -> List[StateImage]:
+        frames: list[Frame],
+        events: list[InputEvent],
+    ) -> list[StateImage]:
         """Extract StateImages from a detected state.
 
         This is the main entry point for image extraction. It:
@@ -105,7 +104,7 @@ class StateImageExtractor:
         click_locations = self._get_click_locations(state, events)
         logger.debug("Found %d click locations in state %s", len(click_locations), state.name)
 
-        extracted_images: List[StateImage] = []
+        extracted_images: list[StateImage] = []
 
         # Step 3: Extract regions around click locations
         if self.config.extract_at_click_locations and click_locations:
@@ -175,8 +174,8 @@ class StateImageExtractor:
         x: int,
         y: int,
         padding: int = 20,
-        frame_index: Optional[int] = None,
-    ) -> Optional[StateImage]:
+        frame_index: int | None = None,
+    ) -> StateImage | None:
         """Extract image region around a specific location.
 
         Args:
@@ -244,7 +243,7 @@ class StateImageExtractor:
             logger.error("Error extracting at location (%d, %d): %s", x, y, e)
             return None
 
-    def detect_contours(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    def detect_contours(self, frame: np.ndarray) -> list[tuple[int, int, int, int]]:
         """Detect UI element contours using edge detection.
 
         Args:
@@ -319,7 +318,7 @@ class StateImageExtractor:
     def determine_position_type(
         self,
         image: StateImage,
-        occurrences: List[Tuple[int, int]],
+        occurrences: list[tuple[int, int]],
     ) -> bool:
         """Determine if an image position is fixed or dynamic.
 
@@ -359,7 +358,7 @@ class StateImageExtractor:
     def find_best_crop(
         self,
         frame: np.ndarray,
-        region: Tuple[int, int, int, int],
+        region: tuple[int, int, int, int],
     ) -> StateImage:
         """Find optimal crop boundaries using edge detection.
 
@@ -474,8 +473,8 @@ class StateImageExtractor:
     def _get_state_frames(
         self,
         state: DetectedState,
-        frames: List[Frame],
-    ) -> List[Frame]:
+        frames: list[Frame],
+    ) -> list[Frame]:
         """Get frames belonging to a specific state.
 
         Args:
@@ -500,8 +499,8 @@ class StateImageExtractor:
     def _get_click_locations(
         self,
         state: DetectedState,
-        events: List[InputEvent],
-    ) -> List[Tuple[int, int]]:
+        events: list[InputEvent],
+    ) -> list[tuple[int, int]]:
         """Get click locations within a state's timeframe.
 
         Args:
@@ -529,8 +528,8 @@ class StateImageExtractor:
         self,
         frame: Frame,
         state: DetectedState,
-        exclude_locations: List[Tuple[int, int]],
-    ) -> List[StateImage]:
+        exclude_locations: list[tuple[int, int]],
+    ) -> list[StateImage]:
         """Extract StateImages from contours, excluding click locations.
 
         Args:
@@ -587,8 +586,8 @@ class StateImageExtractor:
     def _find_occurrences(
         self,
         state_image: StateImage,
-        frames: List[Frame],
-    ) -> List[Tuple[int, int]]:
+        frames: list[Frame],
+    ) -> list[tuple[int, int]]:
         """Find all occurrences of an image across frames.
 
         Args:
@@ -629,7 +628,7 @@ class StateImageExtractor:
                     locations = np.where(result >= state_image.similarity_threshold)
 
                     # Add locations
-                    for pt in zip(*locations[::-1]):
+                    for pt in zip(*locations[::-1], strict=False):
                         occurrences.append(pt)
 
                 except Exception as e:
@@ -674,7 +673,7 @@ def save_state_image(state_image: StateImage, output_dir: Path) -> Path:
     return file_path
 
 
-def load_state_image(file_path: Path, metadata_path: Optional[Path] = None) -> StateImage:
+def load_state_image(file_path: Path, metadata_path: Path | None = None) -> StateImage:
     """Load a StateImage from disk.
 
     Args:
@@ -694,7 +693,7 @@ def load_state_image(file_path: Path, metadata_path: Optional[Path] = None) -> S
     # Load metadata if available
     metadata = {}
     if metadata_path and metadata_path.exists():
-        with open(metadata_path, "r") as f:
+        with open(metadata_path) as f:
             metadata = json.load(f)
 
     # Extract bbox from image dimensions

@@ -5,7 +5,7 @@ to automatically identify state transitions from captured video sessions.
 """
 
 import logging
-from typing import List
+
 import numpy as np
 
 # Configure logging
@@ -14,14 +14,14 @@ logging.basicConfig(
 )
 
 from analysis.transition_analyzer import (
-    TransitionAnalyzer,
     AutoTransitionBuilder,
     CaptureSession,
+    TransitionAnalyzer,
 )
-from models.state_models import DetectedState, StateImage, Frame, InputEvent
+from models.state_models import DetectedState, Frame, InputEvent, StateImage
 
 
-def create_sample_state_images() -> List[StateImage]:
+def create_sample_state_images() -> list[StateImage]:
     """Create sample StateImages for demonstration."""
     # Create dummy images (in real usage, these would be actual screenshots)
     dummy_image = np.zeros((50, 50, 3), dtype=np.uint8)
@@ -54,7 +54,7 @@ def create_sample_state_images() -> List[StateImage]:
     ]
 
 
-def create_sample_states() -> List[DetectedState]:
+def create_sample_states() -> list[DetectedState]:
     """Create sample detected states for demonstration."""
     state_images = create_sample_state_images()
 
@@ -65,7 +65,7 @@ def create_sample_states() -> List[DetectedState]:
             state_images=[state_images[0], state_images[1]],  # login_button, username_field
             start_frame_index=0,
             end_frame_index=29,
-            frame_indices=list(range(0, 30)),
+            frame_indices=list(range(30)),
         ),
         DetectedState(
             name="Dashboard",
@@ -80,7 +80,7 @@ def create_sample_states() -> List[DetectedState]:
     return states
 
 
-def create_sample_events() -> List[InputEvent]:
+def create_sample_events() -> list[InputEvent]:
     """Create sample input events for demonstration."""
     return [
         InputEvent(
@@ -102,7 +102,7 @@ def create_sample_events() -> List[InputEvent]:
     ]
 
 
-def create_sample_frames() -> List[Frame]:
+def create_sample_frames() -> list[Frame]:
     """Create sample frames for demonstration."""
     frames = []
     dummy_image = np.zeros((600, 800, 3), dtype=np.uint8)
@@ -136,7 +136,7 @@ def example_basic_analysis():
     events = create_sample_events()
     frames = create_sample_frames()
 
-    print(f"Input data:")
+    print("Input data:")
     print(f"  States: {len(states)}")
     print(f"  Events: {len(events)}")
     print(f"  Frames: {len(frames)}")
@@ -182,7 +182,7 @@ def example_auto_builder():
         },
     )
 
-    print(f"Capture session:")
+    print("Capture session:")
     print(f"  FPS: {session.fps}")
     print(f"  States: {len(session.states)}")
     print(f"  Events: {len(session.events)}")
@@ -247,9 +247,9 @@ def example_custom_configuration():
     )
 
     print("Strict analyzer configuration:")
-    print(f"  Correlation window: 200ms")
-    print(f"  Click proximity: 25px")
-    print(f"  Min visual change: 0.3")
+    print("  Correlation window: 200ms")
+    print("  Click proximity: 25px")
+    print("  Min visual change: 0.3")
     print()
 
     transitions = strict_analyzer.analyze_transitions(
@@ -268,9 +268,9 @@ def example_custom_configuration():
     )
 
     print("Relaxed analyzer configuration:")
-    print(f"  Correlation window: 2000ms")
-    print(f"  Click proximity: 100px")
-    print(f"  Min visual change: 0.05")
+    print("  Correlation window: 2000ms")
+    print("  Click proximity: 100px")
+    print("  Min visual change: 0.05")
     print()
 
     transitions = relaxed_analyzer.analyze_transitions(

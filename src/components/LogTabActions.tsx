@@ -55,6 +55,8 @@ export function LogTabActions({
             <button
               onClick={() => onToggleLogFilter(!showLogFilter)}
               className="p-2 hover:bg-accent rounded-lg transition-colors"
+              title="Filter logs"
+              aria-label="Filter logs by level"
             >
               <Filter className="w-4 h-4" />
             </button>

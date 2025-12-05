@@ -31,11 +31,12 @@ import gzip
 import json
 import logging
 import time
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple, Callable
-from datetime import datetime, timezone
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import Path
+from typing import Any
 
 try:
     import websockets
@@ -54,7 +55,6 @@ except ImportError:
 
 # Import models
 from models import InputMonitorEvent, ProcessingResult
-
 
 logger = logging.getLogger(__name__)
 
@@ -77,9 +77,9 @@ class StreamConfig:
     """
 
     video_fps: int = 10
-    video_resolution: Tuple[int, int] = (1280, 720)
+    video_resolution: tuple[int, int] = (1280, 720)
     video_bitrate: str = "1M"
-    thumbnail_size: Tuple[int, int] = (320, 180)
+    thumbnail_size: tuple[int, int] = (320, 180)
     thumbnail_quality: int = 85
     compress_events: bool = True
     max_chunk_size: int = 1024 * 1024  # 1 MB
@@ -116,9 +116,9 @@ class StreamedData:
     session_id: str
     timestamp: float
     data: bytes
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization.
 
         Returns:
@@ -201,12 +201,12 @@ class CloudStreamingService:
 
     def __init__(
         self,
-        websocket_url: Optional[str] = None,
-        api_url: Optional[str] = None,
-        config: Optional[StreamConfig] = None,
-        on_connected: Optional[Callable] = None,
-        on_disconnected: Optional[Callable] = None,
-        on_error: Optional[Callable] = None,
+        websocket_url: str | None = None,
+        api_url: str | None = None,
+        config: StreamConfig | None = None,
+        on_connected: Callable | None = None,
+        on_disconnected: Callable | None = None,
+        on_error: Callable | None = None,
     ):
         """Initialize the CloudStreamingService.
 
@@ -226,8 +226,9 @@ class CloudStreamingService:
                 "websockets library not installed. Install with: pip install websockets"
             )
 
-        self.websocket_url = websocket_url or "wss://localhost:8001/ws/stream"
-        self.api_url = api_url or "https://localhost:8001"
+        # NOTE: Port 8000 is the main backend, NOT 8001 (qontinui-api)
+        self.websocket_url = websocket_url or "wss://localhost:8000/ws/stream"
+        self.api_url = api_url or "https://localhost:8000"
         self.config = config or StreamConfig()
 
         # Callbacks
@@ -236,15 +237,15 @@ class CloudStreamingService:
         self.on_error = on_error
 
         # Connection state
-        self.ws: Optional[WebSocketClientProtocol] = None
+        self.ws: WebSocketClientProtocol | None = None
         self.is_connected = False
         self.is_running = False
-        self.jwt_token: Optional[str] = None
-        self.session_id: Optional[str] = None
+        self.jwt_token: str | None = None
+        self.session_id: str | None = None
 
         # Tasks
-        self.heartbeat_task: Optional[asyncio.Task] = None
-        self.reconnect_task: Optional[asyncio.Task] = None
+        self.heartbeat_task: asyncio.Task | None = None
+        self.reconnect_task: asyncio.Task | None = None
 
         # Statistics
         self.video_chunks_sent = 0
@@ -258,8 +259,8 @@ class CloudStreamingService:
         self.heartbeats_sent = 0
 
         # Pending screenshot requests
-        self.screenshot_requests: Dict[str, Dict[str, Any]] = {}
-        self.screenshot_request_callbacks: Dict[str, Callable] = {}
+        self.screenshot_requests: dict[str, dict[str, Any]] = {}
+        self.screenshot_request_callbacks: dict[str, Callable] = {}
 
     def _get_timestamp(self) -> str:
         """Get current UTC timestamp in ISO format.
@@ -267,7 +268,7 @@ class CloudStreamingService:
         Returns:
             ISO 8601 formatted timestamp string
         """
-        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     async def connect(self, jwt_token: str) -> bool:
         """Establish WebSocket connection to cloud.
@@ -362,10 +363,10 @@ class CloudStreamingService:
     async def _send_message(
         self,
         message_type: str,
-        payload: Dict[str, Any],
+        payload: dict[str, Any],
         wait_for_response: bool = False,
         timeout: float = 10.0,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Send message to cloud WebSocket server.
 
         Args:
@@ -410,7 +411,7 @@ class CloudStreamingService:
 
             return {"success": True}
 
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.error("Timeout waiting for cloud response")
             return None
         except ConnectionClosed:
@@ -428,8 +429,8 @@ class CloudStreamingService:
         session_id: str,
         chunk: bytes,
         timestamp: float,
-        chunk_index: Optional[int] = None,
-        frame_number: Optional[int] = None,
+        chunk_index: int | None = None,
+        frame_number: int | None = None,
     ) -> bool:
         """Stream a compressed video chunk to cloud.
 
@@ -481,7 +482,7 @@ class CloudStreamingService:
             logger.error(f"Error streaming video chunk: {e}")
             return False
 
-    async def stream_events(self, session_id: str, events: List[InputMonitorEvent]) -> bool:
+    async def stream_events(self, session_id: str, events: list[InputMonitorEvent]) -> bool:
         """Stream input events to cloud (compressed as JSONL).
 
         Events are serialized to JSONL format and optionally gzipped for efficient
@@ -550,7 +551,7 @@ class CloudStreamingService:
             return False
 
     async def stream_thumbnail(
-        self, session_id: str, frame_number: int, image: bytes, timestamp: Optional[float] = None
+        self, session_id: str, frame_number: int, image: bytes, timestamp: float | None = None
     ) -> bool:
         """Stream a thumbnail image to cloud.
 
@@ -684,7 +685,7 @@ class CloudStreamingService:
             return False
 
     async def handle_screenshot_request(
-        self, request_id: str, filter_params: Dict[str, Any]
+        self, request_id: str, filter_params: dict[str, Any]
     ) -> bool:
         """Handle request for full-size screenshots from cloud.
 
@@ -717,7 +718,7 @@ class CloudStreamingService:
             return False
 
     async def upload_screenshots(
-        self, session_id: str, screenshots: List[str], request_id: Optional[str] = None
+        self, session_id: str, screenshots: list[str], request_id: str | None = None
     ) -> bool:
         """Upload full-size screenshots to cloud on demand.
 
@@ -868,7 +869,7 @@ class CloudStreamingService:
             except Exception as e:
                 logger.error(f"Error in on_error callback: {e}")
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """Get streaming statistics.
 
         Returns:

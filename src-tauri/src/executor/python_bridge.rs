@@ -14,8 +14,8 @@ use tracing::{debug, error, info};
 // Re-export protocol types for backward compatibility
 pub use super::protocol::{ExecutorEvent, ExecutorResponse};
 
-/// Python executor bridge with lifecycle management and health monitoring
-/// Acts as a facade that delegates to specialized handlers
+/// Python executor bridge with lifecycle management and health monitoring.
+/// Acts as a facade that delegates to specialized handlers.
 pub struct PythonBridge {
     /// Python process handle
     process: Option<Child>,
@@ -55,24 +55,20 @@ impl PythonBridge {
         }
     }
 
-    #[allow(dead_code)]
+    /// Starts the Python executor process.
     pub fn start(&mut self) -> Result<(), String> {
-        self.start_with_executor("simple")
-    }
-
-    pub fn start_with_executor(&mut self, executor_type: &str) -> Result<(), String> {
         // Check if process is already running
         if self.process.is_some() {
             return Err("Python process already running".to_string());
         }
 
-        info!("Starting executor with type: {}", executor_type);
+        info!("Starting Python executor");
 
         // Load debug settings to send to Python
         let debug_settings = crate::settings::get_debug_settings();
 
         // Spawn Python process using process manager
-        let mut child = self.process_manager.spawn_process(executor_type)?;
+        let mut child = self.process_manager.spawn_process()?;
 
         info!("Python process spawned, waiting for READY signal");
 
@@ -126,102 +122,97 @@ impl PythonBridge {
         // Store process handle
         self.process = Some(child);
 
-        // TEMPORARY FIX: Don't block on READY signal to restore original working behavior
-        // The READY signal will still be processed asynchronously when it arrives
-        // This avoids the 30-second buffering issue on Windows
+        // Start immediately without waiting for READY signal
+        // The READY signal will be processed asynchronously when it arrives
         info!("Python process started, will process READY signal asynchronously");
 
-        // Start immediately without waiting (original behavior that worked)
-        {
-            info!("Starting health monitoring");
+        // Start health monitoring
+        info!("Starting health monitoring");
+        self.runtime.block_on(async {
+            self.health_monitor.start().await;
+        });
 
-            // Start health monitoring
-            self.runtime.block_on(async {
-                self.health_monitor.start().await;
-            });
+        // Start health check task
+        let health_monitor_task = Arc::clone(&self.health_monitor);
+        let cmd_tx_health = cmd_tx.clone();
+        let (ping_tx, mut ping_rx) = mpsc::channel::<()>(10);
 
-            // Start health check task
-            let health_monitor_task = Arc::clone(&self.health_monitor);
-            let cmd_tx_health = cmd_tx.clone();
-            let (ping_tx, mut ping_rx) = mpsc::channel::<()>(10);
-
-            let runtime_health = Arc::clone(&self.runtime);
-            std::thread::spawn(move || {
-                runtime_health.block_on(async {
-                    let task = HealthCheckTask::new(health_monitor_task, ping_tx);
-                    if let Err(e) = task.run().await {
-                        error!("Health check task error: {}", e);
-                    }
-                });
-            });
-
-            // Spawn task to send ping commands
-            let runtime_ping = Arc::clone(&self.runtime);
-            std::thread::spawn(move || {
-                runtime_ping.block_on(async {
-                    while let Some(()) = ping_rx.recv().await {
-                        let ping_cmd = ExecutorCommand {
-                            cmd_type: "command".to_string(),
-                            id: uuid::Uuid::new_v4().to_string(),
-                            command: "ping".to_string(),
-                            params: None,
-                        };
-
-                        if cmd_tx_health.send(ping_cmd).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            });
-
-            // Send debug settings to Python executor
-            info!(
-                "Sending debug settings to Python executor: {:?}",
-                debug_settings
-            );
-            let debug_params = json!({
-                "enable_image_debug": debug_settings.enable_image_debug,
-                "top_matches_count": debug_settings.top_matches_count,
-            });
-
-            let debug_cmd = ExecutorCommand {
-                cmd_type: "command".to_string(),
-                id: uuid::Uuid::new_v4().to_string(),
-                command: "set_debug_settings".to_string(),
-                params: Some(debug_params),
-            };
-
-            if let Err(e) = self
-                .runtime
-                .block_on(async { cmd_tx.send(debug_cmd).await })
-            {
-                error!("Failed to send debug settings to Python: {}", e);
-            }
-
-            // Drain any queued events
-            let queued_events = self
-                .runtime
-                .block_on(async { self.lifecycle.read().await.drain_queued_events().await });
-
-            for queued in queued_events {
-                info!(
-                    "Processing queued event: {} (queued at {})",
-                    queued.event_type, queued.queued_at
-                );
-                let event = ExecutorEvent {
-                    event_type: "event".to_string(),
-                    event: queued.event_type,
-                    timestamp: queued.queued_at as f64 / 1000.0,
-                    sequence: 0,
-                    data: queued.data,
-                };
-                if let Err(e) = self.app_handle.emit("executor-event", &event) {
-                    error!("Failed to emit queued event: {}", e);
+        let runtime_health = Arc::clone(&self.runtime);
+        std::thread::spawn(move || {
+            runtime_health.block_on(async {
+                let task = HealthCheckTask::new(health_monitor_task, ping_tx);
+                if let Err(e) = task.run().await {
+                    error!("Health check task error: {}", e);
                 }
-            }
+            });
+        });
 
-            Ok(())
+        // Spawn task to send ping commands
+        let runtime_ping = Arc::clone(&self.runtime);
+        std::thread::spawn(move || {
+            runtime_ping.block_on(async {
+                while let Some(()) = ping_rx.recv().await {
+                    let ping_cmd = ExecutorCommand {
+                        cmd_type: "command".to_string(),
+                        id: uuid::Uuid::new_v4().to_string(),
+                        command: "ping".to_string(),
+                        params: None,
+                    };
+
+                    if cmd_tx_health.send(ping_cmd).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        });
+
+        // Send debug settings to Python executor
+        info!(
+            "Sending debug settings to Python executor: {:?}",
+            debug_settings
+        );
+        let debug_params = json!({
+            "enable_image_debug": debug_settings.enable_image_debug,
+            "top_matches_count": debug_settings.top_matches_count,
+        });
+
+        let debug_cmd = ExecutorCommand {
+            cmd_type: "command".to_string(),
+            id: uuid::Uuid::new_v4().to_string(),
+            command: "set_debug_settings".to_string(),
+            params: Some(debug_params),
+        };
+
+        if let Err(e) = self
+            .runtime
+            .block_on(async { cmd_tx.send(debug_cmd).await })
+        {
+            error!("Failed to send debug settings to Python: {}", e);
         }
+
+        // Drain any queued events
+        let queued_events = self
+            .runtime
+            .block_on(async { self.lifecycle.read().await.drain_queued_events().await });
+
+        for queued in queued_events {
+            info!(
+                "Processing queued event: {} (queued at {})",
+                queued.event_type, queued.queued_at
+            );
+            let event = ExecutorEvent {
+                event_type: "event".to_string(),
+                event: queued.event_type,
+                timestamp: queued.queued_at as f64 / 1000.0,
+                sequence: 0,
+                data: queued.data,
+            };
+            if let Err(e) = self.app_handle.emit("executor-event", &event) {
+                error!("Failed to emit queued event: {}", e);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
@@ -277,16 +268,6 @@ impl PythonBridge {
             "load",
             Some(json!({
                 "config_path": config_path
-            })),
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn start_execution(&mut self, mode: &str) -> Result<(), String> {
-        self.send_command(
-            "start",
-            Some(json!({
-                "mode": mode
             })),
         )
     }
@@ -379,17 +360,20 @@ impl PythonBridge {
             let state = self.lifecycle.read().await.get_state().await;
             debug!("[PYTHON_BRIDGE] is_running() - got state: {}", state.name());
             let can_accept = state.can_accept_commands();
-            debug!("[PYTHON_BRIDGE] is_running() - can_accept_commands: {}", can_accept);
+            debug!(
+                "[PYTHON_BRIDGE] is_running() - can_accept_commands: {}",
+                can_accept
+            );
             can_accept
         });
         debug!("[PYTHON_BRIDGE] is_running() returning: {}", result);
         result
     }
 
-    #[allow(dead_code)]
     pub fn get_state(&self) -> ExecutorState {
         debug!("[PYTHON_BRIDGE] get_state() called");
-        let state = self.runtime
+        let state = self
+            .runtime
             .block_on(async { self.lifecycle.read().await.get_state().await });
         debug!("[PYTHON_BRIDGE] get_state() returning: {}", state.name());
         state
