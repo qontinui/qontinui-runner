@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info};
 
 // Re-export protocol types for backward compatibility
-pub use super::protocol::{ExecutorEvent, ExecutorResponse};
+pub use super::protocol::ExecutorEvent;
 
 /// Python executor bridge with lifecycle management and health monitoring.
 /// Acts as a facade that delegates to specialized handlers.

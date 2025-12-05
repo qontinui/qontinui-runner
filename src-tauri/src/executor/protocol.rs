@@ -68,6 +68,7 @@ impl ProtocolHandler {
     }
 
     /// Sends a command to Python executor
+    #[allow(dead_code)]
     pub async fn send_command(&self, cmd: ExecutorCommand) -> Result<(), String> {
         if let Some(ref tx) = self.command_tx {
             tx.send(cmd)

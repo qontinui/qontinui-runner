@@ -56,10 +56,7 @@ pub use extraction::{
     export_state_structure, export_training_data, get_extraction_status, list_extractions,
     request_extraction_screenshot, start_web_extraction, stop_web_extraction,
 };
-pub use screenshot::{
-    capture_and_upload_screenshot, capture_screenshot, capture_screenshot_via_python,
-    get_screenshot_monitors, ScreenshotUploadConfig,
-};
+pub use screenshot::{capture_and_upload_screenshot, capture_screenshot, get_screenshot_monitors};
 pub use state_machine::{
     clear_action_log, execute_transition, get_action_log_view, get_active_states,
     get_available_transitions, navigate_to_multiple_states, navigate_to_state,

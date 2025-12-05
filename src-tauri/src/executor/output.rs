@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 use tauri::Emitter;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Handles output processing from Python executor
 pub struct OutputProcessor;
