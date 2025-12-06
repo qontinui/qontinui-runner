@@ -143,8 +143,30 @@ class ExecutorWrapper:
         """Stop the current execution."""
         if self.is_running and self.runner:
             self._emit_log("info", "Stopping execution...")
-            # TODO: Implement graceful shutdown
+
+            # Graceful shutdown:
+            # 1. Mark as not running to stop execution loop
             self.is_running = False
+
+            # 2. Clean up state executor if available
+            if hasattr(self.runner, 'state_executor') and self.runner.state_executor:
+                try:
+                    # Clear active states
+                    if hasattr(self.runner.state_executor, 'active_states'):
+                        self.runner.state_executor.active_states.clear()
+                except Exception as e:
+                    self._emit_log("warning", f"Failed to clear active states: {e}")
+
+            # 3. Clean up action executor if available
+            if hasattr(self.runner, 'action_executor') and self.runner.action_executor:
+                try:
+                    # Clear last action result and variable context if needed
+                    if hasattr(self.runner.action_executor, 'last_action_result'):
+                        self.runner.action_executor.last_action_result = None
+                except Exception as e:
+                    self._emit_log("warning", f"Failed to clear action executor state: {e}")
+
+            # 4. Emit completion event
             self._emit_event(
                 EventType.EXECUTION_COMPLETED, {"success": False, "reason": "User stopped"}
             )

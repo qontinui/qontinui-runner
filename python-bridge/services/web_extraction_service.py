@@ -48,6 +48,7 @@ class WebExtractionService:
         self._orchestrator = None
         self._current_extraction_id: str | None = None
         self._is_running = False
+        self._current_task: asyncio.Task | None = None  # Track current extraction task for cancellation
 
         # Store extraction results
         self._extraction_results: dict[str, Any] = {}  # extraction_id -> ExtractionResult
@@ -161,7 +162,7 @@ class WebExtractionService:
             logger.info(f"Starting extraction {self._current_extraction_id}")
 
             # Start extraction in background
-            task = asyncio.create_task(self._run_extraction(extraction_config))
+            self._current_task = asyncio.create_task(self._run_extraction(extraction_config))
 
             # Add error handler
             def handle_task_exception(t):
@@ -171,8 +172,12 @@ class WebExtractionService:
                         logger.error(f"Extraction task exception: {exc}", exc_info=exc)
                 except asyncio.CancelledError:
                     logger.info("Extraction task was cancelled")
+                finally:
+                    # Clear task reference when done
+                    if self._current_task is t:
+                        self._current_task = None
 
-            task.add_done_callback(handle_task_exception)
+            self._current_task.add_done_callback(handle_task_exception)
 
             return {
                 "success": True,
@@ -320,6 +325,19 @@ class WebExtractionService:
                     f"{len(result.transitions)} transitions"
                 )
 
+        except asyncio.CancelledError:
+            # Handle cancellation gracefully
+            logger.info(f"Extraction {self._current_extraction_id} was cancelled")
+            await self._emit_event(
+                "extraction_cancelled",
+                {
+                    "extraction_id": self._current_extraction_id,
+                    "message": "Extraction cancelled by user",
+                },
+            )
+            # Re-raise to let asyncio handle the cancellation
+            raise
+
         except Exception as e:
             logger.error(f"Extraction failed: {e}", exc_info=True)
             await self._emit_event(
@@ -398,12 +416,30 @@ class WebExtractionService:
             }
 
         try:
-            # Note: ExtractionOrchestrator doesn't have a stop() method yet
-            # For now, we just mark as not running
-            # TODO: Implement proper cancellation when orchestrator supports it
+            # Proper cancellation implementation:
+            # 1. Mark as not running to prevent new operations
             self._is_running = False
-            self._orchestrator = None
 
+            # 2. Cancel the extraction task if it's still running
+            if self._current_task and not self._current_task.done():
+                logger.info(f"Cancelling extraction task {self._current_extraction_id}")
+                self._current_task.cancel()
+
+                # Wait for the task to be cancelled (with timeout)
+                try:
+                    await asyncio.wait_for(self._current_task, timeout=5.0)
+                except asyncio.CancelledError:
+                    logger.info("Extraction task cancelled successfully")
+                except asyncio.TimeoutError:
+                    logger.warning("Extraction task cancellation timed out")
+                except Exception as e:
+                    logger.warning(f"Exception during task cancellation: {e}")
+
+            # 3. Clean up orchestrator
+            self._orchestrator = None
+            self._current_task = None
+
+            # 4. Emit stopped event
             await self._emit_event(
                 "extraction_stopped",
                 {"extraction_id": self._current_extraction_id},

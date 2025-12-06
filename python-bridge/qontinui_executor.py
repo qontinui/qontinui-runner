@@ -1204,7 +1204,33 @@ class QontinuiExecutor:
             # Apply any variables if provided
             if variables:
                 self.event_manager.emit_log("info", f"Applying variables: {list(variables.keys())}")
-                # TODO: Apply variables to the loaded configuration
+
+                # Apply variables to the action executor's variable context
+                if self.executor_core and self.executor_core.action_executor:
+                    try:
+                        if hasattr(self.executor_core.action_executor, 'variable_context'):
+                            for key, value in variables.items():
+                                # Set variables with 'global' scope so they're available throughout execution
+                                self.executor_core.action_executor.variable_context.set(
+                                    key, value, "global"
+                                )
+                                self.event_manager.emit_log(
+                                    "debug", f"Set variable '{key}' = {value} (type: {type(value).__name__})"
+                                )
+                            self.event_manager.emit_log(
+                                "info", f"Successfully applied {len(variables)} variables to execution context"
+                            )
+                        else:
+                            self.event_manager.emit_log(
+                                "warning", "Action executor does not have variable_context"
+                            )
+                    except Exception as e:
+                        self.event_manager.emit_log("error", f"Failed to apply variables: {e}")
+                        self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")
+                else:
+                    self.event_manager.emit_log(
+                        "warning", "Cannot apply variables: executor_core or action_executor not initialized"
+                    )
 
             # Get the workflow ID to execute (first workflow if not specified)
             workflow_id = None
