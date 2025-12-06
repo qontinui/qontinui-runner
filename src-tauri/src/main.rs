@@ -8,6 +8,7 @@ mod display;
 mod error;
 mod executor;
 mod logging;
+mod mcp_api;
 mod settings;
 mod storage;
 mod video_recorder;
@@ -79,16 +80,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
+    // Create shared AppState for both Tauri and MCP API
+    let shared_app_state = Arc::new(AppState {
+        python_bridge: Mutex::new(None),
+        current_config: Mutex::new(None),
+        display_processor,
+        local_storage,
+        video_recorder,
+    });
+    let mcp_app_state = shared_app_state.clone();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .manage(AppState {
-            python_bridge: Mutex::new(None),
-            current_config: Mutex::new(None),
-            display_processor,
-            local_storage,
-            video_recorder,
-        })
+        .manage(shared_app_state)
         .invoke_handler(tauri::generate_handler![
             // Authentication commands
             commands::auth::login,
@@ -225,7 +230,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Auto-start Python executor for screenshot capture and other features
             info!("Auto-starting Python executor");
-            let app_state = app.state::<AppState>();
+            let app_state = app.state::<Arc<AppState>>();
             let mut bridge_lock = app_state.python_bridge.lock().unwrap();
             let mut bridge = executor::PythonBridge::new(app.handle().clone());
             match bridge.start() {
@@ -241,13 +246,26 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             }
             drop(bridge_lock);
 
+            // Start MCP API server in background using the shared AppState
+            info!("Starting MCP API server on port {}", mcp_api::MCP_API_PORT);
+            tauri::async_runtime::spawn(async move {
+                // Wait a bit for app to fully initialize
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+                info!("MCP API server task starting...");
+                match mcp_api::start_server(mcp_app_state, mcp_api::MCP_API_PORT).await {
+                    Ok(_) => info!("MCP API server stopped normally"),
+                    Err(e) => error!("MCP API server error: {}", e),
+                }
+            });
+
             info!("Tauri application setup complete");
             Ok(())
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 info!("Window close requested");
-                let app_state = window.state::<AppState>();
+                let app_state = window.state::<Arc<AppState>>();
                 if let Ok(mut bridge) = app_state.python_bridge.lock() {
                     if let Some(ref mut pb) = *bridge {
                         let _ = pb.stop();

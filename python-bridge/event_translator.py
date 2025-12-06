@@ -432,9 +432,7 @@ class EventTranslator:
             # Emit to frontend via the provided emitter callback
             self.emitter("image_recognition", frontend_data)
 
-            print(
-                "[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr
-            )
+            print("[EventTranslator] IMAGE_RECOGNITION event emitted successfully", file=sys.stderr)
 
         except Exception as e:
             # Log exception to help debug translation failures

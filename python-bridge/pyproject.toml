@@ -11,6 +11,7 @@ python = "^3.12"
 pillow = "^10.2"
 qontinui = {path = "../../qontinui", develop = true}
 websockets = "^15.0.1"
+croniter = "^5.0"
 
 
 [tool.poetry.group.dev.dependencies]

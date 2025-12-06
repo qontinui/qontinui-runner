@@ -19,6 +19,8 @@ Design Principles:
 - Clear Lifecycle: start_action() -> record_*() -> create_record() -> clear buffer
 """
 
+from __future__ import annotations
+
 import threading
 from typing import Any
 

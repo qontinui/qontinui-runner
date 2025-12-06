@@ -9,6 +9,7 @@
 use super::{AppState, CommandResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tauri::State;
 use tracing::info;
 
@@ -28,7 +29,7 @@ pub struct WebExtractionConfig {
 /// Start a web extraction process
 #[tauri::command]
 pub fn start_web_extraction(
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
     config: WebExtractionConfig,
 ) -> Result<CommandResponse, String> {
     info!("Starting web extraction for URLs: {:?}", config.urls);
@@ -72,7 +73,7 @@ pub fn start_web_extraction(
 
 /// Stop the current web extraction process
 #[tauri::command]
-pub fn stop_web_extraction(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn stop_web_extraction(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping web extraction");
 
     let mut bridge_lock = state
@@ -101,7 +102,7 @@ pub fn stop_web_extraction(state: State<AppState>) -> Result<CommandResponse, St
 
 /// Get the current extraction status
 #[tauri::command]
-pub fn get_extraction_status(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn get_extraction_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting extraction status");
 
     let mut bridge_lock = state
@@ -137,7 +138,7 @@ pub struct ScreenshotRequest {
 
 #[tauri::command]
 pub fn request_extraction_screenshot(
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
     request: ScreenshotRequest,
 ) -> Result<CommandResponse, String> {
     info!(
@@ -187,7 +188,7 @@ pub struct TrainingDataExportConfig {
 /// Export extraction results as training data
 #[tauri::command]
 pub fn export_training_data(
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
     config: TrainingDataExportConfig,
 ) -> Result<CommandResponse, String> {
     info!(
@@ -237,7 +238,7 @@ pub struct StateStructureExportConfig {
 
 #[tauri::command]
 pub fn export_state_structure(
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
     config: StateStructureExportConfig,
 ) -> Result<CommandResponse, String> {
     info!(
@@ -277,7 +278,7 @@ pub fn export_state_structure(
 
 /// Get list of available extractions
 #[tauri::command]
-pub fn list_extractions(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn list_extractions(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Listing available extractions");
 
     let mut bridge_lock = state

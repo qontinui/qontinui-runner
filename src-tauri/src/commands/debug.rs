@@ -7,6 +7,7 @@
 
 use crate::settings;
 use serde_json;
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
@@ -52,7 +53,7 @@ pub fn get_debug_settings() -> Result<CommandResponse, String> {
 pub fn set_debug_settings(
     enable_image_debug: bool,
     top_matches_count: u32,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Setting debug settings: enable_image_debug={}, top_matches_count={}",

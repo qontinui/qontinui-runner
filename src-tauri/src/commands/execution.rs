@@ -12,6 +12,7 @@ use crate::error::UserFacingError;
 use crate::executor::PythonBridge;
 use crate::settings;
 use std::process::Command;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tracing::{debug, error, info, warn};
 
@@ -35,7 +36,7 @@ use super::{AppState, CommandResponse};
 #[tauri::command]
 pub fn start_python_executor(
     app_handle: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Starting Python executor");
     let mut bridge_lock = state.python_bridge.lock().unwrap();
@@ -113,7 +114,7 @@ pub fn start_python_executor(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor fails to stop
 #[tauri::command]
-pub fn stop_python_executor(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping Python executor");
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
@@ -150,7 +151,7 @@ pub fn stop_python_executor(state: State<AppState>) -> Result<CommandResponse, S
 pub fn start_execution(
     process_id: Option<String>,
     monitor_index: Option<i32>,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
@@ -200,7 +201,7 @@ pub fn start_execution(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not initialized or stop fails
 #[tauri::command]
-pub fn stop_execution(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
     if let Some(ref mut bridge) = *bridge_lock {
@@ -229,7 +230,7 @@ pub fn stop_execution(state: State<AppState>) -> Result<CommandResponse, String>
 /// * `Ok(CommandResponse)` - Success with status data
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
-pub fn get_executor_status(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     debug!("[GET_EXECUTOR_STATUS] Called - checking bridge lock...");
     let mut bridge_lock = state.python_bridge.lock().unwrap();
     debug!("[GET_EXECUTOR_STATUS] Got bridge lock");
@@ -511,7 +512,7 @@ pub fn open_folder(path: String) -> Result<CommandResponse, String> {
 #[tauri::command]
 pub fn update_capture_settings(
     settings: ScreenshotCaptureSettings,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Updating screenshot capture settings: enabled={}",

@@ -228,9 +228,7 @@ class ExecutionTree:
 
         return node
 
-    def end_transition(
-        self, transition_id: str, success: bool, error: str | None = None
-    ) -> None:
+    def end_transition(self, transition_id: str, success: bool, error: str | None = None) -> None:
         """Mark transition as complete and move up the tree.
 
         Args:

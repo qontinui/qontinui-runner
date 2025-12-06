@@ -7,6 +7,7 @@
 
 use crate::video_recorder::VideoRecordingConfig;
 use serde_json;
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
@@ -28,7 +29,7 @@ use super::{AppState, CommandResponse};
 pub fn start_video_recording(
     session_id: String,
     config: VideoRecordingConfig,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Starting video recording for session: {}", session_id);
 
@@ -57,7 +58,7 @@ pub fn start_video_recording(
 /// * `Ok(CommandResponse)` - Success with saved video path
 /// * `Err(String)` - Error if recording fails to stop
 #[tauri::command]
-pub fn stop_video_recording(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn stop_video_recording(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping video recording");
 
     let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
@@ -87,7 +88,7 @@ pub fn stop_video_recording(state: State<AppState>) -> Result<CommandResponse, S
 /// * `Ok(CommandResponse)` - Success with status data
 /// * `Err(String)` - Error if status query fails
 #[tauri::command]
-pub fn get_video_recording_status(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn get_video_recording_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     let recorder = state.video_recorder.lock().map_err(|e| e.to_string())?;
 
     let status = recorder.get_status().map_err(|e| {

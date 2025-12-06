@@ -10,6 +10,7 @@ use crate::auth::AuthManager;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
@@ -351,7 +352,7 @@ pub async fn capture_and_upload_screenshot(
 #[tauri::command]
 pub fn capture_screenshot_via_python(
     monitor: Option<i32>,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Capturing screenshot via Python bridge for monitor: {:?}",

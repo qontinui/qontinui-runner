@@ -7,6 +7,7 @@
 //! - Getting storage configuration paths
 
 use serde_json;
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
@@ -31,7 +32,7 @@ pub fn save_screenshot_to_disk(
     session_id: String,
     screenshot_id: String,
     data: Vec<u8>,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Saving screenshot to disk: session={}, id={}, size={} bytes",
@@ -76,7 +77,7 @@ pub fn save_screenshot_to_disk(
 pub fn save_video_to_disk(
     session_id: String,
     data: Vec<u8>,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Saving video to disk: session={}, size={} bytes",
@@ -113,7 +114,7 @@ pub fn save_video_to_disk(
 /// * `Ok(CommandResponse)` - Success with usage statistics
 /// * `Err(String)` - Error if usage query fails
 #[tauri::command]
-pub fn get_local_storage_usage(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn get_local_storage_usage(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting local storage usage");
 
     let storage = state.local_storage.lock().unwrap();
@@ -153,7 +154,7 @@ pub fn get_local_storage_usage(state: State<AppState>) -> Result<CommandResponse
 pub fn delete_old_sessions(
     storage_type: String,
     older_than_days: u32,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Deleting old sessions: type={}, older_than_days={}",
@@ -191,7 +192,7 @@ pub fn delete_old_sessions(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if clear operation fails
 #[tauri::command]
-pub fn clear_all_storage(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn clear_all_storage(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Clearing all local storage");
 
     let storage = state.local_storage.lock().unwrap();
@@ -221,7 +222,7 @@ pub fn clear_all_storage(state: State<AppState>) -> Result<CommandResponse, Stri
 /// * `Ok(CommandResponse)` - Success with storage configuration
 /// * `Err(String)` - Error message if configuration cannot be retrieved
 #[tauri::command]
-pub fn get_storage_paths(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn get_storage_paths(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting storage paths");
 
     let storage = state.local_storage.lock().unwrap();

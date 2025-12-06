@@ -53,7 +53,6 @@ hidden_imports = [
     'executor_wrapper',
     'websocket_client',
     'websocket_config',
-    'dsl_action_executor',
     'services',
     'services.unified_data_collector',
     'services.screenshot_service',

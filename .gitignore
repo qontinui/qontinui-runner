@@ -66,6 +66,8 @@ docs/
 # Configuration files
 configs/
 demo-config.json
+*_config.json
+debugger_config.json
 
 # Build/config files
 postcss.config.js

@@ -708,9 +708,7 @@ class StateBoundaryDetector:
     # Private Methods - Utilities
     # ========================================================================
 
-    def _find_closest_event(
-        self, frame_timestamp: float, events: list[InputEvent]
-    ) -> int | None:
+    def _find_closest_event(self, frame_timestamp: float, events: list[InputEvent]) -> int | None:
         """Find the input event closest to a frame timestamp.
 
         Args:

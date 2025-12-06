@@ -89,9 +89,7 @@ class EventManager:
         """
         self.emit_event(EventType.LOG, {"level": level, "message": message})
 
-    def emit_tree_event(
-        self, event_type: str, node: Any, extra_data: dict | None = None
-    ) -> None:
+    def emit_tree_event(self, event_type: str, node: Any, extra_data: dict | None = None) -> None:
         """
         Emit a tree-based event with full tree context.
 

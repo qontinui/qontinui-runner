@@ -307,12 +307,24 @@ class GUIAutomation:
             is_inline = True
             self.emit_log("debug", f"Workflow {workflow_id} called from action, marking as inline")
 
-        # Try local workflows first
+        # Try local workflows first - by ID or by name
+        actual_workflow_id = workflow_id
         if workflow_id in self.workflows:
             workflow_data = self.workflows[workflow_id]
+        else:
+            # Try to find workflow by name
+            workflow_data = None
+            for wf_id, wf_data in self.workflows.items():
+                if isinstance(wf_data, dict) and wf_data.get("name") == workflow_id:
+                    workflow_data = wf_data
+                    actual_workflow_id = wf_id
+                    self.emit_log("debug", f"Found workflow '{workflow_id}' by name (id: {wf_id})")
+                    break
+
+        if workflow_data is not None:
             if isinstance(workflow_data, dict):
                 actions = workflow_data.get("actions", [])
-                workflow_name = workflow_data.get("name", workflow_id)
+                workflow_name = workflow_data.get("name", actual_workflow_id)
             else:
                 actions = workflow_data
         # Fallback to registry for inline workflows
@@ -335,7 +347,9 @@ class GUIAutomation:
             return False
 
         # Start workflow in execution tree
-        node = self.execution_tree.start_workflow(workflow_id, workflow_name, is_inline=is_inline)
+        node = self.execution_tree.start_workflow(
+            actual_workflow_id, workflow_name, is_inline=is_inline
+        )
         self.emit_tree_event("workflow_started", node, None)
 
         success = True
@@ -358,12 +372,12 @@ class GUIAutomation:
                 time.sleep(0.5)
 
             # End workflow with success status
-            self.execution_tree.end_workflow(workflow_id, success=success)
+            self.execution_tree.end_workflow(actual_workflow_id, success=success)
             self.emit_tree_event("workflow_completed" if success else "workflow_failed", node, None)
 
         except Exception as e:
             # End workflow with failure status
-            self.execution_tree.end_workflow(workflow_id, success=False, error=str(e))
+            self.execution_tree.end_workflow(actual_workflow_id, success=False, error=str(e))
             self.emit_tree_event("workflow_failed", node, {"error": str(e)})
             success = False
 

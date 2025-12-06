@@ -19,6 +19,8 @@ The service is designed to be:
 - Thread-safe: Proper locking for concurrent access
 """
 
+from __future__ import annotations
+
 import logging
 import threading
 import time

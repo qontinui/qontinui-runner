@@ -6,6 +6,7 @@
 //! - Managing project association
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
@@ -38,7 +39,7 @@ pub struct WebSocketConfig {
 #[tauri::command]
 pub fn configure_websocket(
     config: WebSocketConfig,
-    state: State<AppState>,
+    state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!(
         "Configuring WebSocket: enabled={}, url={}, runner_name={:?}",
@@ -87,7 +88,7 @@ pub fn configure_websocket(
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or connection fails
 #[tauri::command]
-pub fn connect_websocket(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Connecting WebSocket");
 
     let mut bridge_lock = state.python_bridge.lock().unwrap();
@@ -124,7 +125,7 @@ pub fn connect_websocket(state: State<AppState>) -> Result<CommandResponse, Stri
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or disconnection fails
 #[tauri::command]
-pub fn disconnect_websocket(state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Disconnecting WebSocket");
 
     let mut bridge_lock = state.python_bridge.lock().unwrap();

@@ -148,6 +148,7 @@ class QontinuiExecutor:
         self.config = None
         self.is_running = False
         self._navigation_sequence = 0
+        self.target_monitor: int | None = None  # Monitor index for execution
 
         # Initialize EventManager first (other modules depend on it)
         self.event_manager = EventManager()
@@ -456,8 +457,13 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Workflow execution failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def start_execution(self, workflow_id: str) -> bool:
-        """Start workflow execution in background thread."""
+    def start_execution(self, workflow_id: str, monitor: int | None = None) -> bool:
+        """Start workflow execution in background thread.
+
+        Args:
+            workflow_id: ID of the workflow to execute
+            monitor: Monitor index to use for screen capture and actions (None = default)
+        """
         if self.is_running:
             self.event_manager.emit_log("warning", "Execution already in progress")
             return False
@@ -467,6 +473,23 @@ class QontinuiExecutor:
                 "error", "GUI automation not initialized - load config first"
             )
             return False
+
+        # Store monitor selection for use in actions
+        self.target_monitor = monitor
+        if monitor is not None:
+            self.event_manager.emit_log("info", f"Using monitor index: {monitor}")
+            # Apply monitor setting to FrameworkSettings so qontinui core uses this monitor
+            if QONTINUI_AVAILABLE:
+                try:
+                    settings = get_settings()
+                    settings.monitor.default_screen_index = monitor
+                    self.event_manager.emit_log(
+                        "debug", f"Set FrameworkSettings.monitor.default_screen_index = {monitor}"
+                    )
+                except Exception as e:
+                    self.event_manager.emit_log(
+                        "warning", f"Failed to set monitor in FrameworkSettings: {e}"
+                    )
 
         self.is_running = True
         self.gui_automation.set_running(True)
@@ -725,8 +748,9 @@ class QontinuiExecutor:
             return {"success": success}
 
         elif cmd_type == "start":
-            workflow_id = params.get("workflow_id")
-            success = self.start_execution(workflow_id)
+            workflow_id = params.get("workflow_id") or params.get("workflow")
+            monitor = params.get("monitor")  # Monitor index to use
+            success = self.start_execution(workflow_id, monitor=monitor)
             return {"success": success}
 
         elif cmd_type == "stop":

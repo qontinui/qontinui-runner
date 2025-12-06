@@ -9,6 +9,7 @@
 use crate::config::{ConfigLoader, QontinuiConfig};
 use crate::error::AppError;
 use crate::settings;
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info, warn};
 
@@ -31,7 +32,7 @@ use super::{AppState, CommandResponse};
 /// * `Ok(CommandResponse)` - Success with configuration summary
 /// * `Err(String)` - Error message if loading fails
 #[tauri::command]
-pub fn load_configuration(path: String, state: State<AppState>) -> Result<CommandResponse, String> {
+pub fn load_configuration(path: String, state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Loading configuration from: {}", path);
 
     // Load the configuration file
@@ -102,7 +103,7 @@ pub fn load_configuration(path: String, state: State<AppState>) -> Result<Comman
 /// * `Ok(QontinuiConfig)` - The current configuration
 /// * `Err(String)` - Error if no configuration is loaded
 #[tauri::command]
-pub fn get_current_configuration(state: State<AppState>) -> Result<QontinuiConfig, String> {
+pub fn get_current_configuration(state: State<Arc<AppState>>) -> Result<QontinuiConfig, String> {
     state
         .current_config
         .lock()

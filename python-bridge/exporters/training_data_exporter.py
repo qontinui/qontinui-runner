@@ -13,6 +13,8 @@ analysis provided by qontinui.discovery.click_analysis, which detects
 actual element boundaries rather than using fixed-size boxes.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
