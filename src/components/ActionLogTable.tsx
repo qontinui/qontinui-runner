@@ -78,13 +78,14 @@ function formatTarget(action: ActionLogEntry): string {
 
   switch (action.action_type) {
     case "Outgoing Transition":
-    case "Incoming Transition":
+    case "Incoming Transition": {
       // For transitions, show the target states from metadata
       const targetStates = action.metadata?.target_states as string[] | undefined;
       if (targetStates && Array.isArray(targetStates)) {
         return targetStates.join(", ");
       }
       return "-";
+    }
 
     case "FIND":
       // Handle multiple images (new format)
@@ -128,7 +129,7 @@ function formatTarget(action: ActionLogEntry): string {
       }
       return "-";
 
-    case "TYPE":
+    case "TYPE": {
       // Show the actual text that was typed (from runtime) or configured text
       const runtime = action.metadata?.runtime as Record<string, any> | undefined;
 
@@ -149,6 +150,7 @@ function formatTarget(action: ActionLogEntry): string {
         return `text from ${safeStringify(config.textSource.stateId)}`;
       }
       return "-";
+    }
 
     case "CLICK":
       if (config.target?.type === "lastFindResult") {
@@ -171,7 +173,7 @@ function formatTarget(action: ActionLogEntry): string {
       }
       return "unknown state";
 
-    case "RUN_WORKFLOW":
+    case "RUN_WORKFLOW": {
       // Try to get workflow name from runtime data, fall back to ID
       const workflowRuntime = action.metadata?.runtime as Record<string, any> | undefined;
       if (workflowRuntime?.workflow_name) {
@@ -184,6 +186,7 @@ function formatTarget(action: ActionLogEntry): string {
         return safeStringify(action.metadata.workflow_name);
       }
       return "-";
+    }
 
     case "WAIT":
       if (config.duration !== undefined) {
@@ -232,7 +235,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
   if (action.status === "success") {
     // Format success details based on action type
     switch (action.action_type) {
-      case "FIND":
+      case "FIND": {
         // Check for match result in metadata
         const matchResult = action.metadata?.matchResult as any;
         if (matchResult) {
@@ -261,6 +264,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
             <span className="mr-1">✓</span>found
           </span>
         );
+      }
 
       case "TYPE":
         // Text is already shown in Target column, just show success indicator
@@ -270,7 +274,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
           </span>
         );
 
-      case "CLICK":
+      case "CLICK": {
         const clickPosition = action.metadata?.clickPosition as any;
         if (clickPosition) {
           return (
@@ -285,6 +289,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
             <span className="mr-1">✓</span>clicked
           </span>
         );
+      }
 
       case "GO_TO_STATE":
         if (config.stateNames && Array.isArray(config.stateNames)) {

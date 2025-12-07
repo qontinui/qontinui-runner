@@ -136,9 +136,9 @@ function ScreenshotViewer({ screenshotPath, isOpen, onClose }: ScreenshotViewerP
           aria-describedby="screenshot-description"
         >
           <Dialog.Title className="sr-only">Full Size Screenshot</Dialog.Title>
-          <p id="screenshot-description" className="sr-only">
+          <Dialog.Description id="screenshot-description" className="sr-only">
             Full resolution view of the action screenshot
-          </p>
+          </Dialog.Description>
           <div className="relative">
             <img
               src={`file://${screenshotPath}`}
@@ -254,10 +254,10 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
               </Dialog.Close>
             </div>
 
-            <p id="action-detail-description" className="sr-only">
+            <Dialog.Description id="action-detail-description" className="sr-only">
               Detailed information about the {actionName} action including configuration, runtime
               results, and timing
-            </p>
+            </Dialog.Description>
 
             {/* Scrollable Content */}
             <div className="flex-1 overflow-y-auto p-4 space-y-4">
