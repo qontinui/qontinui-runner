@@ -1,0 +1,157 @@
+/**
+ * useProjectSelection
+ *
+ * Hook for managing project selection state across the application.
+ * The selected project is shared between Connection settings and Capture settings.
+ * It persists the selection to localStorage and emits events for StatusIndicator.
+ */
+
+import { useState, useEffect, useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import type { Project } from "../types/auth";
+
+const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
+
+export interface ProjectSelectionState {
+  selectedProjectId: string | null;
+  selectedProjectName: string | null;
+}
+
+interface UseProjectSelectionReturn {
+  projects: Project[];
+  selectedProjectId: string | null;
+  selectedProjectName: string | null;
+  loading: boolean;
+  error: string | null;
+  setSelectedProject: (projectId: string | null) => void;
+  loadProjects: () => Promise<void>;
+}
+
+/**
+ * Hook to manage project selection across the application.
+ * Projects are fetched from the backend and the selection is persisted.
+ */
+export function useProjectSelection(): UseProjectSelectionReturn {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectIdState] = useState<string | null>(() => {
+    // Load from localStorage on mount
+    const stored = localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as ProjectSelectionState;
+        return parsed.selectedProjectId;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  });
+  const [selectedProjectName, setSelectedProjectName] = useState<string | null>(() => {
+    const stored = localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored) as ProjectSelectionState;
+        return parsed.selectedProjectName;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  /**
+   * Load projects from the backend
+   */
+  const loadProjects = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const projectList = await invoke<Project[]>("get_user_projects");
+      setProjects(projectList);
+      console.log("[PROJECT_SELECTION] Loaded", projectList.length, "projects");
+
+      // If we have a stored selection, validate it still exists
+      if (selectedProjectId) {
+        const projectStillExists = projectList.some((p) => p.id === selectedProjectId);
+        if (!projectStillExists && projectList.length > 0) {
+          // Auto-select first project if stored project no longer exists
+          setSelectedProject(projectList[0].id);
+        } else if (projectStillExists) {
+          // Update name in case it changed
+          const project = projectList.find((p) => p.id === selectedProjectId);
+          if (project) {
+            setSelectedProjectName(project.name);
+          }
+        }
+      } else if (projectList.length > 0) {
+        // Auto-select first project if none selected
+        setSelectedProject(projectList[0].id);
+      }
+    } catch (err) {
+      console.error("[PROJECT_SELECTION] Failed to load projects:", err);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [selectedProjectId]);
+
+  /**
+   * Set the selected project and persist to localStorage
+   */
+  const setSelectedProject = useCallback(
+    (projectId: string | null) => {
+      setSelectedProjectIdState(projectId);
+
+      // Find the project name
+      const project = projects.find((p) => p.id === projectId);
+      const projectName = project?.name || null;
+      setSelectedProjectName(projectName);
+
+      // Persist to localStorage
+      const state: ProjectSelectionState = {
+        selectedProjectId: projectId,
+        selectedProjectName: projectName,
+      };
+      localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, JSON.stringify(state));
+
+      // Dispatch event for StatusIndicator
+      window.dispatchEvent(
+        new CustomEvent("project-selection-changed", {
+          detail: { projectId, projectName },
+        }),
+      );
+
+      console.log("[PROJECT_SELECTION] Selected project:", projectId, projectName);
+    },
+    [projects],
+  );
+
+  // When projects change, update the selected project name if needed
+  useEffect(() => {
+    if (selectedProjectId && projects.length > 0) {
+      const project = projects.find((p) => p.id === selectedProjectId);
+      if (project && project.name !== selectedProjectName) {
+        setSelectedProjectName(project.name);
+        // Update localStorage
+        const state: ProjectSelectionState = {
+          selectedProjectId,
+          selectedProjectName: project.name,
+        };
+        localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, JSON.stringify(state));
+      }
+    }
+  }, [projects, selectedProjectId, selectedProjectName]);
+
+  return {
+    projects,
+    selectedProjectId,
+    selectedProjectName,
+    loading,
+    error,
+    setSelectedProject,
+    loadProjects,
+  };
+}

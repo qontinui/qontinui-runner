@@ -33,3 +33,6 @@ export { useWorkflowSelection } from "./useWorkflowSelection";
 export { useMonitorDetection } from "./useMonitorDetection";
 
 export { useExecutionControl } from "./useExecutionControl";
+
+export { useProjectSelection } from "./useProjectSelection";
+export type { ProjectSelectionState } from "./useProjectSelection";

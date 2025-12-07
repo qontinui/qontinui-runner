@@ -100,6 +100,13 @@ class EventManager:
         """
         node_dict = node.to_dict(include_children=False)
 
+        # Debug logging for action status
+        import os
+        debug_log_path = os.path.join(os.environ.get("TEMP", "/tmp"), "qontinui_tree_event_debug.log")
+        with open(debug_log_path, "a") as f:
+            import datetime
+            f.write(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] emit_tree_event: event_type={event_type}, node.id={node.id}, node.status={node.status}, node_dict['status']={node_dict.get('status')}\n")
+
         # Add nesting_level directly to the node dict for workflows
         # Actions already have this in their execution_record, but workflows don't
         if "nesting_level" not in node_dict:

@@ -8,6 +8,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { eventRouter } from "../managers";
 
 export interface Config {
   name: string;
@@ -272,6 +273,79 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
       autoLoadLastConfig();
     }
   }, [autoLoadOnMount, autoLoadLastConfig]);
+
+  /**
+   * Listen for config_loaded events from the MCP API
+   * This allows the frontend to update when config is loaded via HTTP API
+   */
+  useEffect(() => {
+    const handleConfigLoaded = (payload: any) => {
+      console.log("[CONFIG] Received config_loaded event from MCP API:", payload);
+
+      const configPath = payload.data?.path;
+      const configData = payload.data?.config;
+
+      if (!configPath || !configData) {
+        console.warn("[CONFIG] config_loaded event missing path or config data");
+        return;
+      }
+
+      // Extract filename without extension
+      const pathParts = configPath.split(/[/\\]/);
+      const fullFilename = pathParts[pathParts.length - 1] || "config.json";
+      const nameWithoutExtension = fullFilename.replace(/\.[^/.]+$/, "");
+
+      const loadedConfig: Config = {
+        name: nameWithoutExtension,
+        version: "1.0.0",
+        statesCount: configData.states?.length || 0,
+        workflowsCount: configData.workflows?.length || 0,
+        workflows: configData.workflows || [],
+        images: configData.images || [],
+        states: configData.states || [],
+        path: configPath,
+      };
+
+      console.log(
+        "[CONFIG] Config loaded via MCP API with images:",
+        loadedConfig.images?.length || 0,
+        "images",
+      );
+      console.log(
+        "[CONFIG] Config loaded via MCP API with states:",
+        loadedConfig.states?.length || 0,
+        "states",
+      );
+
+      setConfig(loadedConfig);
+
+      // Filter workflows to only show those in the "main" category
+      const allWorkflows = configData.workflows || [];
+
+      console.log("[CONFIG] MCP API - All workflows loaded:", allWorkflows.length);
+
+      // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
+      const mainWorkflows = allWorkflows.filter(
+        (w: any) =>
+          w.category &&
+          w.category.toLowerCase() === "main" &&
+          (!w.visibility || w.visibility !== "internal"),
+      );
+
+      console.log("[CONFIG] MCP API - Filtered main workflows:", mainWorkflows.length);
+
+      setWorkflows(mainWorkflows);
+      setConfigLoaded(true);
+      onLog?.("success", `Configuration loaded via MCP API: ${configPath}`);
+    };
+
+    // Subscribe to config_loaded events
+    const unsubscribe = eventRouter.subscribe("config_loaded", handleConfigLoaded);
+
+    return () => {
+      unsubscribe();
+    };
+  }, [onLog]);
 
   return {
     config,

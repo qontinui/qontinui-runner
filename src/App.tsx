@@ -1,19 +1,17 @@
 /**
- * App.tsx (Refactored - SRP Compliant)
+ * App.tsx (Refactored - New Tab Structure)
  *
- * Main application component - thin orchestration layer.
- * Responsibilities:
- * - Provider composition
- * - High-level layout structure
- * - Component orchestration
- *
- * All business logic, state management, and UI concerns have been
- * extracted to contexts, hooks, and dedicated components.
+ * Main application component with reorganized tab structure:
+ * - Run: Execute workflows (configuration + execution controls)
+ * - Logs: View logs (General, Image Recognition, Actions)
+ * - Capture: Screenshot capture operations
+ * - Settings: Passive configuration only
  */
 
-import { useEffect, useRef } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { FileText } from "lucide-react";
+import * as Tabs from "@radix-ui/react-tabs";
+import { Play, Camera, Settings as SettingsIcon, ScrollText } from "lucide-react";
 
 // Contexts
 import { ExecutionProvider, useExecution, EventManagerProvider } from "./contexts";
@@ -29,18 +27,15 @@ import {
   useUIState,
   useModalState,
   useLogFilter,
-  useAutoScroll,
+  useProjectSelection,
 } from "./hooks";
 
 // Components
 import StatusIndicator from "./components/StatusIndicator";
 import { ConfigurationPanel } from "./components/ConfigurationPanel";
 import { ExecutionControlPanel } from "./components/ExecutionControlPanel";
-import { LogTabNavigation } from "./components/LogTabNavigation";
-import { LogTabActions } from "./components/LogTabActions";
-import { GeneralLogTab } from "./components/GeneralLogTab";
-import ImageLogTable from "./components/ImageLogTable";
-import ActionLogTable from "./components/ActionLogTable";
+import { LogsTab } from "./components/LogsTab";
+import { CaptureTab } from "./components/CaptureTab";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
@@ -48,6 +43,11 @@ import { LoginScreen } from "./components/LoginScreen";
 
 // Styles
 import "./index.css";
+
+type MainTab = "run" | "logs" | "capture" | "settings";
+type LogSubTab = "general" | "image" | "actions";
+
+const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
 /**
  * Main app content (inside providers)
@@ -58,6 +58,23 @@ function AppContent() {
 
   // Execution state from context
   const execution = useExecution();
+
+  // Main tab state
+  const [activeMainTab, setActiveMainTab] = useState<MainTab>(() => {
+    const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
+    if (stored && ["run", "logs", "capture", "settings"].includes(stored)) {
+      return stored as MainTab;
+    }
+    return "run";
+  });
+
+  // Log sub-tab state
+  const [activeLogSubTab, setActiveLogSubTab] = useState<LogSubTab>("general");
+
+  // Persist main tab
+  useEffect(() => {
+    localStorage.setItem(MAIN_TAB_STORAGE_KEY, activeMainTab);
+  }, [activeMainTab]);
 
   // Logs from LogManager
   const {
@@ -90,13 +107,8 @@ function AppContent() {
   // Log filtering
   const { logLevel, setLogLevel, filteredLogs } = useLogFilter(logs);
 
-  // Auto-scroll for general logs
-  const logViewerRef = useRef<HTMLDivElement>(null);
-  useAutoScroll({
-    enabled: uiState.activeLogTab === "general",
-    containerRef: logViewerRef,
-    dependencies: [logs],
-  });
+  // Project selection (shared between Capture and Settings)
+  const projectSelection = useProjectSelection();
 
   // Setup event handlers on mount (ONCE only)
   useEffect(() => {
@@ -110,14 +122,13 @@ function AppContent() {
     return cleanup;
   }, []); // Empty deps - run only on mount to prevent duplicate event handlers
 
-  // Refresh action log when switching to Actions tab
+  // Refresh action log when switching to Actions sub-tab
   useEffect(() => {
-    console.log("[TAB_SWITCH] useEffect triggered, activeLogTab:", uiState.activeLogTab);
-    if (uiState.activeLogTab === "actions") {
+    if (activeMainTab === "logs" && activeLogSubTab === "actions") {
       console.log("[TAB_SWITCH] Switched to Actions tab, refreshing action log");
       refreshActionLog();
     }
-  }, [uiState.activeLogTab, refreshActionLog]);
+  }, [activeMainTab, activeLogSubTab, refreshActionLog]);
 
   // Event handlers
   const handleWorkflowSelect = (workflowId: string) => {
@@ -132,11 +143,7 @@ function AppContent() {
 
   const handleCopyLogs = async () => {
     const logType =
-      uiState.activeLogTab === "general"
-        ? "general"
-        : uiState.activeLogTab === "image"
-          ? "image"
-          : "actions";
+      activeLogSubTab === "general" ? "general" : activeLogSubTab === "image" ? "image" : "actions";
     const success = await copyLogs(
       logType,
       logType === "actions" ? actionLogViewData?.actions : undefined,
@@ -178,147 +185,135 @@ function AppContent() {
     return <LoginScreen onLoginSuccess={auth.refreshAuth} />;
   }
 
+  const mainTabs = [
+    { id: "run" as const, label: "Run", icon: Play },
+    { id: "logs" as const, label: "Logs", icon: ScrollText },
+    { id: "capture" as const, label: "Capture", icon: Camera },
+    { id: "settings" as const, label: "Settings", icon: SettingsIcon },
+  ];
+
   return (
-    <div className="min-h-screen bg-background grid-dots">
+    <div className="min-h-screen bg-background grid-dots flex flex-col">
       {/* Status Bar */}
-      <div className="border-b border-border bg-card/50 backdrop-blur-sm">
-        <div className="container mx-auto px-6 py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <StatusIndicator
-                  pythonStatus={execution.pythonStatus}
-                  configLoaded={execution.configLoaded}
-                  executionActive={execution.executionActive}
+      <StatusIndicator
+        pythonStatus={execution.pythonStatus}
+        configLoaded={execution.configLoaded}
+        executionActive={execution.executionActive}
+      />
+
+      {/* Main Content with Tabs */}
+      <Tabs.Root
+        value={activeMainTab}
+        onValueChange={(value) => setActiveMainTab(value as MainTab)}
+        className="flex-1 flex flex-col container mx-auto"
+      >
+        {/* Main Tab Navigation */}
+        <Tabs.List className="flex border-b border-border bg-card/30 px-4">
+          {mainTabs.map((tab) => {
+            const Icon = tab.icon;
+            return (
+              <Tabs.Trigger
+                key={tab.id}
+                value={tab.id}
+                className={`
+                  flex items-center gap-2 px-6 py-4 text-sm font-medium
+                  border-b-2 transition-colors
+                  data-[state=active]:border-primary data-[state=active]:text-primary
+                  data-[state=inactive]:border-transparent data-[state=inactive]:text-muted-foreground
+                  data-[state=inactive]:hover:text-foreground data-[state=inactive]:hover:bg-muted/30
+                `}
+              >
+                <Icon className="w-4 h-4" />
+                {tab.label}
+              </Tabs.Trigger>
+            );
+          })}
+        </Tabs.List>
+
+        {/* Tab Content */}
+        <div className="flex-1 overflow-hidden">
+          {/* Run Tab */}
+          <Tabs.Content value="run" className="h-full outline-none p-6 overflow-y-auto">
+            <div className="space-y-6">
+              {/* Control Panels Grid */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                {/* Configuration Panel */}
+                <ConfigurationPanel
+                  config={execution.config}
+                  collapsed={uiState.configPanelCollapsed}
+                  onToggle={uiState.setConfigPanelCollapsed}
+                  onLoadConfiguration={execution.loadConfiguration}
+                  onLoadLastConfiguration={execution.loadLastConfiguration}
                 />
-                <span className="text-sm font-medium text-muted-foreground">
-                  Python Status:{" "}
-                  <span
-                    className={
-                      execution.pythonStatus === "running" ? "text-green-600" : "text-orange-600"
-                    }
-                  >
-                    {execution.pythonStatus}
-                  </span>
-                </span>
+
+                {/* Execution Control Panel */}
+                <ExecutionControlPanel
+                  collapsed={uiState.executionPanelCollapsed}
+                  onToggle={uiState.setExecutionPanelCollapsed}
+                  workflows={execution.workflows}
+                  selectedWorkflow={execution.selectedWorkflow}
+                  configLoaded={execution.configLoaded}
+                  showWorkflowDropdown={uiState.showWorkflowDropdown}
+                  onWorkflowDropdownToggle={uiState.setShowWorkflowDropdown}
+                  onWorkflowSelect={handleWorkflowSelect}
+                  selectedMonitor={execution.selectedMonitor}
+                  availableMonitors={execution.availableMonitors}
+                  showMonitorDropdown={uiState.showMonitorDropdown}
+                  onMonitorDropdownToggle={uiState.setShowMonitorDropdown}
+                  onMonitorSelect={handleMonitorSelect}
+                  autoMinimize={execution.autoMinimize}
+                  onAutoMinimizeChange={execution.setAutoMinimize}
+                  executionActive={execution.executionActive}
+                  onStartExecution={execution.startExecution}
+                  onStopExecution={execution.stopExecution}
+                />
               </div>
-              {execution.config && (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <FileText className="w-4 h-4" />
-                  <span>{execution.config.name}</span>
-                </div>
-              )}
             </div>
-          </div>
-        </div>
-      </div>
+          </Tabs.Content>
 
-      {/* Main Content */}
-      <div className="container mx-auto p-6 space-y-6">
-        {/* Header */}
-        <div className="text-center space-y-2">
-          <h1 className="text-4xl font-bold gradient-text">Qontinui Runner</h1>
-          <p className="text-muted-foreground">Workflow Automation</p>
-        </div>
+          {/* Logs Tab */}
+          <Tabs.Content value="logs" className="h-full outline-none">
+            <div className="h-full card m-4">
+              <LogsTab
+                logs={logs}
+                filteredLogs={filteredLogs}
+                logLevel={logLevel}
+                onLogLevelChange={setLogLevel}
+                showLogFilter={uiState.showLogFilter}
+                onToggleLogFilter={uiState.setShowLogFilter}
+                imageLogs={imageLogs}
+                onImageRowClick={modalState.openImageModal}
+                actionLogData={actionLogViewData}
+                actionLogLoading={actionLogLoading}
+                actionLogError={actionLogError}
+                onActionRowClick={modalState.openActionModal}
+                logCount={logCount}
+                imageLogCount={imageLogCount}
+                actionCount={actionLogViewData?.visible_count || 0}
+                onClearGeneralLogs={clearGeneralLogs}
+                onClearImageLogs={clearImageLogs}
+                onClearActionLogs={clearActionLogs}
+                onClearAllLogs={clearAllLogs}
+                onCopyLogs={handleCopyLogs}
+                copySuccess={uiState.copySuccess}
+                activeSubTab={activeLogSubTab}
+                onSubTabChange={setActiveLogSubTab}
+              />
+            </div>
+          </Tabs.Content>
 
-        {/* Control Panels Grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Configuration Panel */}
-          <ConfigurationPanel
-            config={execution.config}
-            collapsed={uiState.configPanelCollapsed}
-            onToggle={uiState.setConfigPanelCollapsed}
-            onLoadConfiguration={execution.loadConfiguration}
-            onLoadLastConfiguration={execution.loadLastConfiguration}
-          />
-
-          {/* Execution Control Panel */}
-          <ExecutionControlPanel
-            collapsed={uiState.executionPanelCollapsed}
-            onToggle={uiState.setExecutionPanelCollapsed}
-            workflows={execution.workflows}
-            selectedWorkflow={execution.selectedWorkflow}
-            configLoaded={execution.configLoaded}
-            showWorkflowDropdown={uiState.showWorkflowDropdown}
-            onWorkflowDropdownToggle={uiState.setShowWorkflowDropdown}
-            onWorkflowSelect={handleWorkflowSelect}
-            selectedMonitor={execution.selectedMonitor}
-            availableMonitors={execution.availableMonitors}
-            showMonitorDropdown={uiState.showMonitorDropdown}
-            onMonitorDropdownToggle={uiState.setShowMonitorDropdown}
-            onMonitorSelect={handleMonitorSelect}
-            autoMinimize={execution.autoMinimize}
-            onAutoMinimizeChange={execution.setAutoMinimize}
-            executionActive={execution.executionActive}
-            onStartExecution={execution.startExecution}
-            onStopExecution={execution.stopExecution}
-          />
-        </div>
-
-        {/* Log Viewer */}
-        <div className="card">
-          {/* Tab Navigation */}
-          <div className="flex items-center justify-between border-b border-border">
-            <LogTabNavigation
-              activeTab={uiState.activeLogTab}
-              onTabChange={uiState.setActiveLogTab}
-              logCount={logCount}
-              imageLogCount={imageLogCount}
-              actionCount={actionLogViewData?.visible_count || 0}
+          {/* Capture Tab */}
+          <Tabs.Content value="capture" className="h-full outline-none overflow-y-auto">
+            <CaptureTab
+              onLog={addLog}
+              projects={projectSelection.projects}
+              selectedProjectId={projectSelection.selectedProjectId}
             />
+          </Tabs.Content>
 
-            {/* Tab Actions */}
-            <LogTabActions
-              activeTab={uiState.activeLogTab}
-              showLogFilter={uiState.showLogFilter}
-              onToggleLogFilter={uiState.setShowLogFilter}
-              logLevel={logLevel}
-              onLogLevelChange={setLogLevel}
-              onClearGeneralLogs={clearGeneralLogs}
-              onClearImageLogs={clearImageLogs}
-              onClearActionLogs={clearActionLogs}
-              onClearAllLogs={clearAllLogs}
-              onCopyLogs={handleCopyLogs}
-              copySuccess={uiState.copySuccess}
-            />
-          </div>
-
-          {/* Tab Content */}
-          <div className="p-4">
-            {/* General Tab */}
-            {uiState.activeLogTab === "general" && (
-              <GeneralLogTab logs={filteredLogs} containerRef={logViewerRef} />
-            )}
-
-            {/* Image Recognition Tab */}
-            {uiState.activeLogTab === "image" && (
-              <div style={{ maxHeight: "400px", overflowY: "auto" }}>
-                <ImageLogTable imageLogs={imageLogs} onRowClick={modalState.openImageModal} />
-              </div>
-            )}
-
-            {/* Actions Tab */}
-            {uiState.activeLogTab === "actions" && (
-              <>
-                {actionLogLoading && (
-                  <div className="text-center text-muted-foreground py-8">
-                    Loading action log...
-                  </div>
-                )}
-                {actionLogError && (
-                  <div className="text-center text-red-600 py-8">Error: {actionLogError}</div>
-                )}
-                {!actionLogLoading && !actionLogError && actionLogViewData && (
-                  <ActionLogTable
-                    actions={actionLogViewData.actions}
-                    onRowClick={modalState.openActionModal}
-                  />
-                )}
-              </>
-            )}
-
-            {/* Settings Tab */}
-            {uiState.activeLogTab === "settings" && (
+          {/* Settings Tab */}
+          <Tabs.Content value="settings" className="h-full outline-none">
+            <div className="h-full">
               <Settings
                 onLog={addLog}
                 onDebugModeChange={async (enabled) => {
@@ -335,10 +330,10 @@ function AppContent() {
                   }
                 }}
               />
-            )}
-          </div>
+            </div>
+          </Tabs.Content>
         </div>
-      </div>
+      </Tabs.Root>
 
       {/* Action Detail Modal */}
       <ActionDetailModal

@@ -7,6 +7,7 @@
 //! - Getting available transitions
 //! - Action log viewing and management
 
+use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
 
@@ -27,7 +28,7 @@ use super::{AppState, CommandResponse};
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn execute_transition(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     transition_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Executing transition: {}", transition_id);
@@ -73,7 +74,7 @@ pub async fn execute_transition(
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn navigate_to_state(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     state_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to state: {}", state_id);
@@ -117,7 +118,7 @@ pub async fn navigate_to_state(
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn navigate_to_multiple_states(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
     state_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to multiple states: {:?}", state_ids);
@@ -161,9 +162,7 @@ pub async fn navigate_to_multiple_states(
 /// * `Ok(CommandResponse)` - Success, active states will be sent via event
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
-pub async fn get_active_states(
-    state: tauri::State<'_, AppState>,
-) -> Result<CommandResponse, String> {
+pub async fn get_active_states(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting active states");
     let mut bridge = state.python_bridge.lock().unwrap();
 
@@ -202,7 +201,7 @@ pub async fn get_active_states(
 /// * `Err(String)` - Error message if the executor is not running or command fails
 #[tauri::command]
 pub async fn get_available_transitions(
-    state: tauri::State<'_, AppState>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Getting available transitions");
     let mut bridge = state.python_bridge.lock().unwrap();
@@ -240,15 +239,24 @@ pub async fn get_available_transitions(
 /// * `Ok(serde_json::Value)` - Action log view data as JSON
 /// * `Err(String)` - Error message if view cannot be retrieved
 #[tauri::command]
-pub async fn get_action_log_view(state: State<'_, AppState>) -> Result<CommandResponse, String> {
+pub async fn get_action_log_view(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    eprintln!("[DEBUG] get_action_log_view called");
     info!("Getting action log view");
 
+    eprintln!("[DEBUG] Acquiring display_processor lock...");
     let processor = state.display_processor.lock().await;
+    eprintln!("[DEBUG] Got display_processor lock");
+
+    eprintln!("[DEBUG] Calling processor.get_view(\"action_log\")...");
     let view_data = processor.get_view("action_log").map_err(|e| {
+        eprintln!("[DEBUG] get_view failed: {}", e);
         error!("Failed to get action log view: {}", e);
         format!("Failed to get action log view: {}", e)
     })?;
 
+    eprintln!("[DEBUG] get_view succeeded, view_data: {:?}", view_data);
     info!("Action log view retrieved successfully");
     Ok(CommandResponse {
         success: true,
@@ -269,7 +277,7 @@ pub async fn get_action_log_view(state: State<'_, AppState>) -> Result<CommandRe
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error message if clear fails
 #[tauri::command]
-pub async fn clear_action_log(state: State<'_, AppState>) -> Result<CommandResponse, String> {
+pub async fn clear_action_log(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Clearing action log");
 
     let mut processor = state.display_processor.lock().await;

@@ -1,6 +1,7 @@
 use crate::display::{DisplayProfile, RawEvent, ViewType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use tracing::debug;
 
 /// Configuration for Action Log profile
 #[derive(Debug, Clone)]
@@ -87,6 +88,12 @@ impl ActionLogProfile {
         let action_type = node.get("name").and_then(|v| v.as_str())?.to_string();
         let timestamp = node.get("timestamp").and_then(|v| v.as_f64())?;
         let status = node.get("status").and_then(|v| v.as_str())?.to_string();
+
+        // Debug: Log extracted status for action events
+        debug!(
+            "extract_action_info: id={}, action_type={}, event_type={}, status={}",
+            id, action_type, event.event_type, status
+        );
 
         // Get both metadata and execution_record (execution_record has runtime data)
         let mut metadata = node

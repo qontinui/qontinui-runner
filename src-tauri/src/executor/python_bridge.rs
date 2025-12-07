@@ -378,6 +378,11 @@ impl PythonBridge {
         debug!("[PYTHON_BRIDGE] get_state() returning: {}", state.name());
         state
     }
+
+    /// Returns a reference to the lifecycle for accessing completion notifications
+    pub fn get_lifecycle(&self) -> Arc<RwLock<ExecutorLifecycle>> {
+        Arc::clone(&self.lifecycle)
+    }
 }
 
 impl Drop for PythonBridge {

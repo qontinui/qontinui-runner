@@ -73,8 +73,8 @@ pub struct ScreenshotUploadConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotUploadResult {
     pub success: bool,
-    pub image_id: Option<String>,
-    pub url: Option<String>,
+    pub screenshot_id: Option<String>,
+    pub presigned_url: Option<String>,
     pub error: Option<String>,
 }
 
@@ -230,8 +230,8 @@ pub async fn capture_and_upload_screenshot(
     if !capture_result.success || capture_result.screenshot_base64.is_none() {
         return Ok(ScreenshotUploadResult {
             success: false,
-            image_id: None,
-            url: None,
+            screenshot_id: None,
+            presigned_url: None,
             error: capture_result
                 .error
                 .or_else(|| Some("Capture failed".to_string())),
@@ -245,8 +245,8 @@ pub async fn capture_and_upload_screenshot(
     if !auth_manager.has_tokens() {
         return Ok(ScreenshotUploadResult {
             success: false,
-            image_id: None,
-            url: None,
+            screenshot_id: None,
+            presigned_url: None,
             error: Some("Not authenticated. Please log in first.".to_string()),
         });
     }
@@ -266,9 +266,11 @@ pub async fn capture_and_upload_screenshot(
 
     // 4. Create multipart form for upload
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-    let filename = config
+    let screenshot_name = config
         .name
-        .unwrap_or_else(|| format!("screenshot_{}.png", timestamp));
+        .clone()
+        .unwrap_or_else(|| format!("screenshot_{}", timestamp));
+    let filename = format!("{}.png", screenshot_name);
 
     let part = reqwest::multipart::Part::bytes(image_bytes)
         .file_name(filename.clone())
@@ -277,15 +279,24 @@ pub async fn capture_and_upload_screenshot(
 
     let form = reqwest::multipart::Form::new().part("file", part);
 
-    // 5. Upload to qontinui-web backend
+    // 5. Build upload URL with query parameters
     let client = reqwest::Client::new();
     let api_url = get_api_base_url();
 
+    let mut upload_url = format!(
+        "{}/api/v1/projects/{}/screenshots/upload?name={}&source=runner_capture",
+        api_url,
+        config.project_id,
+        urlencoding::encode(&screenshot_name)
+    );
+
+    // Add monitor index if provided
+    if let Some(monitor_idx) = config.monitor {
+        upload_url = format!("{}&monitor_index={}", upload_url, monitor_idx);
+    }
+
     let response = client
-        .post(format!(
-            "{}/api/v1/projects/{}/images/upload",
-            api_url, config.project_id
-        ))
+        .post(&upload_url)
         .bearer_auth(&access_token)
         .multipart(form)
         .send()
@@ -307,8 +318,8 @@ pub async fn capture_and_upload_screenshot(
         );
         return Ok(ScreenshotUploadResult {
             success: false,
-            image_id: None,
-            url: None,
+            screenshot_id: None,
+            presigned_url: None,
             error: Some(format!("Upload failed: {}", error_text)),
         });
     }
@@ -318,25 +329,25 @@ pub async fn capture_and_upload_screenshot(
         format!("Invalid response from server: {}", e)
     })?;
 
-    let image_id = upload_response
-        .get("image_id")
+    let screenshot_id = upload_response
+        .get("id")
         .and_then(|id| id.as_str())
         .map(|s| s.to_string());
 
-    let url = upload_response
-        .get("url")
+    let presigned_url = upload_response
+        .get("presigned_url")
         .and_then(|u| u.as_str())
         .map(|s| s.to_string());
 
     info!(
         "Screenshot uploaded successfully: {:?}",
-        image_id.as_ref().unwrap_or(&"unknown".to_string())
+        screenshot_id.as_ref().unwrap_or(&"unknown".to_string())
     );
 
     Ok(ScreenshotUploadResult {
         success: true,
-        image_id,
-        url,
+        screenshot_id,
+        presigned_url,
         error: None,
     })
 }

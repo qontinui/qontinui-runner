@@ -28,7 +28,7 @@ impl EventForwarder {
             eprintln!("[PYTHON_BRIDGE] Node data: {:?}", node);
 
             // Get the AppState and add event to DisplayProcessor
-            if let Some(app_state) = app_handle.try_state::<AppState>() {
+            if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
                 eprintln!("[PYTHON_BRIDGE] AppState found, creating RawEvent");
 
                 let raw_event = RawEvent {

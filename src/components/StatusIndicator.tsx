@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from "react";
-import { AlertCircle, Info, AlertTriangle, X, Wifi, WifiOff, Tag } from "lucide-react";
+import { AlertCircle, Info, AlertTriangle, X, Tag, FolderKanban } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
+const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
 
 interface ErrorEvent {
   title: string;
@@ -26,13 +27,22 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   executionActive,
 }) => {
   const [error, setError] = useState<ErrorEvent | null>(null);
-  const [connectionStatus, setConnectionStatus] = useState<
-    "connected" | "disconnected" | "connecting"
-  >("disconnected");
   const [showError, setShowError] = useState(false);
   const [isBeta] = useState(true);
   const [runnerName, setRunnerName] = useState<string>(() => {
     return localStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
+  });
+  const [projectName, setProjectName] = useState<string | null>(() => {
+    const stored = localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY);
+    if (stored) {
+      try {
+        const parsed = JSON.parse(stored);
+        return parsed.selectedProjectName || null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
   });
 
   useEffect(() => {
@@ -46,23 +56,30 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       }
     });
 
-    const unlistenConnection = listen<{ status: "connected" | "disconnected" | "connecting" }>(
-      "connection-status",
-      (event) => {
-        setConnectionStatus(event.payload.status);
-      },
-    );
-
     // Listen for runner name changes from settings
     const handleRunnerNameChange = (event: CustomEvent<string>) => {
       setRunnerName(event.detail);
     };
     window.addEventListener("runner-name-changed", handleRunnerNameChange as EventListener);
 
+    // Listen for project selection changes from settings
+    const handleProjectSelectionChange = (
+      event: CustomEvent<{ projectId: string | null; projectName: string | null }>,
+    ) => {
+      setProjectName(event.detail.projectName);
+    };
+    window.addEventListener(
+      "project-selection-changed",
+      handleProjectSelectionChange as EventListener,
+    );
+
     return () => {
       unlistenError.then((fn) => fn());
-      unlistenConnection.then((fn) => fn());
       window.removeEventListener("runner-name-changed", handleRunnerNameChange as EventListener);
+      window.removeEventListener(
+        "project-selection-changed",
+        handleProjectSelectionChange as EventListener,
+      );
     };
   }, []);
 
@@ -109,6 +126,14 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
 
       {/* Status Bar */}
       <div className="flex items-center gap-4 px-4 py-2 bg-gray-50 border-b border-gray-200">
+        {/* Title */}
+        <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
+          <div
+            className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-green-500" : "bg-gray-400"}`}
+          />
+          <span className="text-sm font-bold text-gray-800">Qontinui Runner</span>
+        </div>
+
         {/* Runner Name */}
         {runnerName && (
           <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
@@ -117,12 +142,13 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           </div>
         )}
 
-        <div className="flex items-center gap-2">
-          <div
-            className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-green-500" : "bg-gray-400"}`}
-          />
-          <span className="text-sm text-gray-600">Executor: {pythonStatus}</span>
-        </div>
+        {/* Selected Project */}
+        {projectName && (
+          <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
+            <FolderKanban className="w-4 h-4 text-blue-500" />
+            <span className="text-sm font-medium text-gray-800">{projectName}</span>
+          </div>
+        )}
 
         <div className="flex items-center gap-2">
           <div
@@ -140,25 +166,6 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           <span className="text-sm text-gray-600">
             Execution: {executionActive ? "Active" : "Inactive"}
           </span>
-        </div>
-
-        <div className="flex items-center gap-2 ml-auto">
-          {connectionStatus === "connected" ? (
-            <>
-              <Wifi className="w-4 h-4 text-green-500" />
-              <span className="text-sm text-gray-600">Connected to Qontinui</span>
-            </>
-          ) : connectionStatus === "connecting" ? (
-            <>
-              <Wifi className="w-4 h-4 text-yellow-500 animate-pulse" />
-              <span className="text-sm text-gray-600">Connecting...</span>
-            </>
-          ) : (
-            <>
-              <WifiOff className="w-4 h-4 text-gray-400" />
-              <span className="text-sm text-gray-600">Offline Mode</span>
-            </>
-          )}
         </div>
       </div>
 

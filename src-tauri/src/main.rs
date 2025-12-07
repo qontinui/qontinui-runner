@@ -248,12 +248,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 
             // Start MCP API server in background using the shared AppState
             info!("Starting MCP API server on port {}", mcp_api::MCP_API_PORT);
+            let mcp_app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 // Wait a bit for app to fully initialize
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 info!("MCP API server task starting...");
-                match mcp_api::start_server(mcp_app_state, mcp_api::MCP_API_PORT).await {
+                match mcp_api::start_server(mcp_app_state, mcp_app_handle, mcp_api::MCP_API_PORT).await {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }

@@ -97,6 +97,17 @@ pub enum ExecutorMessage {
     },
 }
 
+/// Result of a workflow execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionCompletionResult {
+    /// Whether the execution was successful
+    pub success: bool,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// Additional data from the execution
+    pub data: Option<serde_json::Value>,
+}
+
 /// Manages executor lifecycle and state transitions
 pub struct ExecutorLifecycle {
     /// Current executor state
@@ -107,6 +118,10 @@ pub struct ExecutorLifecycle {
 
     /// Channel for notifying when ready state is reached
     ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
+
+    /// Channel for notifying when execution completes
+    execution_complete_tx:
+        Arc<RwLock<Option<tokio::sync::oneshot::Sender<ExecutionCompletionResult>>>>,
 
     /// Whether lifecycle has been started
     #[allow(dead_code)]
@@ -122,7 +137,30 @@ impl ExecutorLifecycle {
             })),
             event_queue: Arc::new(RwLock::new(Vec::new())),
             ready_tx: None,
+            execution_complete_tx: Arc::new(RwLock::new(None)),
             started: Arc::new(RwLock::new(false)),
+        }
+    }
+
+    /// Registers a oneshot channel to receive execution completion notification.
+    /// Returns a receiver that will receive the result when execution completes.
+    pub async fn register_execution_completion(
+        &self,
+    ) -> tokio::sync::oneshot::Receiver<ExecutionCompletionResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut lock = self.execution_complete_tx.write().await;
+        *lock = Some(tx);
+        rx
+    }
+
+    /// Notifies any waiting completion channel that execution has completed.
+    /// Called when an execution_completed event is received.
+    pub async fn notify_execution_complete(&self, result: ExecutionCompletionResult) {
+        let mut lock = self.execution_complete_tx.write().await;
+        if let Some(tx) = lock.take() {
+            if tx.send(result).is_err() {
+                debug!("Execution completion receiver was dropped");
+            }
         }
     }
 
@@ -238,7 +276,32 @@ impl ExecutorLifecycle {
                 Ok(Some(ExecutorMessage::Ready { data }))
             }
 
-            ExecutorMessage::Event { .. } => {
+            ExecutorMessage::Event {
+                ref event,
+                ref data,
+                ..
+            } => {
+                // Check for execution_completed event and notify any waiters
+                if event == "execution_completed" {
+                    info!("[LIFECYCLE] Received execution_completed event");
+                    let success = data
+                        .get("success")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let error = data
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .or_else(|| data.get("error").and_then(|v| v.as_str()).map(String::from));
+
+                    let result = ExecutionCompletionResult {
+                        success,
+                        error,
+                        data: Some(data.clone()),
+                    };
+                    self.notify_execution_complete(result).await;
+                }
+
                 // Check if we're ready to process events
                 let state = self.state.read().await;
 

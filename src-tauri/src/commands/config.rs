@@ -32,7 +32,10 @@ use super::{AppState, CommandResponse};
 /// * `Ok(CommandResponse)` - Success with configuration summary
 /// * `Err(String)` - Error message if loading fails
 #[tauri::command]
-pub fn load_configuration(path: String, state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
+pub fn load_configuration(
+    path: String,
+    state: State<Arc<AppState>>,
+) -> Result<CommandResponse, String> {
     info!("Loading configuration from: {}", path);
 
     // Load the configuration file

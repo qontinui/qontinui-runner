@@ -1,18 +1,25 @@
+/**
+ * Settings.tsx
+ *
+ * Settings tab containing only passive configuration options.
+ * Active operations (capture, storage cleanup) have been moved to dedicated tabs.
+ */
+
 import { useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Wifi, Settings as SettingsIcon, Camera, HardDrive, Wrench } from "lucide-react";
+import { Wifi, Settings as SettingsIcon, HardDrive, Wrench } from "lucide-react";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
-import { CaptureSettings } from "./CaptureSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
+import { useProjectSelection } from "../../hooks";
 
 interface SettingsProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   onDebugModeChange: (enabled: boolean) => void;
 }
 
-type SettingsTab = "connection" | "general" | "capture" | "storage" | "advanced";
+type SettingsTab = "connection" | "general" | "storage" | "advanced";
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
@@ -20,11 +27,14 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // Load persisted tab on mount
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored && ["connection", "general", "capture", "storage", "advanced"].includes(stored)) {
+    if (stored && ["connection", "general", "storage", "advanced"].includes(stored)) {
       return stored as SettingsTab;
     }
     return "connection";
   });
+
+  // Shared project selection state
+  const projectSelection = useProjectSelection();
 
   // Persist active tab
   useEffect(() => {
@@ -33,10 +43,9 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
 
   const tabs = [
     { id: "connection" as const, label: "Connection", icon: Wifi },
-    { id: "general" as const, label: "General", icon: SettingsIcon },
-    { id: "capture" as const, label: "Capture", icon: Camera },
+    { id: "general" as const, label: "Preferences", icon: SettingsIcon },
     { id: "storage" as const, label: "Storage", icon: HardDrive },
-    { id: "advanced" as const, label: "Advanced", icon: Wrench },
+    { id: "advanced" as const, label: "Debug", icon: Wrench },
   ];
 
   return (
@@ -87,15 +96,17 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
       {/* Content area */}
       <div className="flex-1 overflow-y-auto p-6">
         <Tabs.Content value="connection" className="outline-none">
-          <AuthConnectionSettings onLog={onLog} />
+          <AuthConnectionSettings
+            onLog={onLog}
+            projects={projectSelection.projects}
+            selectedProjectId={projectSelection.selectedProjectId}
+            onProjectSelect={projectSelection.setSelectedProject}
+            onLoadProjects={projectSelection.loadProjects}
+          />
         </Tabs.Content>
 
         <Tabs.Content value="general" className="outline-none">
           <GeneralSettings onLog={onLog} />
-        </Tabs.Content>
-
-        <Tabs.Content value="capture" className="outline-none">
-          <CaptureSettings onLog={onLog} />
         </Tabs.Content>
 
         <Tabs.Content value="storage" className="outline-none">

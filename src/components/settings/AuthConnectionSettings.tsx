@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, X, Wifi, Cloud, LogOut, User, Tag } from "lucide-react";
+import { X, Wifi, Cloud, LogOut, User, Tag } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { useAuth } from "../AuthProvider";
 import type { ConnectionInfo, Project } from "../../types/auth";
@@ -16,15 +16,23 @@ const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 
 interface AuthConnectionSettingsProps {
   onLog: (level: "success" | "error" | "info", message: string) => void;
+  projects: Project[];
+  selectedProjectId: string | null;
+  onProjectSelect: (projectId: string | null) => void;
+  onLoadProjects: () => Promise<void>;
 }
 
-export function AuthConnectionSettings({ onLog }: AuthConnectionSettingsProps) {
+export function AuthConnectionSettings({
+  onLog,
+  projects,
+  selectedProjectId,
+  onProjectSelect,
+  onLoadProjects,
+}: AuthConnectionSettingsProps) {
   const auth = useAuth();
 
   // Connection state
   const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo | null>(null);
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -46,9 +54,9 @@ export function AuthConnectionSettings({ onLog }: AuthConnectionSettingsProps) {
   useEffect(() => {
     if (auth.authStatus?.authenticated) {
       loadConnectionInfo();
-      loadProjects();
+      onLoadProjects();
     }
-  }, [auth.authStatus?.authenticated]);
+  }, [auth.authStatus?.authenticated, onLoadProjects]);
 
   // Send heartbeat periodically when connected
   useEffect(() => {
@@ -85,22 +93,6 @@ export function AuthConnectionSettings({ onLog }: AuthConnectionSettingsProps) {
     } catch (err) {
       console.error("[AUTH_CONNECTION] Failed to load connection info:", err);
       setError(err as string);
-    }
-  };
-
-  const loadProjects = async () => {
-    try {
-      const projectList = await invoke<Project[]>("get_user_projects");
-      setProjects(projectList);
-      console.log("[AUTH_CONNECTION] Loaded", projectList.length, "projects");
-
-      // Auto-select first project if available
-      if (projectList.length > 0 && !selectedProjectId) {
-        setSelectedProjectId(projectList[0].id);
-      }
-    } catch (err) {
-      console.error("[AUTH_CONNECTION] Failed to load projects:", err);
-      // Don't set error here - projects are optional
     }
   };
 
@@ -334,11 +326,12 @@ export function AuthConnectionSettings({ onLog }: AuthConnectionSettingsProps) {
             <label className="block">
               <div className="font-medium mb-1">Project</div>
               <div className="text-sm text-muted-foreground mb-3">
-                Choose which project this runner should connect to
+                Choose which project this runner should connect to. This selection is used across
+                all features that require a project.
               </div>
               <select
                 value={selectedProjectId || ""}
-                onChange={(e) => setSelectedProjectId(e.target.value)}
+                onChange={(e) => onProjectSelect(e.target.value || null)}
                 className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
                 disabled={connected}
               >

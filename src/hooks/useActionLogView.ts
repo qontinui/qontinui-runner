@@ -119,8 +119,9 @@ export function useActionLogView(options: UseActionLogViewOptions = {}): UseActi
         return;
       }
 
-      const errorMessage = err instanceof Error ? err.message : "Unknown error occurred";
-      console.log("[HOOK] Exception caught:", errorMessage);
+      // Tauri commands return string errors when Rust returns Err(String)
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      console.log("[HOOK] Exception caught:", errorMessage, "Raw error:", err);
       setError(errorMessage);
       console.error("Failed to fetch action log view:", err);
     } finally {
