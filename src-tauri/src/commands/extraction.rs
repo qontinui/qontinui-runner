@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::State;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Configuration for web extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]

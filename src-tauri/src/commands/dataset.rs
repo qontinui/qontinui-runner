@@ -5,7 +5,7 @@
 //! - Packaging annotation exports with local images into YOLO format
 //! - Splitting datasets into train/val/test sets
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use sha2::{Digest, Sha256};
@@ -35,6 +35,7 @@ pub struct ImageMetadata {
 
 /// Image manifest from annotation export
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct ImageManifest {
     pub version: String,
     pub dataset_id: String,

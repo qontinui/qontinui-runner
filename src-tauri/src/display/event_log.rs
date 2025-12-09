@@ -64,7 +64,7 @@ impl EventLog {
         // Add to type index
         self.type_index
             .entry(event.event_type.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(event_idx);
 
         // Add to node index if event has a node_id
@@ -77,7 +77,7 @@ impl EventLog {
             eprintln!("[EVENT_LOG] Found node_id in event: {}", node_id);
             self.node_index
                 .entry(node_id.to_string())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(event_idx);
         } else {
             eprintln!("[EVENT_LOG] No node_id found in event data");

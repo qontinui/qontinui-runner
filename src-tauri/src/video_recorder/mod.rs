@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -255,7 +255,7 @@ impl VideoRecordingService {
     /// Build FFmpeg command arguments based on platform and configuration
     fn build_ffmpeg_args(
         config: &VideoRecordingConfig,
-        output_path: &PathBuf,
+        output_path: &Path,
     ) -> Result<Vec<String>, String> {
         let mut args = Vec::new();
 

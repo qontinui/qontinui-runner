@@ -45,38 +45,6 @@ pub mod video;
 pub mod websocket;
 
 // Re-export all command functions for easy access in main.rs
-pub use auth::{check_auth_status, get_device_info, login, logout};
-pub use config::{
-    get_auto_load_last_config, get_current_configuration, get_last_config_path, load_configuration,
-    save_auto_load_last_config, save_last_monitor_index, save_last_workflow_id,
-};
-pub use dataset::{package_dataset, scan_local_images};
-pub use debug::{get_debug_settings, set_debug_settings};
-pub use execution::{
-    check_for_updates, get_executor_status, get_monitors, handle_error, install_update,
-    open_folder, start_execution, start_python_executor, stop_execution, stop_python_executor,
-    update_capture_settings,
-};
-pub use extraction::{
-    create_extraction_session, export_state_structure, export_training_data, get_extraction_status,
-    get_project_extractions, list_extractions, request_extraction_screenshot, start_web_extraction,
-    stop_web_extraction, update_extraction_session, upload_extraction_annotations,
-    upload_state_structure,
-};
-pub use logging::{append_ai_output_log, clear_ai_output_log, get_ai_output_log_path_cmd};
-pub use screenshot::{capture_and_upload_screenshot, capture_screenshot, get_screenshot_monitors};
-pub use state_machine::{
-    clear_action_log, execute_transition, get_action_log_view, get_active_states,
-    get_available_transitions, navigate_to_multiple_states, navigate_to_state,
-};
-pub use storage::{
-    clear_all_storage, delete_old_sessions, get_local_storage_usage, get_storage_paths,
-    save_screenshot_to_disk, save_video_to_disk,
-};
-pub use video::{get_video_recording_status, start_video_recording, stop_video_recording};
-pub use websocket::{
-    configure_websocket, connect_websocket, disconnect_websocket, WebSocketConfig,
-};
 
 /// Application state shared across all commands.
 ///
