@@ -129,7 +129,7 @@ function formatActionDetails(node: DisplayNode): string {
       }
       break;
 
-    case "IF":
+    case "IF": {
       // Image ID is shown in main label as FIND, no need to repeat
       // Only show additional condition details if not image-based
       const target = config.target;
@@ -140,6 +140,7 @@ function formatActionDetails(node: DisplayNode): string {
         details.push(`${config.condition}`);
       }
       break;
+    }
 
     case "WAIT":
       if (config.duration !== undefined) {
@@ -328,7 +329,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         }
         return "ACTIVATE STATE" + details;
 
-      case "IF":
+      case "IF": {
         // IF actions that check for images should show as FIND
         const target = config.target;
         if (config.imageName) {
@@ -341,6 +342,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
           return `FIND "${config.imageId}"`;
         }
         return "IF" + details;
+      }
 
       default:
         return node.name + details;

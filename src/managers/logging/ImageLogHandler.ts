@@ -57,6 +57,7 @@ export class ImageLogHandler {
       visualDebugImage: data.visual_debug_image,
       templatePath: data.template_path,
       imageData: data.image_data,
+      matchedRegionImage: data.matched_region_image, // Cropped region from screenshot at match location
       debug: data.debug,
     };
   }

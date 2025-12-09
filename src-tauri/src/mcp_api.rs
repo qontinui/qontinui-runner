@@ -518,143 +518,16 @@ async fn run_workflow(
     info!("MCP API: Step 4 - Registered for completion, dropped read lock");
 
     // ==========================================================================
-    // MONITOR OFFSET CALCULATION - Critical for Multi-Monitor Click Accuracy
+    // MONITOR SELECTION - Passed to Python, offset calculated by qontinui library
     // ==========================================================================
     //
-    // WHY THIS MATTERS:
-    // -----------------
-    // The FIND action in Python captures a screenshot of the ENTIRE virtual desktop
-    // (all monitors combined). The match coordinates returned are relative to the
-    // top-left corner of this combined screenshot.
+    // The qontinui Python library handles monitor offset calculation internally
+    // using MSS (the same library used for screen capture). This ensures the
+    // coordinate system is consistent between screenshot capture and click actions.
     //
-    // MSS (Python's screen capture library) uses monitors[0] for the virtual desktop,
-    // which has its origin at the minimum (x, y) across all physical monitors.
-    //
-    // For pyautogui to click in the correct location, we need to translate the
-    // FIND coordinates back to absolute virtual desktop coordinates by adding
-    // the virtual desktop origin.
-    //
-    // COORDINATE FLOW:
-    // ----------------
-    // 1. FIND action captures virtual desktop screenshot
-    // 2. Pattern matching returns (x, y) relative to screenshot origin
-    // 3. Screenshot origin = virtual desktop origin = (min_x, min_y) of all monitors
-    // 4. CLICK target = FIND result + virtual desktop origin = absolute coordinates
-    //
-    // EXAMPLE:
-    // --------
-    // Monitor layout: Left(-1920,702) + Primary(0,0) + Right(3840,702)
-    // Virtual desktop origin: (-1920, 0)  ← min X=-1920, min Y=0
-    // FIND result: (65, 1372)
-    // CLICK target: (65 + -1920, 1372 + 0) = (-1855, 1372) ← correct!
-    //
-    // The monitor_index parameter is currently unused for offset calculation because
-    // FIND always captures the full virtual desktop. It may be used in the future
-    // for monitor-specific captures.
+    // The runner only passes the monitor_index to Python. The library's
+    // StateExecutor.set_monitor() method looks up the monitor position via MSS.
     // ==========================================================================
-    use std::io::Write;
-    let debug_log_path = std::env::temp_dir().join("qontinui_rust_monitor_debug.log");
-    let mut debug_log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&debug_log_path)
-        .ok();
-
-    // Calculate the virtual desktop origin (minimum x, minimum y across all monitors).
-    // This offset is applied to FIND results to get absolute screen coordinates.
-    //
-    // IMPORTANT: Do NOT use a specific monitor's position here! The FIND action
-    // captures the entire virtual desktop, so we need the virtual desktop origin,
-    // not any individual monitor's position.
-    let monitor_offset: Option<(i32, i32)> = {
-        let app_handle = state.app_handle.clone();
-        if let Some(window) = app_handle.get_webview_window("main") {
-            if let Ok(monitors) = window.available_monitors() {
-                // Debug: log all monitors as Tauri sees them
-                if let Some(ref mut f) = debug_log {
-                    let _ = writeln!(f, "[{}] Looking up virtual desktop origin from {} monitors (monitor_index={:?})",
-                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"), monitors.len(), monitor_index);
-                    for (i, m) in monitors.iter().enumerate() {
-                        let pos = m.position();
-                        let size = m.size();
-                        let _ = writeln!(
-                            f,
-                            "[{}] Tauri enum[{}]: x={}, y={}, {}x{}",
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                            i,
-                            pos.x,
-                            pos.y,
-                            size.width,
-                            size.height
-                        );
-                    }
-                }
-
-                // Calculate virtual desktop origin (minimum x and y across all monitors)
-                // This matches MSS's monitor[0] which is the combined virtual desktop
-                let mut min_x = i32::MAX;
-                let mut min_y = i32::MAX;
-                for m in monitors.iter() {
-                    let pos = m.position();
-                    if pos.x < min_x {
-                        min_x = pos.x;
-                    }
-                    if pos.y < min_y {
-                        min_y = pos.y;
-                    }
-                }
-
-                if min_x != i32::MAX && min_y != i32::MAX {
-                    if let Some(ref mut f) = debug_log {
-                        let _ = writeln!(
-                            f,
-                            "[{}] Virtual desktop origin: x={}, y={}",
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                            min_x,
-                            min_y
-                        );
-                    }
-                    Some((min_x, min_y))
-                } else {
-                    if let Some(ref mut f) = debug_log {
-                        let _ = writeln!(
-                            f,
-                            "[{}] WARNING: Could not calculate virtual desktop origin",
-                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
-                        );
-                    }
-                    None
-                }
-            } else {
-                if let Some(ref mut f) = debug_log {
-                    let _ = writeln!(
-                        f,
-                        "[{}] ERROR: Failed to get available_monitors()",
-                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
-                    );
-                }
-                None
-            }
-        } else {
-            if let Some(ref mut f) = debug_log {
-                let _ = writeln!(
-                    f,
-                    "[{}] ERROR: Failed to get main window",
-                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
-                );
-            }
-            None
-        }
-    };
-    if let Some(ref mut f) = debug_log {
-        let _ = writeln!(
-            f,
-            "[{}] Final monitor offset: monitor_index={:?}, offset={:?}",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            monitor_index,
-            monitor_offset
-        );
-    }
 
     // Start the workflow execution - use spawn_blocking because send_command uses block_on internally
     // which cannot be called from within an async context
@@ -665,7 +538,7 @@ async fn run_workflow(
         });
 
         if let Some(ref mut bridge) = *bridge_lock {
-            // Build params for execution
+            // Build params for execution - only pass monitor_index, Python looks up offset via MSS
             let mut params = serde_json::Map::new();
             let resolved_monitor = monitor_index.unwrap_or(0);
             eprintln!(
@@ -680,15 +553,6 @@ async fn run_workflow(
                 "workflow".to_string(),
                 serde_json::json!(workflow_name.clone()),
             );
-            // Include monitor offset if available
-            if let Some((offset_x, offset_y)) = monitor_offset {
-                params.insert("monitor_offset_x".to_string(), serde_json::json!(offset_x));
-                params.insert("monitor_offset_y".to_string(), serde_json::json!(offset_y));
-                eprintln!(
-                    "[MCP_API] Including monitor offset: x={}, y={}",
-                    offset_x, offset_y
-                );
-            }
             eprintln!("[MCP_API] Sending to Python: {:?}", params);
 
             match bridge.start_execution_with_params(Some(serde_json::Value::Object(params))) {
@@ -750,6 +614,162 @@ async fn run_workflow(
                     request.timeout_seconds
                 ))),
             ))
+        }
+    }
+}
+
+/// Response for load-last-config endpoint
+#[derive(Debug, Serialize)]
+pub struct LoadLastConfigResponse {
+    pub config_path: String,
+    pub workflow_id: Option<String>,
+    pub monitor_index: Option<i32>,
+    pub summary: String,
+}
+
+/// Load the last used configuration, workflow, and monitor from settings
+///
+/// This is useful after a runner restart to restore the previous state.
+/// It reads saved settings and loads the configuration just like load_config.
+async fn load_last_config(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<LoadLastConfigResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Loading last configuration from settings");
+
+    // First, get the saved settings
+    let config_path = match settings::get_last_config_path() {
+        Some(path) => path,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error("No last configuration found")),
+            ))
+        }
+    };
+
+    let workflow_id = settings::get_last_workflow_id();
+    let monitor_index = settings::get_last_monitor_index();
+
+    info!(
+        "MCP API: Found last config: path={}, workflow={:?}, monitor={:?}",
+        config_path, workflow_id, monitor_index
+    );
+
+    // Check if the file still exists
+    if !std::path::Path::new(&config_path).exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!(
+                "Last configuration file no longer exists: {}",
+                config_path
+            ))),
+        ));
+    }
+
+    let app_state = state.app_state.clone();
+    let config_path_clone = config_path.clone();
+    let config_path_for_event = config_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        // Load and validate the configuration file
+        let config = ConfigLoader::load_from_file(&config_path_clone).map_err(|e| {
+            error!(
+                "MCP API: Failed to load configuration from {}: {}",
+                config_path_clone, e
+            );
+            format!("Failed to load configuration: {}", e)
+        })?;
+
+        let summary = config.summary();
+        info!("MCP API: Configuration validated: {}", summary);
+
+        // Create config data for event emission
+        let config_data = serde_json::json!({
+            "workflows": config.workflows.clone(),
+            "states": config.states.clone(),
+            "transitions": config.transitions.clone(),
+            "images": config.images.clone()
+        });
+
+        // Store the configuration in app state
+        *app_state.current_config.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: current_config mutex was poisoned, recovering");
+            poisoned.into_inner()
+        }) = Some(config);
+        info!("MCP API: Configuration stored in app state");
+
+        // Send debug settings and configuration to Python bridge
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            // Send debug settings first
+            let debug_settings = settings::get_debug_settings();
+            if let Err(e) = bridge.set_debug_settings(
+                debug_settings.enable_image_debug,
+                debug_settings.top_matches_count,
+            ) {
+                warn!("MCP API: Failed to send debug settings: {}", e);
+            }
+
+            // Send configuration to Python
+            bridge.load_configuration(&config_path_clone).map_err(|e| {
+                error!("MCP API: Failed to send configuration to Python: {}", e);
+                format!("Failed to send configuration to Python: {}", e)
+            })?;
+
+            info!("MCP API: Configuration sent to Python executor");
+            Ok((summary, config_data))
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok((summary, config_data)) => {
+            info!("MCP API: Last config loaded successfully");
+
+            // Emit event to notify frontend of config load
+            let event_payload = serde_json::json!({
+                "event": "config_loaded",
+                "data": {
+                    "path": config_path_for_event,
+                    "config": config_data,
+                    "workflow_id": workflow_id,
+                    "monitor_index": monitor_index
+                }
+            });
+
+            if let Err(e) = state.app_handle.emit("executor-event", &event_payload) {
+                warn!("MCP API: Failed to emit config_loaded event: {}", e);
+            } else {
+                info!("MCP API: Emitted config_loaded event to frontend");
+            }
+
+            Ok(Json(ApiResponse::success(LoadLastConfigResponse {
+                config_path,
+                workflow_id,
+                monitor_index,
+                summary,
+            })))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to load last config: {}", e);
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e))))
         }
     }
 }
@@ -816,6 +836,7 @@ pub fn create_router(app_state: Arc<AppState>, app_handle: tauri::AppHandle) -> 
         .route("/status", get(get_status))
         .route("/monitors", get(get_monitors))
         .route("/load-config", post(load_config))
+        .route("/load-last-config", post(load_last_config))
         .route("/run-workflow", post(run_workflow))
         .route("/stop-execution", post(stop_execution))
         .layer(cors)

@@ -7,13 +7,15 @@
 //!
 //! - `auth` - Authentication and device management
 //! - `config` - Configuration file loading and management
+//! - `dataset` - Dataset packaging and YOLO format export
+//! - `debug` - Debug settings management
 //! - `execution` - Python executor lifecycle and workflow execution
 //! - `extraction` - Web GUI extraction and training data export
+//! - `screenshot` - Screenshot capture operations
 //! - `state_machine` - State navigation and transition execution
-//! - `debug` - Debug settings management
-//! - `websocket` - WebSocket connectivity for remote monitoring
-//! - `video` - Video recording operations
 //! - `storage` - Local disk storage management
+//! - `video` - Video recording operations
+//! - `websocket` - WebSocket connectivity for remote monitoring
 //!
 //! # Shared Types
 //!
@@ -31,9 +33,11 @@ use tokio::sync::Mutex as TokioMutex;
 // Command modules organized by domain
 pub mod auth;
 pub mod config;
+pub mod dataset;
 pub mod debug;
 pub mod execution;
 pub mod extraction;
+pub mod logging;
 pub mod screenshot;
 pub mod state_machine;
 pub mod storage;
@@ -44,18 +48,22 @@ pub mod websocket;
 pub use auth::{check_auth_status, get_device_info, login, logout};
 pub use config::{
     get_auto_load_last_config, get_current_configuration, get_last_config_path, load_configuration,
-    save_auto_load_last_config, save_last_workflow_id,
+    save_auto_load_last_config, save_last_monitor_index, save_last_workflow_id,
 };
+pub use dataset::{package_dataset, scan_local_images};
 pub use debug::{get_debug_settings, set_debug_settings};
 pub use execution::{
-    check_for_updates, get_executor_status, get_monitors, handle_error, open_folder,
-    start_execution, start_python_executor, stop_execution, stop_python_executor,
+    check_for_updates, get_executor_status, get_monitors, handle_error, install_update,
+    open_folder, start_execution, start_python_executor, stop_execution, stop_python_executor,
     update_capture_settings,
 };
 pub use extraction::{
-    export_state_structure, export_training_data, get_extraction_status, list_extractions,
-    request_extraction_screenshot, start_web_extraction, stop_web_extraction,
+    create_extraction_session, export_state_structure, export_training_data, get_extraction_status,
+    get_project_extractions, list_extractions, request_extraction_screenshot, start_web_extraction,
+    stop_web_extraction, update_extraction_session, upload_extraction_annotations,
+    upload_state_structure,
 };
+pub use logging::{append_ai_output_log, clear_ai_output_log, get_ai_output_log_path_cmd};
 pub use screenshot::{capture_and_upload_screenshot, capture_screenshot, get_screenshot_monitors};
 pub use state_machine::{
     clear_action_log, execute_transition, get_action_log_view, get_active_states,

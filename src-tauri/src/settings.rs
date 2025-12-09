@@ -19,7 +19,8 @@ pub struct DebugSettings {
 impl Default for DebugSettings {
     fn default() -> Self {
         Self {
-            enable_image_debug: false,
+            // Default to true to enable visual debug image generation for troubleshooting
+            enable_image_debug: true,
             top_matches_count: 5,
         }
     }
@@ -31,6 +32,8 @@ pub struct Settings {
     last_config_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_workflow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_monitor_index: Option<i32>,
     #[serde(default = "default_auto_load_last_config")]
     pub auto_load_last_config: bool,
     #[serde(default)]
@@ -46,6 +49,7 @@ impl Default for Settings {
         Self {
             last_config_path: None,
             last_workflow_id: None,
+            last_monitor_index: None,
             auto_load_last_config: false,
             debug: DebugSettings::default(),
         }
@@ -150,6 +154,21 @@ pub fn save_last_workflow_id(workflow_id: &str) -> Result<(), String> {
 pub fn get_last_workflow_id() -> Option<String> {
     let settings = load_settings();
     settings.last_workflow_id
+}
+
+/// Save the last used monitor index
+pub fn save_last_monitor_index(monitor_index: i32) -> Result<(), String> {
+    info!("Saving last monitor index: {}", monitor_index);
+    let mut settings = load_settings();
+    settings.last_monitor_index = Some(monitor_index);
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the last used monitor index
+pub fn get_last_monitor_index() -> Option<i32> {
+    let settings = load_settings();
+    settings.last_monitor_index
 }
 
 /// Get the auto-load last config setting

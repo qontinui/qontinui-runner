@@ -81,7 +81,12 @@ pub struct ScreenshotUploadResult {
 /// Get available monitors for screenshot capture via qontinui-api.
 ///
 /// This calls the qontinui-api screenshot/monitors endpoint to get
-/// information about all connected displays at physical resolution.
+/// information about all connected displays at **physical resolution**.
+///
+/// Note: This is distinct from `get_monitors` in execution.rs, which uses
+/// Tauri's window API for logical (DPI-scaled) coordinates. Use this command
+/// when you need physical pixel coordinates for screenshot capture, and
+/// `get_monitors` for workflow execution monitor selection.
 #[tauri::command]
 pub async fn get_screenshot_monitors() -> Result<CommandResponse, String> {
     info!("Getting available monitors for screenshot capture");

@@ -94,6 +94,7 @@ function ImageViewer({ imagePath, imageData, title, isOpen, onClose }: ImageView
 export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetailModalProps) {
   const [screenshotViewerOpen, setScreenshotViewerOpen] = useState(false);
   const [templateViewerOpen, setTemplateViewerOpen] = useState(false);
+  const [matchedRegionViewerOpen, setMatchedRegionViewerOpen] = useState(false);
 
   if (!entry) return null;
 
@@ -226,36 +227,72 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                 entry.screenshotData ||
                 entry.visualDebugImage ||
                 entry.templatePath ||
-                entry.imageData) && (
+                entry.imageData ||
+                entry.matchedRegionImage) && (
                 <Section title="Visual Data">
                   <div className="space-y-4">
-                    {/* Template (above screenshot, thumbnail) */}
-                    {entry.templatePath || entry.imageData ? (
-                      <div className="space-y-2">
-                        <div className="text-xs text-muted-foreground font-medium">
-                          Template Image
-                        </div>
-                        <div className="relative group inline-block">
-                          <img
-                            src={
-                              entry.imageData
-                                ? `data:image/png;base64,${entry.imageData}`
-                                : `file://${entry.templatePath}`
-                            }
-                            alt="Template"
-                            className="max-w-[200px] max-h-[200px] object-contain rounded-lg border border-border cursor-pointer hover:border-primary transition-colors"
-                            onClick={() => setTemplateViewerOpen(true)}
-                          />
-                          <button
-                            onClick={() => setTemplateViewerOpen(true)}
-                            className="absolute top-2 right-2 p-2 bg-black/50 hover:bg-black/70 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
-                            aria-label="View full size template"
-                          >
-                            <Maximize2 className="w-4 h-4" />
-                          </button>
-                        </div>
+                    {/* Template and Matched Region side-by-side comparison */}
+                    {(entry.templatePath || entry.imageData || entry.matchedRegionImage) && (
+                      <div className="flex gap-6 flex-wrap">
+                        {/* Template Image */}
+                        {(entry.templatePath || entry.imageData) && (
+                          <div className="space-y-2">
+                            <div className="text-xs text-muted-foreground font-medium">
+                              Template Image
+                            </div>
+                            <div className="relative group inline-block">
+                              <img
+                                src={
+                                  entry.imageData
+                                    ? `data:image/png;base64,${entry.imageData}`
+                                    : `file://${entry.templatePath}`
+                                }
+                                alt="Template"
+                                className="max-w-[200px] max-h-[200px] object-contain rounded-lg border border-border cursor-pointer hover:border-primary transition-colors"
+                                onClick={() => setTemplateViewerOpen(true)}
+                              />
+                              <button
+                                onClick={() => setTemplateViewerOpen(true)}
+                                className="absolute top-2 right-2 p-2 bg-black/50 hover:bg-black/70 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                                aria-label="View full size template"
+                              >
+                                <Maximize2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Matched Region Image (cropped from screenshot at match location) */}
+                        {entry.matchedRegionImage && (
+                          <div className="space-y-2">
+                            <div className="text-xs text-muted-foreground font-medium">
+                              Matched Region
+                              <span className="ml-1 text-xs opacity-60">(actual pixels)</span>
+                            </div>
+                            <div className="relative group inline-block">
+                              <img
+                                src={`data:image/png;base64,${entry.matchedRegionImage}`}
+                                alt="Matched region from screenshot"
+                                className={cn(
+                                  "max-w-[200px] max-h-[200px] object-contain rounded-lg border-2 cursor-pointer transition-colors",
+                                  entry.found
+                                    ? "border-green-500 hover:border-green-400"
+                                    : "border-red-500 hover:border-red-400",
+                                )}
+                                onClick={() => setMatchedRegionViewerOpen(true)}
+                              />
+                              <button
+                                onClick={() => setMatchedRegionViewerOpen(true)}
+                                className="absolute top-2 right-2 p-2 bg-black/50 hover:bg-black/70 text-white rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                                aria-label="View full size matched region"
+                              >
+                                <Maximize2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
-                    ) : null}
+                    )}
 
                     {/* Screenshot with annotations (full width) */}
                     {entry.visualDebugImage || entry.screenshotPath || entry.screenshotData ? (
@@ -272,7 +309,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                               entry.visualDebugImage
                                 ? `data:image/png;base64,${entry.visualDebugImage}`
                                 : entry.screenshotData
-                                  ? `data:image/png;base64,${entry.screenshotData}`
+                                  ? `data:image/jpeg;base64,${entry.screenshotData}`
                                   : `file://${entry.screenshotPath}`
                             }
                             alt="Search screenshot"
@@ -392,6 +429,14 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
           title="Full Size Template"
           isOpen={templateViewerOpen}
           onClose={() => setTemplateViewerOpen(false)}
+        />
+      )}
+      {entry.matchedRegionImage && (
+        <ImageViewer
+          imageData={entry.matchedRegionImage}
+          title="Matched Region"
+          isOpen={matchedRegionViewerOpen}
+          onClose={() => setMatchedRegionViewerOpen(false)}
         />
       )}
     </>

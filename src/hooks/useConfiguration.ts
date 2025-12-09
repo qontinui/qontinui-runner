@@ -32,6 +32,7 @@ interface UseConfigurationOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   onPythonStart?: () => Promise<boolean>;
   autoLoadOnMount?: boolean;
+  onLastConfigLoaded?: (workflowId: string | null, monitorIndex: number | null) => void;
 }
 
 interface UseConfigurationReturn {
@@ -50,7 +51,7 @@ interface UseConfigurationReturn {
  * Hook to manage configuration loading and state
  */
 export function useConfiguration(options: UseConfigurationOptions = {}): UseConfigurationReturn {
-  const { onLog, onPythonStart, autoLoadOnMount = true } = options;
+  const { onLog, onPythonStart, autoLoadOnMount = true, onLastConfigLoaded } = options;
 
   const [config, setConfig] = useState<Config | null>(null);
   const [configLoaded, setConfigLoaded] = useState(false);
@@ -203,14 +204,17 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
       const result: any = await invoke("get_last_config_path");
       if (result.success && result.data?.path) {
-        const workflowId = result.data?.workflow_id;
+        const workflowId = result.data?.workflow_id || null;
+        const monitorIndex = result.data?.monitor_index ?? null;
         onLog?.("info", `Auto-loading last config: ${result.data.path}`);
         await loadConfigFromPath(result.data.path, workflowId);
+        // Notify caller of last workflow and monitor selection
+        onLastConfigLoaded?.(workflowId, monitorIndex);
       }
     } catch (error) {
       console.log("No last config to auto-load:", error);
     }
-  }, [onLog, loadConfigFromPath]);
+  }, [onLog, loadConfigFromPath, onLastConfigLoaded]);
 
   /**
    * Load configuration via file dialog
@@ -251,9 +255,12 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
     try {
       const result: any = await invoke("get_last_config_path");
       if (result.success && result.data?.path) {
-        const workflowId = result.data?.workflow_id;
+        const workflowId = result.data?.workflow_id || null;
+        const monitorIndex = result.data?.monitor_index ?? null;
         onLog?.("info", `Loading last config: ${result.data.path}`);
         await loadConfigFromPath(result.data.path, workflowId);
+        // Notify caller of last workflow and monitor selection
+        onLastConfigLoaded?.(workflowId, monitorIndex);
       } else {
         onLog?.("warning", "No previous configuration found");
       }
@@ -261,7 +268,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
       console.error("[CONFIG] Error loading last config:", error);
       onLog?.("error", `Failed to load last configuration: ${error}`);
     }
-  }, [onLog, loadConfigFromPath]);
+  }, [onLog, loadConfigFromPath, onLastConfigLoaded]);
 
   /**
    * Auto-load configuration on mount (if enabled)

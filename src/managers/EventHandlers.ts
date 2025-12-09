@@ -125,6 +125,21 @@ export function setupEventHandlers(
     }),
   );
 
+  // Handler for "ai_output_stream" event - streams Claude's output in real-time
+  unsubscribers.push(
+    eventRouter.subscribe("ai_output_stream", (payload: any) => {
+      const data = payload.data;
+      if (!data) {
+        console.warn("[EVENT_HANDLER] ai_output_stream event has no data");
+        return;
+      }
+      const line = data.line || "";
+      const source = data.source || "ai";
+      const actionId = data.action_id;
+      logManager.addAiOutputLog(line, source, actionId);
+    }),
+  );
+
   console.log("[EVENT_HANDLERS] All event handlers registered");
 
   // Return cleanup function that unsubscribes all handlers

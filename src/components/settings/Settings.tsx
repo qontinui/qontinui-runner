@@ -7,34 +7,43 @@
 
 import { useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Wifi, Settings as SettingsIcon, HardDrive, Wrench } from "lucide-react";
+import { Wifi, Settings as SettingsIcon, HardDrive, Wrench, Download } from "lucide-react";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
-import { useProjectSelection } from "../../hooks";
+import { UpdateSettings } from "./UpdateSettings";
+import type { Project } from "../../types/auth";
 
 interface SettingsProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   onDebugModeChange: (enabled: boolean) => void;
+  projects: Project[];
+  selectedProjectId: string | null;
+  onProjectSelect: (projectId: string | null) => void;
+  onLoadProjects: () => Promise<void>;
 }
 
-type SettingsTab = "connection" | "general" | "storage" | "advanced";
+type SettingsTab = "connection" | "general" | "storage" | "advanced" | "updates";
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
-export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
+export function Settings({
+  onLog,
+  onDebugModeChange,
+  projects,
+  selectedProjectId,
+  onProjectSelect,
+  onLoadProjects,
+}: SettingsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // Load persisted tab on mount
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored && ["connection", "general", "storage", "advanced"].includes(stored)) {
+    if (stored && ["connection", "general", "storage", "advanced", "updates"].includes(stored)) {
       return stored as SettingsTab;
     }
     return "connection";
   });
-
-  // Shared project selection state
-  const projectSelection = useProjectSelection();
 
   // Persist active tab
   useEffect(() => {
@@ -46,6 +55,7 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
     { id: "general" as const, label: "Preferences", icon: SettingsIcon },
     { id: "storage" as const, label: "Storage", icon: HardDrive },
     { id: "advanced" as const, label: "Debug", icon: Wrench },
+    { id: "updates" as const, label: "Updates", icon: Download },
   ];
 
   return (
@@ -98,10 +108,10 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
         <Tabs.Content value="connection" className="outline-none">
           <AuthConnectionSettings
             onLog={onLog}
-            projects={projectSelection.projects}
-            selectedProjectId={projectSelection.selectedProjectId}
-            onProjectSelect={projectSelection.setSelectedProject}
-            onLoadProjects={projectSelection.loadProjects}
+            projects={projects}
+            selectedProjectId={selectedProjectId}
+            onProjectSelect={onProjectSelect}
+            onLoadProjects={onLoadProjects}
           />
         </Tabs.Content>
 
@@ -115,6 +125,10 @@ export function Settings({ onLog, onDebugModeChange }: SettingsProps) {
 
         <Tabs.Content value="advanced" className="outline-none">
           <AdvancedSettings onLog={onLog} onDebugModeChange={onDebugModeChange} />
+        </Tabs.Content>
+
+        <Tabs.Content value="updates" className="outline-none">
+          <UpdateSettings onLog={onLog} />
         </Tabs.Content>
       </div>
     </Tabs.Root>

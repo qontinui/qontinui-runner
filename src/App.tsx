@@ -11,7 +11,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Play, Camera, Settings as SettingsIcon, ScrollText } from "lucide-react";
+import { Play, Camera, Settings as SettingsIcon, ScrollText, Globe, Package } from "lucide-react";
 
 // Contexts
 import { ExecutionProvider, useExecution, EventManagerProvider } from "./contexts";
@@ -36,6 +36,8 @@ import { ConfigurationPanel } from "./components/ConfigurationPanel";
 import { ExecutionControlPanel } from "./components/ExecutionControlPanel";
 import { LogsTab } from "./components/LogsTab";
 import { CaptureTab } from "./components/CaptureTab";
+import { ExtractionTab } from "./components/ExtractionTab";
+import { DatasetPackager } from "./components/DatasetPackager";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
@@ -44,8 +46,8 @@ import { LoginScreen } from "./components/LoginScreen";
 // Styles
 import "./index.css";
 
-type MainTab = "run" | "logs" | "capture" | "settings";
-type LogSubTab = "general" | "image" | "actions";
+type MainTab = "run" | "logs" | "capture" | "extract" | "dataset" | "settings";
+type LogSubTab = "general" | "image" | "actions" | "ai";
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
@@ -62,7 +64,7 @@ function AppContent() {
   // Main tab state
   const [activeMainTab, setActiveMainTab] = useState<MainTab>(() => {
     const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
-    if (stored && ["run", "logs", "capture", "settings"].includes(stored)) {
+    if (stored && ["run", "logs", "capture", "extract", "dataset", "settings"].includes(stored)) {
       return stored as MainTab;
     }
     return "run";
@@ -80,12 +82,15 @@ function AppContent() {
   const {
     logs,
     imageLogs,
+    aiOutputLogs,
     addLog,
     clearGeneralLogs,
     clearImageLogs,
+    clearAiOutputLogs,
     copyLogs,
     logCount,
     imageLogCount,
+    aiOutputLogCount,
   } = useLogManager();
 
   // Action log view
@@ -110,6 +115,14 @@ function AppContent() {
   // Project selection (shared between Capture and Settings)
   const projectSelection = useProjectSelection();
 
+  // Auto-load projects when authenticated
+  useEffect(() => {
+    if (auth.authStatus?.authenticated && !auth.loading) {
+      console.log("[APP] User authenticated, loading projects");
+      projectSelection.loadProjects();
+    }
+  }, [auth.authStatus?.authenticated, auth.loading]);
+
   // Setup event handlers on mount (ONCE only)
   useEffect(() => {
     console.log("[APP] Setting up event handlers");
@@ -132,12 +145,12 @@ function AppContent() {
 
   // Event handlers
   const handleWorkflowSelect = (workflowId: string) => {
-    execution.setSelectedWorkflow(workflowId);
+    execution.selectWorkflowWithPersistence(workflowId);
     uiState.setShowWorkflowDropdown(false);
   };
 
   const handleMonitorSelect = (index: number) => {
-    execution.setSelectedMonitor(index);
+    execution.selectMonitorWithPersistence(index);
     uiState.setShowMonitorDropdown(false);
   };
 
@@ -165,6 +178,7 @@ function AppContent() {
   const clearAllLogs = async () => {
     clearGeneralLogs();
     clearImageLogs();
+    clearAiOutputLogs();
     await clearActionLogs();
   };
 
@@ -189,6 +203,8 @@ function AppContent() {
     { id: "run" as const, label: "Run", icon: Play },
     { id: "logs" as const, label: "Logs", icon: ScrollText },
     { id: "capture" as const, label: "Capture", icon: Camera },
+    { id: "extract" as const, label: "Extract", icon: Globe },
+    { id: "dataset" as const, label: "Dataset", icon: Package },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
   ];
 
@@ -287,9 +303,12 @@ function AppContent() {
                 actionLogLoading={actionLogLoading}
                 actionLogError={actionLogError}
                 onActionRowClick={modalState.openActionModal}
+                aiOutputLines={aiOutputLogs}
+                onClearAiOutput={clearAiOutputLogs}
                 logCount={logCount}
                 imageLogCount={imageLogCount}
                 actionCount={actionLogViewData?.visible_count || 0}
+                aiOutputCount={aiOutputLogCount}
                 onClearGeneralLogs={clearGeneralLogs}
                 onClearImageLogs={clearImageLogs}
                 onClearActionLogs={clearActionLogs}
@@ -311,6 +330,20 @@ function AppContent() {
             />
           </Tabs.Content>
 
+          {/* Extract Tab */}
+          <Tabs.Content value="extract" className="h-full outline-none overflow-y-auto">
+            <ExtractionTab
+              onLog={addLog}
+              projects={projectSelection.projects}
+              selectedProjectId={projectSelection.selectedProjectId}
+            />
+          </Tabs.Content>
+
+          {/* Dataset Tab */}
+          <Tabs.Content value="dataset" className="h-full outline-none overflow-y-auto">
+            <DatasetPackager />
+          </Tabs.Content>
+
           {/* Settings Tab */}
           <Tabs.Content value="settings" className="h-full outline-none">
             <div className="h-full">
@@ -329,6 +362,10 @@ function AppContent() {
                     addLog("error", `Failed to set debug mode: ${error}`);
                   }
                 }}
+                projects={projectSelection.projects}
+                selectedProjectId={projectSelection.selectedProjectId}
+                onProjectSelect={projectSelection.setSelectedProject}
+                onLoadProjects={projectSelection.loadProjects}
               />
             </div>
           </Tabs.Content>

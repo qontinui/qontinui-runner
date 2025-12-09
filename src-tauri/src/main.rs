@@ -110,8 +110,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::get_current_configuration,
             commands::config::get_last_config_path,
             commands::config::save_last_workflow_id,
+            commands::config::save_last_monitor_index,
             commands::config::get_auto_load_last_config,
             commands::config::save_auto_load_last_config,
+            // Dataset commands
+            commands::dataset::scan_local_images,
+            commands::dataset::package_dataset,
             // Execution commands
             commands::execution::start_python_executor,
             commands::execution::stop_python_executor,
@@ -121,6 +125,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution::get_monitors,
             commands::execution::handle_error,
             commands::execution::check_for_updates,
+            commands::execution::install_update,
             commands::execution::open_folder,
             commands::execution::update_capture_settings,
             // State machine commands
@@ -157,11 +162,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::extraction::export_training_data,
             commands::extraction::export_state_structure,
             commands::extraction::list_extractions,
+            // Web extraction backend integration commands
+            commands::extraction::create_extraction_session,
+            commands::extraction::update_extraction_session,
+            commands::extraction::upload_extraction_annotations,
+            commands::extraction::upload_state_structure,
+            commands::extraction::get_project_extractions,
             // Screenshot capture commands
             commands::screenshot::get_screenshot_monitors,
             commands::screenshot::capture_screenshot,
             commands::screenshot::capture_and_upload_screenshot,
             commands::screenshot::capture_screenshot_via_python,
+            // Logging commands
+            commands::logging::append_ai_output_log,
+            commands::logging::clear_ai_output_log,
+            commands::logging::get_ai_output_log_path_cmd,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

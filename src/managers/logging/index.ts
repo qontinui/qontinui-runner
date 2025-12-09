@@ -5,7 +5,7 @@
  */
 
 export { LogStore } from "./LogStore";
-export type { LogEntry, ImageRecognitionEntry } from "./LogStore";
+export type { LogEntry, ImageRecognitionEntry, AiOutputEntry } from "./LogStore";
 
 export { LogFilter } from "./LogFilter";
 

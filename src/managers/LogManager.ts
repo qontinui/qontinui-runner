@@ -10,11 +10,12 @@
  * - Handle deduplication of consecutive log messages
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import { LogStore, LogFilter, LogFormatter, TimestampFormatter, ImageLogHandler } from "./logging";
-import type { LogEntry, ImageRecognitionEntry, ActionLogEntry } from "./logging";
+import type { LogEntry, ImageRecognitionEntry, ActionLogEntry, AiOutputEntry } from "./logging";
 
 // Re-export types for backward compatibility
-export type { LogEntry, ImageRecognitionEntry };
+export type { LogEntry, ImageRecognitionEntry, AiOutputEntry };
 
 type LogListener = () => void;
 
@@ -99,6 +100,40 @@ class LogManager {
   }
 
   /**
+   * Add an AI output log entry
+   */
+  addAiOutputLog(line: string, source: string, actionId?: string): void {
+    const entry: AiOutputEntry = {
+      id: `ai-${Date.now()}-${Math.random()}`,
+      timestamp: Date.now(),
+      line,
+      source,
+      actionId,
+    };
+    this.logStore.addAiOutputLog(entry);
+
+    // Persist to file for QA feedback loop
+    invoke("append_ai_output_log", {
+      entry: {
+        id: entry.id,
+        timestamp: entry.timestamp,
+        line: entry.line,
+        source: entry.source,
+        action_id: entry.actionId,
+      },
+    }).catch((err) => {
+      console.warn("[LogManager] Failed to persist AI output log:", err);
+    });
+  }
+
+  /**
+   * Get all AI output logs
+   */
+  getAiOutputLogs(): AiOutputEntry[] {
+    return this.logStore.getAiOutputLogs();
+  }
+
+  /**
    * Clear general logs
    */
   clearGeneralLogs(): void {
@@ -114,11 +149,19 @@ class LogManager {
   }
 
   /**
+   * Clear AI output logs
+   */
+  clearAiOutputLogs(): void {
+    this.logStore.clearAiOutputLogs();
+  }
+
+  /**
    * Clear all logs
    */
   clearAllLogs(): void {
     this.clearGeneralLogs();
     this.clearImageLogs();
+    this.clearAiOutputLogs();
   }
 
   /**
@@ -165,6 +208,13 @@ class LogManager {
    */
   getImageLogCount(): number {
     return this.logStore.getImageLogCount();
+  }
+
+  /**
+   * Get AI output log count
+   */
+  getAiOutputLogCount(): number {
+    return this.logStore.getAiOutputLogCount();
   }
 }
 

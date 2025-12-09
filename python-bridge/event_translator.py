@@ -418,6 +418,14 @@ class EventTranslator:
                     file=sys.stderr,
                 )
 
+            # Pass through matched_region_image (cropped region from screenshot at match location)
+            if data.get("matched_region_image"):
+                frontend_data["matched_region_image"] = data.get("matched_region_image")
+                print(
+                    f"[EventTranslator] Including matched_region_image (length={len(data.get('matched_region_image'))})",
+                    file=sys.stderr,
+                )
+
             # Pass through debug data for match details
             if data.get("debug"):
                 frontend_data["debug"] = data.get("debug")

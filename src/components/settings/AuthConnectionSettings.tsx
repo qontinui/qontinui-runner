@@ -7,7 +7,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { X, Wifi, Cloud, LogOut, User, Tag } from "lucide-react";
+import { X, Wifi, Cloud, LogOut, User, Tag, ChevronDown, Check } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { useAuth } from "../AuthProvider";
 import type { ConnectionInfo, Project } from "../../types/auth";
@@ -37,6 +37,10 @@ export function AuthConnectionSettings({
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Project dropdown state
+  const [showProjectDropdown, setShowProjectDropdown] = useState(false);
+  const projectDropdownRef = useRef<HTMLDivElement>(null);
+
   // Runner name state - persisted in localStorage
   const [runnerName, setRunnerName] = useState<string>(() => {
     return localStorage.getItem(RUNNER_NAME_STORAGE_KEY) || "";
@@ -57,6 +61,25 @@ export function AuthConnectionSettings({
       onLoadProjects();
     }
   }, [auth.authStatus?.authenticated, onLoadProjects]);
+
+  // Close project dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (
+        projectDropdownRef.current &&
+        !projectDropdownRef.current.contains(event.target as Node)
+      ) {
+        setShowProjectDropdown(false);
+      }
+    };
+
+    if (showProjectDropdown) {
+      document.addEventListener("mousedown", handleClickOutside);
+    }
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+    };
+  }, [showProjectDropdown]);
 
   // Send heartbeat periodically when connected
   useEffect(() => {
@@ -323,26 +346,59 @@ export function AuthConnectionSettings({
           </div>
 
           <div className="space-y-2">
-            <label className="block">
-              <div className="font-medium mb-1">Project</div>
-              <div className="text-sm text-muted-foreground mb-3">
-                Choose which project this runner should connect to. This selection is used across
-                all features that require a project.
-              </div>
-              <select
-                value={selectedProjectId || ""}
-                onChange={(e) => onProjectSelect(e.target.value || null)}
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
-                disabled={connected}
+            <div className="font-medium mb-1">Project</div>
+            <div className="text-sm text-muted-foreground mb-3">
+              Choose which project this runner should connect to. This selection is used across
+              all features that require a project.
+            </div>
+            <div className="relative" ref={projectDropdownRef}>
+              <button
+                type="button"
+                onClick={() => !connected && setShowProjectDropdown(!showProjectDropdown)}
+                className={`w-full px-3 py-2 bg-input border border-border/50 rounded-md flex items-center justify-between gap-2 text-left transition-colors ${
+                  connected
+                    ? "opacity-60 cursor-default"
+                    : "hover:border-border cursor-pointer"
+                }`}
               >
-                <option value="">Select a project...</option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.name}
-                  </option>
-                ))}
-              </select>
-            </label>
+                <span className={selectedProjectId ? "" : "text-muted-foreground"}>
+                  {selectedProjectId
+                    ? projects.find((p) => p.id === selectedProjectId)?.name || "Select a project..."
+                    : "Select a project..."}
+                </span>
+                {!connected && (
+                  <ChevronDown
+                    className={`w-4 h-4 flex-shrink-0 transition-transform ${showProjectDropdown ? "rotate-180" : ""}`}
+                  />
+                )}
+              </button>
+
+              {showProjectDropdown && !connected && (
+                <div className="absolute z-20 w-full mt-1 bg-card border border-border rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                  {projects.map((project) => (
+                    <button
+                      key={project.id}
+                      type="button"
+                      onClick={() => {
+                        onProjectSelect(project.id);
+                        setShowProjectDropdown(false);
+                      }}
+                      className="w-full px-3 py-2 text-left hover:bg-muted/50 transition-colors flex items-center justify-between gap-2 first:rounded-t-lg last:rounded-b-lg"
+                    >
+                      <span>{project.name}</span>
+                      {selectedProjectId === project.id && (
+                        <Check className="w-4 h-4 text-primary" />
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {connected && (
+              <div className="text-sm text-muted-foreground mt-2">
+                Disconnect to change projects.
+              </div>
+            )}
           </div>
         </div>
       )}

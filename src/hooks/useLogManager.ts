@@ -21,7 +21,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { logManager, LogEntry, ImageRecognitionEntry } from "../managers";
+import { logManager, LogEntry, ImageRecognitionEntry, AiOutputEntry } from "../managers";
 
 export interface UseLogManagerResult {
   /** General log entries */
@@ -30,11 +30,17 @@ export interface UseLogManagerResult {
   /** Image recognition log entries */
   imageLogs: ImageRecognitionEntry[];
 
+  /** AI output log entries */
+  aiOutputLogs: AiOutputEntry[];
+
   /** Add a general log entry */
   addLog: (level: LogEntry["level"], message: string) => void;
 
   /** Add an image recognition log entry */
   addImageLog: (entry: ImageRecognitionEntry) => void;
+
+  /** Add an AI output log entry */
+  addAiOutputLog: (line: string, source: string, actionId?: string) => void;
 
   /** Get filtered logs by level */
   getFilteredLogs: (level: string) => LogEntry[];
@@ -44,6 +50,9 @@ export interface UseLogManagerResult {
 
   /** Clear image logs */
   clearImageLogs: () => void;
+
+  /** Clear AI output logs */
+  clearAiOutputLogs: () => void;
 
   /** Clear all logs */
   clearAllLogs: () => void;
@@ -56,6 +65,9 @@ export interface UseLogManagerResult {
 
   /** Get image log count */
   imageLogCount: number;
+
+  /** Get AI output log count */
+  aiOutputLogCount: number;
 }
 
 /**
@@ -64,17 +76,20 @@ export interface UseLogManagerResult {
 export function useLogManager(): UseLogManagerResult {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [imageLogs, setImageLogs] = useState<ImageRecognitionEntry[]>([]);
+  const [aiOutputLogs, setAiOutputLogs] = useState<AiOutputEntry[]>([]);
 
   // Subscribe to log changes
   useEffect(() => {
     // Initial fetch
     setLogs(logManager.getGeneralLogs());
     setImageLogs(logManager.getImageLogs());
+    setAiOutputLogs(logManager.getAiOutputLogs());
 
     // Subscribe to changes
     const unsubscribe = logManager.subscribe(() => {
       setLogs(logManager.getGeneralLogs());
       setImageLogs(logManager.getImageLogs());
+      setAiOutputLogs(logManager.getAiOutputLogs());
     });
 
     return unsubscribe;
@@ -89,6 +104,10 @@ export function useLogManager(): UseLogManagerResult {
     logManager.addImageLog(entry);
   }, []);
 
+  const addAiOutputLog = useCallback((line: string, source: string, actionId?: string) => {
+    logManager.addAiOutputLog(line, source, actionId);
+  }, []);
+
   const getFilteredLogs = useCallback((level: string) => {
     return logManager.getFilteredLogs(level);
   }, []);
@@ -99,6 +118,10 @@ export function useLogManager(): UseLogManagerResult {
 
   const clearImageLogs = useCallback(() => {
     logManager.clearImageLogs();
+  }, []);
+
+  const clearAiOutputLogs = useCallback(() => {
+    logManager.clearAiOutputLogs();
   }, []);
 
   const clearAllLogs = useCallback(() => {
@@ -115,14 +138,18 @@ export function useLogManager(): UseLogManagerResult {
   return {
     logs,
     imageLogs,
+    aiOutputLogs,
     addLog,
     addImageLog,
+    addAiOutputLog,
     getFilteredLogs,
     clearGeneralLogs,
     clearImageLogs,
+    clearAiOutputLogs,
     clearAllLogs,
     copyLogs,
     logCount: logManager.getLogCount(),
     imageLogCount: logManager.getImageLogCount(),
+    aiOutputLogCount: logManager.getAiOutputLogCount(),
   };
 }

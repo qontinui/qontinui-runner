@@ -402,7 +402,31 @@ class QontinuiExecutor:
         Returns:
             True if successful, False otherwise
         """
+        # DEBUG: Log config loading
+        import os
+        import tempfile
+        debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_load_config_debug.log")
+        try:
+            with open(debug_log_path, "a") as f:
+                from datetime import datetime
+                f.write(f"\n=== LOAD_CONFIGURATION DEBUG {datetime.now()} ===\n")
+                f.write(f"config_path: {config_path}\n")
+                f.write(f"QONTINUI_AVAILABLE: {QONTINUI_AVAILABLE}\n")
+                f.flush()
+        except Exception:
+            pass
+
         success = self.executor_core.load_configuration(config_path)
+
+        # DEBUG: Log result
+        try:
+            with open(debug_log_path, "a") as f:
+                f.write(f"executor_core.load_configuration returned: {success}\n")
+                f.write(f"executor_core.action_executor: {self.executor_core.action_executor}\n")
+                f.write(f"executor_core.state_executor: {self.executor_core.state_executor}\n")
+                f.flush()
+        except Exception:
+            pass
 
         if success:
             # Store reference to config
@@ -463,15 +487,15 @@ class QontinuiExecutor:
         Args:
             workflow_id: ID of the workflow to execute
             monitor: Monitor index to use for screen capture and actions (None = default)
-            monitor_offset_x: X offset for monitor coordinates (from Rust)
-            monitor_offset_y: Y offset for monitor coordinates (from Rust)
+            monitor_offset_x: DEPRECATED - X offset (ignored, library looks up internally)
+            monitor_offset_y: DEPRECATED - Y offset (ignored, library looks up internally)
         """
-        self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})")
+        self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}")
         # Write to debug file for monitor tracing
         try:
             with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n")
+                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}\n")
         except Exception:
             pass
 
@@ -506,42 +530,27 @@ class QontinuiExecutor:
                         "debug", f"Set FrameworkSettings.monitor.default_screen_index = {monitor}"
                     )
 
-                    # Set monitor offset on state_executor for coordinate conversion
-                    # The offset comes from Rust which has accurate multi-monitor detection
+                    # Set target monitor on state_executor for coordinate conversion
+                    # The library looks up monitor position internally using MSS
                     if self.executor_core and self.executor_core.state_executor:
-                        if monitor_offset_x is not None and monitor_offset_y is not None:
-                            self.executor_core.state_executor.set_monitor_offset(
-                                monitor_index=monitor,
-                                offset_x=monitor_offset_x,
-                                offset_y=monitor_offset_y,
-                            )
-                            self.event_manager.emit_log(
-                                "debug",
-                                f"Set monitor offset from Rust: index={monitor}, x={monitor_offset_x}, y={monitor_offset_y}"
-                            )
-                            # Write to debug file
-                            try:
-                                with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
-                                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                    f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set monitor offset from Rust: index={monitor}, x={monitor_offset_x}, y={monitor_offset_y}\n")
-                            except Exception:
-                                pass
-                        else:
-                            self.event_manager.emit_log(
-                                "warning", f"No monitor offset provided from Rust for monitor {monitor}"
-                            )
-                            try:
-                                with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
-                                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                    f.write(f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: No monitor offset from Rust for monitor {monitor}\n")
-                            except Exception:
-                                pass
-                    else:
-                        # Debug: Log why we couldn't set monitor offset
+                        self.executor_core.state_executor.set_monitor(monitor)
+                        self.event_manager.emit_log(
+                            "debug",
+                            f"Set target monitor: {monitor} (library will look up position via MSS)"
+                        )
+                        # Write to debug file
                         try:
                             with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
                                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor offset - executor_core or state_executor is None\n")
+                                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set target monitor: {monitor}\n")
+                        except Exception:
+                            pass
+                    else:
+                        # Debug: Log why we couldn't set monitor
+                        try:
+                            with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor - executor_core or state_executor is None\n")
                         except Exception:
                             pass
                 except Exception as e:
@@ -574,6 +583,27 @@ class QontinuiExecutor:
             # Reset navigation state
             if self.gui_automation:
                 self.gui_automation.reset_navigation_state()
+
+            # Initialize state executor with workflow's initial states (if any)
+            if self.executor_core and self.executor_core.state_executor:
+                workflow = self.executor_core.workflows.get(workflow_id)
+                if workflow:
+                    # Get initialStateIds from workflow (handles both dict and object)
+                    initial_state_ids = None
+                    if isinstance(workflow, dict):
+                        initial_state_ids = workflow.get("initialStateIds")
+                    elif hasattr(workflow, "initial_state_ids"):
+                        initial_state_ids = workflow.initial_state_ids
+
+                    if initial_state_ids:
+                        self.event_manager.emit_log(
+                            "info", f"Initializing with workflow initial states: {initial_state_ids}"
+                        )
+                        self.executor_core.state_executor.initialize(initial_state_ids)
+                    else:
+                        self.executor_core.state_executor.initialize()
+                else:
+                    self.executor_core.state_executor.initialize()
 
             # Execute workflow
             success = self.gui_automation.execute_workflow(workflow_id)
@@ -808,7 +838,10 @@ class QontinuiExecutor:
         elif cmd_type == "start":
             workflow_id = params.get("workflow_id") or params.get("workflow")
             # Support both "monitor" and "monitor_index" parameter names
-            monitor = params.get("monitor_index") or params.get("monitor")  # Monitor index to use
+            # Use explicit None check to handle monitor_index=0 correctly (0 is falsy in Python)
+            monitor = params.get("monitor_index")
+            if monitor is None:
+                monitor = params.get("monitor")  # Monitor index to use
             # Get monitor offset from Rust (if provided)
             monitor_offset_x = params.get("monitor_offset_x")
             monitor_offset_y = params.get("monitor_offset_y")

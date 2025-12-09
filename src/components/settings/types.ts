@@ -86,3 +86,13 @@ export type LogFunction = (
   level: "info" | "warning" | "error" | "debug" | "success",
   message: string,
 ) => void;
+
+export interface UpdateInfo {
+  available: boolean;
+  version?: string;
+  current_version?: string;
+  notes?: string;
+  development?: boolean;
+}
+
+export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | "error";

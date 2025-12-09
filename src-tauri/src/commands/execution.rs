@@ -107,6 +107,18 @@ pub fn start_python_executor(
 ///
 /// Gracefully shuts down the Python process and clears the bridge instance.
 ///
+/// This command is intentionally not exposed in the UI. The executor auto-starts
+/// on app launch and stays running between workflow runs. Users control workflows
+/// via `start_execution`/`stop_execution`, not the underlying executor.
+///
+/// This command exists for:
+/// - Internal use during app shutdown
+/// - Recovery scenarios (stuck executor)
+/// - MCP API access for debugging
+///
+/// Normal users should never need to stop the executor directly - if it's broken,
+/// restarting the app is simpler than managing executor lifecycle manually.
+///
 /// # Arguments
 /// * `state` - Application state containing the Python bridge
 ///
@@ -144,6 +156,9 @@ pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandRespon
 /// * `monitor_index` - The monitor to capture (defaults to 0)
 /// * `state` - Application state containing the Python bridge
 ///
+/// Note: Monitor offset calculation is handled by the qontinui Python library
+/// using MSS, ensuring coordinate consistency with screenshot capture.
+///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success message
 /// * `Err(String)` - Error if executor not running or workflow ID missing
@@ -164,10 +179,13 @@ pub fn start_execution(
         let mut params = serde_json::Map::new();
 
         // Add monitor index (default to 0 if not provided)
+        // Note: The qontinui Python library handles offset calculation internally via MSS
+        let resolved_monitor = monitor_index.unwrap_or(0);
         params.insert(
             "monitor_index".to_string(),
-            serde_json::json!(monitor_index.unwrap_or(0)),
+            serde_json::json!(resolved_monitor),
         );
+        debug!("Using monitor index: {}", resolved_monitor);
 
         // Add workflow_id (required)
         if let Some(pid) = process_id {
@@ -286,6 +304,12 @@ pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandRespons
 /// Detect and return information about system monitors.
 ///
 /// Returns details about all connected monitors including position, size, and primary status.
+/// Uses Tauri's window API to get **logical (DPI-scaled) coordinates**.
+///
+/// Note: This is distinct from `get_screenshot_monitors` in screenshot.rs, which uses
+/// qontinui-api for physical pixel coordinates. Use this command for workflow execution
+/// monitor selection, and `get_screenshot_monitors` when capturing screenshots at
+/// physical resolution.
 ///
 /// # Arguments
 /// * `app_handle` - Tauri application handle for window access
@@ -408,6 +432,7 @@ pub async fn check_for_updates(
                         data: Some(serde_json::json!({
                             "available": true,
                             "version": update.version.to_string(),
+                            "current_version": env!("CARGO_PKG_VERSION"),
                             "notes": update.body,
                         })),
                     })
@@ -419,6 +444,7 @@ pub async fn check_for_updates(
                         message: Some("No updates available".to_string()),
                         data: Some(serde_json::json!({
                             "available": false,
+                            "current_version": env!("CARGO_PKG_VERSION"),
                         })),
                     })
                 }
@@ -442,6 +468,93 @@ pub async fn check_for_updates(
             message: Some("Update check disabled in development".to_string()),
             data: Some(serde_json::json!({
                 "available": false,
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "development": true,
+            })),
+        })
+    }
+}
+
+/// Download and install an available update.
+///
+/// In release builds, downloads and installs the update, then restarts the application.
+/// In debug builds, returns a development mode message.
+///
+/// # Arguments
+/// * `app_handle` - Tauri application handle for updater access
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message (note: app will restart on success)
+/// * `Err(String)` - Error if update installation fails
+#[tauri::command]
+pub async fn install_update(
+    #[allow(unused_variables)] app_handle: AppHandle,
+) -> Result<CommandResponse, String> {
+    info!("Installing update");
+
+    #[cfg(not(debug_assertions))]
+    {
+        use tauri_plugin_updater::UpdaterExt;
+
+        match app_handle.updater_builder().build() {
+            Ok(updater) => match updater.check().await {
+                Ok(Some(update)) => {
+                    info!("Downloading update version {}", update.version);
+
+                    // Download and install the update
+                    match update
+                        .download_and_install(|_chunk_length, _content_length| {}, || {})
+                        .await
+                    {
+                        Ok(_) => {
+                            info!("Update installed successfully, restarting application");
+                            Ok(CommandResponse {
+                                success: true,
+                                message: Some(
+                                    "Update installed. The application will restart.".to_string(),
+                                ),
+                                data: Some(serde_json::json!({
+                                    "installed": true,
+                                    "version": update.version.to_string(),
+                                })),
+                            })
+                        }
+                        Err(e) => {
+                            error!("Failed to install update: {}", e);
+                            Err(format!("Failed to install update: {}", e))
+                        }
+                    }
+                }
+                Ok(None) => {
+                    info!("No update available to install");
+                    Ok(CommandResponse {
+                        success: false,
+                        message: Some("No update available".to_string()),
+                        data: Some(serde_json::json!({
+                            "installed": false,
+                        })),
+                    })
+                }
+                Err(e) => {
+                    error!("Failed to check for updates: {}", e);
+                    Err(format!("Failed to check for updates: {}", e))
+                }
+            },
+            Err(e) => {
+                error!("Failed to build updater: {}", e);
+                Err(format!("Failed to build updater: {}", e))
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        info!("Update installation skipped in development mode");
+        Ok(CommandResponse {
+            success: false,
+            message: Some("Updates are disabled in development mode".to_string()),
+            data: Some(serde_json::json!({
+                "installed": false,
                 "development": true,
             })),
         })

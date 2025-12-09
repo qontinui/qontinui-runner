@@ -43,3 +43,6 @@ axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 urlencoding = "2.1"
+zip = "0.6"
+sha2 = "0.10"
+rand = { version = "0.8", features = ["std_rng"] }

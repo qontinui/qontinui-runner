@@ -117,6 +117,27 @@ ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
         icon="move",
         description="Move mouse to coordinates or image target",
     ),
+    "SHELL": ActionDefinition(
+        type="SHELL",
+        is_expandable=False,
+        requires_library=True,
+        icon="terminal",
+        description="Execute a shell command",
+    ),
+    "SHELL_SCRIPT": ActionDefinition(
+        type="SHELL_SCRIPT",
+        is_expandable=False,
+        requires_library=True,
+        icon="file-code",
+        description="Execute a multi-line shell script",
+    ),
+    "TRIGGER_AI_ANALYSIS": ActionDefinition(
+        type="TRIGGER_AI_ANALYSIS",
+        is_expandable=False,
+        requires_library=True,
+        icon="brain",
+        description="Trigger an AI assistant to analyze automation results and fix issues",
+    ),
 }
 
 

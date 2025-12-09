@@ -118,9 +118,10 @@ pub fn get_current_configuration(state: State<Arc<AppState>>) -> Result<Qontinui
 /// Get the path of the last loaded configuration file.
 ///
 /// Returns the path if it exists and the file is still present on disk.
+/// Also returns the last workflow_id and monitor_index if saved.
 ///
 /// # Returns
-/// * `Ok(CommandResponse)` - Success with path and workflow_id, or message if not found
+/// * `Ok(CommandResponse)` - Success with path, workflow_id, and monitor_index, or message if not found
 /// * `Err(String)` - Error message if settings cannot be read
 #[tauri::command]
 pub fn get_last_config_path() -> Result<CommandResponse, String> {
@@ -130,12 +131,14 @@ pub fn get_last_config_path() -> Result<CommandResponse, String> {
         // Check if the file still exists
         if std::path::Path::new(&path).exists() {
             let workflow_id = settings::get_last_workflow_id();
+            let monitor_index = settings::get_last_monitor_index();
             Ok(CommandResponse {
                 success: true,
                 message: Some(format!("Last config found: {}", path)),
                 data: Some(serde_json::json!({
                     "path": path,
-                    "workflow_id": workflow_id
+                    "workflow_id": workflow_id,
+                    "monitor_index": monitor_index
                 })),
             })
         } else {
@@ -176,6 +179,28 @@ pub fn save_last_workflow_id(workflow_id: String) -> Result<CommandResponse, Str
     Ok(CommandResponse {
         success: true,
         message: Some("Last workflow ID saved".to_string()),
+        data: None,
+    })
+}
+
+/// Save the last used monitor index to persistent settings.
+///
+/// # Arguments
+/// * `monitor_index` - The monitor index to save
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message
+/// * `Err(String)` - Error if settings cannot be saved
+#[tauri::command]
+pub fn save_last_monitor_index(monitor_index: i32) -> Result<CommandResponse, String> {
+    info!("Saving last monitor index: {}", monitor_index);
+
+    settings::save_last_monitor_index(monitor_index)
+        .map_err(|e| format!("Failed to save last monitor index: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Last monitor index saved".to_string()),
         data: None,
     })
 }

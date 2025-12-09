@@ -3,5 +3,6 @@ export { AuthConnectionSettings } from "./AuthConnectionSettings";
 export { GeneralSettings } from "./GeneralSettings";
 export { StorageSettings } from "./StorageSettings";
 export { AdvancedSettings } from "./AdvancedSettings";
+export { UpdateSettings } from "./UpdateSettings";
 export { SectionHeader } from "./SectionHeader";
 export * from "./types";

@@ -5,19 +5,24 @@
 //! - Monitoring extraction progress
 //! - Exporting training data
 //! - Managing screenshots
+//! - Creating extraction sessions in qontinui-web
 
 use super::{AppState, CommandResponse};
+use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::State;
-use tracing::info;
+use tracing::{error, info, warn};
 
 /// Configuration for web extraction
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebExtractionConfig {
     pub urls: Vec<String>,
+    /// Multiple viewports to test (optional)
     pub viewports: Option<Vec<(i32, i32)>>,
+    /// Single viewport from frontend (preferred)
+    pub viewport: Option<(i32, i32)>,
     pub capture_hover_states: Option<bool>,
     pub capture_focus_states: Option<bool>,
     pub capture_scroll_states: Option<bool>,
@@ -303,4 +308,470 @@ pub fn list_extractions(state: State<Arc<AppState>>) -> Result<CommandResponse, 
     } else {
         Err("Python executor not initialized".to_string())
     }
+}
+
+// ============================================================================
+// Web Backend Integration Commands
+// ============================================================================
+
+/// Get API base URL for qontinui-web backend
+fn get_api_base_url() -> String {
+    std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            "http://localhost:8000".to_string()
+        } else {
+            "https://qontinui-prod-py.eba-km2u4s23.eu-central-1.elasticbeanstalk.com".to_string()
+        }
+    })
+}
+
+/// Request to create an extraction session in qontinui-web
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateExtractionSessionRequest {
+    pub project_id: String,
+    pub source_urls: Vec<String>,
+    pub config: WebExtractionConfig,
+}
+
+/// Response from creating an extraction session
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractionSessionResponse {
+    pub id: String,
+    pub project_id: String,
+    pub source_urls: Vec<String>,
+    pub config: Value,
+    pub status: String,
+    pub stats: Value,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub completed_at: Option<String>,
+    pub created_by: Option<String>,
+}
+
+/// Create an extraction session in qontinui-web backend
+///
+/// This creates a record of the extraction session on the web backend,
+/// which can then be used to track progress and store results.
+#[tauri::command]
+pub async fn create_extraction_session(
+    request: CreateExtractionSessionRequest,
+) -> Result<ExtractionSessionResponse, String> {
+    info!(
+        "Creating extraction session for project {} with {} URLs",
+        request.project_id,
+        request.source_urls.len()
+    );
+
+    let auth_manager = AuthManager::new();
+
+    // Check authentication
+    if !auth_manager.has_tokens() {
+        return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    // Get access token
+    let access_token = auth_manager.get_access_token().map_err(|e| {
+        error!("Failed to get access token: {}", e);
+        format!("Failed to get access token: {}", e)
+    })?;
+
+    // Prepare the request body for the API
+    #[derive(Serialize)]
+    struct ApiRequest {
+        source_urls: Vec<String>,
+        config: ApiConfig,
+    }
+
+    #[derive(Serialize)]
+    struct ApiConfig {
+        viewports: Vec<(i32, i32)>,
+        capture_hover_states: bool,
+        capture_focus_states: bool,
+        max_depth: i32,
+        max_pages: i32,
+        auth_cookies: std::collections::HashMap<String, String>,
+    }
+
+    let api_request = ApiRequest {
+        source_urls: request.source_urls,
+        config: ApiConfig {
+            viewports: request
+                .config
+                .viewports
+                .unwrap_or_else(|| vec![(1920, 1080)]),
+            capture_hover_states: request.config.capture_hover_states.unwrap_or(true),
+            capture_focus_states: request.config.capture_focus_states.unwrap_or(true),
+            max_depth: request.config.max_depth.unwrap_or(5),
+            max_pages: request.config.max_pages.unwrap_or(100),
+            auth_cookies: request.config.auth_cookies.unwrap_or_default(),
+        },
+    };
+
+    // Call the backend API
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!(
+            "{}/api/v1/projects/{}/extractions",
+            get_api_base_url(),
+            request.project_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&api_request)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to create extraction session: {}", e);
+            format!("Network error: {}", e)
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        error!(
+            "Create extraction session failed with status {}: {}",
+            status, error_text
+        );
+        return Err(format!(
+            "Failed to create extraction session: {}",
+            error_text
+        ));
+    }
+
+    let session: ExtractionSessionResponse = response.json().await.map_err(|e| {
+        error!("Failed to parse extraction session response: {}", e);
+        format!("Invalid response from server: {}", e)
+    })?;
+
+    info!("Extraction session created: {}", session.id);
+    Ok(session)
+}
+
+/// Update extraction session status
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateExtractionSessionRequest {
+    pub extraction_id: String,
+    pub status: Option<String>,
+    pub stats: Option<Value>,
+    pub error_message: Option<String>,
+}
+
+/// Update an extraction session's status in qontinui-web
+#[tauri::command]
+pub async fn update_extraction_session(
+    request: UpdateExtractionSessionRequest,
+) -> Result<ExtractionSessionResponse, String> {
+    info!("Updating extraction session: {}", request.extraction_id);
+
+    let auth_manager = AuthManager::new();
+
+    if !auth_manager.has_tokens() {
+        return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    let access_token = auth_manager.get_access_token().map_err(|e| {
+        error!("Failed to get access token: {}", e);
+        format!("Failed to get access token: {}", e)
+    })?;
+
+    #[derive(Serialize)]
+    struct ApiUpdateRequest {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stats: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error_message: Option<String>,
+    }
+
+    let api_request = ApiUpdateRequest {
+        status: request.status,
+        stats: request.stats,
+        error_message: request.error_message,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .patch(format!(
+            "{}/api/v1/extractions/{}",
+            get_api_base_url(),
+            request.extraction_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&api_request)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to update extraction session: {}", e);
+            format!("Network error: {}", e)
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        error!(
+            "Update extraction session failed with status {}: {}",
+            status, error_text
+        );
+        return Err(format!(
+            "Failed to update extraction session: {}",
+            error_text
+        ));
+    }
+
+    let session: ExtractionSessionResponse = response.json().await.map_err(|e| {
+        error!("Failed to parse extraction session response: {}", e);
+        format!("Invalid response from server: {}", e)
+    })?;
+
+    info!("Extraction session updated: {}", session.id);
+    Ok(session)
+}
+
+/// Upload extraction annotations to qontinui-web
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadAnnotationsRequest {
+    pub extraction_id: String,
+    pub screenshot_id: String,
+    pub source_url: String,
+    pub viewport_width: i32,
+    pub viewport_height: i32,
+    pub elements: Vec<Value>,
+    pub states: Vec<Value>,
+}
+
+/// Annotation response from qontinui-web
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnnotationResponse {
+    pub id: String,
+    pub session_id: String,
+    pub screenshot_id: String,
+    pub source_url: String,
+    pub viewport_width: i32,
+    pub viewport_height: i32,
+    pub elements: Vec<Value>,
+    pub states: Vec<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Upload annotations for a screenshot to qontinui-web
+#[tauri::command]
+pub async fn upload_extraction_annotations(
+    request: UploadAnnotationsRequest,
+) -> Result<AnnotationResponse, String> {
+    info!(
+        "Uploading annotations for extraction {} screenshot {}",
+        request.extraction_id, request.screenshot_id
+    );
+
+    let auth_manager = AuthManager::new();
+
+    if !auth_manager.has_tokens() {
+        return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    let access_token = auth_manager.get_access_token().map_err(|e| {
+        error!("Failed to get access token: {}", e);
+        format!("Failed to get access token: {}", e)
+    })?;
+
+    #[derive(Serialize)]
+    struct ApiAnnotationRequest {
+        screenshot_id: String,
+        elements: Vec<Value>,
+        states: Vec<Value>,
+    }
+
+    let api_request = ApiAnnotationRequest {
+        screenshot_id: request.screenshot_id,
+        elements: request.elements,
+        states: request.states,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!(
+            "{}/api/v1/extractions/{}/annotations",
+            get_api_base_url(),
+            request.extraction_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&api_request)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to upload annotations: {}", e);
+            format!("Network error: {}", e)
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        error!(
+            "Upload annotations failed with status {}: {}",
+            status, error_text
+        );
+        return Err(format!("Failed to upload annotations: {}", error_text));
+    }
+
+    let annotation: AnnotationResponse = response.json().await.map_err(|e| {
+        error!("Failed to parse annotation response: {}", e);
+        format!("Invalid response from server: {}", e)
+    })?;
+
+    info!("Annotations uploaded successfully");
+    Ok(annotation)
+}
+
+/// Upload state structure to qontinui-web
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadStateStructureRequest {
+    pub extraction_id: String,
+    pub state_structure: Value,
+}
+
+/// Response from uploading state structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateStructureResponse {
+    pub id: String,
+    pub session_id: String,
+    pub state_structure: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Upload the generated state structure to qontinui-web backend
+///
+/// This uploads the state machine structure discovered during extraction
+/// to the web backend for storage and further processing.
+#[tauri::command]
+pub async fn upload_state_structure(
+    request: UploadStateStructureRequest,
+) -> Result<StateStructureResponse, String> {
+    info!(
+        "Uploading state structure for extraction {}",
+        request.extraction_id
+    );
+
+    let auth_manager = AuthManager::new();
+
+    if !auth_manager.has_tokens() {
+        return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    let access_token = auth_manager.get_access_token().map_err(|e| {
+        error!("Failed to get access token: {}", e);
+        format!("Failed to get access token: {}", e)
+    })?;
+
+    #[derive(Serialize)]
+    struct ApiStateStructureRequest {
+        state_structure: Value,
+    }
+
+    let api_request = ApiStateStructureRequest {
+        state_structure: request.state_structure,
+    };
+
+    let client = reqwest::Client::new();
+    let response = client
+        .put(format!(
+            "{}/api/v1/extractions/{}/state-structure",
+            get_api_base_url(),
+            request.extraction_id
+        ))
+        .bearer_auth(&access_token)
+        .json(&api_request)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to upload state structure: {}", e);
+            format!("Network error: {}", e)
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        error!(
+            "Upload state structure failed with status {}: {}",
+            status, error_text
+        );
+        return Err(format!("Failed to upload state structure: {}", error_text));
+    }
+
+    let state_response: StateStructureResponse = response.json().await.map_err(|e| {
+        error!("Failed to parse state structure response: {}", e);
+        format!("Invalid response from server: {}", e)
+    })?;
+
+    info!("State structure uploaded successfully");
+    Ok(state_response)
+}
+
+/// Get extraction sessions for a project from qontinui-web
+#[tauri::command]
+pub async fn get_project_extractions(
+    project_id: String,
+) -> Result<Vec<ExtractionSessionResponse>, String> {
+    info!("Getting extractions for project: {}", project_id);
+
+    let auth_manager = AuthManager::new();
+
+    if !auth_manager.has_tokens() {
+        return Err("Not authenticated. Please log in first.".to_string());
+    }
+
+    let access_token = auth_manager.get_access_token().map_err(|e| {
+        error!("Failed to get access token: {}", e);
+        format!("Failed to get access token: {}", e)
+    })?;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!(
+            "{}/api/v1/projects/{}/extractions",
+            get_api_base_url(),
+            project_id
+        ))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| {
+            error!("Failed to get extractions: {}", e);
+            format!("Network error: {}", e)
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        error!(
+            "Get extractions failed with status {}: {}",
+            status, error_text
+        );
+        return Err(format!("Failed to get extractions: {}", error_text));
+    }
+
+    let sessions: Vec<ExtractionSessionResponse> = response.json().await.map_err(|e| {
+        error!("Failed to parse extractions response: {}", e);
+        format!("Invalid response from server: {}", e)
+    })?;
+
+    info!("Retrieved {} extractions", sessions.len());
+    Ok(sessions)
 }

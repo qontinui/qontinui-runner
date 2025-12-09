@@ -35,7 +35,16 @@ export interface ImageRecognitionEntry {
   visualDebugImage?: string; // Base64 encoded annotated screenshot with colored match boxes
   templatePath?: string;
   imageData?: string; // Base64 encoded template image
+  matchedRegionImage?: string; // Base64 encoded cropped region from screenshot at match location
   debug?: any; // Debug data with top_matches for displaying match details
+}
+
+export interface AiOutputEntry {
+  id: string;
+  timestamp: number;
+  line: string;
+  source: string;
+  actionId?: string;
 }
 
 type StoreListener = () => void;
@@ -47,6 +56,7 @@ type StoreListener = () => void;
 export class LogStore {
   private generalLogs: LogEntry[] = [];
   private imageLogs: ImageRecognitionEntry[] = [];
+  private aiOutputLogs: AiOutputEntry[] = [];
   private listeners = new Set<StoreListener>();
 
   /**
@@ -66,6 +76,14 @@ export class LogStore {
   }
 
   /**
+   * Add an AI output log entry
+   */
+  addAiOutputLog(entry: AiOutputEntry): void {
+    this.aiOutputLogs.push(entry);
+    this.notifyListeners();
+  }
+
+  /**
    * Get all general logs (returns a copy)
    */
   getGeneralLogs(): LogEntry[] {
@@ -77,6 +95,13 @@ export class LogStore {
    */
   getImageLogs(): ImageRecognitionEntry[] {
     return [...this.imageLogs];
+  }
+
+  /**
+   * Get all AI output logs (returns a copy)
+   */
+  getAiOutputLogs(): AiOutputEntry[] {
+    return [...this.aiOutputLogs];
   }
 
   /**
@@ -96,6 +121,14 @@ export class LogStore {
   }
 
   /**
+   * Clear AI output logs
+   */
+  clearAiOutputLogs(): void {
+    this.aiOutputLogs = [];
+    this.notifyListeners();
+  }
+
+  /**
    * Get count of general logs
    */
   getGeneralLogCount(): number {
@@ -107,6 +140,13 @@ export class LogStore {
    */
   getImageLogCount(): number {
     return this.imageLogs.length;
+  }
+
+  /**
+   * Get count of AI output logs
+   */
+  getAiOutputLogCount(): number {
+    return this.aiOutputLogs.length;
   }
 
   /**

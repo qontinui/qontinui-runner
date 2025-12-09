@@ -1,8 +1,14 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, X, Wrench, Settings as SettingsIcon } from "lucide-react";
+import { Check, X, Wrench, Settings as SettingsIcon, Monitor, Copy, RefreshCw } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { DebugSettings, LogFunction } from "./types";
+
+interface DeviceInfo {
+  device_id: string;
+  device_name: string;
+  platform: string;
+}
 
 interface AdvancedSettingsProps {
   onLog: LogFunction;
@@ -19,8 +25,14 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Device info state
+  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
+  const [deviceInfoLoading, setDeviceInfoLoading] = useState(true);
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+
   useEffect(() => {
     loadSettings();
+    loadDeviceInfo();
   }, []);
 
   const loadSettings = async () => {
@@ -46,6 +58,32 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       onLog("error", `Failed to load settings: ${err}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const loadDeviceInfo = async () => {
+    try {
+      setDeviceInfoLoading(true);
+      const info: DeviceInfo = await invoke("get_device_info");
+      setDeviceInfo(info);
+      onLog("debug", "Device info loaded");
+    } catch (err) {
+      console.error("Failed to load device info:", err);
+      onLog("warning", `Failed to load device info: ${err}`);
+    } finally {
+      setDeviceInfoLoading(false);
+    }
+  };
+
+  const copyToClipboard = async (text: string, fieldName: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedField(fieldName);
+      onLog("info", `${fieldName} copied to clipboard`);
+      setTimeout(() => setCopiedField(null), 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
+      onLog("error", "Failed to copy to clipboard");
     }
   };
 
@@ -209,6 +247,96 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               </>
             )}
           </button>
+        </div>
+      </div>
+
+      {/* Device Information Section */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <div className="flex items-center justify-between">
+          <h4 className="font-semibold text-lg flex items-center gap-2">
+            <Monitor className="w-5 h-5 text-primary" />
+            Device Information
+          </h4>
+          <button
+            onClick={loadDeviceInfo}
+            disabled={deviceInfoLoading}
+            className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors disabled:opacity-50"
+            title="Refresh device info"
+          >
+            <RefreshCw className={`w-4 h-4 ${deviceInfoLoading ? "animate-spin" : ""}`} />
+          </button>
+        </div>
+
+        <p className="text-sm text-muted-foreground">
+          System information useful for debugging and support. Click to copy values.
+        </p>
+
+        {deviceInfoLoading && !deviceInfo ? (
+          <div className="flex items-center gap-2 text-muted-foreground">
+            <RefreshCw className="w-4 h-4 animate-spin" />
+            <span>Loading device info...</span>
+          </div>
+        ) : deviceInfo ? (
+          <div className="space-y-3">
+            {/* Device ID */}
+            <div className="space-y-1">
+              <label className="text-sm font-medium text-muted-foreground">Device ID</label>
+              <button
+                onClick={() => copyToClipboard(deviceInfo.device_id, "Device ID")}
+                className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors group"
+              >
+                <span className="font-mono text-sm truncate">{deviceInfo.device_id}</span>
+                {copiedField === "Device ID" ? (
+                  <Check className="w-4 h-4 text-green-400 shrink-0 ml-2" />
+                ) : (
+                  <Copy className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
+                )}
+              </button>
+            </div>
+
+            {/* Device Name */}
+            <div className="space-y-1">
+              <label className="text-sm font-medium text-muted-foreground">Device Name</label>
+              <button
+                onClick={() => copyToClipboard(deviceInfo.device_name, "Device Name")}
+                className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors group"
+              >
+                <span className="text-sm truncate">{deviceInfo.device_name}</span>
+                {copiedField === "Device Name" ? (
+                  <Check className="w-4 h-4 text-green-400 shrink-0 ml-2" />
+                ) : (
+                  <Copy className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
+                )}
+              </button>
+            </div>
+
+            {/* Platform */}
+            <div className="space-y-1">
+              <label className="text-sm font-medium text-muted-foreground">Platform</label>
+              <button
+                onClick={() => copyToClipboard(deviceInfo.platform, "Platform")}
+                className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors group"
+              >
+                <span className="text-sm capitalize">{deviceInfo.platform}</span>
+                {copiedField === "Platform" ? (
+                  <Check className="w-4 h-4 text-green-400 shrink-0 ml-2" />
+                ) : (
+                  <Copy className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
+                )}
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="text-sm text-muted-foreground italic">
+            Unable to load device information.
+          </div>
+        )}
+
+        <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
+          <div className="text-sm text-muted-foreground">
+            <strong className="text-foreground">Tip:</strong> Include your Device ID when reporting
+            issues to help identify your runner in the system.
+          </div>
         </div>
       </div>
     </div>

@@ -5,7 +5,7 @@
  */
 
 export { logManager } from "./LogManager";
-export type { LogEntry, ImageRecognitionEntry } from "./LogManager";
+export type { LogEntry, ImageRecognitionEntry, AiOutputEntry } from "./LogManager";
 
 export { windowManager } from "./WindowManager";
 

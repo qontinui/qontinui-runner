@@ -43,3 +43,14 @@ export type { ActionLogViewData, ActionLogEntry, CommandResponse } from "./displ
 
 // Authentication types
 export type { User, DeviceInfo, LoginResponse, AuthStatus, AuthContextValue } from "./auth";
+
+// Web extraction types
+export type {
+  WebExtractionConfig,
+  ExtractionStatus,
+  ExtractionResult,
+  ExtractedElement,
+  ExtractedState,
+  ExtractionSession,
+  BoundingBox,
+} from "./extraction";

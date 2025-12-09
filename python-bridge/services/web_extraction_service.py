@@ -107,7 +107,16 @@ class WebExtractionService:
                 target_kwargs["project_path"] = Path(config["project_path"])
 
             # Runtime access
-            if "url" in config and config["url"]:
+            # Handle both 'url' (singular) and 'urls' (array from frontend)
+            if "urls" in config and config["urls"]:
+                # For now, use the first URL from the array
+                # Future: support multi-URL extraction
+                urls = config["urls"]
+                if isinstance(urls, list) and len(urls) > 0:
+                    target_kwargs["url"] = urls[0]
+                elif isinstance(urls, str):
+                    target_kwargs["url"] = urls
+            elif "url" in config and config["url"]:
                 target_kwargs["url"] = config["url"]
             if "executable_path" in config and config["executable_path"]:
                 target_kwargs["executable_path"] = Path(config["executable_path"])
@@ -131,10 +140,19 @@ class WebExtractionService:
             target = ExtractionTarget(**target_kwargs)
 
             # Build extraction config
+            # Handle both 'viewports' (plural array) and 'viewport' (singular tuple from frontend)
+            viewports_config = config.get("viewports")
+            if viewports_config:
+                viewports = [tuple(v) for v in viewports_config]
+            elif "viewport" in config and config["viewport"]:
+                viewports = [tuple(config["viewport"])]
+            else:
+                viewports = [(1920, 1080)]
+
             extraction_config = ExtractionConfig(
                 target=target,
                 mode=mode,
-                viewports=[tuple(v) for v in config.get("viewports", [(1920, 1080)])],
+                viewports=viewports,
                 capture_hover_states=config.get("capture_hover_states", True),
                 capture_focus_states=config.get("capture_focus_states", True),
                 capture_scroll_states=config.get("capture_scroll_states", True),
@@ -290,7 +308,13 @@ class WebExtractionService:
         Args:
             config: ExtractionConfig object
         """
-        logger.info("Starting extraction process")
+        logger.info("=" * 60)
+        logger.info("EXTRACTION STARTED")
+        logger.info("=" * 60)
+        logger.info(f"Extraction config mode: {config.mode}")
+        logger.info(f"Extraction config target URL: {config.target.url if config.target else 'None'}")
+        logger.info(f"Extraction config viewports: {config.viewports}")
+        logger.info(f"Extraction ID: {self._current_extraction_id}")
 
         if not self._orchestrator:
             logger.error("No orchestrator available!")
@@ -298,19 +322,54 @@ class WebExtractionService:
 
         try:
             # Run extraction
+            logger.info("Calling orchestrator.extract()...")
             result = await self._orchestrator.extract(config)
+            logger.info("=" * 60)
+            logger.info("EXTRACTION RESULT FROM ORCHESTRATOR")
+            logger.info("=" * 60)
+            logger.info(f"  States count: {len(result.states)}")
+            logger.info(f"  Transitions count: {len(result.transitions)}")
+            logger.info(f"  Errors: {result.errors}")
+            logger.info(f"  Warnings: {result.warnings}")
+            logger.info(f"  Framework: {result.framework}")
+            logger.info(f"  Mode: {result.mode}")
+            if result.runtime_extraction:
+                logger.info(f"  Runtime elements: {len(result.runtime_extraction.elements)}")
+                logger.info(f"  Runtime states: {len(result.runtime_extraction.states)}")
+            else:
+                logger.info("  Runtime extraction: None")
 
             # Store result
             if self._current_extraction_id:
                 self._extraction_results[self._current_extraction_id]["result"] = result
 
-                # Emit completion event
+                # Build state_structure for the frontend
+                state_structure = {
+                    "type": "application_state_structure",
+                    "extraction_id": self._current_extraction_id,
+                    "framework": result.framework.value,
+                    "mode": result.mode.value,
+                    "states": [self._serialize_state(s) for s in result.states],
+                    "transitions": [self._serialize_transition(t) for t in result.transitions],
+                    "metadata": {
+                        "started_at": result.started_at.isoformat() if result.started_at else None,
+                        "completed_at": result.completed_at.isoformat() if result.completed_at else None,
+                        "errors": result.errors,
+                        "warnings": result.warnings,
+                    },
+                }
+
+                logger.info(f"Built state_structure with {len(result.states)} states")
+
+                # Emit completion event with state_structure
                 await self._emit_event(
-                    "extraction_complete",
+                    "extraction_completed",  # Use extraction_completed to match frontend handler
                     {
                         "extraction_id": self._current_extraction_id,
+                        "session_id": self._current_extraction_id,
                         "framework": result.framework.value,
                         "mode": result.mode.value,
+                        "state_structure": state_structure,
                         "summary": {
                             "states": len(result.states),
                             "transitions": len(result.transitions),
