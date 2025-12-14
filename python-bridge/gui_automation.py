@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 try:
     from qontinui import Location, navigation_api, registry
-    from qontinui.config.schema import Action
+    from qontinui_schemas.config.models import Action
 
     QONTINUI_AVAILABLE = True
 except ImportError:

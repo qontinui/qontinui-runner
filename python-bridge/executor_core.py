@@ -24,9 +24,9 @@ logger = logging.getLogger(__name__)
 try:
     from qontinui import Image, navigation_api, registry
     from qontinui.config import disable_mock_mode, enable_mock_mode, get_settings
-    from qontinui.config.schema import Workflow, WorkflowVisibility
     from qontinui.json_executor.config_parser import ConfigParser
     from qontinui.json_executor.state_executor import StateExecutor
+    from qontinui_schemas.config.models import Workflow, WorkflowVisibility
 
     QONTINUI_AVAILABLE = True
 except ImportError:
