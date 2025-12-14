@@ -1,0 +1,167 @@
+{
+  "version": "2.0.0",
+  "metadata": {
+    "name": "Task Continuation Example",
+    "description": "Example configuration demonstrating multi-session task continuation with CONTINUE_TASK action",
+    "author": "Qontinui"
+  },
+  "images": [],
+  "workflows": [
+    {
+      "id": "workflow-lint-fix-autonomous",
+      "name": "Fix All Linting Errors (Autonomous)",
+      "description": "Triggers AI to fix linting errors, then continues until complete",
+      "actions": [
+        {
+          "id": "trigger-lint-fix",
+          "type": "TRIGGER_AI_ANALYSIS",
+          "name": "Start Fixing Linting Errors",
+          "config": {
+            "provider": "claude",
+            "prompt": "Fix all linting errors in the codebase. Run 'ruff check .' to see errors. Fix them file by file. Write progress to .dev-logs/task-state.json with status 'needs_continuation' when you need to stop. Include a detailed continue_prompt that tells the next session exactly where to resume.",
+            "timeout": 600000,
+            "workingDirectory": null,
+            "resultsDirectory": ".dev-logs"
+          }
+        },
+        {
+          "id": "continue-lint-fix",
+          "type": "CONTINUE_TASK",
+          "name": "Continue Until Complete",
+          "config": {
+            "maxIterations": 20,
+            "includeChatHistory": true,
+            "chatHistoryLines": 500,
+            "condition": "auto",
+            "taskStateFile": "task-state.json",
+            "resultsDirectory": ".dev-logs",
+            "timeout": 600000,
+            "provider": "claude"
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow-type-fix-with-tests",
+      "name": "Fix Type Errors with Test Verification",
+      "description": "Fixes type errors then runs tests between continuation sessions",
+      "actions": [
+        {
+          "id": "trigger-type-fix",
+          "type": "TRIGGER_AI_ANALYSIS",
+          "name": "Start Fixing Type Errors",
+          "config": {
+            "provider": "claude",
+            "prompt": "Fix all mypy type errors in the codebase. Run 'mypy src/' to see errors. Fix them module by module. Write progress to .dev-logs/task-state.json. Set status to 'needs_continuation' if incomplete.",
+            "timeout": 600000,
+            "resultsDirectory": ".dev-logs"
+          }
+        },
+        {
+          "id": "run-tests-between",
+          "type": "SHELL",
+          "name": "Run Tests After Each Session",
+          "config": {
+            "command": "poetry run pytest tests/ -x --tb=short",
+            "timeout": 120000,
+            "failOnError": false,
+            "outputVariable": "test_results"
+          }
+        },
+        {
+          "id": "continue-type-fix",
+          "type": "CONTINUE_TASK",
+          "name": "Continue Type Fixes",
+          "config": {
+            "maxIterations": 15,
+            "includeChatHistory": true,
+            "chatHistoryLines": 300,
+            "condition": "auto",
+            "timeout": 600000
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow-fixed-iterations",
+      "name": "Fixed Iteration Task",
+      "description": "Runs AI for a fixed number of iterations regardless of completion status",
+      "actions": [
+        {
+          "id": "trigger-refactor",
+          "type": "TRIGGER_AI_ANALYSIS",
+          "name": "Start Refactoring",
+          "config": {
+            "provider": "claude",
+            "prompt": "Refactor large classes in src/ to follow SRP. Target classes over 300 lines. Write progress to task-state.json.",
+            "timeout": 600000
+          }
+        },
+        {
+          "id": "continue-fixed",
+          "type": "CONTINUE_TASK",
+          "name": "Continue for 5 Iterations",
+          "config": {
+            "maxIterations": 5,
+            "condition": "always",
+            "includeChatHistory": true,
+            "timeout": 600000
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow-marker-file",
+      "name": "Continue Until Marker File Exists",
+      "description": "Continues task until a completion marker file is created",
+      "actions": [
+        {
+          "id": "trigger-migration",
+          "type": "TRIGGER_AI_ANALYSIS",
+          "name": "Start Database Migration",
+          "config": {
+            "provider": "claude",
+            "prompt": "Migrate all database queries from raw SQL to SQLAlchemy ORM. When completely done, create a file at .dev-logs/migration-complete.marker",
+            "timeout": 600000
+          }
+        },
+        {
+          "id": "continue-until-marker",
+          "type": "CONTINUE_TASK",
+          "name": "Continue Until Marker",
+          "config": {
+            "maxIterations": 30,
+            "condition": "check_file",
+            "completionMarker": ".dev-logs/migration-complete.marker",
+            "includeChatHistory": true,
+            "timeout": 600000
+          }
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-ready",
+      "name": "Ready",
+      "isInitial": true,
+      "identifyingImages": []
+    }
+  ],
+  "transitions": [],
+  "categories": [],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 600000,
+      "executionMode": "real",
+      "screenshotDirectory": ".dev-logs/screenshots",
+      "useGraphExecution": false
+    },
+    "recognition": {
+      "defaultThreshold": 0.9
+    },
+    "logging": {
+      "level": "info"
+    }
+  }
+}

@@ -82,6 +82,7 @@ icons/source/
 # Development/diagnostic files
 python-bridge/diagnostics/
 temp_dev/
+.qontinui/
 
 # Ignore CLAUDE notes file
 CLAUDE.md

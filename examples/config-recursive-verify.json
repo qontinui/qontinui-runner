@@ -1,0 +1,155 @@
+{
+  "version": "2.0.0",
+  "metadata": {
+    "name": "Recursive AI Verification Example",
+    "description": "Example configuration demonstrating RECURSIVE_VERIFY action for AI-powered automation verification",
+    "author": "Qontinui"
+  },
+  "images": [],
+  "workflows": [
+    {
+      "id": "workflow-verify-extraction",
+      "name": "Verify Web Extraction Feature",
+      "description": "Recursively verify the web extraction feature works correctly, fixing issues until success",
+      "actions": [
+        {
+          "id": "verify-extraction",
+          "type": "RECURSIVE_VERIFY",
+          "name": "Verify Extraction States",
+          "config": {
+            "states": ["ExtractionPage", "ExtractionResults", "ExtractionComplete"],
+            "screenshotStates": ["ExtractionPage", "ExtractionResults"],
+            "goal": "Verify that web extraction navigates through all states correctly and displays extraction results",
+            "maxIterations": 10,
+            "timeout": 600000
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow-verify-login",
+      "name": "Verify Login Flow",
+      "description": "Verify login and authentication works end-to-end",
+      "actions": [
+        {
+          "id": "verify-login-flow",
+          "type": "RECURSIVE_VERIFY",
+          "name": "Verify Login States",
+          "config": {
+            "states": ["LoginPage", "DashboardHome"],
+            "screenshotStates": ["LoginPage", "DashboardHome"],
+            "goal": "Verify that login navigates from login page to dashboard successfully",
+            "maxIterations": 5,
+            "timeout": 300000
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow-full-verification",
+      "name": "Full Application Verification",
+      "description": "Run comprehensive verification across multiple features",
+      "actions": [
+        {
+          "id": "verify-capture",
+          "type": "RECURSIVE_VERIFY",
+          "name": "Verify Capture Feature",
+          "config": {
+            "states": ["CaptureTab", "CaptureInProgress", "CaptureComplete"],
+            "goal": "Verify screen capture functionality",
+            "maxIterations": 5
+          }
+        },
+        {
+          "id": "verify-dataset",
+          "type": "RECURSIVE_VERIFY",
+          "name": "Verify Dataset Feature",
+          "config": {
+            "states": ["DatasetTab", "DatasetPackaging"],
+            "goal": "Verify dataset packaging functionality",
+            "maxIterations": 5
+          }
+        }
+      ]
+    }
+  ],
+  "states": [
+    {
+      "id": "state-login",
+      "name": "LoginPage",
+      "description": "The login page where users enter credentials",
+      "isInitial": true,
+      "identifyingImages": []
+    },
+    {
+      "id": "state-dashboard",
+      "name": "DashboardHome",
+      "description": "The main dashboard after login",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-extraction-page",
+      "name": "ExtractionPage",
+      "description": "The web extraction configuration page",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-extraction-results",
+      "name": "ExtractionResults",
+      "description": "The page showing extraction results",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-extraction-complete",
+      "name": "ExtractionComplete",
+      "description": "The final state after extraction is complete",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-capture-tab",
+      "name": "CaptureTab",
+      "description": "The capture tab in the runner",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-capture-progress",
+      "name": "CaptureInProgress",
+      "description": "Capture in progress state",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-capture-complete",
+      "name": "CaptureComplete",
+      "description": "Capture completed state",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-dataset-tab",
+      "name": "DatasetTab",
+      "description": "The dataset packaging tab",
+      "identifyingImages": []
+    },
+    {
+      "id": "state-dataset-packaging",
+      "name": "DatasetPackaging",
+      "description": "Dataset packaging in progress",
+      "identifyingImages": []
+    }
+  ],
+  "transitions": [],
+  "categories": [],
+  "settings": {
+    "execution": {
+      "defaultTimeout": 600000,
+      "executionMode": "real",
+      "screenshotDirectory": ".dev-logs/screenshots",
+      "useGraphExecution": false
+    },
+    "recognition": {
+      "defaultThreshold": 0.9
+    },
+    "logging": {
+      "level": "info"
+    }
+  }
+}
