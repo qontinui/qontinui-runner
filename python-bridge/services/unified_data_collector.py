@@ -22,7 +22,7 @@ Design Principles:
 from __future__ import annotations
 
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from models.action_execution_record import ActionExecutionRecord
 
@@ -80,7 +80,7 @@ class UnifiedDataCollector:
         self,
         state_memory: Any,
         screenshot_service: Any | None = None,
-        record_created_callback: callable | None = None,
+        record_created_callback: Callable[[Any], None] | None = None,
     ) -> None:
         """Initialize the UnifiedDataCollector.
 

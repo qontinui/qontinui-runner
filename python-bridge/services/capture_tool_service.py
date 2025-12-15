@@ -81,7 +81,7 @@ class ScreenSelection:
         """Convert to dictionary."""
         result = {"type": self.type}
         if self.indices is not None:
-            result["indices"] = self.indices
+            result["indices"] = self.indices  # type: ignore[assignment]
         return result
 
     @classmethod
@@ -212,7 +212,7 @@ class CaptureToolService:
             return
 
         # Schedule screenshots at configured timings
-        for delay_ms in self.settings.capture_timings:
+        for delay_ms in self.settings.capture_timings:  # type: ignore[union-attr]
             if delay_ms == 0:
                 # Immediate capture
                 self._capture_screenshot()
@@ -305,16 +305,16 @@ class CaptureToolService:
         """
         images = []
 
-        if self.settings.screens.type == "all":
+        if self.settings.screens.type == "all":  # type: ignore[union-attr]
             # Capture all monitors
-            monitors = self.mss_capture.get_monitors()
+            monitors = self.mss_capture.get_monitors()  # type: ignore[union-attr]
             for monitor in monitors:
                 print(
                     f"[CaptureService] Capturing monitor {monitor.index}: expected {monitor.width}x{monitor.height}",
                     file=sys.stderr,
                     flush=True,
                 )
-                image = self.mss_capture.capture_screen(monitor.index)
+                image = self.mss_capture.capture_screen(monitor.index)  # type: ignore[union-attr]
                 print(
                     f"[CaptureService] Captured monitor {monitor.index}: actual {image.width}x{image.height}",
                     file=sys.stderr,
@@ -322,9 +322,9 @@ class CaptureToolService:
                 )
                 images.append(image)
 
-        elif self.settings.screens.type == "primary":
+        elif self.settings.screens.type == "primary":  # type: ignore[union-attr]
             # Capture primary monitor only
-            image = self.mss_capture.capture_screen(None)
+            image = self.mss_capture.capture_screen(None)  # type: ignore[union-attr]
             print(
                 f"[CaptureService] Captured primary monitor: {image.width}x{image.height}",
                 file=sys.stderr,
@@ -332,12 +332,12 @@ class CaptureToolService:
             )
             images.append(image)
 
-        elif self.settings.screens.type == "specific":
+        elif self.settings.screens.type == "specific":  # type: ignore[union-attr]
             # Capture specific monitors
-            if self.settings.screens.indices:
-                for monitor_index in self.settings.screens.indices:
+            if self.settings.screens.indices:  # type: ignore[union-attr]
+                for monitor_index in self.settings.screens.indices:  # type: ignore[union-attr]
                     try:
-                        monitors = self.mss_capture.get_monitors()
+                        monitors = self.mss_capture.get_monitors()  # type: ignore[union-attr]
                         monitor = monitors[monitor_index] if monitor_index < len(monitors) else None
                         if monitor:
                             print(
@@ -345,7 +345,7 @@ class CaptureToolService:
                                 file=sys.stderr,
                                 flush=True,
                             )
-                        image = self.mss_capture.capture_screen(monitor_index)
+                        image = self.mss_capture.capture_screen(monitor_index)  # type: ignore[union-attr]
                         print(
                             f"[CaptureService] Captured monitor {monitor_index}: actual {image.width}x{image.height}",
                             file=sys.stderr,
@@ -371,11 +371,11 @@ class CaptureToolService:
         next_num = self._get_next_number()
 
         # Create output directory if needed
-        output_dir = Path(self.settings.output_folder)
+        output_dir = Path(self.settings.output_folder)  # type: ignore[union-attr]
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Create filename
-        filename = f"{self.settings.base_image_name}_{next_num}.png"
+        filename = f"{self.settings.base_image_name}_{next_num}.png"  # type: ignore[union-attr]
         filepath = output_dir / filename
 
         # Save image
@@ -392,13 +392,13 @@ class CaptureToolService:
         Returns:
             Next available number (1-based)
         """
-        output_dir = Path(self.settings.output_folder)
+        output_dir = Path(self.settings.output_folder)  # type: ignore[union-attr]
 
         if not output_dir.exists():
             return 1
 
         # Find all files matching base name pattern
-        pattern = f"{self.settings.base_image_name}_*.png"
+        pattern = f"{self.settings.base_image_name}_*.png"  # type: ignore[union-attr]
         existing_files = list(output_dir.glob(pattern))
 
         if not existing_files:
@@ -408,7 +408,7 @@ class CaptureToolService:
         numbers = []
         for file in existing_files:
             # Match pattern: {base_name}_{number}.png
-            match = re.match(rf"{re.escape(self.settings.base_image_name)}_(\d+)\.png", file.name)
+            match = re.match(rf"{re.escape(self.settings.base_image_name)}_(\d+)\.png", file.name)  # type: ignore[union-attr]
             if match:
                 numbers.append(int(match.group(1)))
 
@@ -494,7 +494,7 @@ class ManualClickListener:
                 f"[ManualClickListener] Found {len(monitors)} monitors", file=sys.stderr, flush=True
             )
 
-            if settings.screens.type == "all":
+            if settings.screens.type == "all":  # type: ignore[union-attr]
                 # All monitors
                 print("[ManualClickListener] Screen selection: ALL", file=sys.stderr, flush=True)
                 for monitor in monitors:
@@ -511,7 +511,7 @@ class ManualClickListener:
                         file=sys.stderr,
                         flush=True,
                     )
-            elif settings.screens.type == "primary":
+            elif settings.screens.type == "primary":  # type: ignore[union-attr]
                 # Primary monitor only
                 print(
                     "[ManualClickListener] Screen selection: PRIMARY", file=sys.stderr, flush=True
@@ -537,15 +537,15 @@ class ManualClickListener:
                             flush=True,
                         )
                         break
-            elif settings.screens.type == "specific" and settings.screens.indices:
+            elif settings.screens.type == "specific" and settings.screens.indices:  # type: ignore[union-attr]
                 # Specific monitors
                 print(
-                    f"[ManualClickListener] Screen selection: SPECIFIC {settings.screens.indices}",
+                    f"[ManualClickListener] Screen selection: SPECIFIC {settings.screens.indices}",  # type: ignore[union-attr]
                     file=sys.stderr,
                     flush=True,
                 )
                 for monitor in monitors:
-                    if monitor.index in settings.screens.indices:
+                    if monitor.index in settings.screens.indices:  # type: ignore[union-attr]
                         bounds.append(
                             {
                                 "x": monitor.x,
@@ -737,7 +737,7 @@ class ManualClickListener:
                     file=sys.stderr,
                     flush=True,
                 )
-                self._listener.start()
+                self._listener.start()  # type: ignore[attr-defined]
                 self._is_running = True
 
                 print(
@@ -746,17 +746,17 @@ class ManualClickListener:
                     flush=True,
                 )
                 print(
-                    f"[ManualClickListener]   Capture settings: enabled={self.capture_service.settings.enabled}",
+                    f"[ManualClickListener]   Capture settings: enabled={self.capture_service.settings.enabled}",  # type: ignore[union-attr]
                     file=sys.stderr,
                     flush=True,
                 )
                 print(
-                    f"[ManualClickListener]   Screen selection: {self.capture_service.settings.screens.to_dict()}",
+                    f"[ManualClickListener]   Screen selection: {self.capture_service.settings.screens.to_dict()}",  # type: ignore[union-attr]
                     file=sys.stderr,
                     flush=True,
                 )
                 print(
-                    f"[ManualClickListener]   Output folder: {self.capture_service.settings.output_folder}",
+                    f"[ManualClickListener]   Output folder: {self.capture_service.settings.output_folder}",  # type: ignore[union-attr]
                     file=sys.stderr,
                     flush=True,
                 )

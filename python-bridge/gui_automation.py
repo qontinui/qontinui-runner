@@ -94,7 +94,7 @@ class GUIAutomation:
         config = action_data.get("config", {})
 
         # Get action definition from registry
-        action_def = self.get_action_definition(action_type)
+        action_def = self.get_action_definition(action_type)  # type: ignore[arg-type]
 
         # Extract hierarchy context from execution tree for data collection
         hierarchy_context = self._get_hierarchy_context()
@@ -162,7 +162,7 @@ class GUIAutomation:
                 and self.action_executor.last_find_location
             ):
                 loc = self.action_executor.last_find_location
-                self._last_find_location = Location(loc[0], loc[1])
+                self._last_find_location = Location(loc[0], loc[1])  # type: ignore[assignment]
                 self.emit_log(
                     "debug", f"Synced last_find_location from library: {self._last_find_location}"
                 )
@@ -334,7 +334,7 @@ class GUIAutomation:
                 self.emit_log("error", f"Workflow {workflow_id} not found")
                 return False
             workflow_name = (
-                registry.get_workflow_name(workflow_id)
+                registry.get_workflow_name(workflow_id)  # type: ignore[assignment]
                 if hasattr(registry, "get_workflow_name")
                 else workflow_id
             )
@@ -428,7 +428,7 @@ class GUIAutomation:
         # Check for imageId at root level
         if "imageId" in config:
             image_id = config.get("imageId")
-            image_name = self.get_image_name(image_id)
+            image_name = self.get_image_name(image_id)  # type: ignore[arg-type]
             if image_name:
                 config_copy = config.copy() if config_copy is None else config_copy
                 config_copy["imageName"] = image_name
@@ -438,7 +438,7 @@ class GUIAutomation:
         if isinstance(target, dict):
             if "imageId" in target:
                 image_id = target.get("imageId")
-                image_name = self.get_image_name(image_id)
+                image_name = self.get_image_name(image_id)  # type: ignore[arg-type]
                 if image_name:
                     config_copy = config.copy() if config_copy is None else config_copy
                     target_copy = (
@@ -465,7 +465,7 @@ class GUIAutomation:
                     target_copy["imageNames"] = image_names
                     config_copy["target"] = target_copy
                     config_copy["imageNames"] = image_names
-                    config_copy["imageName"] = ", ".join(image_names)
+                    config_copy["imageName"] = ", ".join(image_names)  # type: ignore[arg-type]
 
         # Handle multiple images at root level
         if "imageIds" in config:
@@ -475,7 +475,7 @@ class GUIAutomation:
             if image_names:
                 config_copy = config.copy() if config_copy is None else config_copy
                 config_copy["imageNames"] = image_names
-                config_copy["imageName"] = ", ".join(image_names)
+                config_copy["imageName"] = ", ".join(image_names)  # type: ignore[arg-type]
 
         # Use enriched config if we made changes
         if config_copy:

@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -275,8 +276,9 @@ class VideoCaptureService:
                 # Send 'q' to FFmpeg to gracefully stop
                 if session.process and session.process.poll() is None:
                     try:
-                        session.process.stdin.write(b"q")
-                        session.process.stdin.flush()
+                        if session.process.stdin is not None:
+                            session.process.stdin.write(b"q")
+                            session.process.stdin.flush()
                     except Exception as e:
                         logger.warning(f"Failed to send quit command to FFmpeg: {e}")
 
@@ -343,7 +345,7 @@ class VideoCaptureService:
 
             return False
 
-    def get_current_session_info(self) -> dict[str, any] | None:
+    def get_current_session_info(self) -> dict[str, Any] | None:
         """Get information about the current recording session.
 
         Returns:

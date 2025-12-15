@@ -39,7 +39,7 @@ class CaptureSession:
     states: list[DetectedState]
     events: list[InputEvent]
     fps: int = 30
-    metadata: dict[str, Any] = None
+    metadata: dict[str, Any] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.metadata is None:
@@ -341,7 +341,7 @@ class TransitionAnalyzer:
 
             if states_appeared or states_disappeared:
                 # Find the corresponding frame for timestamp
-                frame = next((f for f in frames if f.frame_index == curr_frame_idx), None)
+                frame = next((f for f in frames if f.frame_index == curr_frame_idx), None)  # type: ignore[assignment]
                 timestamp = frame.timestamp if frame else 0.0
 
                 change_point = StateChangePoint(

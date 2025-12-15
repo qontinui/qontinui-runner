@@ -248,7 +248,7 @@ class WebSocketHandler:
                 # Run auth in event loop
                 future = asyncio.run_coroutine_threadsafe(
                     authenticate(auth_url, self.ws_config.email, self.ws_config.password),
-                    self.ws_loop,
+                    self.ws_loop,  # type: ignore[arg-type]
                 )
                 token = future.result(timeout=10)
 
@@ -274,8 +274,8 @@ class WebSocketHandler:
             )
             self.ws_client = RunnerWebSocketClient(
                 api_url=self.ws_config.api_url,
-                token=token,
-                project_id=self.ws_config.project_id,
+                token=token,  # type: ignore[arg-type]
+                project_id=self.ws_config.project_id,  # type: ignore[arg-type]
                 runner_version=self.ws_config.runner_version,
                 runner_name=self.ws_config.runner_name,
                 auto_reconnect=self.ws_config.auto_reconnect,
@@ -313,7 +313,7 @@ class WebSocketHandler:
                 file=sys.stderr,
                 flush=True,
             )
-            future = asyncio.run_coroutine_threadsafe(self.ws_client.connect(), self.ws_loop)
+            future = asyncio.run_coroutine_threadsafe(self.ws_client.connect(), self.ws_loop)  # type: ignore[arg-type]
             success = future.result(timeout=10)
             print(
                 f"[info    ] WS_HANDLER: ws_client.connect() returned: {success}",

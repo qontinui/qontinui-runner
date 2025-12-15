@@ -47,7 +47,7 @@ class EventEmitter:
 
     def log(self, level: str, message: str, details: dict | None = None):
         """Emit a log event."""
-        log_data = {"level": level, "message": message}
+        log_data: dict[str, Any] = {"level": level, "message": message}
         if details:
             log_data["details"] = details
 
@@ -55,7 +55,7 @@ class EventEmitter:
 
     def error(self, message: str, exception: Exception | None = None):
         """Emit an error event."""
-        error_data = {"message": message}
+        error_data: dict[str, Any] = {"message": message}
 
         if exception:
             error_data["exception"] = {"type": type(exception).__name__, "message": str(exception)}
@@ -90,7 +90,7 @@ class EventEmitter:
             self.log("warning", "PIL not available, cannot send screenshot")
             return
 
-        screenshot_data = {}
+        screenshot_data: dict[str, Any] = {}
 
         try:
             if image_path:

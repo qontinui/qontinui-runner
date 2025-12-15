@@ -417,7 +417,7 @@ class ExecutorCore:
 
     def get_temp_dir(self) -> str | None:
         """Get temporary directory for this execution."""
-        return self.temp_dir
+        return self.temp_dir  # type: ignore[no-any-return]
 
     def cleanup(self):
         """Clean up temporary resources."""

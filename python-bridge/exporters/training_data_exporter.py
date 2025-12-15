@@ -22,7 +22,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from PIL import Image
@@ -157,7 +157,7 @@ class TrainingDataExporter:
         self,
         records: list[ActionExecutionRecord],
         storage_dir: Path,
-        filter_fn: callable | None = None,
+        filter_fn: Callable[[ActionExecutionRecord], bool] | None = None,
     ) -> ExportStatistics:
         """Export a list of ActionExecutionRecords to training format.
 
@@ -205,7 +205,7 @@ class TrainingDataExporter:
             stats: Statistics object to update.
         """
         # Build screenshot path
-        screenshot_path = storage_dir / record.screenshot_reference
+        screenshot_path = storage_dir / record.screenshot_reference  # type: ignore[operator]
         if not screenshot_path.exists():
             stats.skipped_records += 1
             return
@@ -427,7 +427,7 @@ class TrainingDataExporter:
             logger.warning(f"Smart bbox inference failed: {e}. Using fallback.")
             # Fall back to fixed-size
             img_height, img_width = screenshot.shape[:2]
-            bbox = self._infer_bbox_from_click(clicked_location, img_width, img_height)
+            bbox = self._infer_bbox_from_click(clicked_location, img_width, img_height)  # type: ignore[assignment]
             category_name = click_target_type or "click_target"
             category_id = self._get_or_create_category_id(category_name)
             return {
@@ -626,7 +626,7 @@ class TrainingDataExporter:
             img_hash = data["image_id"]
 
             # Add image entry
-            coco_data["images"].append(
+            coco_data["images"].append(  # type: ignore[attr-defined]
                 {
                     "id": img_hash,
                     "file_name": data["image_filename"],
@@ -641,7 +641,7 @@ class TrainingDataExporter:
                 bbox = ann["bbox"]
                 area = bbox[2] * bbox[3]  # width * height
 
-                coco_data["annotations"].append(
+                coco_data["annotations"].append(  # type: ignore[attr-defined]
                     {
                         "id": annotation_id,
                         "image_id": img_hash,

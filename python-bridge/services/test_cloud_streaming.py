@@ -45,7 +45,7 @@ except ImportError:
     import sys
     from pathlib import Path
 
-    from cloud_streaming_service import (
+    from cloud_streaming_service import (  # type: ignore[no-redef]
         CloudStreamingService,
         StreamConfig,
         StreamedData,
@@ -94,7 +94,7 @@ def create_test_image(width: int = 1920, height: int = 1080) -> bytes:
 
     for y in range(height):
         for x in range(width):
-            pixels[x, y] = (int(255 * x / width), int(255 * y / height), 128)
+            pixels[x, y] = (int(255 * x / width), int(255 * y / height), 128)  # type: ignore[index]
 
     from io import BytesIO
 

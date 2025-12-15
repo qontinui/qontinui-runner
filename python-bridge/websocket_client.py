@@ -21,18 +21,18 @@ from typing import Any
 
 try:
     import websockets
-    from websockets.client import WebSocketClientProtocol
+    from websockets.client import ClientProtocol as WebSocketClientProtocol
     from websockets.exceptions import ConnectionClosed, WebSocketException
 except ImportError:
-    websockets = None
-    WebSocketClientProtocol = None
-    ConnectionClosed = None
-    WebSocketException = None
+    websockets = None  # type: ignore
+    WebSocketClientProtocol = None  # type: ignore
+    ConnectionClosed = None  # type: ignore
+    WebSocketException = None  # type: ignore
 
 try:
     from PIL import Image
 except ImportError:
-    Image = None
+    Image = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +178,7 @@ class RunnerWebSocketClient:
             except Exception:
                 pass
 
-            self.ws = await websockets.connect(
+            self.ws = await websockets.connect(  # type: ignore[assignment]
                 ws_url,
                 ping_interval=20,
                 ping_timeout=10,
@@ -303,10 +303,10 @@ class RunnerWebSocketClient:
 
         try:
             # Send message
-            await self.ws.send(json.dumps(message))
+            await self.ws.send(json.dumps(message))  # type: ignore[attr-defined]
 
             # Wait for response (with timeout)
-            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=10.0)
+            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=10.0)  # type: ignore[attr-defined]
             response = json.loads(response_raw)
 
             # Check for error response
@@ -323,7 +323,7 @@ class RunnerWebSocketClient:
 
                 return None
 
-            return response
+            return response  # type: ignore[no-any-return]
 
         except TimeoutError:
             logger.error("Timeout waiting for server response")
@@ -356,7 +356,7 @@ class RunnerWebSocketClient:
             return False
 
         try:
-            await self.ws.send(json.dumps(message))
+            await self.ws.send(json.dumps(message))  # type: ignore[attr-defined]
             logger.debug(f"Message sent: type={message.get('type')}")
             return True
         except ConnectionClosed:
@@ -395,7 +395,7 @@ class RunnerWebSocketClient:
 
         try:
             if self.ws and self.is_connected:
-                await self.ws.send(json.dumps(message))
+                await self.ws.send(json.dumps(message))  # type: ignore[attr-defined]
                 logger.info("Runner info sent successfully")
                 return True
         except Exception as e:
@@ -487,7 +487,7 @@ class RunnerWebSocketClient:
         self.session_id = None
         self.log_sequence = 0
 
-        return success
+        return success  # type: ignore[return-value]
 
     async def send_screenshot(
         self, image, name: str, metadata: dict[str, Any] | None = None
@@ -554,7 +554,7 @@ class RunnerWebSocketClient:
                 screenshot_id = response.get("data", {}).get("screenshot_id")
                 self.screenshots_sent += 1
                 logger.debug(f"Screenshot uploaded successfully: {screenshot_id}")
-                return screenshot_id
+                return screenshot_id  # type: ignore[no-any-return]
             else:
                 logger.error(f"Failed to upload screenshot: {name}")
                 return None
@@ -594,7 +594,7 @@ class RunnerWebSocketClient:
         try:
             # Send without waiting for response to avoid blocking
             if self.ws and self.is_connected:
-                await self.ws.send(json.dumps(log_message))
+                await self.ws.send(json.dumps(log_message))  # type: ignore[attr-defined]
                 self.log_sequence += 1
                 self.logs_sent += 1
                 return True
@@ -852,7 +852,7 @@ async def authenticate(api_url: str, email: str, password: str) -> str | None:
             data = response.json()
             token = data.get("access_token")
             logger.info("Authentication successful")
-            return token
+            return token  # type: ignore[no-any-return]
         else:
             logger.error(f"Authentication failed: {response.status_code} - {response.text}")
             return None

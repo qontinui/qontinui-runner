@@ -19,7 +19,7 @@ try:
     QONTINUI_AVAILABLE = True
 except ImportError:
     QONTINUI_AVAILABLE = False
-    QontinuiEventType = None
+    QontinuiEventType = None  # type: ignore[assignment,misc]
 
 from services.unified_data_collector import UnifiedDataCollector
 

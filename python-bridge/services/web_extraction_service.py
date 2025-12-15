@@ -117,7 +117,7 @@ class WebExtractionService:
                 if isinstance(urls, list) and len(urls) > 0:
                     target_kwargs["url"] = urls[0]
                 elif isinstance(urls, str):
-                    target_kwargs["url"] = urls
+                    target_kwargs["url"] = urls  # type: ignore[assignment]
             elif "url" in config and config["url"]:
                 target_kwargs["url"] = config["url"]
             if "executable_path" in config and config["executable_path"]:
@@ -129,7 +129,7 @@ class WebExtractionService:
             if "framework" in config and config["framework"]:
                 framework_str = config["framework"].upper()
                 if framework_str in FrameworkType.__members__:
-                    target_kwargs["framework"] = FrameworkType[framework_str]
+                    target_kwargs["framework"] = FrameworkType[framework_str]  # type: ignore[assignment]
 
             # Authentication
             if "auth_cookies" in config:
@@ -139,7 +139,7 @@ class WebExtractionService:
             if "login_url" in config:
                 target_kwargs["login_url"] = config["login_url"]
 
-            target = ExtractionTarget(**target_kwargs)
+            target = ExtractionTarget(**target_kwargs)  # type: ignore[arg-type]
 
             # Build extraction config
             # Handle both 'viewports' (plural array) and 'viewport' (singular tuple from frontend)

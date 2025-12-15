@@ -23,7 +23,7 @@ from .transition import Transition
 try:
     from .transition import StateChangePoint
 except ImportError:
-    StateChangePoint = None
+    StateChangePoint = None  # type: ignore[assignment,misc]
 
 __all__ = [
     # Core execution models

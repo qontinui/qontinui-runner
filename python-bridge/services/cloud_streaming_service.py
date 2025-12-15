@@ -40,18 +40,18 @@ from typing import Any
 
 try:
     import websockets
-    from websockets.client import WebSocketClientProtocol
+    from websockets.client import ClientProtocol as WebSocketClientProtocol
     from websockets.exceptions import ConnectionClosed, WebSocketException
 except ImportError:
-    websockets = None
-    WebSocketClientProtocol = None
-    ConnectionClosed = None
-    WebSocketException = None
+    websockets = None  # type: ignore
+    WebSocketClientProtocol = None  # type: ignore
+    ConnectionClosed = None  # type: ignore
+    WebSocketException = None  # type: ignore
 
 try:
     from PIL import Image
 except ImportError:
-    Image = None
+    Image = None  # type: ignore[assignment]
 
 # Import models
 from models import InputMonitorEvent, ProcessingResult
@@ -288,7 +288,7 @@ class CloudStreamingService:
 
             logger.info(f"Connecting to cloud streaming endpoint: {self.websocket_url}")
 
-            self.ws = await websockets.connect(
+            self.ws = await websockets.connect(  # type: ignore[assignment]
                 ws_url,
                 ping_interval=20,
                 ping_timeout=10,
@@ -386,11 +386,11 @@ class CloudStreamingService:
             message = {"type": message_type, "timestamp": self._get_timestamp(), **payload}
 
             # Send message
-            await self.ws.send(json.dumps(message))
+            await self.ws.send(json.dumps(message))  # type: ignore[attr-defined]
 
             if wait_for_response:
                 # Wait for response
-                response_raw = await asyncio.wait_for(self.ws.recv(), timeout=timeout)
+                response_raw = await asyncio.wait_for(self.ws.recv(), timeout=timeout)  # type: ignore[attr-defined]
                 response = json.loads(response_raw)
 
                 # Check for error response
@@ -407,7 +407,7 @@ class CloudStreamingService:
 
                     return None
 
-                return response
+                return response  # type: ignore[no-any-return]
 
             return {"success": True}
 
@@ -580,7 +580,7 @@ class CloudStreamingService:
                 return False
 
             # Resize to thumbnail size
-            img.thumbnail(self.config.thumbnail_size, Image.LANCZOS)
+            img.thumbnail(self.config.thumbnail_size, Image.LANCZOS)  # type: ignore[attr-defined]
 
             # Convert to JPEG with compression
             buffer = BytesIO()

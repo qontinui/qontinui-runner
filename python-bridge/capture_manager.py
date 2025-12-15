@@ -115,14 +115,14 @@ class CaptureManager:
             )
             self.emit_log("info", f"Output folder: {settings.output_folder}")
 
-            self.capture_tool_service.update_settings(settings)
+            self.capture_tool_service.update_settings(settings)  # type: ignore[union-attr]
 
             # Start or stop manual click listener based on manual_clicks_enabled setting
             if settings.manual_clicks_enabled and settings.enabled:
                 self.emit_log("info", "Attempting to start manual click listener")
-                if not self.manual_click_listener.is_running():
+                if not self.manual_click_listener.is_running():  # type: ignore[union-attr]
                     self.emit_log("info", "Starting listener...")
-                    success = self.manual_click_listener.start()
+                    success = self.manual_click_listener.start()  # type: ignore[union-attr]
                     self.emit_log("info", f"Listener start result: {success}")
                     if success:
                         self.emit_log("info", "Manual click capture started successfully")
@@ -132,12 +132,12 @@ class CaptureManager:
                     self.emit_log("info", "Listener already running")
             else:
                 self.emit_log("info", "Manual clicks disabled or capture disabled")
-                if self.manual_click_listener.is_running():
+                if self.manual_click_listener.is_running():  # type: ignore[union-attr]
                     self.emit_log("info", "Stopping listener")
-                    self.manual_click_listener.stop()
+                    self.manual_click_listener.stop()  # type: ignore[union-attr]
                     self.emit_log("info", "Manual click capture stopped")
 
-            is_running = self.manual_click_listener.is_running()
+            is_running = self.manual_click_listener.is_running()  # type: ignore[union-attr]
             self.emit_log("info", f"Final state: listener is_running={is_running}")
 
             # Emit event with manual capture status for frontend

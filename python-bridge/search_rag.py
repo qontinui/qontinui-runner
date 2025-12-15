@@ -110,7 +110,7 @@ async def search_elements(
             # Build result dictionary
             result_dict = {
                 "element_id": element.id,
-                "name": element.name,
+                "name": element.name,  # type: ignore[attr-defined]
                 "score": float(result.score),
                 "element_type": element.element_type.value if element.element_type else None,
                 "text_description": element.text_description or "",
@@ -126,7 +126,7 @@ async def search_elements(
                     if element.bounding_box
                     else None
                 ),
-                "metadata": element.metadata or {},
+                "metadata": element.metadata or {},  # type: ignore[attr-defined]
             }
             results.append(result_dict)
 

@@ -221,7 +221,7 @@ class FrameExtractorService:
             try:
                 image = Image.open(tmp_path)
                 # Copy to memory and close file
-                image = image.copy()
+                image = image.copy()  # type: ignore[assignment]
             except Exception as e:
                 logger.error(f"Failed to load extracted frame: {e}")
                 Path(tmp_path).unlink(missing_ok=True)
@@ -400,7 +400,7 @@ class FrameExtractorService:
                         try:
                             image = Image.open(extracted_files[i])
                             # Copy to memory before file is deleted
-                            image = image.copy()
+                            image = image.copy()  # type: ignore[assignment]
 
                             frames.append(
                                 ExtractedFrame(
@@ -495,7 +495,7 @@ class FrameExtractorService:
                 for i, file_path in enumerate(extracted_files):
                     try:
                         image = Image.open(file_path)
-                        image = image.copy()
+                        image = image.copy()  # type: ignore[assignment]
 
                         # Estimate timestamp (actual keyframe times would require parsing FFmpeg output)
                         # This is an approximation

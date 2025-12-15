@@ -100,7 +100,7 @@ def load_screenshot(
 
     if capture_screen:
         try:
-            from qontinui.hal import ScreenCapture
+            from qontinui.hal import ScreenCapture  # type: ignore[attr-defined]
 
             capture = ScreenCapture()
             monitors = capture.list_monitors()
@@ -240,7 +240,7 @@ async def find_elements(
 
                 match_info: dict[str, Any] = {
                     "element_id": element.id,
-                    "element_name": element.name,
+                    "element_name": element.name,  # type: ignore[attr-defined]
                     "visual_similarity": float(visual_sim),
                     "text_similarity": float(text_sim) if text_sim else None,
                     "combined_score": float(combined_score),

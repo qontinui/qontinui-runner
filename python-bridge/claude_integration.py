@@ -66,7 +66,8 @@ def get_execution_metadata() -> dict[str, Any] | None:
 
     try:
         with open(execution_json) as f:
-            return json.load(f)
+            data: dict[str, Any] | None = json.load(f)
+            return data
     except Exception as e:
         logger.error(f"Failed to read execution.json: {e}")
         return None

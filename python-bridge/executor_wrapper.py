@@ -66,12 +66,12 @@ class ExecutorWrapper:
                 self.config = self.runner.config
                 config_info = {
                     "path": config_path,
-                    "version": self.config.version,
-                    "name": self.config.metadata.get("name", "Unnamed"),
-                    "states": len(self.config.states),
-                    "processes": len(self.config.processes),
-                    "transitions": len(self.config.transitions),
-                    "images": len(self.config.images),
+                    "version": self.config.version,  # type: ignore[union-attr]
+                    "name": self.config.metadata.get("name", "Unnamed"),  # type: ignore[union-attr]
+                    "states": len(self.config.states),  # type: ignore[union-attr]
+                    "processes": len(self.config.processes),  # type: ignore[union-attr]
+                    "transitions": len(self.config.transitions),  # type: ignore[union-attr]
+                    "images": len(self.config.images),  # type: ignore[union-attr]
                 }
                 self._emit_event(EventType.CONFIG_LOADED, config_info)
                 return True

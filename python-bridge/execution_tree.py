@@ -113,8 +113,8 @@ class ExecutionNode:
         Returns:
             List of {id, name, type} dictionaries from root to this node
         """
-        path = []
-        node = self
+        path: list[dict[str, str]] = []
+        node: ExecutionNode | None = self
         while node:
             path.insert(0, {"id": node.id, "name": node.name, "type": node.node_type})
             node = node.parent
@@ -176,7 +176,8 @@ class ExecutionTree:
             self.current = node
         else:
             # Nested workflow - add as child of current node
-            self.current.add_child(node)
+            if self.current is not None:
+                self.current.add_child(node)
             self.current = node
 
         return node
@@ -190,12 +191,12 @@ class ExecutionTree:
             error: Optional error message if failed
         """
         node = self.node_map.get(workflow_id)
-        if node:
+        if node is not None:
             node.status = "success" if success else "failed"
             node.error = error
             node.end_timestamp = time.time()
             # Move current pointer to parent
-            if node.parent:
+            if node.parent is not None:
                 self.current = node.parent
 
     def start_transition(
@@ -237,12 +238,12 @@ class ExecutionTree:
             error: Optional error message if failed
         """
         node = self.node_map.get(transition_id)
-        if node:
+        if node is not None:
             node.status = "success" if success else "failed"
             node.error = error
             node.end_timestamp = time.time()
             # Move current pointer to parent
-            if node.parent:
+            if node.parent is not None:
                 self.current = node.parent
 
     def start_action(
@@ -284,12 +285,12 @@ class ExecutionTree:
             error: Optional error message if failed
         """
         node = self.node_map.get(action_id)
-        if node:
+        if node is not None:
             node.status = "success" if success else "failed"
             node.error = error
             node.end_timestamp = time.time()
             # Move current pointer to parent
-            if node.parent:
+            if node.parent is not None:
                 self.current = node.parent
 
     def get_current_hierarchy(self) -> dict[str, Any]:
@@ -311,7 +312,7 @@ class ExecutionTree:
             if node.node_type == "workflow":
                 workflow_name = node.name
                 break
-            node = node.parent
+            node = node.parent  # type: ignore[assignment]
 
         return {
             "parent_id": self.current.id,

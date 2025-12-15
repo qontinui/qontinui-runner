@@ -346,7 +346,7 @@ class StateBoundaryDetector:
 
                 # Extract keypoints and descriptors
                 gray = cv2.cvtColor(frame.image, cv2.COLOR_BGR2GRAY)
-                keypoints, descriptors = self.feature_detector.detectAndCompute(gray, None)
+                keypoints, descriptors = self.feature_detector.detectAndCompute(gray, None)  # type: ignore[attr-defined]
 
                 # Compute color histogram
                 histogram = self._compute_histogram(frame.image)
@@ -422,7 +422,7 @@ class StateBoundaryDetector:
                 gray2 = gray2[:h, :w]
 
             # Compute dense optical flow
-            flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            flow = cv2.calcOpticalFlowFarneback(gray1, gray2, None, 0.5, 3, 15, 3, 5, 1.2, 0)  # type: ignore[call-overload]
 
             # Calculate magnitude
             magnitude, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
@@ -539,7 +539,7 @@ class StateBoundaryDetector:
         )
         labels = clustering.fit_predict(distance_matrix)
         logger.info(f"DBSCAN found {len(set(labels)) - (1 if -1 in labels else 0)} clusters")
-        return labels
+        return labels  # type: ignore[no-any-return]
 
     def _cluster_hierarchical(self, distance_matrix: np.ndarray) -> np.ndarray:
         """Cluster using hierarchical clustering.
@@ -558,7 +558,7 @@ class StateBoundaryDetector:
         )
         labels = clustering.fit_predict(distance_matrix)
         logger.info(f"Hierarchical clustering found {len(set(labels))} clusters")
-        return labels
+        return labels  # type: ignore[no-any-return]
 
     def _cluster_kmeans(self, distance_matrix: np.ndarray) -> np.ndarray:
         """Cluster using k-means algorithm.
@@ -582,7 +582,7 @@ class StateBoundaryDetector:
         clustering = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         labels = clustering.fit_predict(features_scaled)
         logger.info(f"K-means found {len(set(labels))} clusters")
-        return labels
+        return labels  # type: ignore[no-any-return]
 
     # ========================================================================
     # Private Methods - State Building
@@ -673,7 +673,7 @@ class StateBoundaryDetector:
 
             avg_similarity = np.mean(similarities) if similarities else 0.0
             if avg_similarity > best_avg_similarity:
-                best_avg_similarity = avg_similarity
+                best_avg_similarity = avg_similarity  # type: ignore[assignment]
                 best_idx = idx
 
         return best_idx

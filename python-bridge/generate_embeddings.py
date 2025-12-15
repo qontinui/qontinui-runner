@@ -190,7 +190,7 @@ async def generate_embeddings_for_project(project_id: str) -> None:
                     clip_embedding = clip_embedder.encode_image(element_image)
 
                     # Generate DINOv2 embedding
-                    dinov2_embedding = dinov2_embedder.encode_image(element_image)
+                    dinov2_embedding = dinov2_embedder.encode_image(element_image)  # type: ignore[attr-defined]
 
                     # Store embeddings in element
                     # Note: GUIElementChunk stores these in image_embedding field

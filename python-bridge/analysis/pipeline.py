@@ -442,21 +442,21 @@ class AnalysisPipeline:
             return states
 
         elif phase == "image_extraction":
-            states = kwargs.get("states")
+            states = kwargs.get("states")  # type: ignore[assignment]
             if not states:
                 raise ValueError("image_extraction phase requires 'states' parameter")
             step = self._run_image_extraction(states, session.frames, session.events)
             return states  # Modified in place
 
         elif phase == "element_detection":
-            states = kwargs.get("states")
+            states = kwargs.get("states")  # type: ignore[assignment]
             if not states:
                 raise ValueError("element_detection phase requires 'states' parameter")
             step = self._run_element_detection(states, session.frames)
             return states  # Modified in place
 
         elif phase == "transition_analysis":
-            states = kwargs.get("states")
+            states = kwargs.get("states")  # type: ignore[assignment]
             if not states:
                 raise ValueError("transition_analysis phase requires 'states' parameter")
             transitions, step = self._run_transition_analysis(
@@ -539,7 +539,7 @@ class AnalysisPipeline:
             "result1": {
                 "num_states": len(result1.states),
                 "num_transitions": len(result1.transitions),
-                "num_state_images": sum(len(s.state_images) for s in result1.states),
+                "num_state_images": sum(len(s.state_images) for s in result1.states),  # type: ignore[misc,attr-defined]
                 "processing_duration_ms": result1.processing_log.total_duration_ms,
                 "success": result1.success,
                 "errors": len(result1.processing_log.errors),
@@ -548,7 +548,7 @@ class AnalysisPipeline:
             "result2": {
                 "num_states": len(result2.states),
                 "num_transitions": len(result2.transitions),
-                "num_state_images": sum(len(s.state_images) for s in result2.states),
+                "num_state_images": sum(len(s.state_images) for s in result2.states),  # type: ignore[misc,attr-defined]
                 "processing_duration_ms": result2.processing_log.total_duration_ms,
                 "success": result2.success,
                 "errors": len(result2.processing_log.errors),
@@ -557,8 +557,8 @@ class AnalysisPipeline:
             "differences": {
                 "states_delta": len(result2.states) - len(result1.states),
                 "transitions_delta": len(result2.transitions) - len(result1.transitions),
-                "state_images_delta": sum(len(s.state_images) for s in result2.states)
-                - sum(len(s.state_images) for s in result1.states),
+                "state_images_delta": sum(len(s.state_images) for s in result2.states)  # type: ignore[misc,attr-defined]
+                - sum(len(s.state_images) for s in result1.states),  # type: ignore[misc,attr-defined]
                 "duration_delta_ms": result2.processing_log.total_duration_ms
                 - result1.processing_log.total_duration_ms,
             },
@@ -702,7 +702,7 @@ class AnalysisPipeline:
 
         end_time = time.time()
 
-        return states, ProcessingStep(
+        return states, ProcessingStep(  # type: ignore[return-value]
             name="state_detection",
             start_time=start_time,
             end_time=end_time,
@@ -738,14 +738,14 @@ class AnalysisPipeline:
         try:
             for state in states:
                 extracted_images = self.image_extractor.extract_from_state(state, frames, events)
-                state.state_images = extracted_images
+                state.state_images = extracted_images  # type: ignore[attr-defined]
                 total_images += len(extracted_images)
 
             success = True
             logger.info("Image extraction complete: %d total images extracted", total_images)
 
             for state in states:
-                logger.debug("  - %s: %d StateImages", state.name, len(state.state_images))
+                logger.debug("  - %s: %d StateImages", state.name, len(state.state_images))  # type: ignore[attr-defined]
 
         except Exception as e:
             error = str(e)
@@ -836,7 +836,7 @@ class AnalysisPipeline:
         success = False
 
         try:
-            transitions = self.transition_analyzer.analyze_transitions(states, events, frames)
+            transitions = self.transition_analyzer.analyze_transitions(states, events, frames)  # type: ignore[arg-type]
             success = True
 
             logger.info("Transition analysis complete: %d transitions found", len(transitions))
@@ -894,13 +894,13 @@ class AnalysisPipeline:
 
         # Average state image count (more images = higher confidence)
         if states:
-            avg_images_per_state = sum(len(s.state_images) for s in states) / len(states)
+            avg_images_per_state = sum(len(s.state_images) for s in states) / len(states)  # type: ignore[misc,attr-defined]
             scores["avg_state_images"] = avg_images_per_state
 
             # State coverage (what percentage of frames are in states)
-            total_state_frames = sum(len(s.frame_indices) for s in states)
+            total_state_frames = sum(len(s.frame_indices) for s in states)  # type: ignore[misc,attr-defined]
             scores["state_coverage"] = total_state_frames / max(
-                1, max(s.end_frame_index for s in states)
+                1, max(s.end_frame_index for s in states)  # type: ignore[attr-defined]
             )
 
         # Transition coverage (what percentage of states have transitions)

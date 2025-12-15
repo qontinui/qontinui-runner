@@ -213,7 +213,7 @@ class InputMonitorService:
 
             self._monitoring = False
 
-            events_file_path = str(self._events_file.absolute())
+            events_file_path = str(self._events_file.absolute())  # type: ignore[union-attr]
             event_count = len(self._events)
 
             logger.info(
@@ -536,9 +536,9 @@ class InputMonitorService:
         """
         try:
             if hasattr(key, "char") and key.char is not None:
-                return key.char
+                return key.char  # type: ignore[no-any-return]
             elif hasattr(key, "name"):
-                return key.name
+                return key.name  # type: ignore[no-any-return]
             else:
                 return str(key)
         except Exception:
@@ -556,7 +556,7 @@ class InputMonitorService:
         """
         try:
             if hasattr(key, "vk"):
-                return key.vk
+                return key.vk  # type: ignore[no-any-return]
         except Exception:
             pass
         return None
@@ -602,4 +602,4 @@ class InputMonitorService:
             True if movement exceeds threshold, False otherwise
         """
         distance = ((end[0] - start[0]) ** 2 + (end[1] - start[1]) ** 2) ** 0.5
-        return distance > threshold
+        return distance > threshold  # type: ignore[no-any-return]

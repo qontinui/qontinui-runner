@@ -129,7 +129,7 @@ class StateMemoryAdapter:
     def get_active_state_names(self) -> list[str]:
         if self.state_executor is None:
             return []
-        return self.state_executor.get_active_states()
+        return self.state_executor.get_active_states()  # type: ignore[no-any-return]
 
 
 class QontinuiExecutor:
@@ -288,7 +288,7 @@ class QontinuiExecutor:
 
     def _get_current_hierarchy(self) -> dict[str, Any]:
         """Get current execution hierarchy from execution tree."""
-        return self.execution_tree.get_current_hierarchy()
+        return self.execution_tree.get_current_hierarchy()  # type: ignore[no-any-return]
 
     def _get_state_for_image(self, image_id: str) -> str | None:
         """Find which state an image belongs to."""
@@ -303,13 +303,13 @@ class QontinuiExecutor:
             for state_image in state_images:
                 state_image_id = state_image.get("id")
                 if state_image_id == image_id:
-                    return state_name
+                    return state_name  # type: ignore[no-any-return]
 
                 patterns = state_image.get("patterns", [])
                 for pattern in patterns:
                     pattern_image_id = pattern.get("image")
                     if pattern_image_id == image_id:
-                        return state_name
+                        return state_name  # type: ignore[no-any-return]
 
         return None
 
@@ -323,12 +323,12 @@ class QontinuiExecutor:
             state_images = state.get("stateImages", [])
             for state_image in state_images:
                 if state_image.get("id") == image_id:
-                    return state_image.get("name")
+                    return state_image.get("name")  # type: ignore[no-any-return]
 
                 patterns = state_image.get("patterns", [])
                 for pattern in patterns:
                     if pattern.get("image") == image_id:
-                        return state_image.get("name")
+                        return state_image.get("name")  # type: ignore[no-any-return]
 
         return None
 
@@ -340,7 +340,7 @@ class QontinuiExecutor:
         images = self.config.get("images", [])
         for image in images:
             if image.get("id") == image_id:
-                return image.get("data")
+                return image.get("data")  # type: ignore[no-any-return]
 
         return None
 
@@ -456,7 +456,7 @@ class QontinuiExecutor:
                 navigation_api.set_workflow_executor(self)
                 self.event_manager.emit_log("info", "Runner injected as workflow_executor")
 
-        return success
+        return success  # type: ignore[no-any-return]
 
     def execute_workflow(
         self, workflow_id: str, transition_context: dict | None = None
@@ -925,7 +925,7 @@ class QontinuiExecutor:
 
         elif cmd_type == "update_capture_settings":
             settings = params.get("settings", {})
-            return self.capture_manager.update_settings(settings)
+            return self.capture_manager.update_settings(settings)  # type: ignore[no-any-return]
 
         elif cmd_type == "manual_capture_status":
             return {"success": True, "is_running": self.capture_manager.is_manual_capture_running()}
@@ -1135,7 +1135,7 @@ class QontinuiExecutor:
                 event_manager=self.event_manager,
                 websocket_handler=self.websocket_handler,
             )
-        return self._web_extraction_service
+        return self._web_extraction_service  # type: ignore[no-any-return]
 
     def _start_async_loop(self):
         """Start the async event loop in a background thread."""
@@ -1252,7 +1252,7 @@ class QontinuiExecutor:
                 self._web_extraction_service.stop_extraction(), loop
             )
             result = future.result(timeout=30)
-            return result
+            return result  # type: ignore[no-any-return]
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to stop extraction: {e}")
