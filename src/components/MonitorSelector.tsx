@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Check, Pencil, RotateCcw } from "lucide-react";
+import { Monitor, Check, Pencil, RotateCcw, AlertTriangle } from "lucide-react";
 
 export interface MonitorInfo {
   index: number;
@@ -70,6 +70,7 @@ export function MonitorSelector({
 }: MonitorSelectorProps) {
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [showWarning, setShowWarning] = useState(false);
 
   useEffect(() => {
     loadMonitors();
@@ -115,16 +116,25 @@ export function MonitorSelector({
     }
   };
 
+  const handleOverrideToggle = () => {
+    if (!onOverrideToggle) return;
+
+    // If enabling override mode (Edit button), show warning
+    if (!isOverrideActive) {
+      setShowWarning(true);
+      // Auto-hide warning after 5 seconds
+      setTimeout(() => setShowWarning(false), 5000);
+    }
+
+    onOverrideToggle();
+  };
+
   if (loading) {
-    return (
-      <div className={`text-sm text-muted-foreground ${className}`}>Loading monitors...</div>
-    );
+    return <div className={`text-sm text-muted-foreground ${className}`}>Loading monitors...</div>;
   }
 
   if (monitors.length === 0) {
-    return (
-      <div className={`text-sm text-muted-foreground ${className}`}>No monitors detected</div>
-    );
+    return <div className={`text-sm text-muted-foreground ${className}`}>No monitors detected</div>;
   }
 
   const buttonSize = compact ? "p-2 min-w-[80px]" : "p-3 min-w-[100px]";
@@ -150,20 +160,12 @@ export function MonitorSelector({
           >
             <div className="flex items-center gap-1.5">
               <Monitor className={iconSize} />
-              <span className="font-medium">
-                #{monitor.index}
-              </span>
-              {multiSelect && isSelected && (
-                <Check className={`${iconSize} text-primary`} />
-              )}
+              <span className="font-medium">#{monitor.index}</span>
+              {multiSelect && isSelected && <Check className={`${iconSize} text-primary`} />}
             </div>
             <div className={`${textSize} text-muted-foreground space-y-0.5`}>
-              {monitor.is_primary && (
-                <div className="text-primary font-medium">Primary</div>
-              )}
-              {position && !compact && (
-                <div>{position}</div>
-              )}
+              {monitor.is_primary && <div className="text-primary font-medium">Primary</div>}
+              {position && !compact && <div>{position}</div>}
               <div>
                 {monitor.width}x{monitor.height}
               </div>
@@ -189,16 +191,14 @@ export function MonitorSelector({
               <Check className={`${iconSize} text-primary`} />
             )}
           </div>
-          <div className={`${textSize} text-muted-foreground`}>
-            {monitors.length} monitors
-          </div>
+          <div className={`${textSize} text-muted-foreground`}>{monitors.length} monitors</div>
         </button>
       )}
 
       {/* Override toggle button */}
       {onOverrideToggle && (
         <button
-          onClick={onOverrideToggle}
+          onClick={handleOverrideToggle}
           className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs transition-colors ${
             isOverrideActive
               ? "bg-yellow-500/20 text-yellow-600 hover:bg-yellow-500/30"
@@ -218,6 +218,18 @@ export function MonitorSelector({
             </>
           )}
         </button>
+      )}
+
+      {/* Warning when override is active */}
+      {showWarning && isOverrideActive && (
+        <div className="flex items-start gap-2 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs">
+          <AlertTriangle className="w-4 h-4 flex-shrink-0 text-yellow-600 mt-0.5" />
+          <div className="text-yellow-600">
+            <strong>Efficiency Warning:</strong> Manual monitor selection will reduce efficiency by
+            searching all selected monitors for images. By default, StateImages are only searched on
+            their associated monitor(s).
+          </div>
+        </div>
       )}
     </div>
   );

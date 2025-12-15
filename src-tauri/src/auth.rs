@@ -102,10 +102,10 @@ impl AuthManager {
             .context("Failed to create keychain entry for refresh token")?;
 
         // Ignore errors if tokens don't exist
-        if let Err(e) = entry_access.delete_password() {
+        if let Err(e) = entry_access.delete_credential() {
             error!("Failed to delete access token (may not exist): {}", e);
         }
-        if let Err(e) = entry_refresh.delete_password() {
+        if let Err(e) = entry_refresh.delete_credential() {
             error!("Failed to delete refresh token (may not exist): {}", e);
         }
 

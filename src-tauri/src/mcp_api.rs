@@ -66,9 +66,12 @@ use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
+use crate::commands::rag::RAGState;
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
+use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::settings;
+use axum::routing::delete;
 use tauri::{Emitter, Manager};
 
 /// Default port for the MCP API server
@@ -77,6 +80,7 @@ pub const MCP_API_PORT: u16 = 9876;
 /// Shared state for the API server
 pub struct ApiState {
     pub app_state: Arc<AppState>,
+    pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
 }
 
@@ -818,10 +822,293 @@ async fn stop_execution(
     }
 }
 
+// ============================================================================
+// RAG API Endpoints
+// ============================================================================
+
+/// Request to import a RAG configuration
+///
+/// Accepts the full QontinuiConfig format directly from the frontend.
+/// The runner extracts what it needs (images, states, patterns) internally.
+/// This eliminates the need for frontend transformation code.
+#[derive(Debug, Deserialize)]
+pub struct ImportRAGRequest {
+    /// Full QontinuiConfig - the canonical format from TypeScript/Python
+    pub config: QontinuiConfig,
+    /// Optional project_id override (defaults to derived from metadata.name)
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Import a RAG configuration
+///
+/// Accepts the full QontinuiConfig format directly from the frontend.
+/// Saves the complete config and extracts images for embedding generation.
+async fn import_rag(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ImportRAGRequest>,
+) -> Result<Json<ApiResponse<ImportResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Use provided project_id or derive from metadata.name
+    let project_id = request
+        .project_id
+        .clone()
+        .unwrap_or_else(|| request.config.project_id());
+
+    let image_count = request.config.images.len();
+    let state_image_count = request.config.state_image_count();
+    let pattern_count = request.config.pattern_count();
+
+    info!(
+        "MCP API: Importing QontinuiConfig: project_id={}, name={}, images={}, states={}, stateImages={}, patterns={}",
+        project_id,
+        request.config.metadata.name,
+        image_count,
+        request.config.states.len(),
+        state_image_count,
+        pattern_count
+    );
+
+    // Save the full QontinuiConfig
+    let storage = state.rag_state.storage.lock().await;
+    let storage_path = storage
+        .save_qontinui_config(&project_id, &request.config)
+        .map_err(|e| {
+            error!("Failed to save QontinuiConfig: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to save config: {}", e))),
+            )
+        })?;
+
+    // Extract and save images from config.images[]
+    // Only save images that are referenced by patterns
+    let referenced_ids = request.config.referenced_image_ids();
+    let saved_image_count = storage
+        .save_images_from_config(&project_id, &request.config.images, &referenced_ids)
+        .map_err(|e| {
+            error!("Failed to save images: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to save images: {}", e))),
+            )
+        })?;
+
+    let storage_path_str = storage_path.to_string_lossy().to_string();
+    drop(storage);
+
+    // Trigger embedding generation in background
+    info!(
+        "MCP API: Starting background embedding generation for project_id={}",
+        project_id
+    );
+    let embedding_generator = state.rag_state.embedding_generator.lock().await;
+    let _progress_rx = embedding_generator.generate_embeddings_async(project_id.clone());
+    drop(embedding_generator);
+
+    let result = ImportResult {
+        success: true,
+        project_id: project_id.clone(),
+        message: format!(
+            "Successfully imported QontinuiConfig '{}' with {} images ({} saved for RAG) and {} patterns. Embedding generation started.",
+            request.config.metadata.name, image_count, saved_image_count, pattern_count
+        ),
+        screenshot_count: saved_image_count,
+        element_count: pattern_count,
+        storage_path: storage_path_str,
+    };
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+/// List all RAG configurations
+async fn list_rag_configs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<RAGConfigSummary>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Listing RAG configurations");
+
+    let storage = state.rag_state.storage.lock().await;
+    let summaries = storage.list_configs().map_err(|e| {
+        error!("Failed to list RAG configs: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to list configs: {}", e))),
+        )
+    })?;
+
+    info!("MCP API: Found {} RAG configurations", summaries.len());
+
+    Ok(Json(ApiResponse::success(summaries)))
+}
+
+/// Get RAG embedding status for a project
+async fn get_rag_status(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(project_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Getting RAG status for project_id={}", project_id);
+
+    let embedding_generator = state.rag_state.embedding_generator.lock().await;
+
+    // Get progress from state if available (includes in-progress tracking)
+    if let Some(progress) = embedding_generator.get_progress(&project_id) {
+        let status_str = match &progress.status {
+            crate::rag::EmbeddingStatus::NotStarted => "not_started",
+            crate::rag::EmbeddingStatus::InProgress(_) => "in_progress",
+            crate::rag::EmbeddingStatus::Completed => "completed",
+            crate::rag::EmbeddingStatus::Failed(_) => "failed",
+        };
+
+        let mut data = serde_json::json!({
+            "status": status_str,
+            "message": progress.message,
+        });
+
+        // Add optional fields if present
+        if let Some(percent) = progress.percent {
+            data["percent"] = serde_json::json!(percent);
+        }
+        if let Some(elements_processed) = progress.elements_processed {
+            data["elements_processed"] = serde_json::json!(elements_processed);
+        }
+        if let Some(total_elements) = progress.total_elements {
+            data["total_elements"] = serde_json::json!(total_elements);
+        }
+
+        return Ok(Json(ApiResponse::success(data)));
+    }
+
+    // Fallback to file-based check (for completed/not started)
+    let status = embedding_generator.check_status(&project_id);
+
+    let status_str = match &status {
+        crate::rag::EmbeddingStatus::NotStarted => "not_started",
+        crate::rag::EmbeddingStatus::InProgress(pct) => {
+            return Ok(Json(ApiResponse::success(serde_json::json!({
+                "status": "in_progress",
+                "percent": pct
+            }))));
+        }
+        crate::rag::EmbeddingStatus::Completed => "completed",
+        crate::rag::EmbeddingStatus::Failed(_) => "failed",
+    };
+
+    let message = match &status {
+        crate::rag::EmbeddingStatus::Failed(err) => {
+            Some(format!("Embedding generation failed: {}", err))
+        }
+        crate::rag::EmbeddingStatus::Completed => {
+            Some("Embeddings generated successfully".to_string())
+        }
+        _ => None,
+    };
+
+    let mut data = serde_json::json!({
+        "status": status_str
+    });
+    if let Some(msg) = message {
+        data["message"] = serde_json::json!(msg);
+    }
+
+    Ok(Json(ApiResponse::success(data)))
+}
+
+/// Delete a RAG configuration
+async fn delete_rag_config(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(project_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Deleting RAG config for project_id={}", project_id);
+
+    let storage = state.rag_state.storage.lock().await;
+    storage.delete_config(&project_id).map_err(|e| {
+        error!("Failed to delete RAG config: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to delete config: {}", e))),
+        )
+    })?;
+
+    info!(
+        "MCP API: Successfully deleted RAG config for project_id={}",
+        project_id
+    );
+
+    Ok(Json(ApiResponse::success(format!(
+        "Successfully deleted RAG config: {}",
+        project_id
+    ))))
+}
+
+/// Load a RAG project into the executor
+async fn load_rag_project(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(project_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Loading RAG project for project_id={}", project_id);
+
+    // Try to load as QontinuiConfig first
+    let storage = state.rag_state.storage.lock().await;
+
+    if let Ok(config) = storage.load_qontinui_config(&project_id) {
+        drop(storage);
+
+        // TODO: Load into executor if needed
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "project_id": project_id,
+            "name": config.metadata.name,
+            "states": config.states.len(),
+            "patterns": config.pattern_count(),
+            "loaded": true
+        }))));
+    }
+
+    // Try legacy format
+    if let Ok(config) = storage.load_config(&project_id) {
+        drop(storage);
+
+        return Ok(Json(ApiResponse::success(serde_json::json!({
+            "project_id": project_id,
+            "name": config.project_name,
+            "screenshots": config.screenshots.len(),
+            "elements": config.total_element_count(),
+            "loaded": true
+        }))));
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(api_error(format!("Project not found: {}", project_id))),
+    ))
+}
+
+/// Get RAG availability (ML models status)
+async fn get_rag_availability(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Checking RAG availability");
+
+    // TODO: Actually check ML model availability
+    // For now, return a placeholder response
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "available": true,
+        "models": {
+            "clip": true,
+            "text": true,
+            "ocr": true,
+            "sam": false
+        }
+    }))))
+}
+
 /// Create the API router
-pub fn create_router(app_state: Arc<AppState>, app_handle: tauri::AppHandle) -> Router {
+pub fn create_router(
+    app_state: Arc<AppState>,
+    rag_state: Arc<RAGState>,
+    app_handle: tauri::AppHandle,
+) -> Router {
     let api_state = Arc::new(ApiState {
         app_state,
+        rag_state,
         app_handle,
     });
 
@@ -839,6 +1126,13 @@ pub fn create_router(app_state: Arc<AppState>, app_handle: tauri::AppHandle) -> 
         .route("/load-last-config", post(load_last_config))
         .route("/run-workflow", post(run_workflow))
         .route("/stop-execution", post(stop_execution))
+        // RAG routes
+        .route("/rag/import", post(import_rag))
+        .route("/rag/list", get(list_rag_configs))
+        .route("/rag/availability", get(get_rag_availability))
+        .route("/rag/:project_id/status", get(get_rag_status))
+        .route("/rag/:project_id/load", post(load_rag_project))
+        .route("/rag/:project_id", delete(delete_rag_config))
         .layer(cors)
         .with_state(api_state)
 }
@@ -846,10 +1140,11 @@ pub fn create_router(app_state: Arc<AppState>, app_handle: tauri::AppHandle) -> 
 /// Start the MCP API server
 pub async fn start_server(
     app_state: Arc<AppState>,
+    rag_state: Arc<RAGState>,
     app_handle: tauri::AppHandle,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let router = create_router(app_state, app_handle);
+    let router = create_router(app_state, rag_state, app_handle);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     info!("MCP API server listening on port {}", port);

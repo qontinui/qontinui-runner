@@ -68,8 +68,7 @@ export class ConfigurationParserService {
    */
   filterMainWorkflows(workflows: Workflow[]): Workflow[] {
     return workflows.filter(
-      (w) =>
-        w.category?.toLowerCase() === "main" && (!w.visibility || w.visibility !== "internal"),
+      (w) => w.category?.toLowerCase() === "main" && (!w.visibility || w.visibility !== "internal"),
     );
   }
 

@@ -11,6 +11,7 @@
 //! - `debug` - Debug settings management
 //! - `execution` - Python executor lifecycle and workflow execution
 //! - `extraction` - Web GUI extraction and training data export
+//! - `project_logs` - Project-specific log management and external log sources
 //! - `screenshot` - Screenshot capture operations
 //! - `state_machine` - State navigation and transition execution
 //! - `storage` - Local disk storage management
@@ -38,6 +39,8 @@ pub mod debug;
 pub mod execution;
 pub mod extraction;
 pub mod logging;
+pub mod project_logs;
+pub mod rag;
 pub mod screenshot;
 pub mod state_machine;
 pub mod storage;

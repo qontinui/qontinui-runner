@@ -8,11 +8,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type {
-  WebExtractionConfig,
-  ExtractionStatus,
-  ExtractionResult,
-} from "../types/extraction";
+import type { WebExtractionConfig, ExtractionStatus, ExtractionResult } from "../types/extraction";
 
 interface UseWebExtractionReturn {
   extractionStatus: ExtractionStatus | null;

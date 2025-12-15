@@ -6,9 +6,26 @@
  */
 
 import { useState, useRef, useEffect } from "react";
-import { X, Plus, Trash2, Save, FileText, Folder, Eye, EyeOff, ChevronDown, Zap, FolderOpen } from "lucide-react";
+import {
+  X,
+  Plus,
+  Trash2,
+  Save,
+  FileText,
+  Folder,
+  Eye,
+  EyeOff,
+  ChevronDown,
+  Zap,
+  FolderOpen,
+} from "lucide-react";
 import type { LogSource, ProjectLogConfig, CommonLogPath } from "../types/projectLogs";
-import { LOG_SOURCE_TEMPLATES, COMMON_LOG_PATHS, generateLogSourceId, createLogSource } from "../types/projectLogs";
+import {
+  LOG_SOURCE_TEMPLATES,
+  COMMON_LOG_PATHS,
+  generateLogSourceId,
+  createLogSource,
+} from "../types/projectLogs";
 
 interface LogSourceManagerProps {
   /** Current project configuration */
@@ -23,7 +40,13 @@ interface LogSourceManagerProps {
   projectDirectory?: string;
 }
 
-export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirectory }: LogSourceManagerProps) {
+export function LogSourceManager({
+  config,
+  isOpen,
+  onClose,
+  onSave,
+  projectDirectory,
+}: LogSourceManagerProps) {
   const [sources, setSources] = useState<LogSource[]>(config.logSources || []);
   const [hasChanges, setHasChanges] = useState(false);
   const [showQuickAdd, setShowQuickAdd] = useState(false);
@@ -70,7 +93,7 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
         createLogSource({
           ...partial,
           id: generateLogSourceId(),
-        })
+        }),
       );
       setSources([...sources, ...newSources]);
       setHasChanges(true);
@@ -104,7 +127,7 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
       acc[path.category].push(path);
       return acc;
     },
-    {} as Record<string, CommonLogPath[]>
+    {} as Record<string, CommonLogPath[]>,
   );
 
   const handleSave = () => {
@@ -142,10 +165,7 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <h2 className="text-lg font-semibold">Configure Log Sources</h2>
-          <button
-            onClick={handleCancel}
-            className="p-1 hover:bg-muted rounded transition-colors"
-          >
+          <button onClick={handleCancel} className="p-1 hover:bg-muted rounded transition-colors">
             <X className="w-5 h-5" />
           </button>
         </div>
@@ -192,9 +212,17 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
                             ? "text-green-500 hover:bg-green-500/10"
                             : "text-muted-foreground hover:bg-muted"
                         }`}
-                        title={source.enabled ? "Enabled - click to disable" : "Disabled - click to enable"}
+                        title={
+                          source.enabled
+                            ? "Enabled - click to disable"
+                            : "Disabled - click to enable"
+                        }
                       >
-                        {source.enabled ? <Eye className="w-5 h-5" /> : <EyeOff className="w-5 h-5" />}
+                        {source.enabled ? (
+                          <Eye className="w-5 h-5" />
+                        ) : (
+                          <EyeOff className="w-5 h-5" />
+                        )}
                       </button>
 
                       {/* Name input */}
@@ -237,9 +265,7 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
 
                     {/* Tail lines */}
                     <div>
-                      <label className="text-xs text-muted-foreground block mb-1">
-                        Tail Lines
-                      </label>
+                      <label className="text-xs text-muted-foreground block mb-1">Tail Lines</label>
                       <input
                         type="number"
                         value={source.tailLines || 100}
@@ -270,13 +296,9 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
                         <input
                           type="text"
                           value={source.path}
-                          onChange={(e) =>
-                            handleUpdateSource(source.id, { path: e.target.value })
-                          }
+                          onChange={(e) => handleUpdateSource(source.id, { path: e.target.value })}
                           placeholder={
-                            source.type === "file"
-                              ? "/path/to/your/app.log"
-                              : "/path/to/logs/"
+                            source.type === "file" ? "/path/to/your/app.log" : "/path/to/logs/"
                           }
                           className="flex-1 bg-transparent text-sm focus:outline-none"
                         />
@@ -293,9 +315,7 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
                       <input
                         type="text"
                         value={source.pattern || ""}
-                        onChange={(e) =>
-                          handleUpdateSource(source.id, { pattern: e.target.value })
-                        }
+                        onChange={(e) => handleUpdateSource(source.id, { pattern: e.target.value })}
                         placeholder="*.log"
                         className="w-full bg-muted border border-border rounded px-2 py-1.5 text-sm"
                       />
@@ -336,7 +356,9 @@ export function LogSourceManager({ config, isOpen, onClose, onSave, projectDirec
               >
                 <Zap className="w-4 h-4" />
                 Quick Add
-                <ChevronDown className={`w-4 h-4 transition-transform ${showQuickAdd ? "rotate-180" : ""}`} />
+                <ChevronDown
+                  className={`w-4 h-4 transition-transform ${showQuickAdd ? "rotate-180" : ""}`}
+                />
               </button>
 
               {/* Dropdown menu */}

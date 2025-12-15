@@ -649,3 +649,123 @@ pub fn update_capture_settings(
         Err("Python executor not initialized. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string())
     }
 }
+
+/// Get the required screens/monitors for a workflow based on automatic calculation.
+///
+/// Analyzes the workflow's actions and their associated states to determine
+/// which monitors will be used during execution.
+///
+/// Note: This is a lightweight analysis that happens synchronously. The Python
+/// executor performs the analysis and returns the result immediately.
+///
+/// # Arguments
+/// * `workflow_id` - The workflow ID to analyze
+/// * `state` - Application state containing the Python bridge and config
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with array of monitor indices in data.screens
+/// * `Err(String)` - Error if executor not running or analysis fails
+#[tauri::command]
+pub fn get_workflow_required_screens(
+    workflow_id: String,
+    state: State<Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    info!("Getting required screens for workflow: {}", workflow_id);
+
+    // Get the current config from state
+    let config_lock = state.current_config.lock().unwrap();
+    if config_lock.is_none() {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some("No configuration loaded".to_string()),
+            data: None,
+        });
+    }
+
+    let config = config_lock.as_ref().unwrap();
+
+    // Find the workflow
+    let workflow = config
+        .workflows
+        .iter()
+        .find(|w| w.get("id").and_then(|id| id.as_str()) == Some(&workflow_id));
+
+    if workflow.is_none() {
+        return Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Workflow '{}' not found", workflow_id)),
+            data: None,
+        });
+    }
+
+    let workflow = workflow.unwrap();
+
+    // Collect screen associations from states
+    let mut screens = std::collections::HashSet::new();
+
+    // Build state -> screen mapping
+    let mut state_screen_map = std::collections::HashMap::new();
+    for state in &config.states {
+        if let Some(state_id) = state.get("id").and_then(|id| id.as_str()) {
+            if let Some(screen) = state.get("screenAssociation").and_then(|s| s.as_i64()) {
+                state_screen_map.insert(state_id.to_string(), screen as i32);
+            }
+        }
+    }
+
+    // Check initial states
+    if let Some(initial_states) = workflow
+        .get("initialStateIds")
+        .and_then(|ids| ids.as_array())
+    {
+        for state_id in initial_states {
+            if let Some(state_id_str) = state_id.as_str() {
+                if let Some(&screen) = state_screen_map.get(state_id_str) {
+                    screens.insert(screen);
+                }
+            }
+        }
+    }
+
+    // Analyze actions
+    if let Some(actions) = workflow.get("actions").and_then(|a| a.as_array()) {
+        for action in actions {
+            // GO_TO_STATE actions
+            if let Some(action_type) = action.get("type").and_then(|t| t.as_str()) {
+                if action_type == "GO_TO_STATE" {
+                    if let Some(target_state) = action
+                        .get("config")
+                        .and_then(|c| c.get("targetState"))
+                        .and_then(|ts| ts.as_str())
+                    {
+                        if let Some(&screen) = state_screen_map.get(target_state) {
+                            screens.insert(screen);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Convert to sorted vec
+    let mut screen_list: Vec<i32> = screens.into_iter().collect();
+    screen_list.sort();
+
+    // Default to screen 0 if no screens found
+    if screen_list.is_empty() {
+        screen_list.push(0);
+    }
+
+    info!(
+        "Workflow '{}' requires screens: {:?}",
+        workflow_id, screen_list
+    );
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "screens": screen_list
+        })),
+    })
+}

@@ -368,7 +368,7 @@ export function createLogSource(partial: Partial<LogSource> = {}): LogSource {
 export function createProjectLogConfig(
   projectId: string,
   projectName: string,
-  baseDir: string
+  baseDir: string,
 ): ProjectLogConfig {
   return {
     projectId,

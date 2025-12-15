@@ -47,9 +47,15 @@ interface CaptureTabProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   projects: Project[];
   selectedProjectId: string | null;
+  selectedProjectName: string | null;
 }
 
-export function CaptureTab({ onLog, projects, selectedProjectId }: CaptureTabProps) {
+export function CaptureTab({
+  onLog,
+  projects,
+  selectedProjectId,
+  selectedProjectName,
+}: CaptureTabProps) {
   // Local capture settings
   const [captureSettings, setCaptureSettings] = useState<ScreenshotCaptureSettings>({
     enabled: false,
@@ -353,11 +359,13 @@ export function CaptureTab({ onLog, projects, selectedProjectId }: CaptureTabPro
           {/* Project Info */}
           <div className="space-y-2">
             <div className="font-medium">Target Project</div>
-            {selectedProjectId && projects.length > 0 ? (
+            {selectedProjectId ? (
               <div className="flex items-center gap-2 px-3 py-2 bg-input border border-border/50 rounded-md">
                 <Cloud className="w-4 h-4 text-primary" />
                 <span className="font-medium">
-                  {projects.find((p) => p.id === selectedProjectId)?.name || "Unknown project"}
+                  {selectedProjectName ||
+                    projects.find((p) => p.id === selectedProjectId)?.name ||
+                    "Loading..."}
                 </span>
               </div>
             ) : (

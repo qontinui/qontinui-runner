@@ -315,10 +315,12 @@ class ExecutorCore:
         # DEBUG: Log to file
         import os
         import tempfile
+
         debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_init_executors_debug.log")
         try:
             with open(debug_log_path, "a") as f:
                 from datetime import datetime
+
                 f.write(f"\n=== _INITIALIZE_EXECUTORS DEBUG {datetime.now()} ===\n")
                 f.flush()
         except Exception:

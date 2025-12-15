@@ -5,8 +5,11 @@
  * Single responsibility: Execution control UI.
  */
 
+import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { Play, Square, Cpu, ChevronDown } from "lucide-react";
 import CollapsiblePanel from "./CollapsiblePanel";
+import { MonitorSelector } from "./MonitorSelector";
 import type { Workflow } from "../contexts/ExecutionContext";
 
 export interface ExecutionControlPanelProps {
@@ -22,11 +25,8 @@ export interface ExecutionControlPanelProps {
   onWorkflowSelect: (workflowId: string) => void;
 
   // Monitor selection
-  selectedMonitor: number;
-  availableMonitors: number[];
-  showMonitorDropdown: boolean;
-  onMonitorDropdownToggle: (show: boolean) => void;
-  onMonitorSelect: (index: number) => void;
+  selectedMonitors: number[];
+  onMonitorSelectionChange: (indices: number[]) => void;
 
   // Auto-minimize
   autoMinimize: boolean;
@@ -47,17 +47,66 @@ export function ExecutionControlPanel({
   showWorkflowDropdown,
   onWorkflowDropdownToggle,
   onWorkflowSelect,
-  selectedMonitor,
-  availableMonitors,
-  showMonitorDropdown,
-  onMonitorDropdownToggle,
-  onMonitorSelect,
+  selectedMonitors,
+  onMonitorSelectionChange,
   autoMinimize,
   onAutoMinimizeChange,
   executionActive,
   onStartExecution,
   onStopExecution,
 }: ExecutionControlPanelProps) {
+  const [calculatedScreens, setCalculatedScreens] = useState<number[]>([]);
+  const [isOverrideActive, setIsOverrideActive] = useState(false);
+  const [isCalculating, setIsCalculating] = useState(false);
+
+  // Calculate required screens when workflow changes
+  useEffect(() => {
+    if (!selectedWorkflow || !configLoaded) {
+      setCalculatedScreens([]);
+      return;
+    }
+
+    const calculateScreens = async () => {
+      setIsCalculating(true);
+      try {
+        const result = await invoke<{ success: boolean; data?: { screens: number[] } }>(
+          "get_workflow_required_screens",
+          { workflowId: selectedWorkflow },
+        );
+
+        if (result?.success && result.data?.screens) {
+          setCalculatedScreens(result.data.screens);
+
+          // If not in override mode, update selected monitors to match calculated screens
+          if (!isOverrideActive) {
+            onMonitorSelectionChange(result.data.screens);
+          }
+        }
+      } catch (err) {
+        console.error("Failed to calculate required screens:", err);
+        setCalculatedScreens([]);
+      } finally {
+        setIsCalculating(false);
+      }
+    };
+
+    calculateScreens();
+  }, [selectedWorkflow, configLoaded]);
+
+  // Handle override toggle
+  const handleOverrideToggle = () => {
+    const newOverrideState = !isOverrideActive;
+    setIsOverrideActive(newOverrideState);
+
+    // If turning off override, reset to calculated screens
+    if (!newOverrideState && calculatedScreens.length > 0) {
+      onMonitorSelectionChange(calculatedScreens);
+    }
+  };
+
+  // Determine if monitor selector is read-only
+  const monitorSelectorReadOnly = !isOverrideActive && calculatedScreens.length > 0;
+
   return (
     <CollapsiblePanel
       title="Execution Control"
@@ -97,32 +146,32 @@ export function ExecutionControlPanel({
         </div>
 
         {/* Monitor Selector */}
-        <div className="relative">
-          <button
-            onClick={() => onMonitorDropdownToggle(!showMonitorDropdown)}
-            className="w-full btn-secondary flex items-center justify-between gap-2"
-          >
-            <span>Monitor {selectedMonitor}</span>
-            <ChevronDown className="w-4 h-4" />
-          </button>
-
-          {showMonitorDropdown && (
-            <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-lg shadow-lg">
-              {availableMonitors.map((index) => (
-                <button
-                  key={index}
-                  onClick={() => onMonitorSelect(index)}
-                  className="w-full px-4 py-2 text-left hover:bg-accent hover:text-accent-foreground transition-colors"
-                >
-                  Monitor {index}
-                </button>
-              ))}
+        <div className="space-y-2">
+          {calculatedScreens.length > 0 && !isOverrideActive && (
+            <div className="text-xs text-muted-foreground">
+              {isCalculating ? (
+                <span>Calculating required monitors...</span>
+              ) : (
+                <span>
+                  This workflow will use monitor{calculatedScreens.length > 1 ? "s" : ""}:{" "}
+                  {calculatedScreens.map((s) => `#${s}`).join(", ")}
+                </span>
+              )}
             </div>
           )}
+          <MonitorSelector
+            selectedMonitors={selectedMonitors}
+            onSelectionChange={onMonitorSelectionChange}
+            multiSelect={false}
+            compact={true}
+            readOnly={monitorSelectorReadOnly}
+            isOverrideActive={isOverrideActive}
+            onOverrideToggle={calculatedScreens.length > 0 ? handleOverrideToggle : undefined}
+          />
         </div>
 
         {/* Auto-minimize Toggle */}
-        {availableMonitors.length === 1 && (
+        {selectedMonitors.length === 1 && (
           <label className="flex items-center gap-2 text-sm">
             <input
               type="checkbox"

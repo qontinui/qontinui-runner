@@ -25,7 +25,11 @@ import {
   AlertCircle,
   Zap,
 } from "lucide-react";
-import type { WebExtractionConfig, ExtractionStatus, ExtractionCompletedPayload } from "../types/extraction";
+import type {
+  WebExtractionConfig,
+  ExtractionStatus,
+  ExtractionCompletedPayload,
+} from "../types/extraction";
 import type { Project } from "../types/auth";
 import { useExecution } from "../contexts";
 import { eventRouter } from "../managers";
@@ -46,9 +50,15 @@ interface ExtractionTabProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
   projects: Project[];
   selectedProjectId: string | null;
+  selectedProjectName: string | null;
 }
 
-export function ExtractionTab({ onLog, projects, selectedProjectId }: ExtractionTabProps) {
+export function ExtractionTab({
+  onLog,
+  projects,
+  selectedProjectId,
+  selectedProjectName,
+}: ExtractionTabProps) {
   // Get Python executor status from context
   const { pythonStatus } = useExecution();
 
@@ -147,7 +157,9 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
     };
 
     // Handler for extraction_completed event
-    const handleExtractionCompleted = async (payload: ExtractionCompletedPayload | { data?: ExtractionCompletedPayload }) => {
+    const handleExtractionCompleted = async (
+      payload: ExtractionCompletedPayload | { data?: ExtractionCompletedPayload },
+    ) => {
       console.log("[EXTRACTION_TAB] Extraction completed:", payload);
       setIsExtracting(false);
       setExtractionSuccess(true);
@@ -155,7 +167,8 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
       onLog("success", "Web extraction completed successfully");
 
       // Extract data from payload (handle both direct and nested formats)
-      const data = "data" in payload && payload.data ? payload.data : payload as ExtractionCompletedPayload;
+      const data =
+        "data" in payload && payload.data ? payload.data : (payload as ExtractionCompletedPayload);
       const sessionId = data.session_id || currentSessionId;
       const stateStructure = data.state_structure;
 
@@ -172,10 +185,16 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
           onLog("success", "State structure uploaded successfully");
         } catch (uploadErr) {
           console.error("Failed to upload state structure:", uploadErr);
-          onLog("warning", `Could not upload state structure: ${uploadErr}. The extraction data is still saved locally.`);
+          onLog(
+            "warning",
+            `Could not upload state structure: ${uploadErr}. The extraction data is still saved locally.`,
+          );
         }
       } else if (stateStructure && !sessionId) {
-        onLog("warning", "State structure generated but no cloud session - data saved locally only");
+        onLog(
+          "warning",
+          "State structure generated but no cloud session - data saved locally only",
+        );
       }
 
       // Clear session ID after completion
@@ -310,14 +329,21 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
     if (pythonStatus !== "running") {
       onLog("info", "Python executor not running, attempting to start...");
       try {
-        const startResult = await invoke<{ success: boolean; message?: string }>("start_python_executor");
+        const startResult = await invoke<{ success: boolean; message?: string }>(
+          "start_python_executor",
+        );
         if (!startResult.success) {
           // Check if it's actually already running
           if (startResult.message?.toLowerCase().includes("already running")) {
             onLog("info", "Python executor is already running");
           } else {
-            setExtractionError("Failed to start Python executor. Please try loading a configuration first.");
-            onLog("error", `Python executor failed to start: ${startResult.message || "Unknown error"}`);
+            setExtractionError(
+              "Failed to start Python executor. Please try loading a configuration first.",
+            );
+            onLog(
+              "error",
+              `Python executor failed to start: ${startResult.message || "Unknown error"}`,
+            );
             return;
           }
         } else {
@@ -326,7 +352,9 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
           await new Promise((resolve) => setTimeout(resolve, 1000));
         }
       } catch (err) {
-        setExtractionError("Failed to start Python executor. Please try loading a configuration first.");
+        setExtractionError(
+          "Failed to start Python executor. Please try loading a configuration first.",
+        );
         onLog("error", `Failed to start Python executor: ${err}`);
         return;
       }
@@ -372,7 +400,10 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
       } catch (sessionErr) {
         // Log warning but continue - extraction can still work locally
         console.warn("Failed to create cloud session:", sessionErr);
-        onLog("warning", `Could not create cloud session: ${sessionErr}. Continuing with local extraction.`);
+        onLog(
+          "warning",
+          `Could not create cloud session: ${sessionErr}. Continuing with local extraction.`,
+        );
       }
 
       // Step 2: Start the actual extraction via Python bridge
@@ -449,8 +480,12 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
 
         {/* Python Status Indicator */}
         <div className="flex items-center gap-2">
-          <Zap className={`w-4 h-4 ${pythonStatus === "running" ? "text-green-400" : "text-yellow-400"}`} />
-          <span className={`text-sm ${pythonStatus === "running" ? "text-green-400" : "text-yellow-400"}`}>
+          <Zap
+            className={`w-4 h-4 ${pythonStatus === "running" ? "text-green-400" : "text-yellow-400"}`}
+          />
+          <span
+            className={`text-sm ${pythonStatus === "running" ? "text-green-400" : "text-yellow-400"}`}
+          >
             {pythonStatus === "running" ? "Python Ready" : "Python Starting..."}
           </span>
         </div>
@@ -538,17 +573,22 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
                 <span>
                   Monitor #{availableMonitors[selectedMonitor].index}
                   {availableMonitors[selectedMonitor].is_primary && (
-                    <span className="ml-2 text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">Primary</span>
+                    <span className="ml-2 text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">
+                      Primary
+                    </span>
                   )}
                   <span className="text-muted-foreground ml-2">
-                    ({availableMonitors[selectedMonitor].width}x{availableMonitors[selectedMonitor].height})
+                    ({availableMonitors[selectedMonitor].width}x
+                    {availableMonitors[selectedMonitor].height})
                   </span>
                 </span>
               ) : (
                 <span className="text-muted-foreground">Loading monitors...</span>
               )}
             </div>
-            <ChevronDown className={`w-4 h-4 transition-transform ${showMonitorDropdown ? "rotate-180" : ""}`} />
+            <ChevronDown
+              className={`w-4 h-4 transition-transform ${showMonitorDropdown ? "rotate-180" : ""}`}
+            />
           </button>
 
           {showMonitorDropdown && availableMonitors.length > 0 && (
@@ -564,7 +604,9 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
                   <Monitor className="w-4 h-4" />
                   <span>Monitor #{monitor.index}</span>
                   {monitor.is_primary && (
-                    <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">Primary</span>
+                    <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">
+                      Primary
+                    </span>
                   )}
                   <span className="text-muted-foreground">
                     ({monitor.width}x{monitor.height})
@@ -579,11 +621,13 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
       {/* Target Project Display */}
       <div className="space-y-2 bg-card rounded-lg border border-border/50 p-6">
         <div className="font-medium">Target Project</div>
-        {selectedProjectId && projects.length > 0 ? (
+        {selectedProjectId ? (
           <div className="flex items-center gap-2 px-3 py-2 bg-input border border-border/50 rounded-md">
             <Cloud className="w-4 h-4 text-primary" />
             <span className="font-medium">
-              {projects.find((p) => p.id === selectedProjectId)?.name || "Unknown project"}
+              {selectedProjectName ||
+                projects.find((p) => p.id === selectedProjectId)?.name ||
+                "Loading..."}
             </span>
           </div>
         ) : (
@@ -627,7 +671,9 @@ export function ExtractionTab({ onLog, projects, selectedProjectId }: Extraction
                   min="1"
                   max="10"
                   value={maxDepth}
-                  onChange={(e) => setMaxDepth(Math.min(10, Math.max(1, parseInt(e.target.value) || 1)))}
+                  onChange={(e) =>
+                    setMaxDepth(Math.min(10, Math.max(1, parseInt(e.target.value) || 1)))
+                  }
                   className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
                 />
               </label>

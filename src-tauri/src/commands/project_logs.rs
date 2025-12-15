@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
 
@@ -517,13 +517,15 @@ pub fn append_project_log(
 
     let timestamp = chrono::Utc::now().to_rfc3339();
     let source_str = source.unwrap_or_else(|| "runner".to_string());
-    let log_line = format!("[{}] [{}] [{}] {}\n", timestamp, level.to_uppercase(), source_str, message);
+    let log_line = format!(
+        "[{}] [{}] [{}] {}\n",
+        timestamp,
+        level.to_uppercase(),
+        source_str,
+        message
+    );
 
-    let mut file = match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)
-    {
+    let mut file = match OpenOptions::new().create(true).append(true).open(&log_file) {
         Ok(f) => f,
         Err(e) => {
             return CommandResponse {

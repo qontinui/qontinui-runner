@@ -104,9 +104,7 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
             <div className="text-2xl font-bold text-primary">
               v{updateInfo?.current_version || "0.1.0"}
             </div>
-            <div className="text-sm text-muted-foreground">
-              Last checked: {formatLastChecked()}
-            </div>
+            <div className="text-sm text-muted-foreground">Last checked: {formatLastChecked()}</div>
           </div>
 
           <button

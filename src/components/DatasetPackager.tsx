@@ -148,7 +148,7 @@ export function DatasetPackager() {
         "scan_local_images",
         {
           manifestPath,
-        }
+        },
       );
 
       if (response.success && response.data) {
@@ -192,7 +192,7 @@ export function DatasetPackager() {
             test_split: testSplit / 100,
             random_seed: randomSeed,
           },
-        }
+        },
       );
 
       if (response.success && response.data) {
@@ -254,9 +254,7 @@ export function DatasetPackager() {
 
         {/* Annotation ZIP */}
         <div className="space-y-2">
-          <label className="text-sm font-medium text-foreground">
-            Annotation Export ZIP
-          </label>
+          <label className="text-sm font-medium text-foreground">Annotation Export ZIP</label>
           <div className="flex gap-2">
             <input
               type="text"
@@ -274,9 +272,7 @@ export function DatasetPackager() {
 
         {/* Output Directory */}
         <div className="space-y-2">
-          <label className="text-sm font-medium text-foreground">
-            Output Directory
-          </label>
+          <label className="text-sm font-medium text-foreground">Output Directory</label>
           <div className="flex gap-2">
             <input
               type="text"
@@ -471,11 +467,7 @@ export function DatasetPackager() {
           <button
             onClick={packageDataset}
             disabled={
-              !manifestPath ||
-              !annotationZipPath ||
-              !outputPath ||
-              !splitsValid ||
-              packaging
+              !manifestPath || !annotationZipPath || !outputPath || !splitsValid || packaging
             }
             className="btn-primary w-full"
           >

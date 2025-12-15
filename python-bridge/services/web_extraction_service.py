@@ -48,7 +48,9 @@ class WebExtractionService:
         self._orchestrator = None
         self._current_extraction_id: str | None = None
         self._is_running = False
-        self._current_task: asyncio.Task | None = None  # Track current extraction task for cancellation
+        self._current_task: asyncio.Task | None = (
+            None  # Track current extraction task for cancellation
+        )
 
         # Store extraction results
         self._extraction_results: dict[str, Any] = {}  # extraction_id -> ExtractionResult
@@ -312,7 +314,9 @@ class WebExtractionService:
         logger.info("EXTRACTION STARTED")
         logger.info("=" * 60)
         logger.info(f"Extraction config mode: {config.mode}")
-        logger.info(f"Extraction config target URL: {config.target.url if config.target else 'None'}")
+        logger.info(
+            f"Extraction config target URL: {config.target.url if config.target else 'None'}"
+        )
         logger.info(f"Extraction config viewports: {config.viewports}")
         logger.info(f"Extraction ID: {self._current_extraction_id}")
 
@@ -353,7 +357,9 @@ class WebExtractionService:
                     "transitions": [self._serialize_transition(t) for t in result.transitions],
                     "metadata": {
                         "started_at": result.started_at.isoformat() if result.started_at else None,
-                        "completed_at": result.completed_at.isoformat() if result.completed_at else None,
+                        "completed_at": (
+                            result.completed_at.isoformat() if result.completed_at else None
+                        ),
                         "errors": result.errors,
                         "warnings": result.warnings,
                     },
@@ -489,7 +495,7 @@ class WebExtractionService:
                     await asyncio.wait_for(self._current_task, timeout=5.0)
                 except asyncio.CancelledError:
                     logger.info("Extraction task cancelled successfully")
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("Extraction task cancellation timed out")
                 except Exception as e:
                     logger.warning(f"Exception during task cancellation: {e}")

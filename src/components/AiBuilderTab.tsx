@@ -506,8 +506,7 @@ export function AiBuilderTab() {
                         <span className="text-sm font-medium truncate">{entry.goal}</span>
                       </div>
                       <div className="text-xs text-muted-foreground mt-1">
-                        {entry.states.length} states •{" "}
-                        {new Date(entry.timestamp).toLocaleString()}
+                        {entry.states.length} states • {new Date(entry.timestamp).toLocaleString()}
                       </div>
                     </button>
                   ))}

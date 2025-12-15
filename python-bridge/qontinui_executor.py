@@ -405,10 +405,12 @@ class QontinuiExecutor:
         # DEBUG: Log config loading
         import os
         import tempfile
+
         debug_log_path = os.path.join(tempfile.gettempdir(), "qontinui_load_config_debug.log")
         try:
             with open(debug_log_path, "a") as f:
                 from datetime import datetime
+
                 f.write(f"\n=== LOAD_CONFIGURATION DEBUG {datetime.now()} ===\n")
                 f.write(f"config_path: {config_path}\n")
                 f.write(f"QONTINUI_AVAILABLE: {QONTINUI_AVAILABLE}\n")
@@ -481,7 +483,13 @@ class QontinuiExecutor:
             self.event_manager.emit_log("error", f"Workflow execution failed: {e}")
             return {"success": False, "error": str(e)}
 
-    def start_execution(self, workflow_id: str, monitor: int | None = None, monitor_offset_x: int | None = None, monitor_offset_y: int | None = None) -> bool:
+    def start_execution(
+        self,
+        workflow_id: str,
+        monitor: int | None = None,
+        monitor_offset_x: int | None = None,
+        monitor_offset_y: int | None = None,
+    ) -> bool:
         """Start workflow execution in background thread.
 
         Args:
@@ -490,12 +498,21 @@ class QontinuiExecutor:
             monitor_offset_x: DEPRECATED - X offset (ignored, library looks up internally)
             monitor_offset_y: DEPRECATED - Y offset (ignored, library looks up internally)
         """
-        self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}")
+        self.event_manager.emit_log(
+            "info",
+            f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}",
+        )
         # Write to debug file for monitor tracing
         try:
-            with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
+            with open(
+                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                "a",
+                encoding="utf-8",
+            ) as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}\n")
+                f.write(
+                    f"[{timestamp}] [PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}\n"
+                )
         except Exception:
             pass
 
@@ -511,10 +528,16 @@ class QontinuiExecutor:
 
         # Store monitor selection for use in actions
         self.target_monitor = monitor
-        self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] Set self.target_monitor = {monitor}")
+        self.event_manager.emit_log(
+            "info", f"[PYTHON_EXECUTOR] Set self.target_monitor = {monitor}"
+        )
         # Write to debug file for monitor tracing
         try:
-            with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
+            with open(
+                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                "a",
+                encoding="utf-8",
+            ) as f:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                 f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set self.target_monitor = {monitor}\n")
         except Exception:
@@ -536,21 +559,33 @@ class QontinuiExecutor:
                         self.executor_core.state_executor.set_monitor(monitor)
                         self.event_manager.emit_log(
                             "debug",
-                            f"Set target monitor: {monitor} (library will look up position via MSS)"
+                            f"Set target monitor: {monitor} (library will look up position via MSS)",
                         )
                         # Write to debug file
                         try:
-                            with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
+                            with open(
+                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                                "a",
+                                encoding="utf-8",
+                            ) as f:
                                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] Set target monitor: {monitor}\n")
+                                f.write(
+                                    f"[{timestamp}] [PYTHON_EXECUTOR] Set target monitor: {monitor}\n"
+                                )
                         except Exception:
                             pass
                     else:
                         # Debug: Log why we couldn't set monitor
                         try:
-                            with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
+                            with open(
+                                os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                                "a",
+                                encoding="utf-8",
+                            ) as f:
                                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                f.write(f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor - executor_core or state_executor is None\n")
+                                f.write(
+                                    f"[{timestamp}] [PYTHON_EXECUTOR] WARNING: Cannot set monitor - executor_core or state_executor is None\n"
+                                )
                         except Exception:
                             pass
                 except Exception as e:
@@ -597,7 +632,8 @@ class QontinuiExecutor:
 
                     if initial_state_ids:
                         self.event_manager.emit_log(
-                            "info", f"Initializing with workflow initial states: {initial_state_ids}"
+                            "info",
+                            f"Initializing with workflow initial states: {initial_state_ids}",
                         )
                         self.executor_core.state_executor.initialize(initial_state_ids)
                     else:
@@ -845,15 +881,29 @@ class QontinuiExecutor:
             # Get monitor offset from Rust (if provided)
             monitor_offset_x = params.get("monitor_offset_x")
             monitor_offset_y = params.get("monitor_offset_y")
-            self.event_manager.emit_log("info", f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}")
+            self.event_manager.emit_log(
+                "info",
+                f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}",
+            )
             # Write to debug file for monitor tracing
             try:
-                with open(os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"), "a", encoding="utf-8") as f:
+                with open(
+                    os.path.join(tempfile.gettempdir(), "qontinui_monitor_debug.log"),
+                    "a",
+                    encoding="utf-8",
+                ) as f:
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    f.write(f"[{timestamp}] [PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n")
+                    f.write(
+                        f"[{timestamp}] [PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}, offset=({monitor_offset_x}, {monitor_offset_y})\n"
+                    )
             except Exception:
                 pass
-            success = self.start_execution(workflow_id, monitor=monitor, monitor_offset_x=monitor_offset_x, monitor_offset_y=monitor_offset_y)
+            success = self.start_execution(
+                workflow_id,
+                monitor=monitor,
+                monitor_offset_x=monitor_offset_x,
+                monitor_offset_y=monitor_offset_y,
+            )
             return {"success": success}
 
         elif cmd_type == "stop":
@@ -1311,17 +1361,19 @@ class QontinuiExecutor:
                 # Apply variables to the action executor's variable context
                 if self.executor_core and self.executor_core.action_executor:
                     try:
-                        if hasattr(self.executor_core.action_executor, 'variable_context'):
+                        if hasattr(self.executor_core.action_executor, "variable_context"):
                             for key, value in variables.items():
                                 # Set variables with 'global' scope so they're available throughout execution
                                 self.executor_core.action_executor.variable_context.set(
                                     key, value, "global"
                                 )
                                 self.event_manager.emit_log(
-                                    "debug", f"Set variable '{key}' = {value} (type: {type(value).__name__})"
+                                    "debug",
+                                    f"Set variable '{key}' = {value} (type: {type(value).__name__})",
                                 )
                             self.event_manager.emit_log(
-                                "info", f"Successfully applied {len(variables)} variables to execution context"
+                                "info",
+                                f"Successfully applied {len(variables)} variables to execution context",
                             )
                         else:
                             self.event_manager.emit_log(
@@ -1332,7 +1384,8 @@ class QontinuiExecutor:
                         self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")
                 else:
                     self.event_manager.emit_log(
-                        "warning", "Cannot apply variables: executor_core or action_executor not initialized"
+                        "warning",
+                        "Cannot apply variables: executor_core or action_executor not initialized",
                     )
 
             # Get the workflow ID to execute (first workflow if not specified)

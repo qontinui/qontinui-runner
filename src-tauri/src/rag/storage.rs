@@ -250,7 +250,7 @@ impl RAGStorage {
         project_id: &str,
         screenshots: &[ScreenshotData],
     ) -> Result<usize, RAGStorageError> {
-        let screenshots_path = self.get_screenshots_path(project_id);
+        let screenshots_path = self.get_images_path(project_id);
         fs::create_dir_all(&screenshots_path)?;
 
         let mut saved_count = 0;
@@ -401,7 +401,7 @@ impl RAGStorage {
 
         // Also check legacy screenshots directory
         #[allow(deprecated)]
-        let screenshots_path = self.get_screenshots_path(project_id);
+        let screenshots_path = self.get_images_path(project_id);
         if screenshots_path.exists() {
             for entry in fs::read_dir(&screenshots_path)? {
                 let entry = entry?;

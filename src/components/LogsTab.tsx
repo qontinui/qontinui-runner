@@ -7,18 +7,20 @@
 
 import { useRef } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { FileText, Image, Zap, Brain } from "lucide-react";
+import { FileText, Image, Zap, Brain, FolderOpen } from "lucide-react";
 import { GeneralLogTab } from "./GeneralLogTab";
 import ImageLogTable from "./ImageLogTable";
 import ActionLogTable from "./ActionLogTable";
 import { AiOutputTab, type AiOutputLine } from "./AiOutputTab";
+import { ExternalLogsTab } from "./ExternalLogsTab";
 import { LogTabActions } from "./LogTabActions";
 import { useAutoScroll } from "../hooks";
 import type { LogEntry, ImageRecognitionEntry } from "../managers/LogManager";
 import type { ActionLogEntry } from "../types/displayProfile";
 import type { LogLevel } from "../hooks/useLogFilter";
+import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
 
-type LogSubTab = "general" | "image" | "actions" | "ai";
+type LogSubTab = "general" | "image" | "actions" | "ai" | "external";
 
 interface LogsTabProps {
   // General logs
@@ -46,11 +48,21 @@ interface LogsTabProps {
   aiOutputLines: AiOutputLine[];
   onClearAiOutput: () => void;
 
+  // External logs (project logs)
+  projectLogConfig: ProjectLogConfig | null;
+  projectLogSources: LogSourceContent[];
+  projectLogsLoading: boolean;
+  projectLogsError?: string;
+  projectLogsLastRefresh?: string;
+  onRefreshProjectLogs: () => void;
+  onConfigureProjectLogs: () => void;
+
   // Log counts
   logCount: number;
   imageLogCount: number;
   actionCount: number;
   aiOutputCount: number;
+  externalLogCount: number;
 
   // Clear/copy actions
   onClearGeneralLogs: () => void;
@@ -80,10 +92,18 @@ export function LogsTab({
   onActionRowClick,
   aiOutputLines,
   onClearAiOutput,
+  projectLogConfig,
+  projectLogSources,
+  projectLogsLoading,
+  projectLogsError,
+  projectLogsLastRefresh,
+  onRefreshProjectLogs,
+  onConfigureProjectLogs,
   logCount,
   imageLogCount,
   actionCount,
   aiOutputCount,
+  externalLogCount,
   onClearGeneralLogs,
   onClearImageLogs,
   onClearActionLogs,
@@ -106,6 +126,7 @@ export function LogsTab({
     { id: "image" as const, label: "Image Recognition", icon: Image, count: imageLogCount },
     { id: "actions" as const, label: "Actions", icon: Zap, count: actionCount },
     { id: "ai" as const, label: "AI Output", icon: Brain, count: aiOutputCount },
+    { id: "external" as const, label: "Project Logs", icon: FolderOpen, count: externalLogCount },
   ];
 
   return (
@@ -185,6 +206,18 @@ export function LogsTab({
 
         <Tabs.Content value="ai" className="h-full outline-none">
           <AiOutputTab lines={aiOutputLines} onClear={onClearAiOutput} />
+        </Tabs.Content>
+
+        <Tabs.Content value="external" className="h-full outline-none">
+          <ExternalLogsTab
+            config={projectLogConfig}
+            sources={projectLogSources}
+            loading={projectLogsLoading}
+            error={projectLogsError}
+            lastRefresh={projectLogsLastRefresh}
+            onRefresh={onRefreshProjectLogs}
+            onConfigureSources={onConfigureProjectLogs}
+          />
         </Tabs.Content>
       </div>
     </Tabs.Root>

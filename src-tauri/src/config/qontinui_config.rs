@@ -195,6 +195,8 @@ pub struct State {
     pub is_initial: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "isFinal")]
     pub is_final: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "screenAssociation")]
+    pub screen_association: Option<i32>,
 }
 
 /// Position coordinates

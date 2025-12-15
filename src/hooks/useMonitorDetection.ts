@@ -35,21 +35,18 @@ export function useMonitorDetection(
   /**
    * Select a monitor and save it as the last used
    */
-  const selectMonitorWithPersistence = useCallback(
-    async (index: number) => {
-      setSelectedMonitor(index);
+  const selectMonitorWithPersistence = useCallback(async (index: number) => {
+    setSelectedMonitor(index);
 
-      // Save the monitor index as the last used monitor
-      try {
-        await invoke("save_last_monitor_index", { monitorIndex: index });
-        console.log("[MONITOR_DETECTION] Saved last monitor index:", index);
-      } catch (saveError) {
-        console.error("[MONITOR_DETECTION] Failed to save last monitor index:", saveError);
-        // Non-critical error, don't throw
-      }
-    },
-    [],
-  );
+    // Save the monitor index as the last used monitor
+    try {
+      await invoke("save_last_monitor_index", { monitorIndex: index });
+      console.log("[MONITOR_DETECTION] Saved last monitor index:", index);
+    } catch (saveError) {
+      console.error("[MONITOR_DETECTION] Failed to save last monitor index:", saveError);
+      // Non-critical error, don't throw
+    }
+  }, []);
 
   /**
    * Detect system monitors

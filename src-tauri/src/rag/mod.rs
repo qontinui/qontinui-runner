@@ -41,8 +41,8 @@ pub mod search;
 pub mod storage;
 
 pub use embeddings::{EmbeddingGenerator, EmbeddingStatus};
-pub use find::{FindError, FindResponse, FindSegment, RAGFinder, SegmentMatch};
-pub use search::{SearchError, SemanticSearch, SemanticSearchResult};
+pub use find::RAGFinder;
+pub use search::{SearchError, SemanticSearch};
 pub use storage::RAGStorage;
 
 use serde::{Deserialize, Serialize};

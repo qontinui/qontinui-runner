@@ -90,7 +90,7 @@ export function useProjectLogs(): UseProjectLogsReturn {
     try {
       // Get project directories
       const dirResponse = await invoke<CommandResponse>("get_project_directories", {
-        project_id: projectId,
+        projectId: projectId,
       });
 
       if (dirResponse.success && dirResponse.data) {
@@ -99,7 +99,7 @@ export function useProjectLogs(): UseProjectLogsReturn {
 
       // Try to load existing config
       const response = await invoke<CommandResponse>("get_project_log_config", {
-        project_id: projectId,
+        projectId: projectId,
       });
 
       if (response.success && response.data) {
@@ -330,9 +330,7 @@ export function useProjectLogs(): UseProjectLogsReturn {
       hasUnsavedChanges.current = true;
       return {
         ...prev,
-        logSources: prev.logSources.map((s) =>
-          s.id === id ? { ...s, enabled: !s.enabled } : s
-        ),
+        logSources: prev.logSources.map((s) => (s.id === id ? { ...s, enabled: !s.enabled } : s)),
       };
     });
   }, []);
@@ -416,19 +414,21 @@ export function useProjectLogs(): UseProjectLogsReturn {
 
     try {
       const response = await invoke<CommandResponse>("read_project_logs", {
-        project_id: config.projectId,
+        projectId: config.projectId,
       });
 
       if (response.success && response.data) {
-        const sources = (response.data as Array<{
-          source_id: string;
-          source_name: string;
-          lines: string[];
-          total_lines: number;
-          file_path: string;
-          last_modified?: string;
-          error?: string;
-        }>).map((s) => ({
+        const sources = (
+          response.data as Array<{
+            source_id: string;
+            source_name: string;
+            lines: string[];
+            total_lines: number;
+            file_path: string;
+            last_modified?: string;
+            error?: string;
+          }>
+        ).map((s) => ({
           sourceId: s.source_id,
           sourceName: s.source_name,
           lines: s.lines,

@@ -5,7 +5,15 @@
  * Delegates responsibilities to specialized hooks following SRP.
  */
 
-import { createContext, useContext, ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import {
+  createContext,
+  useContext,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   usePythonExecutor,
   useConfiguration,

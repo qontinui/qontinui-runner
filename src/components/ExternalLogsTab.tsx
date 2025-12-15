@@ -6,7 +6,18 @@
  */
 
 import { useEffect, useRef, useState } from "react";
-import { RefreshCw, FolderOpen, Settings, AlertCircle, FileText, Info, Camera, Sparkles, Copy, Check } from "lucide-react";
+import {
+  RefreshCw,
+  FolderOpen,
+  Settings,
+  AlertCircle,
+  FileText,
+  Info,
+  Camera,
+  Sparkles,
+  Copy,
+  Check,
+} from "lucide-react";
 import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
 import { useAutoScroll } from "../hooks";
 
@@ -98,6 +109,21 @@ export function ExternalLogsTab({
         <FolderOpen className="w-12 h-12 mb-4 opacity-50" />
         <p className="text-lg font-medium mb-2">No Project Selected</p>
         <p className="text-sm mb-4">Select a project to view external logs</p>
+        {/* Show error if config failed to load */}
+        {error && (
+          <div className="flex flex-col gap-2 px-3 py-2 bg-destructive/10 text-destructive text-sm rounded-md mt-4 max-w-2xl">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 flex-shrink-0" />
+              <span className="font-medium">Error loading project logs</span>
+            </div>
+            <div className="text-xs text-left ml-6 font-mono bg-destructive/5 p-2 rounded">
+              {error}
+            </div>
+            <div className="text-xs text-left ml-6 text-muted-foreground">
+              The runner may need to be rebuilt if Rust commands were recently added.
+            </div>
+          </div>
+        )}
       </div>
     );
   }
@@ -307,10 +333,10 @@ export function ExternalLogsTab({
           {error.includes("projectId") || error.includes("missing required key")
             ? "Please select a project in the Settings tab to view external logs."
             : error.includes("not found") || error.includes("No such file")
-            ? "Log file not found. The file may not exist yet or the path may be incorrect."
-            : error.includes("permission") || error.includes("Permission denied")
-            ? "Permission denied. Cannot read the log file."
-            : error}
+              ? "Log file not found. The file may not exist yet or the path may be incorrect."
+              : error.includes("permission") || error.includes("Permission denied")
+                ? "Permission denied. Cannot read the log file."
+                : error}
         </div>
       )}
 

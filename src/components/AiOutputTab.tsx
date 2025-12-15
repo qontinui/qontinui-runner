@@ -60,10 +60,7 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
       const isStreamingResponse = lastLine?.source === "claude";
 
       setIsAiWorking(
-        lines.length > 0 &&
-          isExecutorRunning &&
-          hasRecentActivity &&
-          isStreamingResponse
+        lines.length > 0 && isExecutorRunning && hasRecentActivity && isStreamingResponse,
       );
     } catch (error) {
       console.warn("[AiOutputTab] Failed to get executor status:", error);
@@ -119,8 +116,12 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
                 AI Working
                 <span className="inline-flex ml-0.5">
                   <span className="animate-pulse">.</span>
-                  <span className="animate-pulse" style={{ animationDelay: "0.2s" }}>.</span>
-                  <span className="animate-pulse" style={{ animationDelay: "0.4s" }}>.</span>
+                  <span className="animate-pulse" style={{ animationDelay: "0.2s" }}>
+                    .
+                  </span>
+                  <span className="animate-pulse" style={{ animationDelay: "0.4s" }}>
+                    .
+                  </span>
                 </span>
               </span>
             </div>
@@ -160,9 +161,7 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
                     {new Date(entry.timestamp).toLocaleTimeString()}
                   </span>
                 </div>
-                <div className="text-foreground whitespace-pre-wrap break-words">
-                  {entry.line}
-                </div>
+                <div className="text-foreground whitespace-pre-wrap break-words">{entry.line}</div>
               </div>
             );
           }

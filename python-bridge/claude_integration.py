@@ -161,7 +161,7 @@ def trigger_analysis(
     result["execution_metadata"] = metadata
 
     # Log what we found
-    logger.info(f"Found automation results:")
+    logger.info("Found automation results:")
     logger.info(f"  Config: {metadata.get('config_path', 'unknown')}")
     logger.info(f"  Workflow: {metadata.get('workflow_name', 'unknown')}")
     logger.info(f"  Success: {metadata.get('success', 'unknown')}")
@@ -196,23 +196,24 @@ def trigger_analysis(
             "wsl.exe",
             "bash",
             "-c",
-            f'cd "{wsl_cwd}" && claude -p "{command_content[:1000]}..." --output-format text --permission-mode bypassPermissions 2>&1'
+            f'cd "{wsl_cwd}" && claude -p "{command_content[:1000]}..." --output-format text --permission-mode bypassPermissions 2>&1',
         ]
 
         # For very long prompts, we need to pass via a temp file
         # Create a temp script that reads the full prompt
-        script_content = f'''#!/bin/bash
+        script_content = f"""#!/bin/bash
 cd "{wsl_cwd}"
 PROMPT=$(cat <<'ENDOFPROMPT'
 {command_content}
 ENDOFPROMPT
 )
 claude -p "$PROMPT" --output-format text --permission-mode bypassPermissions 2>&1
-'''
+"""
 
         # Write script to temp file
         import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
             f.write(script_content)
             script_path = f.name
 
@@ -228,9 +229,12 @@ claude -p "$PROMPT" --output-format text --permission-mode bypassPermissions 2>&
         # On Unix, invoke directly
         cmd = [
             "claude",
-            "-p", command_content,
-            "--output-format", "text",
-            "--permission-mode", "bypassPermissions",
+            "-p",
+            command_content,
+            "--output-format",
+            "text",
+            "--permission-mode",
+            "bypassPermissions",
         ]
 
     # Execute Claude Code
@@ -246,7 +250,7 @@ claude -p "$PROMPT" --output-format text --permission-mode bypassPermissions 2>&
         )
 
         # Clean up temp script on Windows
-        if system == "Windows" and 'script_path' in locals():
+        if system == "Windows" and "script_path" in locals():
             try:
                 os.unlink(script_path)
             except Exception:
@@ -296,7 +300,8 @@ def main():
         help="Only check if analysis can be triggered, don't run it",
     )
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
         help="Enable verbose logging",
     )
@@ -315,7 +320,7 @@ def main():
 
         metadata = get_execution_metadata()
         if metadata:
-            print(f"✓ Found automation results:")
+            print("✓ Found automation results:")
             print(f"  Config: {metadata.get('config_path', 'unknown')}")
             print(f"  Workflow: {metadata.get('workflow_name', 'unknown')}")
             print(f"  Success: {metadata.get('success', 'unknown')}")

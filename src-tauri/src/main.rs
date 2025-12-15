@@ -9,6 +9,7 @@ mod error;
 mod executor;
 mod logging;
 mod mcp_api;
+mod rag;
 mod settings;
 mod storage;
 mod video_recorder;
@@ -80,6 +81,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
+    // Initialize RAGState
+    let rag_state =
+        Arc::new(commands::rag::RAGState::new().expect("Failed to initialize RAG state"));
+
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
         python_bridge: Mutex::new(None),
@@ -89,11 +94,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         video_recorder,
     });
     let mcp_app_state = shared_app_state.clone();
+    let mcp_rag_state = rag_state.clone();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared_app_state)
+        .manage(rag_state)
         .invoke_handler(tauri::generate_handler![
             // Authentication commands
             commands::auth::login,
@@ -128,6 +135,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution::install_update,
             commands::execution::open_folder,
             commands::execution::update_capture_settings,
+            commands::execution::get_workflow_required_screens,
             // State machine commands
             commands::state_machine::execute_transition,
             commands::state_machine::navigate_to_state,
@@ -177,6 +185,24 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::logging::append_ai_output_log,
             commands::logging::clear_ai_output_log,
             commands::logging::get_ai_output_log_path_cmd,
+            // RAG commands
+            commands::rag::list_rag_configs,
+            commands::rag::get_rag_config,
+            commands::rag::delete_rag_config,
+            commands::rag::import_rag_config,
+            commands::rag::search_rag_elements,
+            commands::rag::search_rag_elements_semantic,
+            commands::rag::get_rag_embedding_status,
+            commands::rag::get_rag_storage_usage,
+            // Project logs commands
+            commands::project_logs::get_project_log_config,
+            commands::project_logs::save_project_log_config,
+            commands::project_logs::list_project_configs,
+            commands::project_logs::delete_project_config,
+            commands::project_logs::read_log_source,
+            commands::project_logs::read_project_logs,
+            commands::project_logs::get_project_directories,
+            commands::project_logs::append_project_log,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -269,7 +295,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
                 info!("MCP API server task starting...");
-                match mcp_api::start_server(mcp_app_state, mcp_app_handle, mcp_api::MCP_API_PORT).await {
+                match mcp_api::start_server(mcp_app_state, mcp_rag_state, mcp_app_handle, mcp_api::MCP_API_PORT).await {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }

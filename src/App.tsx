@@ -11,7 +11,15 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Play, Camera, Settings as SettingsIcon, ScrollText, Globe, Package } from "lucide-react";
+import {
+  Play,
+  Camera,
+  Settings as SettingsIcon,
+  ScrollText,
+  Globe,
+  Package,
+  Sparkles,
+} from "lucide-react";
 
 // Contexts
 import { ExecutionProvider, useExecution, EventManagerProvider } from "./contexts";
@@ -28,6 +36,7 @@ import {
   useModalState,
   useLogFilter,
   useProjectSelection,
+  useProjectLogs,
 } from "./hooks";
 
 // Components
@@ -42,12 +51,14 @@ import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
+import { LogSourceManager } from "./components/LogSourceManager";
+import { AiBuilderTab } from "./components/AiBuilderTab";
 
 // Styles
 import "./index.css";
 
-type MainTab = "run" | "logs" | "capture" | "extract" | "dataset" | "settings";
-type LogSubTab = "general" | "image" | "actions" | "ai";
+type MainTab = "run" | "logs" | "capture" | "extract" | "dataset" | "ai-builder" | "settings";
+type LogSubTab = "general" | "image" | "actions" | "ai" | "external";
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
@@ -64,7 +75,10 @@ function AppContent() {
   // Main tab state
   const [activeMainTab, setActiveMainTab] = useState<MainTab>(() => {
     const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
-    if (stored && ["run", "logs", "capture", "extract", "dataset", "settings"].includes(stored)) {
+    if (
+      stored &&
+      ["run", "logs", "capture", "extract", "dataset", "ai-builder", "settings"].includes(stored)
+    ) {
       return stored as MainTab;
     }
     return "run";
@@ -115,6 +129,12 @@ function AppContent() {
   // Project selection (shared between Capture and Settings)
   const projectSelection = useProjectSelection();
 
+  // Project logs (external logs from target application)
+  const projectLogs = useProjectLogs();
+
+  // Log source manager modal state
+  const [showLogSourceManager, setShowLogSourceManager] = useState(false);
+
   // Auto-load projects when authenticated
   useEffect(() => {
     if (auth.authStatus?.authenticated && !auth.loading) {
@@ -122,6 +142,17 @@ function AppContent() {
       projectSelection.loadProjects();
     }
   }, [auth.authStatus?.authenticated, auth.loading]);
+
+  // Load project logs config when a project is selected or on mount if already selected
+  useEffect(() => {
+    if (projectSelection.selectedProjectId && projectSelection.selectedProjectName) {
+      console.log("[APP] Loading project logs for:", projectSelection.selectedProjectName);
+      projectLogs.loadConfig(
+        projectSelection.selectedProjectId,
+        projectSelection.selectedProjectName,
+      );
+    }
+  }, [projectSelection.selectedProjectId, projectSelection.selectedProjectName]);
 
   // Setup event handlers on mount (ONCE only)
   useEffect(() => {
@@ -149,9 +180,11 @@ function AppContent() {
     uiState.setShowWorkflowDropdown(false);
   };
 
-  const handleMonitorSelect = (index: number) => {
-    execution.selectMonitorWithPersistence(index);
-    uiState.setShowMonitorDropdown(false);
+  const handleMonitorSelectionChange = (indices: number[]) => {
+    // For single monitor selection, use the first index
+    if (indices.length > 0) {
+      execution.selectMonitorWithPersistence(indices[0]);
+    }
   };
 
   const handleCopyLogs = async () => {
@@ -205,6 +238,7 @@ function AppContent() {
     { id: "capture" as const, label: "Capture", icon: Camera },
     { id: "extract" as const, label: "Extract", icon: Globe },
     { id: "dataset" as const, label: "Dataset", icon: Package },
+    { id: "ai-builder" as const, label: "AI Builder", icon: Sparkles },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
   ];
 
@@ -260,6 +294,7 @@ function AppContent() {
                   onToggle={uiState.setConfigPanelCollapsed}
                   onLoadConfiguration={execution.loadConfiguration}
                   onLoadLastConfiguration={execution.loadLastConfiguration}
+                  onLog={addLog}
                 />
 
                 {/* Execution Control Panel */}
@@ -272,11 +307,8 @@ function AppContent() {
                   showWorkflowDropdown={uiState.showWorkflowDropdown}
                   onWorkflowDropdownToggle={uiState.setShowWorkflowDropdown}
                   onWorkflowSelect={handleWorkflowSelect}
-                  selectedMonitor={execution.selectedMonitor}
-                  availableMonitors={execution.availableMonitors}
-                  showMonitorDropdown={uiState.showMonitorDropdown}
-                  onMonitorDropdownToggle={uiState.setShowMonitorDropdown}
-                  onMonitorSelect={handleMonitorSelect}
+                  selectedMonitors={[execution.selectedMonitor]}
+                  onMonitorSelectionChange={handleMonitorSelectionChange}
                   autoMinimize={execution.autoMinimize}
                   onAutoMinimizeChange={execution.setAutoMinimize}
                   executionActive={execution.executionActive}
@@ -305,10 +337,18 @@ function AppContent() {
                 onActionRowClick={modalState.openActionModal}
                 aiOutputLines={aiOutputLogs}
                 onClearAiOutput={clearAiOutputLogs}
+                projectLogConfig={projectLogs.config}
+                projectLogSources={projectLogs.logsState.sources}
+                projectLogsLoading={projectLogs.logsState.loading}
+                projectLogsError={projectLogs.error || undefined}
+                projectLogsLastRefresh={undefined}
+                onRefreshProjectLogs={projectLogs.refreshLogs}
+                onConfigureProjectLogs={() => setShowLogSourceManager(true)}
                 logCount={logCount}
                 imageLogCount={imageLogCount}
                 actionCount={actionLogViewData?.visible_count || 0}
                 aiOutputCount={aiOutputLogCount}
+                externalLogCount={projectLogs.logsState.sources.length}
                 onClearGeneralLogs={clearGeneralLogs}
                 onClearImageLogs={clearImageLogs}
                 onClearActionLogs={clearActionLogs}
@@ -327,6 +367,7 @@ function AppContent() {
               onLog={addLog}
               projects={projectSelection.projects}
               selectedProjectId={projectSelection.selectedProjectId}
+              selectedProjectName={projectSelection.selectedProjectName}
             />
           </Tabs.Content>
 
@@ -336,12 +377,18 @@ function AppContent() {
               onLog={addLog}
               projects={projectSelection.projects}
               selectedProjectId={projectSelection.selectedProjectId}
+              selectedProjectName={projectSelection.selectedProjectName}
             />
           </Tabs.Content>
 
           {/* Dataset Tab */}
           <Tabs.Content value="dataset" className="h-full outline-none overflow-y-auto">
             <DatasetPackager />
+          </Tabs.Content>
+
+          {/* AI Builder Tab */}
+          <Tabs.Content value="ai-builder" className="h-full outline-none overflow-y-auto">
+            <AiBuilderTab />
           </Tabs.Content>
 
           {/* Settings Tab */}
@@ -385,6 +432,20 @@ function AppContent() {
         isOpen={modalState.isImageModalOpen}
         onClose={modalState.closeImageModal}
       />
+
+      {/* Log Source Manager Modal */}
+      {projectLogs.config && (
+        <LogSourceManager
+          config={projectLogs.config}
+          isOpen={showLogSourceManager}
+          onClose={() => setShowLogSourceManager(false)}
+          onSave={(sources) => {
+            projectLogs.setLogSources(sources);
+            projectLogs.saveConfig();
+            setShowLogSourceManager(false);
+          }}
+        />
+      )}
     </div>
   );
 }

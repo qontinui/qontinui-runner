@@ -149,19 +149,19 @@ class ExecutorWrapper:
             self.is_running = False
 
             # 2. Clean up state executor if available
-            if hasattr(self.runner, 'state_executor') and self.runner.state_executor:
+            if hasattr(self.runner, "state_executor") and self.runner.state_executor:
                 try:
                     # Clear active states
-                    if hasattr(self.runner.state_executor, 'active_states'):
+                    if hasattr(self.runner.state_executor, "active_states"):
                         self.runner.state_executor.active_states.clear()
                 except Exception as e:
                     self._emit_log("warning", f"Failed to clear active states: {e}")
 
             # 3. Clean up action executor if available
-            if hasattr(self.runner, 'action_executor') and self.runner.action_executor:
+            if hasattr(self.runner, "action_executor") and self.runner.action_executor:
                 try:
                     # Clear last action result and variable context if needed
-                    if hasattr(self.runner.action_executor, 'last_action_result'):
+                    if hasattr(self.runner.action_executor, "last_action_result"):
                         self.runner.action_executor.last_action_result = None
                 except Exception as e:
                     self._emit_log("warning", f"Failed to clear action executor state: {e}")

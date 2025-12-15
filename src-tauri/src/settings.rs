@@ -26,8 +26,7 @@ impl Default for DebugSettings {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[derive(Default)]
+#[derive(serde::Serialize, serde::Deserialize, Default)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_config_path: Option<String>,
@@ -44,7 +43,6 @@ pub struct Settings {
 fn default_auto_load_last_config() -> bool {
     false
 }
-
 
 /// Get the settings file path in the app data directory
 fn get_settings_path() -> Result<PathBuf, String> {

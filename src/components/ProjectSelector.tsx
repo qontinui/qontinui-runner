@@ -189,9 +189,7 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
                     <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
                       <span>{project.element_count} elements</span>
                       <span>{project.screenshot_count} screenshots</span>
-                      {project.has_embeddings && (
-                        <span className="text-green-400">RAG Ready</span>
-                      )}
+                      {project.has_embeddings && <span className="text-green-400">RAG Ready</span>}
                     </div>
                   </div>
                 </div>

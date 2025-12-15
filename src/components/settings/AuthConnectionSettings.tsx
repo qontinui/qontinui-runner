@@ -348,22 +348,21 @@ export function AuthConnectionSettings({
           <div className="space-y-2">
             <div className="font-medium mb-1">Project</div>
             <div className="text-sm text-muted-foreground mb-3">
-              Choose which project this runner should connect to. This selection is used across
-              all features that require a project.
+              Choose which project this runner should connect to. This selection is used across all
+              features that require a project.
             </div>
             <div className="relative" ref={projectDropdownRef}>
               <button
                 type="button"
                 onClick={() => !connected && setShowProjectDropdown(!showProjectDropdown)}
                 className={`w-full px-3 py-2 bg-input border border-border/50 rounded-md flex items-center justify-between gap-2 text-left transition-colors ${
-                  connected
-                    ? "opacity-60 cursor-default"
-                    : "hover:border-border cursor-pointer"
+                  connected ? "opacity-60 cursor-default" : "hover:border-border cursor-pointer"
                 }`}
               >
                 <span className={selectedProjectId ? "" : "text-muted-foreground"}>
                   {selectedProjectId
-                    ? projects.find((p) => p.id === selectedProjectId)?.name || "Select a project..."
+                    ? projects.find((p) => p.id === selectedProjectId)?.name ||
+                      "Select a project..."
                     : "Select a project..."}
                 </span>
                 {!connected && (

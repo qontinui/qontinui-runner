@@ -24,7 +24,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from websocket_client import RunnerWebSocketClient, authenticate
-from websocket_config import WebSocketConfig
 
 
 def capture_fake_screenshot() -> str:
