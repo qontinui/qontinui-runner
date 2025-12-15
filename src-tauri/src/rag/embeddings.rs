@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tracing::{error, info};
@@ -15,9 +14,6 @@ use tracing::{error, info};
 pub enum EmbeddingError {
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-
-    #[error("Python execution error: {0}")]
-    PythonError(String),
 
     #[error("Invalid configuration: {0}")]
     ConfigError(String),
@@ -129,57 +125,6 @@ impl EmbeddingGenerator {
             })
     }
 
-    /// Create a new embedding generator with custom paths
-    pub fn with_paths(python_path: PathBuf, script_path: PathBuf) -> Self {
-        Self {
-            python_path,
-            script_path,
-            progress_state: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    /// Build the Python command for running the embedding script
-    ///
-    /// Uses Poetry if available, falls back to venv or system Python.
-    fn build_python_command(&self, project_id: &str) -> Result<Command, EmbeddingError> {
-        let python_bridge_dir = self.script_path.parent().ok_or_else(|| {
-            EmbeddingError::ConfigError("Could not determine python-bridge directory".to_string())
-        })?;
-
-        // Check for pyproject.toml (poetry project)
-        let pyproject_path = python_bridge_dir.join("pyproject.toml");
-        let poetry_available = pyproject_path.exists();
-
-        let mut cmd = if poetry_available {
-            info!(
-                "Using Poetry to run embedding generation from: {:?}",
-                python_bridge_dir
-            );
-            let mut cmd = Command::new("poetry");
-            cmd.current_dir(python_bridge_dir);
-            cmd.arg("run");
-            cmd.arg("python");
-            cmd.arg("-u"); // Unbuffered output
-            cmd.arg(&self.script_path);
-            cmd
-        } else {
-            info!(
-                "Poetry not found, using system Python: {:?}",
-                self.python_path
-            );
-            let mut cmd = Command::new(&self.python_path);
-            cmd.arg("-u"); // Unbuffered output
-            cmd.arg(&self.script_path);
-            cmd
-        };
-
-        // Add script arguments
-        cmd.arg("--project-id");
-        cmd.arg(project_id);
-
-        Ok(cmd)
-    }
-
     /// Build the async Python command for running the embedding script
     ///
     /// Same as build_python_command but returns tokio::process::Command
@@ -223,50 +168,6 @@ impl EmbeddingGenerator {
         cmd.arg(project_id);
 
         Ok(cmd)
-    }
-
-    /// Generate embeddings for a RAG project
-    ///
-    /// This spawns a Python subprocess to generate embeddings.
-    /// The Python script should:
-    /// 1. Load the RAG config from ~/.qontinui/rag/{project_id}/config.json
-    /// 2. Load screenshots from ~/.qontinui/rag/{project_id}/screenshots/
-    /// 3. Generate embeddings for each element
-    /// 4. Save embeddings to ~/.qontinui/rag/{project_id}/embeddings/
-    ///
-    /// # Arguments
-    /// * `project_id` - Project ID to generate embeddings for
-    ///
-    /// # Returns
-    /// * `Ok(())` - Embeddings generated successfully
-    /// * `Err(EmbeddingError)` - Error occurred during generation
-    pub fn generate_embeddings(&self, project_id: &str) -> Result<(), EmbeddingError> {
-        info!(
-            "Starting embedding generation for project_id={}",
-            project_id
-        );
-
-        let mut cmd = self.build_python_command(project_id)?;
-
-        info!("Executing embedding generation command: {:?}", cmd);
-
-        let output = cmd.output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Embedding generation failed: {}", stderr);
-            return Err(EmbeddingError::PythonError(stderr.to_string()));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        info!("Embedding generation output: {}", stdout);
-
-        info!(
-            "Embedding generation completed for project_id={}",
-            project_id
-        );
-
-        Ok(())
     }
 
     /// Generate embeddings asynchronously (background task)
@@ -461,17 +362,6 @@ impl EmbeddingGenerator {
         });
 
         rx
-    }
-
-    /// Update progress for a project
-    ///
-    /// # Arguments
-    /// * `project_id` - Project ID
-    /// * `progress` - Progress update
-    fn update_progress(&self, project_id: &str, progress: EmbeddingProgress) {
-        if let Ok(mut state) = self.progress_state.lock() {
-            state.insert(project_id.to_string(), progress);
-        }
     }
 
     /// Get current progress for a project

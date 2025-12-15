@@ -21,7 +21,7 @@ use super::{ImageAsset, QontinuiConfig, RAGConfig, RAGConfigSummary, ScreenshotD
 use base64::{engine::general_purpose, Engine};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{error, info, warn};
 
@@ -42,9 +42,6 @@ pub enum RAGStorageError {
 
     #[error("Project not found: {0}")]
     ProjectNotFound(String),
-
-    #[error("Config validation failed: {0}")]
-    ValidationError(String),
 }
 
 /// RAG storage manager
@@ -77,11 +74,6 @@ impl RAGStorage {
         Ok(Self { base_path })
     }
 
-    /// Get the base path for RAG storage
-    pub fn base_path(&self) -> &Path {
-        &self.base_path
-    }
-
     /// Get the path for a specific project
     pub fn get_project_path(&self, project_id: &str) -> PathBuf {
         self.base_path.join(project_id)
@@ -95,12 +87,6 @@ impl RAGStorage {
     /// Get the path for the images directory (extracted from config.images[])
     pub fn get_images_path(&self, project_id: &str) -> PathBuf {
         self.get_project_path(project_id).join("images")
-    }
-
-    /// Get the path for the screenshots directory (legacy - use get_images_path instead)
-    #[deprecated(note = "Use get_images_path instead")]
-    pub fn get_screenshots_path(&self, project_id: &str) -> PathBuf {
-        self.get_project_path(project_id).join("screenshots")
     }
 
     /// Get the path for the embeddings directory

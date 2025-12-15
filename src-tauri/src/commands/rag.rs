@@ -4,8 +4,8 @@
 //! RAG configs contain pattern screenshots and element annotations for visual automation.
 
 use crate::rag::{
-    EmbeddingGenerator, ImportResult, RAGConfig, RAGFinder, RAGStorage, ScreenshotData,
-    SearchFilters, SearchResult, SemanticSearch,
+    EmbeddingGenerator, ImportResult, RAGConfig, RAGStorage, ScreenshotData, SearchFilters,
+    SearchResult, SemanticSearch,
 };
 use std::sync::Arc;
 use tauri::State;
@@ -19,7 +19,6 @@ pub struct RAGState {
     pub storage: Arc<TokioMutex<RAGStorage>>,
     pub embedding_generator: Arc<TokioMutex<EmbeddingGenerator>>,
     pub semantic_search: Arc<TokioMutex<SemanticSearch>>,
-    pub finder: Arc<TokioMutex<RAGFinder>>,
 }
 
 impl RAGState {
@@ -30,14 +29,11 @@ impl RAGState {
             .map_err(|e| format!("Failed to initialize embedding generator: {}", e))?;
         let semantic_search = SemanticSearch::new()
             .map_err(|e| format!("Failed to initialize semantic search: {}", e))?;
-        let finder =
-            RAGFinder::new().map_err(|e| format!("Failed to initialize RAG finder: {}", e))?;
 
         Ok(Self {
             storage: Arc::new(TokioMutex::new(storage)),
             embedding_generator: Arc::new(TokioMutex::new(embedding_generator)),
             semantic_search: Arc::new(TokioMutex::new(semantic_search)),
-            finder: Arc::new(TokioMutex::new(finder)),
         })
     }
 }

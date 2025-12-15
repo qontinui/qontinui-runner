@@ -152,7 +152,7 @@ fn tail_file(path: &PathBuf, num_lines: u32) -> Result<(Vec<String>, u64), Strin
         File::open(path).map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
 
     let reader = BufReader::new(&file);
-    let all_lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+    let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
     let total_lines = all_lines.len() as u64;
 
     let start = if all_lines.len() > num_lines as usize {
