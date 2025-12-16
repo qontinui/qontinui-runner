@@ -14,6 +14,7 @@ The executor acts as a facade, coordinating these modules while maintaining
 the same stdin/stdout protocol for Rust bridge communication.
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -71,29 +72,27 @@ logger.debug(
     f"Qontinui source path added to sys.path: {qontinui_src_path} (exists: {qontinui_src_path.exists()})"
 )
 
-from action_definitions import get_action_definition
-from capture_manager import CaptureManager
+from action_definitions import get_action_definition  # noqa: E402
+from capture_manager import CaptureManager  # noqa: E402
 
 # Import our specialized modules
-from event_manager import EventManager, EventType
+from event_manager import EventManager, EventType  # noqa: E402
 
 # CRITICAL: Import local python-bridge modules BEFORE qontinui library
-from event_translator import EventTranslator
-from execution_tree import ExecutionNode, ExecutionTree
-from executor_core import ExecutorCore
-from gui_automation import GUIAutomation
-from services.screenshot_service import ScreenshotService
-from services.unified_data_collector import UnifiedDataCollector
-from services.web_extraction_service import WebExtractionService
-from training_export import TrainingExportCoordinator
-from websocket_handler import WebSocketHandler
+from event_translator import EventTranslator  # noqa: E402
+from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
+from executor_core import ExecutorCore  # noqa: E402
+from gui_automation import GUIAutomation  # noqa: E402
+from services.screenshot_service import ScreenshotService  # noqa: E402
+from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
+from services.web_extraction_service import WebExtractionService  # noqa: E402
+from training_export import TrainingExportCoordinator  # noqa: E402
+from websocket_handler import WebSocketHandler  # noqa: E402
 
 # Check if qontinui library is available
 try:
-    from qontinui import Find, Image, Location, navigation_api, registry
-    from qontinui.config import get_settings
-    from qontinui.reporting import EventType as QontinuiEventType
-    from qontinui.reporting import register_callback
+    from qontinui import navigation_api  # noqa: E402, F401
+    from qontinui.config import get_settings  # noqa: E402
 
     QONTINUI_AVAILABLE = True
 except ImportError as e:
@@ -1348,10 +1347,8 @@ class QontinuiExecutor:
             load_success = self.load_configuration(temp_file)
             if not load_success:
                 # Clean up temp file
-                try:
+                with contextlib.suppress(Exception):
                     os.unlink(temp_file)
-                except Exception:
-                    pass
                 return {"success": False, "error": "Failed to load workflow configuration"}
 
             # Apply any variables if provided
@@ -1381,7 +1378,7 @@ class QontinuiExecutor:
                             )
                     except Exception as e:
                         self.event_manager.emit_log("error", f"Failed to apply variables: {e}")
-                        self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")
+                        self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")  # noqa: F823
                 else:
                     self.event_manager.emit_log(
                         "warning",
@@ -1445,12 +1442,9 @@ class QontinuiExecutor:
     def __del__(self):
         """Clean up resources on exit."""
         # Stop capture manager
-        if hasattr(self, "capture_manager") and self.capture_manager:
-            if self.capture_manager.manual_click_listener:
-                try:
-                    self.capture_manager.manual_click_listener.cleanup()
-                except Exception:
-                    pass
+        if hasattr(self, "capture_manager") and self.capture_manager and self.capture_manager.manual_click_listener:
+            with contextlib.suppress(Exception):
+                self.capture_manager.manual_click_listener.cleanup()
 
         # Clean up executor core
         if hasattr(self, "executor_core") and self.executor_core:

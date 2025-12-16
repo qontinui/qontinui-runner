@@ -15,6 +15,7 @@ Or import and use programmatically:
     result = trigger_analysis()
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -252,10 +253,8 @@ claude -p "$PROMPT" --output-format text --permission-mode bypassPermissions 2>&
 
         # Clean up temp script on Windows
         if system == "Windows" and "script_path" in locals():
-            try:
+            with contextlib.suppress(Exception):
                 os.unlink(script_path)
-            except Exception:
-                pass
 
         result["output"] = proc.stdout
 

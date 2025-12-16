@@ -68,6 +68,7 @@ impl RAGStorage {
     }
 
     /// Create a new RAGStorage with custom base path
+    #[allow(dead_code)]
     pub fn with_path(base_path: PathBuf) -> Result<Self, RAGStorageError> {
         fs::create_dir_all(&base_path)?;
         info!("RAG storage initialized at: {:?}", base_path);
@@ -344,6 +345,7 @@ impl RAGStorage {
     }
 
     /// Check if a project exists
+    #[allow(dead_code)]
     pub fn project_exists(&self, project_id: &str) -> bool {
         self.get_config_path(project_id).exists()
     }

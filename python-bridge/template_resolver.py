@@ -61,10 +61,7 @@ def resolve_template(template: str, context: WorkflowContext) -> str:
         # Handle nested keys (e.g., "config.timeout")
         keys = key.split(".")
 
-        if namespace == "context":
-            value = context.get(keys[0])
-        else:  # execution
-            value = context.get_execution(keys[0])
+        value = context.get(keys[0]) if namespace == "context" else context.get_execution(keys[0])
 
         # Navigate nested keys
         for nested_key in keys[1:]:

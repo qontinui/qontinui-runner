@@ -15,9 +15,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 try:
-    from services.screenshot_service import ScreenshotService
-    from services.training_export_service import ExportConfig, TrainingExportService
-    from services.unified_data_collector import UnifiedDataCollector
+    from services.training_export_service import ExportConfig, TrainingExportService  # noqa: F401
 
     EXPORT_AVAILABLE = True
 except ImportError:

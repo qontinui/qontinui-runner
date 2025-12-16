@@ -85,6 +85,7 @@ pub async fn import_rag_config(
 
     // Save configuration
     let storage = state.storage.lock().await;
+    #[allow(deprecated)]
     let storage_path = storage
         .save_config(&config)
         .map_err(|e| format!("Failed to save config: {}", e))?;

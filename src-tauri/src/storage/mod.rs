@@ -254,6 +254,11 @@ impl LocalStorage {
 
     /// Calculate directory size and file count (recursive)
     fn calculate_directory_size(&self, path: &Path) -> Result<(u64, usize)> {
+        Self::calculate_directory_size_impl(path)
+    }
+
+    /// Recursive implementation of directory size calculation
+    fn calculate_directory_size_impl(path: &Path) -> Result<(u64, usize)> {
         let mut total_size = 0u64;
         let mut file_count = 0usize;
 
@@ -271,7 +276,7 @@ impl LocalStorage {
                     file_count += 1;
                 }
             } else if path.is_dir() {
-                let (dir_size, dir_count) = self.calculate_directory_size(&path)?;
+                let (dir_size, dir_count) = Self::calculate_directory_size_impl(&path)?;
                 total_size += dir_size;
                 file_count += dir_count;
             }

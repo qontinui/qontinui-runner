@@ -231,7 +231,7 @@ class GUIAutomation:
             # Emit tree event with enriched metadata
             self.emit_tree_event("action_completed" if success else "action_failed", node, None)
 
-            return success
+        return success
 
     def execute_workflow(self, workflow_id: str, transition_context: dict | None = None) -> bool:
         """
@@ -355,7 +355,7 @@ class GUIAutomation:
         success = True
 
         try:
-            for idx, action in enumerate(actions):
+            for _, action in enumerate(actions):
                 if not self.is_running:
                     break
 

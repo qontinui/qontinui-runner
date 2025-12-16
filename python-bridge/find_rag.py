@@ -109,7 +109,7 @@ def load_screenshot(
             np_image = capture.capture_monitor(monitors[monitor])
             return Image.fromarray(np_image)
         except ImportError:
-            raise ValueError("Screen capture not available. Install qontinui with HAL support.")
+            raise ValueError("Screen capture not available. Install qontinui with HAL support.") from None
 
     raise ValueError("No screenshot source provided")
 

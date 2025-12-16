@@ -204,7 +204,6 @@ class ExecutorCore:
 
             for state_image in state_images:
                 state_image_id = state_image.get("id")
-                state_image_name = state_image.get("name", "unknown")
                 patterns = state_image.get("patterns", [])
 
                 if patterns and len(patterns) > 0:

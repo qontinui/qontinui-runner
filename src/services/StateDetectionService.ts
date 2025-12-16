@@ -1,5 +1,11 @@
-import { spawn, ChildProcess } from "child_process";
-import { join } from "path";
+/**
+ * State Detection Service
+ *
+ * NOTE: This service is a TypeScript interface layer. The actual state detection
+ * logic runs in Rust via Tauri commands, which handles the Python subprocess.
+ * This file should NOT use Node.js APIs (child_process, path, __dirname, etc.)
+ * as it runs in the Vite frontend environment.
+ */
 
 /**
  * Represents a detected UI element within a state.
@@ -197,34 +203,25 @@ export class StateDetectionError extends Error {
  * ```
  */
 export class StateDetectionService {
-  private pythonPath: string;
-  private bridgeScriptPath: string;
   private defaultTimeout: number;
-  private activeProcesses: Map<string, ChildProcess>;
 
   /**
    * Creates a new StateDetectionService instance.
    *
    * @param config - Service configuration
-   * @param config.pythonPath - Path to Python interpreter (default: "python3")
-   * @param config.bridgeScriptPath - Path to Python bridge script
    * @param config.defaultTimeout - Default timeout for analysis in milliseconds (default: 300000)
    */
   constructor(config?: {
-    pythonPath?: string;
-    bridgeScriptPath?: string;
     defaultTimeout?: number;
   }) {
-    this.pythonPath = config?.pythonPath || "python3";
-    this.bridgeScriptPath =
-      config?.bridgeScriptPath ||
-      join(__dirname, "..", "..", "python", "state_detection_bridge.py");
     this.defaultTimeout = config?.defaultTimeout || 300000; // 5 minutes default
-    this.activeProcesses = new Map();
   }
 
   /**
    * Process a session of screenshots to detect states and UI elements.
+   *
+   * NOTE: This method should invoke Tauri commands instead of spawning processes directly.
+   * The actual implementation would use invoke() from @tauri-apps/api/core.
    *
    * @param sessionPath - Path to directory containing screenshots
    * @param config - Detection configuration options
@@ -235,192 +232,15 @@ export class StateDetectionService {
     sessionPath: string,
     config?: StateDetectionConfig,
   ): Promise<StateDetectionResult> {
-    const startTime = Date.now();
-    const processId = `process_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    // This is a stub implementation. In production, this should call:
+    // const result = await invoke('process_state_detection_session', { sessionPath, config });
 
-    // Build configuration with defaults
-    const analysisConfig = {
-      min_region_size: config?.minRegionSize || [20, 20],
-      max_region_size: config?.maxRegionSize || [500, 500],
-      color_tolerance: config?.colorTolerance || 5,
-      stability_threshold: config?.stabilityThreshold || 0.98,
-      variance_threshold: config?.varianceThreshold || 10.0,
-      min_screenshots_present: config?.minScreenshotsPresent || 2,
-      processing_mode: config?.processingMode || "full",
-      enable_rectangle_decomposition: config?.enableRectangleDecomposition ?? true,
-      enable_cooccurrence_analysis: config?.enableCooccurrenceAnalysis ?? true,
-      similarity_threshold: config?.similarityThreshold || 0.95,
-      region: config?.region || null,
-    };
-
-    try {
-      // Spawn Python process
-      const process = await this.spawnPythonBridge(sessionPath, analysisConfig, processId);
-
-      // Wait for process to complete and collect output
-      const output = await this.waitForCompletion(
-        process,
-        processId,
-        config?.timeout || this.defaultTimeout,
-      );
-
-      // Parse and validate output
-      const result = this.parseOutput(output);
-
-      // Add processing time
-      result.processingTime = Date.now() - startTime;
-
-      return result;
-    } catch (error) {
-      // Clean up process if it exists
-      this.cleanupProcess(processId);
-
-      if (error instanceof StateDetectionError) {
-        throw error;
-      }
-
-      throw new StateDetectionError(
-        StateDetectionErrorType.UNKNOWN,
-        `Unexpected error during state detection: ${error instanceof Error ? error.message : String(error)}`,
-        error,
-      );
-    }
+    throw new StateDetectionError(
+      StateDetectionErrorType.UNKNOWN,
+      "State detection not implemented. This service should delegate to Tauri commands.",
+    );
   }
 
-  /**
-   * Spawn the Python bridge process.
-   *
-   * @private
-   */
-  private spawnPythonBridge(
-    sessionPath: string,
-    config: Record<string, unknown>,
-    processId: string,
-  ): Promise<ChildProcess> {
-    return new Promise((resolve, reject) => {
-      try {
-        const args = [this.bridgeScriptPath, sessionPath, JSON.stringify(config)];
-
-        const process = spawn(this.pythonPath, args, {
-          stdio: ["pipe", "pipe", "pipe"],
-        });
-
-        this.activeProcesses.set(processId, process);
-
-        // Handle immediate spawn errors
-        process.on("error", (error) => {
-          reject(
-            new StateDetectionError(
-              StateDetectionErrorType.PROCESS_SPAWN_FAILED,
-              `Failed to spawn Python process: ${error.message}`,
-              error,
-            ),
-          );
-        });
-
-        // Wait for process to start successfully
-        setTimeout(() => {
-          if (process.pid) {
-            resolve(process);
-          } else {
-            reject(
-              new StateDetectionError(
-                StateDetectionErrorType.PROCESS_SPAWN_FAILED,
-                "Python process failed to start",
-              ),
-            );
-          }
-        }, 100);
-      } catch (error) {
-        reject(
-          new StateDetectionError(
-            StateDetectionErrorType.PROCESS_SPAWN_FAILED,
-            `Failed to spawn Python process: ${error instanceof Error ? error.message : String(error)}`,
-            error,
-          ),
-        );
-      }
-    });
-  }
-
-  /**
-   * Wait for the Python process to complete and collect output.
-   *
-   * @private
-   */
-  private waitForCompletion(
-    process: ChildProcess,
-    processId: string,
-    timeout: number,
-  ): Promise<string> {
-    return new Promise((resolve, reject) => {
-      let stdout = "";
-      let stderr = "";
-      let timeoutId: NodeJS.Timeout | null = null;
-
-      // Set up timeout
-      timeoutId = setTimeout(() => {
-        process.kill();
-        reject(
-          new StateDetectionError(
-            StateDetectionErrorType.TIMEOUT,
-            `State detection timed out after ${timeout}ms`,
-            { stdout, stderr },
-          ),
-        );
-      }, timeout);
-
-      // Collect stdout
-      process.stdout?.on("data", (data) => {
-        stdout += data.toString();
-      });
-
-      // Collect stderr
-      process.stderr?.on("data", (data) => {
-        stderr += data.toString();
-        // Log stderr for debugging
-        console.error("[StateDetection] Python stderr:", data.toString());
-      });
-
-      // Handle process exit
-      process.on("close", (code) => {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-
-        this.cleanupProcess(processId);
-
-        if (code === 0) {
-          resolve(stdout);
-        } else {
-          reject(
-            new StateDetectionError(
-              StateDetectionErrorType.PROCESS_CRASHED,
-              `Python process exited with code ${code}`,
-              { stdout, stderr, exitCode: code },
-            ),
-          );
-        }
-      });
-
-      // Handle process errors
-      process.on("error", (error) => {
-        if (timeoutId) {
-          clearTimeout(timeoutId);
-        }
-
-        this.cleanupProcess(processId);
-
-        reject(
-          new StateDetectionError(
-            StateDetectionErrorType.PROCESS_CRASHED,
-            `Python process error: ${error.message}`,
-            { error, stdout, stderr },
-          ),
-        );
-      });
-    });
-  }
 
   /**
    * Parse the JSON output from the Python bridge.
@@ -537,56 +357,6 @@ export class StateDetectionService {
       confidence: Number(state.confidence || 0),
       metadata: (state.metadata as Record<string, unknown>) || {},
     }));
-  }
-
-  /**
-   * Clean up a process and remove it from tracking.
-   *
-   * @private
-   */
-  private cleanupProcess(processId: string): void {
-    const process = this.activeProcesses.get(processId);
-    if (process && !process.killed) {
-      process.kill();
-    }
-    this.activeProcesses.delete(processId);
-  }
-
-  /**
-   * Kill all active processes (cleanup method).
-   */
-  killAllProcesses(): void {
-    for (const [processId, process] of this.activeProcesses.entries()) {
-      if (!process.killed) {
-        process.kill();
-      }
-      this.activeProcesses.delete(processId);
-    }
-  }
-
-  /**
-   * Get the number of active Python processes.
-   */
-  getActiveProcessCount(): number {
-    return this.activeProcesses.size;
-  }
-
-  /**
-   * Update the Python path for the service.
-   *
-   * @param pythonPath - New path to Python interpreter
-   */
-  setPythonPath(pythonPath: string): void {
-    this.pythonPath = pythonPath;
-  }
-
-  /**
-   * Update the bridge script path for the service.
-   *
-   * @param bridgeScriptPath - New path to bridge script
-   */
-  setBridgeScriptPath(bridgeScriptPath: string): void {
-    this.bridgeScriptPath = bridgeScriptPath;
   }
 
   /**

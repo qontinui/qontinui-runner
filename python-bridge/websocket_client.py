@@ -10,6 +10,7 @@ This module provides real-time bidirectional communication for:
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import platform
@@ -247,27 +248,21 @@ class RunnerWebSocketClient:
         # Cancel reconnect task if running
         if self.reconnect_task and not self.reconnect_task.done():
             self.reconnect_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.reconnect_task
-            except asyncio.CancelledError:
-                pass
             self.reconnect_task = None
 
         # Cancel heartbeat task
         if self.heartbeat_task and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.heartbeat_task
-            except asyncio.CancelledError:
-                pass
 
         # Cancel listener task
         if self.listener_task and not self.listener_task.done():
             self.listener_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.listener_task
-            except asyncio.CancelledError:
-                pass
 
         # Close WebSocket
         if self.ws and not self.ws.closed:
@@ -472,10 +467,8 @@ class RunnerWebSocketClient:
         # Cancel heartbeat task
         if self.heartbeat_task and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.heartbeat_task
-            except asyncio.CancelledError:
-                pass
 
         success = response and response.get("success", False)
 
@@ -673,7 +666,6 @@ class RunnerWebSocketClient:
                     if message_type == "command":
                         # Handle command from frontend
                         command = message.get("command")
-                        params = message.get("params", {})
                         logger.info(f"Received command: {command}")
 
                         if self.on_command:
