@@ -45,12 +45,20 @@ interface ExecutionContextValue {
   setSelectedWorkflow: (id: string) => void;
   selectWorkflowWithPersistence: (id: string) => Promise<void>;
 
-  // Monitor State
-  selectedMonitor: number;
-  setSelectedMonitor: (index: number) => void;
-  selectMonitorWithPersistence: (index: number) => Promise<void>;
+  // Monitor State (multi-monitor support)
+  selectedMonitors: number[];
+  setSelectedMonitors: (indices: number[]) => void;
+  selectMonitorsWithPersistence: (indices: number[]) => Promise<void>;
   availableMonitors: number[];
   detectSystemMonitors: () => Promise<void>;
+
+  // Legacy single-monitor API (backward compatibility)
+  /** @deprecated Use selectedMonitors instead */
+  selectedMonitor: number;
+  /** @deprecated Use setSelectedMonitors instead */
+  setSelectedMonitor: (index: number) => void;
+  /** @deprecated Use selectMonitorsWithPersistence instead */
+  selectMonitorWithPersistence: (index: number) => Promise<void>;
 
   // Execution Control
   executionActive: boolean;
@@ -84,7 +92,7 @@ export function ExecutionProvider({
 
   // Pending workflow/monitor to set after config loads
   const [pendingWorkflowId, setPendingWorkflowId] = useState<string | null>(null);
-  const [pendingMonitorIndex, setPendingMonitorIndex] = useState<number | null>(null);
+  const [pendingMonitorIndices, setPendingMonitorIndices] = useState<number[] | null>(null);
 
   // Auto-start Python executor on mount
   const hasAutoStarted = useRef(false);
@@ -104,15 +112,21 @@ export function ExecutionProvider({
 
   // Callback when last config is loaded with workflow/monitor info
   const handleLastConfigLoaded = useCallback(
-    (workflowId: string | null, monitorIndex: number | null) => {
+    (workflowId: string | null, monitorIndices: number[] | number | null) => {
       console.log(
         "[EXECUTION_CONTEXT] Last config loaded with workflow:",
         workflowId,
-        "monitor:",
-        monitorIndex,
+        "monitors:",
+        monitorIndices,
       );
       setPendingWorkflowId(workflowId);
-      setPendingMonitorIndex(monitorIndex);
+      // Handle both array and legacy single-monitor format
+      if (monitorIndices !== null) {
+        const indices = Array.isArray(monitorIndices) ? monitorIndices : [monitorIndices];
+        setPendingMonitorIndices(indices);
+      } else {
+        setPendingMonitorIndices(null);
+      }
     },
     [],
   );
@@ -140,13 +154,17 @@ export function ExecutionProvider({
   const { selectedWorkflow, setSelectedWorkflow, selectWorkflowWithPersistence } =
     useWorkflowSelection();
 
-  // Monitor Detection Hook
+  // Monitor Detection Hook (multi-monitor support)
   const {
+    selectedMonitors,
+    setSelectedMonitors,
+    selectMonitorsWithPersistence,
+    availableMonitors,
+    detectSystemMonitors,
+    // Legacy single-monitor API
     selectedMonitor,
     setSelectedMonitor,
     selectMonitorWithPersistence,
-    availableMonitors,
-    detectSystemMonitors,
   } = useMonitorDetection({
     onLog,
     detectOnMount: true,
@@ -172,22 +190,23 @@ export function ExecutionProvider({
 
   // Apply pending monitor selection after monitors are detected
   useEffect(() => {
-    if (pendingMonitorIndex !== null && availableMonitors.length > 0) {
-      // Check if the pending monitor exists in available monitors
-      if (availableMonitors.includes(pendingMonitorIndex)) {
-        console.log("[EXECUTION_CONTEXT] Auto-selecting saved monitor:", pendingMonitorIndex);
-        setSelectedMonitor(pendingMonitorIndex);
+    if (pendingMonitorIndices !== null && availableMonitors.length > 0) {
+      // Filter to only available monitors
+      const validIndices = pendingMonitorIndices.filter((idx) => availableMonitors.includes(idx));
+      if (validIndices.length > 0) {
+        console.log("[EXECUTION_CONTEXT] Auto-selecting saved monitors:", validIndices);
+        setSelectedMonitors(validIndices);
       } else {
         console.log(
-          "[EXECUTION_CONTEXT] Saved monitor not available:",
-          pendingMonitorIndex,
+          "[EXECUTION_CONTEXT] Saved monitors not available:",
+          pendingMonitorIndices,
           "available:",
           availableMonitors,
         );
       }
-      setPendingMonitorIndex(null);
+      setPendingMonitorIndices(null);
     }
-  }, [pendingMonitorIndex, availableMonitors, setSelectedMonitor]);
+  }, [pendingMonitorIndices, availableMonitors, setSelectedMonitors]);
 
   // Execution Control Hook
   const {
@@ -209,11 +228,11 @@ export function ExecutionProvider({
   const startExecution = useCallback(async () => {
     await startExecutionHook({
       selectedWorkflow,
-      selectedMonitor,
+      selectedMonitors,
       workflows,
       availableMonitors,
     });
-  }, [startExecutionHook, selectedWorkflow, selectedMonitor, workflows, availableMonitors]);
+  }, [startExecutionHook, selectedWorkflow, selectedMonitors, workflows, availableMonitors]);
 
   const value: ExecutionContextValue = {
     // Python Executor
@@ -235,12 +254,17 @@ export function ExecutionProvider({
     setSelectedWorkflow,
     selectWorkflowWithPersistence,
 
-    // Monitors
+    // Monitors (multi-monitor support)
+    selectedMonitors,
+    setSelectedMonitors,
+    selectMonitorsWithPersistence,
+    availableMonitors,
+    detectSystemMonitors,
+
+    // Legacy single-monitor API
     selectedMonitor,
     setSelectedMonitor,
     selectMonitorWithPersistence,
-    availableMonitors,
-    detectSystemMonitors,
 
     // Execution Control
     executionActive,

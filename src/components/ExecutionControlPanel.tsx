@@ -58,6 +58,30 @@ export function ExecutionControlPanel({
   const [calculatedScreens, setCalculatedScreens] = useState<number[]>([]);
   const [isOverrideActive, setIsOverrideActive] = useState(false);
   const [isCalculating, setIsCalculating] = useState(false);
+  const [availableMonitors, setAvailableMonitors] = useState<number[]>([]);
+
+  // Load available monitors on mount
+  useEffect(() => {
+    const loadMonitors = async () => {
+      try {
+        const result = await invoke<{
+          success: boolean;
+          data?: { monitors: { index: number; is_primary: boolean }[] };
+        }>("get_monitors");
+        if (result?.success && result.data?.monitors) {
+          setAvailableMonitors(result.data.monitors.map((m) => m.index));
+        }
+      } catch (err) {
+        console.error("Failed to load monitors:", err);
+      }
+    };
+    loadMonitors();
+  }, []);
+
+  // Reset override mode when workflow changes
+  useEffect(() => {
+    setIsOverrideActive(false);
+  }, [selectedWorkflow]);
 
   // Calculate required screens when workflow changes
   useEffect(() => {
@@ -74,24 +98,29 @@ export function ExecutionControlPanel({
           { workflowId: selectedWorkflow },
         );
 
-        if (result?.success && result.data?.screens) {
+        if (result?.success && result.data?.screens && result.data.screens.length > 0) {
           setCalculatedScreens(result.data.screens);
-
-          // If not in override mode, update selected monitors to match calculated screens
-          if (!isOverrideActive) {
-            onMonitorSelectionChange(result.data.screens);
-          }
+          // Auto-select calculated screens (override mode is reset above)
+          onMonitorSelectionChange(result.data.screens);
+        } else {
+          // If no screens calculated from workflow, default to primary (index 0)
+          const defaultScreen = availableMonitors.length > 0 ? [availableMonitors[0]] : [0];
+          setCalculatedScreens(defaultScreen);
+          onMonitorSelectionChange(defaultScreen);
         }
       } catch (err) {
         console.error("Failed to calculate required screens:", err);
-        setCalculatedScreens([]);
+        // Default to primary monitor on error
+        const defaultScreen = availableMonitors.length > 0 ? [availableMonitors[0]] : [0];
+        setCalculatedScreens(defaultScreen);
+        onMonitorSelectionChange(defaultScreen);
       } finally {
         setIsCalculating(false);
       }
     };
 
     calculateScreens();
-  }, [selectedWorkflow, configLoaded]);
+  }, [selectedWorkflow, configLoaded, availableMonitors]);
 
   // Handle override toggle
   const handleOverrideToggle = () => {
@@ -104,8 +133,8 @@ export function ExecutionControlPanel({
     }
   };
 
-  // Determine if monitor selector is read-only
-  const monitorSelectorReadOnly = !isOverrideActive && calculatedScreens.length > 0;
+  // Determine if monitor selector is read-only (read-only when workflow selected and not in override mode)
+  const monitorSelectorReadOnly = !!selectedWorkflow && !isOverrideActive;
 
   return (
     <CollapsiblePanel
@@ -147,7 +176,7 @@ export function ExecutionControlPanel({
 
         {/* Monitor Selector */}
         <div className="space-y-2">
-          {calculatedScreens.length > 0 && !isOverrideActive && (
+          {selectedWorkflow && !isOverrideActive && (
             <div className="text-xs text-muted-foreground">
               {isCalculating ? (
                 <span>Calculating required monitors...</span>
@@ -162,11 +191,11 @@ export function ExecutionControlPanel({
           <MonitorSelector
             selectedMonitors={selectedMonitors}
             onSelectionChange={onMonitorSelectionChange}
-            multiSelect={false}
+            multiSelect={true}
             compact={true}
             readOnly={monitorSelectorReadOnly}
             isOverrideActive={isOverrideActive}
-            onOverrideToggle={calculatedScreens.length > 0 ? handleOverrideToggle : undefined}
+            onOverrideToggle={selectedWorkflow ? handleOverrideToggle : undefined}
           />
         </div>
 

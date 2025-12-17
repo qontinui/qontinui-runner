@@ -666,7 +666,9 @@ class RunnerWebSocketClient:
                     if message_type == "command":
                         # Handle command from frontend
                         command = message.get("command")
-                        logger.info(f"Received command: {command}")
+                        # Don't log high-frequency commands to avoid flooding
+                        if command not in ("ping", "status"):
+                            logger.info(f"Received command: {command}")
 
                         if self.on_command:
                             try:

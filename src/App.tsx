@@ -181,9 +181,9 @@ function AppContent() {
   };
 
   const handleMonitorSelectionChange = (indices: number[]) => {
-    // For single monitor selection, use the first index
+    // Use multi-monitor selection with persistence
     if (indices.length > 0) {
-      execution.selectMonitorWithPersistence(indices[0]);
+      execution.selectMonitorsWithPersistence(indices);
     }
   };
 
@@ -216,7 +216,9 @@ function AppContent() {
   };
 
   // Show loading state while checking auth
+  console.log("[APP] Render - auth.loading:", auth.loading, "auth.authStatus:", auth.authStatus);
   if (auth.loading) {
+    console.log("[APP] Rendering loading state");
     return (
       <div className="min-h-screen bg-background grid-dots flex items-center justify-center">
         <div className="card p-8 text-center space-y-4">
@@ -229,8 +231,11 @@ function AppContent() {
 
   // Show login screen if not authenticated
   if (!auth.authStatus?.authenticated) {
-    return <LoginScreen onLoginSuccess={auth.refreshAuth} />;
+    console.log("[APP] Rendering LoginScreen (not authenticated)");
+    return <LoginScreen onLogin={auth.login} />;
   }
+
+  console.log("[APP] Rendering main app (authenticated)");
 
   const mainTabs = [
     { id: "run" as const, label: "Run", icon: Play },
@@ -307,7 +312,7 @@ function AppContent() {
                   showWorkflowDropdown={uiState.showWorkflowDropdown}
                   onWorkflowDropdownToggle={uiState.setShowWorkflowDropdown}
                   onWorkflowSelect={handleWorkflowSelect}
-                  selectedMonitors={[execution.selectedMonitor]}
+                  selectedMonitors={execution.selectedMonitors}
                   onMonitorSelectionChange={handleMonitorSelectionChange}
                   autoMinimize={execution.autoMinimize}
                   onAutoMinimizeChange={execution.setAutoMinimize}
@@ -441,7 +446,7 @@ function AppContent() {
           onClose={() => setShowLogSourceManager(false)}
           onSave={(sources) => {
             projectLogs.setLogSources(sources);
-            projectLogs.saveConfig();
+            projectLogs.saveConfig(sources);  // Pass sources directly to avoid React async state issue
             setShowLogSourceManager(false);
           }}
         />

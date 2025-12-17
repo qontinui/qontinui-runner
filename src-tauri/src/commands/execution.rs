@@ -153,7 +153,8 @@ pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandRespon
 ///
 /// # Arguments
 /// * `process_id` - The workflow ID to execute (required)
-/// * `monitor_index` - The monitor to capture (defaults to 0)
+/// * `monitor_indices` - Array of monitor indices to use (defaults to [0])
+/// * `monitor_index` - Legacy single monitor index (deprecated, use monitor_indices)
 /// * `state` - Application state containing the Python bridge
 ///
 /// Note: Monitor offset calculation is handled by the qontinui Python library
@@ -165,7 +166,8 @@ pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandRespon
 #[tauri::command]
 pub fn start_execution(
     process_id: Option<String>,
-    monitor_index: Option<i32>,
+    monitor_indices: Option<Vec<i32>>,
+    monitor_index: Option<i32>, // Legacy single monitor support
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     let mut bridge_lock = state.python_bridge.lock().unwrap();
@@ -178,14 +180,20 @@ pub fn start_execution(
         // Build params
         let mut params = serde_json::Map::new();
 
-        // Add monitor index (default to 0 if not provided)
-        // Note: The qontinui Python library handles offset calculation internally via MSS
-        let resolved_monitor = monitor_index.unwrap_or(0);
+        // Resolve monitor indices (prefer array, fall back to legacy single index)
+        let resolved_monitors = monitor_indices.unwrap_or_else(|| vec![monitor_index.unwrap_or(0)]);
+
+        // Pass both formats for compatibility
+        params.insert(
+            "monitor_indices".to_string(),
+            serde_json::json!(resolved_monitors),
+        );
+        // Also pass single monitor_index for backward compatibility with Python
         params.insert(
             "monitor_index".to_string(),
-            serde_json::json!(resolved_monitor),
+            serde_json::json!(resolved_monitors.first().copied().unwrap_or(0)),
         );
-        debug!("Using monitor index: {}", resolved_monitor);
+        debug!("Using monitor indices: {:?}", resolved_monitors);
 
         // Add workflow_id (required)
         if let Some(pid) = process_id {
@@ -700,15 +708,49 @@ pub fn get_workflow_required_screens(
 
     let workflow = workflow.unwrap();
 
-    // Collect screen associations from states
+    // Collect monitor associations from states
     let mut screens = std::collections::HashSet::new();
 
-    // Build state -> screen mapping
-    let mut state_screen_map = std::collections::HashMap::new();
+    // Build state -> monitors mapping by examining stateImages.monitors
+    let mut state_monitors_map: std::collections::HashMap<String, Vec<i32>> =
+        std::collections::HashMap::new();
     for state in &config.states {
         if let Some(state_id) = state.get("id").and_then(|id| id.as_str()) {
-            if let Some(screen) = state.get("screenAssociation").and_then(|s| s.as_i64()) {
-                state_screen_map.insert(state_id.to_string(), screen as i32);
+            let mut state_monitors = Vec::new();
+
+            // Check stateImages for monitors field
+            if let Some(state_images) = state.get("stateImages").and_then(|si| si.as_array()) {
+                for state_image in state_images {
+                    if let Some(monitors) = state_image.get("monitors").and_then(|m| m.as_array()) {
+                        for monitor in monitors {
+                            if let Some(monitor_idx) = monitor.as_i64() {
+                                state_monitors.push(monitor_idx as i32);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also check regions, locations, and strings for monitors
+            for field_name in &["regions", "locations", "strings"] {
+                if let Some(items) = state.get(*field_name).and_then(|f| f.as_array()) {
+                    for item in items {
+                        if let Some(monitors) = item.get("monitors").and_then(|m| m.as_array()) {
+                            for monitor in monitors {
+                                if let Some(monitor_idx) = monitor.as_i64() {
+                                    state_monitors.push(monitor_idx as i32);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !state_monitors.is_empty() {
+                // Deduplicate
+                state_monitors.sort();
+                state_monitors.dedup();
+                state_monitors_map.insert(state_id.to_string(), state_monitors);
             }
         }
     }
@@ -720,8 +762,10 @@ pub fn get_workflow_required_screens(
     {
         for state_id in initial_states {
             if let Some(state_id_str) = state_id.as_str() {
-                if let Some(&screen) = state_screen_map.get(state_id_str) {
-                    screens.insert(screen);
+                if let Some(state_monitors) = state_monitors_map.get(state_id_str) {
+                    for &monitor in state_monitors {
+                        screens.insert(monitor);
+                    }
                 }
             }
         }
@@ -730,16 +774,83 @@ pub fn get_workflow_required_screens(
     // Analyze actions
     if let Some(actions) = workflow.get("actions").and_then(|a| a.as_array()) {
         for action in actions {
-            // GO_TO_STATE actions
             if let Some(action_type) = action.get("type").and_then(|t| t.as_str()) {
+                // GO_TO_STATE actions - check stateIds field (can be array)
                 if action_type == "GO_TO_STATE" {
-                    if let Some(target_state) = action
+                    // Check stateIds array (preferred)
+                    if let Some(state_ids) = action
+                        .get("config")
+                        .and_then(|c| c.get("stateIds"))
+                        .and_then(|ids| ids.as_array())
+                    {
+                        for state_id in state_ids {
+                            if let Some(state_id_str) = state_id.as_str() {
+                                if let Some(state_monitors) = state_monitors_map.get(state_id_str) {
+                                    for &monitor in state_monitors {
+                                        screens.insert(monitor);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Legacy: check targetState string
+                    else if let Some(target_state) = action
                         .get("config")
                         .and_then(|c| c.get("targetState"))
                         .and_then(|ts| ts.as_str())
                     {
-                        if let Some(&screen) = state_screen_map.get(target_state) {
-                            screens.insert(screen);
+                        if let Some(state_monitors) = state_monitors_map.get(target_state) {
+                            for &monitor in state_monitors {
+                                screens.insert(monitor);
+                            }
+                        }
+                    }
+                }
+
+                // FIND actions may have target with stateImage that specifies monitors
+                if action_type == "FIND" || action_type == "RAG_FIND" {
+                    if let Some(action_config) = action.get("config") {
+                        // Check if target references a stateImage with monitors
+                        if let Some(target) = action_config.get("target") {
+                            if let Some(target_type) = target.get("type").and_then(|t| t.as_str()) {
+                                if target_type == "stateImage" {
+                                    // The stateImage may have monitors defined
+                                    // Search through states to find the stateImage
+                                    if let Some(state_image_id) =
+                                        target.get("stateImageId").and_then(|id| id.as_str())
+                                    {
+                                        // Search all states in the main config for this stateImage
+                                        for state in &config.states {
+                                            if let Some(state_images) = state
+                                                .get("stateImages")
+                                                .and_then(|si| si.as_array())
+                                            {
+                                                for state_image in state_images {
+                                                    if state_image
+                                                        .get("id")
+                                                        .and_then(|id| id.as_str())
+                                                        == Some(state_image_id)
+                                                    {
+                                                        if let Some(monitors) = state_image
+                                                            .get("monitors")
+                                                            .and_then(|m| m.as_array())
+                                                        {
+                                                            for monitor in monitors {
+                                                                if let Some(monitor_idx) =
+                                                                    monitor.as_i64()
+                                                                {
+                                                                    screens
+                                                                        .insert(monitor_idx as i32);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -757,9 +868,12 @@ pub fn get_workflow_required_screens(
     }
 
     info!(
-        "Workflow '{}' requires screens: {:?}",
-        workflow_id, screen_list
+        "Workflow '{}' requires screens: {:?} (found {} states with monitor info)",
+        workflow_id,
+        screen_list,
+        state_monitors_map.len()
     );
+    debug!("State -> monitors mapping: {:?}", state_monitors_map);
 
     Ok(CommandResponse {
         success: true,

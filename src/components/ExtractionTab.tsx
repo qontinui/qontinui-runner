@@ -20,11 +20,12 @@ import {
   X,
   Cloud,
   Monitor,
-  ChevronDown,
   ChevronUp,
+  ChevronDown,
   AlertCircle,
   Zap,
 } from "lucide-react";
+import { MonitorSelector } from "./MonitorSelector";
 import type {
   WebExtractionConfig,
   ExtractionStatus,
@@ -87,9 +88,8 @@ export function ExtractionTab({
   // URL input (not persisted - just for the input field)
   const [newUrl, setNewUrl] = useState("");
 
-  // Monitor list (from system, not persisted)
+  // Monitor list (from system, not persisted - used for resolution calculation)
   const [availableMonitors, setAvailableMonitors] = useState<MonitorInfo[]>([]);
-  const [showMonitorDropdown, setShowMonitorDropdown] = useState(false);
 
   // Transient UI state (not persisted)
   const [isExtracting, setIsExtracting] = useState(false);
@@ -295,11 +295,6 @@ export function ExtractionTab({
     const removedUrl = urls[index];
     removeUrl(index);
     onLog("info", `Removed URL: ${removedUrl}`);
-  };
-
-  const handleMonitorSelect = (index: number) => {
-    setSelectedMonitor(index);
-    setShowMonitorDropdown(false);
   };
 
   // Get physical resolution from selected monitor
@@ -561,61 +556,16 @@ export function ExtractionTab({
           </div>
         </div>
 
-        {/* Monitor Dropdown */}
-        <div className="relative">
-          <button
-            onClick={() => setShowMonitorDropdown(!showMonitorDropdown)}
-            className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors"
-          >
-            <div className="flex items-center gap-2">
-              <Monitor className="w-4 h-4 text-primary" />
-              {availableMonitors[selectedMonitor] ? (
-                <span>
-                  Monitor #{availableMonitors[selectedMonitor].index}
-                  {availableMonitors[selectedMonitor].is_primary && (
-                    <span className="ml-2 text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">
-                      Primary
-                    </span>
-                  )}
-                  <span className="text-muted-foreground ml-2">
-                    ({availableMonitors[selectedMonitor].width}x
-                    {availableMonitors[selectedMonitor].height})
-                  </span>
-                </span>
-              ) : (
-                <span className="text-muted-foreground">Loading monitors...</span>
-              )}
-            </div>
-            <ChevronDown
-              className={`w-4 h-4 transition-transform ${showMonitorDropdown ? "rotate-180" : ""}`}
-            />
-          </button>
-
-          {showMonitorDropdown && availableMonitors.length > 0 && (
-            <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border/50 rounded-md shadow-lg z-10 max-h-60 overflow-y-auto">
-              {availableMonitors.map((monitor, index) => (
-                <button
-                  key={index}
-                  onClick={() => handleMonitorSelect(index)}
-                  className={`w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-muted/50 transition-colors ${
-                    selectedMonitor === index ? "bg-primary/10 text-primary" : ""
-                  }`}
-                >
-                  <Monitor className="w-4 h-4" />
-                  <span>Monitor #{monitor.index}</span>
-                  {monitor.is_primary && (
-                    <span className="text-xs bg-primary/20 text-primary px-2 py-0.5 rounded">
-                      Primary
-                    </span>
-                  )}
-                  <span className="text-muted-foreground">
-                    ({monitor.width}x{monitor.height})
-                  </span>
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        {/* Monitor Card Selector */}
+        <MonitorSelector
+          selectedMonitors={[selectedMonitor]}
+          onSelectionChange={(indices) => {
+            if (indices.length > 0) {
+              setSelectedMonitor(indices[0]);
+            }
+          }}
+          multiSelect={false}
+        />
       </div>
 
       {/* Target Project Display */}

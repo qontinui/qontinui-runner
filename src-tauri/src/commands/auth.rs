@@ -33,6 +33,7 @@ pub struct LoginResponse {
     pub access_token: String,
     pub refresh_token: String,
     pub user: UserInfo,
+    pub device_info: DeviceInfo,
 }
 
 /// User information returned after login
@@ -297,6 +298,11 @@ pub async fn login(email: String, password: String) -> Result<LoginResponse, Str
             id: user_info.id,
             email: user_info.email,
             name: user_info.full_name,
+        },
+        device_info: DeviceInfo {
+            device_id,
+            device_name,
+            platform,
         },
     })
 }

@@ -96,3 +96,30 @@ export interface UpdateInfo {
 }
 
 export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | "error";
+
+// AI Settings Types
+export type AiProvider = "claude_cli" | "claude_api";
+export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
+
+export interface ClaudeCliSettings {
+  execution_mode: CliExecutionMode;
+  custom_path?: string;
+  timeout_seconds: number;
+}
+
+export interface ClaudeApiSettings {
+  model: string;
+  max_tokens: number;
+}
+
+export interface AiSettings {
+  provider: AiProvider;
+  claude_cli: ClaudeCliSettings;
+  claude_api: ClaudeApiSettings;
+}
+
+export interface AiConnectionTestResult {
+  success: boolean;
+  message: string;
+  provider: string;
+}

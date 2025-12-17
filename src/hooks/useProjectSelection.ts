@@ -63,13 +63,29 @@ export function useProjectSelection(): UseProjectSelectionReturn {
 
   /**
    * Load projects from the backend
+   * Retries once on auth failure to handle race conditions with keychain access
    */
   const loadProjects = useCallback(async () => {
     setLoading(true);
     setError(null);
 
+    const attemptLoad = async (retryCount = 0): Promise<Project[]> => {
+      try {
+        return await invoke<Project[]>("get_user_projects");
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        // Retry once on auth failure (handles keychain race condition)
+        if (retryCount === 0 && errorMsg.includes("Not authenticated")) {
+          console.log("[PROJECT_SELECTION] Auth race condition, retrying in 500ms...");
+          await new Promise((resolve) => setTimeout(resolve, 500));
+          return attemptLoad(1);
+        }
+        throw err;
+      }
+    };
+
     try {
-      const projectList = await invoke<Project[]>("get_user_projects");
+      const projectList = await attemptLoad();
       setProjects(projectList);
       console.log("[PROJECT_SELECTION] Loaded", projectList.length, "projects");
 

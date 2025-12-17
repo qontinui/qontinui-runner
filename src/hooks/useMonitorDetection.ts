@@ -2,7 +2,7 @@
  * useMonitorDetection
  *
  * Hook for detecting and managing system monitors.
- * Responsibility: Detect available monitors and track selected monitor.
+ * Responsibility: Detect available monitors and track selected monitors (supports multi-select).
  */
 
 import { useState, useCallback, useEffect } from "react";
@@ -14,37 +14,57 @@ interface UseMonitorDetectionOptions {
 }
 
 interface UseMonitorDetectionReturn {
-  selectedMonitor: number;
-  setSelectedMonitor: (index: number) => void;
-  selectMonitorWithPersistence: (index: number) => Promise<void>;
+  /** Array of selected monitor indices */
+  selectedMonitors: number[];
+  /** Set selected monitors (array for multi-select) */
+  setSelectedMonitors: (indices: number[]) => void;
+  /** Select monitors and save to persistence */
+  selectMonitorsWithPersistence: (indices: number[]) => Promise<void>;
+  /** Available monitor indices */
   availableMonitors: number[];
+  /** Detect system monitors */
   detectSystemMonitors: () => Promise<void>;
+
+  // Legacy single-monitor API for backward compatibility
+  /** @deprecated Use selectedMonitors[0] instead */
+  selectedMonitor: number;
+  /** @deprecated Use setSelectedMonitors instead */
+  setSelectedMonitor: (index: number) => void;
+  /** @deprecated Use selectMonitorsWithPersistence instead */
+  selectMonitorWithPersistence: (index: number) => Promise<void>;
 }
 
 /**
- * Hook to manage monitor detection and selection
+ * Hook to manage monitor detection and selection (supports multi-select)
  */
 export function useMonitorDetection(
   options: UseMonitorDetectionOptions = {},
 ): UseMonitorDetectionReturn {
   const { onLog, detectOnMount = true } = options;
 
-  const [selectedMonitor, setSelectedMonitor] = useState(0);
+  const [selectedMonitors, setSelectedMonitors] = useState<number[]>([0]);
   const [availableMonitors, setAvailableMonitors] = useState<number[]>([0]);
 
   /**
-   * Select a monitor and save it as the last used
+   * Select monitors and save as last used
    */
-  const selectMonitorWithPersistence = useCallback(async (index: number) => {
-    setSelectedMonitor(index);
+  const selectMonitorsWithPersistence = useCallback(async (indices: number[]) => {
+    // Ensure at least one monitor is selected
+    const validIndices = indices.length > 0 ? indices : [0];
+    setSelectedMonitors(validIndices);
 
-    // Save the monitor index as the last used monitor
+    // Save the monitor indices as the last used monitors
     try {
-      await invoke("save_last_monitor_index", { monitorIndex: index });
-      console.log("[MONITOR_DETECTION] Saved last monitor index:", index);
+      await invoke("save_last_monitor_indices", { monitorIndices: validIndices });
+      console.log("[MONITOR_DETECTION] Saved last monitor indices:", validIndices);
     } catch (saveError) {
-      console.error("[MONITOR_DETECTION] Failed to save last monitor index:", saveError);
-      // Non-critical error, don't throw
+      // Fallback to old single-monitor API for backward compatibility
+      try {
+        await invoke("save_last_monitor_index", { monitorIndex: validIndices[0] });
+        console.log("[MONITOR_DETECTION] Saved last monitor index (legacy):", validIndices[0]);
+      } catch (legacyError) {
+        console.error("[MONITOR_DETECTION] Failed to save last monitor indices:", saveError);
+      }
     }
   }, []);
 
@@ -59,12 +79,11 @@ export function useMonitorDetection(
         setAvailableMonitors(indices);
         onLog?.("info", `Detected ${result.data.count} monitor(s)`);
 
-        // If currently selected monitor is not available, reset to primary
-        setSelectedMonitor((current) => {
-          if (!indices.includes(current)) {
-            return 0;
-          }
-          return current;
+        // Validate currently selected monitors
+        setSelectedMonitors((current) => {
+          const validSelections = current.filter((idx) => indices.includes(idx));
+          // If no valid selections, reset to primary monitor
+          return validSelections.length > 0 ? validSelections : [0];
         });
       }
     } catch (error) {
@@ -84,11 +103,31 @@ export function useMonitorDetection(
     }
   }, [detectOnMount, detectSystemMonitors]);
 
+  // Legacy single-monitor API for backward compatibility
+  const selectedMonitor = selectedMonitors[0] ?? 0;
+
+  const setSelectedMonitor = useCallback((index: number) => {
+    setSelectedMonitors([index]);
+  }, []);
+
+  const selectMonitorWithPersistence = useCallback(
+    async (index: number) => {
+      await selectMonitorsWithPersistence([index]);
+    },
+    [selectMonitorsWithPersistence],
+  );
+
   return {
+    // New multi-monitor API
+    selectedMonitors,
+    setSelectedMonitors,
+    selectMonitorsWithPersistence,
+    availableMonitors,
+    detectSystemMonitors,
+
+    // Legacy single-monitor API
     selectedMonitor,
     setSelectedMonitor,
     selectMonitorWithPersistence,
-    availableMonitors,
-    detectSystemMonitors,
   };
 }

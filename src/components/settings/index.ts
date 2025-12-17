@@ -4,5 +4,6 @@ export { GeneralSettings } from "./GeneralSettings";
 export { StorageSettings } from "./StorageSettings";
 export { AdvancedSettings } from "./AdvancedSettings";
 export { UpdateSettings } from "./UpdateSettings";
+export { AiSettings } from "./AiSettings";
 export { SectionHeader } from "./SectionHeader";
 export * from "./types";

@@ -43,8 +43,8 @@ export interface UseProjectLogsReturn {
 
   /** Load or create config for a project */
   loadConfig: (projectId: string, projectName: string) => Promise<void>;
-  /** Save the current configuration */
-  saveConfig: () => Promise<void>;
+  /** Save the current configuration (optionally with override sources for async state handling) */
+  saveConfig: (overrideSources?: LogSource[]) => Promise<void>;
   /** Add a new log source */
   addLogSource: (source?: Partial<LogSource>) => void;
   /** Update an existing log source */
@@ -103,7 +103,43 @@ export function useProjectLogs(): UseProjectLogsReturn {
       });
 
       if (response.success && response.data) {
-        const loadedConfig = response.data as ProjectLogConfig;
+        // Convert backend snake_case to TypeScript camelCase
+        const rawConfig = response.data as {
+          project_id: string;
+          project_name: string;
+          log_sources?: Array<{
+            id: string;
+            name: string;
+            type: "file" | "directory";
+            path: string;
+            pattern?: string;
+            tail_lines?: number;
+            enabled: boolean;
+            color?: string;
+          }>;
+          log_directory: string;
+          screenshot_directory: string;
+          ai_output_directory: string;
+          updated_at?: string;
+        };
+        const loadedConfig: ProjectLogConfig = {
+          projectId: rawConfig.project_id,
+          projectName: rawConfig.project_name,
+          logSources: (rawConfig.log_sources || []).map((s) => ({
+            id: s.id,
+            name: s.name,
+            type: s.type,
+            path: s.path,
+            pattern: s.pattern,
+            tailLines: s.tail_lines,
+            enabled: s.enabled,
+            color: s.color,
+          })),
+          logDirectory: rawConfig.log_directory,
+          screenshotDirectory: rawConfig.screenshot_directory,
+          aiOutputDirectory: rawConfig.ai_output_directory,
+          updatedAt: rawConfig.updated_at,
+        };
         setConfig(loadedConfig);
         setLogsState((prev) => ({ ...prev, projectId }));
         console.log("[PROJECT_LOGS] Loaded config for", projectName);
@@ -190,8 +226,10 @@ export function useProjectLogs(): UseProjectLogsReturn {
 
   /**
    * Save the current configuration to disk
+   * @param overrideSources - Optional sources to save instead of config.logSources
+   *                          (useful when called immediately after setLogSources due to React async state)
    */
-  const saveConfig = useCallback(async () => {
+  const saveConfig = useCallback(async (overrideSources?: LogSource[]) => {
     if (!config) {
       setError("No configuration to save");
       return;
@@ -202,10 +240,12 @@ export function useProjectLogs(): UseProjectLogsReturn {
 
     try {
       // Convert TypeScript camelCase to Rust snake_case
+      // Use override sources if provided (to handle React async state updates)
+      const logSources = overrideSources ?? config.logSources ?? [];
       const rustConfig = {
         project_id: config.projectId,
         project_name: config.projectName,
-        log_sources: config.logSources.map((s) => ({
+        log_sources: logSources.map((s) => ({
           id: s.id,
           name: s.name,
           type: s.type,
@@ -400,7 +440,7 @@ export function useProjectLogs(): UseProjectLogsReturn {
    * Refresh log content from all enabled sources
    */
   const refreshLogs = useCallback(async () => {
-    if (!config || config.logSources.length === 0) {
+    if (!config || !config.logSources || config.logSources.length === 0) {
       setLogsState((prev) => ({
         ...prev,
         sources: [],

@@ -862,7 +862,8 @@ class QontinuiExecutor:
         cmd_type = command.get("command")
         params = command.get("params", {})
 
-        if cmd_type != "ping":
+        # Don't log high-frequency commands to avoid flooding the logs
+        if cmd_type not in ("ping", "status"):
             self.event_manager.emit_log("info", f"handle_command: received '{cmd_type}'")
 
         if cmd_type == "load":
@@ -1378,7 +1379,9 @@ class QontinuiExecutor:
                             )
                     except Exception as e:
                         self.event_manager.emit_log("error", f"Failed to apply variables: {e}")
-                        self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")  # noqa: F823
+                        self.event_manager.emit_log(
+                            "debug", f"Traceback: {traceback.format_exc()}"
+                        )  # noqa: F823
                 else:
                     self.event_manager.emit_log(
                         "warning",
@@ -1442,7 +1445,11 @@ class QontinuiExecutor:
     def __del__(self):
         """Clean up resources on exit."""
         # Stop capture manager
-        if hasattr(self, "capture_manager") and self.capture_manager and self.capture_manager.manual_click_listener:
+        if (
+            hasattr(self, "capture_manager")
+            and self.capture_manager
+            and self.capture_manager.manual_click_listener
+        ):
             with contextlib.suppress(Exception):
                 self.capture_manager.manual_click_listener.cleanup()
 
@@ -1465,7 +1472,8 @@ def main():
             command = json.loads(line.strip())
             cmd_name = command.get("command", "unknown")
 
-            if cmd_name != "ping":
+            # Don't log high-frequency commands to avoid flooding the logs
+            if cmd_name not in ("ping", "status"):
                 executor.event_manager.emit_log("info", f"Received command: {cmd_name}")
 
             if command.get("type") == "command":

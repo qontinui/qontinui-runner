@@ -6,7 +6,7 @@
  */
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
-import { eventRouter } from "../managers";
+import { eventRouter, logManager } from "../managers";
 
 interface EventManagerContextValue {
   isConnected: boolean;
@@ -22,16 +22,18 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    let unlisten: (() => void) | null = null;
+    let unlistenExecutor: (() => void) | null = null;
+    let unlistenAiOutput: (() => void) | null = null;
     let isMounted = true;
 
     const setupListeners = async () => {
       try {
         const { listen } = await import("@tauri-apps/api/event");
 
-        console.log("[EVENT_MGR] Setting up Tauri event listener");
+        console.log("[EVENT_MGR] Setting up Tauri event listeners");
 
-        const unlistenFn = await listen("executor-event", (event: any) => {
+        // Listen for executor events
+        const unlistenExecutorFn = await listen("executor-event", (event: any) => {
           // Prevent processing events if component is unmounted
           if (!isMounted) {
             console.log("[EVENT_MGR] Component unmounted, ignoring event");
@@ -44,11 +46,27 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
           eventRouter.route(data);
         });
 
-        unlisten = unlistenFn;
+        // Listen for AI output events
+        const unlistenAiOutputFn = await listen("ai-output", (event: any) => {
+          if (!isMounted) {
+            return;
+          }
+
+          const data = event.payload;
+          console.log("[EVENT_MGR] AI output event:", data.source, data.line?.substring(0, 50));
+
+          // Route AI output to LogManager
+          if (data.line !== undefined && data.source !== undefined) {
+            logManager.addAiOutputLog(data.line, data.source, data.actionId);
+          }
+        });
+
+        unlistenExecutor = unlistenExecutorFn;
+        unlistenAiOutput = unlistenAiOutputFn;
         setIsConnected(true);
-        console.log("[EVENT_MGR] Event listener set up successfully");
+        console.log("[EVENT_MGR] Event listeners set up successfully");
       } catch (error) {
-        console.error("[EVENT_MGR] Failed to set up event listener:", error);
+        console.error("[EVENT_MGR] Failed to set up event listeners:", error);
         setIsConnected(false);
       }
     };
@@ -57,10 +75,13 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
 
     // Cleanup
     return () => {
-      console.log("[EVENT_MGR] Cleaning up event listener");
+      console.log("[EVENT_MGR] Cleaning up event listeners");
       isMounted = false;
-      if (unlisten) {
-        unlisten();
+      if (unlistenExecutor) {
+        unlistenExecutor();
+      }
+      if (unlistenAiOutput) {
+        unlistenAiOutput();
       }
       setIsConnected(false);
     };

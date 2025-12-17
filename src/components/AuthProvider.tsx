@@ -5,7 +5,7 @@
  * Handles login/logout, token refresh, and auth status checking
  */
 
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from "react";
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthStatus, AuthContextValue, LoginResponse } from "../types";
 
@@ -21,15 +21,28 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const mountCountRef = useRef(0);
+  const refreshCallCountRef = useRef(0);
+
+  // Log mount/unmount
+  useEffect(() => {
+    mountCountRef.current += 1;
+    console.log(`[AUTH] AuthProvider MOUNTED (mount #${mountCountRef.current})`);
+    return () => {
+      console.log(`[AUTH] AuthProvider UNMOUNTED (was mount #${mountCountRef.current})`);
+    };
+  }, []);
 
   /**
    * Check authentication status
    * Called on mount and after login
    */
   const checkAuthStatus = useCallback(async () => {
+    console.log("[AUTH] checkAuthStatus() called");
     try {
       setError(null);
       const status = await invoke<AuthStatus>("check_auth_status");
+      console.log("[AUTH] checkAuthStatus() result:", status);
       setAuthStatus(status);
       return status;
     } catch (err) {
@@ -51,12 +64,19 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Called periodically and can be called manually
    */
   const refreshAuth = useCallback(async () => {
+    refreshCallCountRef.current += 1;
+    const callNum = refreshCallCountRef.current;
+    console.log(`[AUTH] refreshAuth() called (call #${callNum})`);
+    console.log("[AUTH] refreshAuth() stack trace:", new Error().stack);
     try {
       setError(null);
+      console.log(`[AUTH] refreshAuth() #${callNum} - invoking refresh_token command...`);
       await invoke("refresh_token");
+      console.log(`[AUTH] refreshAuth() #${callNum} - refresh_token succeeded, checking auth status...`);
       await checkAuthStatus();
+      console.log(`[AUTH] refreshAuth() #${callNum} - completed successfully`);
     } catch (err) {
-      console.error("[AUTH] Failed to refresh token:", err);
+      console.error(`[AUTH] refreshAuth() #${callNum} - Failed to refresh token:`, err);
       setError(err as string);
       // If refresh fails, user needs to log in again
       setAuthStatus({
@@ -122,7 +142,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Check auth status on mount
    */
   useEffect(() => {
-    console.log("[AUTH] AuthProvider mounted, checking auth status");
+    console.log("[AUTH] useEffect[checkAuthStatus] - checking auth status on mount");
     checkAuthStatus();
   }, [checkAuthStatus]);
 
@@ -130,18 +150,25 @@ export function AuthProvider({ children }: AuthProviderProps) {
    * Set up auto-refresh timer when authenticated
    */
   useEffect(() => {
+    console.log("[AUTH] useEffect[auto-refresh] triggered:", {
+      "authStatus": authStatus,
+      "authStatus?.authenticated": authStatus?.authenticated,
+      "refreshAuth reference": refreshAuth.toString().slice(0, 100),
+    });
+
     if (!authStatus?.authenticated) {
+      console.log("[AUTH] useEffect[auto-refresh] - NOT authenticated, skipping timer setup");
       return;
     }
 
-    console.log("[AUTH] Setting up token refresh timer");
+    console.log("[AUTH] useEffect[auto-refresh] - IS authenticated, setting up token refresh timer");
     const intervalId = setInterval(() => {
-      console.log("[AUTH] Auto-refreshing token");
+      console.log("[AUTH] Auto-refresh timer fired - calling refreshAuth()");
       refreshAuth();
     }, TOKEN_REFRESH_INTERVAL);
 
     return () => {
-      console.log("[AUTH] Clearing token refresh timer");
+      console.log("[AUTH] useEffect[auto-refresh] cleanup - clearing token refresh timer");
       clearInterval(intervalId);
     };
   }, [authStatus?.authenticated, refreshAuth]);

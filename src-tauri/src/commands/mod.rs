@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
+pub mod ai_settings;
 pub mod auth;
 pub mod config;
 pub mod dataset;

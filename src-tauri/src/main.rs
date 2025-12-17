@@ -118,6 +118,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::get_last_config_path,
             commands::config::save_last_workflow_id,
             commands::config::save_last_monitor_index,
+            commands::config::save_last_monitor_indices,
             commands::config::get_auto_load_last_config,
             commands::config::save_auto_load_last_config,
             // Dataset commands
@@ -203,6 +204,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::project_logs::read_project_logs,
             commands::project_logs::get_project_directories,
             commands::project_logs::append_project_log,
+            // AI settings commands
+            commands::ai_settings::get_ai_settings,
+            commands::ai_settings::save_ai_settings,
+            commands::ai_settings::save_ai_api_key_command,
+            commands::ai_settings::delete_ai_api_key_command,
+            commands::ai_settings::has_ai_api_key,
+            commands::ai_settings::test_ai_connection,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

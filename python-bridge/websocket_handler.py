@@ -538,7 +538,12 @@ class WebSocketHandler:
             message: Command message with format:
                      {"type": "command", "command": "...", "params": {...}}
         """
-        print(f"[info    ] WS_HANDLER: Received command: {message}", file=sys.stderr, flush=True)
+        # Don't log high-frequency commands to avoid flooding
+        cmd = message.get("command") if isinstance(message, dict) else None
+        if cmd not in ("ping", "status"):
+            print(
+                f"[info    ] WS_HANDLER: Received command: {message}", file=sys.stderr, flush=True
+            )
 
         if self.on_command_fn:
             try:

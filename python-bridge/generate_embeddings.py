@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,22 @@ def log_progress(status: str, **kwargs: Any) -> None:
     """
     message = {"status": status, **kwargs}
     print(json.dumps(message), flush=True)
+
+
+def id_to_uuid(element_id: str) -> str:
+    """Convert an element ID to a UUID v5 (deterministic).
+
+    Uses a namespace UUID and the element ID to generate a consistent UUID.
+
+    Args:
+        element_id: Element ID string
+
+    Returns:
+        UUID string in standard format
+    """
+    # Use a fixed namespace for all Qontinui RAG elements
+    namespace = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # URL namespace
+    return str(uuid.uuid5(namespace, element_id))
 
 
 def get_rag_dir(project_id: str) -> Path:
@@ -76,20 +93,78 @@ def crop_element_from_screenshot(screenshot_path: Path, bounding_box: BoundingBo
     return cropped
 
 
+def extract_elements_from_qontinui_config(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract GUI elements from QontinuiConfig format.
+
+    QontinuiConfig stores patterns within states/stateImages.
+    This function extracts them into a flat list of elements for embedding.
+
+    Args:
+        config: QontinuiConfig dictionary
+
+    Returns:
+        List of element dictionaries with id, name, text_description, bounding_box, etc.
+    """
+    elements = []
+    states = config.get("states", [])
+
+    for state in states:
+        state_id = state.get("id", "")
+        state_name = state.get("name", "")
+
+        # Extract from stateImages -> patterns
+        for state_image in state.get("stateImages", []):
+            state_image_id = state_image.get("id", "")
+            state_image_name = state_image.get("name", "")
+
+            for pattern in state_image.get("patterns", []):
+                pattern_id = pattern.get("id", "")
+                pattern_name = pattern.get("name", state_image_name)
+                image_id = pattern.get("imageId", "")
+
+                # Create element from pattern
+                # Use "image" as element_type since patterns are image-based elements
+                element = {
+                    "id": pattern_id or f"{state_image_id}-pattern",
+                    "name": pattern_name,
+                    "element_type": "image",  # Valid ElementType enum value
+                    "element_subtype": "stateImage",
+                    "text_description": f"{pattern_name} in state {state_name}",
+                    "state_id": state_id,
+                    "state_name": state_name,
+                    "source_screenshot_id": image_id,  # References images/{image_id}.png
+                    "similarity_threshold": pattern.get("similarity", 0.8),
+                    "is_defining_element": True,
+                }
+
+                # Add bounding box if available (pattern covers full image)
+                # For patterns, we use the full image
+                element["use_full_image"] = True
+
+                elements.append(element)
+
+    return elements
+
+
 async def generate_embeddings_for_project(project_id: str) -> None:
     """Generate embeddings for all elements in a RAG project.
+
+    Supports both RAGConfig format (with 'elements' array) and
+    QontinuiConfig format (with states/stateImages/patterns).
 
     Args:
         project_id: Project ID to generate embeddings for
 
     Raises:
-        FileNotFoundError: If config or screenshots not found
+        FileNotFoundError: If config or images not found
         RuntimeError: If embedding generation fails
     """
     try:
         # Get project directory
         rag_dir = get_rag_dir(project_id)
         config_path = rag_dir / "config.json"
+        # Support both 'screenshots' (legacy) and 'images' (QontinuiConfig) directories
+        images_dir = rag_dir / "images"
         screenshots_dir = rag_dir / "screenshots"
         embeddings_dir = rag_dir / "embeddings"
         db_path = embeddings_dir / "vector.qvdb"
@@ -97,8 +172,14 @@ async def generate_embeddings_for_project(project_id: str) -> None:
         # Validate paths
         if not config_path.exists():
             raise FileNotFoundError(f"Config not found: {config_path}")
-        if not screenshots_dir.exists():
-            raise FileNotFoundError(f"Screenshots directory not found: {screenshots_dir}")
+
+        # Use images dir if it exists, otherwise fall back to screenshots
+        if images_dir.exists():
+            source_images_dir = images_dir
+        elif screenshots_dir.exists():
+            source_images_dir = screenshots_dir
+        else:
+            raise FileNotFoundError(f"Neither images nor screenshots directory found in {rag_dir}")
 
         # Create embeddings directory
         embeddings_dir.mkdir(parents=True, exist_ok=True)
@@ -109,7 +190,12 @@ async def generate_embeddings_for_project(project_id: str) -> None:
         with open(config_path) as f:
             config = json.load(f)
 
+        # Support both RAGConfig (elements) and QontinuiConfig (states/stateImages/patterns)
         elements_data = config.get("elements", [])
+        if not elements_data:
+            # Try to extract from QontinuiConfig format
+            elements_data = extract_elements_from_qontinui_config(config)
+
         if not elements_data:
             log_progress("complete", elements_embedded=0, message="No elements to embed")
             return
@@ -159,63 +245,64 @@ async def generate_embeddings_for_project(project_id: str) -> None:
                 if element.text_description:
                     element.text_embedding = text_embedder.encode(element.text_description)
 
-                # Get screenshot path
-                screenshot_id = element.source_screenshot_id
-                if not screenshot_id:
-                    # Try to infer from element ID or use first screenshot
-                    screenshots = list(screenshots_dir.glob("*.png"))
-                    if screenshots:
-                        screenshot_path = screenshots[0]
+                # Get image path
+                image_id = element.source_screenshot_id
+                if not image_id:
+                    # Try to infer from element ID or use first image
+                    images = list(source_images_dir.glob("*.png"))
+                    if images:
+                        image_path = images[0]
                     else:
-                        raise FileNotFoundError("No screenshots found")
+                        raise FileNotFoundError("No images found")
                 else:
-                    screenshot_path = screenshots_dir / f"{screenshot_id}.png"
-                    if not screenshot_path.exists():
+                    image_path = source_images_dir / f"{image_id}.png"
+                    if not image_path.exists():
                         # Try common extensions
                         for ext in [".jpg", ".jpeg", ".png"]:
-                            alt_path = screenshots_dir / f"{screenshot_id}{ext}"
+                            alt_path = source_images_dir / f"{image_id}{ext}"
                             if alt_path.exists():
-                                screenshot_path = alt_path
+                                image_path = alt_path
                                 break
                         else:
-                            raise FileNotFoundError(f"Screenshot not found: {screenshot_path}")
+                            raise FileNotFoundError(f"Image not found: {image_path}")
 
-                # Crop element from screenshot using bounding box
-                if element.bounding_box:
-                    element_image = crop_element_from_screenshot(
-                        screenshot_path, element.bounding_box
-                    )
-
-                    # Generate CLIP embedding
-                    clip_embedding = clip_embedder.encode_image(element_image)
-
-                    # Generate DINOv2 embedding
-                    dinov2_embedding = dinov2_embedder.encode_image(element_image)  # type: ignore[attr-defined]
-
-                    # Store embeddings in element
-                    # Note: GUIElementChunk stores these in image_embedding field
-                    # For multi-vector search, we'll need to handle this in indexing
-                    element.image_embedding = clip_embedding
-
-                    # Create point with multiple vectors for Qdrant
-                    # We'll store both CLIP and DINOv2 embeddings
-                    point = {
-                        "id": element.id,
-                        "vector": {
-                            "text_embedding": element.text_embedding or [0.0] * 384,
-                            "clip_embedding": clip_embedding,
-                            "dinov2_embedding": dinov2_embedding,
-                        },
-                        "payload": element.to_dict(),
-                    }
-
-                    # Index in RAG database
-                    await db.upsert(rag_index.COLLECTION_NAME, [point])
-
-                    processed_elements.append(element)
-
+                # Get element image - either use full pattern image or crop from screenshot
+                use_full_image = element_data.get("use_full_image", False)
+                if use_full_image or not element.bounding_box:
+                    # Use the full image (for patterns)
+                    element_image = Image.open(image_path)
                 else:
-                    errors.append(f"Element {element.id} missing bounding_box")
+                    # Crop from screenshot using bounding box
+                    element_image = crop_element_from_screenshot(image_path, element.bounding_box)
+
+                # Generate CLIP embedding
+                clip_embedding = clip_embedder.encode_image(element_image)
+
+                # Generate DINOv2 embedding (uses encode(), not encode_image())
+                dinov2_embedding = dinov2_embedder.encode(element_image)
+
+                # Store embeddings in element
+                # Note: GUIElementChunk stores these in image_embedding field
+                # For multi-vector search, we'll need to handle this in indexing
+                element.image_embedding = clip_embedding
+
+                # Create point with multiple vectors for Qdrant
+                # We'll store both CLIP and DINOv2 embeddings
+                # Convert element ID to UUID for Qdrant compatibility
+                point = {
+                    "id": id_to_uuid(element.id),
+                    "vector": {
+                        "text_embedding": element.text_embedding or [0.0] * 384,
+                        "clip_embedding": clip_embedding,
+                        "dinov2_embedding": dinov2_embedding,
+                    },
+                    "payload": {**element.to_dict(), "original_id": element.id},
+                }
+
+                # Index in RAG database
+                await db.upsert(rag_index.COLLECTION_NAME, [point])
+
+                processed_elements.append(element)
 
             except Exception as e:
                 error_msg = f"Failed to process element {idx}: {e}"

@@ -2,9 +2,10 @@
  * AiBuilderTab.tsx
  *
  * AI Automation Builder panel that allows users to:
- * 1. Select states and images from loaded configuration
- * 2. Enter natural language goals
- * 3. Generate and run AI-powered recursive automation
+ * 1. Build an ordered list of workflows and states to execute
+ * 2. Configure screenshot capture for each step
+ * 3. Enter natural language goals
+ * 4. Generate and run AI-powered recursive automation
  */
 
 import { useState, useEffect, useMemo } from "react";
@@ -22,6 +23,12 @@ import {
   XCircle,
   Copy,
   History,
+  Workflow,
+  Camera,
+  Plus,
+  Trash2,
+  ChevronUp,
+  GripVertical,
 } from "lucide-react";
 import { useExecution } from "../contexts";
 import CollapsiblePanel from "./CollapsiblePanel";
@@ -37,47 +44,56 @@ interface ImageInfo {
   stateName: string;
 }
 
+interface WorkflowInfo {
+  id: string;
+  name: string;
+  category?: string;
+}
+
+/** A single step in the execution sequence */
+interface ExecutionStep {
+  id: string;
+  type: "workflow" | "state";
+  name: string;
+  takeScreenshot: boolean;
+}
+
 interface PromptHistoryEntry {
   id: string;
   timestamp: number;
-  states: string[];
-  screenshotStates: string[];
+  steps: ExecutionStep[];
   goal: string;
   success?: boolean;
 }
 
 const PROMPT_TEMPLATE = `# Recursive Automation Loop
 
-Execute automation steps, analyze results, fix issues, and recursively continue until success.
+Execute automation steps in order, analyze results, fix issues, and recursively continue until success.
 
 ## Configuration
 
-**States to Navigate:** {{STATES}}
-**Screenshot States:** {{SCREENSHOT_STATES}}
+**Execution Steps:** {{STEP_COUNT}} steps
 **Goal:** {{GOAL}}
 
-## Instructions
+## Execution Sequence
 
-### Step 1: Navigate to Each State
+{{EXECUTION_STEPS}}
 
-For each state in the list, navigate using the MCP tool:
-\`\`\`
-mcp__qontinui__go_to_state with state_names=["STATE_NAME"], take_screenshot=true
-\`\`\`
+## Post-Execution Analysis
 
-### Step 2: Analyze Logs
+### Analyze Logs
 
-After completing all state visits, check for errors:
+After completing all steps, check for errors:
 \`\`\`bash
 tail -200 /mnt/c/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/runner-backend.log
 grep -i "error\\|exception\\|failed\\|panic" /mnt/c/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/runner-backend.log | tail -50
 \`\`\`
 
-### Step 3: Analyze Screenshots
+### Analyze Screenshots
 
-Read any screenshots saved during navigation to visually inspect the UI state.
+Read any screenshots saved during execution to visually inspect the UI state.
 
-### Step 4: Fix Issues
+### Fix Issues
 
 If any errors were found:
 1. Identify the root cause from logs and screenshots
@@ -85,31 +101,30 @@ If any errors were found:
 3. Make the fix
 4. Restart affected services if needed
 
-### Step 5: Recursive Continuation
+### Recursive Continuation
 
 **If fixes were made**, use trigger_ai_analysis to spawn a new session with this same prompt.
 **If no issues found**, report success and stop.
 
 ## Rules
 
-- ALWAYS analyze logs after navigation
+- Execute steps IN THE EXACT ORDER specified above
+- ALWAYS analyze logs after all steps complete
 - ALWAYS visually inspect screenshots
 - NEVER ask the user to check things manually
-- STOP when all navigations succeed with no errors
+- STOP when all steps succeed with no errors
 - MAX ITERATIONS: 10
 `;
 
 export function AiBuilderTab() {
   const execution = useExecution();
 
-  // State selections
-  const [selectedStates, setSelectedStates] = useState<string[]>([]);
-  const [screenshotStates, setScreenshotStates] = useState<string[]>([]);
+  // Ordered execution steps
+  const [executionSteps, setExecutionSteps] = useState<ExecutionStep[]>([]);
   const [goal, setGoal] = useState("");
 
   // UI state
-  const [showStatesDropdown, setShowStatesDropdown] = useState(false);
-  const [showScreenshotDropdown, setShowScreenshotDropdown] = useState(false);
+  const [showAddDropdown, setShowAddDropdown] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
 
@@ -123,14 +138,15 @@ export function AiBuilderTab() {
     }
   });
 
-  // Parse states and images from config
-  const { states, images } = useMemo(() => {
+  // Parse states, images, and workflows from config
+  const { states, images, workflows } = useMemo(() => {
     const stateList: StateInfo[] = [];
     const imageList: ImageInfo[] = [];
+    const workflowList: WorkflowInfo[] = [];
 
+    // Parse states and images
     if (execution.config?.states && Array.isArray(execution.config.states)) {
       for (const state of execution.config.states) {
-        // Get state name from name or id field
         const stateName = state.name || state.id || "Unknown";
         const stateImages: string[] = [];
 
@@ -151,7 +167,23 @@ export function AiBuilderTab() {
       }
     }
 
-    return { states: stateList, images: imageList };
+    // Parse workflows (filter to "Main" category, exclude internal)
+    if (execution.config?.workflows && Array.isArray(execution.config.workflows)) {
+      for (const workflow of execution.config.workflows) {
+        const category = workflow.category?.toLowerCase() || "";
+        const visibility = workflow.visibility || "public";
+
+        if (category === "main" && visibility !== "internal") {
+          workflowList.push({
+            id: workflow.id || workflow.name || "unknown",
+            name: workflow.name || workflow.id || "Unknown",
+            category: workflow.category,
+          });
+        }
+      }
+    }
+
+    return { states: stateList, images: imageList, workflows: workflowList };
   }, [execution.config]);
 
   // Save history to localStorage
@@ -159,28 +191,90 @@ export function AiBuilderTab() {
     localStorage.setItem("qontinui-ai-builder-history", JSON.stringify(history.slice(0, 20)));
   }, [history]);
 
-  // Toggle state selection
-  const toggleState = (stateName: string, list: "navigate" | "screenshot") => {
-    if (list === "navigate") {
-      setSelectedStates((prev) =>
-        prev.includes(stateName) ? prev.filter((s) => s !== stateName) : [...prev, stateName],
-      );
-    } else {
-      setScreenshotStates((prev) =>
-        prev.includes(stateName) ? prev.filter((s) => s !== stateName) : [...prev, stateName],
-      );
-    }
+  // Add a step to the execution list
+  const addStep = (type: "workflow" | "state", name: string) => {
+    const newStep: ExecutionStep = {
+      id: crypto.randomUUID(),
+      type,
+      name,
+      takeScreenshot: true, // Default to taking screenshots
+    };
+    setExecutionSteps((prev) => [...prev, newStep]);
+    setShowAddDropdown(false);
+  };
+
+  // Remove a step
+  const removeStep = (stepId: string) => {
+    setExecutionSteps((prev) => prev.filter((s) => s.id !== stepId));
+  };
+
+  // Toggle screenshot for a step
+  const toggleStepScreenshot = (stepId: string) => {
+    setExecutionSteps((prev) =>
+      prev.map((s) => (s.id === stepId ? { ...s, takeScreenshot: !s.takeScreenshot } : s)),
+    );
+  };
+
+  // Move step up
+  const moveStepUp = (index: number) => {
+    if (index === 0) return;
+    setExecutionSteps((prev) => {
+      const newSteps = [...prev];
+      [newSteps[index - 1], newSteps[index]] = [newSteps[index], newSteps[index - 1]];
+      return newSteps;
+    });
+  };
+
+  // Move step down
+  const moveStepDown = (index: number) => {
+    setExecutionSteps((prev) => {
+      if (index === prev.length - 1) return prev;
+      const newSteps = [...prev];
+      [newSteps[index], newSteps[index + 1]] = [newSteps[index + 1], newSteps[index]];
+      return newSteps;
+    });
   };
 
   // Generate the prompt
   const generatePrompt = () => {
-    const statesStr = selectedStates.length > 0 ? selectedStates.join(", ") : "(none selected)";
-    const screenshotStr =
-      screenshotStates.length > 0 ? screenshotStates.join(", ") : "(all states)";
     const goalStr = goal.trim() || "Verify automation works correctly";
 
-    return PROMPT_TEMPLATE.replace("{{STATES}}", statesStr)
-      .replace("{{SCREENSHOT_STATES}}", screenshotStr)
+    // Generate execution steps instructions
+    let executionInstructions = "";
+    if (executionSteps.length === 0) {
+      executionInstructions = "No steps configured. Nothing to execute.";
+    } else {
+      executionInstructions = executionSteps
+        .map((step, index) => {
+          const stepNum = index + 1;
+          if (step.type === "workflow") {
+            let instruction = `### Step ${stepNum}: Run Workflow "${step.name}"
+
+Execute the workflow using the MCP tool:
+\`\`\`
+mcp__qontinui__run_workflow with workflow_name="${step.name}", timeout_seconds=300
+\`\`\``;
+            if (step.takeScreenshot) {
+              instruction += `
+
+After the workflow completes, take a screenshot to capture the result.`;
+            }
+            return instruction;
+          } else {
+            let instruction = `### Step ${stepNum}: Navigate to State "${step.name}"
+
+Navigate to the state using the MCP tool:
+\`\`\`
+mcp__qontinui__go_to_state with state_names=["${step.name}"], take_screenshot=${step.takeScreenshot}
+\`\`\``;
+            return instruction;
+          }
+        })
+        .join("\n\n");
+    }
+
+    return PROMPT_TEMPLATE.replace("{{STEP_COUNT}}", String(executionSteps.length))
+      .replace("{{EXECUTION_STEPS}}", executionInstructions)
       .replace("{{GOAL}}", goalStr);
   };
 
@@ -194,8 +288,11 @@ export function AiBuilderTab() {
 
   // Run the automation
   const runAutomation = async () => {
-    if (selectedStates.length === 0) {
-      setLastResult({ success: false, message: "Please select at least one state to navigate" });
+    if (executionSteps.length === 0) {
+      setLastResult({
+        success: false,
+        message: "Please add at least one workflow or state to execute",
+      });
       return;
     }
 
@@ -209,8 +306,7 @@ export function AiBuilderTab() {
       const historyEntry: PromptHistoryEntry = {
         id: crypto.randomUUID(),
         timestamp: Date.now(),
-        states: [...selectedStates],
-        screenshotStates: [...screenshotStates],
+        steps: [...executionSteps],
         goal: goal.trim() || "Verify automation works correctly",
       };
       setHistory((prev) => [historyEntry, ...prev]);
@@ -227,16 +323,15 @@ export function AiBuilderTab() {
 
       const result = await response.json();
 
-      if (result.success) {
+      if (result.success && result.data?.success) {
         setLastResult({ success: true, message: "AI automation started successfully!" });
-        // Update history entry
         setHistory((prev) =>
           prev.map((h) => (h.id === historyEntry.id ? { ...h, success: true } : h)),
         );
       } else {
         setLastResult({
           success: false,
-          message: result.error || "Failed to start AI automation",
+          message: result.error || result.data?.error || result.data?.message || "Failed to start AI automation",
         });
         setHistory((prev) =>
           prev.map((h) => (h.id === historyEntry.id ? { ...h, success: false } : h)),
@@ -252,14 +347,21 @@ export function AiBuilderTab() {
     }
   };
 
-  // Load from history
   const loadFromHistory = (entry: PromptHistoryEntry) => {
-    setSelectedStates(entry.states);
-    setScreenshotStates(entry.screenshotStates);
+    setExecutionSteps(entry.steps);
     setGoal(entry.goal);
   };
 
-  const hasConfig = execution.configLoaded && states.length > 0;
+  const getHistorySummary = (entry: PromptHistoryEntry): string => {
+    const workflowCount = entry.steps.filter((s) => s.type === "workflow").length;
+    const stateCount = entry.steps.filter((s) => s.type === "state").length;
+    const parts: string[] = [];
+    if (workflowCount > 0) parts.push(`${workflowCount} workflow${workflowCount > 1 ? "s" : ""}`);
+    if (stateCount > 0) parts.push(`${stateCount} state${stateCount > 1 ? "s" : ""}`);
+    return parts.join(" • ") || "No steps";
+  };
+
+  const hasConfig = execution.configLoaded && (states.length > 0 || workflows.length > 0);
 
   return (
     <div className="p-6 space-y-6">
@@ -271,7 +373,7 @@ export function AiBuilderTab() {
         <div>
           <h2 className="text-xl font-semibold">AI Automation Builder</h2>
           <p className="text-sm text-muted-foreground">
-            Build recursive AI automation loops with visual feedback
+            Build ordered execution sequences with visual feedback
           </p>
         </div>
       </div>
@@ -290,115 +392,166 @@ export function AiBuilderTab() {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Left Panel - Configuration */}
           <div className="space-y-4">
-            {/* States to Navigate */}
+            {/* Execution Steps */}
             <div className="card p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <Target className="w-4 h-4 text-primary" />
-                <span className="font-medium">States to Navigate</span>
-                <span className="text-xs text-muted-foreground">
-                  ({selectedStates.length} selected)
-                </span>
-              </div>
-
-              <div className="relative">
-                <button
-                  onClick={() => setShowStatesDropdown(!showStatesDropdown)}
-                  className="w-full flex items-center justify-between px-3 py-2 bg-background border border-border rounded-md text-sm hover:bg-muted/30 transition-colors"
-                >
-                  <span>
-                    {selectedStates.length > 0
-                      ? selectedStates.join(", ")
-                      : "Select states to navigate..."}
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Play className="w-4 h-4 text-primary" />
+                  <span className="font-medium">Execution Steps</span>
+                  <span className="text-xs text-muted-foreground">
+                    ({executionSteps.length} step{executionSteps.length !== 1 ? "s" : ""})
                   </span>
-                  <ChevronDown
-                    className={`w-4 h-4 transition-transform ${showStatesDropdown ? "rotate-180" : ""}`}
-                  />
-                </button>
+                </div>
 
-                {showStatesDropdown && (
-                  <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg max-h-60 overflow-y-auto">
-                    {states.map((state) => (
+                {/* Add Step Dropdown */}
+                <div className="relative">
+                  <button
+                    onClick={() => setShowAddDropdown(!showAddDropdown)}
+                    className="flex items-center gap-1 px-2 py-1 text-sm bg-primary/10 text-primary rounded hover:bg-primary/20 transition-colors"
+                  >
+                    <Plus className="w-4 h-4" />
+                    Add Step
+                    <ChevronDown
+                      className={`w-3 h-3 transition-transform ${showAddDropdown ? "rotate-180" : ""}`}
+                    />
+                  </button>
+
+                  {showAddDropdown && (
+                    <div className="absolute right-0 z-20 w-64 mt-1 bg-card border border-border rounded-md shadow-lg max-h-80 overflow-y-auto">
+                      {/* Workflows section */}
+                      {workflows.length > 0 && (
+                        <>
+                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                            <Workflow className="w-3 h-3" />
+                            Workflows
+                          </div>
+                          {workflows.map((workflow) => (
+                            <button
+                              key={workflow.id}
+                              onClick={() => addStep("workflow", workflow.name)}
+                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                            >
+                              <Workflow className="w-4 h-4 text-purple-500" />
+                              <span>{workflow.name}</span>
+                            </button>
+                          ))}
+                        </>
+                      )}
+
+                      {/* States section */}
+                      {states.length > 0 && (
+                        <>
+                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                            <Target className="w-3 h-3" />
+                            States
+                          </div>
+                          {states.map((state) => (
+                            <button
+                              key={state.name}
+                              onClick={() => addStep("state", state.name)}
+                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                            >
+                              <Target className="w-4 h-4 text-primary" />
+                              <span>{state.name}</span>
+                              {state.images.length > 0 && (
+                                <span className="text-xs text-muted-foreground ml-auto">
+                                  {state.images.length} img
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Steps List */}
+              {executionSteps.length === 0 ? (
+                <div className="text-center py-8 text-muted-foreground">
+                  <GripVertical className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                  <p className="text-sm">No steps added yet</p>
+                  <p className="text-xs mt-1">Click "Add Step" to build your execution sequence</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {executionSteps.map((step, index) => (
+                    <div
+                      key={step.id}
+                      className={`flex items-center gap-2 p-2 rounded-md border ${
+                        step.type === "workflow"
+                          ? "bg-purple-500/5 border-purple-500/20"
+                          : "bg-primary/5 border-primary/20"
+                      }`}
+                    >
+                      {/* Step number */}
+                      <span className="w-6 h-6 flex items-center justify-center text-xs font-medium rounded bg-background">
+                        {index + 1}
+                      </span>
+
+                      {/* Icon */}
+                      {step.type === "workflow" ? (
+                        <Workflow className="w-4 h-4 text-purple-500 flex-shrink-0" />
+                      ) : (
+                        <Target className="w-4 h-4 text-primary flex-shrink-0" />
+                      )}
+
+                      {/* Name */}
+                      <span className="flex-1 text-sm truncate">{step.name}</span>
+
+                      {/* Screenshot toggle */}
                       <button
-                        key={state.name}
-                        onClick={() => toggleState(state.name, "navigate")}
-                        className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors ${
-                          selectedStates.includes(state.name) ? "bg-primary/10" : ""
+                        onClick={() => toggleStepScreenshot(step.id)}
+                        className={`p-1 rounded transition-colors ${
+                          step.takeScreenshot
+                            ? "text-green-500 hover:text-green-400"
+                            : "text-muted-foreground hover:text-foreground"
                         }`}
+                        title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
                       >
-                        <div
-                          className={`w-4 h-4 border rounded flex items-center justify-center ${
-                            selectedStates.includes(state.name)
-                              ? "bg-primary border-primary"
-                              : "border-border"
-                          }`}
-                        >
-                          {selectedStates.includes(state.name) && (
-                            <CheckCircle className="w-3 h-3 text-white" />
-                          )}
-                        </div>
-                        <span>{state.name}</span>
-                        {state.images.length > 0 && (
-                          <span className="text-xs text-muted-foreground ml-auto">
-                            {state.images.length} images
-                          </span>
-                        )}
+                        <Camera className="w-4 h-4" />
                       </button>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
 
-            {/* Screenshot States */}
-            <div className="card p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <ImageIcon className="w-4 h-4 text-secondary" />
-                <span className="font-medium">Screenshot States</span>
-                <span className="text-xs text-muted-foreground">(optional)</span>
-              </div>
-
-              <div className="relative">
-                <button
-                  onClick={() => setShowScreenshotDropdown(!showScreenshotDropdown)}
-                  className="w-full flex items-center justify-between px-3 py-2 bg-background border border-border rounded-md text-sm hover:bg-muted/30 transition-colors"
-                >
-                  <span>
-                    {screenshotStates.length > 0
-                      ? screenshotStates.join(", ")
-                      : "All states (default)"}
-                  </span>
-                  <ChevronDown
-                    className={`w-4 h-4 transition-transform ${showScreenshotDropdown ? "rotate-180" : ""}`}
-                  />
-                </button>
-
-                {showScreenshotDropdown && (
-                  <div className="absolute z-10 w-full mt-1 bg-card border border-border rounded-md shadow-lg max-h-60 overflow-y-auto">
-                    {states.map((state) => (
+                      {/* Move up */}
                       <button
-                        key={state.name}
-                        onClick={() => toggleState(state.name, "screenshot")}
-                        className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors ${
-                          screenshotStates.includes(state.name) ? "bg-secondary/10" : ""
-                        }`}
+                        onClick={() => moveStepUp(index)}
+                        disabled={index === 0}
+                        className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                        title="Move up"
                       >
-                        <div
-                          className={`w-4 h-4 border rounded flex items-center justify-center ${
-                            screenshotStates.includes(state.name)
-                              ? "bg-secondary border-secondary"
-                              : "border-border"
-                          }`}
-                        >
-                          {screenshotStates.includes(state.name) && (
-                            <CheckCircle className="w-3 h-3 text-white" />
-                          )}
-                        </div>
-                        <span>{state.name}</span>
+                        <ChevronUp className="w-4 h-4" />
                       </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+
+                      {/* Move down */}
+                      <button
+                        onClick={() => moveStepDown(index)}
+                        disabled={index === executionSteps.length - 1}
+                        className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                        title="Move down"
+                      >
+                        <ChevronDown className="w-4 h-4" />
+                      </button>
+
+                      {/* Remove */}
+                      <button
+                        onClick={() => removeStep(step.id)}
+                        className="p-1 text-muted-foreground hover:text-red-500 transition-colors"
+                        title="Remove step"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {executionSteps.length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  <Camera className="w-3 h-3 inline mr-1" />
+                  Click the camera icon to toggle screenshots for each step
+                </p>
+              )}
             </div>
 
             {/* Goal */}
@@ -420,7 +573,7 @@ export function AiBuilderTab() {
             <div className="flex gap-3">
               <button
                 onClick={runAutomation}
-                disabled={isRunning || selectedStates.length === 0}
+                disabled={isRunning || executionSteps.length === 0}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
                 {isRunning ? (
@@ -506,7 +659,9 @@ export function AiBuilderTab() {
                         <span className="text-sm font-medium truncate">{entry.goal}</span>
                       </div>
                       <div className="text-xs text-muted-foreground mt-1">
-                        {entry.states.length} states • {new Date(entry.timestamp).toLocaleString()}
+                        {getHistorySummary(entry)}
+                        {" • "}
+                        {new Date(entry.timestamp).toLocaleString()}
                       </div>
                     </button>
                   ))}

@@ -7,6 +7,77 @@ const SETTINGS_FILE: &str = "settings.json";
 #[allow(dead_code)]
 const LAST_CONFIG_KEY: &str = "last_config_path";
 
+// ============================================================================
+// AI Settings
+// ============================================================================
+
+/// AI provider selection
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AiProvider {
+    #[default]
+    ClaudeCli, // Claude Code CLI (subscription-based, recommended)
+    ClaudeApi, // Claude API (per-token billing)
+}
+
+/// CLI execution mode for Claude Code
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CliExecutionMode {
+    #[default]
+    Auto, // Auto-detect based on platform
+    WindowsNative, // Call claude.exe directly on Windows
+    Wsl,           // Call via WSL
+    Native,        // Native *nix execution
+}
+
+/// Settings for Claude Code CLI execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeCliSettings {
+    pub execution_mode: CliExecutionMode,
+    pub custom_path: Option<String>, // Custom path to claude executable
+    pub timeout_seconds: u64,
+}
+
+impl Default for ClaudeCliSettings {
+    fn default() -> Self {
+        Self {
+            execution_mode: CliExecutionMode::Auto,
+            custom_path: None,
+            timeout_seconds: 600,
+        }
+    }
+}
+
+/// Settings for Claude API (direct HTTP calls)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeApiSettings {
+    pub model: String,
+    pub max_tokens: u32,
+    // Note: API key stored separately in OS keychain
+}
+
+impl Default for ClaudeApiSettings {
+    fn default() -> Self {
+        Self {
+            model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 4096,
+        }
+    }
+}
+
+/// Complete AI settings
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AiSettings {
+    pub provider: AiProvider,
+    pub claude_cli: ClaudeCliSettings,
+    pub claude_api: ClaudeApiSettings,
+}
+
+// ============================================================================
+// Debug Settings
+// ============================================================================
+
 /// Debug settings for image matching and other diagnostic features
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugSettings {
@@ -34,10 +105,15 @@ pub struct Settings {
     last_workflow_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_monitor_index: Option<i32>,
+    /// Multi-monitor selection support (takes precedence over last_monitor_index)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_monitor_indices: Option<Vec<i32>>,
     #[serde(default = "default_auto_load_last_config")]
     pub auto_load_last_config: bool,
     #[serde(default)]
     pub debug: DebugSettings,
+    #[serde(default)]
+    pub ai: AiSettings,
 }
 
 fn default_auto_load_last_config() -> bool {
@@ -159,6 +235,29 @@ pub fn get_last_monitor_index() -> Option<i32> {
     settings.last_monitor_index
 }
 
+/// Save the last used monitor indices (multi-monitor support)
+pub fn save_last_monitor_indices(monitor_indices: Vec<i32>) -> Result<(), String> {
+    info!("Saving last monitor indices: {:?}", monitor_indices);
+    let mut settings = load_settings();
+    settings.last_monitor_indices = Some(monitor_indices.clone());
+    // Also update legacy single monitor for backward compatibility
+    if let Some(first) = monitor_indices.first() {
+        settings.last_monitor_index = Some(*first);
+    }
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the last used monitor indices (multi-monitor support)
+/// Falls back to legacy single monitor index if not set
+pub fn get_last_monitor_indices() -> Option<Vec<i32>> {
+    let settings = load_settings();
+    // Prefer new multi-monitor setting, fall back to legacy single monitor
+    settings
+        .last_monitor_indices
+        .or_else(|| settings.last_monitor_index.map(|idx| vec![idx]))
+}
+
 /// Get the auto-load last config setting
 pub fn get_auto_load_last_config() -> bool {
     let settings = load_settings();
@@ -170,6 +269,21 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<(), String> {
     info!("Saving auto-load last config setting: {}", enabled);
     let mut settings = load_settings();
     settings.auto_load_last_config = enabled;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the current AI settings
+pub fn get_ai_settings() -> AiSettings {
+    let settings = load_settings();
+    settings.ai
+}
+
+/// Save AI settings
+pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
+    info!("Saving AI settings: {:?}", ai_settings);
+    let mut settings = load_settings();
+    settings.ai = ai_settings;
     save_settings(&settings)?;
     Ok(())
 }

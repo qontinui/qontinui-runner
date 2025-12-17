@@ -287,9 +287,9 @@ export function AuthConnectionSettings({
             </div>
             <div>
               <div className="font-medium">{auth.authStatus.user.email}</div>
-              {auth.authStatus.user.full_name && (
+              {auth.authStatus.user.name && (
                 <div className="text-sm text-muted-foreground">
-                  {auth.authStatus.user.full_name}
+                  {auth.authStatus.user.name}
                 </div>
               )}
             </div>

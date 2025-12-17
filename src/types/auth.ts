@@ -7,10 +7,7 @@
 export interface User {
   id: string;
   email: string;
-  full_name: string | null;
-  is_active: boolean;
-  is_superuser: boolean;
-  created_at: string;
+  name: string | null;
 }
 
 export interface DeviceInfo {
@@ -22,7 +19,6 @@ export interface DeviceInfo {
 export interface LoginResponse {
   access_token: string;
   refresh_token: string;
-  token_type: string;
   user: User;
   device_info: DeviceInfo;
 }

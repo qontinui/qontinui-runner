@@ -6,15 +6,13 @@
  */
 
 import { useState, FormEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { Lock, Mail, AlertCircle, Loader2 } from "lucide-react";
-import type { LoginResponse } from "../types";
 
 interface LoginScreenProps {
-  onLoginSuccess: () => void;
+  onLogin: (email: string, password: string) => Promise<void>;
 }
 
-export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
+export function LoginScreen({ onLogin }: LoginScreenProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -22,13 +20,17 @@ export function LoginScreen({ onLoginSuccess }: LoginScreenProps) {
 
   const handleLogin = async (e: FormEvent) => {
     e.preventDefault();
+    console.log("[LOGIN_SCREEN] handleLogin() called");
     setLoading(true);
     setError("");
 
     try {
-      await invoke<LoginResponse>("login", { email, password });
-      onLoginSuccess();
+      console.log("[LOGIN_SCREEN] Calling onLogin with credentials...");
+      await onLogin(email, password);
+      console.log("[LOGIN_SCREEN] Login completed successfully");
+      // AuthProvider.login() handles setting the auth state, no callback needed
     } catch (err) {
+      console.error("[LOGIN_SCREEN] Login failed:", err);
       setError(err as string);
     } finally {
       setLoading(false);
