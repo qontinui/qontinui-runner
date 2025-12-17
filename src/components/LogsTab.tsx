@@ -7,12 +7,13 @@
 
 import { useRef } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { FileText, Image, Zap, Brain, FolderOpen } from "lucide-react";
+import { FileText, Image, Zap, Brain, FolderOpen, Database } from "lucide-react";
 import { GeneralLogTab } from "./GeneralLogTab";
 import ImageLogTable from "./ImageLogTable";
 import ActionLogTable from "./ActionLogTable";
 import { AiOutputTab, type AiOutputLine } from "./AiOutputTab";
 import { ExternalLogsTab } from "./ExternalLogsTab";
+import { RagLogTab, type RagProcessingState } from "./RagLogTab";
 import { LogTabActions } from "./LogTabActions";
 import { useAutoScroll } from "../hooks";
 import type { LogEntry, ImageRecognitionEntry } from "../managers/LogManager";
@@ -20,7 +21,7 @@ import type { ActionLogEntry } from "../types/displayProfile";
 import type { LogLevel } from "../hooks/useLogFilter";
 import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
 
-type LogSubTab = "general" | "image" | "actions" | "ai" | "external";
+type LogSubTab = "general" | "image" | "actions" | "ai" | "rag" | "external";
 
 interface LogsTabProps {
   // General logs
@@ -57,11 +58,18 @@ interface LogsTabProps {
   onRefreshProjectLogs: () => void;
   onConfigureProjectLogs: () => void;
 
+  // RAG processing
+  ragState: RagProcessingState;
+  onStartRagProcessing: () => void;
+  onClearRagLogs: () => void;
+  canStartRagProcessing: boolean;
+
   // Log counts
   logCount: number;
   imageLogCount: number;
   actionCount: number;
   aiOutputCount: number;
+  ragLogCount: number;
   externalLogCount: number;
 
   // Clear/copy actions
@@ -99,10 +107,15 @@ export function LogsTab({
   projectLogsLastRefresh,
   onRefreshProjectLogs,
   onConfigureProjectLogs,
+  ragState,
+  onStartRagProcessing,
+  onClearRagLogs,
+  canStartRagProcessing,
   logCount,
   imageLogCount,
   actionCount,
   aiOutputCount,
+  ragLogCount,
   externalLogCount,
   onClearGeneralLogs,
   onClearImageLogs,
@@ -126,6 +139,7 @@ export function LogsTab({
     { id: "image" as const, label: "Image Recognition", icon: Image, count: imageLogCount },
     { id: "actions" as const, label: "Actions", icon: Zap, count: actionCount },
     { id: "ai" as const, label: "AI Output", icon: Brain, count: aiOutputCount },
+    { id: "rag" as const, label: "RAG", icon: Database, count: ragLogCount },
     { id: "external" as const, label: "Project Logs", icon: FolderOpen, count: externalLogCount },
   ];
 
@@ -206,6 +220,15 @@ export function LogsTab({
 
         <Tabs.Content value="ai" className="h-full outline-none">
           <AiOutputTab lines={aiOutputLines} onClear={onClearAiOutput} />
+        </Tabs.Content>
+
+        <Tabs.Content value="rag" className="h-full outline-none">
+          <RagLogTab
+            state={ragState}
+            onStartProcessing={onStartRagProcessing}
+            onClearLogs={onClearRagLogs}
+            canStartProcessing={canStartRagProcessing}
+          />
         </Tabs.Content>
 
         <Tabs.Content value="external" className="h-full outline-none">

@@ -331,7 +331,11 @@ mcp__qontinui__go_to_state with state_names=["${step.name}"], take_screenshot=${
       } else {
         setLastResult({
           success: false,
-          message: result.error || result.data?.error || result.data?.message || "Failed to start AI automation",
+          message:
+            result.error ||
+            result.data?.error ||
+            result.data?.message ||
+            "Failed to start AI automation",
         });
         setHistory((prev) =>
           prev.map((h) => (h.id === historyEntry.id ? { ...h, success: false } : h)),

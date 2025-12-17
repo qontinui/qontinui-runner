@@ -56,6 +56,7 @@ export function ExecutionControlPanel({
   onStopExecution,
 }: ExecutionControlPanelProps) {
   const [calculatedScreens, setCalculatedScreens] = useState<number[]>([]);
+  const [isOverrideActive, setIsOverrideActive] = useState(false);
   const [isCalculating, setIsCalculating] = useState(false);
   const [availableMonitors, setAvailableMonitors] = useState<number[]>([]);
 
@@ -77,6 +78,11 @@ export function ExecutionControlPanel({
     loadMonitors();
   }, []);
 
+  // Reset override mode when workflow changes
+  useEffect(() => {
+    setIsOverrideActive(false);
+  }, [selectedWorkflow]);
+
   // Calculate required screens when workflow changes
   useEffect(() => {
     if (!selectedWorkflow || !configLoaded) {
@@ -94,7 +100,7 @@ export function ExecutionControlPanel({
 
         if (result?.success && result.data?.screens && result.data.screens.length > 0) {
           setCalculatedScreens(result.data.screens);
-          // Auto-select calculated screens
+          // Auto-select calculated screens (override mode is reset above)
           onMonitorSelectionChange(result.data.screens);
         } else {
           // If no screens calculated from workflow, default to primary (index 0)
@@ -115,6 +121,20 @@ export function ExecutionControlPanel({
 
     calculateScreens();
   }, [selectedWorkflow, configLoaded, availableMonitors]);
+
+  // Handle override toggle
+  const handleOverrideToggle = () => {
+    const newOverrideState = !isOverrideActive;
+    setIsOverrideActive(newOverrideState);
+
+    // If turning off override, reset to calculated screens
+    if (!newOverrideState && calculatedScreens.length > 0) {
+      onMonitorSelectionChange(calculatedScreens);
+    }
+  };
+
+  // Determine if monitor selector is read-only (read-only when workflow selected and not in override mode)
+  const monitorSelectorReadOnly = !!selectedWorkflow && !isOverrideActive;
 
   return (
     <CollapsiblePanel
@@ -156,17 +176,15 @@ export function ExecutionControlPanel({
 
         {/* Monitor Selector */}
         <div className="space-y-2">
-          {selectedWorkflow && (
+          {selectedWorkflow && !isOverrideActive && (
             <div className="text-xs text-muted-foreground">
               {isCalculating ? (
                 <span>Calculating required monitors...</span>
-              ) : calculatedScreens.length > 0 ? (
+              ) : (
                 <span>
                   This workflow will use monitor{calculatedScreens.length > 1 ? "s" : ""}:{" "}
                   {calculatedScreens.map((s) => `#${s}`).join(", ")}
                 </span>
-              ) : (
-                <span>Monitors are configured per element in qontinui-web</span>
               )}
             </div>
           )}
@@ -175,7 +193,9 @@ export function ExecutionControlPanel({
             onSelectionChange={onMonitorSelectionChange}
             multiSelect={true}
             compact={true}
-            readOnly={!!selectedWorkflow}
+            readOnly={monitorSelectorReadOnly}
+            isOverrideActive={isOverrideActive}
+            onOverrideToggle={selectedWorkflow ? handleOverrideToggle : undefined}
           />
         </div>
 

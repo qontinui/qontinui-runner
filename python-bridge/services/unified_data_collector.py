@@ -155,8 +155,13 @@ class UnifiedDataCollector:
             # Capture "before" state snapshot
             if self.state_memory:
                 self._active_states_before = self.state_memory.get_active_state_names()
+                print(
+                    f"[DEBUG] start_action: active_states_before = {self._active_states_before}",
+                    flush=True,
+                )
             else:
                 self._active_states_before = []
+                print("[DEBUG] start_action: no state_memory, using empty list", flush=True)
 
             # Clear runtime buffers
             self._text_typed = None
@@ -437,8 +442,13 @@ class UnifiedDataCollector:
             # Capture "after" state snapshot
             if self.state_memory:
                 active_states_after = self.state_memory.get_active_state_names()
+                print(
+                    f"[DEBUG] create_record: active_states_after = {active_states_after}",
+                    flush=True,
+                )
             else:
                 active_states_after = []
+                print("[DEBUG] create_record: no state_memory, using empty list", flush=True)
 
             # Convert state lists to frozen sets
             state_before_set = frozenset(self._active_states_before)

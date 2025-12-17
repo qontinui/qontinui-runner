@@ -40,7 +40,10 @@ export function Settings({
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // Load persisted tab on mount
     const stored = localStorage.getItem(STORAGE_KEY);
-    if (stored && ["connection", "ai", "general", "storage", "advanced", "updates"].includes(stored)) {
+    if (
+      stored &&
+      ["connection", "ai", "general", "storage", "advanced", "updates"].includes(stored)
+    ) {
       return stored as SettingsTab;
     }
     return "connection";

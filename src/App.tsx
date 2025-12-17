@@ -37,6 +37,7 @@ import {
   useLogFilter,
   useProjectSelection,
   useProjectLogs,
+  useRagProcessing,
 } from "./hooks";
 
 // Components
@@ -58,7 +59,7 @@ import { AiBuilderTab } from "./components/AiBuilderTab";
 import "./index.css";
 
 type MainTab = "run" | "logs" | "capture" | "extract" | "dataset" | "ai-builder" | "settings";
-type LogSubTab = "general" | "image" | "actions" | "ai" | "external";
+type LogSubTab = "general" | "image" | "actions" | "ai" | "rag" | "external";
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
@@ -132,6 +133,9 @@ function AppContent() {
   // Project logs (external logs from target application)
   const projectLogs = useProjectLogs();
 
+  // RAG processing state
+  const ragProcessing = useRagProcessing();
+
   // Log source manager modal state
   const [showLogSourceManager, setShowLogSourceManager] = useState(false);
 
@@ -153,6 +157,46 @@ function AppContent() {
       );
     }
   }, [projectSelection.selectedProjectId, projectSelection.selectedProjectName]);
+
+  // Update RAG processing state when config is loaded
+  useEffect(() => {
+    if (execution.config && execution.configLoaded) {
+      const states = execution.config.states || [];
+      // Check if any stateImages have patterns (embeddings can be useful for all)
+      let hasStateImagesWithPatterns = false;
+      for (const state of states) {
+        const stateImages = state.stateImages || [];
+        for (const stateImage of stateImages) {
+          const patterns = stateImage.patterns || [];
+          if (patterns.length > 0) {
+            hasStateImagesWithPatterns = true;
+            break;
+          }
+        }
+        if (hasStateImagesWithPatterns) break;
+      }
+
+      // Use config name as project ID (from filename)
+      const projectId = execution.config.name || "unknown";
+      const projectName = execution.config.name || "Unnamed Project";
+
+      console.log(
+        "[APP] Config loaded, updating RAG state:",
+        projectId,
+        "hasStateImagesWithPatterns:",
+        hasStateImagesWithPatterns,
+      );
+      // Pass the full config so it can be saved to RAG storage if needed
+      ragProcessing.setProject(
+        projectId,
+        projectName,
+        hasStateImagesWithPatterns,
+        execution.config,
+      );
+    } else if (!execution.configLoaded) {
+      ragProcessing.setProject(null, null, false);
+    }
+  }, [execution.config, execution.configLoaded]);
 
   // Setup event handlers on mount (ONCE only)
   useEffect(() => {
@@ -349,10 +393,15 @@ function AppContent() {
                 projectLogsLastRefresh={undefined}
                 onRefreshProjectLogs={projectLogs.refreshLogs}
                 onConfigureProjectLogs={() => setShowLogSourceManager(true)}
+                ragState={ragProcessing.state}
+                onStartRagProcessing={ragProcessing.startProcessing}
+                onClearRagLogs={ragProcessing.clearLogs}
+                canStartRagProcessing={ragProcessing.configHasRagImages && execution.configLoaded}
                 logCount={logCount}
                 imageLogCount={imageLogCount}
                 actionCount={actionLogViewData?.visible_count || 0}
                 aiOutputCount={aiOutputLogCount}
+                ragLogCount={ragProcessing.state.logs.length}
                 externalLogCount={projectLogs.logsState.sources.length}
                 onClearGeneralLogs={clearGeneralLogs}
                 onClearImageLogs={clearImageLogs}
@@ -446,7 +495,7 @@ function AppContent() {
           onClose={() => setShowLogSourceManager(false)}
           onSave={(sources) => {
             projectLogs.setLogSources(sources);
-            projectLogs.saveConfig(sources);  // Pass sources directly to avoid React async state issue
+            projectLogs.saveConfig(sources); // Pass sources directly to avoid React async state issue
             setShowLogSourceManager(false);
           }}
         />

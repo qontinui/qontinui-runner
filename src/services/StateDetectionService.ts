@@ -211,9 +211,7 @@ export class StateDetectionService {
    * @param config - Service configuration
    * @param config.defaultTimeout - Default timeout for analysis in milliseconds (default: 300000)
    */
-  constructor(config?: {
-    defaultTimeout?: number;
-  }) {
+  constructor(config?: { defaultTimeout?: number }) {
     this.defaultTimeout = config?.defaultTimeout || 300000; // 5 minutes default
   }
 
@@ -240,7 +238,6 @@ export class StateDetectionService {
       "State detection not implemented. This service should delegate to Tauri commands.",
     );
   }
-
 
   /**
    * Parse the JSON output from the Python bridge.

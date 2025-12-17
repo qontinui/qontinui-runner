@@ -43,3 +43,5 @@ export type { UseProjectLogsReturn } from "./useProjectLogs";
 export { useWebExtraction } from "./useWebExtraction";
 
 export { useExtractionState } from "./useExtractionState";
+
+export { useRagProcessing } from "./useRagProcessing";

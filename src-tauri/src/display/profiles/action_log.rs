@@ -120,6 +120,20 @@ impl ActionLogProfile {
             if let Some(level) = exec_record.get("nesting_level") {
                 metadata.insert("level".to_string(), level.clone());
             }
+
+            // Copy state_context (directly in execution_record)
+            if let Some(state_context) = exec_record.get("state_context") {
+                debug!(
+                    "extract_action_info: Found state_context: {:?}",
+                    state_context
+                );
+                metadata.insert("state_context".to_string(), state_context.clone());
+            } else {
+                debug!(
+                    "extract_action_info: No state_context found in execution_record. Keys: {:?}",
+                    exec_record.keys().collect::<Vec<_>>()
+                );
+            }
         }
 
         // Also check if nesting_level is directly on the node

@@ -102,13 +102,18 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         setSettings({
           provider: result.data.provider || DEFAULT_AI_SETTINGS.provider,
           claude_cli: {
-            execution_mode: result.data.claude_cli?.execution_mode || DEFAULT_AI_SETTINGS.claude_cli.execution_mode,
+            execution_mode:
+              result.data.claude_cli?.execution_mode ||
+              DEFAULT_AI_SETTINGS.claude_cli.execution_mode,
             custom_path: result.data.claude_cli?.custom_path,
-            timeout_seconds: result.data.claude_cli?.timeout_seconds || DEFAULT_AI_SETTINGS.claude_cli.timeout_seconds,
+            timeout_seconds:
+              result.data.claude_cli?.timeout_seconds ||
+              DEFAULT_AI_SETTINGS.claude_cli.timeout_seconds,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
-            max_tokens: result.data.claude_api?.max_tokens || DEFAULT_AI_SETTINGS.claude_api.max_tokens,
+            max_tokens:
+              result.data.claude_api?.max_tokens || DEFAULT_AI_SETTINGS.claude_api.max_tokens,
           },
         });
         onLog("debug", "AI settings loaded");
@@ -339,7 +344,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 ))}
               </select>
               <p className="text-sm text-muted-foreground">
-                {EXECUTION_MODE_OPTIONS.find((o) => o.value === settings.claude_cli.execution_mode)?.description}
+                {
+                  EXECUTION_MODE_OPTIONS.find((o) => o.value === settings.claude_cli.execution_mode)
+                    ?.description
+                }
               </p>
             </div>
 
@@ -377,7 +385,10 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     ...prev,
                     claude_cli: {
                       ...prev.claude_cli,
-                      timeout_seconds: Math.max(60, Math.min(3600, parseInt(e.target.value) || 600)),
+                      timeout_seconds: Math.max(
+                        60,
+                        Math.min(3600, parseInt(e.target.value) || 600),
+                      ),
                     },
                   }))
                 }
@@ -495,13 +506,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 }
                 className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
               />
-              <p className="text-sm text-muted-foreground">Maximum tokens in the response (256-32768).</p>
+              <p className="text-sm text-muted-foreground">
+                Maximum tokens in the response (256-32768).
+              </p>
             </div>
 
             <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
               <div className="text-sm text-yellow-400">
-                <strong>Note:</strong> Using the Claude API incurs per-token costs. Consider using Claude Code CLI
-                with your subscription for unlimited usage.
+                <strong>Note:</strong> Using the Claude API incurs per-token costs. Consider using
+                Claude Code CLI with your subscription for unlimited usage.
               </div>
             </div>
           </div>

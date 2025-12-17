@@ -3,12 +3,12 @@
  *
  * Visual monitor selection component showing monitor layout with size and position info.
  * Supports both single-select and multi-select modes.
- * Supports read-only mode for calculated monitors with override capability.
+ * When readOnly is true, monitors are displayed as read-only (configured in qontinui-web).
  */
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Check, Pencil, RotateCcw, AlertTriangle } from "lucide-react";
+import { Monitor, Check, Info } from "lucide-react";
 
 export interface MonitorInfo {
   index: number;
@@ -32,12 +32,8 @@ interface MonitorSelectorProps {
   compact?: boolean;
   /** Optional class name */
   className?: string;
-  /** Whether the selector is read-only (calculated mode, not editable) */
+  /** Whether the selector is read-only (monitors configured in qontinui-web) */
   readOnly?: boolean;
-  /** Whether override mode is active (user is manually editing) */
-  isOverrideActive?: boolean;
-  /** Called to toggle override mode */
-  onOverrideToggle?: () => void;
 }
 
 /**
@@ -65,12 +61,9 @@ export function MonitorSelector({
   compact = false,
   className = "",
   readOnly = false,
-  isOverrideActive = false,
-  onOverrideToggle,
 }: MonitorSelectorProps) {
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showWarning, setShowWarning] = useState(false);
 
   useEffect(() => {
     loadMonitors();
@@ -116,19 +109,6 @@ export function MonitorSelector({
     }
   };
 
-  const handleOverrideToggle = () => {
-    if (!onOverrideToggle) return;
-
-    // If enabling override mode (Edit button), show warning
-    if (!isOverrideActive) {
-      setShowWarning(true);
-      // Auto-hide warning after 5 seconds
-      setTimeout(() => setShowWarning(false), 5000);
-    }
-
-    onOverrideToggle();
-  };
-
   if (loading) {
     return <div className={`text-sm text-muted-foreground ${className}`}>Loading monitors...</div>;
   }
@@ -142,95 +122,71 @@ export function MonitorSelector({
   const textSize = compact ? "text-xs" : "text-sm";
 
   return (
-    <div className={`flex flex-wrap items-center gap-2 ${className}`}>
-      {monitors.map((monitor) => {
-        const isSelected = selectedMonitors.includes(monitor.index);
-        const position = getPositionLabel(monitor, monitors);
-
-        return (
-          <button
-            key={monitor.index}
-            onClick={() => handleMonitorClick(monitor.index)}
-            disabled={readOnly}
-            className={`flex flex-col items-center gap-1 rounded-lg border transition-all ${buttonSize} ${
-              isSelected
-                ? "bg-primary/20 border-primary text-primary ring-2 ring-primary/30"
-                : "bg-input border-border/50 hover:border-primary/50 hover:bg-accent/50"
-            } ${readOnly ? "cursor-default opacity-80" : "cursor-pointer"}`}
-          >
-            <div className="flex items-center gap-1.5">
-              <Monitor className={iconSize} />
-              <span className="font-medium">#{monitor.index}</span>
-              {multiSelect && isSelected && <Check className={`${iconSize} text-primary`} />}
-            </div>
-            <div className={`${textSize} text-muted-foreground space-y-0.5`}>
-              {monitor.is_primary && <div className="text-primary font-medium">Primary</div>}
-              {position && !compact && <div>{position}</div>}
-              <div>
-                {monitor.width}x{monitor.height}
-              </div>
-            </div>
-          </button>
-        );
-      })}
-
-      {/* "All" option for multi-select (only when not read-only) */}
-      {multiSelect && monitors.length > 1 && !readOnly && (
-        <button
-          onClick={() => onSelectionChange(monitors.map((m) => m.index))}
-          className={`flex flex-col items-center justify-center gap-1 rounded-lg border transition-all ${buttonSize} ${
-            selectedMonitors.length === monitors.length
-              ? "bg-primary/20 border-primary text-primary ring-2 ring-primary/30"
-              : "bg-input border-border/50 hover:border-primary/50 hover:bg-accent/50"
-          }`}
-        >
-          <div className="flex items-center gap-1.5">
-            <Monitor className={iconSize} />
-            <span className="font-medium">All</span>
-            {selectedMonitors.length === monitors.length && (
-              <Check className={`${iconSize} text-primary`} />
-            )}
-          </div>
-          <div className={`${textSize} text-muted-foreground`}>{monitors.length} monitors</div>
-        </button>
-      )}
-
-      {/* Override toggle button */}
-      {onOverrideToggle && (
-        <button
-          onClick={handleOverrideToggle}
-          className={`flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs transition-colors ${
-            isOverrideActive
-              ? "bg-yellow-500/20 text-yellow-600 hover:bg-yellow-500/30"
-              : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
-          }`}
-          title={isOverrideActive ? "Use calculated monitors" : "Override automatic selection"}
-        >
-          {isOverrideActive ? (
-            <>
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>Auto</span>
-            </>
-          ) : (
-            <>
-              <Pencil className="w-3.5 h-3.5" />
-              <span>Edit</span>
-            </>
-          )}
-        </button>
-      )}
-
-      {/* Warning when override is active */}
-      {showWarning && isOverrideActive && (
-        <div className="flex items-start gap-2 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg text-xs">
-          <AlertTriangle className="w-4 h-4 flex-shrink-0 text-yellow-600 mt-0.5" />
-          <div className="text-yellow-600">
-            <strong>Efficiency Warning:</strong> Manual monitor selection will reduce efficiency by
-            searching all selected monitors for images. By default, StateImages are only searched on
-            their associated monitor(s).
+    <div className={`space-y-2 ${className}`}>
+      {/* Info message when read-only */}
+      {readOnly && (
+        <div className="flex items-start gap-2 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs">
+          <Info className="w-4 h-4 flex-shrink-0 text-blue-600 mt-0.5" />
+          <div className="text-blue-600">
+            Monitors are configured per element in qontinui-web. To change monitors, update your
+            workflow configuration.
           </div>
         </div>
       )}
+
+      <div className="flex flex-wrap items-center gap-2">
+        {monitors.map((monitor) => {
+          const isSelected = selectedMonitors.includes(monitor.index);
+          const position = getPositionLabel(monitor, monitors);
+
+          return (
+            <button
+              key={monitor.index}
+              onClick={() => handleMonitorClick(monitor.index)}
+              disabled={readOnly}
+              className={`flex flex-col items-center gap-1 rounded-lg border transition-all ${buttonSize} ${
+                isSelected
+                  ? "bg-primary/20 border-primary text-primary ring-2 ring-primary/30"
+                  : "bg-input border-border/50 hover:border-primary/50 hover:bg-accent/50"
+              } ${readOnly ? "cursor-default opacity-80" : "cursor-pointer"}`}
+            >
+              <div className="flex items-center gap-1.5">
+                <Monitor className={iconSize} />
+                <span className="font-medium">#{monitor.index}</span>
+                {multiSelect && isSelected && <Check className={`${iconSize} text-primary`} />}
+              </div>
+              <div className={`${textSize} text-muted-foreground space-y-0.5`}>
+                {monitor.is_primary && <div className="text-primary font-medium">Primary</div>}
+                {position && !compact && <div>{position}</div>}
+                <div>
+                  {monitor.width}x{monitor.height}
+                </div>
+              </div>
+            </button>
+          );
+        })}
+
+        {/* "All" option for multi-select (only when not read-only) */}
+        {multiSelect && monitors.length > 1 && !readOnly && (
+          <button
+            onClick={() => onSelectionChange(monitors.map((m) => m.index))}
+            className={`flex flex-col items-center justify-center gap-1 rounded-lg border transition-all ${buttonSize} ${
+              selectedMonitors.length === monitors.length
+                ? "bg-primary/20 border-primary text-primary ring-2 ring-primary/30"
+                : "bg-input border-border/50 hover:border-primary/50 hover:bg-accent/50"
+            }`}
+          >
+            <div className="flex items-center gap-1.5">
+              <Monitor className={iconSize} />
+              <span className="font-medium">All</span>
+              {selectedMonitors.length === monitors.length && (
+                <Check className={`${iconSize} text-primary`} />
+              )}
+            </div>
+            <div className={`${textSize} text-muted-foreground`}>{monitors.length} monitors</div>
+          </button>
+        )}
+      </div>
     </div>
   );
 }

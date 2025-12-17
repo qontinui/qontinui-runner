@@ -858,6 +858,38 @@ pub fn get_workflow_required_screens(
         }
     }
 
+    // Also check transitions in the config
+    for transition in &config.transitions {
+        // Check fromState
+        if let Some(from_state) = transition.get("fromState").and_then(|s| s.as_str()) {
+            if let Some(state_monitors) = state_monitors_map.get(from_state) {
+                for &monitor in state_monitors {
+                    screens.insert(monitor);
+                }
+            }
+        }
+        // Check toState
+        if let Some(to_state) = transition.get("toState").and_then(|s| s.as_str()) {
+            if let Some(state_monitors) = state_monitors_map.get(to_state) {
+                for &monitor in state_monitors {
+                    screens.insert(monitor);
+                }
+            }
+        }
+        // Check activateStates array
+        if let Some(activate_states) = transition.get("activateStates").and_then(|a| a.as_array()) {
+            for activate_state in activate_states {
+                if let Some(state_id) = activate_state.as_str() {
+                    if let Some(state_monitors) = state_monitors_map.get(state_id) {
+                        for &monitor in state_monitors {
+                            screens.insert(monitor);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Convert to sorted vec
     let mut screen_list: Vec<i32> = screens.into_iter().collect();
     screen_list.sort();

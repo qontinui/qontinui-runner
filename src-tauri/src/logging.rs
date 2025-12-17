@@ -1,5 +1,7 @@
 use chrono::Local;
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Level;
 use tracing_appender::{non_blocking, rolling};
 use tracing_subscriber::{
@@ -8,6 +10,9 @@ use tracing_subscriber::{
     util::SubscriberInitExt,
     EnvFilter, Registry,
 };
+
+/// Flag to track if we're already handling a crash (prevent recursive crashes)
+static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
 
 pub struct LoggingConfig {
     pub level: Level,
@@ -123,6 +128,105 @@ macro_rules! log_debug {
     };
 }
 
+/// Get the crash dump directory
+pub fn get_crash_dump_dir() -> PathBuf {
+    // Try to use the .dev-logs directory in the parent directory
+    if let Ok(exe_path) = std::env::current_exe() {
+        // Navigate from exe to qontinui_parent_directory/.dev-logs
+        if let Some(parent_dir) = exe_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let dev_logs = parent_dir.join(".dev-logs");
+            if dev_logs.exists() || std::fs::create_dir_all(&dev_logs).is_ok() {
+                return dev_logs;
+            }
+        }
+    }
+
+    // Fallback to local app data
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("qontinui-runner")
+        .join("crash-dumps")
+}
+
+/// Write a crash dump file with detailed information
+pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
+    // Prevent recursive crash handling
+    if CRASH_HANDLING.swap(true, Ordering::SeqCst) {
+        eprintln!("RECURSIVE CRASH DETECTED - skipping crash dump");
+        return;
+    }
+
+    let crash_dir = get_crash_dump_dir();
+    let _ = std::fs::create_dir_all(&crash_dir);
+
+    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+    let crash_file = crash_dir.join(format!("crash_{}.txt", timestamp));
+
+    let crash_content = format!(
+        "=== QONTINUI RUNNER CRASH DUMP ===\n\
+        Timestamp: {}\n\
+        Version: {}\n\
+        \n\
+        === PANIC LOCATION ===\n\
+        {}\n\
+        \n\
+        === PANIC MESSAGE ===\n\
+        {}\n\
+        \n\
+        === ENVIRONMENT ===\n\
+        OS: {}\n\
+        Arch: {}\n\
+        Current Dir: {:?}\n\
+        Exe Path: {:?}\n\
+        \n\
+        === THREAD INFO ===\n\
+        Thread: {:?}\n\
+        \n\
+        === BACKTRACE ===\n\
+        {}\n\
+        \n\
+        === END CRASH DUMP ===\n",
+        Local::now().to_rfc3339(),
+        env!("CARGO_PKG_VERSION"),
+        location,
+        message,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::current_dir().ok(),
+        std::env::current_exe().ok(),
+        std::thread::current().name().unwrap_or("unnamed"),
+        backtrace,
+    );
+
+    // Write to file
+    match std::fs::File::create(&crash_file) {
+        Ok(mut file) => {
+            let _ = file.write_all(crash_content.as_bytes());
+            eprintln!("Crash dump written to: {:?}", crash_file);
+        }
+        Err(e) => {
+            eprintln!("Failed to write crash dump: {}", e);
+        }
+    }
+
+    // Also write to a fixed "latest_crash.txt" for easy access
+    let latest_crash = crash_dir.join("latest_crash.txt");
+    if let Ok(mut file) = std::fs::File::create(&latest_crash) {
+        let _ = file.write_all(crash_content.as_bytes());
+    }
+
+    // Print to stderr as well
+    eprintln!("\n{}", crash_content);
+
+    CRASH_HANDLING.store(false, Ordering::SeqCst);
+}
+
 pub fn log_panic(info: &std::panic::PanicHookInfo) {
     let location = if let Some(location) = info.location() {
         format!(
@@ -143,11 +247,16 @@ pub fn log_panic(info: &std::panic::PanicHookInfo) {
         "Unknown panic payload".to_string()
     };
 
+    let backtrace = format!("{:?}", std::backtrace::Backtrace::capture());
+
+    // Write crash dump to file
+    write_crash_dump(&location, &message, &backtrace);
+
     tracing::error!(
-        "PANIC at {}: {}\nBacktrace:\n{:?}",
+        "PANIC at {}: {}\nBacktrace:\n{}",
         location,
         message,
-        std::backtrace::Backtrace::capture()
+        backtrace
     );
 }
 

@@ -322,11 +322,12 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
 }
 
 /**
- * Extract active states after this action
+ * Extract active states after this action from state_context
  */
 function formatActiveStates(action: ActionLogEntry): string {
-  const activeStates = action.metadata?.activeStates;
-  if (activeStates && Array.isArray(activeStates)) {
+  const stateContext = action.metadata?.state_context as { active_after?: string[] } | undefined;
+  const activeStates = stateContext?.active_after;
+  if (activeStates && Array.isArray(activeStates) && activeStates.length > 0) {
     return activeStates.join(", ");
   }
   return "-";

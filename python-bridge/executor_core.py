@@ -116,6 +116,9 @@ class ExecutorCore:
             # Process state images
             self._process_state_images()
 
+            # Process state regions and locations (for monitor association)
+            self._process_state_regions_and_locations()
+
             # Configure execution mode
             self._configure_execution_mode()
 
@@ -193,7 +196,12 @@ class ExecutorCore:
                 self.emit_log("error", f"Failed to load image {img_id}: {e}")
 
     def _process_state_images(self):
-        """Load state images - map state image IDs to their underlying image objects."""
+        """Load state images - map state image IDs to their underlying image objects.
+
+        For StateImages with multiple patterns, ALL pattern images are registered
+        in the registry, and a mapping from StateImage ID to pattern image IDs
+        is stored to support multi-pattern find operations.
+        """
         states = self.config.get("states", [])
         self.emit_log("debug", f"Loading state images from {len(states)} states")
 
@@ -205,40 +213,119 @@ class ExecutorCore:
             for state_image in state_images:
                 state_image_id = state_image.get("id")
                 patterns = state_image.get("patterns", [])
+                # Get monitors from state image config
+                monitors = state_image.get("monitors")
 
                 if patterns and len(patterns) > 0:
-                    # Get the first pattern's image ID
-                    first_pattern = patterns[0]
-                    underlying_image_id = first_pattern.get("imageId") or first_pattern.get("image")
+                    # Collect all pattern image IDs for this StateImage
+                    pattern_image_ids = []
 
-                    if underlying_image_id and underlying_image_id in self.images:
-                        # Map state image ID to the underlying image object
-                        self.images[state_image_id] = self.images[underlying_image_id]
+                    for i, pattern in enumerate(patterns):
+                        pattern_image_id = pattern.get("imageId") or pattern.get("image")
 
-                        # Register the state image ID in the library's registry
-                        underlying_metadata = registry.get_image_metadata(underlying_image_id)
-                        if underlying_metadata:
-                            registry.register_image(
-                                state_image_id,
-                                self.images[underlying_image_id],
-                                file_path=underlying_metadata.get("file_path"),
-                                name=underlying_metadata.get("name"),
-                            )
+                        if pattern_image_id and pattern_image_id in self.images:
+                            pattern_image_ids.append(pattern_image_id)
+
+                            # For the first pattern, also map state_image_id -> image
+                            # (backwards compatibility with code expecting StateImage ID lookup)
+                            if i == 0:
+                                self.images[state_image_id] = self.images[pattern_image_id]
+
+                                # Register the state image ID in the library's registry
+                                underlying_metadata = registry.get_image_metadata(pattern_image_id)
+                                if underlying_metadata:
+                                    registry.register_image(
+                                        state_image_id,
+                                        self.images[pattern_image_id],
+                                        file_path=underlying_metadata.get("file_path"),
+                                        name=underlying_metadata.get("name"),
+                                        monitors=monitors,
+                                    )
+                                else:
+                                    registry.register_image(
+                                        state_image_id,
+                                        self.images[pattern_image_id],
+                                        monitors=monitors,
+                                    )
                         else:
-                            registry.register_image(
-                                state_image_id, self.images[underlying_image_id]
+                            self.emit_log(
+                                "warning",
+                                f"State image {state_image_id} pattern {i} references missing image {pattern_image_id}",
                             )
 
+                    # Register the StateImage -> pattern image IDs mapping
+                    if pattern_image_ids:
+                        registry.register_state_image_patterns(state_image_id, pattern_image_ids)
                         self.emit_log(
-                            "debug", f"Mapped state image {state_image_id} -> {underlying_image_id}"
-                        )
-                    else:
-                        self.emit_log(
-                            "warning",
-                            f"State image {state_image_id} references missing image {underlying_image_id}",
+                            "debug",
+                            f"Mapped state image {state_image_id} -> {len(pattern_image_ids)} pattern(s): {pattern_image_ids} (monitors={monitors})",
                         )
                 else:
                     self.emit_log("warning", f"State image {state_image_id} has no patterns")
+
+    def _process_state_regions_and_locations(self):
+        """Register StateRegions and StateLocations in the library registry.
+
+        This enables actions to reference regions/locations by ID and use their
+        configured monitors instead of a global default.
+        """
+        states = self.config.get("states", [])
+        region_count = 0
+        location_count = 0
+
+        for state in states:
+            state_name = state.get("name", "unknown")
+
+            # Process regions
+            regions = state.get("regions", [])
+            for region in regions:
+                region_id = region.get("id")
+                if not region_id:
+                    continue
+
+                x = region.get("x", 0)
+                y = region.get("y", 0)
+                width = region.get("width", 0)
+                height = region.get("height", 0)
+                monitors = region.get("monitors")
+                name = region.get("name", region_id)
+
+                registry.register_region(
+                    region_id=region_id,
+                    x=x,
+                    y=y,
+                    width=width,
+                    height=height,
+                    monitors=monitors,
+                    name=name,
+                )
+                region_count += 1
+
+            # Process locations
+            locations = state.get("locations", [])
+            for location in locations:
+                location_id = location.get("id")
+                if not location_id:
+                    continue
+
+                x = location.get("x", 0)
+                y = location.get("y", 0)
+                monitors = location.get("monitors")
+                name = location.get("name", location_id)
+
+                registry.register_location(
+                    location_id=location_id,
+                    x=x,
+                    y=y,
+                    monitors=monitors,
+                    name=name,
+                )
+                location_count += 1
+
+        self.emit_log(
+            "debug",
+            f"Registered {region_count} regions and {location_count} locations from {len(states)} states",
+        )
 
     def _configure_execution_mode(self):
         """Configure execution mode (real/mock/screenshot)."""

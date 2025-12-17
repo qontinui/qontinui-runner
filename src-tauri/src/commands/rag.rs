@@ -3,14 +3,162 @@
 //! This module provides Tauri commands for importing and managing RAG configurations.
 //! RAG configs contain pattern screenshots and element annotations for visual automation.
 
+use crate::auth::AuthManager;
 use crate::rag::{
-    EmbeddingGenerator, ImportResult, RAGConfig, RAGStorage, ScreenshotData, SearchFilters,
-    SearchResult, SemanticSearch,
+    EmbeddingGenerator, EmbeddingStatus, ImportResult, QontinuiConfig, RAGConfig, RAGStorage,
+    ScreenshotData, SearchFilters, SearchResult, SemanticSearch,
 };
+use base64::Engine as _;
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+
+/// Get API base URL for qontinui-web backend
+fn get_api_base_url() -> String {
+    std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            "http://localhost:8000".to_string()
+        } else {
+            "https://qontinui.io".to_string()
+        }
+    })
+}
+
+/// Send embedding results to the web backend
+///
+/// This function reads the embeddings.json file and sends the results
+/// to the web backend for storage.
+async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
+    // Get the embeddings file path
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    let embeddings_path = home
+        .join(".qontinui")
+        .join("rag")
+        .join(project_id)
+        .join("embeddings")
+        .join("embeddings.json");
+
+    if !embeddings_path.exists() {
+        return Err(format!(
+            "Embeddings file not found: {}",
+            embeddings_path.display()
+        ));
+    }
+
+    // Read embeddings file
+    let embeddings_content = std::fs::read_to_string(&embeddings_path)
+        .map_err(|e| format!("Failed to read embeddings file: {}", e))?;
+
+    let embeddings_data: Value = serde_json::from_str(&embeddings_content)
+        .map_err(|e| format!("Failed to parse embeddings JSON: {}", e))?;
+
+    // Extract elements and group by state_image_id
+    let elements = embeddings_data
+        .get("elements")
+        .and_then(|e| e.as_array())
+        .ok_or("No elements found in embeddings")?;
+
+    // Group embeddings by state_image_id (web stores embeddings per stateImage)
+    let mut state_image_embeddings: HashMap<String, Value> = HashMap::new();
+
+    for element in elements {
+        let state_image_id = element
+            .get("state_image_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if state_image_id.is_empty() {
+            continue;
+        }
+
+        // Extract embeddings from the element
+        let image_embedding = element.get("image_embedding").cloned();
+        let text_embedding = element.get("text_embedding").cloned();
+        let ocr_text = element.get("ocr_text").cloned();
+        let ocr_confidence = element.get("ocr_confidence").cloned();
+
+        // Only keep first result per state_image_id (multiple patterns may reference same stateImage)
+        if !state_image_embeddings.contains_key(state_image_id) {
+            state_image_embeddings.insert(
+                state_image_id.to_string(),
+                serde_json::json!({
+                    "state_image_id": state_image_id,
+                    "success": true,
+                    "image_embedding": image_embedding,
+                    "text_embedding": text_embedding,
+                    "ocr_text": ocr_text,
+                    "ocr_confidence": ocr_confidence,
+                    "error": null
+                }),
+            );
+        }
+    }
+
+    let results: Vec<Value> = state_image_embeddings.into_values().collect();
+    let successful = results.len();
+
+    if results.is_empty() {
+        info!("No embeddings to send to web backend");
+        return Ok(());
+    }
+
+    // Get auth token
+    let auth_manager = AuthManager::new();
+    let access_token = auth_manager
+        .get_access_token()
+        .map_err(|e| format!("Failed to get access token: {}", e))?;
+
+    // Build request payload
+    let request_body = serde_json::json!({
+        "project_id": project_id,
+        "results": results,
+        "total_processed": successful,
+        "successful": successful,
+        "failed": 0
+    });
+
+    // Send to web backend
+    let api_url = get_api_base_url();
+    let endpoint = format!("{}/api/v1/rag/{}/embedding-results", api_url, project_id);
+
+    info!(
+        "Sending {} embedding results to web backend: {}",
+        successful, endpoint
+    );
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&endpoint)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send embeddings to web: {}", e))?;
+
+    if response.status().is_success() {
+        let response_body: Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        info!(
+            "Successfully sent embeddings to web backend: {:?}",
+            response_body
+        );
+        Ok(())
+    } else {
+        let status = response.status();
+        let error_body = response.text().await.unwrap_or_default();
+        Err(format!(
+            "Web backend returned error {}: {}",
+            status, error_body
+        ))
+    }
+}
 
 use super::CommandResponse;
 
@@ -506,5 +654,185 @@ pub async fn get_rag_storage_usage(
             "embeddings_bytes": usage.embeddings_bytes,
             "embeddings_size": crate::rag::storage::StorageUsage::format_bytes(usage.embeddings_bytes),
         })),
+    })
+}
+
+/// Start RAG processing (embedding generation) for a project
+///
+/// This command triggers embedding generation and emits progress events
+/// to the frontend via Tauri events. The frontend can listen to:
+/// - `rag-progress`: Progress updates during processing
+/// - `rag-completion`: Final results when processing completes
+///
+/// # Arguments
+/// * `project_id` - Project ID to process
+/// * `config` - Optional QontinuiConfig to save before processing (for configs loaded from file)
+/// * `app_handle` - Tauri app handle for emitting events
+/// * `state` - RAG state
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Processing started successfully
+/// * `Err(String)` - Error message if start fails
+#[tauri::command]
+pub async fn start_rag_processing(
+    project_id: String,
+    config: Option<QontinuiConfig>,
+    app_handle: AppHandle,
+    state: State<'_, Arc<RAGState>>,
+) -> Result<CommandResponse, String> {
+    info!("Starting RAG processing for project_id={}", project_id);
+
+    // Check if config exists, if not and config is provided, save it
+    let storage = state.storage.lock().await;
+    let config_exists = storage.config_exists(&project_id);
+
+    if !config_exists {
+        if let Some(ref cfg) = config {
+            info!(
+                "Config not found in RAG storage, saving provided config for project_id={}",
+                project_id
+            );
+
+            // Save the config
+            storage
+                .save_qontinui_config(&project_id, cfg)
+                .map_err(|e| format!("Failed to save config: {}", e))?;
+
+            // Also save images to disk for embedding generation
+            let images_path = storage.get_images_path(&project_id);
+            std::fs::create_dir_all(&images_path)
+                .map_err(|e| format!("Failed to create images directory: {}", e))?;
+
+            for image in &cfg.images {
+                let image_path = images_path.join(format!("{}.png", image.id));
+                if let Ok(image_data) =
+                    base64::engine::general_purpose::STANDARD.decode(&image.data)
+                {
+                    if let Err(e) = std::fs::write(&image_path, &image_data) {
+                        warn!("Failed to save image {}: {}", image.id, e);
+                    } else {
+                        info!("Saved image: {:?}", image_path);
+                    }
+                }
+            }
+        } else {
+            drop(storage);
+            return Err(format!("Project not found: {}", project_id));
+        }
+    }
+    drop(storage);
+
+    // Start embedding generation
+    let embedding_generator = state.embedding_generator.lock().await;
+    let mut progress_rx = embedding_generator.generate_embeddings_async(project_id.clone());
+    drop(embedding_generator);
+
+    // Spawn task to listen for progress and emit events
+    let app_handle_clone = app_handle.clone();
+    let project_id_clone = project_id.clone();
+
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            // Convert status to string
+            let status_str = match &progress.status {
+                EmbeddingStatus::NotStarted => "not_started",
+                EmbeddingStatus::InProgress(_) => "in_progress",
+                EmbeddingStatus::Completed => "completed",
+                EmbeddingStatus::Failed(_) => "failed",
+            };
+
+            // Build event payload
+            let mut payload = serde_json::json!({
+                "project_id": project_id_clone,
+                "status": status_str,
+                "message": progress.message,
+            });
+
+            if let Some(percent) = progress.percent {
+                payload["percent"] = serde_json::json!(percent);
+            }
+            if let Some(elements_processed) = progress.elements_processed {
+                payload["elements_processed"] = serde_json::json!(elements_processed);
+            }
+            if let Some(total_elements) = progress.total_elements {
+                payload["total_elements"] = serde_json::json!(total_elements);
+            }
+
+            // Add error message if failed
+            if let EmbeddingStatus::Failed(err) = &progress.status {
+                payload["error"] = serde_json::json!(err);
+            }
+
+            // Emit progress event
+            if let Err(e) = app_handle_clone.emit("rag-progress", &payload) {
+                error!("Failed to emit rag-progress event: {}", e);
+            }
+
+            // If completed or failed, emit completion event and send to web
+            if matches!(
+                progress.status,
+                EmbeddingStatus::Completed | EmbeddingStatus::Failed(_)
+            ) {
+                let is_success = matches!(progress.status, EmbeddingStatus::Completed);
+
+                // If successful, send embeddings to web backend
+                let mut web_sync_success = false;
+                let mut web_sync_error: Option<String> = None;
+
+                if is_success {
+                    info!(
+                        "Embedding generation completed, sending results to web for project_id={}",
+                        project_id_clone
+                    );
+
+                    match send_embeddings_to_web(&project_id_clone).await {
+                        Ok(()) => {
+                            info!(
+                                "Successfully synced embeddings to web for project_id={}",
+                                project_id_clone
+                            );
+                            web_sync_success = true;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to sync embeddings to web for project_id={}: {}",
+                                project_id_clone, e
+                            );
+                            web_sync_error = Some(e);
+                        }
+                    }
+                }
+
+                let completion_payload = serde_json::json!({
+                    "project_id": project_id_clone,
+                    "success": is_success,
+                    "total_processed": progress.elements_processed.unwrap_or(0),
+                    "successful": if is_success {
+                        progress.elements_processed.unwrap_or(0)
+                    } else { 0 },
+                    "failed": if matches!(progress.status, EmbeddingStatus::Failed(_)) {
+                        progress.total_elements.unwrap_or(0)
+                    } else { 0 },
+                    "results": [],
+                    "web_sync_success": web_sync_success,
+                    "web_sync_error": web_sync_error,
+                });
+
+                if let Err(e) = app_handle_clone.emit("rag-completion", &completion_payload) {
+                    error!("Failed to emit rag-completion event: {}", e);
+                }
+
+                break;
+            }
+        }
+    });
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "RAG processing started for project: {}",
+            project_id
+        )),
+        data: None,
     })
 }

@@ -5,7 +5,15 @@
  * Handles login/logout, token refresh, and auth status checking
  */
 
-import { createContext, useContext, useState, useEffect, useCallback, ReactNode, useRef } from "react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  ReactNode,
+  useRef,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthStatus, AuthContextValue, LoginResponse } from "../types";
 
@@ -72,7 +80,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
       setError(null);
       console.log(`[AUTH] refreshAuth() #${callNum} - invoking refresh_token command...`);
       await invoke("refresh_token");
-      console.log(`[AUTH] refreshAuth() #${callNum} - refresh_token succeeded, checking auth status...`);
+      console.log(
+        `[AUTH] refreshAuth() #${callNum} - refresh_token succeeded, checking auth status...`,
+      );
       await checkAuthStatus();
       console.log(`[AUTH] refreshAuth() #${callNum} - completed successfully`);
     } catch (err) {
@@ -151,7 +161,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
    */
   useEffect(() => {
     console.log("[AUTH] useEffect[auto-refresh] triggered:", {
-      "authStatus": authStatus,
+      authStatus: authStatus,
       "authStatus?.authenticated": authStatus?.authenticated,
       "refreshAuth reference": refreshAuth.toString().slice(0, 100),
     });
@@ -161,7 +171,9 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return;
     }
 
-    console.log("[AUTH] useEffect[auto-refresh] - IS authenticated, setting up token refresh timer");
+    console.log(
+      "[AUTH] useEffect[auto-refresh] - IS authenticated, setting up token refresh timer",
+    );
     const intervalId = setInterval(() => {
       console.log("[AUTH] Auto-refresh timer fired - calling refreshAuth()");
       refreshAuth();

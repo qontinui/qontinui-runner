@@ -95,6 +95,11 @@ impl RAGStorage {
         self.get_project_path(project_id).join("embeddings")
     }
 
+    /// Check if a config exists for a project
+    pub fn config_exists(&self, project_id: &str) -> bool {
+        self.get_config_path(project_id).exists()
+    }
+
     /// Save a RAG configuration to disk (legacy format)
     #[deprecated(note = "Use save_qontinui_config instead")]
     pub fn save_config(&self, config: &RAGConfig) -> Result<PathBuf, RAGStorageError> {

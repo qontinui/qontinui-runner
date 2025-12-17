@@ -132,6 +132,7 @@ def extract_elements_from_qontinui_config(config: dict[str, Any]) -> list[dict[s
                     "text_description": f"{pattern_name} in state {state_name}",
                     "state_id": state_id,
                     "state_name": state_name,
+                    "state_image_id": state_image_id,  # For sending results back to web
                     "source_screenshot_id": image_id,  # References images/{image_id}.png
                     "similarity_threshold": pattern.get("similarity", 0.8),
                     "is_defining_element": True,

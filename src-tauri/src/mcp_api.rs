@@ -1152,6 +1152,35 @@ fn emit_ai_output(app_handle: &tauri::AppHandle, line: &str, source: &str) {
     }
 }
 
+/// Write AI debug log to file
+fn write_ai_debug_log(message: &str) {
+    use std::io::Write;
+
+    // Get the .dev-logs directory
+    let log_dir = if let Ok(exe_path) = std::env::current_exe() {
+        exe_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|p| p.join(".dev-logs"))
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    } else {
+        std::path::PathBuf::from(".")
+    };
+
+    let log_file = log_dir.join("ai_execution_debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
+        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let _ = writeln!(file, "[{}] {}", timestamp, message);
+    }
+}
+
 /// Trigger AI analysis via configured provider
 ///
 /// This endpoint triggers AI analysis using the configured provider:
@@ -1161,11 +1190,20 @@ async fn trigger_ai_analysis(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<TriggerAiAnalysisRequest>,
 ) -> Result<Json<ApiResponse<TriggerAiAnalysisResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    write_ai_debug_log("=== AI ANALYSIS TRIGGERED ===");
+
     // Load AI settings
     let ai_settings = settings::get_ai_settings();
     let timeout_secs = request
         .timeout_seconds
         .unwrap_or(ai_settings.claude_cli.timeout_seconds);
+
+    write_ai_debug_log(&format!(
+        "Provider: {:?}, Timeout: {}s, Prompt length: {} chars",
+        ai_settings.provider,
+        timeout_secs,
+        request.prompt.len()
+    ));
 
     info!(
         "MCP API: Triggering AI analysis (provider: {:?}, timeout: {}s, prompt length: {})",
@@ -1175,14 +1213,23 @@ async fn trigger_ai_analysis(
     );
 
     // Emit prompt to frontend
+    write_ai_debug_log("Emitting prompt to frontend...");
     emit_ai_output(&state.app_handle, &request.prompt, "prompt");
+    write_ai_debug_log("Prompt emitted successfully");
+
+    // Emit hourglass indicator to show AI is processing
+    emit_ai_output(&state.app_handle, "⏳ AI is processing...", "status");
 
     let app_handle = state.app_handle.clone();
+    write_ai_debug_log("Starting AI execution...");
+
     let result = match ai_settings.provider {
         AiProvider::ClaudeCli => {
+            write_ai_debug_log("Using Claude CLI provider");
             execute_claude_cli(&ai_settings.claude_cli, &request.prompt, &app_handle).await
         }
         AiProvider::ClaudeApi => {
+            write_ai_debug_log("Using Claude API provider");
             execute_claude_api(&ai_settings.claude_api, &request.prompt, &app_handle).await
         }
     };
@@ -1190,16 +1237,26 @@ async fn trigger_ai_analysis(
     match result {
         Ok(response) => {
             if response.success {
+                write_ai_debug_log("AI analysis completed successfully");
                 info!("MCP API: AI analysis completed successfully");
+                // Emit completion indicator
+                emit_ai_output(&state.app_handle, "✅ AI analysis complete", "status");
             } else {
+                write_ai_debug_log(&format!("AI analysis failed: {:?}", response.error));
                 warn!("MCP API: AI analysis failed: {:?}", response.error);
+                // Emit failure indicator
+                emit_ai_output(&state.app_handle, "❌ AI analysis failed", "status");
             }
+            write_ai_debug_log("=== AI ANALYSIS COMPLETE ===\n");
             Ok(Json(ApiResponse::success(response)))
         }
         Err(e) => {
+            write_ai_debug_log(&format!("AI analysis error: {}", e));
             error!("MCP API: Failed to trigger AI analysis: {}", e);
             // Emit error to frontend
+            emit_ai_output(&state.app_handle, "❌ AI analysis error", "status");
             emit_ai_output(&state.app_handle, &format!("Error: {}", e), "claude");
+            write_ai_debug_log("=== AI ANALYSIS FAILED ===\n");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -1211,10 +1268,18 @@ async fn execute_claude_cli(
     prompt: &str,
     app_handle: &tauri::AppHandle,
 ) -> Result<TriggerAiAnalysisResponse, String> {
+    write_ai_debug_log("execute_claude_cli: Starting");
+
     let system = std::env::consts::OS;
+    write_ai_debug_log(&format!("execute_claude_cli: OS = {}", system));
 
     // Get the working directory (qontinui_parent_directory)
-    let exe_path = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {}", e))?;
+    let exe_path = std::env::current_exe().map_err(|e| {
+        let err = format!("Failed to get exe path: {}", e);
+        write_ai_debug_log(&format!("execute_claude_cli ERROR: {}", err));
+        err
+    })?;
+    write_ai_debug_log(&format!("execute_claude_cli: exe_path = {:?}", exe_path));
 
     // Navigate from exe to qontinui_parent_directory
     let working_dir = exe_path
@@ -1226,51 +1291,199 @@ async fn execute_claude_cli(
         .unwrap_or_else(|| std::path::Path::new("."));
 
     let working_dir_str = working_dir.to_string_lossy().to_string();
+    write_ai_debug_log(&format!(
+        "execute_claude_cli: working_dir = {}",
+        working_dir_str
+    ));
+
     let prompt_owned = prompt.to_string();
+    let prompt_len = prompt_owned.len();
     let custom_path = cli_settings.custom_path.clone();
     let execution_mode = cli_settings.execution_mode;
     let app_handle = app_handle.clone();
 
+    write_ai_debug_log(&format!(
+        "execute_claude_cli: execution_mode = {:?}, custom_path = {:?}, prompt_len = {}",
+        execution_mode, custom_path, prompt_len
+    ));
+
+    write_ai_debug_log("execute_claude_cli: Spawning blocking task...");
+
     // Spawn a blocking task to run the command
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
+        write_ai_debug_log("execute_claude_cli: Inside spawn_blocking");
+
         // Determine execution mode
         let effective_mode = match execution_mode {
             CliExecutionMode::Auto => {
                 if system == "windows" {
+                    write_ai_debug_log("execute_claude_cli: Auto -> WindowsNative (Windows OS)");
                     CliExecutionMode::WindowsNative
                 } else {
+                    write_ai_debug_log("execute_claude_cli: Auto -> Native (non-Windows OS)");
                     CliExecutionMode::Native
                 }
             }
-            mode => mode,
+            mode => {
+                write_ai_debug_log(&format!(
+                    "execute_claude_cli: Using specified mode: {:?}",
+                    mode
+                ));
+                mode
+            }
         };
 
-        match effective_mode {
-            CliExecutionMode::WindowsNative | CliExecutionMode::Auto => execute_windows_native(
-                &working_dir_str,
-                &prompt_owned,
-                custom_path.as_deref(),
-                &app_handle,
-            ),
-            CliExecutionMode::Wsl => execute_via_wsl(
-                &working_dir_str,
-                &prompt_owned,
-                custom_path.as_deref(),
-                &app_handle,
-            ),
-            CliExecutionMode::Native => execute_native(
-                &working_dir_str,
-                &prompt_owned,
-                custom_path.as_deref(),
-                &app_handle,
-            ),
-        }
+        let result = match effective_mode {
+            CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
+                write_ai_debug_log("execute_claude_cli: Calling execute_windows_native");
+                execute_windows_native(
+                    &working_dir_str,
+                    &prompt_owned,
+                    custom_path.as_deref(),
+                    &app_handle,
+                )
+            }
+            CliExecutionMode::Wsl => {
+                write_ai_debug_log("execute_claude_cli: Calling execute_via_wsl");
+                execute_via_wsl(
+                    &working_dir_str,
+                    &prompt_owned,
+                    custom_path.as_deref(),
+                    &app_handle,
+                )
+            }
+            CliExecutionMode::Native => {
+                write_ai_debug_log("execute_claude_cli: Calling execute_native");
+                execute_native(
+                    &working_dir_str,
+                    &prompt_owned,
+                    custom_path.as_deref(),
+                    &app_handle,
+                )
+            }
+        };
+
+        write_ai_debug_log(&format!(
+            "execute_claude_cli: Execution result: {:?}",
+            result.as_ref().map(|r| &r.success)
+        ));
+        result
     })
-    .await
-    .map_err(|e| format!("spawn_blocking error: {}", e))?
+    .await;
+
+    match result {
+        Ok(inner_result) => {
+            write_ai_debug_log("execute_claude_cli: spawn_blocking completed successfully");
+            inner_result
+        }
+        Err(e) => {
+            let err = format!("spawn_blocking error: {}", e);
+            write_ai_debug_log(&format!("execute_claude_cli ERROR: {}", err));
+            Err(err)
+        }
+    }
 }
 
-/// Execute Claude CLI on Windows natively
+/// Streaming text buffer that emits complete lines or paragraphs
+struct StreamingTextBuffer {
+    buffer: String,
+    app_handle: tauri::AppHandle,
+    last_emit_time: std::time::Instant,
+}
+
+impl StreamingTextBuffer {
+    fn new(app_handle: tauri::AppHandle) -> Self {
+        Self {
+            buffer: String::new(),
+            app_handle,
+            last_emit_time: std::time::Instant::now(),
+        }
+    }
+
+    /// Add text to the buffer and emit complete lines/paragraphs
+    fn add_text(&mut self, text: &str) {
+        self.buffer.push_str(text);
+
+        // Check for complete lines or paragraphs to emit
+        self.try_emit();
+    }
+
+    /// Try to emit buffered content if we have complete lines
+    fn try_emit(&mut self) {
+        // Emit on newlines (complete lines) or after timeout with content
+        let should_emit = self.buffer.contains('\n')
+            || (self.buffer.len() > 100 && self.last_emit_time.elapsed().as_millis() > 500);
+
+        if !should_emit {
+            return;
+        }
+
+        // Find the last newline to emit complete lines
+        if let Some(last_newline) = self.buffer.rfind('\n') {
+            let to_emit = self.buffer[..=last_newline].to_string();
+            self.buffer = self.buffer[last_newline + 1..].to_string();
+
+            // Emit each line separately for better formatting
+            for line in to_emit.lines() {
+                if !line.is_empty() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(&self.app_handle, line, "claude");
+                    }));
+                }
+            }
+            self.last_emit_time = std::time::Instant::now();
+        } else if self.buffer.len() > 100 && self.last_emit_time.elapsed().as_millis() > 500 {
+            // Emit partial content if buffer is getting large and time has passed
+            let to_emit = std::mem::take(&mut self.buffer);
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(&self.app_handle, &to_emit, "claude");
+            }));
+            self.last_emit_time = std::time::Instant::now();
+        }
+    }
+
+    /// Flush any remaining content
+    fn flush(&mut self) {
+        if !self.buffer.is_empty() {
+            let to_emit = std::mem::take(&mut self.buffer);
+            for line in to_emit.lines() {
+                if !line.is_empty() {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(&self.app_handle, line, "claude");
+                    }));
+                }
+            }
+        }
+    }
+}
+
+/// Parse a stream-json line and extract text content
+fn parse_stream_json_line(line: &str) -> Option<String> {
+    // Parse the JSON line
+    let json: serde_json::Value = serde_json::from_str(line).ok()?;
+
+    // Handle different event types
+    match json.get("type")?.as_str()? {
+        "content_block_delta" => {
+            // Extract text from delta: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}
+            let delta = json.get("delta")?;
+            if delta.get("type")?.as_str()? == "text_delta" {
+                return delta.get("text")?.as_str().map(String::from);
+            }
+        }
+        "result" => {
+            // Handle result event which contains the full text
+            // {"type":"result","subtype":"success","result":"full text here",...}
+            if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
+                return Some(result.to_string());
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Execute Claude CLI on Windows natively with streaming output
 fn execute_windows_native(
     working_dir: &str,
     prompt: &str,
@@ -1279,110 +1492,224 @@ fn execute_windows_native(
 ) -> Result<TriggerAiAnalysisResponse, String> {
     use std::io::{BufRead, BufReader};
 
+    write_ai_debug_log("execute_windows_native: Starting (streaming mode)");
+    write_ai_debug_log(&format!(
+        "execute_windows_native: working_dir = {}, custom_path = {:?}",
+        working_dir, custom_path
+    ));
+
     // Write prompt to a temp file to avoid shell escaping issues
     let temp_dir = std::env::temp_dir();
     let prompt_file = temp_dir.join("qontinui_ai_prompt.txt");
+    write_ai_debug_log(&format!(
+        "execute_windows_native: Writing prompt to {:?}",
+        prompt_file
+    ));
 
-    std::fs::write(&prompt_file, prompt)
-        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+    std::fs::write(&prompt_file, prompt).map_err(|e| {
+        let err = format!("Failed to write prompt file: {}", e);
+        write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
+        err
+    })?;
+    write_ai_debug_log(&format!(
+        "execute_windows_native: Prompt written ({} bytes)",
+        prompt.len()
+    ));
 
     // On Windows, Claude Code installed via npm uses 'claude.cmd' not 'claude.exe'
     // We use cmd.exe /c to handle both .cmd and .exe files
     let program = custom_path.unwrap_or("claude");
+    write_ai_debug_log(&format!(
+        "execute_windows_native: Using program = {}",
+        program
+    ));
     info!(
-        "Running Claude Code on Windows via cmd.exe: {} with prompt from {:?}",
+        "Running Claude Code on Windows via cmd.exe: {} with prompt from {:?} (streaming mode)",
         program, prompt_file
     );
 
     // Read the prompt file and pipe it to claude via stdin
-    let prompt_content =
-        std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
+    write_ai_debug_log("execute_windows_native: Reading prompt file...");
+    let prompt_content = std::fs::read(&prompt_file).map_err(|e| {
+        let err = format!("Failed to read prompt file: {}", e);
+        write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
+        err
+    })?;
+    write_ai_debug_log(&format!(
+        "execute_windows_native: Read {} bytes from prompt file",
+        prompt_content.len()
+    ));
 
-    // Use cmd.exe /c to run claude (handles .cmd files from npm install)
-    let mut child = std::process::Command::new("cmd.exe")
-        .args([
-            "/c",
-            program,
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "bypassPermissions",
-        ])
-        .current_dir(working_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
+    // Use cmd.exe /c to run claude with stream-json for real-time output
+    write_ai_debug_log("execute_windows_native: Spawning cmd.exe process with stream-json...");
+    let spawn_result = std::panic::catch_unwind(|| {
+        std::process::Command::new("cmd.exe")
+            .args([
+                "/c",
+                program,
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--permission-mode",
+                "bypassPermissions",
+            ])
+            .current_dir(working_dir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+    });
+
+    let mut child = match spawn_result {
+        Ok(Ok(child)) => {
+            write_ai_debug_log("execute_windows_native: Process spawned successfully");
+            child
+        }
+        Ok(Err(e)) => {
+            let err = format!(
                 "Failed to spawn {}: {}. Is Claude Code installed and in PATH?",
                 program, e
-            )
-        })?;
+            );
+            write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
+            return Err(err);
+        }
+        Err(panic) => {
+            let err = format!("PANIC during spawn: {:?}", panic);
+            write_ai_debug_log(&format!("execute_windows_native PANIC: {}", err));
+            return Err(err);
+        }
+    };
 
     // Write prompt to stdin
+    write_ai_debug_log("execute_windows_native: Writing to stdin...");
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
-        stdin
-            .write_all(&prompt_content)
-            .map_err(|e| format!("Failed to write to claude stdin: {}", e))?;
+        if let Err(e) = stdin.write_all(&prompt_content) {
+            let err = format!("Failed to write to claude stdin: {}", e);
+            write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
+            return Err(err);
+        }
+        write_ai_debug_log("execute_windows_native: Stdin written and closed");
         // Stdin is dropped here, signaling EOF to Claude
+    } else {
+        write_ai_debug_log("execute_windows_native WARNING: No stdin available");
     }
-    info!("Prompt written to Claude stdin, waiting for output...");
+    info!("Prompt written to Claude stdin, waiting for streaming output...");
 
-    // Stream stdout line by line
+    // Stream stdout and parse JSON events
+    write_ai_debug_log("execute_windows_native: Reading streaming stdout...");
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let mut all_output = String::new();
     let mut line_count = 0;
+    let mut text_buffer = StreamingTextBuffer::new(app_handle.clone());
 
     if let Some(stdout) = stdout {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                line_count += 1;
-                info!("Claude output line {}: {} chars", line_count, line.len());
-                // Emit each line to frontend
-                emit_ai_output(app_handle, &line, "claude");
-                all_output.push_str(&line);
-                all_output.push('\n');
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    line_count += 1;
+                    if line_count <= 10 || line_count % 100 == 0 {
+                        write_ai_debug_log(&format!(
+                            "execute_windows_native: stream line {} ({} chars)",
+                            line_count,
+                            line.len()
+                        ));
+                    }
+
+                    // Parse the JSON line and extract text
+                    if let Some(text) = parse_stream_json_line(&line) {
+                        all_output.push_str(&text);
+                        text_buffer.add_text(&text);
+                    }
+                }
+                Err(e) => {
+                    write_ai_debug_log(&format!(
+                        "execute_windows_native: stdout read error: {}",
+                        e
+                    ));
+                }
             }
         }
     }
+
+    // Flush any remaining buffered text
+    text_buffer.flush();
+
+    write_ai_debug_log(&format!(
+        "execute_windows_native: stdout complete - {} JSON lines, {} chars extracted",
+        line_count,
+        all_output.len()
+    ));
     info!(
-        "Claude stdout complete: {} lines, {} chars total",
+        "Claude stdout complete: {} JSON lines, {} chars extracted",
         line_count,
         all_output.len()
     );
 
     // Capture any stderr
+    write_ai_debug_log("execute_windows_native: Reading stderr...");
     let mut stderr_output = String::new();
     if let Some(stderr) = stderr {
         let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                stderr_output.push_str(&line);
-                stderr_output.push('\n');
-                // Also emit errors to frontend
-                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+        for line_result in reader.lines() {
+            match line_result {
+                Ok(line) => {
+                    write_ai_debug_log(&format!("execute_windows_native: stderr: {}", line));
+                    stderr_output.push_str(&line);
+                    stderr_output.push('\n');
+                    // Also emit errors to frontend
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                    }));
+                }
+                Err(e) => {
+                    write_ai_debug_log(&format!(
+                        "execute_windows_native: stderr read error: {}",
+                        e
+                    ));
+                }
             }
         }
     }
+    write_ai_debug_log(&format!(
+        "execute_windows_native: stderr complete - {} chars",
+        stderr_output.len()
+    ));
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for claude: {}", e))?;
+    write_ai_debug_log("execute_windows_native: Waiting for process to exit...");
+    let status = match child.wait() {
+        Ok(s) => {
+            write_ai_debug_log(&format!(
+                "execute_windows_native: Process exited with status: {:?}",
+                s
+            ));
+            s
+        }
+        Err(e) => {
+            let err = format!("Failed to wait for claude: {}", e);
+            write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
+            return Err(err);
+        }
+    };
 
+    write_ai_debug_log("execute_windows_native: Cleaning up temp file...");
     let _ = std::fs::remove_file(&prompt_file);
 
     if status.success() {
+        write_ai_debug_log("execute_windows_native: SUCCESS");
         Ok(TriggerAiAnalysisResponse {
             success: true,
             message: "AI analysis completed successfully".to_string(),
             error: None,
         })
     } else {
+        write_ai_debug_log(&format!(
+            "execute_windows_native: FAILED with code {:?}",
+            status.code()
+        ));
         Ok(TriggerAiAnalysisResponse {
             success: false,
             message: all_output,
@@ -1395,7 +1722,7 @@ fn execute_windows_native(
     }
 }
 
-/// Execute Claude CLI via WSL
+/// Execute Claude CLI via WSL with streaming output
 fn execute_via_wsl(
     working_dir: &str,
     prompt: &str,
@@ -1404,12 +1731,19 @@ fn execute_via_wsl(
 ) -> Result<TriggerAiAnalysisResponse, String> {
     use std::io::{BufRead, BufReader};
 
+    write_ai_debug_log("execute_via_wsl: Starting (streaming mode)");
+
     // Convert Windows path to WSL path
     let wsl_working_dir = working_dir.replace('\\', "/").replace("C:", "/mnt/c");
     let program = custom_path.unwrap_or("claude");
 
+    write_ai_debug_log(&format!(
+        "execute_via_wsl: wsl_working_dir = {}, program = {}",
+        wsl_working_dir, program
+    ));
+
     info!(
-        "Running Claude Code via WSL: {} in {}",
+        "Running Claude Code via WSL: {} in {} (streaming mode)",
         program, wsl_working_dir
     );
 
@@ -1425,12 +1759,13 @@ fn execute_via_wsl(
         .replace('\\', "/")
         .replace("C:", "/mnt/c");
 
-    // Use bash to read the file and pipe to claude
+    // Use bash to read the file and pipe to claude with stream-json
     let bash_command = format!(
-        "cd '{}' && cat '{}' | {} --output-format text --permission-mode bypassPermissions",
+        "cd '{}' && cat '{}' | {} --output-format stream-json --verbose --permission-mode bypassPermissions",
         wsl_working_dir, wsl_prompt_file, program
     );
 
+    write_ai_debug_log("execute_via_wsl: Spawning WSL process...");
     let mut child = std::process::Command::new("wsl")
         .args(["bash", "-c", &bash_command])
         .stdout(std::process::Stdio::piped())
@@ -1438,22 +1773,36 @@ fn execute_via_wsl(
         .spawn()
         .map_err(|e| format!("Failed to run WSL: {}. Is WSL installed?", e))?;
 
-    // Stream stdout line by line
+    // Stream stdout and parse JSON events
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let mut all_output = String::new();
+    let mut line_count = 0;
+    let mut text_buffer = StreamingTextBuffer::new(app_handle.clone());
 
     if let Some(stdout) = stdout {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                emit_ai_output(app_handle, &line, "claude");
-                all_output.push_str(&line);
-                all_output.push('\n');
+        for line_result in reader.lines() {
+            if let Ok(line) = line_result {
+                line_count += 1;
+                // Parse the JSON line and extract text
+                if let Some(text) = parse_stream_json_line(&line) {
+                    all_output.push_str(&text);
+                    text_buffer.add_text(&text);
+                }
             }
         }
     }
+
+    // Flush any remaining buffered text
+    text_buffer.flush();
+
+    write_ai_debug_log(&format!(
+        "execute_via_wsl: stdout complete - {} JSON lines, {} chars extracted",
+        line_count,
+        all_output.len()
+    ));
 
     // Capture any stderr
     let mut stderr_output = String::new();
@@ -1463,7 +1812,9 @@ fn execute_via_wsl(
             if let Ok(line) = line {
                 stderr_output.push_str(&line);
                 stderr_output.push('\n');
-                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                }));
             }
         }
     }
@@ -1475,12 +1826,17 @@ fn execute_via_wsl(
     let _ = std::fs::remove_file(&prompt_file);
 
     if status.success() {
+        write_ai_debug_log("execute_via_wsl: SUCCESS");
         Ok(TriggerAiAnalysisResponse {
             success: true,
             message: "AI analysis completed successfully".to_string(),
             error: None,
         })
     } else {
+        write_ai_debug_log(&format!(
+            "execute_via_wsl: FAILED with code {:?}",
+            status.code()
+        ));
         Ok(TriggerAiAnalysisResponse {
             success: false,
             message: all_output,
@@ -1493,7 +1849,7 @@ fn execute_via_wsl(
     }
 }
 
-/// Execute Claude CLI natively (Unix/macOS/Linux)
+/// Execute Claude CLI natively (Unix/macOS/Linux) with streaming output
 fn execute_native(
     working_dir: &str,
     prompt: &str,
@@ -1502,8 +1858,10 @@ fn execute_native(
 ) -> Result<TriggerAiAnalysisResponse, String> {
     use std::io::{BufRead, BufReader, Write};
 
+    write_ai_debug_log("execute_native: Starting (streaming mode)");
+
     let program = custom_path.unwrap_or("claude");
-    info!("Running Claude Code natively: {}", program);
+    info!("Running Claude Code natively: {} (streaming mode)", program);
 
     // Write prompt to a temp file
     let temp_dir = std::env::temp_dir();
@@ -1514,10 +1872,12 @@ fn execute_native(
     let prompt_content =
         std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
 
+    write_ai_debug_log("execute_native: Spawning process with stream-json...");
     let mut child = std::process::Command::new(program)
         .args([
             "--output-format",
-            "text",
+            "stream-json",
+            "--verbose",
             "--permission-mode",
             "bypassPermissions",
         ])
@@ -1539,22 +1899,36 @@ fn execute_native(
             .map_err(|e| format!("Failed to write to claude stdin: {}", e))?;
     }
 
-    // Stream stdout line by line
+    // Stream stdout and parse JSON events
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let mut all_output = String::new();
+    let mut line_count = 0;
+    let mut text_buffer = StreamingTextBuffer::new(app_handle.clone());
 
     if let Some(stdout) = stdout {
         let reader = BufReader::new(stdout);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                emit_ai_output(app_handle, &line, "claude");
-                all_output.push_str(&line);
-                all_output.push('\n');
+        for line_result in reader.lines() {
+            if let Ok(line) = line_result {
+                line_count += 1;
+                // Parse the JSON line and extract text
+                if let Some(text) = parse_stream_json_line(&line) {
+                    all_output.push_str(&text);
+                    text_buffer.add_text(&text);
+                }
             }
         }
     }
+
+    // Flush any remaining buffered text
+    text_buffer.flush();
+
+    write_ai_debug_log(&format!(
+        "execute_native: stdout complete - {} JSON lines, {} chars extracted",
+        line_count,
+        all_output.len()
+    ));
 
     // Capture any stderr
     let mut stderr_output = String::new();
@@ -1564,7 +1938,9 @@ fn execute_native(
             if let Ok(line) = line {
                 stderr_output.push_str(&line);
                 stderr_output.push('\n');
-                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                }));
             }
         }
     }
@@ -1576,12 +1952,17 @@ fn execute_native(
     let _ = std::fs::remove_file(&prompt_file);
 
     if status.success() {
+        write_ai_debug_log("execute_native: SUCCESS");
         Ok(TriggerAiAnalysisResponse {
             success: true,
             message: "AI analysis completed successfully".to_string(),
             error: None,
         })
     } else {
+        write_ai_debug_log(&format!(
+            "execute_native: FAILED with code {:?}",
+            status.code()
+        ));
         Ok(TriggerAiAnalysisResponse {
             success: false,
             message: all_output,

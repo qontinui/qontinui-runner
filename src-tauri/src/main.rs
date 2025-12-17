@@ -195,6 +195,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::rag::search_rag_elements_semantic,
             commands::rag::get_rag_embedding_status,
             commands::rag::get_rag_storage_usage,
+            commands::rag::start_rag_processing,
             // Project logs commands
             commands::project_logs::get_project_log_config,
             commands::project_logs::save_project_log_config,

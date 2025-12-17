@@ -229,94 +229,97 @@ export function useProjectLogs(): UseProjectLogsReturn {
    * @param overrideSources - Optional sources to save instead of config.logSources
    *                          (useful when called immediately after setLogSources due to React async state)
    */
-  const saveConfig = useCallback(async (overrideSources?: LogSource[]) => {
-    if (!config) {
-      setError("No configuration to save");
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-
-    try {
-      // Convert TypeScript camelCase to Rust snake_case
-      // Use override sources if provided (to handle React async state updates)
-      const logSources = overrideSources ?? config.logSources ?? [];
-      const rustConfig = {
-        project_id: config.projectId,
-        project_name: config.projectName,
-        log_sources: logSources.map((s) => ({
-          id: s.id,
-          name: s.name,
-          type: s.type,
-          path: s.path,
-          pattern: s.pattern,
-          tail_lines: s.tailLines,
-          enabled: s.enabled,
-          color: s.color,
-        })),
-        log_directory: config.logDirectory,
-        screenshot_directory: config.screenshotDirectory,
-        ai_output_directory: config.aiOutputDirectory,
-      };
-
-      const response = await invoke<CommandResponse>("save_project_log_config", {
-        config: rustConfig,
-      });
-
-      if (response.success) {
-        hasUnsavedChanges.current = false;
-        console.log("[PROJECT_LOGS] Config saved successfully");
-
-        // Update config with any backend-computed values
-        if (response.data) {
-          const savedConfig = response.data as {
-            project_id: string;
-            project_name: string;
-            log_sources: Array<{
-              id: string;
-              name: string;
-              type: "file" | "directory";
-              path: string;
-              pattern?: string;
-              tail_lines?: number;
-              enabled: boolean;
-              color?: string;
-            }>;
-            log_directory: string;
-            screenshot_directory: string;
-            ai_output_directory: string;
-            updated_at?: string;
-          };
-          setConfig({
-            projectId: savedConfig.project_id,
-            projectName: savedConfig.project_name,
-            logSources: savedConfig.log_sources.map((s) => ({
-              id: s.id,
-              name: s.name,
-              type: s.type,
-              path: s.path,
-              pattern: s.pattern,
-              tailLines: s.tail_lines,
-              enabled: s.enabled,
-              color: s.color,
-            })),
-            logDirectory: savedConfig.log_directory,
-            screenshotDirectory: savedConfig.screenshot_directory,
-            aiOutputDirectory: savedConfig.ai_output_directory,
-            updatedAt: savedConfig.updated_at,
-          });
-        }
-      } else {
-        throw new Error(response.message || "Failed to save config");
+  const saveConfig = useCallback(
+    async (overrideSources?: LogSource[]) => {
+      if (!config) {
+        setError("No configuration to save");
+        return;
       }
-    } catch (err) {
-      console.error("[PROJECT_LOGS] Failed to save config:", err);
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [config]);
+
+      setLoading(true);
+      setError(null);
+
+      try {
+        // Convert TypeScript camelCase to Rust snake_case
+        // Use override sources if provided (to handle React async state updates)
+        const logSources = overrideSources ?? config.logSources ?? [];
+        const rustConfig = {
+          project_id: config.projectId,
+          project_name: config.projectName,
+          log_sources: logSources.map((s) => ({
+            id: s.id,
+            name: s.name,
+            type: s.type,
+            path: s.path,
+            pattern: s.pattern,
+            tail_lines: s.tailLines,
+            enabled: s.enabled,
+            color: s.color,
+          })),
+          log_directory: config.logDirectory,
+          screenshot_directory: config.screenshotDirectory,
+          ai_output_directory: config.aiOutputDirectory,
+        };
+
+        const response = await invoke<CommandResponse>("save_project_log_config", {
+          config: rustConfig,
+        });
+
+        if (response.success) {
+          hasUnsavedChanges.current = false;
+          console.log("[PROJECT_LOGS] Config saved successfully");
+
+          // Update config with any backend-computed values
+          if (response.data) {
+            const savedConfig = response.data as {
+              project_id: string;
+              project_name: string;
+              log_sources: Array<{
+                id: string;
+                name: string;
+                type: "file" | "directory";
+                path: string;
+                pattern?: string;
+                tail_lines?: number;
+                enabled: boolean;
+                color?: string;
+              }>;
+              log_directory: string;
+              screenshot_directory: string;
+              ai_output_directory: string;
+              updated_at?: string;
+            };
+            setConfig({
+              projectId: savedConfig.project_id,
+              projectName: savedConfig.project_name,
+              logSources: savedConfig.log_sources.map((s) => ({
+                id: s.id,
+                name: s.name,
+                type: s.type,
+                path: s.path,
+                pattern: s.pattern,
+                tailLines: s.tail_lines,
+                enabled: s.enabled,
+                color: s.color,
+              })),
+              logDirectory: savedConfig.log_directory,
+              screenshotDirectory: savedConfig.screenshot_directory,
+              aiOutputDirectory: savedConfig.ai_output_directory,
+              updatedAt: savedConfig.updated_at,
+            });
+          }
+        } else {
+          throw new Error(response.message || "Failed to save config");
+        }
+      } catch (err) {
+        console.error("[PROJECT_LOGS] Failed to save config:", err);
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [config],
+  );
 
   /**
    * Add a new log source
