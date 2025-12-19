@@ -383,6 +383,7 @@ impl PythonBridge {
     ///
     /// # Returns
     /// The command response result or an error if timeout or send fails
+    #[allow(clippy::async_yields_async)]
     pub fn send_command_and_wait(
         &mut self,
         command: &str,
@@ -407,7 +408,9 @@ impl PythonBridge {
         let lifecycle = Arc::clone(&self.lifecycle);
         let response_rx = self.runtime.block_on(async {
             let lifecycle_guard = lifecycle.read().await;
-            lifecycle_guard.register_command_response(cmd_id.clone()).await
+            lifecycle_guard
+                .register_command_response(cmd_id.clone())
+                .await
         });
 
         // Send the command

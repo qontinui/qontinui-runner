@@ -204,7 +204,10 @@ impl ExecutorLifecycle {
         let mut lock = self.pending_commands.write().await;
         if let Some(tx) = lock.remove(command_id) {
             if tx.send(result).is_err() {
-                debug!("Command response receiver was dropped for ID: {}", command_id);
+                debug!(
+                    "Command response receiver was dropped for ID: {}",
+                    command_id
+                );
             }
             true
         } else {

@@ -221,10 +221,7 @@ impl FileLogger {
                 .get("confidence")
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0),
-            found: data
-                .get("found")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            found: data.get("found").and_then(|v| v.as_bool()).unwrap_or(false),
             threshold: data
                 .get("threshold")
                 .and_then(|v| v.as_f64())
@@ -242,7 +239,10 @@ impl FileLogger {
                 .get("template_path")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            monitor_index: data.get("monitor_index").and_then(|v| v.as_i64()).map(|v| v as i32),
+            monitor_index: data
+                .get("monitor_index")
+                .and_then(|v| v.as_i64())
+                .map(|v| v as i32),
             debug: data.get("debug").cloned(),
         };
 

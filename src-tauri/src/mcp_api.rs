@@ -1222,8 +1222,12 @@ async fn segment_screenshot(
                                 if bbox_vec.len() != 4 {
                                     return None;
                                 }
-                                let area = seg.get("area").and_then(|a| a.as_i64()).unwrap_or(0) as i32;
-                                let image_base64 = seg.get("image_base64").and_then(|i| i.as_str()).map(|s| s.to_string());
+                                let area =
+                                    seg.get("area").and_then(|a| a.as_i64()).unwrap_or(0) as i32;
+                                let image_base64 = seg
+                                    .get("image_base64")
+                                    .and_then(|i| i.as_str())
+                                    .map(|s| s.to_string());
 
                                 Some(SegmentInfo {
                                     id,
@@ -1253,7 +1257,9 @@ async fn segment_screenshot(
                     processing_time_ms: Some(elapsed.as_millis() as i64),
                 })))
             } else {
-                let error_msg = response.error.unwrap_or_else(|| "Segmentation failed".to_string());
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Segmentation failed".to_string());
                 error!("MCP API: Segmentation failed: {}", error_msg);
 
                 Ok(Json(ApiResponse::success(SegmentScreenshotResponse {
@@ -1509,13 +1515,22 @@ fn log_workflow_event(workflow_id: &str, event_type: &str, message: &str) {
             .append(true)
             .open(&log_file)
         {
-            let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+            let _ = writeln!(
+                file,
+                "{}",
+                serde_json::to_string(&event).unwrap_or_default()
+            );
         }
     }
 }
 
 /// Emit AI output event to frontend
-fn emit_ai_output(app_handle: &tauri::AppHandle, line: &str, source: &str, action_id: Option<&str>) {
+fn emit_ai_output(
+    app_handle: &tauri::AppHandle,
+    line: &str,
+    source: &str,
+    action_id: Option<&str>,
+) {
     let event = AiOutputEvent {
         id: format!(
             "ai-{}-{}",
@@ -1594,12 +1609,16 @@ async fn trigger_ai_analysis(
     // Clone the Arc so the guard owns it and can access it when dropped
     let state_for_guard = state.clone();
     let _guard = scopeguard::guard((), move |_| {
-        state_for_guard.ai_analysis_running.store(false, Ordering::SeqCst);
+        state_for_guard
+            .ai_analysis_running
+            .store(false, Ordering::SeqCst);
         write_ai_debug_log("AI analysis flag cleared");
     });
 
     // Clear any previous stop request
-    state.ai_analysis_stop_requested.store(false, Ordering::SeqCst);
+    state
+        .ai_analysis_stop_requested
+        .store(false, Ordering::SeqCst);
 
     // Generate a unique action_id for this AI analysis session
     // This groups all output from this analysis into one "AI Loop"
@@ -1639,7 +1658,12 @@ async fn trigger_ai_analysis(
     write_ai_debug_log("Prompt emitted successfully");
 
     // Emit hourglass indicator to show AI is processing
-    emit_ai_output(&state.app_handle, "⏳ AI is processing...", "status", Some(&action_id));
+    emit_ai_output(
+        &state.app_handle,
+        "⏳ AI is processing...",
+        "status",
+        Some(&action_id),
+    );
 
     let app_handle = state.app_handle.clone();
     write_ai_debug_log("Starting AI execution...");
@@ -1647,11 +1671,23 @@ async fn trigger_ai_analysis(
     let result = match ai_settings.provider {
         AiProvider::ClaudeCli => {
             write_ai_debug_log("Using Claude CLI provider");
-            execute_claude_cli(&ai_settings.claude_cli, &request.prompt, &app_handle, &action_id).await
+            execute_claude_cli(
+                &ai_settings.claude_cli,
+                &request.prompt,
+                &app_handle,
+                &action_id,
+            )
+            .await
         }
         AiProvider::ClaudeApi => {
             write_ai_debug_log("Using Claude API provider");
-            execute_claude_api(&ai_settings.claude_api, &request.prompt, &app_handle, &action_id).await
+            execute_claude_api(
+                &ai_settings.claude_api,
+                &request.prompt,
+                &app_handle,
+                &action_id,
+            )
+            .await
         }
     };
 
@@ -1661,12 +1697,22 @@ async fn trigger_ai_analysis(
                 write_ai_debug_log("AI analysis completed successfully");
                 info!("MCP API: AI analysis completed successfully");
                 // Emit completion indicator
-                emit_ai_output(&state.app_handle, "✅ AI analysis complete", "status", Some(&action_id));
+                emit_ai_output(
+                    &state.app_handle,
+                    "✅ AI analysis complete",
+                    "status",
+                    Some(&action_id),
+                );
             } else {
                 write_ai_debug_log(&format!("AI analysis failed: {:?}", response.error));
                 warn!("MCP API: AI analysis failed: {:?}", response.error);
                 // Emit failure indicator
-                emit_ai_output(&state.app_handle, "❌ AI analysis failed", "status", Some(&action_id));
+                emit_ai_output(
+                    &state.app_handle,
+                    "❌ AI analysis failed",
+                    "status",
+                    Some(&action_id),
+                );
             }
             write_ai_debug_log("=== AI ANALYSIS COMPLETE ===\n");
             Ok(Json(ApiResponse::success(response)))
@@ -1675,8 +1721,18 @@ async fn trigger_ai_analysis(
             write_ai_debug_log(&format!("AI analysis error: {}", e));
             error!("MCP API: Failed to trigger AI analysis: {}", e);
             // Emit error to frontend
-            emit_ai_output(&state.app_handle, "❌ AI analysis error", "status", Some(&action_id));
-            emit_ai_output(&state.app_handle, &format!("Error: {}", e), "claude", Some(&action_id));
+            emit_ai_output(
+                &state.app_handle,
+                "❌ AI analysis error",
+                "status",
+                Some(&action_id),
+            );
+            emit_ai_output(
+                &state.app_handle,
+                &format!("Error: {}", e),
+                "claude",
+                Some(&action_id),
+            );
             write_ai_debug_log("=== AI ANALYSIS FAILED ===\n");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
@@ -1698,7 +1754,9 @@ async fn stop_ai_analysis(
     }
 
     // Set the stop flag
-    state.ai_analysis_stop_requested.store(true, Ordering::SeqCst);
+    state
+        .ai_analysis_stop_requested
+        .store(true, Ordering::SeqCst);
 
     // Emit status to frontend
     emit_ai_output(
@@ -1730,7 +1788,10 @@ async fn restart_runner(
     // Emit status to frontend so user knows what's happening
     emit_ai_output(
         &state.app_handle,
-        &format!("🔄 Restarting runner in {} seconds: {}", delay_secs, request.reason),
+        &format!(
+            "🔄 Restarting runner in {} seconds: {}",
+            delay_secs, request.reason
+        ),
         "status",
         None, // No action_id for restart status
     );
@@ -1752,14 +1813,17 @@ async fn restart_runner(
 // ============================================================================
 
 /// Helper function to get workspace paths (reused from config.rs pattern)
-fn get_workspace_paths_internal() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+fn get_workspace_paths_internal(
+) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let mut current = exe_path.as_path();
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -1770,9 +1834,14 @@ fn get_workspace_paths_internal() -> Result<(std::path::PathBuf, std::path::Path
         }
     };
 
-    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let workspace_root = runner_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| runner_dir.clone());
     let dev_logs_path = workspace_root.join(".dev-logs");
-    let scripts_path = workspace_root.join("qontinui-claude-config").join("scripts");
+    let scripts_path = workspace_root
+        .join("qontinui-claude-config")
+        .join("scripts");
 
     Ok((workspace_root, dev_logs_path, scripts_path))
 }
@@ -1788,11 +1857,18 @@ async fn spawn_ai_developer_http(
 ) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Generate session_id if not provided
     let session_id = request.session_id.unwrap_or_else(|| {
-        format!("{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), rand::random::<u16>())
+        format!(
+            "{}-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            rand::random::<u16>()
+        )
     });
     let max_iterations = request.max_iterations.unwrap_or(10);
 
-    info!("MCP API: Spawning AI Developer session: {} (max {} iterations)", session_id, max_iterations);
+    info!(
+        "MCP API: Spawning AI Developer session: {} (max {} iterations)",
+        session_id, max_iterations
+    );
 
     let result = tokio::task::spawn_blocking(move || {
         let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
@@ -1819,8 +1895,11 @@ async fn spawn_ai_developer_http(
             "activity_log": []
         });
 
-        std::fs::write(&state_file, serde_json::to_string_pretty(&initial_state).unwrap())
-            .map_err(|e| format!("Failed to write state file: {}", e))?;
+        std::fs::write(
+            &state_file,
+            serde_json::to_string_pretty(&initial_state).unwrap(),
+        )
+        .map_err(|e| format!("Failed to write state file: {}", e))?;
 
         // Write prompt to file
         std::fs::write(&prompt_file, &request.prompt)
@@ -1914,7 +1993,10 @@ async fn stop_ai_developer_http(
     Json(request): Json<StopAiDeveloperRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let session_id = request.session_id;
-    info!("MCP API: Requesting stop for AI Developer session: {}", session_id);
+    info!(
+        "MCP API: Requesting stop for AI Developer session: {}",
+        session_id
+    );
 
     let result = tokio::task::spawn_blocking(move || {
         let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
@@ -1959,55 +2041,80 @@ async fn stop_ai_developer_http(
 /// List all AI Developer sessions
 async fn list_ai_developer_sessions_http(
     State(_state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<ListAiDeveloperSessionsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let result: Result<ListAiDeveloperSessionsResponse, String> = tokio::task::spawn_blocking(move || {
-        let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
+) -> Result<Json<ApiResponse<ListAiDeveloperSessionsResponse>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let result: Result<ListAiDeveloperSessionsResponse, String> =
+        tokio::task::spawn_blocking(move || {
+            let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
 
-        let mut sessions = Vec::new();
+            let mut sessions = Vec::new();
 
-        if let Ok(entries) = std::fs::read_dir(&dev_logs_path) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("ai-developer-") && name.ends_with(".json") && !name.contains("-prompt") {
-                        // Extract session ID
-                        let session_id = name
-                            .strip_prefix("ai-developer-")
-                            .and_then(|s| s.strip_suffix(".json"))
-                            .unwrap_or("unknown")
-                            .to_string();
+            if let Ok(entries) = std::fs::read_dir(&dev_logs_path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        if name.starts_with("ai-developer-")
+                            && name.ends_with(".json")
+                            && !name.contains("-prompt")
+                        {
+                            // Extract session ID
+                            let session_id = name
+                                .strip_prefix("ai-developer-")
+                                .and_then(|s| s.strip_suffix(".json"))
+                                .unwrap_or("unknown")
+                                .to_string();
 
-                        // Try to read state
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
-                                sessions.push(AiDeveloperSessionSummary {
-                                    session_id,
-                                    status: state.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                    iteration: state.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    max_iterations: state.get("max_iterations").and_then(|v| v.as_u64()).unwrap_or(10),
-                                    errors_fixed: state.get("errors_fixed").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
-                                    started_at: state.get("started_at").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                                });
+                            // Try to read state
+                            if let Ok(content) = std::fs::read_to_string(&path) {
+                                if let Ok(state) =
+                                    serde_json::from_str::<serde_json::Value>(&content)
+                                {
+                                    sessions.push(AiDeveloperSessionSummary {
+                                        session_id,
+                                        status: state
+                                            .get("status")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string(),
+                                        iteration: state
+                                            .get("iteration")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0),
+                                        max_iterations: state
+                                            .get("max_iterations")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(10),
+                                        errors_fixed: state
+                                            .get("errors_fixed")
+                                            .and_then(|v| v.as_array())
+                                            .map(|a| a.len())
+                                            .unwrap_or(0),
+                                        started_at: state
+                                            .get("started_at")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("unknown")
+                                            .to_string(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        // Sort by started_at descending (most recent first)
-        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+            // Sort by started_at descending (most recent first)
+            sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
-        Ok(ListAiDeveloperSessionsResponse { sessions })
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
+            Ok(ListAiDeveloperSessionsResponse { sessions })
+        })
+        .await
+        .map_err(|e| {
+            error!("MCP API: spawn_blocking error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Internal error: {}", e))),
+            )
+        })?;
 
     match result {
         Ok(response) => Ok(Json(ApiResponse::success(response))),
@@ -2036,15 +2143,24 @@ async fn read_claude_session_log_http(
 
         // Get last N lines
         let lines: Vec<&str> = content.lines().collect();
-        let start = if lines.len() > lines_to_read { lines.len() - lines_to_read } else { 0 };
+        let start = if lines.len() > lines_to_read {
+            lines.len() - lines_to_read
+        } else {
+            0
+        };
         let tail_content = lines[start..].join("\n");
 
         // Get file size and modification time
         let metadata = std::fs::metadata(&log_file)
             .map_err(|e| format!("Failed to get log file metadata: {}", e))?;
 
-        let modified = metadata.modified()
-            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+        let modified = metadata
+            .modified()
+            .map(|t| {
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            })
             .unwrap_or(0);
 
         Ok(ReadClaudeSessionLogResponse {
@@ -2091,7 +2207,10 @@ async fn get_prompt(
 ) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
     match prompts::get_prompt(&id) {
         Some(prompt) => Ok(Json(ApiResponse::success(prompt))),
-        None => Err((StatusCode::NOT_FOUND, Json(api_error(format!("Prompt not found: {}", id))))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Prompt not found: {}", id))),
+        )),
     }
 }
 
@@ -2153,18 +2272,29 @@ async fn run_prompt(
     Json(request): Json<RunPromptRequest>,
 ) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Get the prompt
-    let prompt = prompts::get_prompt(&id)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error(format!("Prompt not found: {}", id)))))?;
+    let prompt = prompts::get_prompt(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Prompt not found: {}", id))),
+        )
+    })?;
 
     // Generate session_id if not provided
     let session_id = request.session_id.unwrap_or_else(|| {
-        format!("{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), rand::random::<u16>())
+        format!(
+            "{}-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S"),
+            rand::random::<u16>()
+        )
     });
 
     // Use override or prompt's setting
     let max_iterations = request.max_iterations.unwrap_or(prompt.max_iterations);
 
-    info!("MCP API: Running prompt '{}' (session: {}, max_iterations: {})", prompt.name, session_id, max_iterations);
+    info!(
+        "MCP API: Running prompt '{}' (session: {}, max_iterations: {})",
+        prompt.name, session_id, max_iterations
+    );
 
     let result = tokio::task::spawn_blocking(move || {
         let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
@@ -2193,8 +2323,11 @@ async fn run_prompt(
             "activity_log": []
         });
 
-        std::fs::write(&state_file, serde_json::to_string_pretty(&initial_state).unwrap())
-            .map_err(|e| format!("Failed to write state file: {}", e))?;
+        std::fs::write(
+            &state_file,
+            serde_json::to_string_pretty(&initial_state).unwrap(),
+        )
+        .map_err(|e| format!("Failed to write state file: {}", e))?;
 
         // Write prompt content to file
         std::fs::write(&prompt_file, &prompt.content)
@@ -2215,7 +2348,11 @@ async fn run_prompt(
 
         match spawn_result {
             Ok(child) => {
-                info!("MCP API: AI Developer spawned with PID: {} for prompt '{}'", child.id(), prompt.name);
+                info!(
+                    "MCP API: AI Developer spawned with PID: {} for prompt '{}'",
+                    child.id(),
+                    prompt.name
+                );
                 Ok(SpawnAiDeveloperResponse {
                     session_id,
                     state_file: state_file.to_string_lossy().to_string(),
@@ -2620,7 +2757,12 @@ fn execute_windows_native(
                     format!("⏳ AI processing... ({}s elapsed)", secs)
                 };
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(&app_handle_heartbeat, &msg, "status", Some(&action_id_heartbeat));
+                    emit_ai_output(
+                        &app_handle_heartbeat,
+                        &msg,
+                        "status",
+                        Some(&action_id_heartbeat),
+                    );
                 }));
             }
         }
@@ -2649,11 +2791,15 @@ fn execute_windows_native(
 
                             if !text.is_empty() {
                                 // Emit the extracted text immediately
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                    || {
-                                        emit_ai_output(&app_handle_stdout, &text, "claude", Some(&action_id_stdout));
-                                    },
-                                ));
+                                let _ =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        emit_ai_output(
+                                            &app_handle_stdout,
+                                            &text,
+                                            "claude",
+                                            Some(&action_id_stdout),
+                                        );
+                                    }));
                                 all_text.push_str(&text);
                                 write_ai_debug_log(&format!(
                                     "execute_windows_native: stream line {} ({} chars)",
@@ -2722,7 +2868,12 @@ fn execute_windows_native(
     if !stderr_output.is_empty() {
         for line in stderr_output.lines() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", Some(&action_id_owned));
+                emit_ai_output(
+                    app_handle,
+                    &format!("[stderr] {}", line),
+                    "claude",
+                    Some(&action_id_owned),
+                );
             }));
         }
     }
@@ -2849,7 +3000,12 @@ fn execute_via_wsl(
                     format!("⏳ AI processing... ({}s elapsed)", secs)
                 };
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(&app_handle_heartbeat, &msg, "status", Some(&action_id_heartbeat));
+                    emit_ai_output(
+                        &app_handle_heartbeat,
+                        &msg,
+                        "status",
+                        Some(&action_id_heartbeat),
+                    );
                 }));
             }
         }
@@ -2878,11 +3034,15 @@ fn execute_via_wsl(
 
                             if !text.is_empty() {
                                 // Emit the extracted text immediately
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                    || {
-                                        emit_ai_output(&app_handle_stdout, &text, "claude", Some(&action_id_stdout));
-                                    },
-                                ));
+                                let _ =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        emit_ai_output(
+                                            &app_handle_stdout,
+                                            &text,
+                                            "claude",
+                                            Some(&action_id_stdout),
+                                        );
+                                    }));
                                 all_text.push_str(&text);
                             }
                         }
@@ -2946,7 +3106,12 @@ fn execute_via_wsl(
     if !stderr_output.is_empty() {
         for line in stderr_output.lines() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", Some(&action_id_owned));
+                emit_ai_output(
+                    app_handle,
+                    &format!("[stderr] {}", line),
+                    "claude",
+                    Some(&action_id_owned),
+                );
             }));
         }
     }
@@ -3072,7 +3237,12 @@ fn execute_native(
                     format!("⏳ AI processing... ({}s elapsed)", secs)
                 };
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(&app_handle_heartbeat, &msg, "status", Some(&action_id_heartbeat));
+                    emit_ai_output(
+                        &app_handle_heartbeat,
+                        &msg,
+                        "status",
+                        Some(&action_id_heartbeat),
+                    );
                 }));
             }
         }
@@ -3101,11 +3271,15 @@ fn execute_native(
 
                             if !text.is_empty() {
                                 // Emit the extracted text immediately
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                                    || {
-                                        emit_ai_output(&app_handle_stdout, &text, "claude", Some(&action_id_stdout));
-                                    },
-                                ));
+                                let _ =
+                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                        emit_ai_output(
+                                            &app_handle_stdout,
+                                            &text,
+                                            "claude",
+                                            Some(&action_id_stdout),
+                                        );
+                                    }));
                                 all_text.push_str(&text);
                             }
                         }
@@ -3169,7 +3343,12 @@ fn execute_native(
     if !stderr_output.is_empty() {
         for line in stderr_output.lines() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", Some(&action_id_owned));
+                emit_ai_output(
+                    app_handle,
+                    &format!("[stderr] {}", line),
+                    "claude",
+                    Some(&action_id_owned),
+                );
             }));
         }
     }
@@ -3266,7 +3445,12 @@ async fn execute_claude_api(
         };
 
         // Emit error to frontend
-        emit_ai_output(app_handle, &format!("Error: {}", error_message), "claude", Some(action_id));
+        emit_ai_output(
+            app_handle,
+            &format!("Error: {}", error_message),
+            "claude",
+            Some(action_id),
+        );
 
         Ok(TriggerAiAnalysisResponse {
             success: false,
@@ -3288,12 +3472,25 @@ async fn start_workflow_run(
     // Get the prompt
     let prompt = match prompts::get_prompt(&request.prompt_id) {
         Some(p) => p,
-        None => return Err((StatusCode::NOT_FOUND, Json(api_error(format!("Prompt not found: {}", request.prompt_id))))),
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!(
+                    "Prompt not found: {}",
+                    request.prompt_id
+                ))),
+            ))
+        }
     };
 
     // Check if workflow is enabled
     if !prompt.workflow.enabled {
-        return Err((StatusCode::BAD_REQUEST, Json(api_error("Workflow mode not enabled for this prompt".to_string()))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "Workflow mode not enabled for this prompt".to_string(),
+            )),
+        ));
     }
 
     // Start the workflow run
@@ -3310,10 +3507,23 @@ async fn start_workflow_run(
     let action_id = format!("workflow-{}", chrono::Utc::now().timestamp_millis());
 
     // Execute the initial session
-    match execute_claude_cli(&cli_settings, &prompt.content, &state.app_handle, &action_id).await {
+    match execute_claude_cli(
+        &cli_settings,
+        &prompt.content,
+        &state.app_handle,
+        &action_id,
+    )
+    .await
+    {
         Ok(_) => {
-            run.log_event("session_started", &format!("Initial session {} started", session_id));
-            state.workflow_manager.set_active_session(&run.id, Some(session_id)).await;
+            run.log_event(
+                "session_started",
+                &format!("Initial session {} started", session_id),
+            );
+            state
+                .workflow_manager
+                .set_active_session(&run.id, Some(session_id))
+                .await;
         }
         Err(e) => {
             state.workflow_manager.fail_workflow(&run.id, &e).await;
@@ -3333,52 +3543,85 @@ async fn start_workflow_run(
 }
 
 /// Monitor a workflow and auto-spawn continuations when needed
-async fn monitor_workflow(
-    state: Arc<ApiState>,
-    workflow_id: String,
-    prompt: prompts::SavedPrompt,
-) {
+async fn monitor_workflow(state: Arc<ApiState>, workflow_id: String, prompt: prompts::SavedPrompt) {
     let config = &prompt.workflow;
     let check_interval = Duration::from_secs(30); // Check every 30 seconds
     let mut last_phase = 0u32;
 
     info!("Starting workflow monitor for {}", workflow_id);
-    log_workflow_event(&workflow_id, "monitor_started", &format!("Workflow monitor started for '{}'", prompt.name));
+    log_workflow_event(
+        &workflow_id,
+        "monitor_started",
+        &format!("Workflow monitor started for '{}'", prompt.name),
+    );
 
     loop {
         tokio::time::sleep(check_interval).await;
 
         // Check workflow status
-        let run = match state.workflow_manager.check_workflow_status(&workflow_id, &prompt).await {
+        let run = match state
+            .workflow_manager
+            .check_workflow_status(&workflow_id, &prompt)
+            .await
+        {
             Some(r) => r,
             None => {
                 info!("Workflow {} not found, stopping monitor", workflow_id);
-                log_workflow_event(&workflow_id, "monitor_stopped", "Workflow not found, monitor stopping");
+                log_workflow_event(
+                    &workflow_id,
+                    "monitor_stopped",
+                    "Workflow not found, monitor stopping",
+                );
                 break;
             }
         };
 
         // Log phase changes
         if run.current_phase != last_phase {
-            info!("Workflow {} phase: {} -> {}", workflow_id, last_phase, run.current_phase);
-            log_workflow_event(&workflow_id, "phase_changed", &format!("Phase {} -> {} (target: {})", last_phase, run.current_phase, run.completion_value));
+            info!(
+                "Workflow {} phase: {} -> {}",
+                workflow_id, last_phase, run.current_phase
+            );
+            log_workflow_event(
+                &workflow_id,
+                "phase_changed",
+                &format!(
+                    "Phase {} -> {} (target: {})",
+                    last_phase, run.current_phase, run.completion_value
+                ),
+            );
             last_phase = run.current_phase;
         }
 
         match run.status {
             WorkflowStatus::Completed => {
                 info!("Workflow {} completed successfully", workflow_id);
-                log_workflow_event(&workflow_id, "completed", &format!("Workflow completed! Reached phase {}", run.current_phase));
+                log_workflow_event(
+                    &workflow_id,
+                    "completed",
+                    &format!("Workflow completed! Reached phase {}", run.current_phase),
+                );
                 break;
             }
             WorkflowStatus::Failed => {
                 error!("Workflow {} failed: {:?}", workflow_id, run.error_message);
-                log_workflow_event(&workflow_id, "failed", &format!("Workflow failed: {}", run.error_message.unwrap_or_default()));
+                log_workflow_event(
+                    &workflow_id,
+                    "failed",
+                    &format!("Workflow failed: {}", run.error_message.unwrap_or_default()),
+                );
                 break;
             }
             WorkflowStatus::Stalled => {
                 info!("Workflow {} stalled, spawning continuation", workflow_id);
-                log_workflow_event(&workflow_id, "stalled", &format!("No progress detected, spawning continuation session (session #{})", run.sessions_spawned + 1));
+                log_workflow_event(
+                    &workflow_id,
+                    "stalled",
+                    &format!(
+                        "No progress detected, spawning continuation session (session #{})",
+                        run.sessions_spawned + 1
+                    ),
+                );
 
                 // Get the continuation prompt
                 let continuation = if config.continuation_prompt.is_empty() {
@@ -3395,16 +3638,40 @@ async fn monitor_workflow(
                 let cli_settings = ai_settings.claude_cli;
 
                 let action_id = format!("workflow-cont-{}", chrono::Utc::now().timestamp_millis());
-                match execute_claude_cli(&cli_settings, &continuation, &state.app_handle, &action_id).await {
+                match execute_claude_cli(
+                    &cli_settings,
+                    &continuation,
+                    &state.app_handle,
+                    &action_id,
+                )
+                .await
+                {
                     Ok(_) => {
                         let session_id = format!("workflow-{}-cont", &workflow_id[..8]);
-                        state.workflow_manager.set_active_session(&workflow_id, Some(session_id)).await;
+                        state
+                            .workflow_manager
+                            .set_active_session(&workflow_id, Some(session_id))
+                            .await;
                         info!("Spawned continuation session for workflow {}", workflow_id);
-                        log_workflow_event(&workflow_id, "session_spawned", &format!("Continuation session started (total: {})", run.sessions_spawned + 1));
+                        log_workflow_event(
+                            &workflow_id,
+                            "session_spawned",
+                            &format!(
+                                "Continuation session started (total: {})",
+                                run.sessions_spawned + 1
+                            ),
+                        );
                     }
                     Err(e) => {
-                        error!("Failed to spawn continuation for workflow {}: {}", workflow_id, e);
-                        log_workflow_event(&workflow_id, "spawn_failed", &format!("Failed to spawn continuation: {}", e));
+                        error!(
+                            "Failed to spawn continuation for workflow {}: {}",
+                            workflow_id, e
+                        );
+                        log_workflow_event(
+                            &workflow_id,
+                            "spawn_failed",
+                            &format!("Failed to spawn continuation: {}", e),
+                        );
                         state.workflow_manager.fail_workflow(&workflow_id, &e).await;
                         break;
                     }
@@ -3426,7 +3693,10 @@ async fn get_workflow_run(
 ) -> Result<Json<ApiResponse<WorkflowRunResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     match state.workflow_manager.get_run(&run_id).await {
         Some(run) => Ok(Json(ApiResponse::success(WorkflowRunResponse { run }))),
-        None => Err((StatusCode::NOT_FOUND, Json(api_error(format!("Workflow run not found: {}", run_id))))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Workflow run not found: {}", run_id))),
+        )),
     }
 }
 
@@ -3444,11 +3714,17 @@ async fn stop_workflow_run(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<WorkflowRunResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Mark the workflow as failed (which will stop the monitor)
-    state.workflow_manager.fail_workflow(&run_id, "Stopped by user").await;
+    state
+        .workflow_manager
+        .fail_workflow(&run_id, "Stopped by user")
+        .await;
 
     match state.workflow_manager.get_run(&run_id).await {
         Some(run) => Ok(Json(ApiResponse::success(WorkflowRunResponse { run }))),
-        None => Err((StatusCode::NOT_FOUND, Json(api_error(format!("Workflow run not found: {}", run_id))))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Workflow run not found: {}", run_id))),
+        )),
     }
 }
 

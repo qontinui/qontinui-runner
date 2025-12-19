@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 const PROMPTS_FILE: &str = "prompts.json";
@@ -89,6 +89,7 @@ fn default_max_iterations() -> u32 {
 
 impl SavedPrompt {
     /// Create a new prompt with auto-generated ID and timestamps
+    #[allow(dead_code)]
     pub fn new(name: String, content: String) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
@@ -240,7 +241,15 @@ pub fn create_prompt(
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
-    let prompt = SavedPrompt::with_details(name, description, content, category, tags, max_iterations, workflow);
+    let prompt = SavedPrompt::with_details(
+        name,
+        description,
+        content,
+        category,
+        tags,
+        max_iterations,
+        workflow,
+    );
     let created = prompt.clone();
 
     library.prompts.push(prompt);
@@ -251,6 +260,7 @@ pub fn create_prompt(
 }
 
 /// Update an existing prompt
+#[allow(clippy::too_many_arguments)]
 pub fn update_prompt(
     id: &str,
     name: Option<String>,
@@ -319,8 +329,8 @@ pub fn delete_prompt(id: &str) -> Result<(), String> {
 
 /// Import prompts from a JSON array (for bulk import)
 pub fn import_prompts(prompts_json: &str) -> Result<Vec<SavedPrompt>, String> {
-    let imported: Vec<SavedPrompt> =
-        serde_json::from_str(prompts_json).map_err(|e| format!("Failed to parse import JSON: {}", e))?;
+    let imported: Vec<SavedPrompt> = serde_json::from_str(prompts_json)
+        .map_err(|e| format!("Failed to parse import JSON: {}", e))?;
 
     let mut library = load_prompt_library();
     let mut created = Vec::new();
@@ -388,7 +398,9 @@ pub fn search_prompts(query: &str) -> Vec<SavedPrompt> {
             p.name.to_lowercase().contains(&query_lower)
                 || p.description.to_lowercase().contains(&query_lower)
                 || p.category.to_lowercase().contains(&query_lower)
-                || p.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
+                || p.tags
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&query_lower))
         })
         .collect()
 }

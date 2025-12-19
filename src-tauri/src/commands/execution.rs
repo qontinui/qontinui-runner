@@ -946,12 +946,16 @@ pub fn set_input_capture_enabled(
             "enabled": enabled,
         });
 
-        bridge.send_command("set_input_capture_enabled", Some(params))
+        bridge
+            .send_command("set_input_capture_enabled", Some(params))
             .map_err(|e| format!("Failed to set input capture: {}", e))?;
 
         Ok(CommandResponse {
             success: true,
-            message: Some(format!("Input capture {}", if enabled { "enabled" } else { "disabled" })),
+            message: Some(format!(
+                "Input capture {}",
+                if enabled { "enabled" } else { "disabled" }
+            )),
             data: Some(serde_json::json!({ "enabled": enabled })),
         })
     } else {
@@ -968,9 +972,7 @@ pub fn set_input_capture_enabled(
 /// * `Ok(CommandResponse)` - Success with is_monitoring, events_count, session_id
 /// * `Err(String)` - Error if executor not running
 #[tauri::command]
-pub fn get_input_validation_status(
-    state: State<Arc<AppState>>,
-) -> Result<CommandResponse, String> {
+pub fn get_input_validation_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     let mut bridge_lock = state.python_bridge.lock().unwrap();
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
@@ -984,7 +986,8 @@ pub fn get_input_validation_status(
             });
         }
 
-        bridge.send_command("get_input_validation_status", None)
+        bridge
+            .send_command("get_input_validation_status", None)
             .map_err(|e| format!("Failed to get input validation status: {}", e))?;
 
         // Note: The actual response comes from Python asynchronously

@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 // ============================================================================
 // Data Types
@@ -137,8 +137,8 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
         return Err("Checkpoint file does not exist".to_string());
     }
 
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read checkpoint: {}", e))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read checkpoint: {}", e))?;
 
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?;
@@ -204,7 +204,10 @@ impl WorkflowManager {
             runs.insert(run_id.clone(), run.clone());
         }
 
-        info!("Started workflow run {} for prompt '{}'", run_id, prompt.name);
+        info!(
+            "Started workflow run {} for prompt '{}'",
+            run_id, prompt.name
+        );
         Ok(run)
     }
 
@@ -221,12 +224,14 @@ impl WorkflowManager {
     }
 
     /// Update a workflow run
+    #[allow(dead_code)]
     pub async fn update_run(&self, run: WorkflowRun) {
         let mut runs = self.runs.write().await;
         runs.insert(run.id.clone(), run);
     }
 
     /// Remove a completed/failed workflow run
+    #[allow(dead_code)]
     pub async fn remove_run(&self, run_id: &str) {
         let mut runs = self.runs.write().await;
         runs.remove(run_id);
@@ -239,7 +244,10 @@ impl WorkflowManager {
             run.active_session_id = session_id.clone();
             if session_id.is_some() {
                 run.sessions_spawned += 1;
-                run.set_status(WorkflowStatus::Running, &format!("Session started (#{} total)", run.sessions_spawned));
+                run.set_status(
+                    WorkflowStatus::Running,
+                    &format!("Session started (#{} total)", run.sessions_spawned),
+                );
             }
         }
     }
@@ -272,7 +280,10 @@ impl WorkflowManager {
 
                 // Check if complete
                 if phase >= config.completion_value {
-                    run.set_status(WorkflowStatus::Completed, &format!("Reached phase {}", phase));
+                    run.set_status(
+                        WorkflowStatus::Completed,
+                        &format!("Reached phase {}", phase),
+                    );
                     return Some(run.clone());
                 }
             }

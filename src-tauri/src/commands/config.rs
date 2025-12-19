@@ -291,8 +291,8 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<CommandResponse, Stri
 #[tauri::command]
 pub fn get_workspace_paths() -> Result<CommandResponse, String> {
     // Get the current executable's directory
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     // The executable is in qontinui-runner/src-tauri/target/debug or release
     // We need to go up to find the qontinui-runner directory, then up again for workspace
@@ -301,7 +301,9 @@ pub fn get_workspace_paths() -> Result<CommandResponse, String> {
     // Navigate up to find qontinui-runner directory (contains src-tauri)
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -320,7 +322,9 @@ pub fn get_workspace_paths() -> Result<CommandResponse, String> {
         .unwrap_or_else(|| runner_dir.clone());
 
     let dev_logs_path = workspace_root.join(".dev-logs");
-    let scripts_path = workspace_root.join("qontinui-claude-config").join("scripts");
+    let scripts_path = workspace_root
+        .join("qontinui-claude-config")
+        .join("scripts");
     let spawn_script = scripts_path.join("spawn-independent-claude.py");
 
     // Convert paths to strings with forward slashes for cross-platform compatibility in prompts
@@ -380,16 +384,21 @@ pub fn spawn_ai_developer(
     use std::process::Command;
 
     let max_iter = max_iterations.unwrap_or(10);
-    info!("Spawning AI Developer session: {} (max {} iterations)", session_id, max_iter);
+    info!(
+        "Spawning AI Developer session: {} (max {} iterations)",
+        session_id, max_iter
+    );
 
     // Get workspace paths
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let mut current = exe_path.as_path();
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -400,9 +409,14 @@ pub fn spawn_ai_developer(
         }
     };
 
-    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let workspace_root = runner_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| runner_dir.clone());
     let dev_logs_path = workspace_root.join(".dev-logs");
-    let scripts_path = workspace_root.join("qontinui-claude-config").join("scripts");
+    let scripts_path = workspace_root
+        .join("qontinui-claude-config")
+        .join("scripts");
     let spawn_script = scripts_path.join("spawn-independent-claude.py");
     let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
     let prompt_file = dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id));
@@ -425,8 +439,11 @@ pub fn spawn_ai_developer(
         "activity_log": []
     });
 
-    std::fs::write(&state_file, serde_json::to_string_pretty(&initial_state).unwrap())
-        .map_err(|e| format!("Failed to write state file: {}", e))?;
+    std::fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&initial_state).unwrap(),
+    )
+    .map_err(|e| format!("Failed to write state file: {}", e))?;
 
     // Write prompt to file
     std::fs::write(&prompt_file, &prompt)
@@ -479,13 +496,15 @@ pub fn spawn_ai_developer(
 #[tauri::command]
 pub fn read_ai_developer_state(session_id: String) -> Result<CommandResponse, String> {
     // Get workspace paths
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let mut current = exe_path.as_path();
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -496,7 +515,10 @@ pub fn read_ai_developer_state(session_id: String) -> Result<CommandResponse, St
         }
     };
 
-    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let workspace_root = runner_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| runner_dir.clone());
     let dev_logs_path = workspace_root.join(".dev-logs");
     let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
 
@@ -511,8 +533,8 @@ pub fn read_ai_developer_state(session_id: String) -> Result<CommandResponse, St
     let content = std::fs::read_to_string(&state_file)
         .map_err(|e| format!("Failed to read state file: {}", e))?;
 
-    let state: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse state file: {}", e))?;
+    let state: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse state file: {}", e))?;
 
     Ok(CommandResponse {
         success: true,
@@ -537,13 +559,15 @@ pub fn stop_ai_developer(session_id: String) -> Result<CommandResponse, String> 
     info!("Requesting stop for AI Developer session: {}", session_id);
 
     // Get workspace paths
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let mut current = exe_path.as_path();
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -554,7 +578,10 @@ pub fn stop_ai_developer(session_id: String) -> Result<CommandResponse, String> 
         }
     };
 
-    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let workspace_root = runner_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| runner_dir.clone());
     let dev_logs_path = workspace_root.join(".dev-logs");
     let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
 
@@ -570,8 +597,8 @@ pub fn stop_ai_developer(session_id: String) -> Result<CommandResponse, String> 
     let content = std::fs::read_to_string(&state_file)
         .map_err(|e| format!("Failed to read state file: {}", e))?;
 
-    let mut state: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse state file: {}", e))?;
+    let mut state: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse state file: {}", e))?;
 
     // Set stop_requested flag
     state["stop_requested"] = serde_json::Value::Bool(true);
@@ -599,13 +626,15 @@ pub fn stop_ai_developer(session_id: String) -> Result<CommandResponse, String> 
 #[tauri::command]
 pub fn list_ai_developer_sessions() -> Result<CommandResponse, String> {
     // Get workspace paths
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let mut current = exe_path.as_path();
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -616,7 +645,10 @@ pub fn list_ai_developer_sessions() -> Result<CommandResponse, String> {
         }
     };
 
-    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let workspace_root = runner_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| runner_dir.clone());
     let dev_logs_path = workspace_root.join(".dev-logs");
 
     let mut sessions = Vec::new();
@@ -625,7 +657,10 @@ pub fn list_ai_developer_sessions() -> Result<CommandResponse, String> {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("ai-developer-") && name.ends_with(".json") && !name.contains("-prompt") {
+                if name.starts_with("ai-developer-")
+                    && name.ends_with(".json")
+                    && !name.contains("-prompt")
+                {
                     // Extract session ID
                     let session_id = name
                         .strip_prefix("ai-developer-")
@@ -677,17 +712,22 @@ pub fn list_ai_developer_sessions() -> Result<CommandResponse, String> {
 /// * `Ok(CommandResponse)` - Success with log content
 /// * `Err(String)` - Error if log cannot be read
 #[tauri::command]
-pub fn read_claude_session_log(session_id: String, tail_lines: Option<usize>) -> Result<CommandResponse, String> {
+pub fn read_claude_session_log(
+    session_id: String,
+    tail_lines: Option<usize>,
+) -> Result<CommandResponse, String> {
     let lines_to_read = tail_lines.unwrap_or(50);
 
     // Get workspace paths
-    let exe_path = std::env::current_exe()
-        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
     let mut current = exe_path.as_path();
     let runner_dir = loop {
         if let Some(parent) = current.parent() {
-            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+            if parent.join("src-tauri").exists()
+                || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+            {
                 break parent.to_path_buf();
             }
             current = parent;
@@ -698,7 +738,10 @@ pub fn read_claude_session_log(session_id: String, tail_lines: Option<usize>) ->
         }
     };
 
-    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let workspace_root = runner_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| runner_dir.clone());
     let dev_logs_path = workspace_root.join(".dev-logs");
     let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
 
@@ -715,15 +758,24 @@ pub fn read_claude_session_log(session_id: String, tail_lines: Option<usize>) ->
 
     // Get last N lines
     let lines: Vec<&str> = content.lines().collect();
-    let start = if lines.len() > lines_to_read { lines.len() - lines_to_read } else { 0 };
+    let start = if lines.len() > lines_to_read {
+        lines.len() - lines_to_read
+    } else {
+        0
+    };
     let tail_content = lines[start..].join("\n");
 
     // Get file size and modification time for status
     let metadata = std::fs::metadata(&log_file)
         .map_err(|e| format!("Failed to get log file metadata: {}", e))?;
 
-    let modified = metadata.modified()
-        .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+    let modified = metadata
+        .modified()
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        })
         .unwrap_or(0);
 
     Ok(CommandResponse {

@@ -177,7 +177,10 @@ pub fn load_ai_output_log() -> CommandResponse {
                 }
             }
             Err(e) => {
-                warn!("Failed to read line {} from AI output log: {}", line_number, e);
+                warn!(
+                    "Failed to read line {} from AI output log: {}",
+                    line_number, e
+                );
             }
         }
     }
