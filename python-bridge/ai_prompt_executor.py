@@ -62,15 +62,25 @@ class AIPromptExecutor:
         try:
             self.emit_log("info", f"Executing AI prompt: {prompt[:100]}...")
 
-            # Build command
+            # Build command with autonomous execution flags
+            # --permission-mode bypassPermissions: Run without user approval prompts
+            # --output-format text: Plain text output for easier parsing
+            base_args = [
+                "claude",
+                "--output-format",
+                "text",
+                "--permission-mode",
+                "bypassPermissions",
+            ]
+
             if fresh_context:
                 # Use --print for non-interactive execution with fresh context
-                cmd = ["claude", "--print", prompt]
-                self.emit_log("debug", "Using fresh context (--print)")
+                cmd = base_args + ["--print", prompt]
+                self.emit_log("debug", "Using fresh context (--print, bypassPermissions)")
             else:
                 # Use -c for continuing context
-                cmd = ["claude", "-c", prompt]
-                self.emit_log("debug", "Using continuous context (-c)")
+                cmd = base_args + ["-c", prompt]
+                self.emit_log("debug", "Using continuous context (-c, bypassPermissions)")
 
             # Convert timeout from ms to seconds
             timeout_seconds = (timeout / 1000.0) if timeout else 600.0
