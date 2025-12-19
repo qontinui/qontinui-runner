@@ -227,8 +227,8 @@ export class StateDetectionService {
    * @throws {StateDetectionError} If analysis fails
    */
   async processSession(
-    sessionPath: string,
-    config?: StateDetectionConfig,
+    _sessionPath: string,
+    _config?: StateDetectionConfig,
   ): Promise<StateDetectionResult> {
     // This is a stub implementation. In production, this should call:
     // const result = await invoke('process_state_detection_session', { sessionPath, config });

@@ -54,7 +54,7 @@ const STATUS_ICONS: Record<string, React.ReactNode> = {
   skipped: <XCircle className="w-4 h-4" />,
 };
 
-export function IssuesPanel({ onIssueClick }: IssuesPanelProps) {
+export function IssuesPanel({ onIssueClick: _onIssueClick }: IssuesPanelProps) {
   const [issues, setIssues] = useState<DetectedIssue[]>([]);
   const [summary, setSummary] = useState<IssueSessionSummary | null>(null);
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());
@@ -70,7 +70,7 @@ export function IssuesPanel({ onIssueClick }: IssuesPanelProps) {
     updateIssues();
 
     // Subscribe to changes
-    const unsubscribe = issueTracker.subscribe((event: IssueTrackerEvent) => {
+    const unsubscribe = issueTracker.subscribe((_event: IssueTrackerEvent) => {
       updateIssues();
     });
 

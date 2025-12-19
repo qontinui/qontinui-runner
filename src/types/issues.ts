@@ -9,12 +9,7 @@
 export type IssueSeverity = "critical" | "high" | "medium" | "low";
 
 /** Issue types */
-export type IssueType =
-  | "error"
-  | "warning"
-  | "exception"
-  | "type_error"
-  | "runtime_error";
+export type IssueType = "error" | "warning" | "exception" | "type_error" | "runtime_error";
 
 /** Issue status */
 export type IssueStatus = "detected" | "in_progress" | "resolved" | "skipped";
@@ -136,31 +131,29 @@ export const SEVERITY_CONFIG: Record<
 };
 
 /** Status configuration for UI display */
-export const STATUS_CONFIG: Record<
-  IssueStatus,
-  { label: string; color: string; bgColor: string }
-> = {
-  detected: {
-    label: "Detected",
-    color: "text-red-400",
-    bgColor: "bg-red-500/10",
-  },
-  in_progress: {
-    label: "In Progress",
-    color: "text-yellow-400",
-    bgColor: "bg-yellow-500/10",
-  },
-  resolved: {
-    label: "Resolved",
-    color: "text-green-400",
-    bgColor: "bg-green-500/10",
-  },
-  skipped: {
-    label: "Skipped",
-    color: "text-gray-400",
-    bgColor: "bg-gray-500/10",
-  },
-};
+export const STATUS_CONFIG: Record<IssueStatus, { label: string; color: string; bgColor: string }> =
+  {
+    detected: {
+      label: "Detected",
+      color: "text-red-400",
+      bgColor: "bg-red-500/10",
+    },
+    in_progress: {
+      label: "In Progress",
+      color: "text-yellow-400",
+      bgColor: "bg-yellow-500/10",
+    },
+    resolved: {
+      label: "Resolved",
+      color: "text-green-400",
+      bgColor: "bg-green-500/10",
+    },
+    skipped: {
+      label: "Skipped",
+      color: "text-gray-400",
+      bgColor: "bg-gray-500/10",
+    },
+  };
 
 /** Source type labels for UI display */
 export const SOURCE_TYPE_LABELS: Record<IssueSourceType, string> = {

@@ -13,7 +13,17 @@ interface EventManagerContextValue {
   isConnected: boolean;
 }
 
-const EventManagerContext = createContext<EventManagerContextValue | null>(null);
+// Store context in window to survive HMR reloads
+declare global {
+  interface Window {
+    __EVENT_MANAGER_CONTEXT__?: React.Context<EventManagerContextValue | null>;
+  }
+}
+
+// Create context once and store in window to survive HMR reloads
+const EventManagerContext: React.Context<EventManagerContextValue | null> =
+  window.__EVENT_MANAGER_CONTEXT__ ||
+  (window.__EVENT_MANAGER_CONTEXT__ = createContext<EventManagerContextValue | null>(null));
 
 interface EventManagerProviderProps {
   children: ReactNode;

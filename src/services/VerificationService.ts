@@ -62,7 +62,7 @@ class VerificationService {
     try {
       const result = await invoke<{ success: boolean; message?: string }>(
         "save_pending_verification",
-        { verification }
+        { verification },
       );
 
       if (result.success) {
@@ -97,7 +97,7 @@ class VerificationService {
           "[VerificationService] Loaded pending verification:",
           this.currentVerification.id,
           "status:",
-          this.currentVerification.status
+          this.currentVerification.status,
         );
         return this.currentVerification;
       }
@@ -131,9 +131,7 @@ class VerificationService {
   /**
    * Update the status of the pending verification
    */
-  async updateStatus(
-    status: "pending" | "in_progress" | "completed" | "failed"
-  ): Promise<boolean> {
+  async updateStatus(status: "pending" | "in_progress" | "completed" | "failed"): Promise<boolean> {
     try {
       const result = await invoke<{ success: boolean }>("update_verification_status", {
         status,
@@ -164,7 +162,7 @@ class VerificationService {
     if (this.currentVerification.status !== "pending") {
       console.warn(
         "[VerificationService] Verification already in progress or completed:",
-        this.currentVerification.status
+        this.currentVerification.status,
       );
       return null;
     }

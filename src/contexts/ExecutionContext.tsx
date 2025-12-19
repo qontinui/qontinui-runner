@@ -25,6 +25,13 @@ import {
 // Re-export types for backward compatibility
 export type { Config, Workflow } from "../hooks";
 
+// Store context in window to survive HMR
+declare global {
+  interface Window {
+    __EXECUTION_CONTEXT__?: React.Context<ExecutionContextValue | null>;
+  }
+}
+
 interface ExecutionContextValue {
   // Python Executor State
   pythonStatus: "stopped" | "running";
@@ -69,7 +76,11 @@ interface ExecutionContextValue {
   stopExecution: () => Promise<void>;
 }
 
-const ExecutionContext = createContext<ExecutionContextValue | null>(null);
+// Create context once and store in window to survive HMR reloads
+// This prevents "useExecution must be used within ExecutionProvider" errors during HMR
+const ExecutionContext: React.Context<ExecutionContextValue | null> =
+  window.__EXECUTION_CONTEXT__ ||
+  (window.__EXECUTION_CONTEXT__ = createContext<ExecutionContextValue | null>(null));
 
 interface ExecutionProviderProps {
   children: ReactNode;

@@ -94,7 +94,8 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
                 }, 800);
               });
             }
-          } catch (e) {
+            // eslint-disable-next-line @typescript-eslint/no-unused-vars
+          } catch (_e) {
             const errorMsg = "Invalid QR code. Please scan a valid connection QR code.";
             setError(errorMsg);
             setStatusMessage(errorMsg);

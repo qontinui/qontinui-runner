@@ -28,7 +28,7 @@ import {
   Square,
 } from "lucide-react";
 import { issueTracker } from "../services";
-import { groupEntriesIntoLoops, DEFAULT_MAX_LINES, type AiLoop } from "../types/aiLoop";
+import { groupEntriesIntoLoops, DEFAULT_MAX_LINES /* type AiLoop */ } from "../types/aiLoop";
 import type { DetectedIssue } from "../types/issues";
 
 export interface AiOutputLine {
@@ -582,11 +582,11 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
           if (!isPrompt) {
             // Find all consecutive response lines starting from this entry
             let responseLines: string[] = [];
-            let endIndex = index;
+            let _endIndex = index;
             for (let i = index; i < currentLoop.entries.length; i++) {
               if (currentLoop.entries[i].source !== "prompt") {
                 responseLines.push(currentLoop.entries[i].line);
-                endIndex = i;
+                _endIndex = i;
               } else {
                 break;
               }

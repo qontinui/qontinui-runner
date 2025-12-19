@@ -24,7 +24,7 @@ export function VideoRecordingSettings({ onLog }: VideoRecordingSettingsProps) {
     codec: "h264",
   });
 
-  const [saving, setSaving] = useState(false);
+  const [saving, _setSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
 
   const handleToggleEnabled = () => {

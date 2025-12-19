@@ -229,7 +229,7 @@ class AIPromptExecutor:
                 # Execute the prompt with retries
                 retry_count = 0
                 step_success = False
-                step_result = None
+                step_result: dict[str, Any] = {"success": False}
 
                 while retry_count <= step_max_retries and not step_success:
                     if retry_count > 0:

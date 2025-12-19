@@ -40,7 +40,7 @@ type IssueTrackerListener = (event: IssueTrackerEvent) => void;
 // Pattern with JSON payload
 const ISSUE_DETECTED_WITH_JSON_PATTERN = /\[ISSUE:DETECTED\]\s*(\{[\s\S]*?\})/;
 // Simple pattern without JSON (just the marker)
-const ISSUE_DETECTED_SIMPLE_PATTERN = /\[ISSUE:DETECTED\](?!\s*\{)/;
+const _ISSUE_DETECTED_SIMPLE_PATTERN = /\[ISSUE:DETECTED\](?!\s*\{)/;
 const ISSUE_RESOLVED_PATTERN = /\[ISSUE:RESOLVED\]\s*(\{[\s\S]*?\})/;
 const ISSUE_PROGRESS_PATTERN = /\[ISSUE:PROGRESS\]\s*(\{[\s\S]*?\})/;
 

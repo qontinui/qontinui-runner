@@ -11,15 +11,29 @@ Single Responsibility: Coordinate training data export
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from qontinui_train.export.training_export_service import (
+        ExportConfig,
+        TrainingExportService,
+    )
+else:
+    ExportConfig = Any
+    TrainingExportService = Any
+
+EXPORT_AVAILABLE = False
+
 try:
-    from services.training_export_service import ExportConfig, TrainingExportService  # noqa: F401
+    from services.training_export_service import (  # type: ignore[attr-defined]
+        ExportConfig,
+        TrainingExportService,
+    )
 
     EXPORT_AVAILABLE = True
 except ImportError:
-    EXPORT_AVAILABLE = False
     logger.debug("Training export modules not available")
 
 

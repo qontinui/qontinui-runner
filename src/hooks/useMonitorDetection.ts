@@ -62,7 +62,8 @@ export function useMonitorDetection(
       try {
         await invoke("save_last_monitor_index", { monitorIndex: validIndices[0] });
         console.log("[MONITOR_DETECTION] Saved last monitor index (legacy):", validIndices[0]);
-      } catch (legacyError) {
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      } catch (_legacyError) {
         console.error("[MONITOR_DETECTION] Failed to save last monitor indices:", saveError);
       }
     }

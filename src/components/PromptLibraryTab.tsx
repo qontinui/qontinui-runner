@@ -89,7 +89,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
-  const [allTags, setAllTags] = useState<string[]>([]);
+  const [_allTags, _setAllTags] = useState<string[]>([]);
 
   // Edit modal state
   const [editingPrompt, setEditingPrompt] = useState<SavedPrompt | null>(null);
@@ -168,7 +168,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       const response = await fetch(`${API_BASE}/prompts/tags`);
       const result = await response.json();
       if (result.success) {
-        setAllTags(result.data || []);
+        _setAllTags(result.data || []);
       }
     } catch (error) {
       console.error("Failed to load tags:", error);

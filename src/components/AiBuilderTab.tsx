@@ -30,7 +30,7 @@ import {
   ChevronUp,
   GripVertical,
   Square,
-  FileText,
+  // FileText, // unused
   Settings,
   Activity,
   Code,
@@ -968,37 +968,33 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
   const runStandardMode = async (sessionId: string, prompt: string) => {
     console.log("[AI_BUILDER] Running in STANDARD mode via MCP API...");
 
-    try {
-      const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `AI Builder: ${goal.trim() || "Automation analysis"}`,
-          timeout_seconds: 600,
-        }),
+    const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prompt,
+        display_prompt: `AI Builder: ${goal.trim() || "Automation analysis"}`,
+        timeout_seconds: 600,
+      }),
+    });
+
+    const result = await response.json();
+    console.log("[AI_BUILDER] trigger-ai-analysis response:", result);
+
+    if (result.success) {
+      setLastResult({
+        success: true,
+        message: "AI analysis started! Check AI Output tab for results.",
       });
-
-      const result = await response.json();
-      console.log("[AI_BUILDER] trigger-ai-analysis response:", result);
-
-      if (result.success) {
-        setLastResult({
-          success: true,
-          message: "AI analysis started! Check AI Output tab for results.",
-        });
-        setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
-        // Standard mode doesn't track session ID since it uses AI Output tab
-        // Keep button disabled for longer to prevent rapid re-clicking while analysis runs
-        // Analysis typically takes 30-60+ seconds, but we enable after 10s for responsiveness
-        setTimeout(() => setIsRunning(false), 10000);
-        // Note: Input capture is now automatically started/stopped with workflow execution
-        // in Python when captureInputValidation is enabled
-      } else {
-        throw new Error(result.error || "Failed to trigger AI analysis");
-      }
-    } catch (error) {
-      throw error;
+      setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
+      // Standard mode doesn't track session ID since it uses AI Output tab
+      // Keep button disabled for longer to prevent rapid re-clicking while analysis runs
+      // Analysis typically takes 30-60+ seconds, but we enable after 10s for responsiveness
+      setTimeout(() => setIsRunning(false), 10000);
+      // Note: Input capture is now automatically started/stopped with workflow execution
+      // in Python when captureInputValidation is enabled
+    } else {
+      throw new Error(result.error || "Failed to trigger AI analysis");
     }
   };
 

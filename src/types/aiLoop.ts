@@ -62,15 +62,17 @@ export function groupEntriesIntoLoops(entries: AiOutputLine[]): AiLoop[] {
     if (isNewLoop) {
       // Save current loop if exists
       if (currentLoop) {
-        currentLoop.endTime = currentLoop.entries[currentLoop.entries.length - 1]?.timestamp || currentLoop.startTime;
+        currentLoop.endTime =
+          currentLoop.entries[currentLoop.entries.length - 1]?.timestamp || currentLoop.startTime;
         loops.push(currentLoop);
       }
 
       // Start new loop
       loopCounter++;
-      const promptPreview = entry.source === "prompt"
-        ? truncateText(entry.line, PROMPT_PREVIEW_MAX_LENGTH)
-        : "AI Response";
+      const promptPreview =
+        entry.source === "prompt"
+          ? truncateText(entry.line, PROMPT_PREVIEW_MAX_LENGTH)
+          : "AI Response";
 
       currentLoop = {
         id: entry.actionId || `loop-${entry.timestamp}`,
@@ -97,7 +99,8 @@ export function groupEntriesIntoLoops(entries: AiOutputLine[]): AiLoop[] {
 
   // Don't forget the last loop
   if (currentLoop) {
-    currentLoop.endTime = currentLoop.entries[currentLoop.entries.length - 1]?.timestamp || currentLoop.startTime;
+    currentLoop.endTime =
+      currentLoop.entries[currentLoop.entries.length - 1]?.timestamp || currentLoop.startTime;
     loops.push(currentLoop);
   }
 
@@ -117,7 +120,7 @@ export function groupEntriesIntoLoops(entries: AiOutputLine[]): AiLoop[] {
 function shouldStartNewLoop(
   entry: AiOutputLine,
   currentLoop: AiLoop | null,
-  currentActionId: string | undefined
+  currentActionId: string | undefined,
 ): boolean {
   // First entry always starts a loop
   if (!currentLoop) return true;
@@ -149,7 +152,10 @@ export function countLines(text: string): number {
 /**
  * Truncates multiline text to max lines
  */
-export function truncateLines(text: string, maxLines: number): { truncated: string; isTruncated: boolean; totalLines: number } {
+export function truncateLines(
+  text: string,
+  maxLines: number,
+): { truncated: string; isTruncated: boolean; totalLines: number } {
   const lines = text.split("\n");
   const totalLines = lines.length;
   if (totalLines <= maxLines) {

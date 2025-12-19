@@ -503,7 +503,7 @@ function calculateTypeColumnWidth(
   let maxWidth = 0;
 
   for (const action of actions) {
-    const depth = calculateDepth(action, actions);
+    const _depth = calculateDepth(action, actions);
     // For width calculation, assume all actions are visible (worst case)
     const prefix = getTreePrefix(action, actions, parentChildMap, actions);
     // Each character in prefix is ~0.6em in monospace font
@@ -594,14 +594,14 @@ export default function ActionLogTable({
     const visible: ActionLogEntry[] = [];
 
     // Build a set of expanded ancestors for quick lookup
-    const expandedPaths = new Set<string>();
+    const _expandedPaths = new Set<string>();
 
     for (const action of actions) {
       const level = getNestingLevel(action);
 
       // Check if any ancestor is collapsed or if we should show this based on maxLevel
       let isCollapsedByAncestor = false;
-      let isExplicitlyExpanded = false;
+      let _isExplicitlyExpanded = false;
       let currentParent = action.parent_action_id;
 
       // Track all ancestors
@@ -731,8 +731,8 @@ export default function ActionLogTable({
             const level = getNestingLevel(action);
             const levelColors = getLevelColor(level);
             const isEven = index % 2 === 0;
-            const hasChildren = parentChildMap.has(action.id);
-            const isCollapsed = collapsedActions.has(action.id);
+            const _hasChildren = parentChildMap.has(action.id);
+            const _isCollapsed = collapsedActions.has(action.id);
             const treePrefix = getTreePrefix(action, actions, parentChildMap, visibleActions);
 
             // Check if this action has children at all
@@ -745,10 +745,10 @@ export default function ActionLogTable({
             );
 
             // Check if this action is at maxLevel (children would be filtered by default)
-            const isAtMaxLevel = level === maxLevel;
+            const _isAtMaxLevel = level === maxLevel;
 
             // Check if children are beyond maxLevel (would need manual expand to see)
-            const hasChildrenBeyondMaxLevel = children.some((childId) => {
+            const _hasChildrenBeyondMaxLevel = children.some((childId) => {
               const child = actions.find((a) => a.id === childId);
               return child && getNestingLevel(child) > maxLevel;
             });

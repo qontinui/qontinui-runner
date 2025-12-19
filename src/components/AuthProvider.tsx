@@ -17,7 +17,17 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import type { AuthStatus, AuthContextValue, LoginResponse } from "../types";
 
-const AuthContext = createContext<AuthContextValue | null>(null);
+// Store context in window to survive HMR reloads
+declare global {
+  interface Window {
+    __AUTH_CONTEXT__?: React.Context<AuthContextValue | null>;
+  }
+}
+
+// Create context once and store in window to survive HMR reloads
+const AuthContext: React.Context<AuthContextValue | null> =
+  window.__AUTH_CONTEXT__ ||
+  (window.__AUTH_CONTEXT__ = createContext<AuthContextValue | null>(null));
 
 interface AuthProviderProps {
   children: ReactNode;

@@ -15,7 +15,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from PIL import Image
 from qontinui.rag import (
@@ -271,7 +271,7 @@ async def generate_embeddings_for_project(project_id: str) -> None:
                 use_full_image = element_data.get("use_full_image", False)
                 if use_full_image or not element.bounding_box:
                     # Use the full image (for patterns)
-                    element_image = Image.open(image_path)
+                    element_image = cast(Image.Image, Image.open(image_path))
                 else:
                     # Crop from screenshot using bounding box
                     element_image = crop_element_from_screenshot(image_path, element.bounding_box)

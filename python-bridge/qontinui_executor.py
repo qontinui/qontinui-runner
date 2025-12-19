@@ -1291,11 +1291,12 @@ class QontinuiExecutor:
             # Convert to numpy array via PIL
             import numpy as np
             from PIL import Image
+            from PIL.Image import Image as PILImage
 
             pil_image = Image.open(io.BytesIO(image_bytes))
             # Convert to RGB if necessary (SAM expects RGB)
             if pil_image.mode != "RGB":
-                pil_image = pil_image.convert("RGB")
+                pil_image: PILImage = pil_image.convert("RGB")  # type: ignore[no-redef]
             screenshot = np.array(pil_image)
 
             self.event_manager.emit_log(
@@ -1305,7 +1306,7 @@ class QontinuiExecutor:
 
             # Try to use SAM3 via SegmentVectorizer
             try:
-                from qontinui.rag.segment_vectorizer import SegmentVectorizer
+                from qontinui.rag.segment_vectorizer import SegmentVectorizer, HAS_SAM3
 
                 # Get options
                 min_area = params.get("min_area", 100)
@@ -1315,14 +1316,26 @@ class QontinuiExecutor:
                 vectorizer = SegmentVectorizer()
 
                 # Check if SAM is available
-                if not vectorizer.sam_available:
+                if not HAS_SAM3:
                     self.event_manager.emit_log(
                         "warning",
                         "SAM3 not available, falling back to grid segmentation. Install sam2 package for better results.",
                     )
 
                 # Run segmentation
-                segments_raw = vectorizer.segment_image(screenshot)
+                # Run segmentation - vectorize_screenshot returns SegmentVector objects
+                segment_vectors = vectorizer.vectorize_screenshot(screenshot)
+
+                # Convert SegmentVector objects to dict format
+                segments_raw = [
+                    {
+                        "id": f"segment_{idx}",
+                        "bbox": seg.bbox,
+                        "area": seg.area,
+                        "image": None,  # Not directly available from SegmentVector
+                    }
+                    for idx, seg in enumerate(segment_vectors)
+                ]
 
                 # Convert to output format
                 segments = []
@@ -1366,7 +1379,7 @@ class QontinuiExecutor:
                 return {
                     "success": True,
                     "segments": segments,
-                    "sam_available": vectorizer.sam_available,
+                    "sam_available": HAS_SAM3,
                 }
 
             except ImportError as e:
