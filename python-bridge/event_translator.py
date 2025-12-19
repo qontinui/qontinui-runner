@@ -81,6 +81,11 @@ class EventTranslator:
         self.collector = collector
         self._real_stdout = sys.stdout
 
+        # Store last click coordinates for correlation with ACTION_COMPLETED events
+        # This allows us to include actual click coordinates in the action log
+        self._last_click_coordinates: tuple[int, int] | None = None
+        self._last_click_timestamp: float | None = None
+
         if not QONTINUI_AVAILABLE:
             raise RuntimeError(
                 "EventTranslator requires qontinui library to be installed. "
@@ -122,9 +127,18 @@ class EventTranslator:
 
         print("[EventTranslator] register_all_callbacks() completed", file=sys.stderr, flush=True)
 
+        # Register MOUSE_CLICKED callback to capture click coordinates
+        # These coordinates are correlated with ACTION_COMPLETED for CLICK actions
+        print(
+            "[EventTranslator] Registering MOUSE_CLICKED callback...",
+            file=sys.stderr,
+            flush=True,
+        )
+        register_callback(QontinuiEventType.MOUSE_CLICKED, self.on_mouse_clicked)
+        print("[EventTranslator] MOUSE_CLICKED callback registered", file=sys.stderr, flush=True)
+
         # Future: Additional callbacks can be registered here
         # register_callback(QontinuiEventType.ACTION_STARTED, self.on_action_started)
-        # register_callback(QontinuiEventType.MOUSE_CLICKED, self.on_mouse_clicked)
 
     def on_match_attempted(self, event) -> None:
         """Translate MATCH_ATTEMPTED event to IMAGE_RECOGNITION format.
@@ -552,7 +566,11 @@ class EventTranslator:
             sys.stdout = current_stdout
 
     def on_mouse_clicked(self, event) -> None:
-        """Translate mouse click event to ACTION_EXECUTION format.
+        """Handle mouse click event - store coordinates for ACTION_COMPLETED correlation.
+
+        This method stores the click coordinates so they can be included in the
+        action log when the corresponding CLICK action completes. It also records
+        the click to the UnifiedDataCollector for inclusion in ActionExecutionRecord.
 
         Args:
             event: qontinui Event object with type=MOUSE_CLICKED
@@ -560,39 +578,38 @@ class EventTranslator:
                   - x: X coordinate of click
                   - y: Y coordinate of click
                   - button: Mouse button clicked ('left', 'right', 'middle')
-                  - action_id: ID of the action (optional)
-                  - success: Whether click succeeded
-
-        Emits:
-            ACTION_EXECUTION event with click location information
-
-        Note:
-            This is a placeholder for future implementation.
+                  - timestamp: Time of click
+                  - target_type: Type of target (optional)
         """
         current_stdout = sys.stdout
         sys.stdout = self._real_stdout
 
         try:
             data = event.data
+            x = data.get("x", 0)
+            y = data.get("y", 0)
+            button = data.get("button", "left")
+            timestamp = data.get("timestamp", 0)
+            target_type = data.get("target_type", "unknown")
 
-            frontend_data = {
-                "action_type": "CLICK",
-                "action_id": data.get("action_id", ""),
-                "success": data.get("success", True),
-                "attempts": 1,
-                "config": {},
-                "x": data.get("x", 0),
-                "y": data.get("y", 0),
-                "button": data.get("button", "left"),
-                "raw_message": f"Clicked at ({data.get('x', 0)}, {data.get('y', 0)})",
-            }
+            # Store for correlation with ACTION_COMPLETED (backup method)
+            self._last_click_coordinates = (x, y)
+            self._last_click_timestamp = timestamp
 
-            # Add hierarchy information if hierarchy_lookup callback is available
-            if self.hierarchy_lookup:
-                hierarchy = self.hierarchy_lookup()
-                frontend_data["hierarchy"] = hierarchy
-
-            self.emitter("action_execution", frontend_data)
+            # Record to collector for inclusion in ActionExecutionRecord
+            if self.collector is not None:
+                self.collector.record_click(x=x, y=y, button=button, target_type=target_type)
+                print(
+                    f"[EventTranslator] MOUSE_CLICKED recorded to collector: ({x}, {y})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[EventTranslator] MOUSE_CLICKED stored (no collector): ({x}, {y}) at {timestamp}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         finally:
             sys.stdout = current_stdout
@@ -685,6 +702,21 @@ class EventTranslator:
             # Add typed text for TYPE actions
             if action_type == "TYPE" and "text" in result_dict:
                 frontend_data["typed_text"] = result_dict["text"]
+
+            # Add click coordinates for CLICK actions
+            if action_type in ("CLICK", "DOUBLE_CLICK", "RIGHT_CLICK"):
+                if self._last_click_coordinates is not None:
+                    frontend_data["clicked_location"] = {
+                        "x": self._last_click_coordinates[0],
+                        "y": self._last_click_coordinates[1],
+                    }
+                    print(
+                        f"[EventTranslator] Added click coordinates to {action_type}: {self._last_click_coordinates}",
+                        file=sys.stderr,
+                    )
+                    # Clear after use to avoid stale data
+                    self._last_click_coordinates = None
+                    self._last_click_timestamp = None
 
             # Add error info if failed
             if not success:

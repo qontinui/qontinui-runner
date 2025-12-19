@@ -14,7 +14,6 @@ import time
 
 import pytest
 
-from models.action_execution_record import ActionExecutionRecord
 from services.tree_view_layer import TreeNode, TreeViewLayer
 
 

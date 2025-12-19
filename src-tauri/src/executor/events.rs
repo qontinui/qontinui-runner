@@ -1,3 +1,4 @@
+use super::file_logger::FileLogger;
 use super::lifecycle::ExecutorMessage;
 use super::protocol::ExecutorEvent;
 use crate::commands::AppState;
@@ -64,6 +65,9 @@ impl EventForwarder {
                 timestamp,
                 sequence,
             } => {
+                // Log to file
+                FileLogger::log_general_event(&event, &data, timestamp);
+
                 let event_obj = ExecutorEvent {
                     event_type: "event".to_string(),
                     event,
@@ -82,6 +86,9 @@ impl EventForwarder {
                 timestamp,
                 sequence,
             } => {
+                // Log to file (action logs)
+                FileLogger::log_tree_event(&event_type, &node, &path, timestamp, sequence);
+
                 // Emit tree event with all data
                 let tree_event = json!({
                     "type": "tree_event",
@@ -113,6 +120,9 @@ impl EventForwarder {
                 }
             }
             ExecutorMessage::Error { message, details } => {
+                // Log to file
+                FileLogger::log_error(&message, details.as_deref());
+
                 let error_event = json!({
                     "type": "error",
                     "error": "executor_error",
@@ -124,6 +134,9 @@ impl EventForwarder {
                 }
             }
             ExecutorMessage::ImageRecognition { data } => {
+                // Log to file (with screenshot saving)
+                FileLogger::log_image_recognition(&data);
+
                 // Emit image recognition event with debug data
                 // Use "event" field to match frontend's expectation (data.event === "image_recognition")
                 let image_recognition_event = json!({

@@ -12,9 +12,6 @@ This module tests the ScreenshotService:
 """
 
 import json
-from pathlib import Path
-
-import pytest
 
 from services.screenshot_service import ScreenshotService
 
@@ -370,7 +367,7 @@ class TestCleanupOldScreenshots:
             service.store_debug_visual(sample_png_bytes, f"action-{i:03d}", {})
 
         # Keep only the last 2
-        deleted = service.cleanup_old_screenshots(keep_last_n=2)
+        service.cleanup_old_screenshots(keep_last_n=2)
 
         # Should have deleted 3 debug visuals (plus any screenshots)
         debug_visuals = sorted(service.debug_visuals_dir.glob("debug-*.png"))

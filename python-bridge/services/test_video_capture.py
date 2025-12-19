@@ -95,7 +95,7 @@ def test_basic_recording():
     output_path = service.stop_recording()
 
     if output_path:
-        print(f"Recording stopped successfully!")
+        print("Recording stopped successfully!")
         print(f"Output file: {output_path}")
         print(f"Is recording: {service.is_recording()}")
 

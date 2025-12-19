@@ -9,10 +9,12 @@ mod error;
 mod executor;
 mod logging;
 mod mcp_api;
+mod prompts;
 mod rag;
 mod settings;
 mod storage;
 mod video_recorder;
+mod workflow_monitor;
 
 use commands::AppState;
 use display::profiles::ActionLogProfile;
@@ -121,6 +123,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::save_last_monitor_indices,
             commands::config::get_auto_load_last_config,
             commands::config::save_auto_load_last_config,
+            commands::config::get_workspace_paths,
+            // AI Developer commands
+            commands::config::spawn_ai_developer,
+            commands::config::read_ai_developer_state,
+            commands::config::stop_ai_developer,
+            commands::config::list_ai_developer_sessions,
+            commands::config::read_claude_session_log,
             // Dataset commands
             commands::dataset::scan_local_images,
             commands::dataset::package_dataset,
@@ -137,6 +146,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution::open_folder,
             commands::execution::update_capture_settings,
             commands::execution::get_workflow_required_screens,
+            // Input validation commands
+            commands::execution::set_input_capture_enabled,
+            commands::execution::get_input_validation_status,
             // State machine commands
             commands::state_machine::execute_transition,
             commands::state_machine::navigate_to_state,
@@ -186,6 +198,12 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::logging::append_ai_output_log,
             commands::logging::clear_ai_output_log,
             commands::logging::get_ai_output_log_path_cmd,
+            commands::logging::load_ai_output_log,
+            // Verification commands (AI self-healing)
+            commands::verification::save_pending_verification,
+            commands::verification::load_pending_verification,
+            commands::verification::clear_pending_verification,
+            commands::verification::update_verification_status,
             // RAG commands
             commands::rag::list_rag_configs,
             commands::rag::get_rag_config,
@@ -215,6 +233,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
+
+            // Clear runner log files from previous session
+            executor::FileLogger::clear_logs();
+            info!("Cleared previous runner log files");
 
             // Position window at top-center of screen and maximize height
             if let Some(window) = app.get_webview_window("main") {

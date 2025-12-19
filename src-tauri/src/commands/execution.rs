@@ -915,3 +915,93 @@ pub fn get_workflow_required_screens(
         })),
     })
 }
+
+/// Enable or disable input capture for coordinate validation.
+///
+/// When enabled, input events (mouse clicks, keyboard) will be automatically
+/// captured during workflow execution. This allows comparing reported click
+/// positions with actual captured positions for coordinate validation.
+///
+/// # Arguments
+/// * `enabled` - Whether to enable input capture during execution
+/// * `state` - Application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with enabled status
+/// * `Err(String)` - Error if executor not running
+#[tauri::command]
+pub fn set_input_capture_enabled(
+    enabled: bool,
+    state: State<Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    info!("Setting input capture enabled: {}", enabled);
+
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Err("Python executor is not running".to_string());
+        }
+
+        let params = serde_json::json!({
+            "enabled": enabled,
+        });
+
+        bridge.send_command("set_input_capture_enabled", Some(params))
+            .map_err(|e| format!("Failed to set input capture: {}", e))?;
+
+        Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Input capture {}", if enabled { "enabled" } else { "disabled" })),
+            data: Some(serde_json::json!({ "enabled": enabled })),
+        })
+    } else {
+        Err("Python executor not initialized".to_string())
+    }
+}
+
+/// Get input validation capture status.
+///
+/// # Arguments
+/// * `state` - Application state containing the Python bridge
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with is_monitoring, events_count, session_id
+/// * `Err(String)` - Error if executor not running
+#[tauri::command]
+pub fn get_input_validation_status(
+    state: State<Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return Ok(CommandResponse {
+                success: true,
+                message: None,
+                data: Some(serde_json::json!({
+                    "is_monitoring": false,
+                    "events_count": 0
+                })),
+            });
+        }
+
+        bridge.send_command("get_input_validation_status", None)
+            .map_err(|e| format!("Failed to get input validation status: {}", e))?;
+
+        // Note: The actual response comes from Python asynchronously
+        // For now, just confirm the command was sent
+        Ok(CommandResponse {
+            success: true,
+            message: Some("Status query sent".to_string()),
+            data: None,
+        })
+    } else {
+        Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::json!({
+                "is_monitoring": false,
+                "events_count": 0
+            })),
+        })
+    }
+}

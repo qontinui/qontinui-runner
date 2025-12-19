@@ -14,7 +14,7 @@
       "actions": [
         {
           "id": "trigger-lint-fix",
-          "type": "TRIGGER_AI_ANALYSIS",
+          "type": "AI_PROMPT",
           "name": "Start Fixing Linting Errors",
           "config": {
             "provider": "claude",
@@ -48,7 +48,7 @@
       "actions": [
         {
           "id": "trigger-type-fix",
-          "type": "TRIGGER_AI_ANALYSIS",
+          "type": "AI_PROMPT",
           "name": "Start Fixing Type Errors",
           "config": {
             "provider": "claude",
@@ -89,7 +89,7 @@
       "actions": [
         {
           "id": "trigger-refactor",
-          "type": "TRIGGER_AI_ANALYSIS",
+          "type": "AI_PROMPT",
           "name": "Start Refactoring",
           "config": {
             "provider": "claude",
@@ -117,7 +117,7 @@
       "actions": [
         {
           "id": "trigger-migration",
-          "type": "TRIGGER_AI_ANALYSIS",
+          "type": "AI_PROMPT",
           "name": "Start Database Migration",
           "config": {
             "provider": "claude",

@@ -1,6 +1,7 @@
 use super::state::ExecutorState;
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -108,6 +109,17 @@ pub struct ExecutionCompletionResult {
     pub data: Option<serde_json::Value>,
 }
 
+/// Result of a command response
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandResponseResult {
+    /// Whether the command was successful
+    pub success: bool,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// Response data from the command
+    pub data: Option<serde_json::Value>,
+}
+
 /// Manages executor lifecycle and state transitions
 pub struct ExecutorLifecycle {
     /// Current executor state
@@ -122,6 +134,10 @@ pub struct ExecutorLifecycle {
     /// Channel for notifying when execution completes
     execution_complete_tx:
         Arc<RwLock<Option<tokio::sync::oneshot::Sender<ExecutionCompletionResult>>>>,
+
+    /// Pending command responses - maps command ID to oneshot sender
+    pending_commands:
+        Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandResponseResult>>>>,
 
     /// Whether lifecycle has been started
     #[allow(dead_code)]
@@ -138,6 +154,7 @@ impl ExecutorLifecycle {
             event_queue: Arc::new(RwLock::new(Vec::new())),
             ready_tx: None,
             execution_complete_tx: Arc::new(RwLock::new(None)),
+            pending_commands: Arc::new(RwLock::new(HashMap::new())),
             started: Arc::new(RwLock::new(false)),
         }
     }
@@ -161,6 +178,37 @@ impl ExecutorLifecycle {
             if tx.send(result).is_err() {
                 debug!("Execution completion receiver was dropped");
             }
+        }
+    }
+
+    /// Registers a oneshot channel to receive a command response by ID.
+    /// Returns a receiver that will receive the result when the command completes.
+    pub async fn register_command_response(
+        &self,
+        command_id: String,
+    ) -> tokio::sync::oneshot::Receiver<CommandResponseResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut lock = self.pending_commands.write().await;
+        lock.insert(command_id, tx);
+        rx
+    }
+
+    /// Notifies any waiting command response channel.
+    /// Called when a Response message is received.
+    /// Returns true if a handler was found and notified.
+    pub async fn notify_command_response(
+        &self,
+        command_id: &str,
+        result: CommandResponseResult,
+    ) -> bool {
+        let mut lock = self.pending_commands.write().await;
+        if let Some(tx) = lock.remove(command_id) {
+            if tx.send(result).is_err() {
+                debug!("Command response receiver was dropped for ID: {}", command_id);
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -393,8 +441,29 @@ impl ExecutorLifecycle {
                 }
             }
 
-            _ => {
-                // Forward other messages (Response, etc.)
+            ExecutorMessage::Response {
+                ref id,
+                success,
+                ref data,
+                ref error,
+            } => {
+                debug!("Received command response for ID: {}", id);
+
+                // Notify any waiting handler
+                let result = CommandResponseResult {
+                    success,
+                    error: error.clone(),
+                    data: data.clone(),
+                };
+
+                let notified = self.notify_command_response(id, result).await;
+                if notified {
+                    debug!("Command response delivered to waiting handler: {}", id);
+                } else {
+                    debug!("No handler waiting for command response: {}", id);
+                }
+
+                // Forward message for logging/debugging purposes
                 Ok(Some(message))
             }
         }

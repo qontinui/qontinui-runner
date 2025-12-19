@@ -33,12 +33,86 @@ class LogManager {
   // Deduplication state
   private lastLogMessage: string | null = null;
 
+  // Initialization state
+  private initialized = false;
+  private initializationPromise: Promise<void> | null = null;
+
   constructor() {
     this.logStore = new LogStore();
     this.logFilter = new LogFilter();
     this.logFormatter = new LogFormatter();
     this.timestampFormatter = new TimestampFormatter();
     this.imageLogHandler = new ImageLogHandler(this.timestampFormatter);
+  }
+
+  /**
+   * Initialize the LogManager by loading conversation history from disk.
+   * This should be called once on app startup.
+   * Safe to call multiple times - subsequent calls will return immediately.
+   */
+  async initialize(): Promise<void> {
+    // Return existing promise if initialization is in progress
+    if (this.initializationPromise) {
+      return this.initializationPromise;
+    }
+
+    // Skip if already initialized
+    if (this.initialized) {
+      return;
+    }
+
+    this.initializationPromise = this.doInitialize();
+    return this.initializationPromise;
+  }
+
+  private async doInitialize(): Promise<void> {
+    try {
+      console.log("[LogManager] Initializing - loading conversation history...");
+
+      // Rust returns snake_case field names
+      interface RustAiOutputEntry {
+        id: string;
+        timestamp: number;
+        line: string;
+        source: string;
+        action_id?: string;
+      }
+
+      const result = await invoke<{
+        success: boolean;
+        message?: string;
+        data?: { entries: RustAiOutputEntry[] };
+      }>("load_ai_output_log");
+
+      if (result.success && result.data?.entries) {
+        // Map from Rust snake_case to TypeScript camelCase
+        const entries: AiOutputEntry[] = result.data.entries.map((entry) => ({
+          id: entry.id,
+          timestamp: entry.timestamp,
+          line: entry.line,
+          source: entry.source,
+          actionId: entry.action_id,
+        }));
+
+        this.logStore.loadAiOutputLogs(entries);
+        console.log(`[LogManager] Loaded ${entries.length} conversation entries from history`);
+      } else {
+        console.log("[LogManager] No conversation history to load");
+      }
+
+      this.initialized = true;
+    } catch (error) {
+      console.error("[LogManager] Failed to load conversation history:", error);
+      // Mark as initialized even on error to prevent repeated failures
+      this.initialized = true;
+    }
+  }
+
+  /**
+   * Check if the LogManager has been initialized
+   */
+  isInitialized(): boolean {
+    return this.initialized;
   }
 
   /**

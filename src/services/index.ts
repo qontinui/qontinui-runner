@@ -32,3 +32,17 @@ export { VideoRecordingService } from "./VideoRecordingService";
 
 // State Detection Services
 export { StateDetectionService } from "./StateDetectionService";
+
+// Issue Tracking Services
+export { IssueTracker, issueTracker } from "./IssueTracker";
+export type { IssueTrackerEventType, IssueTrackerEvent } from "./IssueTracker";
+
+// Verification Services (AI self-healing)
+export { verificationService } from "./VerificationService";
+export type {
+  PendingVerification,
+  VerificationPendingMarker,
+  VerificationCompletedMarker,
+  VerificationFailedMarker,
+  RunnerRestartMarker,
+} from "./VerificationService";

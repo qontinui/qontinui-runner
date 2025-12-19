@@ -12,14 +12,13 @@ If no video_path is provided, the script will create a test video.
 import sys
 import time
 from pathlib import Path
-from typing import List
 
 from frame_extractor_service import EventFilter, FrameExtractorService
 
 from models.input_event import InputMonitorEvent
 
 
-def create_test_events(start_time: float, count: int = 10) -> List[InputMonitorEvent]:
+def create_test_events(start_time: float, count: int = 10) -> list[InputMonitorEvent]:
     """Create sample input events for testing.
 
     Args:
@@ -248,8 +247,7 @@ def create_test_video(output_path: Path) -> bool:
 
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
 
@@ -282,11 +280,10 @@ def main():
             return
     else:
         video_path = Path(__file__).parent / "test_video.mp4"
-        if not video_path.exists():
-            if not create_test_video(video_path):
-                print("\nPlease provide a video file as argument:")
-                print("  python test_frame_extractor.py <video_path>")
-                return
+        if not video_path.exists() and not create_test_video(video_path):
+            print("\nPlease provide a video file as argument:")
+            print("  python test_frame_extractor.py <video_path>")
+            return
 
     print(f"\nUsing video: {video_path}")
 

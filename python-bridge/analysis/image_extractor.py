@@ -109,7 +109,7 @@ class StateImageExtractor:
         # Step 3: Extract regions around click locations
         if self.config.extract_at_click_locations and click_locations:
             for click_x, click_y in click_locations:
-                for i, frame in enumerate(state_frames):
+                for _i, frame in enumerate(state_frames):
                     try:
                         state_image = self.extract_at_location(
                             frame.image,

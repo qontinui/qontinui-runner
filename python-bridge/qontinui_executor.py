@@ -83,6 +83,7 @@ from event_translator import EventTranslator  # noqa: E402
 from execution_tree import ExecutionNode, ExecutionTree  # noqa: E402
 from executor_core import ExecutorCore  # noqa: E402
 from gui_automation import GUIAutomation  # noqa: E402
+from services.input_monitor_service import InputMonitorService  # noqa: E402
 from services.screenshot_service import ScreenshotService  # noqa: E402
 from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
 from services.web_extraction_service import WebExtractionService  # noqa: E402
@@ -176,6 +177,12 @@ class QontinuiExecutor:
         # Unified data collector (initialized after config load)
         self.unified_data_collector = None
         self.screenshot_service = None
+
+        # InputMonitorService for validation capture (initialized on demand)
+        self.input_monitor_service = None
+        # Flag to enable input capture during workflow execution
+        self.capture_input_for_validation = False
+        self._input_capture_session_id: str | None = None
 
         # GUIAutomation (initialized after config load)
         self.gui_automation = None
@@ -457,6 +464,66 @@ class QontinuiExecutor:
 
         return success  # type: ignore[no-any-return]
 
+    def _start_input_capture_for_execution(self, session_id: str) -> bool:
+        """Start input capture for coordinate validation during execution.
+
+        Args:
+            session_id: Session ID for this capture session
+
+        Returns:
+            True if started successfully
+        """
+        if not self.capture_input_for_validation:
+            return False
+
+        try:
+            if self.input_monitor_service is None:
+                dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs"
+                dev_logs_dir.mkdir(parents=True, exist_ok=True)
+                self.input_monitor_service = InputMonitorService(storage_dir=dev_logs_dir)
+                self.event_manager.emit_log(
+                    "info", f"InputMonitorService initialized: {dev_logs_dir}"
+                )
+
+            self.input_monitor_service.start_monitoring(session_id=session_id, fps=30)
+            self._input_capture_session_id = session_id
+            self.event_manager.emit_log(
+                "info", f"Input capture started for execution validation: session={session_id}"
+            )
+            return True
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to start input capture: {e}")
+            return False
+
+    def _stop_input_capture_for_execution(self) -> dict[str, Any] | None:
+        """Stop input capture and return results.
+
+        Returns:
+            Dict with events_file and events_count, or None if not running
+        """
+        if self.input_monitor_service is None or not self._input_capture_session_id:
+            return None
+
+        try:
+            events_file = self.input_monitor_service.stop_monitoring()
+            events_count = len(self.input_monitor_service.get_events())
+            session_id = self._input_capture_session_id
+            self._input_capture_session_id = None
+
+            self.event_manager.emit_log(
+                "info",
+                f"Input capture stopped: {events_count} events captured, file={events_file}",
+            )
+            return {
+                "session_id": session_id,
+                "events_file": str(events_file) if events_file else None,
+                "events_count": events_count,
+            }
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to stop input capture: {e}")
+            self._input_capture_session_id = None
+            return None
+
     def execute_workflow(
         self, workflow_id: str, transition_context: dict | None = None
     ) -> dict[str, Any]:
@@ -595,6 +662,11 @@ class QontinuiExecutor:
         self.is_running = True
         self.gui_automation.set_running(True)
 
+        # Start input capture for coordinate validation if enabled
+        if self.capture_input_for_validation:
+            capture_session_id = f"exec-{workflow_id}-{int(time.time())}"
+            self._start_input_capture_for_execution(capture_session_id)
+
         # Start WebSocket session if enabled
         if self.websocket_handler.is_enabled():
             self.websocket_handler.start_session(config_snapshot=self.config)
@@ -673,6 +745,9 @@ class QontinuiExecutor:
                 self.websocket_handler.end_session(status="failed", error=str(e))
 
         finally:
+            # Stop input capture for coordinate validation
+            self._stop_input_capture_for_execution()
+
             self.is_running = False
             self.gui_automation.set_running(False)
 
@@ -681,6 +756,9 @@ class QontinuiExecutor:
         if self.is_running:
             self.event_manager.emit_log("info", "Stopping execution...")
             self.is_running = False
+
+            # Stop input capture for coordinate validation
+            self._stop_input_capture_for_execution()
 
             if self.gui_automation:
                 self.gui_automation.set_running(False)
@@ -930,6 +1008,34 @@ class QontinuiExecutor:
         elif cmd_type == "manual_capture_status":
             return {"success": True, "is_running": self.capture_manager.is_manual_capture_running()}
 
+        elif cmd_type == "set_input_capture_enabled":
+            # Enable/disable input capture for coordinate validation during execution
+            # When enabled, input will be automatically captured during workflow execution
+            enabled = params.get("enabled", False)
+            self.capture_input_for_validation = enabled
+            self.event_manager.emit_log(
+                "info",
+                f"Input capture for validation {'enabled' if enabled else 'disabled'}",
+            )
+            return {"success": True, "enabled": enabled}
+
+        elif cmd_type == "get_input_validation_status":
+            # Get current input validation status
+            is_monitoring = (
+                self.input_monitor_service is not None
+                and self._input_capture_session_id is not None
+            )
+            events_count = 0
+            if self.input_monitor_service and is_monitoring:
+                events_count = len(self.input_monitor_service.get_events())
+            return {
+                "success": True,
+                "enabled": self.capture_input_for_validation,
+                "is_monitoring": is_monitoring,
+                "events_count": events_count,
+                "session_id": self._input_capture_session_id,
+            }
+
         elif cmd_type == "ws_configure":
             # Direct stderr output for debugging (use [info] format so Rust logs at info level)
             import sys
@@ -1023,6 +1129,10 @@ class QontinuiExecutor:
         # Screenshot capture command (for direct capture via Python)
         elif cmd_type == "capture_screenshot":
             return self._handle_capture_screenshot(params)
+
+        # SAM3 segmentation command
+        elif cmd_type == "segment_screenshot":
+            return self._handle_segment_screenshot(params)
 
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
@@ -1126,6 +1236,163 @@ class QontinuiExecutor:
                 flush=True,
             )
             self.event_manager.emit_log("error", f"Failed to capture screenshot: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_segment_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle SAM3 segmentation command.
+
+        This uses the qontinui library's SegmentVectorizer with SAM3 to
+        segment a screenshot into UI elements.
+
+        Args:
+            params: Command parameters:
+                - screenshot_base64: Base64 encoded image data
+                - min_area: Optional minimum segment area in pixels
+                - model: Optional SAM model name
+
+        Returns:
+            Dictionary with:
+                - success: Whether segmentation succeeded
+                - segments: List of segment info with id, bbox, area, image_base64
+                - error: Error message (if failed)
+        """
+        import base64
+        import io
+        import sys
+
+        print(
+            "[info    ] EXECUTOR: _handle_segment_screenshot called",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            # Get screenshot data
+            screenshot_base64 = params.get("screenshot_base64", "")
+            if not screenshot_base64:
+                return {"success": False, "error": "No screenshot_base64 provided"}
+
+            # Remove data URL prefix if present
+            if "," in screenshot_base64:
+                screenshot_base64 = screenshot_base64.split(",", 1)[1]
+
+            # Decode base64 to image
+            try:
+                image_bytes = base64.b64decode(screenshot_base64)
+            except Exception as e:
+                return {"success": False, "error": f"Failed to decode base64: {e}"}
+
+            # Convert to numpy array via PIL
+            import numpy as np
+            from PIL import Image
+
+            pil_image = Image.open(io.BytesIO(image_bytes))
+            # Convert to RGB if necessary (SAM expects RGB)
+            if pil_image.mode != "RGB":
+                pil_image = pil_image.convert("RGB")
+            screenshot = np.array(pil_image)
+
+            self.event_manager.emit_log(
+                "info",
+                f"Segmenting screenshot: {screenshot.shape[1]}x{screenshot.shape[0]} pixels",
+            )
+
+            # Try to use SAM3 via SegmentVectorizer
+            try:
+                from qontinui.rag.segment_vectorizer import SegmentVectorizer
+
+                # Get options
+                min_area = params.get("min_area", 100)
+                params.get("model")
+
+                # Create vectorizer (will try to use SAM3)
+                vectorizer = SegmentVectorizer()
+
+                # Check if SAM is available
+                if not vectorizer.sam_available:
+                    self.event_manager.emit_log(
+                        "warning",
+                        "SAM3 not available, falling back to grid segmentation. Install sam2 package for better results.",
+                    )
+
+                # Run segmentation
+                segments_raw = vectorizer.segment_image(screenshot)
+
+                # Convert to output format
+                segments = []
+                for i, seg in enumerate(segments_raw):
+                    # Get bounding box
+                    bbox = seg.get("bbox", [0, 0, 0, 0])
+                    if isinstance(bbox, tuple):
+                        bbox = list(bbox)
+
+                    # Get area
+                    area = seg.get("area", 0)
+                    if area < min_area:
+                        continue
+
+                    # Get cropped image if available
+                    image_base64_out = None
+                    if "image" in seg and seg["image"] is not None:
+                        cropped = seg["image"]
+                        if isinstance(cropped, np.ndarray):
+                            # Convert numpy array to base64
+                            cropped_pil = Image.fromarray(cropped)
+                            buffer = io.BytesIO()
+                            cropped_pil.save(buffer, format="PNG", compress_level=6)
+                            buffer.seek(0)
+                            image_base64_out = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+                    segments.append(
+                        {
+                            "id": seg.get("id", f"segment_{i}"),
+                            "bbox": bbox,
+                            "area": area,
+                            "image_base64": image_base64_out,
+                        }
+                    )
+
+                self.event_manager.emit_log(
+                    "info",
+                    f"Segmentation complete: {len(segments)} segments found",
+                )
+
+                return {
+                    "success": True,
+                    "segments": segments,
+                    "sam_available": vectorizer.sam_available,
+                }
+
+            except ImportError as e:
+                self.event_manager.emit_log(
+                    "error",
+                    f"SegmentVectorizer not available: {e}",
+                )
+                return {
+                    "success": False,
+                    "error": f"SegmentVectorizer not available: {e}",
+                }
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to segment screenshot: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            import traceback
+
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to segment screenshot: {e}")
             return {"success": False, "error": str(e)}
 
     def _get_web_extraction_service(self) -> WebExtractionService:

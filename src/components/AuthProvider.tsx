@@ -25,12 +25,21 @@ interface AuthProviderProps {
 
 const TOKEN_REFRESH_INTERVAL = 14 * 60 * 1000; // 14 minutes (tokens expire in 15 minutes)
 
+// Development auto-login credentials
+const DEV_AUTO_LOGIN = {
+  email: "josh@qontinui.io",
+  password: "admin123",
+};
+
 export function AuthProvider({ children }: AuthProviderProps) {
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // In dev mode, we wait for auto-login to complete before showing the app
+  const [devAutoLoginPending, setDevAutoLoginPending] = useState(import.meta.env.DEV);
   const mountCountRef = useRef(0);
   const refreshCallCountRef = useRef(0);
+  const hasAttemptedDevLogin = useRef(false);
 
   // Log mount/unmount
   useEffect(() => {
@@ -157,6 +166,46 @@ export function AuthProvider({ children }: AuthProviderProps) {
   }, [checkAuthStatus]);
 
   /**
+   * Development mode auto-login
+   * Automatically logs in with dev credentials when not authenticated in dev mode
+   */
+  useEffect(() => {
+    // Only run in development mode
+    if (!import.meta.env.DEV) {
+      setDevAutoLoginPending(false);
+      return;
+    }
+
+    // Wait for auth check to complete
+    if (loading) {
+      return;
+    }
+
+    // If already authenticated, clear pending flag (covers both initial auth and successful auto-login)
+    if (authStatus?.authenticated) {
+      console.log("[AUTH] Dev mode: Authenticated, clearing devAutoLoginPending");
+      setDevAutoLoginPending(false);
+      return;
+    }
+
+    // Only attempt auto-login once to avoid infinite loops
+    if (hasAttemptedDevLogin.current) {
+      // Already attempted but not authenticated - login must have failed
+      // Clear pending flag so user can see login screen
+      setDevAutoLoginPending(false);
+      return;
+    }
+
+    // Auto-login in development
+    console.log("[AUTH] Dev mode: Not authenticated, attempting auto-login...");
+    hasAttemptedDevLogin.current = true;
+    login(DEV_AUTO_LOGIN.email, DEV_AUTO_LOGIN.password).catch((err) => {
+      console.error("[AUTH] Dev mode auto-login failed:", err);
+      // Don't set devAutoLoginPending here - the effect will re-run and handle it above
+    });
+  }, [loading, authStatus?.authenticated, login]);
+
+  /**
    * Set up auto-refresh timer when authenticated
    */
   useEffect(() => {
@@ -189,6 +238,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
     authStatus,
     loading,
     error,
+    devAutoLoginPending,
     login,
     logout,
     refreshAuth,

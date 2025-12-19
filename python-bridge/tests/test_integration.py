@@ -16,11 +16,9 @@ import json
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
 
 import pytest
 
-from models.action_execution_record import ActionExecutionRecord
 from services.screenshot_service import ScreenshotService
 from services.tree_view_layer import TreeViewLayer
 from services.unified_data_collector import UnifiedDataCollector

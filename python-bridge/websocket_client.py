@@ -795,6 +795,127 @@ class RunnerWebSocketClient:
             except Exception as e:
                 logger.error(f"Error in on_error callback: {e}")
 
+    async def send_issue_detected(self, issue_data: dict[str, Any]) -> bool:
+        """
+        Send a detected issue to the server.
+
+        This is called when the IssueTracker in the frontend detects a new issue
+        from AI output parsing.
+
+        Args:
+            issue_data: Issue data matching DetectedIssue schema:
+                - id: str (client-generated UUID)
+                - type: str (error, warning, exception, type_error, runtime_error)
+                - severity: str (critical, high, medium, low)
+                - title: str
+                - description: str | None
+                - file: str | None
+                - line: int | None
+                - source: dict (type, path, line_range, description)
+                - status: str (detected, in_progress, resolved, skipped)
+                - detected_at: str (ISO timestamp)
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        if not self.session_id:
+            logger.warning("Cannot send issue: No active session")
+            return False
+
+        message = {
+            "type": "issue_detected",
+            "session_id": self.session_id,
+            "project_id": self.project_id,
+            "payload": issue_data,
+            "timestamp": self._get_timestamp(),
+        }
+
+        logger.info(f"Sending detected issue: {issue_data.get('title', 'Unknown')[:50]}")
+
+        try:
+            return await self.send_message(message)
+        except Exception as e:
+            logger.error(f"Error sending issue_detected: {e}")
+            return False
+
+    async def send_issue_updated(
+        self,
+        issue_id: str,
+        status: str,
+        resolution: str | None = None,
+    ) -> bool:
+        """
+        Send an issue status update to the server.
+
+        This is called when an issue status changes (e.g., marked as resolved).
+
+        Args:
+            issue_id: The issue ID
+            status: New status (detected, in_progress, resolved, skipped)
+            resolution: Optional resolution description
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        if not self.session_id:
+            logger.warning("Cannot send issue update: No active session")
+            return False
+
+        message = {
+            "type": "issue_updated",
+            "session_id": self.session_id,
+            "payload": {
+                "id": issue_id,
+                "status": status,
+                "resolution": resolution,
+                "updated_at": self._get_timestamp(),
+            },
+            "timestamp": self._get_timestamp(),
+        }
+
+        logger.info(f"Sending issue update: {issue_id} -> {status}")
+
+        try:
+            return await self.send_message(message)
+        except Exception as e:
+            logger.error(f"Error sending issue_updated: {e}")
+            return False
+
+    async def send_issues_sync(self, issues: list[dict[str, Any]]) -> bool:
+        """
+        Sync all issues to the server (bulk update).
+
+        This is called periodically or when the session ends to ensure
+        all issues are persisted to the backend.
+
+        Args:
+            issues: List of issue data dictionaries
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        if not self.session_id:
+            logger.warning("Cannot sync issues: No active session")
+            return False
+
+        message = {
+            "type": "issues_sync",
+            "session_id": self.session_id,
+            "project_id": self.project_id,
+            "payload": {
+                "issues": issues,
+            },
+            "timestamp": self._get_timestamp(),
+        }
+
+        logger.info(f"Syncing {len(issues)} issues to server")
+
+        try:
+            return await self.send_message(message)
+        except Exception as e:
+            logger.error(f"Error sending issues_sync: {e}")
+            return False
+
     def get_stats(self) -> dict[str, Any]:
         """
         Get client statistics.

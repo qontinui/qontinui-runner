@@ -86,9 +86,8 @@ class EventFilter:
                 return False
 
         # Check key for keyboard events
-        if event.key is not None and self.keys is not None:
-            if event.key not in self.keys:
-                return False
+        if event.key is not None and self.keys is not None and event.key not in self.keys:
+            return False
 
         # Check modifiers
         if self.modifiers is not None:
@@ -206,8 +205,7 @@ class FrameExtractorService:
             # Execute FFmpeg
             result = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
 
@@ -377,8 +375,7 @@ class FrameExtractorService:
                 # Execute FFmpeg
                 result = subprocess.run(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
 
@@ -477,8 +474,7 @@ class FrameExtractorService:
                 # Execute FFmpeg
                 result = subprocess.run(
                     cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    capture_output=True,
                     creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
                 )
 
@@ -687,8 +683,7 @@ class FrameExtractorService:
 
             result = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
 
@@ -730,8 +725,7 @@ class FrameExtractorService:
 
             result = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
 

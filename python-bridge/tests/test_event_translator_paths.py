@@ -10,7 +10,7 @@ with screenshot data, it:
 import base64
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, Mock
+from unittest.mock import Mock
 
 import pytest
 

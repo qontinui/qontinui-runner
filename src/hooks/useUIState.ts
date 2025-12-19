@@ -7,7 +7,15 @@
 
 import { useState } from "react";
 
-export type LogTab = "general" | "image" | "actions" | "ai" | "rag" | "external" | "settings";
+export type LogTab =
+  | "general"
+  | "image"
+  | "actions"
+  | "ai"
+  | "issues"
+  | "rag"
+  | "external"
+  | "settings";
 
 export interface UseUIStateResult {
   // Tab state

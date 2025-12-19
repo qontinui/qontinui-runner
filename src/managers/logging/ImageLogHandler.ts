@@ -59,6 +59,7 @@ export class ImageLogHandler {
       imageData: data.image_data,
       matchedRegionImage: data.matched_region_image, // Cropped region from screenshot at match location
       debug: data.debug,
+      monitorIndex: data.monitor_index, // Which monitor was captured (null/undefined = all monitors)
     };
   }
 

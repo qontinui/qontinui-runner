@@ -45,6 +45,7 @@ pub mod rag;
 pub mod screenshot;
 pub mod state_machine;
 pub mod storage;
+pub mod verification;
 pub mod video;
 pub mod websocket;
 

@@ -4,7 +4,7 @@ This module provides a workflow-level context store that persists across actions
 during workflow execution. It enables:
 - User-defined context values via CAPTURE_CONTEXT action
 - Auto-populated execution context (errors, screenshots, etc.)
-- Template variable resolution for TRIGGER_AI_ANALYSIS prompts
+- Template variable resolution for AI_PROMPT prompts
 
 Following the Single Responsibility Principle, this module:
 - Stores and retrieves context values

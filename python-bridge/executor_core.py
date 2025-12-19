@@ -247,6 +247,10 @@ class ExecutorCore:
                                         self.images[pattern_image_id],
                                         monitors=monitors,
                                     )
+                                # DEBUG: Verify monitors were registered
+                                print(
+                                    f"[EXECUTOR_CORE] Registered StateImage {state_image_id} with monitors={monitors}"
+                                )
                         else:
                             self.emit_log(
                                 "warning",
@@ -274,7 +278,7 @@ class ExecutorCore:
         location_count = 0
 
         for state in states:
-            state_name = state.get("name", "unknown")
+            state.get("name", "unknown")
 
             # Process regions
             regions = state.get("regions", [])

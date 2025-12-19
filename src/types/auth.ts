@@ -33,6 +33,8 @@ export interface AuthContextValue {
   authStatus: AuthStatus | null;
   loading: boolean;
   error: string | null;
+  /** True in dev mode until auto-login completes or is skipped */
+  devAutoLoginPending: boolean;
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refreshAuth: () => Promise<void>;

@@ -452,9 +452,8 @@ class InputMonitorService:
         key_str = self._get_key_string(key)
 
         # Track modifier keys
-        if self._is_modifier_key(key_str):
-            if key_str not in self._current_modifiers:
-                self._current_modifiers.append(key_str)
+        if self._is_modifier_key(key_str) and key_str not in self._current_modifiers:
+            self._current_modifiers.append(key_str)
 
         # Track pressed keys for duration calculation
         self._keys_pressed[key_str] = timestamp

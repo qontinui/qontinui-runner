@@ -10,13 +10,8 @@ This test verifies that:
 import json
 import sys
 import time
-from io import StringIO
-from unittest.mock import MagicMock, Mock, patch
 
-import pytest
-
-from execution_tree import ExecutionNode, ExecutionTree
-from models.action_execution_record import ActionExecutionRecord
+from execution_tree import ExecutionNode
 from services.unified_data_collector import UnifiedDataCollector
 
 
@@ -71,7 +66,7 @@ class TestRuntimeMetadataFlow:
         assert "config" in tree_event_data["metadata"]
         assert tree_event_data["metadata"]["config"]["textSource"]["stateId"] == "Main"
 
-        print(f"✓ TYPE action runtime metadata correct:")
+        print("✓ TYPE action runtime metadata correct:")
         print(f"  - typed_text: {typed_text}")
         print(f"  - config present: {tree_event_data['metadata']['config']}")
 
@@ -121,7 +116,7 @@ class TestRuntimeMetadataFlow:
         assert tree_event_data["metadata"]["runtime"]["workflow_name"] == workflow_name
         assert tree_event_data["metadata"]["runtime"]["workflow_status"] == workflow_status
 
-        print(f"✓ RUN_WORKFLOW runtime metadata correct:")
+        print("✓ RUN_WORKFLOW runtime metadata correct:")
         print(f"  - workflow_name: {workflow_name}")
         print(f"  - workflow_status: {workflow_status}")
 
@@ -261,19 +256,19 @@ class TestRuntimeMetadataFlow:
 
         # Verify config is complete
         assert config_received == config, "Config should be complete"
-        print(f"✓ Config complete:")
+        print("✓ Config complete:")
         print(f"  - textSource.stateId: {config_received['textSource']['stateId']}")
         print(f"  - textSource.stringIds: {config_received['textSource']['stringIds']}")
 
         # Verify frontend can access the data
-        print(f"\n✓ Frontend access paths:")
+        print("\n✓ Frontend access paths:")
         print(
             f"  - node.metadata.config.textSource.stateId = '{config_received['textSource']['stateId']}'"
         )
         print(
             f"  - node.metadata.execution_record.metadata.runtime.typed_text = '{runtime['typed_text']}'"
         )
-        print(f"  - OR node.metadata.runtime.typed_text = (if nested)")
+        print("  - OR node.metadata.runtime.typed_text = (if nested)")
 
         # Check if runtime is directly in metadata (it should be in execution_record.metadata)
         if "runtime" in parsed["node"]["metadata"]:
@@ -311,7 +306,7 @@ class TestRuntimeMetadataFlow:
             print(f"  Runtime keys: {list(runtime.keys())}")
             print("  This means EventTranslator.on_text_typed() was not called")
             print("  OR record_text_typed() was not called")
-            assert False, "typed_text is missing - library not emitting TEXT_TYPED events"
+            raise AssertionError("typed_text is missing - library not emitting TEXT_TYPED events")
         else:
             print(f"✓ typed_text present (value: {runtime.get('typed_text')})")
 

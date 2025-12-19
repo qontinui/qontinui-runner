@@ -3317,6 +3317,7 @@ dependencies = [
  "keyring",
  "rand 0.8.5",
  "reqwest",
+ "scopeguard",
  "sentry",
  "serde",
  "serde_json",

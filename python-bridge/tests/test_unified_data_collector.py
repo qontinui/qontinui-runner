@@ -16,7 +16,6 @@ This module tests the UnifiedDataCollector service:
 
 import threading
 import time
-from unittest.mock import Mock
 
 import pytest
 

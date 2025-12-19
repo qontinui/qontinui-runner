@@ -459,7 +459,7 @@ class TreeViewLayer:
         for state_set, group_records in sorted_groups:
             # Format state set label
             if state_set:
-                state_list = sorted(list(state_set))
+                state_list = sorted(state_set)
                 state_label = "{" + ", ".join(state_list) + "}"
             else:
                 state_label = "{no active states}"

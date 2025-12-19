@@ -131,12 +131,20 @@ ACTION_DEFINITIONS: dict[str, ActionDefinition] = {
         icon="file-code",
         description="Execute a multi-line shell script",
     ),
-    "TRIGGER_AI_ANALYSIS": ActionDefinition(
-        type="TRIGGER_AI_ANALYSIS",
+    "AI_PROMPT": ActionDefinition(
+        type="AI_PROMPT",
         is_expandable=False,
-        requires_library=True,
-        icon="brain",
-        description="Trigger an AI assistant to analyze automation results and fix issues",
+        requires_library=False,
+        icon="sparkles",
+        description="Execute a single AI prompt with optional fresh context",
+    ),
+    "RUN_PROMPT_SEQUENCE": ActionDefinition(
+        type="RUN_PROMPT_SEQUENCE",
+        is_expandable=True,
+        requires_library=False,
+        emits_children=True,
+        icon="list-tree",
+        description="Execute a sequence of AI prompts with context isolation",
     ),
 }
 

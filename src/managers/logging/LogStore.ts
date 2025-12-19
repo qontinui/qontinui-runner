@@ -37,6 +37,7 @@ export interface ImageRecognitionEntry {
   imageData?: string; // Base64 encoded template image
   matchedRegionImage?: string; // Base64 encoded cropped region from screenshot at match location
   debug?: any; // Debug data with top_matches for displaying match details
+  monitorIndex?: number | null; // Which monitor was captured (null = all monitors combined)
 }
 
 export interface AiOutputEntry {
@@ -81,6 +82,17 @@ export class LogStore {
   addAiOutputLog(entry: AiOutputEntry): void {
     this.aiOutputLogs.push(entry);
     this.notifyListeners();
+  }
+
+  /**
+   * Load multiple AI output log entries at once (for restoring history)
+   * Only notifies listeners once after all entries are added
+   */
+  loadAiOutputLogs(entries: AiOutputEntry[]): void {
+    this.aiOutputLogs.push(...entries);
+    if (entries.length > 0) {
+      this.notifyListeners();
+    }
   }
 
   /**

@@ -257,10 +257,7 @@ class ScreenshotService:
         # Handle both relative and absolute paths
         ref_path = Path(reference)
 
-        if ref_path.is_absolute():
-            screenshot_path = ref_path
-        else:
-            screenshot_path = self.storage_dir / reference
+        screenshot_path = ref_path if ref_path.is_absolute() else self.storage_dir / reference
 
         # Check if file exists
         if not screenshot_path.exists():

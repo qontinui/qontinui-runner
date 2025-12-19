@@ -60,6 +60,7 @@ use axum::{
     Router,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -71,7 +72,8 @@ use crate::commands::AppState;
 use crate::config::ConfigLoader;
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::settings;
-use axum::routing::delete;
+use crate::workflow_monitor::WorkflowManager;
+use axum::routing::{delete, put};
 use tauri::{Emitter, Manager};
 
 /// Default port for the MCP API server
@@ -82,6 +84,12 @@ pub struct ApiState {
     pub app_state: Arc<AppState>,
     pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
+    /// Tracks whether an AI analysis is currently in progress
+    pub ai_analysis_running: AtomicBool,
+    /// Flag to request stopping the current AI analysis
+    pub ai_analysis_stop_requested: AtomicBool,
+    /// Manages multi-session workflow runs
+    pub workflow_manager: WorkflowManager,
 }
 
 /// Response for API endpoints
@@ -120,6 +128,8 @@ pub struct StatusResponse {
     pub executor_state: String,
     pub config_loaded: bool,
     pub config_path: Option<String>,
+    /// Whether an AI analysis is currently in progress
+    pub ai_analysis_running: bool,
 }
 
 /// Load config request
@@ -328,6 +338,7 @@ async fn get_status(
         executor_state: result.1,
         config_loaded: result.2,
         config_path: result.3,
+        ai_analysis_running: state.ai_analysis_running.load(Ordering::SeqCst),
     })))
 }
 
@@ -1099,6 +1110,166 @@ async fn get_rag_availability(
         }
     }))))
 }
+
+/// Request to segment a screenshot using SAM3
+#[derive(Debug, Deserialize)]
+pub struct SegmentScreenshotRequest {
+    /// Base64-encoded screenshot image (PNG or JPEG)
+    pub screenshot_base64: String,
+    /// Optional minimum segment area in pixels
+    #[serde(default)]
+    pub min_area: Option<i32>,
+    /// Optional SAM model to use (e.g., "sam2_hiera_tiny")
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Segment in the response
+#[derive(Debug, Serialize)]
+pub struct SegmentInfo {
+    /// Unique segment ID
+    pub id: String,
+    /// Bounding box [x, y, width, height]
+    pub bbox: Vec<i32>,
+    /// Segment area in pixels
+    pub area: i32,
+    /// Base64-encoded cropped image of the segment
+    pub image_base64: Option<String>,
+}
+
+/// Response from screenshot segmentation
+#[derive(Debug, Serialize)]
+pub struct SegmentScreenshotResponse {
+    /// Whether segmentation was successful
+    pub success: bool,
+    /// List of detected segments
+    pub segments: Vec<SegmentInfo>,
+    /// Error message if failed
+    pub error: Option<String>,
+    /// Processing time in milliseconds
+    pub processing_time_ms: Option<i64>,
+}
+
+/// Segment a screenshot using SAM3 (Segment Anything Model 3)
+///
+/// This endpoint receives a base64-encoded screenshot and returns
+/// the detected segments with their bounding boxes and cropped images.
+/// SAM3 runs locally on the user's machine via the Python executor.
+async fn segment_screenshot(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<SegmentScreenshotRequest>,
+) -> Result<Json<ApiResponse<SegmentScreenshotResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Segmenting screenshot ({} bytes base64)",
+        request.screenshot_base64.len()
+    );
+
+    let start_time = std::time::Instant::now();
+    let app_state = state.app_state.clone();
+
+    // Build parameters for Python command
+    let params = serde_json::json!({
+        "screenshot_base64": request.screenshot_base64,
+        "min_area": request.min_area,
+        "model": request.model,
+    });
+
+    // Use spawn_blocking for the synchronous bridge operation
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            // Send command and wait for response (2 minute timeout for SAM3 processing)
+            let timeout_duration = std::time::Duration::from_secs(120);
+            bridge.send_command_and_wait("segment_screenshot", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                // Parse segments from response data
+                let segments: Vec<SegmentInfo> = if let Some(data) = response.data {
+                    if let Some(segments_arr) = data.get("segments").and_then(|s| s.as_array()) {
+                        segments_arr
+                            .iter()
+                            .filter_map(|seg| {
+                                let id = seg.get("id")?.as_str()?.to_string();
+                                let bbox = seg.get("bbox")?.as_array()?;
+                                let bbox_vec: Vec<i32> = bbox
+                                    .iter()
+                                    .filter_map(|v| v.as_i64().map(|n| n as i32))
+                                    .collect();
+                                if bbox_vec.len() != 4 {
+                                    return None;
+                                }
+                                let area = seg.get("area").and_then(|a| a.as_i64()).unwrap_or(0) as i32;
+                                let image_base64 = seg.get("image_base64").and_then(|i| i.as_str()).map(|s| s.to_string());
+
+                                Some(SegmentInfo {
+                                    id,
+                                    bbox: bbox_vec,
+                                    area,
+                                    image_base64,
+                                })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                info!(
+                    "MCP API: Segmentation completed with {} segments in {}ms",
+                    segments.len(),
+                    elapsed.as_millis()
+                );
+
+                Ok(Json(ApiResponse::success(SegmentScreenshotResponse {
+                    success: true,
+                    segments,
+                    error: None,
+                    processing_time_ms: Some(elapsed.as_millis() as i64),
+                })))
+            } else {
+                let error_msg = response.error.unwrap_or_else(|| "Segmentation failed".to_string());
+                error!("MCP API: Segmentation failed: {}", error_msg);
+
+                Ok(Json(ApiResponse::success(SegmentScreenshotResponse {
+                    success: false,
+                    segments: Vec::new(),
+                    error: Some(error_msg),
+                    processing_time_ms: Some(elapsed.as_millis() as i64),
+                })))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to segment screenshot: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
 // ============================================================================
 // AI Analysis Trigger Endpoint
 // ============================================================================
@@ -1109,8 +1280,12 @@ use crate::settings::{AiProvider, CliExecutionMode};
 /// Request to trigger AI analysis
 #[derive(Debug, Deserialize)]
 pub struct TriggerAiAnalysisRequest {
-    /// The prompt to send to Claude
+    /// The prompt to send to Claude (may include conversation history)
     pub prompt: String,
+    /// The prompt to display in the UI (just the new message, no history)
+    /// If not provided, falls back to the full prompt
+    #[serde(default)]
+    pub display_prompt: Option<String>,
     /// Timeout in seconds (optional - uses settings if not provided)
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
@@ -1125,6 +1300,185 @@ pub struct TriggerAiAnalysisResponse {
     pub error: Option<String>,
 }
 
+/// Request to restart the runner (for AI self-healing workflow)
+#[derive(Debug, Deserialize)]
+pub struct RestartRunnerRequest {
+    /// Reason for restart (logged for debugging)
+    pub reason: String,
+    /// Delay before restart in seconds (default: 3)
+    #[serde(default)]
+    pub delay_seconds: Option<u64>,
+}
+
+// ============================================================================
+// AI Developer (Persistent Mode) Request/Response Types
+// ============================================================================
+
+/// Request to spawn an AI Developer session (persistent mode)
+#[derive(Debug, Deserialize)]
+pub struct SpawnAiDeveloperRequest {
+    /// The prompt to send to Claude
+    pub prompt: String,
+    /// Unique identifier for this session (generated by caller or auto-generated)
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Maximum number of iterations (default: 10)
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+}
+
+/// Response from spawning an AI Developer session
+#[derive(Debug, Serialize)]
+pub struct SpawnAiDeveloperResponse {
+    pub session_id: String,
+    pub state_file: String,
+    pub log_file: String,
+    pub pid: Option<u32>,
+}
+
+/// Request to read AI Developer session state
+#[derive(Debug, Deserialize)]
+pub struct ReadAiDeveloperStateRequest {
+    pub session_id: String,
+}
+
+/// Request to stop an AI Developer session
+#[derive(Debug, Deserialize)]
+pub struct StopAiDeveloperRequest {
+    pub session_id: String,
+}
+
+/// Request to read Claude session log
+#[derive(Debug, Deserialize)]
+pub struct ReadClaudeSessionLogRequest {
+    pub session_id: String,
+    /// Number of lines to return from end of log (default: 50)
+    #[serde(default)]
+    pub tail_lines: Option<usize>,
+}
+
+/// Session summary for listing
+#[derive(Debug, Serialize)]
+pub struct AiDeveloperSessionSummary {
+    pub session_id: String,
+    pub status: String,
+    pub iteration: u64,
+    pub max_iterations: u64,
+    pub errors_fixed: usize,
+    pub started_at: String,
+}
+
+/// Response from listing AI Developer sessions
+#[derive(Debug, Serialize)]
+pub struct ListAiDeveloperSessionsResponse {
+    pub sessions: Vec<AiDeveloperSessionSummary>,
+}
+
+/// Response from reading Claude session log
+#[derive(Debug, Serialize)]
+pub struct ReadClaudeSessionLogResponse {
+    pub content: String,
+    pub total_lines: usize,
+    pub file_size: u64,
+    pub last_modified: u64,
+    pub log_file: String,
+}
+
+// ============================================================================
+// Prompt Library Request/Response Types
+// ============================================================================
+
+/// Request to create a new prompt
+#[derive(Debug, Deserialize)]
+pub struct CreatePromptRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub content: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_prompt_max_iterations")]
+    pub max_iterations: u32,
+    #[serde(default)]
+    pub workflow: Option<prompts::WorkflowConfig>,
+}
+
+fn default_prompt_max_iterations() -> u32 {
+    10
+}
+
+/// Request to update an existing prompt
+#[derive(Debug, Deserialize)]
+pub struct UpdatePromptRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    #[serde(default)]
+    pub workflow: Option<prompts::WorkflowConfig>,
+}
+
+/// Request to run a prompt
+#[derive(Debug, Deserialize)]
+pub struct RunPromptRequest {
+    /// Optional session_id override (auto-generated if not provided)
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Optional max_iterations override (uses prompt's setting if not provided)
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+}
+
+/// Request to import prompts
+#[derive(Debug, Deserialize)]
+pub struct ImportPromptsRequest {
+    /// JSON array of prompts to import
+    pub prompts_json: String,
+}
+
+/// Request to duplicate a prompt
+#[derive(Debug, Deserialize)]
+pub struct DuplicatePromptRequest {
+    /// Optional new name (defaults to "Original Name (Copy)")
+    #[serde(default)]
+    pub new_name: Option<String>,
+}
+
+// ============================================================================
+// Workflow Request/Response Types
+// ============================================================================
+
+use crate::workflow_monitor::{WorkflowRun, WorkflowStatus};
+
+/// Request to start a workflow run
+#[derive(Debug, Deserialize)]
+pub struct StartWorkflowRequest {
+    /// ID of the prompt to run as a workflow
+    pub prompt_id: String,
+}
+
+/// Response containing workflow run info
+#[derive(Debug, Serialize)]
+pub struct WorkflowRunResponse {
+    pub run: WorkflowRun,
+}
+
+/// Response containing list of workflow runs
+#[derive(Debug, Serialize)]
+pub struct WorkflowListResponse {
+    pub runs: Vec<WorkflowRun>,
+}
+
 /// AI output event payload (emitted to frontend)
 #[derive(Debug, Clone, Serialize)]
 pub struct AiOutputEvent {
@@ -1132,10 +1486,36 @@ pub struct AiOutputEvent {
     pub timestamp: i64,
     pub line: String,
     pub source: String, // "prompt" or "claude"
+    #[serde(rename = "actionId")]
+    pub action_id: Option<String>, // Unique ID per AI analysis session
+}
+
+/// Write workflow event to log file for debugging/persistence
+fn log_workflow_event(workflow_id: &str, event_type: &str, message: &str) {
+    use std::io::Write;
+
+    let event = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "workflow_id": workflow_id,
+        "event_type": event_type,
+        "message": message,
+    });
+
+    // Write to log file
+    if let Ok((_, dev_logs_path, _)) = get_workspace_paths_internal() {
+        let log_file = dev_logs_path.join("workflow-monitor.jsonl");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file)
+        {
+            let _ = writeln!(file, "{}", serde_json::to_string(&event).unwrap_or_default());
+        }
+    }
 }
 
 /// Emit AI output event to frontend
-fn emit_ai_output(app_handle: &tauri::AppHandle, line: &str, source: &str) {
+fn emit_ai_output(app_handle: &tauri::AppHandle, line: &str, source: &str, action_id: Option<&str>) {
     let event = AiOutputEvent {
         id: format!(
             "ai-{}-{}",
@@ -1145,6 +1525,7 @@ fn emit_ai_output(app_handle: &tauri::AppHandle, line: &str, source: &str) {
         timestamp: chrono::Utc::now().timestamp_millis(),
         line: line.to_string(),
         source: source.to_string(),
+        action_id: action_id.map(|s| s.to_string()),
     };
 
     if let Err(e) = app_handle.emit("ai-output", &event) {
@@ -1186,11 +1567,48 @@ fn write_ai_debug_log(message: &str) {
 /// This endpoint triggers AI analysis using the configured provider:
 /// - Claude CLI: Invokes Claude Code CLI (subscription-based)
 /// - Claude API: Direct HTTP calls to Anthropic API (per-token billing)
+///
+/// Returns an error if an AI analysis is already in progress.
 async fn trigger_ai_analysis(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<TriggerAiAnalysisRequest>,
 ) -> Result<Json<ApiResponse<TriggerAiAnalysisResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     write_ai_debug_log("=== AI ANALYSIS TRIGGERED ===");
+
+    // Check if AI analysis is already running (atomic compare-and-swap)
+    // This prevents multiple concurrent AI analyses
+    if state
+        .ai_analysis_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        write_ai_debug_log("AI analysis already in progress - rejecting request");
+        warn!("MCP API: AI analysis already in progress, rejecting new request");
+        return Err((
+            StatusCode::CONFLICT,
+            Json(api_error("AI analysis already in progress. Wait for it to complete before triggering another.")),
+        ));
+    }
+
+    // Ensure we clear the flag when we're done (even on error)
+    // Clone the Arc so the guard owns it and can access it when dropped
+    let state_for_guard = state.clone();
+    let _guard = scopeguard::guard((), move |_| {
+        state_for_guard.ai_analysis_running.store(false, Ordering::SeqCst);
+        write_ai_debug_log("AI analysis flag cleared");
+    });
+
+    // Clear any previous stop request
+    state.ai_analysis_stop_requested.store(false, Ordering::SeqCst);
+
+    // Generate a unique action_id for this AI analysis session
+    // This groups all output from this analysis into one "AI Loop"
+    let action_id = format!(
+        "ai-loop-{}-{}",
+        chrono::Utc::now().timestamp_millis(),
+        rand::random::<u32>()
+    );
+    write_ai_debug_log(&format!("Generated action_id: {}", action_id));
 
     // Load AI settings
     let ai_settings = settings::get_ai_settings();
@@ -1206,19 +1624,22 @@ async fn trigger_ai_analysis(
     ));
 
     info!(
-        "MCP API: Triggering AI analysis (provider: {:?}, timeout: {}s, prompt length: {})",
+        "MCP API: Triggering AI analysis (provider: {:?}, timeout: {}s, prompt length: {}, action_id: {})",
         ai_settings.provider,
         timeout_secs,
-        request.prompt.len()
+        request.prompt.len(),
+        action_id
     );
 
-    // Emit prompt to frontend
+    // Emit prompt to frontend (use display_prompt if provided, else full prompt)
+    // display_prompt shows only the new message, not the conversation history
+    let ui_prompt = request.display_prompt.as_deref().unwrap_or(&request.prompt);
     write_ai_debug_log("Emitting prompt to frontend...");
-    emit_ai_output(&state.app_handle, &request.prompt, "prompt");
+    emit_ai_output(&state.app_handle, ui_prompt, "prompt", Some(&action_id));
     write_ai_debug_log("Prompt emitted successfully");
 
     // Emit hourglass indicator to show AI is processing
-    emit_ai_output(&state.app_handle, "⏳ AI is processing...", "status");
+    emit_ai_output(&state.app_handle, "⏳ AI is processing...", "status", Some(&action_id));
 
     let app_handle = state.app_handle.clone();
     write_ai_debug_log("Starting AI execution...");
@@ -1226,11 +1647,11 @@ async fn trigger_ai_analysis(
     let result = match ai_settings.provider {
         AiProvider::ClaudeCli => {
             write_ai_debug_log("Using Claude CLI provider");
-            execute_claude_cli(&ai_settings.claude_cli, &request.prompt, &app_handle).await
+            execute_claude_cli(&ai_settings.claude_cli, &request.prompt, &app_handle, &action_id).await
         }
         AiProvider::ClaudeApi => {
             write_ai_debug_log("Using Claude API provider");
-            execute_claude_api(&ai_settings.claude_api, &request.prompt, &app_handle).await
+            execute_claude_api(&ai_settings.claude_api, &request.prompt, &app_handle, &action_id).await
         }
     };
 
@@ -1240,12 +1661,12 @@ async fn trigger_ai_analysis(
                 write_ai_debug_log("AI analysis completed successfully");
                 info!("MCP API: AI analysis completed successfully");
                 // Emit completion indicator
-                emit_ai_output(&state.app_handle, "✅ AI analysis complete", "status");
+                emit_ai_output(&state.app_handle, "✅ AI analysis complete", "status", Some(&action_id));
             } else {
                 write_ai_debug_log(&format!("AI analysis failed: {:?}", response.error));
                 warn!("MCP API: AI analysis failed: {:?}", response.error);
                 // Emit failure indicator
-                emit_ai_output(&state.app_handle, "❌ AI analysis failed", "status");
+                emit_ai_output(&state.app_handle, "❌ AI analysis failed", "status", Some(&action_id));
             }
             write_ai_debug_log("=== AI ANALYSIS COMPLETE ===\n");
             Ok(Json(ApiResponse::success(response)))
@@ -1254,12 +1675,632 @@ async fn trigger_ai_analysis(
             write_ai_debug_log(&format!("AI analysis error: {}", e));
             error!("MCP API: Failed to trigger AI analysis: {}", e);
             // Emit error to frontend
-            emit_ai_output(&state.app_handle, "❌ AI analysis error", "status");
-            emit_ai_output(&state.app_handle, &format!("Error: {}", e), "claude");
+            emit_ai_output(&state.app_handle, "❌ AI analysis error", "status", Some(&action_id));
+            emit_ai_output(&state.app_handle, &format!("Error: {}", e), "claude", Some(&action_id));
             write_ai_debug_log("=== AI ANALYSIS FAILED ===\n");
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
+}
+
+/// Stop the currently running AI analysis
+///
+/// This endpoint sets a flag that the AI analysis process checks
+/// to gracefully terminate the Claude CLI subprocess.
+async fn stop_ai_analysis(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Stop AI analysis requested");
+
+    // Check if AI analysis is running
+    if !state.ai_analysis_running.load(Ordering::SeqCst) {
+        return Ok(Json(ApiResponse::success(())));
+    }
+
+    // Set the stop flag
+    state.ai_analysis_stop_requested.store(true, Ordering::SeqCst);
+
+    // Emit status to frontend
+    emit_ai_output(
+        &state.app_handle,
+        "🛑 Stop requested - AI analysis will terminate",
+        "status",
+        None,
+    );
+
+    info!("MCP API: AI analysis stop flag set");
+    Ok(Json(ApiResponse::success(())))
+}
+
+/// Restart the runner (for AI self-healing workflow)
+///
+/// This endpoint allows the AI to trigger a runner restart after applying fixes.
+/// The restart is delayed to allow the response to be sent first.
+async fn restart_runner(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<RestartRunnerRequest>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let delay_secs = request.delay_seconds.unwrap_or(3);
+
+    info!(
+        "MCP API: Runner restart requested - reason: {}, delay: {}s",
+        request.reason, delay_secs
+    );
+
+    // Emit status to frontend so user knows what's happening
+    emit_ai_output(
+        &state.app_handle,
+        &format!("🔄 Restarting runner in {} seconds: {}", delay_secs, request.reason),
+        "status",
+        None, // No action_id for restart status
+    );
+
+    // Spawn a task to exit after delay
+    // The Tauri dev server will automatically restart the app
+    let delay = std::time::Duration::from_secs(delay_secs);
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        info!("MCP API: Exiting for restart...");
+        std::process::exit(0);
+    });
+
+    Ok(Json(ApiResponse::success(())))
+}
+
+// ============================================================================
+// AI Developer (Persistent Mode) HTTP Endpoints
+// ============================================================================
+
+/// Helper function to get workspace paths (reused from config.rs pattern)
+fn get_workspace_paths_internal() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+    let mut current = exe_path.as_path();
+    let runner_dir = loop {
+        if let Some(parent) = current.parent() {
+            if parent.join("src-tauri").exists() || parent.file_name().map_or(false, |n| n == "qontinui-runner") {
+                break parent.to_path_buf();
+            }
+            current = parent;
+        } else {
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("Failed to get current directory: {}", e))?;
+            break cwd;
+        }
+    };
+
+    let workspace_root = runner_dir.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| runner_dir.clone());
+    let dev_logs_path = workspace_root.join(".dev-logs");
+    let scripts_path = workspace_root.join("qontinui-claude-config").join("scripts");
+
+    Ok((workspace_root, dev_logs_path, scripts_path))
+}
+
+/// Spawn an AI Developer session (persistent mode)
+///
+/// This creates a state file and spawns Claude as a completely independent process
+/// using spawn-independent-claude.py. The Claude process can restart any service
+/// including the runner itself.
+async fn spawn_ai_developer_http(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<SpawnAiDeveloperRequest>,
+) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Generate session_id if not provided
+    let session_id = request.session_id.unwrap_or_else(|| {
+        format!("{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), rand::random::<u16>())
+    });
+    let max_iterations = request.max_iterations.unwrap_or(10);
+
+    info!("MCP API: Spawning AI Developer session: {} (max {} iterations)", session_id, max_iterations);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
+        let spawn_script = scripts_path.join("spawn-independent-claude.py");
+        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
+        let prompt_file = dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id));
+        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+
+        // Ensure .dev-logs directory exists
+        std::fs::create_dir_all(&dev_logs_path)
+            .map_err(|e| format!("Failed to create dev-logs directory: {}", e))?;
+
+        // Create initial state file
+        let initial_state = serde_json::json!({
+            "session_id": session_id,
+            "iteration": 1,
+            "max_iterations": max_iterations,
+            "status": "starting",
+            "started_at": chrono::Utc::now().to_rfc3339(),
+            "stop_requested": false,
+            "current_action": "Initializing",
+            "errors_fixed": [],
+            "errors_remaining": [],
+            "activity_log": []
+        });
+
+        std::fs::write(&state_file, serde_json::to_string_pretty(&initial_state).unwrap())
+            .map_err(|e| format!("Failed to write state file: {}", e))?;
+
+        // Write prompt to file
+        std::fs::write(&prompt_file, &request.prompt)
+            .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+
+        info!("MCP API: State file created: {:?}", state_file);
+        info!("MCP API: Prompt file created: {:?}", prompt_file);
+
+        // Spawn Claude independently using the spawn script
+        let spawn_result = std::process::Command::new("python")
+            .arg(&spawn_script)
+            .arg("--file")
+            .arg(&prompt_file)
+            .arg("--session-id")
+            .arg(&session_id)
+            .current_dir(&workspace_root)
+            .spawn();
+
+        match spawn_result {
+            Ok(child) => {
+                info!("MCP API: AI Developer spawned with PID: {}", child.id());
+                Ok(SpawnAiDeveloperResponse {
+                    session_id,
+                    state_file: state_file.to_string_lossy().to_string(),
+                    log_file: log_file.to_string_lossy().to_string(),
+                    pid: Some(child.id()),
+                })
+            }
+            Err(e) => {
+                error!("MCP API: Failed to spawn AI Developer: {}", e);
+                Err(format!("Failed to spawn AI Developer: {}", e))
+            }
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => Ok(Json(ApiResponse::success(response))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Read the current state of an AI Developer session
+async fn read_ai_developer_state_http(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<ReadAiDeveloperStateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let session_id = request.session_id;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
+        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
+
+        if !state_file.exists() {
+            return Err(format!("No state file found for session {}", session_id));
+        }
+
+        let content = std::fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file: {}", e))?;
+
+        let state: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse state file: {}", e))?;
+
+        Ok(state)
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(state) => Ok(Json(ApiResponse::success(state))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Request an AI Developer session to stop
+async fn stop_ai_developer_http(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<StopAiDeveloperRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let session_id = request.session_id;
+    info!("MCP API: Requesting stop for AI Developer session: {}", session_id);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
+        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
+
+        if !state_file.exists() {
+            return Err(format!("No state file found for session {}", session_id));
+        }
+
+        // Read current state
+        let content = std::fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file: {}", e))?;
+
+        let mut state: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse state file: {}", e))?;
+
+        // Set stop_requested flag
+        state["stop_requested"] = serde_json::Value::Bool(true);
+
+        // Write back
+        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap())
+            .map_err(|e| format!("Failed to write state file: {}", e))?;
+
+        info!("MCP API: Stop requested for session {}", session_id);
+        Ok(state)
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(state) => Ok(Json(ApiResponse::success(state))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// List all AI Developer sessions
+async fn list_ai_developer_sessions_http(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<ListAiDeveloperSessionsResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let result: Result<ListAiDeveloperSessionsResponse, String> = tokio::task::spawn_blocking(move || {
+        let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
+
+        let mut sessions = Vec::new();
+
+        if let Ok(entries) = std::fs::read_dir(&dev_logs_path) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("ai-developer-") && name.ends_with(".json") && !name.contains("-prompt") {
+                        // Extract session ID
+                        let session_id = name
+                            .strip_prefix("ai-developer-")
+                            .and_then(|s| s.strip_suffix(".json"))
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // Try to read state
+                        if let Ok(content) = std::fs::read_to_string(&path) {
+                            if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                                sessions.push(AiDeveloperSessionSummary {
+                                    session_id,
+                                    status: state.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                                    iteration: state.get("iteration").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    max_iterations: state.get("max_iterations").and_then(|v| v.as_u64()).unwrap_or(10),
+                                    errors_fixed: state.get("errors_fixed").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0),
+                                    started_at: state.get("started_at").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort by started_at descending (most recent first)
+        sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+
+        Ok(ListAiDeveloperSessionsResponse { sessions })
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => Ok(Json(ApiResponse::success(response))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Read the Claude session log file (tail last N lines)
+async fn read_claude_session_log_http(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<ReadClaudeSessionLogRequest>,
+) -> Result<Json<ApiResponse<ReadClaudeSessionLogResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let session_id = request.session_id;
+    let lines_to_read = request.tail_lines.unwrap_or(50);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
+        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+
+        if !log_file.exists() {
+            return Err(format!("No log file found for session {}", session_id));
+        }
+
+        let content = std::fs::read_to_string(&log_file)
+            .map_err(|e| format!("Failed to read log file: {}", e))?;
+
+        // Get last N lines
+        let lines: Vec<&str> = content.lines().collect();
+        let start = if lines.len() > lines_to_read { lines.len() - lines_to_read } else { 0 };
+        let tail_content = lines[start..].join("\n");
+
+        // Get file size and modification time
+        let metadata = std::fs::metadata(&log_file)
+            .map_err(|e| format!("Failed to get log file metadata: {}", e))?;
+
+        let modified = metadata.modified()
+            .map(|t| t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or(0);
+
+        Ok(ReadClaudeSessionLogResponse {
+            content: tail_content,
+            total_lines: lines.len(),
+            file_size: metadata.len(),
+            last_modified: modified,
+            log_file: log_file.to_string_lossy().to_string(),
+        })
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => Ok(Json(ApiResponse::success(response))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+// ============================================================================
+// Prompt Library HTTP Endpoints
+// ============================================================================
+
+use crate::prompts;
+
+/// List all prompts
+async fn list_prompts(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<prompts::SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let prompts = prompts::get_all_prompts();
+    Ok(Json(ApiResponse::success(prompts)))
+}
+
+/// Get a single prompt by ID
+async fn get_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::get_prompt(&id) {
+        Some(prompt) => Ok(Json(ApiResponse::success(prompt))),
+        None => Err((StatusCode::NOT_FOUND, Json(api_error(format!("Prompt not found: {}", id))))),
+    }
+}
+
+/// Create a new prompt
+async fn create_prompt(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<CreatePromptRequest>,
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::create_prompt(
+        request.name,
+        request.description,
+        request.content,
+        request.category,
+        request.tags,
+        request.max_iterations,
+        request.workflow,
+    ) {
+        Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Update an existing prompt
+async fn update_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<UpdatePromptRequest>,
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::update_prompt(
+        &id,
+        request.name,
+        request.description,
+        request.content,
+        request.category,
+        request.tags,
+        request.max_iterations,
+        request.workflow,
+    ) {
+        Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Delete a prompt
+async fn delete_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::delete_prompt(&id) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Run a prompt by spawning an AI Developer session
+async fn run_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<RunPromptRequest>,
+) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Get the prompt
+    let prompt = prompts::get_prompt(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(api_error(format!("Prompt not found: {}", id)))))?;
+
+    // Generate session_id if not provided
+    let session_id = request.session_id.unwrap_or_else(|| {
+        format!("{}-{}", chrono::Utc::now().format("%Y%m%d-%H%M%S"), rand::random::<u16>())
+    });
+
+    // Use override or prompt's setting
+    let max_iterations = request.max_iterations.unwrap_or(prompt.max_iterations);
+
+    info!("MCP API: Running prompt '{}' (session: {}, max_iterations: {})", prompt.name, session_id, max_iterations);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
+        let spawn_script = scripts_path.join("spawn-independent-claude.py");
+        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
+        let prompt_file = dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id));
+        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+
+        // Ensure .dev-logs directory exists
+        std::fs::create_dir_all(&dev_logs_path)
+            .map_err(|e| format!("Failed to create dev-logs directory: {}", e))?;
+
+        // Create initial state file
+        let initial_state = serde_json::json!({
+            "session_id": session_id,
+            "prompt_id": prompt.id,
+            "prompt_name": prompt.name,
+            "iteration": 1,
+            "max_iterations": max_iterations,
+            "status": "starting",
+            "started_at": chrono::Utc::now().to_rfc3339(),
+            "stop_requested": false,
+            "current_action": "Initializing",
+            "errors_fixed": [],
+            "errors_remaining": [],
+            "activity_log": []
+        });
+
+        std::fs::write(&state_file, serde_json::to_string_pretty(&initial_state).unwrap())
+            .map_err(|e| format!("Failed to write state file: {}", e))?;
+
+        // Write prompt content to file
+        std::fs::write(&prompt_file, &prompt.content)
+            .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+
+        info!("MCP API: State file created: {:?}", state_file);
+        info!("MCP API: Prompt file created: {:?}", prompt_file);
+
+        // Spawn Claude independently using the spawn script
+        let spawn_result = std::process::Command::new("python")
+            .arg(&spawn_script)
+            .arg("--file")
+            .arg(&prompt_file)
+            .arg("--session-id")
+            .arg(&session_id)
+            .current_dir(&workspace_root)
+            .spawn();
+
+        match spawn_result {
+            Ok(child) => {
+                info!("MCP API: AI Developer spawned with PID: {} for prompt '{}'", child.id(), prompt.name);
+                Ok(SpawnAiDeveloperResponse {
+                    session_id,
+                    state_file: state_file.to_string_lossy().to_string(),
+                    log_file: log_file.to_string_lossy().to_string(),
+                    pid: Some(child.id()),
+                })
+            }
+            Err(e) => {
+                error!("MCP API: Failed to spawn AI Developer: {}", e);
+                Err(format!("Failed to spawn AI Developer: {}", e))
+            }
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => Ok(Json(ApiResponse::success(response))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get all categories
+async fn get_prompt_categories(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let categories = prompts::get_categories();
+    Ok(Json(ApiResponse::success(categories)))
+}
+
+/// Get all tags
+async fn get_prompt_tags(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let tags = prompts::get_all_tags();
+    Ok(Json(ApiResponse::success(tags)))
+}
+
+/// Import prompts from JSON
+async fn import_prompts(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<ImportPromptsRequest>,
+) -> Result<Json<ApiResponse<Vec<prompts::SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::import_prompts(&request.prompts_json) {
+        Ok(imported) => Ok(Json(ApiResponse::success(imported))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(api_error(e)))),
+    }
+}
+
+/// Export all prompts as JSON
+async fn export_prompts(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::export_prompts() {
+        Ok(json) => Ok(Json(ApiResponse::success(json))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Duplicate a prompt
+async fn duplicate_prompt(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<DuplicatePromptRequest>,
+) -> Result<Json<ApiResponse<prompts::SavedPrompt>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match prompts::duplicate_prompt(&id, request.new_name) {
+        Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Search prompts by query
+async fn search_prompts(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<prompts::SavedPrompt>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let results = prompts::search_prompts(query);
+    Ok(Json(ApiResponse::success(results)))
 }
 
 /// Execute AI analysis via Claude CLI
@@ -1267,6 +2308,7 @@ async fn execute_claude_cli(
     cli_settings: &settings::ClaudeCliSettings,
     prompt: &str,
     app_handle: &tauri::AppHandle,
+    action_id: &str,
 ) -> Result<TriggerAiAnalysisResponse, String> {
     write_ai_debug_log("execute_claude_cli: Starting");
 
@@ -1301,6 +2343,7 @@ async fn execute_claude_cli(
     let custom_path = cli_settings.custom_path.clone();
     let execution_mode = cli_settings.execution_mode;
     let app_handle = app_handle.clone();
+    let action_id_owned = action_id.to_string();
 
     write_ai_debug_log(&format!(
         "execute_claude_cli: execution_mode = {:?}, custom_path = {:?}, prompt_len = {}",
@@ -1341,6 +2384,7 @@ async fn execute_claude_cli(
                     &prompt_owned,
                     custom_path.as_deref(),
                     &app_handle,
+                    &action_id_owned,
                 )
             }
             CliExecutionMode::Wsl => {
@@ -1350,6 +2394,7 @@ async fn execute_claude_cli(
                     &prompt_owned,
                     custom_path.as_deref(),
                     &app_handle,
+                    &action_id_owned,
                 )
             }
             CliExecutionMode::Native => {
@@ -1359,6 +2404,7 @@ async fn execute_claude_cli(
                     &prompt_owned,
                     custom_path.as_deref(),
                     &app_handle,
+                    &action_id_owned,
                 )
             }
         };
@@ -1384,113 +2430,73 @@ async fn execute_claude_cli(
     }
 }
 
-/// Streaming text buffer that emits complete lines or paragraphs
-struct StreamingTextBuffer {
-    buffer: String,
-    app_handle: tauri::AppHandle,
-    last_emit_time: std::time::Instant,
-}
-
-impl StreamingTextBuffer {
-    fn new(app_handle: tauri::AppHandle) -> Self {
-        Self {
-            buffer: String::new(),
-            app_handle,
-            last_emit_time: std::time::Instant::now(),
-        }
-    }
-
-    /// Add text to the buffer and emit complete lines/paragraphs
-    fn add_text(&mut self, text: &str) {
-        self.buffer.push_str(text);
-
-        // Check for complete lines or paragraphs to emit
-        self.try_emit();
-    }
-
-    /// Try to emit buffered content if we have complete lines
-    fn try_emit(&mut self) {
-        // Emit on newlines (complete lines) or after timeout with content
-        let should_emit = self.buffer.contains('\n')
-            || (self.buffer.len() > 100 && self.last_emit_time.elapsed().as_millis() > 500);
-
-        if !should_emit {
-            return;
-        }
-
-        // Find the last newline to emit complete lines
-        if let Some(last_newline) = self.buffer.rfind('\n') {
-            let to_emit = self.buffer[..=last_newline].to_string();
-            self.buffer = self.buffer[last_newline + 1..].to_string();
-
-            // Emit each line separately for better formatting
-            for line in to_emit.lines() {
-                if !line.is_empty() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(&self.app_handle, line, "claude");
-                    }));
-                }
-            }
-            self.last_emit_time = std::time::Instant::now();
-        } else if self.buffer.len() > 100 && self.last_emit_time.elapsed().as_millis() > 500 {
-            // Emit partial content if buffer is getting large and time has passed
-            let to_emit = std::mem::take(&mut self.buffer);
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(&self.app_handle, &to_emit, "claude");
-            }));
-            self.last_emit_time = std::time::Instant::now();
-        }
-    }
-
-    /// Flush any remaining content
-    fn flush(&mut self) {
-        if !self.buffer.is_empty() {
-            let to_emit = std::mem::take(&mut self.buffer);
-            for line in to_emit.lines() {
-                if !line.is_empty() {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(&self.app_handle, line, "claude");
-                    }));
-                }
-            }
-        }
-    }
-}
-
-/// Parse a stream-json line and extract text content
-fn parse_stream_json_line(line: &str) -> Option<String> {
+/// Extract text content from Claude CLI stream-json format
+fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
     // Parse the JSON line
-    let json: serde_json::Value = serde_json::from_str(line).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(json_line).ok()?;
 
-    // Handle different event types
-    match json.get("type")?.as_str()? {
-        "content_block_delta" => {
-            // Extract text from delta: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"..."}}
-            let delta = json.get("delta")?;
-            if delta.get("type")?.as_str()? == "text_delta" {
-                return delta.get("text")?.as_str().map(String::from);
+    // Handle different message types
+    match parsed.get("type")?.as_str()? {
+        "assistant" => {
+            // Extract text from assistant message content
+            let content = parsed.get("message")?.get("content")?.as_array()?;
+            let mut text_parts = Vec::new();
+            for item in content {
+                if item.get("type")?.as_str()? == "text" {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        text_parts.push(text.to_string());
+                    }
+                }
             }
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join(""))
+            }
+        }
+        "content_block_delta" => {
+            // Handle streaming deltas (partial text)
+            parsed
+                .get("delta")?
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
         }
         "result" => {
-            // Handle result event which contains the full text
-            // {"type":"result","subtype":"success","result":"full text here",...}
-            if let Some(result) = json.get("result").and_then(|r| r.as_str()) {
-                return Some(result.to_string());
+            // Final result - extract text from content blocks
+            let content = parsed.get("result")?.get("content")?.as_array()?;
+            let mut text_parts = Vec::new();
+            for item in content {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        text_parts.push(text.to_string());
+                    }
+                }
+            }
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join(""))
             }
         }
-        _ => {}
+        _ => None,
     }
-    None
 }
 
-/// Execute Claude CLI on Windows natively with streaming output
+/// Execute Claude CLI on Windows natively with real-time streaming output
 fn execute_windows_native(
     working_dir: &str,
     prompt: &str,
     custom_path: Option<&str>,
     app_handle: &tauri::AppHandle,
+    action_id: &str,
 ) -> Result<TriggerAiAnalysisResponse, String> {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     write_ai_debug_log("execute_windows_native: Starting (streaming mode)");
     write_ai_debug_log(&format!(
@@ -1498,49 +2504,36 @@ fn execute_windows_native(
         working_dir, custom_path
     ));
 
+    // Clone action_id for threads
+    let action_id_owned = action_id.to_string();
+
     // Write prompt to a temp file to avoid shell escaping issues
     let temp_dir = std::env::temp_dir();
     let prompt_file = temp_dir.join("qontinui_ai_prompt.txt");
-    write_ai_debug_log(&format!(
-        "execute_windows_native: Writing prompt to {:?}",
-        prompt_file
-    ));
 
     std::fs::write(&prompt_file, prompt).map_err(|e| {
         let err = format!("Failed to write prompt file: {}", e);
         write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
         err
     })?;
-    write_ai_debug_log(&format!(
-        "execute_windows_native: Prompt written ({} bytes)",
-        prompt.len()
-    ));
 
-    // On Windows, Claude Code installed via npm uses 'claude.cmd' not 'claude.exe'
-    // We use cmd.exe /c to handle both .cmd and .exe files
     let program = custom_path.unwrap_or("claude");
     write_ai_debug_log(&format!(
-        "execute_windows_native: Using program = {}",
-        program
+        "execute_windows_native: Using program = {}, prompt {} bytes",
+        program,
+        prompt.len()
     ));
     info!(
-        "Running Claude Code on Windows via cmd.exe: {} with prompt from {:?} (streaming mode)",
+        "Running Claude Code on Windows via cmd.exe: {} with prompt from {:?}",
         program, prompt_file
     );
 
-    // Read the prompt file and pipe it to claude via stdin
-    write_ai_debug_log("execute_windows_native: Reading prompt file...");
-    let prompt_content = std::fs::read(&prompt_file).map_err(|e| {
-        let err = format!("Failed to read prompt file: {}", e);
-        write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
-        err
-    })?;
-    write_ai_debug_log(&format!(
-        "execute_windows_native: Read {} bytes from prompt file",
-        prompt_content.len()
-    ));
+    // Read the prompt file
+    let prompt_content =
+        std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
 
-    // Use cmd.exe /c to run claude with stream-json for real-time output
+    // Spawn the process - use stream-json for real-time streaming output
+    // Note: stream-json requires --verbose flag
     write_ai_debug_log("execute_windows_native: Spawning cmd.exe process with stream-json...");
     let spawn_result = std::panic::catch_unwind(|| {
         std::process::Command::new("cmd.exe")
@@ -1581,7 +2574,6 @@ fn execute_windows_native(
     };
 
     // Write prompt to stdin
-    write_ai_debug_log("execute_windows_native: Writing to stdin...");
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         if let Err(e) = stdin.write_all(&prompt_content) {
@@ -1590,112 +2582,152 @@ fn execute_windows_native(
             return Err(err);
         }
         write_ai_debug_log("execute_windows_native: Stdin written and closed");
-        // Stdin is dropped here, signaling EOF to Claude
-    } else {
-        write_ai_debug_log("execute_windows_native WARNING: No stdin available");
     }
-    info!("Prompt written to Claude stdin, waiting for streaming output...");
 
-    // Stream stdout and parse JSON events
-    write_ai_debug_log("execute_windows_native: Reading streaming stdout...");
+    // Track whether we've received any output (to control heartbeat)
+    let has_output = Arc::new(AtomicBool::new(false));
+    let has_output_heartbeat = has_output.clone();
+
+    // Start a heartbeat thread to show progress while waiting
+    let app_handle_heartbeat = app_handle.clone();
+    let action_id_heartbeat = action_id_owned.clone();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let start_time = Instant::now();
+
+    let heartbeat_handle = thread::spawn(move || {
+        let mut last_update = 0u64;
+        loop {
+            // Check if we should stop every 100ms
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+
+            // Only show heartbeat if we haven't received output yet
+            if has_output_heartbeat.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            let elapsed_secs = start_time.elapsed().as_secs();
+            // Update every 30 seconds
+            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
+                last_update = elapsed_secs;
+                let mins = elapsed_secs / 60;
+                let secs = elapsed_secs % 60;
+                let msg = if mins > 0 {
+                    format!("⏳ AI processing... ({}m {}s elapsed)", mins, secs)
+                } else {
+                    format!("⏳ AI processing... ({}s elapsed)", secs)
+                };
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(&app_handle_heartbeat, &msg, "status", Some(&action_id_heartbeat));
+                }));
+            }
+        }
+    });
+
+    // Read stdout in a separate thread - streaming JSON line by line
     let stdout = child.stdout.take();
+    let app_handle_stdout = app_handle.clone();
+    let action_id_stdout = action_id_owned.clone();
+    let has_output_stdout = has_output.clone();
+
+    let stdout_handle = thread::spawn(move || {
+        let mut all_text = String::new();
+        let mut line_count = 0;
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                match line_result {
+                    Ok(line) => {
+                        line_count += 1;
+
+                        // Try to extract text from the JSON line
+                        if let Some(text) = extract_text_from_stream_json(&line) {
+                            // Mark that we've received output
+                            has_output_stdout.store(true, Ordering::Relaxed);
+
+                            if !text.is_empty() {
+                                // Emit the extracted text immediately
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || {
+                                        emit_ai_output(&app_handle_stdout, &text, "claude", Some(&action_id_stdout));
+                                    },
+                                ));
+                                all_text.push_str(&text);
+                                write_ai_debug_log(&format!(
+                                    "execute_windows_native: stream line {} ({} chars)",
+                                    line_count,
+                                    all_text.len()
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        write_ai_debug_log(&format!(
+                            "execute_windows_native: Error reading stdout line: {}",
+                            e
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        write_ai_debug_log(&format!(
+            "execute_windows_native: stdout complete - {} JSON lines, {} chars extracted",
+            line_count,
+            all_text.len()
+        ));
+        all_text
+    });
+
+    // Read stderr in a separate thread (collect all at once, usually small)
     let stderr = child.stderr.take();
 
-    let mut all_output = String::new();
-    let mut line_count = 0;
-    let mut text_buffer = StreamingTextBuffer::new(app_handle.clone());
-
-    if let Some(stdout) = stdout {
-        let reader = BufReader::new(stdout);
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    line_count += 1;
-                    if line_count <= 10 || line_count % 100 == 0 {
-                        write_ai_debug_log(&format!(
-                            "execute_windows_native: stream line {} ({} chars)",
-                            line_count,
-                            line.len()
-                        ));
-                    }
-
-                    // Parse the JSON line and extract text
-                    if let Some(text) = parse_stream_json_line(&line) {
-                        all_output.push_str(&text);
-                        text_buffer.add_text(&text);
-                    }
-                }
-                Err(e) => {
-                    write_ai_debug_log(&format!(
-                        "execute_windows_native: stdout read error: {}",
-                        e
-                    ));
-                }
-            }
+    let stderr_handle = thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut output);
         }
-    }
+        output
+    });
 
-    // Flush any remaining buffered text
-    text_buffer.flush();
-
-    write_ai_debug_log(&format!(
-        "execute_windows_native: stdout complete - {} JSON lines, {} chars extracted",
-        line_count,
-        all_output.len()
-    ));
-    info!(
-        "Claude stdout complete: {} JSON lines, {} chars extracted",
-        line_count,
-        all_output.len()
-    );
-
-    // Capture any stderr
-    write_ai_debug_log("execute_windows_native: Reading stderr...");
-    let mut stderr_output = String::new();
-    if let Some(stderr) = stderr {
-        let reader = BufReader::new(stderr);
-        for line_result in reader.lines() {
-            match line_result {
-                Ok(line) => {
-                    write_ai_debug_log(&format!("execute_windows_native: stderr: {}", line));
-                    stderr_output.push_str(&line);
-                    stderr_output.push('\n');
-                    // Also emit errors to frontend
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
-                    }));
-                }
-                Err(e) => {
-                    write_ai_debug_log(&format!(
-                        "execute_windows_native: stderr read error: {}",
-                        e
-                    ));
-                }
-            }
-        }
-    }
-    write_ai_debug_log(&format!(
-        "execute_windows_native: stderr complete - {} chars",
-        stderr_output.len()
-    ));
-
-    write_ai_debug_log("execute_windows_native: Waiting for process to exit...");
+    // Wait for process to complete
     let status = match child.wait() {
-        Ok(s) => {
-            write_ai_debug_log(&format!(
-                "execute_windows_native: Process exited with status: {:?}",
-                s
-            ));
-            s
-        }
+        Ok(s) => s,
         Err(e) => {
-            let err = format!("Failed to wait for claude: {}", e);
-            write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
-            return Err(err);
+            let _ = stop_tx.send(());
+            let _ = heartbeat_handle.join();
+            return Err(format!("Failed to wait for claude: {}", e));
         }
     };
 
-    write_ai_debug_log("execute_windows_native: Cleaning up temp file...");
+    // Stop heartbeat
+    let _ = stop_tx.send(());
+    let _ = heartbeat_handle.join();
+
+    // Get output from threads
+    let all_output = stdout_handle.join().unwrap_or_default();
+    let stderr_output = stderr_handle.join().unwrap_or_default();
+
+    let elapsed = start_time.elapsed();
+    write_ai_debug_log(&format!(
+        "execute_windows_native: Process completed in {:.1}s, output {} chars, stderr {} chars",
+        elapsed.as_secs_f64(),
+        all_output.len(),
+        stderr_output.len()
+    ));
+
+    // Emit stderr if any (this is usually error messages, so emit at end)
+    if !stderr_output.is_empty() {
+        for line in stderr_output.lines() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", Some(&action_id_owned));
+            }));
+        }
+    }
+
+    // Cleanup
     let _ = std::fs::remove_file(&prompt_file);
 
     if status.success() {
@@ -1722,16 +2754,23 @@ fn execute_windows_native(
     }
 }
 
-/// Execute Claude CLI via WSL with streaming output
+/// Execute Claude CLI via WSL with real-time streaming output
 fn execute_via_wsl(
     working_dir: &str,
     prompt: &str,
     custom_path: Option<&str>,
     app_handle: &tauri::AppHandle,
+    action_id: &str,
 ) -> Result<TriggerAiAnalysisResponse, String> {
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    write_ai_debug_log("execute_via_wsl: Starting (streaming mode)");
+    let action_id_owned = action_id.to_string();
+    write_ai_debug_log("execute_via_wsl: Starting");
 
     // Convert Windows path to WSL path
     let wsl_working_dir = working_dir.replace('\\', "/").replace("C:", "/mnt/c");
@@ -1743,7 +2782,7 @@ fn execute_via_wsl(
     ));
 
     info!(
-        "Running Claude Code via WSL: {} in {} (streaming mode)",
+        "Running Claude Code via WSL: {} in {}",
         program, wsl_working_dir
     );
 
@@ -1759,7 +2798,8 @@ fn execute_via_wsl(
         .replace('\\', "/")
         .replace("C:", "/mnt/c");
 
-    // Use bash to read the file and pipe to claude with stream-json
+    // Use bash to read the file and pipe to claude with stream-json for real-time output
+    // Note: stream-json requires --verbose flag
     let bash_command = format!(
         "cd '{}' && cat '{}' | {} --output-format stream-json --verbose --permission-mode bypassPermissions",
         wsl_working_dir, wsl_prompt_file, program
@@ -1773,56 +2813,145 @@ fn execute_via_wsl(
         .spawn()
         .map_err(|e| format!("Failed to run WSL: {}. Is WSL installed?", e))?;
 
-    // Stream stdout and parse JSON events
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    // Track whether we've received any output (to control heartbeat)
+    let has_output = Arc::new(AtomicBool::new(false));
+    let has_output_heartbeat = has_output.clone();
 
-    let mut all_output = String::new();
-    let mut line_count = 0;
-    let mut text_buffer = StreamingTextBuffer::new(app_handle.clone());
+    // Start a heartbeat thread to show progress while waiting
+    let app_handle_heartbeat = app_handle.clone();
+    let action_id_heartbeat = action_id_owned.clone();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let start_time = Instant::now();
 
-    if let Some(stdout) = stdout {
-        let reader = BufReader::new(stdout);
-        for line_result in reader.lines() {
-            if let Ok(line) = line_result {
-                line_count += 1;
-                // Parse the JSON line and extract text
-                if let Some(text) = parse_stream_json_line(&line) {
-                    all_output.push_str(&text);
-                    text_buffer.add_text(&text);
-                }
+    let heartbeat_handle = thread::spawn(move || {
+        let mut last_update = 0u64;
+        loop {
+            // Check if we should stop every 100ms
+            if stop_rx.try_recv().is_ok() {
+                break;
             }
-        }
-    }
+            thread::sleep(Duration::from_millis(100));
 
-    // Flush any remaining buffered text
-    text_buffer.flush();
+            // Only show heartbeat if we haven't received output yet
+            if has_output_heartbeat.load(Ordering::Relaxed) {
+                continue;
+            }
 
-    write_ai_debug_log(&format!(
-        "execute_via_wsl: stdout complete - {} JSON lines, {} chars extracted",
-        line_count,
-        all_output.len()
-    ));
-
-    // Capture any stderr
-    let mut stderr_output = String::new();
-    if let Some(stderr) = stderr {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                stderr_output.push_str(&line);
-                stderr_output.push('\n');
+            let elapsed_secs = start_time.elapsed().as_secs();
+            // Update every 30 seconds
+            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
+                last_update = elapsed_secs;
+                let mins = elapsed_secs / 60;
+                let secs = elapsed_secs % 60;
+                let msg = if mins > 0 {
+                    format!("⏳ AI processing... ({}m {}s elapsed)", mins, secs)
+                } else {
+                    format!("⏳ AI processing... ({}s elapsed)", secs)
+                };
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                    emit_ai_output(&app_handle_heartbeat, &msg, "status", Some(&action_id_heartbeat));
                 }));
             }
         }
+    });
+
+    // Read stdout in a separate thread - streaming line by line
+    let stdout = child.stdout.take();
+    let app_handle_stdout = app_handle.clone();
+    let action_id_stdout = action_id_owned.clone();
+    let has_output_stdout = has_output.clone();
+
+    let stdout_handle = thread::spawn(move || {
+        let mut all_text = String::new();
+        let mut line_count = 0;
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                match line_result {
+                    Ok(line) => {
+                        line_count += 1;
+
+                        // Try to extract text from the JSON line
+                        if let Some(text) = extract_text_from_stream_json(&line) {
+                            // Mark that we've received output
+                            has_output_stdout.store(true, Ordering::Relaxed);
+
+                            if !text.is_empty() {
+                                // Emit the extracted text immediately
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || {
+                                        emit_ai_output(&app_handle_stdout, &text, "claude", Some(&action_id_stdout));
+                                    },
+                                ));
+                                all_text.push_str(&text);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        write_ai_debug_log(&format!(
+                            "execute_via_wsl: Error reading stdout line: {}",
+                            e
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        write_ai_debug_log(&format!(
+            "execute_via_wsl: stdout complete - {} JSON lines, {} chars extracted",
+            line_count,
+            all_text.len()
+        ));
+        all_text
+    });
+
+    // Read stderr in a separate thread (collect all at once, usually small)
+    let stderr = child.stderr.take();
+
+    let stderr_handle = thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut output);
+        }
+        output
+    });
+
+    // Wait for process to complete
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = stop_tx.send(());
+            let _ = heartbeat_handle.join();
+            return Err(format!("Failed to wait for WSL: {}", e));
+        }
+    };
+
+    // Stop heartbeat
+    let _ = stop_tx.send(());
+    let _ = heartbeat_handle.join();
+
+    // Get output from threads
+    let all_output = stdout_handle.join().unwrap_or_default();
+    let stderr_output = stderr_handle.join().unwrap_or_default();
+
+    let elapsed = start_time.elapsed();
+    write_ai_debug_log(&format!(
+        "execute_via_wsl: Process completed in {:.1}s, output {} chars, stderr {} chars",
+        elapsed.as_secs_f64(),
+        all_output.len(),
+        stderr_output.len()
+    ));
+
+    // Emit stderr if any (this is usually error messages, so emit at end)
+    if !stderr_output.is_empty() {
+        for line in stderr_output.lines() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", Some(&action_id_owned));
+            }));
+        }
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for WSL: {}", e))?;
-
+    // Cleanup
     let _ = std::fs::remove_file(&prompt_file);
 
     if status.success() {
@@ -1849,19 +2978,26 @@ fn execute_via_wsl(
     }
 }
 
-/// Execute Claude CLI natively (Unix/macOS/Linux) with streaming output
+/// Execute Claude CLI natively (Unix/macOS/Linux) with real-time streaming output
 fn execute_native(
     working_dir: &str,
     prompt: &str,
     custom_path: Option<&str>,
     app_handle: &tauri::AppHandle,
+    action_id: &str,
 ) -> Result<TriggerAiAnalysisResponse, String> {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
-    write_ai_debug_log("execute_native: Starting (streaming mode)");
+    let action_id_owned = action_id.to_string();
+    write_ai_debug_log("execute_native: Starting");
 
     let program = custom_path.unwrap_or("claude");
-    info!("Running Claude Code natively: {} (streaming mode)", program);
+    info!("Running Claude Code natively: {}", program);
 
     // Write prompt to a temp file
     let temp_dir = std::env::temp_dir();
@@ -1872,6 +3008,7 @@ fn execute_native(
     let prompt_content =
         std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
 
+    // Note: stream-json requires --verbose flag
     write_ai_debug_log("execute_native: Spawning process with stream-json...");
     let mut child = std::process::Command::new(program)
         .args([
@@ -1899,56 +3036,145 @@ fn execute_native(
             .map_err(|e| format!("Failed to write to claude stdin: {}", e))?;
     }
 
-    // Stream stdout and parse JSON events
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
+    // Track whether we've received any output (to control heartbeat)
+    let has_output = Arc::new(AtomicBool::new(false));
+    let has_output_heartbeat = has_output.clone();
 
-    let mut all_output = String::new();
-    let mut line_count = 0;
-    let mut text_buffer = StreamingTextBuffer::new(app_handle.clone());
+    // Start a heartbeat thread to show progress while waiting
+    let app_handle_heartbeat = app_handle.clone();
+    let action_id_heartbeat = action_id_owned.clone();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let start_time = Instant::now();
 
-    if let Some(stdout) = stdout {
-        let reader = BufReader::new(stdout);
-        for line_result in reader.lines() {
-            if let Ok(line) = line_result {
-                line_count += 1;
-                // Parse the JSON line and extract text
-                if let Some(text) = parse_stream_json_line(&line) {
-                    all_output.push_str(&text);
-                    text_buffer.add_text(&text);
-                }
+    let heartbeat_handle = thread::spawn(move || {
+        let mut last_update = 0u64;
+        loop {
+            // Check if we should stop every 100ms
+            if stop_rx.try_recv().is_ok() {
+                break;
             }
-        }
-    }
+            thread::sleep(Duration::from_millis(100));
 
-    // Flush any remaining buffered text
-    text_buffer.flush();
+            // Only show heartbeat if we haven't received output yet
+            if has_output_heartbeat.load(Ordering::Relaxed) {
+                continue;
+            }
 
-    write_ai_debug_log(&format!(
-        "execute_native: stdout complete - {} JSON lines, {} chars extracted",
-        line_count,
-        all_output.len()
-    ));
-
-    // Capture any stderr
-    let mut stderr_output = String::new();
-    if let Some(stderr) = stderr {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines() {
-            if let Ok(line) = line {
-                stderr_output.push_str(&line);
-                stderr_output.push('\n');
+            let elapsed_secs = start_time.elapsed().as_secs();
+            // Update every 30 seconds
+            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
+                last_update = elapsed_secs;
+                let mins = elapsed_secs / 60;
+                let secs = elapsed_secs % 60;
+                let msg = if mins > 0 {
+                    format!("⏳ AI processing... ({}m {}s elapsed)", mins, secs)
+                } else {
+                    format!("⏳ AI processing... ({}s elapsed)", secs)
+                };
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude");
+                    emit_ai_output(&app_handle_heartbeat, &msg, "status", Some(&action_id_heartbeat));
                 }));
             }
         }
+    });
+
+    // Read stdout in a separate thread - streaming line by line
+    let stdout = child.stdout.take();
+    let app_handle_stdout = app_handle.clone();
+    let action_id_stdout = action_id_owned.clone();
+    let has_output_stdout = has_output.clone();
+
+    let stdout_handle = thread::spawn(move || {
+        let mut all_text = String::new();
+        let mut line_count = 0;
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                match line_result {
+                    Ok(line) => {
+                        line_count += 1;
+
+                        // Try to extract text from the JSON line
+                        if let Some(text) = extract_text_from_stream_json(&line) {
+                            // Mark that we've received output
+                            has_output_stdout.store(true, Ordering::Relaxed);
+
+                            if !text.is_empty() {
+                                // Emit the extracted text immediately
+                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                                    || {
+                                        emit_ai_output(&app_handle_stdout, &text, "claude", Some(&action_id_stdout));
+                                    },
+                                ));
+                                all_text.push_str(&text);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        write_ai_debug_log(&format!(
+                            "execute_native: Error reading stdout line: {}",
+                            e
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+        write_ai_debug_log(&format!(
+            "execute_native: stdout complete - {} JSON lines, {} chars extracted",
+            line_count,
+            all_text.len()
+        ));
+        all_text
+    });
+
+    // Read stderr in a separate thread (collect all at once, usually small)
+    let stderr = child.stderr.take();
+
+    let stderr_handle = thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut output);
+        }
+        output
+    });
+
+    // Wait for process to complete
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = stop_tx.send(());
+            let _ = heartbeat_handle.join();
+            return Err(format!("Failed to wait for {}: {}", program, e));
+        }
+    };
+
+    // Stop heartbeat
+    let _ = stop_tx.send(());
+    let _ = heartbeat_handle.join();
+
+    // Get output from threads
+    let all_output = stdout_handle.join().unwrap_or_default();
+    let stderr_output = stderr_handle.join().unwrap_or_default();
+
+    let elapsed = start_time.elapsed();
+    write_ai_debug_log(&format!(
+        "execute_native: Process completed in {:.1}s, output {} chars, stderr {} chars",
+        elapsed.as_secs_f64(),
+        all_output.len(),
+        stderr_output.len()
+    ));
+
+    // Emit stderr if any (this is usually error messages, so emit at end)
+    if !stderr_output.is_empty() {
+        for line in stderr_output.lines() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", Some(&action_id_owned));
+            }));
+        }
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| format!("Failed to wait for {}: {}", program, e))?;
-
+    // Cleanup
     let _ = std::fs::remove_file(&prompt_file);
 
     if status.success() {
@@ -1980,6 +3206,7 @@ async fn execute_claude_api(
     api_settings: &settings::ClaudeApiSettings,
     prompt: &str,
     app_handle: &tauri::AppHandle,
+    action_id: &str,
 ) -> Result<TriggerAiAnalysisResponse, String> {
     // Get API key from keychain
     let api_key = ai_settings::get_provider_api_key("claude_api")?.ok_or_else(|| {
@@ -2018,7 +3245,7 @@ async fn execute_claude_api(
 
         // Emit response to frontend (emit line by line for consistency)
         for line in content.lines() {
-            emit_ai_output(app_handle, line, "claude");
+            emit_ai_output(app_handle, line, "claude", Some(action_id));
         }
 
         Ok(TriggerAiAnalysisResponse {
@@ -2039,13 +3266,189 @@ async fn execute_claude_api(
         };
 
         // Emit error to frontend
-        emit_ai_output(app_handle, &format!("Error: {}", error_message), "claude");
+        emit_ai_output(app_handle, &format!("Error: {}", error_message), "claude", Some(action_id));
 
         Ok(TriggerAiAnalysisResponse {
             success: false,
             message: "API call failed".to_string(),
             error: Some(error_message),
         })
+    }
+}
+
+// ============================================================================
+// Workflow API Handlers
+// ============================================================================
+
+/// Start a workflow run for a prompt
+async fn start_workflow_run(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartWorkflowRequest>,
+) -> Result<Json<ApiResponse<WorkflowRunResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Get the prompt
+    let prompt = match prompts::get_prompt(&request.prompt_id) {
+        Some(p) => p,
+        None => return Err((StatusCode::NOT_FOUND, Json(api_error(format!("Prompt not found: {}", request.prompt_id))))),
+    };
+
+    // Check if workflow is enabled
+    if !prompt.workflow.enabled {
+        return Err((StatusCode::BAD_REQUEST, Json(api_error("Workflow mode not enabled for this prompt".to_string()))));
+    }
+
+    // Start the workflow run
+    let mut run = match state.workflow_manager.start_workflow(&prompt).await {
+        Ok(r) => r,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    };
+
+    // Spawn the initial AI Developer session
+    let ai_settings = settings::get_ai_settings();
+    let cli_settings = ai_settings.claude_cli;
+
+    let session_id = format!("workflow-{}", &run.id[..8]);
+    let action_id = format!("workflow-{}", chrono::Utc::now().timestamp_millis());
+
+    // Execute the initial session
+    match execute_claude_cli(&cli_settings, &prompt.content, &state.app_handle, &action_id).await {
+        Ok(_) => {
+            run.log_event("session_started", &format!("Initial session {} started", session_id));
+            state.workflow_manager.set_active_session(&run.id, Some(session_id)).await;
+        }
+        Err(e) => {
+            state.workflow_manager.fail_workflow(&run.id, &e).await;
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
+        }
+    }
+
+    // Start the workflow monitor in the background
+    let workflow_id = run.id.clone();
+    let prompt_clone = prompt.clone();
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        monitor_workflow(state_clone, workflow_id, prompt_clone).await;
+    });
+
+    Ok(Json(ApiResponse::success(WorkflowRunResponse { run })))
+}
+
+/// Monitor a workflow and auto-spawn continuations when needed
+async fn monitor_workflow(
+    state: Arc<ApiState>,
+    workflow_id: String,
+    prompt: prompts::SavedPrompt,
+) {
+    let config = &prompt.workflow;
+    let check_interval = Duration::from_secs(30); // Check every 30 seconds
+    let mut last_phase = 0u32;
+
+    info!("Starting workflow monitor for {}", workflow_id);
+    log_workflow_event(&workflow_id, "monitor_started", &format!("Workflow monitor started for '{}'", prompt.name));
+
+    loop {
+        tokio::time::sleep(check_interval).await;
+
+        // Check workflow status
+        let run = match state.workflow_manager.check_workflow_status(&workflow_id, &prompt).await {
+            Some(r) => r,
+            None => {
+                info!("Workflow {} not found, stopping monitor", workflow_id);
+                log_workflow_event(&workflow_id, "monitor_stopped", "Workflow not found, monitor stopping");
+                break;
+            }
+        };
+
+        // Log phase changes
+        if run.current_phase != last_phase {
+            info!("Workflow {} phase: {} -> {}", workflow_id, last_phase, run.current_phase);
+            log_workflow_event(&workflow_id, "phase_changed", &format!("Phase {} -> {} (target: {})", last_phase, run.current_phase, run.completion_value));
+            last_phase = run.current_phase;
+        }
+
+        match run.status {
+            WorkflowStatus::Completed => {
+                info!("Workflow {} completed successfully", workflow_id);
+                log_workflow_event(&workflow_id, "completed", &format!("Workflow completed! Reached phase {}", run.current_phase));
+                break;
+            }
+            WorkflowStatus::Failed => {
+                error!("Workflow {} failed: {:?}", workflow_id, run.error_message);
+                log_workflow_event(&workflow_id, "failed", &format!("Workflow failed: {}", run.error_message.unwrap_or_default()));
+                break;
+            }
+            WorkflowStatus::Stalled => {
+                info!("Workflow {} stalled, spawning continuation", workflow_id);
+                log_workflow_event(&workflow_id, "stalled", &format!("No progress detected, spawning continuation session (session #{})", run.sessions_spawned + 1));
+
+                // Get the continuation prompt
+                let continuation = if config.continuation_prompt.is_empty() {
+                    format!(
+                        "Continue the workflow. Read checkpoint from {} and resume from phase {}. Complete 2-3 more phases, update checkpoint, then exit.",
+                        config.checkpoint_path, run.current_phase
+                    )
+                } else {
+                    config.continuation_prompt.clone()
+                };
+
+                // Spawn continuation session
+                let ai_settings = settings::get_ai_settings();
+                let cli_settings = ai_settings.claude_cli;
+
+                let action_id = format!("workflow-cont-{}", chrono::Utc::now().timestamp_millis());
+                match execute_claude_cli(&cli_settings, &continuation, &state.app_handle, &action_id).await {
+                    Ok(_) => {
+                        let session_id = format!("workflow-{}-cont", &workflow_id[..8]);
+                        state.workflow_manager.set_active_session(&workflow_id, Some(session_id)).await;
+                        info!("Spawned continuation session for workflow {}", workflow_id);
+                        log_workflow_event(&workflow_id, "session_spawned", &format!("Continuation session started (total: {})", run.sessions_spawned + 1));
+                    }
+                    Err(e) => {
+                        error!("Failed to spawn continuation for workflow {}: {}", workflow_id, e);
+                        log_workflow_event(&workflow_id, "spawn_failed", &format!("Failed to spawn continuation: {}", e));
+                        state.workflow_manager.fail_workflow(&workflow_id, &e).await;
+                        break;
+                    }
+                }
+            }
+            WorkflowStatus::Running | WorkflowStatus::Idle => {
+                // Still running or waiting, continue monitoring
+            }
+        }
+    }
+
+    info!("Workflow monitor for {} stopped", workflow_id);
+}
+
+/// Get status of a specific workflow run
+async fn get_workflow_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<WorkflowRunResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.workflow_manager.get_run(&run_id).await {
+        Some(run) => Ok(Json(ApiResponse::success(WorkflowRunResponse { run }))),
+        None => Err((StatusCode::NOT_FOUND, Json(api_error(format!("Workflow run not found: {}", run_id))))),
+    }
+}
+
+/// List all workflow runs
+async fn list_workflow_runs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<WorkflowListResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let runs = state.workflow_manager.get_all_runs().await;
+    Ok(Json(ApiResponse::success(WorkflowListResponse { runs })))
+}
+
+/// Stop a workflow run
+async fn stop_workflow_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<WorkflowRunResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Mark the workflow as failed (which will stop the monitor)
+    state.workflow_manager.fail_workflow(&run_id, "Stopped by user").await;
+
+    match state.workflow_manager.get_run(&run_id).await {
+        Some(run) => Ok(Json(ApiResponse::success(WorkflowRunResponse { run }))),
+        None => Err((StatusCode::NOT_FOUND, Json(api_error(format!("Workflow run not found: {}", run_id))))),
     }
 }
 
@@ -2059,6 +3462,9 @@ pub fn create_router(
         app_state,
         rag_state,
         app_handle,
+        ai_analysis_running: AtomicBool::new(false),
+        ai_analysis_stop_requested: AtomicBool::new(false),
+        workflow_manager: WorkflowManager::new(),
     });
 
     // Configure CORS to allow requests from WSL
@@ -2079,11 +3485,39 @@ pub fn create_router(
         .route("/rag/import", post(import_rag))
         .route("/rag/list", get(list_rag_configs))
         .route("/rag/availability", get(get_rag_availability))
+        .route("/rag/segment", post(segment_screenshot))
         .route("/rag/:project_id/status", get(get_rag_status))
         .route("/rag/:project_id/load", post(load_rag_project))
         .route("/rag/:project_id", delete(delete_rag_config))
-        // AI Analysis route
+        // AI Analysis routes (standard/inline mode)
         .route("/trigger-ai-analysis", post(trigger_ai_analysis))
+        .route("/stop-ai-analysis", post(stop_ai_analysis))
+        // Runner restart route (for AI self-healing)
+        .route("/restart-runner", post(restart_runner))
+        // AI Developer routes (persistent mode)
+        .route("/ai-developer/spawn", post(spawn_ai_developer_http))
+        .route("/ai-developer/state", post(read_ai_developer_state_http))
+        .route("/ai-developer/stop", post(stop_ai_developer_http))
+        .route("/ai-developer/list", get(list_ai_developer_sessions_http))
+        .route("/ai-developer/log", post(read_claude_session_log_http))
+        // Prompt Library routes
+        .route("/prompts", get(list_prompts))
+        .route("/prompts", post(create_prompt))
+        .route("/prompts/search", get(search_prompts))
+        .route("/prompts/categories", get(get_prompt_categories))
+        .route("/prompts/tags", get(get_prompt_tags))
+        .route("/prompts/import", post(import_prompts))
+        .route("/prompts/export", get(export_prompts))
+        .route("/prompts/:id", get(get_prompt))
+        .route("/prompts/:id", put(update_prompt))
+        .route("/prompts/:id", delete(delete_prompt))
+        .route("/prompts/:id/run", post(run_prompt))
+        .route("/prompts/:id/duplicate", post(duplicate_prompt))
+        // Workflow routes (multi-session prompts)
+        .route("/workflows", get(list_workflow_runs))
+        .route("/workflows/start", post(start_workflow_run))
+        .route("/workflows/:id", get(get_workflow_run))
+        .route("/workflows/:id/stop", post(stop_workflow_run))
         .layer(cors)
         .with_state(api_state)
 }

@@ -6,13 +6,15 @@ Single Responsibility: Handle GUI interaction and action execution
 - Execute workflows and nested workflows
 - Track execution hierarchy with ExecutionTree
 - Collect execution data via UnifiedDataCollector
-- Handle special action types (RUN_WORKFLOW, GO_TO_STATE, FIND)
+- Handle special action types (RUN_WORKFLOW, GO_TO_STATE, FIND, AI_PROMPT, RUN_PROMPT_SEQUENCE)
 """
 
 import logging
 import time
 from collections.abc import Callable
 from typing import Any
+
+from ai_prompt_executor import AIPromptExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +80,9 @@ class GUIAutomation:
         self.get_action_definition = get_action_definition_fn
         self.is_running = False
         self._last_find_location = None
+
+        # Initialize AI prompt executor for AI_PROMPT and RUN_PROMPT_SEQUENCE actions
+        self.ai_prompt_executor = AIPromptExecutor(emit_log_fn=emit_log_fn)
 
     def execute_action(self, action_data: dict[str, Any]) -> bool:
         """
@@ -152,6 +157,66 @@ class GUIAutomation:
                 else:
                     self.emit_log("error", "RUN_WORKFLOW action missing workflowId")
                     success = False
+
+            # Handle AI_PROMPT - execute AI prompt via Claude CLI
+            elif action_type == "AI_PROMPT":
+                prompt = config.get("prompt")
+                fresh_context = config.get("freshContext", True)
+                timeout = config.get("timeout", 600000)
+                working_directory = config.get("workingDirectory")
+                output_variable = config.get("outputVariable")
+
+                if not prompt:
+                    self.emit_log("error", "AI_PROMPT action missing prompt")
+                    success = False
+                else:
+                    result = self.ai_prompt_executor.execute_prompt(
+                        prompt=prompt,
+                        fresh_context=fresh_context,
+                        working_directory=working_directory,
+                        timeout=timeout,
+                        output_variable=output_variable,
+                    )
+                    success = result["success"]
+
+                    # Store output in metadata for tree display
+                    if result.get("output"):
+                        node.metadata["ai_output"] = result["output"][:500]  # Truncate for display
+                    if result.get("error"):
+                        error_message = result["error"]
+
+            # Handle RUN_PROMPT_SEQUENCE - execute sequence of AI prompts
+            elif action_type == "RUN_PROMPT_SEQUENCE":
+                sequence_id = config.get("sequenceId")
+                inline_sequence = config.get("inlineSequence")
+                parameter_overrides = config.get("parameterOverrides")
+                working_directory = config.get("workingDirectory")
+                results_directory = config.get("resultsDirectory")
+
+                if not sequence_id and not inline_sequence:
+                    self.emit_log(
+                        "error", "RUN_PROMPT_SEQUENCE missing sequenceId or inlineSequence"
+                    )
+                    success = False
+                else:
+                    # Use inline sequence if provided, otherwise would look up by ID
+                    sequence_config = inline_sequence if inline_sequence else {"id": sequence_id}
+
+                    result = self.ai_prompt_executor.execute_prompt_sequence(
+                        sequence_config=sequence_config,
+                        parameter_overrides=parameter_overrides,
+                        working_directory=working_directory,
+                        results_directory=results_directory,
+                    )
+                    success = result["success"]
+
+                    # Store sequence results in metadata
+                    node.metadata["sequence_results"] = {
+                        "total_steps": len(result.get("steps", [])),
+                        "failed_step": result.get("failed_step_id"),
+                        "duration": result.get("total_duration_seconds"),
+                    }
+
             else:
                 # Normal action delegation to library
                 success = self.action_executor.execute_action(action)

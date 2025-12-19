@@ -16,7 +16,6 @@ import gzip
 import json
 import time
 from pathlib import Path
-from typing import List
 
 try:
     from PIL import Image
@@ -103,7 +102,7 @@ def create_test_image(width: int = 1920, height: int = 1080) -> bytes:
     return buffer.getvalue()
 
 
-def create_test_events(count: int = 100) -> List[InputMonitorEvent]:
+def create_test_events(count: int = 100) -> list[InputMonitorEvent]:
     """Create test input events.
 
     Args:
@@ -299,7 +298,7 @@ async def test_video_streaming():
     """Test video chunk streaming."""
     print("\n=== Testing Video Streaming ===")
 
-    service = CloudStreamingService()
+    CloudStreamingService()
     session_id = "test-session-001"
 
     # Simulate streaming 10 video chunks
@@ -342,8 +341,7 @@ async def test_event_streaming():
     """Test event streaming with compression."""
     print("\n=== Testing Event Streaming ===")
 
-    service = CloudStreamingService()
-    session_id = "test-session-001"
+    CloudStreamingService()
 
     # Create test events
     events = create_test_events(count=100)
@@ -371,10 +369,9 @@ async def test_thumbnail_streaming():
         print("PIL not available, skipping thumbnail test")
         return
 
-    service = CloudStreamingService(
+    CloudStreamingService(
         config=StreamConfig(thumbnail_size=(320, 180), thumbnail_quality=85)
     )
-    session_id = "test-session-001"
 
     # Create test image
     full_size_image = create_test_image(width=1920, height=1080)
@@ -406,13 +403,13 @@ async def test_processed_data_streaming():
     """Test streaming of processed states and transitions."""
     print("\n=== Testing Processed Data Streaming ===")
 
-    service = CloudStreamingService()
+    CloudStreamingService()
     session_id = "test-session-001"
 
     # Create test processing result
     result = create_test_processing_result(session_id)
 
-    print(f"Processing Result:")
+    print("Processing Result:")
     print(f"  States: {result.num_states}")
     print(f"  Transitions: {result.num_transitions}")
     print(f"  Screenshots: {result.num_screenshots}")
@@ -424,7 +421,7 @@ async def test_processed_data_streaming():
     result_bytes = result_json.encode("utf-8")
     compressed_data = gzip.compress(result_bytes, compresslevel=6)
 
-    print(f"\nData sizes:")
+    print("\nData sizes:")
     print(f"  Original: {len(result_bytes)} bytes ({len(result_bytes) / 1024:.2f} KB)")
     print(f"  Compressed: {len(compressed_data)} bytes ({len(compressed_data) / 1024:.2f} KB)")
     print(f"  Compression ratio: {len(result_bytes) / len(compressed_data):.2f}x")
@@ -438,7 +435,6 @@ async def test_screenshot_upload():
     print("\n=== Testing Screenshot Upload ===")
 
     service = CloudStreamingService()
-    session_id = "test-session-001"
 
     # Register screenshot request
     request_id = "request-001"
@@ -528,8 +524,8 @@ async def test_config_customization():
     print(f"  Thumbnail Size: {hq_config.thumbnail_size}")
     print(f"  Thumbnail Quality: {hq_config.thumbnail_quality}")
 
-    service = CloudStreamingService(config=hq_config)
-    print(f"\nService created with custom config")
+    CloudStreamingService(config=hq_config)
+    print("\nService created with custom config")
 
 
 async def main():

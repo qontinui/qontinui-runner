@@ -254,10 +254,10 @@ class StateChangePoint:
         return {
             "frame_number": self.frame_number,
             "timestamp": self.timestamp,
-            "states_before": sorted(list(self.states_before)),
-            "states_after": sorted(list(self.states_after)),
-            "states_appeared": sorted(list(self.states_appeared)),
-            "states_disappeared": sorted(list(self.states_disappeared)),
+            "states_before": sorted(self.states_before),
+            "states_after": sorted(self.states_after),
+            "states_appeared": sorted(self.states_appeared),
+            "states_disappeared": sorted(self.states_disappeared),
             "is_state_change": self.is_state_change,
             "change_magnitude": self.change_magnitude,
         }

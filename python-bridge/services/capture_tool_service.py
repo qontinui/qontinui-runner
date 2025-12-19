@@ -9,6 +9,7 @@ This module provides two types of click capture:
 2. Manual clicks: Captures screenshots when the user physically clicks their mouse
 """
 
+import contextlib
 import re
 import sys
 import threading
@@ -432,10 +433,8 @@ class CaptureToolService:
         self.cancel_pending_captures()
 
         if self.mss_capture is not None:
-            try:
+            with contextlib.suppress(Exception):
                 self.mss_capture.close()
-            except Exception:
-                pass
             self.mss_capture = None
 
 

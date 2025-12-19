@@ -164,8 +164,8 @@ class TransitionAnalyzer:
                 id=transition_id,
                 source_states=[from_state_id],
                 target_states=[to_state_id],
-                states_appeared=sorted(list(change_point.states_appeared)),
-                states_disappeared=sorted(list(change_point.states_disappeared)),
+                states_appeared=sorted(change_point.states_appeared),
+                states_disappeared=sorted(change_point.states_disappeared),
                 # Outgoing (Action)
                 action_type=trigger_event.event_type,
                 action_target=action_target_id,

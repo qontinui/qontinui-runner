@@ -1,6 +1,6 @@
 """Template Resolver Module.
 
-This module provides template variable resolution for TRIGGER_AI_ANALYSIS prompts.
+This module provides template variable resolution for AI_PROMPT prompts.
 It resolves {{context.key}} and {{execution.key}} patterns in template strings.
 
 Following the Single Responsibility Principle, this module:

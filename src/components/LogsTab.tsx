@@ -5,23 +5,25 @@
  * Contains sub-tabs for General, Image Recognition, and Actions logs.
  */
 
-import { useRef } from "react";
+import { useRef, useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { FileText, Image, Zap, Brain, FolderOpen, Database } from "lucide-react";
+import { FileText, Image, Zap, Brain, FolderOpen, Database, AlertTriangle } from "lucide-react";
 import { GeneralLogTab } from "./GeneralLogTab";
 import ImageLogTable from "./ImageLogTable";
 import ActionLogTable from "./ActionLogTable";
 import { AiOutputTab, type AiOutputLine } from "./AiOutputTab";
 import { ExternalLogsTab } from "./ExternalLogsTab";
 import { RagLogTab, type RagProcessingState } from "./RagLogTab";
+import { IssuesPanel } from "./IssuesPanel";
 import { LogTabActions } from "./LogTabActions";
 import { useAutoScroll } from "../hooks";
+import { issueTracker } from "../services";
 import type { LogEntry, ImageRecognitionEntry } from "../managers/LogManager";
 import type { ActionLogEntry } from "../types/displayProfile";
 import type { LogLevel } from "../hooks/useLogFilter";
 import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
 
-type LogSubTab = "general" | "image" | "actions" | "ai" | "rag" | "external";
+type LogSubTab = "general" | "image" | "actions" | "ai" | "issues" | "rag" | "external";
 
 interface LogsTabProps {
   // General logs
@@ -134,11 +136,31 @@ export function LogsTab({
     dependencies: [logs],
   });
 
+  // Track issue count from IssueTracker
+  const [issueCount, setIssueCount] = useState(issueTracker.count);
+  const [unresolvedCount, setUnresolvedCount] = useState(issueTracker.unresolvedCount);
+
+  useEffect(() => {
+    const updateCounts = () => {
+      setIssueCount(issueTracker.count);
+      setUnresolvedCount(issueTracker.unresolvedCount);
+    };
+    const unsubscribe = issueTracker.subscribe(updateCounts);
+    return unsubscribe;
+  }, []);
+
   const subTabs = [
     { id: "general" as const, label: "General", icon: FileText, count: logCount },
     { id: "image" as const, label: "Image Recognition", icon: Image, count: imageLogCount },
     { id: "actions" as const, label: "Actions", icon: Zap, count: actionCount },
     { id: "ai" as const, label: "AI Output", icon: Brain, count: aiOutputCount },
+    {
+      id: "issues" as const,
+      label: "Issues",
+      icon: AlertTriangle,
+      count: issueCount,
+      highlight: unresolvedCount > 0,
+    },
     { id: "rag" as const, label: "RAG", icon: Database, count: ragLogCount },
     { id: "external" as const, label: "Project Logs", icon: FolderOpen, count: externalLogCount },
   ];
@@ -147,13 +169,14 @@ export function LogsTab({
     <Tabs.Root
       value={activeSubTab}
       onValueChange={(value) => onSubTabChange(value as LogSubTab)}
-      className="h-full flex flex-col"
+      className="h-full flex flex-col overflow-hidden"
     >
-      {/* Sub-tab Navigation */}
-      <div className="flex items-center justify-between border-b border-border">
+      {/* Sub-tab Navigation - Fixed Header (flex-shrink-0 keeps it from scrolling) */}
+      <div className="flex-shrink-0 bg-background flex items-center justify-between border-b border-border z-10 relative">
         <Tabs.List className="flex">
           {subTabs.map((tab) => {
             const Icon = tab.icon;
+            const hasHighlight = "highlight" in tab && tab.highlight;
             return (
               <Tabs.Trigger
                 key={tab.id}
@@ -166,10 +189,14 @@ export function LogsTab({
                   data-[state=inactive]:hover:text-foreground
                 `}
               >
-                <Icon className="w-4 h-4" />
+                <Icon className={`w-4 h-4 ${hasHighlight ? "text-red-500" : ""}`} />
                 {tab.label}
                 {tab.count > 0 && (
-                  <span className="ml-1 px-1.5 py-0.5 text-xs bg-muted rounded-full">
+                  <span
+                    className={`ml-1 px-1.5 py-0.5 text-xs rounded-full ${
+                      hasHighlight ? "bg-red-500/20 text-red-400" : "bg-muted"
+                    }`}
+                  >
                     {tab.count}
                   </span>
                 )}
@@ -194,19 +221,26 @@ export function LogsTab({
         />
       </div>
 
-      {/* Tab Content */}
-      <div className="flex-1 p-4 overflow-hidden">
-        <Tabs.Content value="general" className="h-full outline-none">
+      {/* Tab Content - Each tab manages its own scrolling */}
+      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+        <Tabs.Content
+          value="general"
+          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+        >
           <GeneralLogTab logs={filteredLogs} containerRef={logViewerRef} />
         </Tabs.Content>
 
-        <Tabs.Content value="image" className="h-full outline-none">
-          <div style={{ maxHeight: "400px", overflowY: "auto" }}>
-            <ImageLogTable imageLogs={imageLogs} onRowClick={onImageRowClick} />
-          </div>
+        <Tabs.Content
+          value="image"
+          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+        >
+          <ImageLogTable imageLogs={imageLogs} onRowClick={onImageRowClick} />
         </Tabs.Content>
 
-        <Tabs.Content value="actions" className="h-full outline-none">
+        <Tabs.Content
+          value="actions"
+          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+        >
           {actionLogLoading && (
             <div className="text-center text-muted-foreground py-8">Loading action log...</div>
           )}
@@ -218,11 +252,24 @@ export function LogsTab({
           )}
         </Tabs.Content>
 
-        <Tabs.Content value="ai" className="h-full outline-none">
+        <Tabs.Content
+          value="ai"
+          className="flex-1 flex flex-col p-4 outline-none overflow-hidden data-[state=inactive]:hidden"
+        >
           <AiOutputTab lines={aiOutputLines} onClear={onClearAiOutput} />
         </Tabs.Content>
 
-        <Tabs.Content value="rag" className="h-full outline-none">
+        <Tabs.Content
+          value="issues"
+          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+        >
+          <IssuesPanel />
+        </Tabs.Content>
+
+        <Tabs.Content
+          value="rag"
+          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+        >
           <RagLogTab
             state={ragState}
             onStartProcessing={onStartRagProcessing}
@@ -231,7 +278,10 @@ export function LogsTab({
           />
         </Tabs.Content>
 
-        <Tabs.Content value="external" className="h-full outline-none">
+        <Tabs.Content
+          value="external"
+          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+        >
           <ExternalLogsTab
             config={projectLogConfig}
             sources={projectLogSources}

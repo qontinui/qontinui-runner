@@ -19,6 +19,7 @@ import {
   Globe,
   Package,
   Sparkles,
+  BookOpen,
 } from "lucide-react";
 
 // Contexts
@@ -54,12 +55,21 @@ import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
 import { AiBuilderTab } from "./components/AiBuilderTab";
+import { PromptLibraryTab } from "./components/PromptLibraryTab";
 
 // Styles
 import "./index.css";
 
-type MainTab = "run" | "logs" | "capture" | "extract" | "dataset" | "ai-builder" | "settings";
-type LogSubTab = "general" | "image" | "actions" | "ai" | "rag" | "external";
+type MainTab =
+  | "run"
+  | "logs"
+  | "capture"
+  | "extract"
+  | "dataset"
+  | "ai-builder"
+  | "prompts"
+  | "settings";
+type LogSubTab = "general" | "image" | "actions" | "ai" | "issues" | "rag" | "external";
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
@@ -78,7 +88,16 @@ function AppContent() {
     const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
     if (
       stored &&
-      ["run", "logs", "capture", "extract", "dataset", "ai-builder", "settings"].includes(stored)
+      [
+        "run",
+        "logs",
+        "capture",
+        "extract",
+        "dataset",
+        "ai-builder",
+        "prompts",
+        "settings",
+      ].includes(stored)
     ) {
       return stored as MainTab;
     }
@@ -259,15 +278,25 @@ function AppContent() {
     await clearActionLogs();
   };
 
-  // Show loading state while checking auth
-  console.log("[APP] Render - auth.loading:", auth.loading, "auth.authStatus:", auth.authStatus);
-  if (auth.loading) {
+  // Show loading state while checking auth or during dev auto-login
+  const isAuthLoading = auth.loading || auth.devAutoLoginPending;
+  console.log(
+    "[APP] Render - auth.loading:",
+    auth.loading,
+    "auth.devAutoLoginPending:",
+    auth.devAutoLoginPending,
+    "auth.authStatus:",
+    auth.authStatus,
+  );
+  if (isAuthLoading) {
     console.log("[APP] Rendering loading state");
     return (
       <div className="min-h-screen bg-background grid-dots flex items-center justify-center">
         <div className="card p-8 text-center space-y-4">
           <div className="inline-block w-12 h-12 border-4 border-primary border-t-transparent rounded-full animate-spin" />
-          <p className="text-muted-foreground">Checking authentication...</p>
+          <p className="text-muted-foreground">
+            {auth.devAutoLoginPending ? "Signing in..." : "Checking authentication..."}
+          </p>
         </div>
       </div>
     );
@@ -288,6 +317,7 @@ function AppContent() {
     { id: "extract" as const, label: "Extract", icon: Globe },
     { id: "dataset" as const, label: "Dataset", icon: Package },
     { id: "ai-builder" as const, label: "AI Builder", icon: Sparkles },
+    { id: "prompts" as const, label: "Prompts", icon: BookOpen },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
   ];
 
@@ -330,9 +360,12 @@ function AppContent() {
         </Tabs.List>
 
         {/* Tab Content */}
-        <div className="flex-1 overflow-hidden">
+        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
           {/* Run Tab */}
-          <Tabs.Content value="run" className="h-full outline-none p-6 overflow-y-auto">
+          <Tabs.Content
+            value="run"
+            className="flex-1 outline-none p-6 overflow-y-auto data-[state=inactive]:hidden"
+          >
             <div className="space-y-6">
               {/* Control Panels Grid */}
               <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -369,8 +402,11 @@ function AppContent() {
           </Tabs.Content>
 
           {/* Logs Tab */}
-          <Tabs.Content value="logs" className="h-full outline-none">
-            <div className="h-full card m-4">
+          <Tabs.Content
+            value="logs"
+            className="flex-1 flex flex-col outline-none overflow-hidden p-4 data-[state=inactive]:hidden"
+          >
+            <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
               <LogsTab
                 logs={logs}
                 filteredLogs={filteredLogs}
@@ -416,7 +452,10 @@ function AppContent() {
           </Tabs.Content>
 
           {/* Capture Tab */}
-          <Tabs.Content value="capture" className="h-full outline-none overflow-y-auto">
+          <Tabs.Content
+            value="capture"
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
             <CaptureTab
               onLog={addLog}
               projects={projectSelection.projects}
@@ -426,7 +465,10 @@ function AppContent() {
           </Tabs.Content>
 
           {/* Extract Tab */}
-          <Tabs.Content value="extract" className="h-full outline-none overflow-y-auto">
+          <Tabs.Content
+            value="extract"
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
             <ExtractionTab
               onLog={addLog}
               projects={projectSelection.projects}
@@ -436,17 +478,34 @@ function AppContent() {
           </Tabs.Content>
 
           {/* Dataset Tab */}
-          <Tabs.Content value="dataset" className="h-full outline-none overflow-y-auto">
+          <Tabs.Content
+            value="dataset"
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
             <DatasetPackager />
           </Tabs.Content>
 
           {/* AI Builder Tab */}
-          <Tabs.Content value="ai-builder" className="h-full outline-none overflow-y-auto">
-            <AiBuilderTab />
+          <Tabs.Content
+            value="ai-builder"
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
+            <AiBuilderTab projectLogs={projectLogs} />
+          </Tabs.Content>
+
+          {/* Prompts Tab */}
+          <Tabs.Content
+            value="prompts"
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
+            <PromptLibraryTab onLog={addLog} />
           </Tabs.Content>
 
           {/* Settings Tab */}
-          <Tabs.Content value="settings" className="h-full outline-none">
+          <Tabs.Content
+            value="settings"
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
             <div className="h-full">
               <Settings
                 onLog={addLog}

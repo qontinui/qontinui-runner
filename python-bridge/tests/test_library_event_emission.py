@@ -5,8 +5,7 @@ events when performing image matching operations.
 """
 
 import sys
-from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -82,7 +81,7 @@ def test_library_emits_event_with_match_found():
     from qontinui.actions.basic.find.implementations.find_image.find_image_orchestrator import (
         FindImageOrchestrator,
     )
-    from qontinui.reporting import EventType, emit_event
+    from qontinui.reporting import emit_event
 
     orchestrator = FindImageOrchestrator()
 

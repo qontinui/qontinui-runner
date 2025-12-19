@@ -54,6 +54,8 @@ except ImportError:
     Image = None  # type: ignore[assignment]
 
 # Import models
+import contextlib
+
 from models import InputMonitorEvent, ProcessingResult
 
 logger = logging.getLogger(__name__)
@@ -337,10 +339,8 @@ class CloudStreamingService:
         # Cancel heartbeat task
         if self.heartbeat_task and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError):
                 await self.heartbeat_task
-            except asyncio.CancelledError:
-                pass
 
         # Close WebSocket
         if self.ws and not self.ws.closed:

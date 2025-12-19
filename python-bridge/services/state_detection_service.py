@@ -325,7 +325,7 @@ class LocalStateDetectionService:
                 screenshot_timestamps.append(timestamp)
 
         # Match events to screenshots
-        for i, event in enumerate(events):
+        for _i, event in enumerate(events):
             # Find the screenshot immediately before the event
             before_idx = None
             for j, ts in enumerate(screenshot_timestamps):

@@ -1,5 +1,5 @@
 use super::health::{HealthCheckTask, HealthMonitor};
-use super::lifecycle::ExecutorLifecycle;
+use super::lifecycle::{CommandResponseResult, ExecutorLifecycle};
 use super::output::OutputProcessor;
 use super::process::ProcessManager;
 use super::protocol::{ExecutorCommand, ProtocolHandler};
@@ -7,8 +7,10 @@ use super::state::ExecutorState;
 use serde_json::{json, Value};
 use std::process::Child;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::Emitter;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::timeout;
 use tracing::{debug, error, info};
 
 // Re-export protocol types for backward compatibility
@@ -367,6 +369,66 @@ impl PythonBridge {
             can_accept
         });
         debug!("[PYTHON_BRIDGE] is_running() returning: {}", result);
+        result
+    }
+
+    /// Sends a command and waits for its response.
+    /// This is useful for request-response style commands where
+    /// we need the result before continuing.
+    ///
+    /// # Arguments
+    /// * `command` - The command name
+    /// * `params` - Optional command parameters
+    /// * `timeout_duration` - Maximum time to wait for response
+    ///
+    /// # Returns
+    /// The command response result or an error if timeout or send fails
+    pub fn send_command_and_wait(
+        &mut self,
+        command: &str,
+        params: Option<Value>,
+        timeout_duration: Duration,
+    ) -> Result<CommandResponseResult, String> {
+        let cmd_id = uuid::Uuid::new_v4().to_string();
+
+        let cmd = ExecutorCommand {
+            cmd_type: "command".to_string(),
+            id: cmd_id.clone(),
+            command: command.to_string(),
+            params,
+        };
+
+        let tx = self
+            .protocol_handler
+            .get_sender()
+            .ok_or("Command channel not initialized")?;
+
+        // Register for response before sending command
+        let lifecycle = Arc::clone(&self.lifecycle);
+        let response_rx = self.runtime.block_on(async {
+            let lifecycle_guard = lifecycle.read().await;
+            lifecycle_guard.register_command_response(cmd_id.clone()).await
+        });
+
+        // Send the command
+        self.runtime
+            .block_on(async { tx.send(cmd).await })
+            .map_err(|e| format!("Failed to send command: {}", e))?;
+
+        debug!("Sent command '{}' with ID: {}", command, cmd_id);
+
+        // Wait for response with timeout
+        let result = self.runtime.block_on(async {
+            match timeout(timeout_duration, response_rx).await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(_)) => Err("Response channel closed unexpectedly".to_string()),
+                Err(_) => Err(format!(
+                    "Timeout waiting for command '{}' response after {:?}",
+                    command, timeout_duration
+                )),
+            }
+        });
+
         result
     }
 

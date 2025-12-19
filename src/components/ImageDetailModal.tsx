@@ -7,7 +7,7 @@
 
 import React, { useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { X, Maximize2, CheckCircle2, XCircle, Target } from "lucide-react";
+import { X, Maximize2, CheckCircle2, XCircle, Target, Monitor } from "lucide-react";
 import { ImageRecognitionEntry } from "../managers/LogManager";
 import { cn } from "../lib/utils";
 
@@ -196,6 +196,17 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                       ) : (
                         <span className="text-muted-foreground">No location</span>
                       )}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Captured Screen</div>
+                    <div className="font-mono text-sm">
+                      <div className="flex items-center gap-2">
+                        <Monitor className="w-4 h-4 text-muted-foreground" />
+                        {entry.monitorIndex !== undefined && entry.monitorIndex !== null
+                          ? `Monitor ${entry.monitorIndex + 1}`
+                          : "All monitors"}
+                      </div>
                     </div>
                   </div>
                 </div>
