@@ -25,6 +25,8 @@ pub enum WorkflowStatus {
     Running,
     /// Workflow is idle but not complete (waiting or between sessions)
     Idle,
+    /// Session ended with progress, ready for continuation (no wait needed)
+    ReadyToContinue,
     /// Workflow appears stalled (no progress for stall_threshold)
     Stalled,
     /// Workflow completed successfully
@@ -46,6 +48,8 @@ pub struct WorkflowRun {
     pub status: WorkflowStatus,
     /// Current phase (from checkpoint)
     pub current_phase: u32,
+    /// Previous phase (to detect progress)
+    pub previous_phase: u32,
     /// Completion value (target phase)
     pub completion_value: u32,
     /// Path to checkpoint file
@@ -88,6 +92,7 @@ impl WorkflowRun {
             prompt_name: prompt.name.clone(),
             status: WorkflowStatus::Idle,
             current_phase: 0,
+            previous_phase: 0,
             completion_value: prompt.workflow.completion_value,
             checkpoint_path: prompt.workflow.checkpoint_path.clone(),
             active_session_id: None,
@@ -150,6 +155,7 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
 }
 
 /// Get the modification time of the checkpoint file
+#[allow(dead_code)]
 pub fn get_checkpoint_mtime(checkpoint_path: &str) -> Option<u64> {
     let path = Path::new(checkpoint_path);
     if !path.exists() {
@@ -224,17 +230,23 @@ impl WorkflowManager {
     }
 
     /// Update a workflow run
-    #[allow(dead_code)]
     pub async fn update_run(&self, run: WorkflowRun) {
         let mut runs = self.runs.write().await;
         runs.insert(run.id.clone(), run);
     }
 
     /// Remove a completed/failed workflow run
-    #[allow(dead_code)]
-    pub async fn remove_run(&self, run_id: &str) {
+    pub async fn remove_run(&self, run_id: &str) -> bool {
         let mut runs = self.runs.write().await;
-        runs.remove(run_id);
+        runs.remove(run_id).is_some()
+    }
+
+    /// Clear all workflow runs
+    pub async fn clear_all_runs(&self) -> usize {
+        let mut runs = self.runs.write().await;
+        let count = runs.len();
+        runs.clear();
+        count
     }
 
     /// Set the active session for a workflow run
@@ -253,6 +265,8 @@ impl WorkflowManager {
     }
 
     /// Check and update workflow status based on checkpoint
+    /// Note: Currently unused - sync loop checks checkpoint directly
+    #[allow(dead_code)]
     pub async fn check_workflow_status(
         &self,
         run_id: &str,
@@ -262,6 +276,7 @@ impl WorkflowManager {
         let run = runs.get_mut(run_id)?;
 
         let config = &prompt.workflow;
+        let mut phase_advanced = false;
 
         // Check if checkpoint exists and read current phase
         match read_checkpoint_phase(&config.checkpoint_path, &config.phase_field) {
@@ -271,6 +286,11 @@ impl WorkflowManager {
 
                 if phase != old_phase {
                     run.log_event("phase_update", &format!("Phase {} -> {}", old_phase, phase));
+                    // Track if phase advanced (progress was made)
+                    if phase > run.previous_phase {
+                        phase_advanced = true;
+                        run.previous_phase = phase;
+                    }
                 }
 
                 // Update checkpoint mtime
@@ -295,7 +315,7 @@ impl WorkflowManager {
             }
         }
 
-        // Check for stall condition
+        // Determine workflow status
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -304,19 +324,30 @@ impl WorkflowManager {
         let last_activity = run.last_checkpoint_update.unwrap_or(run.last_activity);
         let seconds_since_activity = now.saturating_sub(last_activity);
 
-        // Only consider stalled if no active session AND exceeded threshold
-        if run.active_session_id.is_none()
-            && seconds_since_activity > config.stall_threshold_secs as u64
+        if run.active_session_id.is_some() {
+            // Session is running
+            if run.status != WorkflowStatus::Running {
+                run.status = WorkflowStatus::Running;
+            }
+        } else if phase_advanced && run.sessions_spawned > 0 {
+            // Session ended with progress - ready for immediate continuation
+            run.set_status(
+                WorkflowStatus::ReadyToContinue,
+                &format!(
+                    "Phase advanced to {}, ready for continuation",
+                    run.current_phase
+                ),
+            );
+        } else if run.status == WorkflowStatus::ReadyToContinue {
+            // Keep ReadyToContinue status until continuation is spawned
+        } else if seconds_since_activity > config.stall_threshold_secs as u64
             && run.sessions_spawned > 0
         {
+            // No progress for too long - stalled
             run.set_status(
                 WorkflowStatus::Stalled,
                 &format!("No activity for {}s", seconds_since_activity),
             );
-        } else if run.active_session_id.is_some() {
-            if run.status != WorkflowStatus::Running {
-                run.status = WorkflowStatus::Running;
-            }
         } else if run.status == WorkflowStatus::Stalled {
             // Keep stalled status
         } else {

@@ -6,6 +6,7 @@
  */
 
 import type { LogEntry, ImageRecognitionEntry } from "./LogStore";
+import type { LogSourceContent } from "../../types/projectLogs";
 
 export interface ActionLogEntry {
   action_type: string;
@@ -14,6 +15,14 @@ export interface ActionLogEntry {
   status: string;
   error?: string | null;
   metadata?: any;
+}
+
+export interface AiOutputLine {
+  id: string;
+  timestamp: number;
+  line: string;
+  source: string;
+  actionId?: string;
 }
 
 /**
@@ -61,6 +70,39 @@ export class LogFormatter {
         return `[${timestamp}] ${action.action_type}${duration} - ${status}${error}`;
       })
       .join("\n");
+  }
+
+  /**
+   * Format AI output logs as text for clipboard
+   */
+  formatAiOutputLogs(lines: AiOutputLine[]): string {
+    return lines
+      .map((entry) => {
+        const timestamp = new Date(entry.timestamp).toLocaleTimeString("en-US", {
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+        const sourceLabel = entry.source === "prompt" ? "USER" : "AI";
+        return `[${timestamp}] [${sourceLabel}] ${entry.line}`;
+      })
+      .join("\n");
+  }
+
+  /**
+   * Format external/project logs as text for clipboard
+   */
+  formatExternalLogs(sources: LogSourceContent[]): string {
+    if (sources.length === 0) return "";
+
+    return sources
+      .map((source) => {
+        const header = `=== ${source.sourceName} (${source.filePath}) ===`;
+        const content = source.lines.join("\n");
+        return `${header}\n${content}`;
+      })
+      .join("\n\n");
   }
 
   /**

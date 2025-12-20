@@ -12,7 +12,14 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { LogStore, LogFilter, LogFormatter, TimestampFormatter, ImageLogHandler } from "./logging";
-import type { LogEntry, ImageRecognitionEntry, ActionLogEntry, AiOutputEntry } from "./logging";
+import type {
+  LogEntry,
+  ImageRecognitionEntry,
+  ActionLogEntry,
+  AiOutputEntry,
+  AiOutputLine,
+} from "./logging";
+import type { LogSourceContent } from "../types/projectLogs";
 
 // Re-export types for backward compatibility
 export type { LogEntry, ImageRecognitionEntry, AiOutputEntry };
@@ -241,11 +248,18 @@ class LogManager {
   /**
    * Copy logs to clipboard
    * @param type - Type of logs to copy
-   * @param actionLogs - Optional action logs data (required when type is "actions")
+   * @param data - Optional data for certain log types:
+   *   - actionLogs: Required when type is "actions"
+   *   - aiOutputLines: Required when type is "ai"
+   *   - externalSources: Required when type is "external"
    */
   async copyLogs(
-    type: "general" | "image" | "actions",
-    actionLogs?: ActionLogEntry[],
+    type: "general" | "image" | "actions" | "ai" | "external",
+    data?: {
+      actionLogs?: ActionLogEntry[];
+      aiOutputLines?: AiOutputLine[];
+      externalSources?: LogSourceContent[];
+    },
   ): Promise<boolean> {
     let text = "";
 
@@ -255,8 +269,12 @@ class LogManager {
     } else if (type === "image") {
       const logs = this.logStore.getImageLogs();
       text = this.logFormatter.formatImageLogs(logs);
-    } else if (type === "actions" && actionLogs) {
-      text = this.logFormatter.formatActionLogs(actionLogs);
+    } else if (type === "actions" && data?.actionLogs) {
+      text = this.logFormatter.formatActionLogs(data.actionLogs);
+    } else if (type === "ai" && data?.aiOutputLines) {
+      text = this.logFormatter.formatAiOutputLogs(data.aiOutputLines);
+    } else if (type === "external" && data?.externalSources) {
+      text = this.logFormatter.formatExternalLogs(data.externalSources);
     }
 
     return await this.logFormatter.copyToClipboard(text);

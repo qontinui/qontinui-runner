@@ -10,7 +10,7 @@ export type { LogEntry, ImageRecognitionEntry, AiOutputEntry } from "./LogStore"
 export { LogFilter } from "./LogFilter";
 
 export { LogFormatter } from "./LogFormatter";
-export type { ActionLogEntry } from "./LogFormatter";
+export type { ActionLogEntry, AiOutputLine } from "./LogFormatter";
 
 export { TimestampFormatter } from "./TimestampFormatter";
 

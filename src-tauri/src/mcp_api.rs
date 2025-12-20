@@ -1464,7 +1464,7 @@ pub struct DuplicatePromptRequest {
 // Workflow Request/Response Types
 // ============================================================================
 
-use crate::workflow_monitor::{WorkflowRun, WorkflowStatus};
+use crate::workflow_monitor::{self, WorkflowRun, WorkflowStatus};
 
 /// Request to start a workflow run
 #[derive(Debug, Deserialize)]
@@ -3494,196 +3494,234 @@ async fn start_workflow_run(
     }
 
     // Start the workflow run
-    let mut run = match state.workflow_manager.start_workflow(&prompt).await {
+    let run = match state.workflow_manager.start_workflow(&prompt).await {
         Ok(r) => r,
         Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     };
 
-    // Spawn the initial AI Developer session
-    let ai_settings = settings::get_ai_settings();
-    let cli_settings = ai_settings.claude_cli;
-
-    let session_id = format!("workflow-{}", &run.id[..8]);
-    let action_id = format!("workflow-{}", chrono::Utc::now().timestamp_millis());
-
-    // Execute the initial session
-    match execute_claude_cli(
-        &cli_settings,
-        &prompt.content,
-        &state.app_handle,
-        &action_id,
-    )
-    .await
-    {
-        Ok(_) => {
-            run.log_event(
-                "session_started",
-                &format!("Initial session {} started", session_id),
-            );
-            state
-                .workflow_manager
-                .set_active_session(&run.id, Some(session_id))
-                .await;
-        }
-        Err(e) => {
-            state.workflow_manager.fail_workflow(&run.id, &e).await;
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
-        }
-    }
-
-    // Start the workflow monitor in the background
+    // Spawn the workflow execution loop in background (returns immediately)
     let workflow_id = run.id.clone();
     let prompt_clone = prompt.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
-        monitor_workflow(state_clone, workflow_id, prompt_clone).await;
+        run_workflow_loop(state_clone, workflow_id, prompt_clone).await;
     });
 
     Ok(Json(ApiResponse::success(WorkflowRunResponse { run })))
 }
 
-/// Monitor a workflow and auto-spawn continuations when needed
-async fn monitor_workflow(state: Arc<ApiState>, workflow_id: String, prompt: prompts::SavedPrompt) {
+/// Synchronous workflow execution loop
+///
+/// Runs sessions one after another, checking the checkpoint immediately after each
+/// session completes. This provides zero-latency continuation without polling.
+async fn run_workflow_loop(
+    state: Arc<ApiState>,
+    workflow_id: String,
+    prompt: prompts::SavedPrompt,
+) {
     let config = &prompt.workflow;
-    let check_interval = Duration::from_secs(30); // Check every 30 seconds
-    let mut last_phase = 0u32;
+    let mut session_count = 0u32;
+    let mut current_prompt_content = prompt.content.clone();
 
-    info!("Starting workflow monitor for {}", workflow_id);
+    info!("Starting workflow execution loop for {}", workflow_id);
     log_workflow_event(
         &workflow_id,
-        "monitor_started",
-        &format!("Workflow monitor started for '{}'", prompt.name),
+        "loop_started",
+        &format!("Workflow execution loop started for '{}'", prompt.name),
     );
 
-    loop {
-        tokio::time::sleep(check_interval).await;
-
-        // Check workflow status
-        let run = match state
-            .workflow_manager
-            .check_workflow_status(&workflow_id, &prompt)
-            .await
-        {
-            Some(r) => r,
-            None => {
-                info!("Workflow {} not found, stopping monitor", workflow_id);
-                log_workflow_event(
-                    &workflow_id,
-                    "monitor_stopped",
-                    "Workflow not found, monitor stopping",
-                );
-                break;
+    // Delete any existing checkpoint file to start fresh
+    if !config.checkpoint_path.is_empty() {
+        if let Err(e) = std::fs::remove_file(&config.checkpoint_path) {
+            // It's OK if file doesn't exist
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Failed to delete existing checkpoint: {}", e);
             }
-        };
+        } else {
+            info!("Deleted existing checkpoint file for fresh start");
+            log_workflow_event(
+                &workflow_id,
+                "checkpoint_reset",
+                "Deleted existing checkpoint file to start fresh",
+            );
+        }
+    }
 
-        // Log phase changes
-        if run.current_phase != last_phase {
-            info!(
-                "Workflow {} phase: {} -> {}",
-                workflow_id, last_phase, run.current_phase
+    loop {
+        session_count += 1;
+        let session_id = if session_count == 1 {
+            format!("workflow-{}", &workflow_id[..8])
+        } else {
+            format!("workflow-{}-cont-{}", &workflow_id[..8], session_count)
+        };
+        // Use consistent action_id for all sessions in the workflow
+        // This ensures all sessions are grouped together in the AI Output tab
+        let action_id = format!("workflow-{}", &workflow_id[..8]);
+
+        // Mark session as active
+        state
+            .workflow_manager
+            .set_active_session(&workflow_id, Some(session_id.clone()))
+            .await;
+        log_workflow_event(
+            &workflow_id,
+            "session_started",
+            &format!(
+                "Session {} started (#{} in workflow)",
+                session_id, session_count
+            ),
+        );
+
+        // Get CLI settings
+        let ai_settings = settings::get_ai_settings();
+        let cli_settings = ai_settings.claude_cli;
+
+        // Execute session (blocks until complete)
+        let result = execute_claude_cli(
+            &cli_settings,
+            &current_prompt_content,
+            &state.app_handle,
+            &action_id,
+        )
+        .await;
+
+        // Session ended - clear active session ID
+        state
+            .workflow_manager
+            .set_active_session(&workflow_id, None)
+            .await;
+
+        // Handle session result
+        if let Err(e) = result {
+            error!(
+                "Workflow {} session {} failed: {}",
+                workflow_id, session_id, e
             );
             log_workflow_event(
                 &workflow_id,
-                "phase_changed",
-                &format!(
-                    "Phase {} -> {} (target: {})",
-                    last_phase, run.current_phase, run.completion_value
-                ),
+                "session_failed",
+                &format!("Session {} failed: {}", session_id, e),
             );
-            last_phase = run.current_phase;
+            state.workflow_manager.fail_workflow(&workflow_id, &e).await;
+            break;
         }
 
-        match run.status {
-            WorkflowStatus::Completed => {
-                info!("Workflow {} completed successfully", workflow_id);
-                log_workflow_event(
-                    &workflow_id,
-                    "completed",
-                    &format!("Workflow completed! Reached phase {}", run.current_phase),
+        log_workflow_event(
+            &workflow_id,
+            "session_completed",
+            &format!("Session {} completed", session_id),
+        );
+
+        // Immediately check checkpoint (no polling delay!)
+        match workflow_monitor::read_checkpoint_phase(&config.checkpoint_path, &config.phase_field)
+        {
+            Ok(phase) => {
+                info!(
+                    "Workflow {} checkpoint: phase {} (target: {})",
+                    workflow_id, phase, config.completion_value
                 );
-                break;
-            }
-            WorkflowStatus::Failed => {
-                error!("Workflow {} failed: {:?}", workflow_id, run.error_message);
                 log_workflow_event(
                     &workflow_id,
-                    "failed",
-                    &format!("Workflow failed: {}", run.error_message.unwrap_or_default()),
-                );
-                break;
-            }
-            WorkflowStatus::Stalled => {
-                info!("Workflow {} stalled, spawning continuation", workflow_id);
-                log_workflow_event(
-                    &workflow_id,
-                    "stalled",
+                    "checkpoint_read",
                     &format!(
-                        "No progress detected, spawning continuation session (session #{})",
-                        run.sessions_spawned + 1
+                        "Checkpoint phase: {} (target: {})",
+                        phase, config.completion_value
                     ),
                 );
 
-                // Get the continuation prompt
-                let continuation = if config.continuation_prompt.is_empty() {
+                // Update workflow manager with current phase
+                if let Some(run) = state.workflow_manager.get_run(&workflow_id).await {
+                    let mut updated_run = run;
+                    updated_run.current_phase = phase;
+                    updated_run.previous_phase = phase;
+                    state.workflow_manager.update_run(updated_run).await;
+                }
+
+                // Check if complete
+                if phase >= config.completion_value {
+                    info!(
+                        "Workflow {} completed! Reached phase {}",
+                        workflow_id, phase
+                    );
+                    log_workflow_event(
+                        &workflow_id,
+                        "completed",
+                        &format!("Workflow completed! Reached phase {}", phase),
+                    );
+                    // Mark as completed in workflow manager
+                    if let Some(run) = state.workflow_manager.get_run(&workflow_id).await {
+                        state
+                            .workflow_manager
+                            .update_run({
+                                let mut r = run;
+                                r.status = WorkflowStatus::Completed;
+                                r
+                            })
+                            .await;
+                    }
+                    break;
+                }
+
+                // Not complete - continue with next session immediately
+                info!(
+                    "Workflow {} phase {} < {}, spawning continuation",
+                    workflow_id, phase, config.completion_value
+                );
+
+                // Use continuation prompt for subsequent sessions
+                current_prompt_content = if config.continuation_prompt.is_empty() {
                     format!(
-                        "Continue the workflow. Read checkpoint from {} and resume from phase {}. Complete 2-3 more phases, update checkpoint, then exit.",
-                        config.checkpoint_path, run.current_phase
+                        "Continue the workflow. Read checkpoint from {} and resume from phase {}. Complete the next phase(s), update checkpoint, then exit.",
+                        config.checkpoint_path, phase
                     )
                 } else {
                     config.continuation_prompt.clone()
                 };
 
-                // Spawn continuation session
-                let ai_settings = settings::get_ai_settings();
-                let cli_settings = ai_settings.claude_cli;
-
-                let action_id = format!("workflow-cont-{}", chrono::Utc::now().timestamp_millis());
-                match execute_claude_cli(
-                    &cli_settings,
-                    &continuation,
-                    &state.app_handle,
-                    &action_id,
-                )
-                .await
-                {
-                    Ok(_) => {
-                        let session_id = format!("workflow-{}-cont", &workflow_id[..8]);
-                        state
-                            .workflow_manager
-                            .set_active_session(&workflow_id, Some(session_id))
-                            .await;
-                        info!("Spawned continuation session for workflow {}", workflow_id);
-                        log_workflow_event(
-                            &workflow_id,
-                            "session_spawned",
-                            &format!(
-                                "Continuation session started (total: {})",
-                                run.sessions_spawned + 1
-                            ),
-                        );
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to spawn continuation for workflow {}: {}",
-                            workflow_id, e
-                        );
-                        log_workflow_event(
-                            &workflow_id,
-                            "spawn_failed",
-                            &format!("Failed to spawn continuation: {}", e),
-                        );
-                        state.workflow_manager.fail_workflow(&workflow_id, &e).await;
-                        break;
-                    }
-                }
+                // Loop continues immediately - no delay!
             }
-            WorkflowStatus::Running | WorkflowStatus::Idle => {
-                // Still running or waiting, continue monitoring
+            Err(e) => {
+                // Checkpoint doesn't exist or is invalid
+                // For first session, this might be expected (checkpoint not created yet)
+                if session_count == 1 {
+                    warn!(
+                        "Workflow {} checkpoint not found after first session: {}",
+                        workflow_id, e
+                    );
+                    log_workflow_event(
+                        &workflow_id,
+                        "checkpoint_missing",
+                        &format!("Checkpoint not found after first session: {}. The session may not have created it.", e),
+                    );
+                    // Give the first session a pass - it might not have created the checkpoint
+                    // Fall back to continuation prompt
+                    current_prompt_content = if config.continuation_prompt.is_empty() {
+                        format!(
+                            "The checkpoint file was not found at {}. Please create it with the current phase and continue the workflow.",
+                            config.checkpoint_path
+                        )
+                    } else {
+                        config.continuation_prompt.clone()
+                    };
+                } else {
+                    // For subsequent sessions, checkpoint should exist
+                    error!("Workflow {} checkpoint read failed: {}", workflow_id, e);
+                    log_workflow_event(
+                        &workflow_id,
+                        "checkpoint_error",
+                        &format!("Failed to read checkpoint: {}", e),
+                    );
+                    state
+                        .workflow_manager
+                        .fail_workflow(&workflow_id, &format!("Checkpoint error: {}", e))
+                        .await;
+                    break;
+                }
             }
         }
     }
 
-    info!("Workflow monitor for {} stopped", workflow_id);
+    info!("Workflow execution loop for {} stopped", workflow_id);
 }
 
 /// Get status of a specific workflow run
@@ -3726,6 +3764,36 @@ async fn stop_workflow_run(
             Json(api_error(format!("Workflow run not found: {}", run_id))),
         )),
     }
+}
+
+/// Delete a workflow run record
+async fn delete_workflow_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    if state.workflow_manager.remove_run(&run_id).await {
+        Ok(Json(ApiResponse::success(())))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Workflow run not found: {}", run_id))),
+        ))
+    }
+}
+
+/// Delete all workflow run records
+async fn delete_all_workflow_runs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<DeleteAllResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let count = state.workflow_manager.clear_all_runs().await;
+    Ok(Json(ApiResponse::success(DeleteAllResponse {
+        deleted_count: count,
+    })))
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteAllResponse {
+    deleted_count: usize,
 }
 
 /// Create the API router
@@ -3790,9 +3858,15 @@ pub fn create_router(
         .route("/prompts/:id/run", post(run_prompt))
         .route("/prompts/:id/duplicate", post(duplicate_prompt))
         // Workflow routes (multi-session prompts)
-        .route("/workflows", get(list_workflow_runs))
+        .route(
+            "/workflows",
+            get(list_workflow_runs).delete(delete_all_workflow_runs),
+        )
         .route("/workflows/start", post(start_workflow_run))
-        .route("/workflows/:id", get(get_workflow_run))
+        .route(
+            "/workflows/:id",
+            get(get_workflow_run).delete(delete_workflow_run),
+        )
         .route("/workflows/:id/stop", post(stop_workflow_run))
         .layer(cors)
         .with_state(api_state)

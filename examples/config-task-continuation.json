@@ -39,7 +39,8 @@
             "provider": "claude"
           }
         }
-      ]
+      ],
+      "category": "Main"
     },
     {
       "id": "workflow-type-fix-with-tests",
@@ -80,7 +81,8 @@
             "timeout": 600000
           }
         }
-      ]
+      ],
+      "category": "Main"
     },
     {
       "id": "workflow-fixed-iterations",
@@ -108,7 +110,8 @@
             "timeout": 600000
           }
         }
-      ]
+      ],
+      "category": "Main"
     },
     {
       "id": "workflow-marker-file",
@@ -137,7 +140,8 @@
             "timeout": 600000
           }
         }
-      ]
+      ],
+      "category": "Main"
     }
   ],
   "states": [

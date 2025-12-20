@@ -36,7 +36,8 @@
             "text": "Testing in mock mode - instant waits!"
           }
         }
-      ]
+      ],
+      "category": "Main"
     }
   ],
   "states": [

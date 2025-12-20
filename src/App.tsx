@@ -251,12 +251,31 @@ function AppContent() {
   };
 
   const handleCopyLogs = async () => {
-    const logType =
-      activeLogSubTab === "general" ? "general" : activeLogSubTab === "image" ? "image" : "actions";
-    const success = await copyLogs(
-      logType,
-      logType === "actions" ? actionLogViewData?.actions : undefined,
-    );
+    let success = false;
+
+    switch (activeLogSubTab) {
+      case "general":
+        success = await copyLogs("general");
+        break;
+      case "image":
+        success = await copyLogs("image");
+        break;
+      case "actions":
+        success = await copyLogs("actions", { actionLogs: actionLogViewData?.actions });
+        break;
+      case "ai":
+        success = await copyLogs("ai", { aiOutputLines: aiOutputLogs });
+        break;
+      case "external":
+        success = await copyLogs("external", { externalSources: projectLogs.logsState.sources });
+        break;
+      // Issues and RAG tabs don't have copyable log content
+      case "issues":
+      case "rag":
+        // No-op for these tabs
+        break;
+    }
+
     if (success) {
       uiState.showCopySuccessFeedback();
     }

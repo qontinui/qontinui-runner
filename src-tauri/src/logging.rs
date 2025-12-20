@@ -14,6 +14,17 @@ use tracing_subscriber::{
 /// Flag to track if we're already handling a crash (prevent recursive crashes)
 static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
 
+/// Safely write to stderr, ignoring errors if the pipe is closed.
+/// This prevents panics in the panic handler when stderr is unavailable
+/// (e.g., when the parent terminal/process has closed the pipe - Windows error 232).
+fn safe_eprintln(msg: &str) {
+    use std::io::Write;
+    // Use write_all instead of eprintln! to avoid panicking on broken pipe
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+    let _ = std::io::stderr().write_all(b"\n");
+    let _ = std::io::stderr().flush();
+}
+
 pub struct LoggingConfig {
     pub level: Level,
     pub log_to_file: bool,
@@ -158,7 +169,7 @@ pub fn get_crash_dump_dir() -> PathBuf {
 pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
     // Prevent recursive crash handling
     if CRASH_HANDLING.swap(true, Ordering::SeqCst) {
-        eprintln!("RECURSIVE CRASH DETECTED - skipping crash dump");
+        safe_eprintln("RECURSIVE CRASH DETECTED - skipping crash dump");
         return;
     }
 
@@ -208,10 +219,10 @@ pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
     match std::fs::File::create(&crash_file) {
         Ok(mut file) => {
             let _ = file.write_all(crash_content.as_bytes());
-            eprintln!("Crash dump written to: {:?}", crash_file);
+            safe_eprintln(&format!("Crash dump written to: {:?}", crash_file));
         }
         Err(e) => {
-            eprintln!("Failed to write crash dump: {}", e);
+            safe_eprintln(&format!("Failed to write crash dump: {}", e));
         }
     }
 
@@ -221,43 +232,50 @@ pub fn write_crash_dump(location: &str, message: &str, backtrace: &str) {
         let _ = file.write_all(crash_content.as_bytes());
     }
 
-    // Print to stderr as well
-    eprintln!("\n{}", crash_content);
+    // Print to stderr as well (using safe write to avoid panic on closed pipe)
+    safe_eprintln(&format!("\n{}", crash_content));
 
     CRASH_HANDLING.store(false, Ordering::SeqCst);
 }
 
 pub fn log_panic(info: &std::panic::PanicHookInfo) {
-    let location = if let Some(location) = info.location() {
-        format!(
-            "{}:{}:{}",
-            location.file(),
-            location.line(),
-            location.column()
-        )
-    } else {
-        "unknown location".to_string()
-    };
+    // Wrap the entire panic logging in catch_unwind to prevent double-panics
+    // This is critical for stability - a panic in the panic handler is catastrophic
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let location = if let Some(location) = info.location() {
+            format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )
+        } else {
+            "unknown location".to_string()
+        };
 
-    let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = info.payload().downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "Unknown panic payload".to_string()
-    };
+        let message = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic payload".to_string()
+        };
 
-    let backtrace = format!("{:?}", std::backtrace::Backtrace::capture());
+        let backtrace = format!("{:?}", std::backtrace::Backtrace::capture());
 
-    // Write crash dump to file
-    write_crash_dump(&location, &message, &backtrace);
+        // Write crash dump to file
+        write_crash_dump(&location, &message, &backtrace);
 
-    tracing::error!(
-        "PANIC at {}: {}\nBacktrace:\n{}",
-        location,
-        message,
-        backtrace
-    );
+        // Try to log via tracing (may fail if tracing is not initialized or broken)
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tracing::error!(
+                "PANIC at {}: {}\nBacktrace:\n{}",
+                location,
+                message,
+                backtrace
+            );
+        }));
+    }));
 }
 
 pub fn setup_panic_handler() {

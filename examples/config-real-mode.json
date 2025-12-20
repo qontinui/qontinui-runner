@@ -29,7 +29,8 @@
             "text": "Hello World"
           }
         }
-      ]
+      ],
+      "category": "Main"
     }
   ],
   "states": [

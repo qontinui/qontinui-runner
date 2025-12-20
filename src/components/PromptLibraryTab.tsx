@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { logManager } from "../managers";
 import {
   BookOpen,
   Plus,
@@ -388,6 +389,41 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       }
     } catch (error) {
       onLog("error", `Failed to stop workflow: ${error}`);
+    }
+  };
+
+  // Delete a workflow run record
+  const deleteWorkflow = async (runId: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/workflows/${runId}`, {
+        method: "DELETE",
+      });
+      const result = await response.json();
+      if (result.success) {
+        loadWorkflowRuns();
+      } else {
+        onLog("error", `Failed to delete workflow: ${result.error}`);
+      }
+    } catch (error) {
+      onLog("error", `Failed to delete workflow: ${error}`);
+    }
+  };
+
+  // Delete all workflow run records
+  const deleteAllWorkflows = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/workflows`, {
+        method: "DELETE",
+      });
+      const result = await response.json();
+      if (result.success) {
+        onLog("success", `Deleted ${result.data.deleted_count} workflow(s)`);
+        loadWorkflowRuns();
+      } else {
+        onLog("error", `Failed to delete workflows: ${result.error}`);
+      }
+    } catch (error) {
+      onLog("error", `Failed to delete workflows: ${error}`);
     }
   };
 
@@ -792,13 +828,23 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
               Active Workflows
               <span className="text-sm text-muted-foreground">({workflowRuns.length})</span>
             </h3>
-            <button onClick={loadWorkflowRuns} className="btn-secondary p-2" title="Refresh">
-              <RefreshCw className="w-4 h-4" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button onClick={loadWorkflowRuns} className="btn-secondary p-2" title="Refresh">
+                <RefreshCw className="w-4 h-4" />
+              </button>
+              <button onClick={deleteAllWorkflows} className="btn-danger p-2" title="Delete All">
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
           </div>
           <div className="space-y-2">
             {workflowRuns.map((run) => (
-              <WorkflowRunCard key={run.id} run={run} onStop={() => stopWorkflow(run.id)} />
+              <WorkflowRunCard
+                key={run.id}
+                run={run}
+                onStop={() => stopWorkflow(run.id)}
+                onDelete={() => deleteWorkflow(run.id)}
+              />
             ))}
           </div>
         </div>
@@ -908,34 +954,28 @@ function PromptCard({
           )}
         </div>
         <div className="flex items-center gap-1">
-          {prompt.workflow?.enabled ? (
+          {/* Regular Run button - always available */}
+          <button
+            onClick={onRun}
+            disabled={isRunning}
+            className="btn-success p-2 disabled:opacity-50"
+            title="Run prompt once"
+          >
+            {isRunning ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Play className="w-4 h-4" />
+            )}
+          </button>
+          {/* Workflow button - only for workflow-enabled prompts */}
+          {prompt.workflow?.enabled && (
             <button
               onClick={onRunWorkflow}
               disabled={isRunning}
-              className="btn-success p-2 disabled:opacity-50 flex items-center gap-1"
-              title="Run as workflow (multi-session)"
+              className="btn-primary p-2 disabled:opacity-50 flex items-center gap-1"
+              title="Run as workflow (multi-session with auto-continuation)"
             >
-              {isRunning ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <>
-                  <Workflow className="w-4 h-4" />
-                  <Play className="w-3 h-3" />
-                </>
-              )}
-            </button>
-          ) : (
-            <button
-              onClick={onRun}
-              disabled={isRunning}
-              className="btn-success p-2 disabled:opacity-50"
-              title="Run prompt"
-            >
-              {isRunning ? (
-                <Loader2 className="w-4 h-4 animate-spin" />
-              ) : (
-                <Play className="w-4 h-4" />
-              )}
+              <Workflow className="w-4 h-4" />
             </button>
           )}
           <button
@@ -972,10 +1012,37 @@ function PromptCard({
 interface WorkflowRunCardProps {
   run: WorkflowRun;
   onStop: () => void;
+  onDelete: () => void;
 }
 
-function WorkflowRunCard({ run, onStop }: WorkflowRunCardProps) {
+function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const [aiOutputLogs, setAiOutputLogs] = useState<
+    { line: string; source: string; timestamp: number }[]
+  >([]);
+
+  // Subscribe to log updates and filter AI output for this workflow
+  useEffect(() => {
+    const updateLogs = () => {
+      const allLogs = logManager.getAiOutputLogs();
+      // Filter logs that match this workflow's action IDs (workflow-{id.slice(0,8)})
+      const workflowPrefix = `workflow-${run.id.slice(0, 8)}`;
+      const filteredLogs = allLogs.filter(
+        (log) => log.actionId?.startsWith(workflowPrefix) && log.source === "claude",
+      );
+      setAiOutputLogs(
+        filteredLogs.map((log) => ({
+          line: log.line,
+          source: log.source,
+          timestamp: log.timestamp,
+        })),
+      );
+    };
+
+    updateLogs();
+    const unsubscribe = logManager.subscribe(updateLogs);
+    return () => unsubscribe();
+  }, [run.id]);
 
   const getStatusIcon = () => {
     switch (run.status) {
@@ -1057,20 +1124,49 @@ function WorkflowRunCard({ run, onStop }: WorkflowRunCardProps) {
               <Square className="w-4 h-4" />
             </button>
           )}
+          <button
+            onClick={onDelete}
+            className="btn-secondary p-2 hover:text-red-500"
+            title="Delete record"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
         </div>
       </div>
 
-      {expanded && run.event_log.length > 0 && (
-        <div className="mt-3 pt-3 border-t border-border">
-          <div className="max-h-40 overflow-y-auto space-y-1">
-            {run.event_log.slice(-10).map((event, idx) => (
-              <div key={idx} className="text-xs font-mono flex gap-2">
-                <span className="text-muted-foreground">{formatTimestamp(event.timestamp)}</span>
-                <span className="text-blue-500">[{event.event_type}]</span>
-                <span>{event.message}</span>
+      {expanded && (
+        <div className="mt-3 pt-3 border-t border-border space-y-3">
+          {/* AI Output Section */}
+          {aiOutputLogs.length > 0 && (
+            <div>
+              <h5 className="text-xs font-semibold text-muted-foreground mb-2">AI Output</h5>
+              <div className="max-h-60 overflow-y-auto space-y-1 bg-muted/30 p-2 rounded">
+                {aiOutputLogs.map((log, idx) => (
+                  <div key={idx} className="text-sm font-mono">
+                    <span className="text-foreground">{log.line}</span>
+                  </div>
+                ))}
               </div>
-            ))}
-          </div>
+            </div>
+          )}
+
+          {/* Workflow Events Section */}
+          {run.event_log.length > 0 && (
+            <div>
+              <h5 className="text-xs font-semibold text-muted-foreground mb-2">Workflow Events</h5>
+              <div className="max-h-40 overflow-y-auto space-y-1">
+                {run.event_log.slice(-10).map((event, idx) => (
+                  <div key={idx} className="text-xs font-mono flex gap-2">
+                    <span className="text-muted-foreground">
+                      {formatTimestamp(event.timestamp)}
+                    </span>
+                    <span className="text-blue-500">[{event.event_type}]</span>
+                    <span>{event.message}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

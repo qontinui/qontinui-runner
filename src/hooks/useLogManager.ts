@@ -22,6 +22,8 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { logManager, LogEntry, ImageRecognitionEntry, AiOutputEntry } from "../managers";
+import type { AiOutputLine, ActionLogEntry } from "../managers/logging";
+import type { LogSourceContent } from "../types/projectLogs";
 
 export interface UseLogManagerResult {
   /** General log entries */
@@ -58,7 +60,14 @@ export interface UseLogManagerResult {
   clearAllLogs: () => void;
 
   /** Copy logs to clipboard */
-  copyLogs: (type: "general" | "image" | "actions", actionLogs?: any[]) => Promise<boolean>;
+  copyLogs: (
+    type: "general" | "image" | "actions" | "ai" | "external",
+    data?: {
+      actionLogs?: ActionLogEntry[];
+      aiOutputLines?: AiOutputLine[];
+      externalSources?: LogSourceContent[];
+    },
+  ) => Promise<boolean>;
 
   /** Get log count */
   logCount: number;
@@ -129,8 +138,15 @@ export function useLogManager(): UseLogManagerResult {
   }, []);
 
   const copyLogs = useCallback(
-    async (type: "general" | "image" | "actions", actionLogs?: any[]) => {
-      return await logManager.copyLogs(type, actionLogs);
+    async (
+      type: "general" | "image" | "actions" | "ai" | "external",
+      data?: {
+        actionLogs?: ActionLogEntry[];
+        aiOutputLines?: AiOutputLine[];
+        externalSources?: LogSourceContent[];
+      },
+    ) => {
+      return await logManager.copyLogs(type, data);
     },
     [],
   );

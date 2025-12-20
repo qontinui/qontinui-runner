@@ -32,7 +32,8 @@
             "timeout": 30000
           }
         }
-      ]
+      ],
+      "category": "Main"
     },
     {
       "id": "test-prompt-sequence",
@@ -63,7 +64,8 @@
             }
           }
         }
-      ]
+      ],
+      "category": "Main"
     }
   ],
   "states": [

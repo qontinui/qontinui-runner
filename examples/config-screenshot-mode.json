@@ -42,7 +42,8 @@
             "duration": 2000
           }
         }
-      ]
+      ],
+      "category": "Main"
     }
   ],
   "states": [
@@ -50,7 +51,9 @@
       "id": "state-playback",
       "name": "Playback State",
       "isInitial": true,
-      "identifyingImages": ["img-button"]
+      "identifyingImages": [
+        "img-button"
+      ]
     }
   ],
   "transitions": [],
