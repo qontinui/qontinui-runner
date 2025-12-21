@@ -286,6 +286,11 @@ pub fn log_panic(info: &std::panic::PanicHookInfo) {
         // Write crash dump to file
         write_crash_dump(&location, &message, &backtrace);
 
+        // Also log to lifecycle debug
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::debug_lifecycle::log_panic_details(info);
+        }));
+
         // Try to log via tracing (may fail if tracing is not initialized or broken)
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             tracing::error!(

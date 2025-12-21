@@ -52,6 +52,7 @@
 //! The fix: Always calculate the virtual desktop origin (min X, min Y across all monitors)
 //! regardless of which monitor is specified, because FIND always captures the full virtual desktop.
 
+use crate::debug_lifecycle;
 use crate::safe_eprintln;
 use axum::{
     extract::State,
@@ -2734,11 +2735,14 @@ fn execute_windows_native(
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let start_time = Instant::now();
 
+    debug_lifecycle::log_claude_cli("spawn", "starting heartbeat thread");
     let heartbeat_handle = thread::spawn(move || {
+        debug_lifecycle::log_thread_start("claude_cli_heartbeat");
         let mut last_update = 0u64;
         loop {
             // Check if we should stop every 100ms
             if stop_rx.try_recv().is_ok() {
+                debug_lifecycle::log_thread_end("claude_cli_heartbeat", "stop signal received");
                 break;
             }
             thread::sleep(Duration::from_millis(100));
@@ -2759,6 +2763,7 @@ fn execute_windows_native(
                 } else {
                     format!("⏳ AI processing... ({}s elapsed)", secs)
                 };
+                debug_lifecycle::log_ai_session("heartbeat", &msg);
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     emit_ai_output(
                         &app_handle_heartbeat,
@@ -2777,15 +2782,27 @@ fn execute_windows_native(
     let action_id_stdout = action_id_owned.clone();
     let has_output_stdout = has_output.clone();
 
+    debug_lifecycle::log_claude_cli("spawn", "starting stdout reader thread");
     let stdout_handle = thread::spawn(move || {
+        debug_lifecycle::log_thread_start("claude_cli_stdout_reader");
         let mut all_text = String::new();
         let mut line_count = 0;
+        let mut last_log_count = 0;
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line_result in reader.lines() {
                 match line_result {
                     Ok(line) => {
                         line_count += 1;
+
+                        // Log progress every 50 lines
+                        if line_count - last_log_count >= 50 {
+                            debug_lifecycle::log_claude_cli(
+                                "stdout_progress",
+                                &format!("{} lines processed, {} chars", line_count, all_text.len()),
+                            );
+                            last_log_count = line_count;
+                        }
 
                         // Try to extract text from the JSON line
                         if let Some(text) = extract_text_from_stream_json(&line) {
@@ -2813,6 +2830,10 @@ fn execute_windows_native(
                         }
                     }
                     Err(e) => {
+                        debug_lifecycle::log_claude_cli(
+                            "stdout_error",
+                            &format!("Error reading line: {}", e),
+                        );
                         write_ai_debug_log(&format!(
                             "execute_windows_native: Error reading stdout line: {}",
                             e
@@ -2822,6 +2843,10 @@ fn execute_windows_native(
                 }
             }
         }
+        debug_lifecycle::log_thread_end(
+            "claude_cli_stdout_reader",
+            &format!("{} lines, {} chars", line_count, all_text.len()),
+        );
         write_ai_debug_log(&format!(
             "execute_windows_native: stdout complete - {} JSON lines, {} chars extracted",
             line_count,
@@ -2833,18 +2858,29 @@ fn execute_windows_native(
     // Read stderr in a separate thread (collect all at once, usually small)
     let stderr = child.stderr.take();
 
+    debug_lifecycle::log_claude_cli("spawn", "starting stderr reader thread");
     let stderr_handle = thread::spawn(move || {
+        debug_lifecycle::log_thread_start("claude_cli_stderr_reader");
         let mut output = String::new();
         if let Some(mut stderr) = stderr {
             let _ = stderr.read_to_string(&mut output);
         }
+        debug_lifecycle::log_thread_end(
+            "claude_cli_stderr_reader",
+            &format!("{} chars", output.len()),
+        );
         output
     });
 
     // Wait for process to complete
+    debug_lifecycle::log_claude_cli("wait", "waiting for Claude CLI process to complete");
     let status = match child.wait() {
-        Ok(s) => s,
+        Ok(s) => {
+            debug_lifecycle::log_claude_cli("wait", &format!("process exited with status: {:?}", s));
+            s
+        }
         Err(e) => {
+            debug_lifecycle::log_claude_cli("error", &format!("wait failed: {}", e));
             let _ = stop_tx.send(());
             let _ = heartbeat_handle.join();
             return Err(format!("Failed to wait for claude: {}", e));
@@ -2852,14 +2888,25 @@ fn execute_windows_native(
     };
 
     // Stop heartbeat
+    debug_lifecycle::log_claude_cli("cleanup", "stopping heartbeat thread");
     let _ = stop_tx.send(());
     let _ = heartbeat_handle.join();
+    debug_lifecycle::log_claude_cli("cleanup", "heartbeat thread joined");
 
     // Get output from threads
+    debug_lifecycle::log_claude_cli("cleanup", "joining stdout thread");
     let all_output = stdout_handle.join().unwrap_or_default();
+    debug_lifecycle::log_claude_cli("cleanup", "stdout thread joined");
+
+    debug_lifecycle::log_claude_cli("cleanup", "joining stderr thread");
     let stderr_output = stderr_handle.join().unwrap_or_default();
+    debug_lifecycle::log_claude_cli("cleanup", "stderr thread joined");
 
     let elapsed = start_time.elapsed();
+    debug_lifecycle::log_claude_cli(
+        "complete",
+        &format!("finished in {:.1}s, {} chars output", elapsed.as_secs_f64(), all_output.len()),
+    );
     write_ai_debug_log(&format!(
         "execute_windows_native: Process completed in {:.1}s, output {} chars, stderr {} chars",
         elapsed.as_secs_f64(),

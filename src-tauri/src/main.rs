@@ -4,6 +4,7 @@
 mod auth;
 mod commands;
 mod config;
+mod debug_lifecycle;
 mod display;
 mod error;
 mod executor;
@@ -28,18 +29,24 @@ use tracing::{error, info};
 use video_recorder::VideoRecordingService;
 
 fn main() {
+    // Initialize lifecycle debugging BEFORE anything else
+    debug_lifecycle::init_lifecycle_debug();
+
     let result = std::panic::catch_unwind(run_app);
 
     match result {
         Ok(Ok(())) => {
             info!("Application exited successfully");
+            debug_lifecycle::log_exit("Normal exit", 0);
         }
         Ok(Err(e)) => {
             error!("Application error: {}", e);
+            debug_lifecycle::log_exit(&format!("Application error: {}", e), 1);
             std::process::exit(1);
         }
         Err(panic) => {
             error!("Application panicked: {:?}", panic);
+            debug_lifecycle::log_exit(&format!("Panic in main: {:?}", panic), 2);
             std::process::exit(2);
         }
     }
