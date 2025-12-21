@@ -1130,7 +1130,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
         <div>
           <h2 className="text-xl font-semibold">AI Automation Builder</h2>
           <p className="text-sm text-muted-foreground">
-            Build ordered execution sequences with visual feedback
+            Run automation sequences, capture screenshots, and let AI analyze/fix issues in a loop
           </p>
         </div>
       </div>
@@ -1374,11 +1374,11 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                   <div className="flex items-center gap-2">
                     <Activity className="w-4 h-4 text-orange-500" />
                     <div>
-                      <span className="text-sm font-medium">Persistent Session</span>
+                      <span className="text-sm font-medium">Persistent Session Mode</span>
                       <p className="text-xs text-muted-foreground">
                         {persistentSession
-                          ? "Runs as independent process - survives runner restarts"
-                          : "Inline execution - output appears in AI Output tab"}
+                          ? "Multi-iteration loop with fresh AI sessions per iteration"
+                          : "Single iteration - AI runs once, output in AI Output tab"}
                       </p>
                     </div>
                   </div>
@@ -1397,11 +1397,17 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
                 {/* When Persistent Session is enabled, show additional options */}
                 {persistentSession && (
-                  <div className="space-y-2 pl-2 border-l-2 border-orange-500/30">
-                    <p className="text-xs text-muted-foreground">
-                      <strong>Use this when:</strong> Your automation may restart the runner, or you
-                      need long-running sessions with state persistence.
-                    </p>
+                  <div className="space-y-3 pl-2 border-l-2 border-orange-500/30">
+                    <div className="space-y-1">
+                      <p className="text-xs font-medium text-foreground">How it works:</p>
+                      <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
+                        <li>Each iteration spawns a <strong>new AI session</strong> (fresh context)</li>
+                        <li>AI runs automation → analyzes logs/screenshots → fixes issues</li>
+                        <li>If issues found: spawns next iteration automatically</li>
+                        <li>Loop continues until all checks pass or max iterations reached</li>
+                        <li>Sessions survive runner restarts (independent process)</li>
+                      </ul>
+                    </div>
                     <div className="flex items-center gap-4 flex-wrap">
                       <label className="flex items-center gap-2 text-sm">
                         <span className="text-muted-foreground">Max Iterations:</span>
@@ -1419,6 +1425,19 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                         />
                       </label>
                     </div>
+                  </div>
+                )}
+
+                {/* When Persistent Session is disabled, show explanation */}
+                {!persistentSession && (
+                  <div className="space-y-1 pl-2 border-l-2 border-muted-foreground/30">
+                    <p className="text-xs font-medium text-foreground">How it works:</p>
+                    <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
+                      <li>Single AI session runs one iteration</li>
+                      <li>AI analyzes automation results and suggests/applies fixes</li>
+                      <li>If fixes applied, AI will instruct you to re-run manually</li>
+                      <li>Output appears in the "AI Output" tab</li>
+                    </ul>
                   </div>
                 )}
 
