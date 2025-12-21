@@ -136,6 +136,9 @@ impl WorkflowRun {
 // ============================================================================
 
 /// Read the current phase from a checkpoint file
+///
+/// Supports both numeric phases (e.g., 1, 2, 3) and completion strings
+/// (e.g., "COMPLETE", "DONE"). Completion strings return u32::MAX.
 pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result<u32, String> {
     let path = Path::new(checkpoint_path);
     if !path.exists() {
@@ -148,10 +151,30 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?;
 
-    json.get(phase_field)
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .ok_or_else(|| format!("Field '{}' not found or not a number", phase_field))
+    let phase_value = json.get(phase_field);
+
+    // Try to read as a number first
+    if let Some(num) = phase_value.and_then(|v| v.as_u64()) {
+        return Ok(num as u32);
+    }
+
+    // If it's a string like "COMPLETE", "DONE", etc., treat as completed (return u32::MAX)
+    if let Some(s) = phase_value.and_then(|v| v.as_str()) {
+        let upper = s.to_uppercase();
+        if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED" {
+            return Ok(u32::MAX); // Signal completion
+        }
+    }
+
+    // Also check for workflow_status field as a backup indicator
+    if let Some(status) = json.get("workflow_status").and_then(|v| v.as_str()) {
+        let upper = status.to_uppercase();
+        if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED" {
+            return Ok(u32::MAX); // Signal completion
+        }
+    }
+
+    Err(format!("Field '{}' not found or not a valid phase value", phase_field))
 }
 
 /// Get the modification time of the checkpoint file
@@ -285,7 +308,13 @@ impl WorkflowManager {
                 run.current_phase = phase;
 
                 if phase != old_phase {
-                    run.log_event("phase_update", &format!("Phase {} -> {}", old_phase, phase));
+                    // Format phase nicely (u32::MAX means "COMPLETE")
+                    let phase_str = if phase == u32::MAX {
+                        "COMPLETE".to_string()
+                    } else {
+                        phase.to_string()
+                    };
+                    run.log_event("phase_update", &format!("Phase {} -> {}", old_phase, phase_str));
                     // Track if phase advanced (progress was made)
                     if phase > run.previous_phase {
                         phase_advanced = true;
@@ -298,12 +327,14 @@ impl WorkflowManager {
                     run.last_checkpoint_update = Some(mtime);
                 }
 
-                // Check if complete
-                if phase >= config.completion_value {
-                    run.set_status(
-                        WorkflowStatus::Completed,
-                        &format!("Reached phase {}", phase),
-                    );
+                // Check if complete (u32::MAX indicates "COMPLETE" string in checkpoint)
+                if phase >= config.completion_value || phase == u32::MAX {
+                    let message = if phase == u32::MAX {
+                        "Workflow marked complete".to_string()
+                    } else {
+                        format!("Reached phase {}", phase)
+                    };
+                    run.set_status(WorkflowStatus::Completed, &message);
                     return Some(run.clone());
                 }
             }
