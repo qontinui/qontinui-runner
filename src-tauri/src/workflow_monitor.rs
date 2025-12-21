@@ -139,6 +139,9 @@ impl WorkflowRun {
 ///
 /// Supports both numeric phases (e.g., 1, 2, 3) and completion strings
 /// (e.g., "COMPLETE", "DONE"). Completion strings return u32::MAX.
+///
+/// Also checks for "status" and "workflow_status" fields to detect completion
+/// even when current_phase hasn't been updated.
 pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result<u32, String> {
     let path = Path::new(checkpoint_path);
     if !path.exists() {
@@ -151,14 +154,22 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?;
 
-    let phase_value = json.get(phase_field);
-
-    // Try to read as a number first
-    if let Some(num) = phase_value.and_then(|v| v.as_u64()) {
-        return Ok(num as u32);
+    // FIRST check for completion status fields - AI might mark status=COMPLETED
+    // before updating current_phase
+    let status_fields = ["status", "workflow_status"];
+    for field in &status_fields {
+        if let Some(status) = json.get(*field).and_then(|v| v.as_str()) {
+            let upper = status.to_uppercase();
+            if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED" {
+                info!("Workflow completion detected via '{}' field: {}", field, status);
+                return Ok(u32::MAX); // Signal completion
+            }
+        }
     }
 
-    // If it's a string like "COMPLETE", "DONE", etc., treat as completed (return u32::MAX)
+    let phase_value = json.get(phase_field);
+
+    // If phase is a string like "COMPLETE", "DONE", etc., treat as completed
     if let Some(s) = phase_value.and_then(|v| v.as_str()) {
         let upper = s.to_uppercase();
         if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED" {
@@ -166,12 +177,9 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
         }
     }
 
-    // Also check for workflow_status field as a backup indicator
-    if let Some(status) = json.get("workflow_status").and_then(|v| v.as_str()) {
-        let upper = status.to_uppercase();
-        if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED" {
-            return Ok(u32::MAX); // Signal completion
-        }
+    // Read numeric phase value
+    if let Some(num) = phase_value.and_then(|v| v.as_u64()) {
+        return Ok(num as u32);
     }
 
     Err(format!("Field '{}' not found or not a valid phase value", phase_field))
