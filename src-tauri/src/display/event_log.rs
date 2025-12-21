@@ -1,3 +1,4 @@
+use crate::safe_eprintln;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -50,11 +51,13 @@ impl EventLog {
 
     /// Add a new event to the log
     pub fn add_event(&mut self, event: RawEvent) {
-        eprintln!(
+        safe_eprintln!(
             "[EVENT_LOG] add_event called: id={}, type={}, sequence={}",
-            event.id, event.event_type, event.sequence
+            event.id,
+            event.event_type,
+            event.sequence
         );
-        eprintln!(
+        safe_eprintln!(
             "[EVENT_LOG] Event data keys: {:?}",
             event.data.as_object().map(|o| o.keys().collect::<Vec<_>>())
         );
@@ -74,17 +77,17 @@ impl EventLog {
             .and_then(|n| n.get("id"))
             .and_then(|id| id.as_str())
         {
-            eprintln!("[EVENT_LOG] Found node_id in event: {}", node_id);
+            safe_eprintln!("[EVENT_LOG] Found node_id in event: {}", node_id);
             self.node_index
                 .entry(node_id.to_string())
                 .or_default()
                 .push(event_idx);
         } else {
-            eprintln!("[EVENT_LOG] No node_id found in event data");
+            safe_eprintln!("[EVENT_LOG] No node_id found in event data");
         }
 
         self.events.push(event);
-        eprintln!(
+        safe_eprintln!(
             "[EVENT_LOG] Event added. Total events now: {}",
             self.events.len()
         );

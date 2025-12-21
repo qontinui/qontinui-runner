@@ -52,6 +52,7 @@
 //! The fix: Always calculate the virtual desktop origin (min X, min Y across all monitors)
 //! regardless of which monitor is specified, because FIND always captures the full virtual desktop.
 
+use crate::safe_eprintln;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -476,9 +477,10 @@ async fn run_workflow(
         "MCP API: Running workflow: {} (timeout: {}s)",
         request.workflow_name, request.timeout_seconds
     );
-    eprintln!(
+    safe_eprintln!(
         "[MCP_API] run_workflow received: workflow={}, monitor_index={:?}",
-        request.workflow_name, request.monitor_index
+        request.workflow_name,
+        request.monitor_index
     );
 
     let app_state = state.app_state.clone();
@@ -556,9 +558,10 @@ async fn run_workflow(
             // Build params for execution - only pass monitor_index, Python looks up offset via MSS
             let mut params = serde_json::Map::new();
             let resolved_monitor = monitor_index.unwrap_or(0);
-            eprintln!(
+            safe_eprintln!(
                 "[MCP_API] Building params: monitor_index={:?}, resolved to {}",
-                monitor_index, resolved_monitor
+                monitor_index,
+                resolved_monitor
             );
             params.insert(
                 "monitor_index".to_string(),
@@ -568,7 +571,7 @@ async fn run_workflow(
                 "workflow".to_string(),
                 serde_json::json!(workflow_name.clone()),
             );
-            eprintln!("[MCP_API] Sending to Python: {:?}", params);
+            safe_eprintln!("[MCP_API] Sending to Python: {:?}", params);
 
             match bridge.start_execution_with_params(Some(serde_json::Value::Object(params))) {
                 Ok(_) => Ok(()),

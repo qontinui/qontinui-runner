@@ -7,6 +7,7 @@
 //! - Getting available transitions
 //! - Action log viewing and management
 
+use crate::safe_eprintln;
 use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
@@ -242,21 +243,21 @@ pub async fn get_available_transitions(
 pub async fn get_action_log_view(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    eprintln!("[DEBUG] get_action_log_view called");
+    safe_eprintln!("[DEBUG] get_action_log_view called");
     info!("Getting action log view");
 
-    eprintln!("[DEBUG] Acquiring display_processor lock...");
+    safe_eprintln!("[DEBUG] Acquiring display_processor lock...");
     let processor = state.display_processor.lock().await;
-    eprintln!("[DEBUG] Got display_processor lock");
+    safe_eprintln!("[DEBUG] Got display_processor lock");
 
-    eprintln!("[DEBUG] Calling processor.get_view(\"action_log\")...");
+    safe_eprintln!("[DEBUG] Calling processor.get_view(\"action_log\")...");
     let view_data = processor.get_view("action_log").map_err(|e| {
-        eprintln!("[DEBUG] get_view failed: {}", e);
+        safe_eprintln!("[DEBUG] get_view failed: {}", e);
         error!("Failed to get action log view: {}", e);
         format!("Failed to get action log view: {}", e)
     })?;
 
-    eprintln!("[DEBUG] get_view succeeded, view_data: {:?}", view_data);
+    safe_eprintln!("[DEBUG] get_view succeeded, view_data: {:?}", view_data);
     info!("Action log view retrieved successfully");
     Ok(CommandResponse {
         success: true,

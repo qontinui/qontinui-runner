@@ -3,6 +3,7 @@ use super::lifecycle::ExecutorMessage;
 use super::protocol::ExecutorEvent;
 use crate::commands::AppState;
 use crate::display::RawEvent;
+use crate::safe_eprintln;
 use serde_json::json;
 use tauri::{Emitter, Manager};
 use tracing::{debug, error};
@@ -22,15 +23,16 @@ impl EventForwarder {
             ..
         } = message
         {
-            eprintln!(
+            safe_eprintln!(
                 "[PYTHON_BRIDGE] Received TreeEvent: type={}, seq={}",
-                event_type, sequence
+                event_type,
+                sequence
             );
-            eprintln!("[PYTHON_BRIDGE] Node data: {:?}", node);
+            safe_eprintln!("[PYTHON_BRIDGE] Node data: {:?}", node);
 
             // Get the AppState and add event to DisplayProcessor
             if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
-                eprintln!("[PYTHON_BRIDGE] AppState found, creating RawEvent");
+                safe_eprintln!("[PYTHON_BRIDGE] AppState found, creating RawEvent");
 
                 let raw_event = RawEvent {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -42,17 +44,18 @@ impl EventForwarder {
                     sequence: *sequence as u64,
                 };
 
-                eprintln!(
+                safe_eprintln!(
                     "[PYTHON_BRIDGE] RawEvent created: id={}, type={}",
-                    raw_event.id, raw_event.event_type
+                    raw_event.id,
+                    raw_event.event_type
                 );
 
                 let mut processor = app_state.display_processor.lock().await;
-                eprintln!("[PYTHON_BRIDGE] Got display_processor lock, calling add_event");
+                safe_eprintln!("[PYTHON_BRIDGE] Got display_processor lock, calling add_event");
                 processor.event_log_mut().add_event(raw_event);
-                eprintln!("[PYTHON_BRIDGE] add_event completed");
+                safe_eprintln!("[PYTHON_BRIDGE] add_event completed");
             } else {
-                eprintln!("[PYTHON_BRIDGE] AppState NOT available!");
+                safe_eprintln!("[PYTHON_BRIDGE] AppState NOT available!");
                 debug!("AppState not available for feeding events to DisplayProcessor");
             }
         }

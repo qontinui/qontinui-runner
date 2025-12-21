@@ -15,14 +15,34 @@ use tracing_subscriber::{
 static CRASH_HANDLING: AtomicBool = AtomicBool::new(false);
 
 /// Safely write to stderr, ignoring errors if the pipe is closed.
-/// This prevents panics in the panic handler when stderr is unavailable
+/// This prevents panics when stderr is unavailable
 /// (e.g., when the parent terminal/process has closed the pipe - Windows error 232).
-fn safe_eprintln(msg: &str) {
+///
+/// # Usage
+/// ```
+/// use crate::logging::safe_eprintln;
+/// safe_eprintln("Error message");
+/// safe_eprintln(&format!("Value: {}", some_value));
+/// ```
+pub fn safe_eprintln(msg: &str) {
     use std::io::Write;
     // Use write_all instead of eprintln! to avoid panicking on broken pipe
     let _ = std::io::stderr().write_all(msg.as_bytes());
     let _ = std::io::stderr().write_all(b"\n");
     let _ = std::io::stderr().flush();
+}
+
+/// Macro for safe stderr printing with format args, similar to eprintln!
+/// This is the preferred way to write debug/error output in the runner.
+#[macro_export]
+macro_rules! safe_eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let msg = format!($($arg)*);
+        let _ = std::io::stderr().write_all(msg.as_bytes());
+        let _ = std::io::stderr().write_all(b"\n");
+        let _ = std::io::stderr().flush();
+    }};
 }
 
 pub struct LoggingConfig {
