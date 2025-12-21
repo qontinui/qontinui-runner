@@ -2644,12 +2644,9 @@ fn execute_windows_native(
 
     write_ai_debug_log("execute_windows_native: Starting (streaming mode)");
     write_ai_debug_log(&format!(
-        "execute_windows_native: working_dir = {}, custom_path = {:?}, timeout = {}s",
+        "execute_windows_native: working_dir = {}, custom_path = {:?}, inactivity_timeout = {}s",
         working_dir, custom_path, timeout_seconds
     ));
-
-    // Calculate the deadline for the process
-    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
 
     // Clone action_id for threads
     let action_id_owned = action_id.to_string();
@@ -2735,6 +2732,16 @@ fn execute_windows_native(
     let has_output = Arc::new(AtomicBool::new(false));
     let has_output_heartbeat = has_output.clone();
 
+    // Track the last time we received output (for inactivity timeout)
+    // Store as epoch seconds (u64)
+    use std::sync::atomic::AtomicU64;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_activity = Arc::new(AtomicU64::new(now_secs));
+    let last_activity_stdout = last_activity.clone();
+
     // Start a heartbeat thread to show progress while waiting
     let app_handle_heartbeat = app_handle.clone();
     let action_id_heartbeat = action_id_owned.clone();
@@ -2800,6 +2807,13 @@ fn execute_windows_native(
                 match line_result {
                     Ok(line) => {
                         line_count += 1;
+
+                        // Update last activity time - we're receiving output
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        last_activity_stdout.store(now, Ordering::Relaxed);
 
                         // Log progress every 50 lines
                         if line_count - last_log_count >= 50 {
@@ -2882,25 +2896,36 @@ fn execute_windows_native(
         output
     });
 
-    // Wait for process to complete with timeout
+    // Wait for process to complete with inactivity timeout
+    // The process will only be killed if it stops producing output for timeout_seconds
     debug_lifecycle::log_claude_cli(
         "wait",
         &format!(
-            "waiting for Claude CLI process to complete (timeout in {}s)",
+            "waiting for Claude CLI process to complete (inactivity timeout: {}s)",
             timeout_seconds
         ),
     );
 
     let status = loop {
-        // Check if we've exceeded the deadline
-        if Instant::now() > deadline {
+        // Check for inactivity - only timeout if no output received for timeout_seconds
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_activity_secs = last_activity.load(Ordering::Relaxed);
+        let inactive_secs = now_secs.saturating_sub(last_activity_secs);
+
+        if inactive_secs > timeout_seconds {
             debug_lifecycle::log_claude_cli(
                 "timeout",
-                &format!("Process exceeded {}s timeout, killing...", timeout_seconds),
+                &format!(
+                    "Process inactive for {}s (> {}s threshold), killing...",
+                    inactive_secs, timeout_seconds
+                ),
             );
             write_ai_debug_log(&format!(
-                "execute_windows_native: TIMEOUT after {}s, killing process",
-                timeout_seconds
+                "execute_windows_native: INACTIVITY TIMEOUT - no output for {}s (threshold: {}s), killing process",
+                inactive_secs, timeout_seconds
             ));
 
             // Kill the process
@@ -2922,7 +2947,10 @@ fn execute_windows_native(
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 emit_ai_output(
                     app_handle,
-                    &format!("⏰ AI analysis timed out after {} seconds", timeout_seconds),
+                    &format!(
+                        "⏰ AI analysis stopped - no response for {} seconds",
+                        inactive_secs
+                    ),
                     "status",
                     Some(&action_id_owned),
                 );
@@ -2933,10 +2961,10 @@ fn execute_windows_native(
 
             return Ok(TriggerAiAnalysisResponse {
                 success: false,
-                message: "AI analysis timed out".to_string(),
+                message: "AI analysis stopped due to inactivity".to_string(),
                 error: Some(format!(
-                    "Claude CLI process exceeded {} second timeout and was killed",
-                    timeout_seconds
+                    "Claude CLI process was unresponsive for {} seconds and was killed",
+                    inactive_secs
                 )),
             });
         }
