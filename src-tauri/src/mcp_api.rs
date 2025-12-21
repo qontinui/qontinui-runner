@@ -2483,12 +2483,13 @@ async fn execute_claude_cli(
     let prompt_len = prompt_owned.len();
     let custom_path = cli_settings.custom_path.clone();
     let execution_mode = cli_settings.execution_mode;
+    let timeout_seconds = cli_settings.timeout_seconds;
     let app_handle = app_handle.clone();
     let action_id_owned = action_id.to_string();
 
     write_ai_debug_log(&format!(
-        "execute_claude_cli: execution_mode = {:?}, custom_path = {:?}, prompt_len = {}",
-        execution_mode, custom_path, prompt_len
+        "execute_claude_cli: execution_mode = {:?}, custom_path = {:?}, prompt_len = {}, timeout = {}s",
+        execution_mode, custom_path, prompt_len, timeout_seconds
     ));
 
     write_ai_debug_log("execute_claude_cli: Spawning blocking task...");
@@ -2526,6 +2527,7 @@ async fn execute_claude_cli(
                     custom_path.as_deref(),
                     &app_handle,
                     &action_id_owned,
+                    timeout_seconds,
                 )
             }
             CliExecutionMode::Wsl => {
@@ -2631,6 +2633,7 @@ fn execute_windows_native(
     custom_path: Option<&str>,
     app_handle: &tauri::AppHandle,
     action_id: &str,
+    timeout_seconds: u64,
 ) -> Result<TriggerAiAnalysisResponse, String> {
     use std::io::{BufRead, BufReader, Read};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2641,9 +2644,12 @@ fn execute_windows_native(
 
     write_ai_debug_log("execute_windows_native: Starting (streaming mode)");
     write_ai_debug_log(&format!(
-        "execute_windows_native: working_dir = {}, custom_path = {:?}",
-        working_dir, custom_path
+        "execute_windows_native: working_dir = {}, custom_path = {:?}, timeout = {}s",
+        working_dir, custom_path, timeout_seconds
     ));
+
+    // Calculate the deadline for the process
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
 
     // Clone action_id for threads
     let action_id_owned = action_id.to_string();
@@ -2799,7 +2805,11 @@ fn execute_windows_native(
                         if line_count - last_log_count >= 50 {
                             debug_lifecycle::log_claude_cli(
                                 "stdout_progress",
-                                &format!("{} lines processed, {} chars", line_count, all_text.len()),
+                                &format!(
+                                    "{} lines processed, {} chars",
+                                    line_count,
+                                    all_text.len()
+                                ),
                             );
                             last_log_count = line_count;
                         }
@@ -2872,18 +2882,85 @@ fn execute_windows_native(
         output
     });
 
-    // Wait for process to complete
-    debug_lifecycle::log_claude_cli("wait", "waiting for Claude CLI process to complete");
-    let status = match child.wait() {
-        Ok(s) => {
-            debug_lifecycle::log_claude_cli("wait", &format!("process exited with status: {:?}", s));
-            s
-        }
-        Err(e) => {
-            debug_lifecycle::log_claude_cli("error", &format!("wait failed: {}", e));
+    // Wait for process to complete with timeout
+    debug_lifecycle::log_claude_cli(
+        "wait",
+        &format!(
+            "waiting for Claude CLI process to complete (timeout in {}s)",
+            timeout_seconds
+        ),
+    );
+
+    let status = loop {
+        // Check if we've exceeded the deadline
+        if Instant::now() > deadline {
+            debug_lifecycle::log_claude_cli(
+                "timeout",
+                &format!("Process exceeded {}s timeout, killing...", timeout_seconds),
+            );
+            write_ai_debug_log(&format!(
+                "execute_windows_native: TIMEOUT after {}s, killing process",
+                timeout_seconds
+            ));
+
+            // Kill the process
+            if let Err(e) = child.kill() {
+                debug_lifecycle::log_claude_cli("error", &format!("Failed to kill process: {}", e));
+            }
+
+            // Wait a bit for the process to terminate
+            thread::sleep(Duration::from_millis(500));
+
+            // Try to reap the process
+            let _ = child.try_wait();
+
+            // Stop heartbeat
             let _ = stop_tx.send(());
             let _ = heartbeat_handle.join();
-            return Err(format!("Failed to wait for claude: {}", e));
+
+            // Emit timeout message to UI
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(
+                    app_handle,
+                    &format!("⏰ AI analysis timed out after {} seconds", timeout_seconds),
+                    "status",
+                    Some(&action_id_owned),
+                );
+            }));
+
+            // Cleanup temp file
+            let _ = std::fs::remove_file(&prompt_file);
+
+            return Ok(TriggerAiAnalysisResponse {
+                success: false,
+                message: "AI analysis timed out".to_string(),
+                error: Some(format!(
+                    "Claude CLI process exceeded {} second timeout and was killed",
+                    timeout_seconds
+                )),
+            });
+        }
+
+        // Try to check if process has exited (non-blocking)
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                debug_lifecycle::log_claude_cli(
+                    "wait",
+                    &format!("process exited with status: {:?}", status),
+                );
+                break status;
+            }
+            Ok(None) => {
+                // Process still running, wait a bit and check again
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                debug_lifecycle::log_claude_cli("error", &format!("try_wait failed: {}", e));
+                let _ = stop_tx.send(());
+                let _ = heartbeat_handle.join();
+                let _ = std::fs::remove_file(&prompt_file);
+                return Err(format!("Failed to wait for claude: {}", e));
+            }
         }
     };
 
@@ -2905,7 +2982,11 @@ fn execute_windows_native(
     let elapsed = start_time.elapsed();
     debug_lifecycle::log_claude_cli(
         "complete",
-        &format!("finished in {:.1}s, {} chars output", elapsed.as_secs_f64(), all_output.len()),
+        &format!(
+            "finished in {:.1}s, {} chars output",
+            elapsed.as_secs_f64(),
+            all_output.len()
+        ),
     );
     write_ai_debug_log(&format!(
         "execute_windows_native: Process completed in {:.1}s, output {} chars, stderr {} chars",

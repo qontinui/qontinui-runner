@@ -29,11 +29,7 @@ pub fn log_lifecycle(category: &str, message: &str) {
 
     // Write to file
     let log_path = get_debug_dir().join("runner-lifecycle.log");
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
         let _ = file.write_all(log_line.as_bytes());
     }
 
@@ -50,9 +46,18 @@ pub fn init_lifecycle_debug() {
     let log_path = debug_dir.join("runner-lifecycle.log");
     let _ = fs::write(&log_path, "");
 
-    log_lifecycle("STARTUP", &format!("Runner starting - PID: {}", std::process::id()));
-    log_lifecycle("STARTUP", &format!("Version: {}", env!("CARGO_PKG_VERSION")));
-    log_lifecycle("STARTUP", &format!("Debug build: {}", cfg!(debug_assertions)));
+    log_lifecycle(
+        "STARTUP",
+        &format!("Runner starting - PID: {}", std::process::id()),
+    );
+    log_lifecycle(
+        "STARTUP",
+        &format!("Version: {}", env!("CARGO_PKG_VERSION")),
+    );
+    log_lifecycle(
+        "STARTUP",
+        &format!("Debug build: {}", cfg!(debug_assertions)),
+    );
 
     // Write startup timestamp to a separate file for easy checking
     let startup_path = debug_dir.join("runner-startup.txt");
@@ -99,7 +104,11 @@ fn start_heartbeat() {
             if count % 6 == 0 {
                 log_lifecycle(
                     "HEARTBEAT",
-                    &format!("Still alive - uptime: {:.0}s, count: {}", elapsed.as_secs_f64(), count),
+                    &format!(
+                        "Still alive - uptime: {:.0}s, count: {}",
+                        elapsed.as_secs_f64(),
+                        count
+                    ),
                 );
             }
 
@@ -175,10 +184,7 @@ pub fn log_panic_details(info: &std::panic::PanicHookInfo) {
         "Unknown panic payload".to_string()
     };
 
-    let thread_name = thread::current()
-        .name()
-        .unwrap_or("unnamed")
-        .to_string();
+    let thread_name = thread::current().name().unwrap_or("unnamed").to_string();
 
     log_lifecycle("PANIC", &format!("Thread: {}", thread_name));
     log_lifecycle("PANIC", &format!("Location: {}", location));
