@@ -24,10 +24,16 @@ fn get_screenshots_dir() -> PathBuf {
     get_dev_logs_dir().join("screenshots")
 }
 
+/// Directory for Playwright screenshots
+fn get_playwright_screenshots_dir() -> PathBuf {
+    get_dev_logs_dir().join("playwright-screenshots")
+}
+
 /// Ensure directories exist
 fn ensure_dirs() -> std::io::Result<()> {
     fs::create_dir_all(get_dev_logs_dir())?;
     fs::create_dir_all(get_screenshots_dir())?;
+    fs::create_dir_all(get_playwright_screenshots_dir())?;
     Ok(())
 }
 
@@ -94,6 +100,47 @@ pub struct ActionLogEntry {
     pub event_type: String,
     pub node: serde_json::Value,
     pub path: Vec<serde_json::Value>,
+}
+
+/// Playwright test execution log entry
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlaywrightLogEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub script_id: String,
+    pub script_name: String,
+    pub passed: bool,
+    pub tests_passed: u32,
+    pub tests_failed: u32,
+    pub tests_skipped: u32,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
+    /// Paths to screenshots copied to .dev-logs
+    pub screenshot_paths: Vec<String>,
+    /// Console output lines from the test
+    pub console_output: Vec<String>,
+    /// Individual test spec results
+    pub specs: Vec<PlaywrightTestSpec>,
+    /// Page snapshot (YAML showing elements on page at failure)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_snapshot: Option<String>,
+}
+
+/// Individual test spec result for logging
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PlaywrightTestSpec {
+    pub title: String,
+    pub status: String,
+    pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// File logger for persisting runner events to disk
@@ -249,6 +296,89 @@ impl FileLogger {
         Self::append_to_jsonl("runner-image-recognition.jsonl", &entry);
     }
 
+    /// Log a Playwright test execution, copying screenshots to .dev-logs
+    pub fn log_playwright_execution(
+        script_id: &str,
+        script_name: &str,
+        target_url: Option<&str>,
+        display_mode: Option<&str>,
+        browser: Option<&str>,
+        passed: bool,
+        tests_passed: u32,
+        tests_failed: u32,
+        tests_skipped: u32,
+        duration_ms: u64,
+        error: Option<&str>,
+        original_screenshots: &[String],
+        console_output: &[String],
+        specs: &[(String, String, u64, Option<String>)], // (title, status, duration_ms, error)
+        page_snapshot: Option<&str>,
+    ) {
+        if let Err(e) = ensure_dirs() {
+            error!("Failed to ensure log directories: {}", e);
+            return;
+        }
+
+        // Copy screenshots to .dev-logs/playwright-screenshots
+        let timestamp_ms = chrono::Utc::now().timestamp_millis();
+        let mut copied_screenshots = Vec::new();
+
+        for (idx, original_path) in original_screenshots.iter().enumerate() {
+            let source = std::path::Path::new(original_path);
+            if source.exists() {
+                let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("png");
+                let dest_name = format!("pw-{}-{}-{}.{}", timestamp_ms, script_id, idx, ext);
+                let dest_path = get_playwright_screenshots_dir().join(&dest_name);
+
+                match fs::copy(source, &dest_path) {
+                    Ok(_) => {
+                        debug!("Copied Playwright screenshot: {}", dest_path.display());
+                        copied_screenshots.push(dest_path.to_string_lossy().to_string());
+                    }
+                    Err(e) => {
+                        warn!("Failed to copy screenshot {}: {}", original_path, e);
+                    }
+                }
+            }
+        }
+
+        let spec_entries: Vec<PlaywrightTestSpec> = specs
+            .iter()
+            .map(|(title, status, dur, err)| PlaywrightTestSpec {
+                title: title.clone(),
+                status: status.clone(),
+                duration_ms: *dur,
+                error: err.clone(),
+            })
+            .collect();
+
+        let entry = PlaywrightLogEntry {
+            id: format!("pw-{}", uuid::Uuid::new_v4()),
+            timestamp: format_timestamp_now(),
+            script_id: script_id.to_string(),
+            script_name: script_name.to_string(),
+            passed,
+            tests_passed,
+            tests_failed,
+            tests_skipped,
+            duration_ms,
+            error: error.map(String::from),
+            target_url: target_url.map(String::from),
+            display_mode: display_mode.map(String::from),
+            browser: browser.map(String::from),
+            screenshot_paths: copied_screenshots,
+            console_output: console_output.to_vec(),
+            specs: spec_entries,
+            page_snapshot: page_snapshot.map(String::from),
+        };
+
+        Self::append_to_jsonl("runner-playwright.jsonl", &entry);
+        debug!(
+            "Logged Playwright execution: {} (passed: {})",
+            script_name, passed
+        );
+    }
+
     /// Save a base64-encoded image to a file
     fn save_base64_image(base64_data: &str, filename: &str) -> Option<String> {
         // Handle data URL prefix if present
@@ -319,6 +449,7 @@ impl FileLogger {
             "runner-general.jsonl",
             "runner-image-recognition.jsonl",
             "runner-actions.jsonl",
+            "runner-playwright.jsonl",
         ];
 
         for filename in files {
@@ -338,6 +469,17 @@ impl FileLogger {
             }
             if let Err(e) = fs::create_dir_all(&screenshots_dir) {
                 warn!("Failed to recreate screenshots directory: {}", e);
+            }
+        }
+
+        // Clear playwright screenshots directory
+        let pw_screenshots_dir = get_playwright_screenshots_dir();
+        if pw_screenshots_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&pw_screenshots_dir) {
+                warn!("Failed to clear playwright screenshots directory: {}", e);
+            }
+            if let Err(e) = fs::create_dir_all(&pw_screenshots_dir) {
+                warn!("Failed to recreate playwright screenshots directory: {}", e);
             }
         }
 

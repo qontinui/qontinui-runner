@@ -89,3 +89,8 @@ CLAUDE.md
 python-bridge/build/
 src-tauri/binaries/*.exe
 .claude/
+
+# Playwright user scripts (generated at runtime)
+playwright-user-scripts/
+test-results/
+test.spec.ts

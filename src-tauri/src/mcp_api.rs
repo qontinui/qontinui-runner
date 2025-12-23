@@ -78,6 +78,37 @@ use crate::workflow_monitor::WorkflowManager;
 use axum::routing::{delete, put};
 use tauri::{Emitter, Manager};
 
+// Windows-specific imports for process creation flags
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+// Windows constants for process creation
+#[cfg(target_os = "windows")]
+const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+#[cfg(target_os = "windows")]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+/// Spawn Python script with proper console on Windows.
+/// Claude CLI requires a console window to function properly.
+fn spawn_python_with_console(
+    python_path: &str,
+    args: &[&std::ffi::OsStr],
+    working_dir: &std::path::Path,
+) -> std::io::Result<std::process::Child> {
+    let mut cmd = std::process::Command::new(python_path);
+    cmd.args(args).current_dir(working_dir);
+
+    #[cfg(target_os = "windows")]
+    {
+        // CREATE_NEW_CONSOLE: Creates a new console window (required for Claude CLI)
+        // Note: CREATE_BREAKAWAY_FROM_JOB requires special permissions so we don't use it here.
+        // The Python spawn script handles job breakaway internally via subprocess.Popen flags.
+        cmd.creation_flags(CREATE_NEW_CONSOLE);
+    }
+
+    cmd.spawn()
+}
+
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
 
@@ -90,8 +121,159 @@ pub struct ApiState {
     pub ai_analysis_running: AtomicBool,
     /// Flag to request stopping the current AI analysis
     pub ai_analysis_stop_requested: AtomicBool,
-    /// Manages multi-session workflow runs
+    /// Manages multi-session workflow runs (Prompt Library)
     pub workflow_manager: WorkflowManager,
+    /// Manages AI Developer sessions with iteration support
+    pub ai_developer_manager: AiDeveloperManager,
+}
+
+// ============================================================================
+// AI Developer Manager
+// ============================================================================
+
+/// Manages AI Developer sessions with iteration support
+pub struct AiDeveloperManager {
+    /// Active AI Developer sessions, keyed by session_id
+    sessions: Arc<tokio::sync::RwLock<std::collections::HashMap<String, AiDeveloperSession>>>,
+    /// Session ID that currently holds the GUI automation lock (if any)
+    /// Only one session can hold this lock at a time
+    gui_lock_holder: Arc<tokio::sync::RwLock<Option<String>>>,
+}
+
+/// An AI Developer session with iteration tracking
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiDeveloperSession {
+    pub session_id: String,
+    pub status: AiDeveloperStatus,
+    pub iteration: u32,
+    pub max_iterations: u32,
+    pub uses_gui_automation: bool,
+    pub started_at: String,
+    pub last_activity: String,
+    pub stop_requested: bool,
+    pub state_file: String,
+    pub log_file: String,
+    pub prompt: String,
+    pub continuation_prompt: Option<String>,
+    pub errors_fixed: Vec<String>,
+    pub errors_remaining: Vec<String>,
+    pub activity_log: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiDeveloperStatus {
+    Starting,
+    Running,
+    WaitingForNextIteration,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl AiDeveloperManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            gui_lock_holder: Arc::new(tokio::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Try to acquire the GUI automation lock for a session
+    pub async fn acquire_gui_lock(&self, session_id: &str) -> Result<(), String> {
+        let mut lock = self.gui_lock_holder.write().await;
+        if let Some(holder) = &*lock {
+            if holder != session_id {
+                return Err(format!(
+                    "GUI automation lock held by session '{}'. Only one GUI automation workflow can run at a time.",
+                    holder
+                ));
+            }
+            // Already holds the lock
+            return Ok(());
+        }
+        *lock = Some(session_id.to_string());
+        info!("GUI automation lock acquired by session '{}'", session_id);
+        Ok(())
+    }
+
+    /// Release the GUI automation lock
+    pub async fn release_gui_lock(&self, session_id: &str) {
+        let mut lock = self.gui_lock_holder.write().await;
+        if let Some(holder) = &*lock {
+            if holder == session_id {
+                *lock = None;
+                info!("GUI automation lock released by session '{}'", session_id);
+            }
+        }
+    }
+
+    /// Check if GUI lock is available or held by given session
+    pub async fn can_use_gui(&self, session_id: &str) -> bool {
+        let lock = self.gui_lock_holder.read().await;
+        match &*lock {
+            None => true,
+            Some(holder) => holder == session_id,
+        }
+    }
+
+    /// Get which session holds the GUI lock
+    pub async fn gui_lock_holder(&self) -> Option<String> {
+        self.gui_lock_holder.read().await.clone()
+    }
+
+    /// Add a new session
+    pub async fn add_session(&self, session: AiDeveloperSession) {
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session.session_id.clone(), session);
+    }
+
+    /// Get a session by ID
+    pub async fn get_session(&self, session_id: &str) -> Option<AiDeveloperSession> {
+        let sessions = self.sessions.read().await;
+        sessions.get(session_id).cloned()
+    }
+
+    /// Update a session
+    pub async fn update_session(&self, session: AiDeveloperSession) {
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(session.session_id.clone(), session);
+    }
+
+    /// Remove a session
+    pub async fn remove_session(&self, session_id: &str) -> Option<AiDeveloperSession> {
+        let mut sessions = self.sessions.write().await;
+        sessions.remove(session_id)
+    }
+
+    /// Get all sessions
+    pub async fn get_all_sessions(&self) -> Vec<AiDeveloperSession> {
+        let sessions = self.sessions.read().await;
+        sessions.values().cloned().collect()
+    }
+
+    /// Get active sessions (running or waiting)
+    pub async fn get_active_sessions(&self) -> Vec<AiDeveloperSession> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    AiDeveloperStatus::Starting
+                        | AiDeveloperStatus::Running
+                        | AiDeveloperStatus::WaitingForNextIteration
+                )
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+impl Default for AiDeveloperManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Response for API endpoints
@@ -188,6 +370,69 @@ pub struct MonitorsResponse {
 /// Health check endpoint
 async fn health() -> Json<ApiResponse<String>> {
     Json(ApiResponse::success("ok".to_string()))
+}
+
+/// Launch Chrome with remote debugging enabled
+async fn launch_debug_chrome() -> Json<ApiResponse<String>> {
+    use std::process::Command;
+
+    // Common Chrome paths on Windows
+    let chrome_paths = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ];
+
+    let chrome_path = chrome_paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists());
+
+    match chrome_path {
+        Some(path) => {
+            // First, kill all existing Chrome processes
+            // The debug port only works on the FIRST Chrome instance
+            info!("Killing existing Chrome processes...");
+            let _ = Command::new("taskkill")
+                .args(["/F", "/IM", "chrome.exe"])
+                .output();
+
+            // Wait a moment for processes to terminate
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+
+            // Now launch Chrome with debug flag and separate profile
+            // Using a separate user-data-dir ensures the debug port works
+            // even if Chrome would normally restore a previous session
+            match Command::new(path)
+                .args([
+                    "--remote-debugging-port=9222",
+                    "--user-data-dir=C:\\temp\\chrome-debug-profile",
+                ])
+                .spawn()
+            {
+                Ok(_) => {
+                    info!("Launched Chrome with remote debugging on port 9222");
+                    Json(ApiResponse::success(
+                        "Chrome launched with debugging enabled".to_string(),
+                    ))
+                }
+                Err(e) => {
+                    error!("Failed to launch Chrome: {}", e);
+                    Json(ApiResponse {
+                        success: false,
+                        data: None,
+                        error: Some(format!("Failed to launch Chrome: {}", e)),
+                    })
+                }
+            }
+        }
+        None => {
+            error!("Chrome not found at expected paths");
+            Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some("Chrome not found. Please close Chrome and launch it manually with: chrome.exe --remote-debugging-port=9222".to_string()),
+            })
+        }
+    }
 }
 
 /// Get available monitors with position information
@@ -1308,6 +1553,9 @@ pub struct TriggerAiAnalysisResponse {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The full output from Claude (if captured synchronously)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 /// Request to restart the runner (for AI self-healing workflow)
@@ -1335,6 +1583,14 @@ pub struct SpawnAiDeveloperRequest {
     /// Maximum number of iterations (default: 10)
     #[serde(default)]
     pub max_iterations: Option<u32>,
+    /// Whether this session uses GUI automation (mouse/keyboard control)
+    /// If true, only one such session can run at a time
+    #[serde(default)]
+    pub uses_gui_automation: bool,
+    /// Optional continuation prompt for subsequent iterations
+    /// If not provided, will use a default continuation prompt
+    #[serde(default)]
+    pub continuation_prompt: Option<String>,
 }
 
 /// Response from spawning an AI Developer session
@@ -1344,6 +1600,10 @@ pub struct SpawnAiDeveloperResponse {
     pub state_file: String,
     pub log_file: String,
     pub pid: Option<u32>,
+    /// Whether this session uses GUI automation
+    pub uses_gui_automation: bool,
+    /// Whether the GUI lock was successfully acquired (only relevant if uses_gui_automation is true)
+    pub gui_lock_acquired: bool,
 }
 
 /// Request to read AI Developer session state
@@ -1498,6 +1758,91 @@ pub struct AiOutputEvent {
     pub source: String, // "prompt" or "claude"
     #[serde(rename = "actionId")]
     pub action_id: Option<String>, // Unique ID per AI analysis session
+}
+
+// ============================================================================
+// Playwright Script Request Types
+// ============================================================================
+
+use crate::playwright::{self, DisplayMode};
+
+/// Request to create a new Playwright script
+#[derive(Debug, Deserialize)]
+pub struct CreatePlaywrightScriptRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub ai_instructions: Option<String>,
+    #[serde(default)]
+    pub target_url: String,
+    pub script_content: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_playwright_timeout")]
+    pub timeout_seconds: u32,
+    #[serde(default)]
+    pub display_mode: DisplayMode,
+    #[serde(default = "default_playwright_browser")]
+    pub browser: String,
+}
+
+fn default_playwright_timeout() -> u32 {
+    60
+}
+
+fn default_playwright_browser() -> String {
+    "chromium".to_string()
+}
+
+/// Request to update an existing Playwright script
+#[derive(Debug, Deserialize)]
+pub struct UpdatePlaywrightScriptRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub ai_instructions: Option<String>,
+    #[serde(default)]
+    pub target_url: Option<String>,
+    #[serde(default)]
+    pub script_content: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+    #[serde(default)]
+    pub display_mode: Option<DisplayMode>,
+    #[serde(default)]
+    pub browser: Option<String>,
+}
+
+/// Request to run a Playwright script
+#[derive(Debug, Deserialize)]
+pub struct RunPlaywrightScriptRequest {
+    /// Optional URL override for this run
+    #[serde(default)]
+    pub target_url_override: Option<String>,
+}
+
+/// Request to import Playwright scripts
+#[derive(Debug, Deserialize)]
+pub struct ImportPlaywrightScriptsRequest {
+    /// JSON array of scripts to import
+    pub scripts_json: String,
+}
+
+/// Request to duplicate a Playwright script
+#[derive(Debug, Deserialize)]
+pub struct DuplicatePlaywrightScriptRequest {
+    /// Optional new name (defaults to "Original Name (Copy)")
+    #[serde(default)]
+    pub new_name: Option<String>,
 }
 
 /// Write workflow event to log file for debugging/persistence
@@ -1855,8 +2200,11 @@ fn get_workspace_paths_internal(
 /// This creates a state file and spawns Claude as a completely independent process
 /// using spawn-independent-claude.py. The Claude process can restart any service
 /// including the runner itself.
+///
+/// If `uses_gui_automation` is true, the session will acquire an exclusive GUI lock
+/// to prevent multiple sessions from controlling mouse/keyboard simultaneously.
 async fn spawn_ai_developer_http(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<SpawnAiDeveloperRequest>,
 ) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Generate session_id if not provided
@@ -1868,31 +2216,70 @@ async fn spawn_ai_developer_http(
         )
     });
     let max_iterations = request.max_iterations.unwrap_or(10);
+    let uses_gui_automation = request.uses_gui_automation;
+    let continuation_prompt = request.continuation_prompt.clone();
+    let prompt = request.prompt.clone();
 
     info!(
-        "MCP API: Spawning AI Developer session: {} (max {} iterations)",
-        session_id, max_iterations
+        "MCP API: Spawning AI Developer session: {} (max {} iterations, gui_automation: {})",
+        session_id, max_iterations, uses_gui_automation
     );
+
+    // Try to acquire GUI lock if needed
+    let mut gui_lock_acquired = false;
+    if uses_gui_automation {
+        match state
+            .ai_developer_manager
+            .acquire_gui_lock(&session_id)
+            .await
+        {
+            Ok(()) => {
+                gui_lock_acquired = true;
+                info!("MCP API: GUI lock acquired for session {}", session_id);
+            }
+            Err(e) => {
+                // Another GUI session is running - return error
+                error!("MCP API: Failed to acquire GUI lock: {}", e);
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(api_error(format!(
+                        "Cannot start GUI automation session: {}",
+                        e
+                    ))),
+                ));
+            }
+        }
+    }
+
+    // Clone values for the blocking task
+    let session_id_clone = session_id.clone();
+    let prompt_clone = prompt.clone();
+    let continuation_prompt_clone = continuation_prompt.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
         let spawn_script = scripts_path.join("spawn-independent-claude.py");
-        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
-        let prompt_file = dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id));
-        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id_clone));
+        let prompt_file =
+            dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id_clone));
+        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id_clone));
 
         // Ensure .dev-logs directory exists
         std::fs::create_dir_all(&dev_logs_path)
             .map_err(|e| format!("Failed to create dev-logs directory: {}", e))?;
 
-        // Create initial state file
+        // Create initial state file with new fields
         let initial_state = serde_json::json!({
-            "session_id": session_id,
+            "session_id": session_id_clone,
             "iteration": 1,
             "max_iterations": max_iterations,
             "status": "starting",
             "started_at": chrono::Utc::now().to_rfc3339(),
+            "last_activity": chrono::Utc::now().to_rfc3339(),
             "stop_requested": false,
+            "uses_gui_automation": uses_gui_automation,
+            "continuation_prompt": continuation_prompt_clone,
+            "restart_permitted": false,
             "current_action": "Initializing",
             "errors_fixed": [],
             "errors_remaining": [],
@@ -1906,31 +2293,41 @@ async fn spawn_ai_developer_http(
         .map_err(|e| format!("Failed to write state file: {}", e))?;
 
         // Write prompt to file
-        std::fs::write(&prompt_file, &request.prompt)
+        std::fs::write(&prompt_file, &prompt_clone)
             .map_err(|e| format!("Failed to write prompt file: {}", e))?;
 
         info!("MCP API: State file created: {:?}", state_file);
         info!("MCP API: Prompt file created: {:?}", prompt_file);
 
         // Spawn Claude independently using the spawn script
-        let spawn_result = std::process::Command::new("python")
-            .arg(&spawn_script)
-            .arg("--file")
-            .arg(&prompt_file)
-            .arg("--session-id")
-            .arg(&session_id)
-            .current_dir(&workspace_root)
-            .spawn();
+        // Use spawn_python_with_console to ensure Claude CLI gets a console window
+        let spawn_result = spawn_python_with_console(
+            "python",
+            &[
+                spawn_script.as_os_str(),
+                std::ffi::OsStr::new("--file"),
+                prompt_file.as_os_str(),
+                std::ffi::OsStr::new("--session-id"),
+                std::ffi::OsStr::new(&session_id_clone),
+            ],
+            &workspace_root,
+        );
 
         match spawn_result {
             Ok(child) => {
                 info!("MCP API: AI Developer spawned with PID: {}", child.id());
-                Ok(SpawnAiDeveloperResponse {
-                    session_id,
-                    state_file: state_file.to_string_lossy().to_string(),
-                    log_file: log_file.to_string_lossy().to_string(),
-                    pid: Some(child.id()),
-                })
+                Ok((
+                    SpawnAiDeveloperResponse {
+                        session_id: session_id_clone,
+                        state_file: state_file.to_string_lossy().to_string(),
+                        log_file: log_file.to_string_lossy().to_string(),
+                        pid: Some(child.id()),
+                        uses_gui_automation,
+                        gui_lock_acquired,
+                    },
+                    state_file,
+                    log_file,
+                ))
             }
             Err(e) => {
                 error!("MCP API: Failed to spawn AI Developer: {}", e);
@@ -1948,9 +2345,737 @@ async fn spawn_ai_developer_http(
     })?;
 
     match result {
-        Ok(response) => Ok(Json(ApiResponse::success(response))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+        Ok((response, state_file, log_file)) => {
+            // Register session with manager
+            let ai_session = AiDeveloperSession {
+                session_id: session_id.clone(),
+                status: AiDeveloperStatus::Running,
+                iteration: 1,
+                max_iterations,
+                uses_gui_automation,
+                started_at: chrono::Utc::now().to_rfc3339(),
+                last_activity: chrono::Utc::now().to_rfc3339(),
+                stop_requested: false,
+                state_file: state_file.to_string_lossy().to_string(),
+                log_file: log_file.to_string_lossy().to_string(),
+                prompt: prompt.clone(),
+                continuation_prompt,
+                errors_fixed: vec![],
+                errors_remaining: vec![],
+                activity_log: vec![format!(
+                    "Session started at {}",
+                    chrono::Utc::now().to_rfc3339()
+                )],
+            };
+            state.ai_developer_manager.add_session(ai_session).await;
+
+            // Spawn background task to monitor this session for iteration completion
+            let state_clone = state.clone();
+            let session_id_for_monitor = session_id.clone();
+            tokio::spawn(async move {
+                monitor_ai_developer_session(state_clone, session_id_for_monitor).await;
+            });
+
+            Ok(Json(ApiResponse::success(response)))
+        }
+        Err(e) => {
+            // Release GUI lock if we acquired it but failed to spawn
+            if gui_lock_acquired {
+                state
+                    .ai_developer_manager
+                    .release_gui_lock(&session_id)
+                    .await;
+            }
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
     }
+}
+
+/// Monitor an AI Developer session for iteration completion and spawn continuations
+///
+/// This function polls for the completion of each iteration and spawns the next
+/// iteration if needed. It handles:
+/// - Detecting when an iteration completes (via .completed marker file)
+/// - Reading the state file to check status
+/// - Spawning continuation sessions for subsequent iterations
+/// - Releasing GUI lock when the session completes
+async fn monitor_ai_developer_session(state: Arc<ApiState>, session_id: String) {
+    info!(
+        "MCP API: Starting iteration monitor for AI Developer session: {}",
+        session_id
+    );
+
+    let poll_interval = std::time::Duration::from_secs(5);
+    let max_poll_attempts = 720; // 1 hour max per iteration (720 * 5s = 3600s)
+
+    loop {
+        let session_opt = state.ai_developer_manager.get_session(&session_id).await;
+        let session = match session_opt {
+            Some(s) => s,
+            None => {
+                warn!(
+                    "MCP API: Session {} no longer exists in manager, stopping monitor",
+                    session_id
+                );
+                return;
+            }
+        };
+
+        // Check if stop requested
+        if session.stop_requested {
+            info!(
+                "MCP API: Stop requested for session {}, ending monitoring",
+                session_id
+            );
+            finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Stopped).await;
+            return;
+        }
+
+        // Check if already completed/failed
+        match session.status {
+            AiDeveloperStatus::Completed
+            | AiDeveloperStatus::Failed
+            | AiDeveloperStatus::Stopped => {
+                info!(
+                    "MCP API: Session {} is in terminal state {:?}, ending monitoring",
+                    session_id, session.status
+                );
+                return;
+            }
+            _ => {}
+        }
+
+        let current_iteration = session.iteration;
+
+        // Wait for the current iteration to complete
+        info!(
+            "MCP API: Waiting for iteration {} of session {} to complete",
+            current_iteration, session_id
+        );
+
+        let completed = wait_for_ai_developer_iteration_completion(
+            &session.state_file,
+            &session_id,
+            poll_interval,
+            max_poll_attempts,
+        )
+        .await;
+
+        if !completed {
+            warn!(
+                "MCP API: Iteration {} of session {} timed out or failed",
+                current_iteration, session_id
+            );
+            finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Failed).await;
+            return;
+        }
+
+        // Read updated state file to check status and get next iteration info
+        let state_result = read_ai_developer_state_file(&session.state_file).await;
+        let file_state = match state_result {
+            Ok(s) => s,
+            Err(e) => {
+                error!(
+                    "MCP API: Failed to read state file for session {}: {}",
+                    session_id, e
+                );
+                finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Failed).await;
+                return;
+            }
+        };
+
+        // Check file state for status
+        let status_str = file_state
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let stop_requested = file_state
+            .get("stop_requested")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let file_iteration = file_state
+            .get("iteration")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(current_iteration as u64) as u32;
+        let max_iterations = file_state
+            .get("max_iterations")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as u32;
+
+        info!(
+            "MCP API: Session {} iteration {} completed with status: {}, file_iteration: {}/{}",
+            session_id, current_iteration, status_str, file_iteration, max_iterations
+        );
+
+        // Check for terminal states
+        if status_str == "completed"
+            || status_str == "failed"
+            || status_str == "stopped"
+            || stop_requested
+        {
+            let final_status = match status_str {
+                "completed" => AiDeveloperStatus::Completed,
+                "stopped" => AiDeveloperStatus::Stopped,
+                _ => {
+                    if stop_requested {
+                        AiDeveloperStatus::Stopped
+                    } else {
+                        AiDeveloperStatus::Failed
+                    }
+                }
+            };
+            info!(
+                "MCP API: Session {} reached terminal state: {:?}",
+                session_id, final_status
+            );
+            finalize_ai_developer_session(&state, &session_id, final_status).await;
+            return;
+        }
+
+        // Check if we've reached max iterations
+        if file_iteration >= max_iterations {
+            info!(
+                "MCP API: Session {} reached max iterations ({})",
+                session_id, max_iterations
+            );
+            finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Completed).await;
+            return;
+        }
+
+        // Spawn next iteration
+        let next_iteration = file_iteration + 1;
+        info!(
+            "MCP API: Spawning iteration {} for session {}",
+            next_iteration, session_id
+        );
+
+        // Update manager state
+        let mut updated_session = session.clone();
+        updated_session.iteration = next_iteration;
+        updated_session.status = AiDeveloperStatus::Running;
+        updated_session.last_activity = chrono::Utc::now().to_rfc3339();
+        updated_session.activity_log.push(format!(
+            "Iteration {} started at {}",
+            next_iteration,
+            chrono::Utc::now().to_rfc3339()
+        ));
+        state
+            .ai_developer_manager
+            .update_session(updated_session.clone())
+            .await;
+
+        // Spawn the next iteration
+        let spawn_result = spawn_ai_developer_continuation(
+            &session.state_file,
+            &session_id,
+            next_iteration,
+            &session.continuation_prompt,
+        )
+        .await;
+
+        if let Err(e) = spawn_result {
+            error!(
+                "MCP API: Failed to spawn continuation for session {}: {}",
+                session_id, e
+            );
+            finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Failed).await;
+            return;
+        }
+
+        // Loop back to wait for this iteration to complete
+    }
+}
+
+/// Wait for an AI Developer iteration to complete by checking for completion marker
+async fn wait_for_ai_developer_iteration_completion(
+    state_file: &str,
+    session_id: &str,
+    poll_interval: std::time::Duration,
+    max_attempts: u32,
+) -> bool {
+    // The completion marker is based on the session_id (same as workflow sessions)
+    let (_, dev_logs_path, _) = match get_workspace_paths_internal() {
+        Ok(paths) => paths,
+        Err(e) => {
+            error!("MCP API: Failed to get workspace paths: {}", e);
+            return false;
+        }
+    };
+
+    let completion_marker = dev_logs_path.join(format!("claude-session-{}.completed", session_id));
+
+    for attempt in 0..max_attempts {
+        // Check for completion marker
+        if completion_marker.exists() {
+            info!(
+                "MCP API: Found completion marker for session {} (attempt {})",
+                session_id, attempt
+            );
+
+            // Remove the completion marker for the next iteration
+            if let Err(e) = std::fs::remove_file(&completion_marker) {
+                warn!("MCP API: Failed to remove completion marker: {}", e);
+            }
+
+            return true;
+        }
+
+        // Also check state file for terminal states
+        if let Ok(file_state) = read_ai_developer_state_file(state_file).await {
+            let status = file_state
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+
+            if status == "completed" || status == "failed" || status == "stopped" {
+                info!(
+                    "MCP API: Session {} state file shows terminal status: {}",
+                    session_id, status
+                );
+                return true;
+            }
+
+            let stop_requested = file_state
+                .get("stop_requested")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if stop_requested {
+                info!("MCP API: Session {} has stop_requested=true", session_id);
+                return true;
+            }
+        }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    warn!(
+        "MCP API: Timeout waiting for session {} iteration completion after {} attempts",
+        session_id, max_attempts
+    );
+    false
+}
+
+/// Read AI Developer state file
+async fn read_ai_developer_state_file(state_file: &str) -> Result<serde_json::Value, String> {
+    let state_file = state_file.to_string();
+    tokio::task::spawn_blocking(move || {
+        let content = std::fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file: {}", e))?;
+        let state: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse state file: {}", e))?;
+        Ok(state)
+    })
+    .await
+    .map_err(|e| format!("Spawn blocking error: {}", e))?
+}
+
+/// Update AI Developer state file
+async fn update_ai_developer_state_file(
+    state_file: &str,
+    updates: serde_json::Value,
+) -> Result<(), String> {
+    let state_file = state_file.to_string();
+    tokio::task::spawn_blocking(move || {
+        // Read current state
+        let content = std::fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file: {}", e))?;
+        let mut state: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse state file: {}", e))?;
+
+        // Merge updates
+        if let (Some(state_obj), Some(updates_obj)) = (state.as_object_mut(), updates.as_object()) {
+            for (key, value) in updates_obj {
+                state_obj.insert(key.clone(), value.clone());
+            }
+        }
+
+        // Write back
+        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap())
+            .map_err(|e| format!("Failed to write state file: {}", e))?;
+
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Spawn blocking error: {}", e))?
+}
+
+/// Spawn a continuation session for the next iteration
+async fn spawn_ai_developer_continuation(
+    state_file: &str,
+    session_id: &str,
+    iteration: u32,
+    continuation_prompt: &Option<String>,
+) -> Result<(), String> {
+    let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
+    let spawn_script = scripts_path.join("spawn-independent-claude.py");
+
+    // Create continuation prompt file
+    let prompt_file = dev_logs_path.join(format!(
+        "ai-developer-{}-iter{}-prompt.txt",
+        session_id, iteration
+    ));
+
+    let prompt = if let Some(custom_prompt) = continuation_prompt {
+        custom_prompt.clone()
+    } else {
+        format!(
+            r#"You are continuing an AI Developer session.
+
+Session ID: {}
+Current Iteration: {}
+State File: {}
+
+Read the state file to understand the current context and what needs to be done next.
+Check errors_remaining and errors_fixed to understand progress.
+Update the state file as you work:
+- Add fixed errors to errors_fixed
+- Update errors_remaining
+- Add entries to activity_log
+- Set status to "running" while working, "completed" when done, or "failed" if you encounter unrecoverable issues
+
+If stop_requested is true, finish your current task and set status to "stopped".
+If you've fixed all errors or completed all tasks, set status to "completed".
+
+Continue where the previous iteration left off."#,
+            session_id, iteration, state_file
+        )
+    };
+
+    // Write prompt file
+    std::fs::write(&prompt_file, &prompt)
+        .map_err(|e| format!("Failed to write continuation prompt: {}", e))?;
+
+    // Update state file for new iteration
+    update_ai_developer_state_file(
+        state_file,
+        serde_json::json!({
+            "iteration": iteration,
+            "status": "running",
+            "last_activity": chrono::Utc::now().to_rfc3339()
+        }),
+    )
+    .await?;
+
+    // Spawn the continuation
+    // Use spawn_python_with_console to ensure Claude CLI gets a console window
+    let spawn_result = spawn_python_with_console(
+        "python",
+        &[
+            spawn_script.as_os_str(),
+            std::ffi::OsStr::new("--file"),
+            prompt_file.as_os_str(),
+            std::ffi::OsStr::new("--session-id"),
+            std::ffi::OsStr::new(session_id),
+        ],
+        &workspace_root,
+    );
+
+    match spawn_result {
+        Ok(child) => {
+            info!(
+                "MCP API: AI Developer continuation spawned with PID: {} (session: {}, iteration: {})",
+                child.id(), session_id, iteration
+            );
+            Ok(())
+        }
+        Err(e) => {
+            error!("MCP API: Failed to spawn AI Developer continuation: {}", e);
+            Err(format!("Failed to spawn continuation: {}", e))
+        }
+    }
+}
+
+/// Finalize an AI Developer session (cleanup, release locks)
+async fn finalize_ai_developer_session(
+    state: &Arc<ApiState>,
+    session_id: &str,
+    final_status: AiDeveloperStatus,
+) {
+    info!(
+        "MCP API: Finalizing AI Developer session {} with status {:?}",
+        session_id, final_status
+    );
+
+    // Update session status in manager
+    if let Some(mut session) = state.ai_developer_manager.get_session(session_id).await {
+        session.status = final_status.clone();
+        session.last_activity = chrono::Utc::now().to_rfc3339();
+        session.activity_log.push(format!(
+            "Session finalized with status {:?} at {}",
+            final_status,
+            chrono::Utc::now().to_rfc3339()
+        ));
+
+        // Update state file
+        let status_str = match final_status {
+            AiDeveloperStatus::Completed => "completed",
+            AiDeveloperStatus::Failed => "failed",
+            AiDeveloperStatus::Stopped => "stopped",
+            _ => "unknown",
+        };
+
+        if let Err(e) = update_ai_developer_state_file(
+            &session.state_file,
+            serde_json::json!({
+                "status": status_str,
+                "last_activity": chrono::Utc::now().to_rfc3339()
+            }),
+        )
+        .await
+        {
+            error!(
+                "MCP API: Failed to update state file for session {}: {}",
+                session_id, e
+            );
+        }
+
+        // Release GUI lock if this session held it
+        if session.uses_gui_automation {
+            state
+                .ai_developer_manager
+                .release_gui_lock(session_id)
+                .await;
+            info!("MCP API: Released GUI lock for session {}", session_id);
+        }
+
+        state.ai_developer_manager.update_session(session).await;
+    }
+}
+
+/// Resume AI Developer sessions on startup by scanning for active state files
+///
+/// This function scans the .dev-logs directory for ai-developer-*.json files
+/// and resumes monitoring for any sessions that have:
+/// - status = "running" or "starting"
+/// - restart_permitted = true
+async fn resume_ai_developer_sessions_on_startup(state: Arc<ApiState>) {
+    info!("MCP API: Scanning for AI Developer sessions to resume...");
+
+    let (_, dev_logs_path, _) = match get_workspace_paths_internal() {
+        Ok(paths) => paths,
+        Err(e) => {
+            error!(
+                "MCP API: Failed to get workspace paths for AI Developer resume: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    // Scan for ai-developer-*.json files
+    let entries = match std::fs::read_dir(&dev_logs_path) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("MCP API: Could not read dev-logs directory: {}", e);
+            return;
+        }
+    };
+
+    let mut sessions_resumed = 0;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let filename = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Check if this is an AI Developer state file
+        if !filename.starts_with("ai-developer-") || !filename.ends_with(".json") {
+            continue;
+        }
+
+        // Parse session_id from filename: ai-developer-{session_id}.json
+        let session_id = filename
+            .strip_prefix("ai-developer-")
+            .and_then(|s| s.strip_suffix(".json"))
+            .unwrap_or("")
+            .to_string();
+
+        if session_id.is_empty() {
+            continue;
+        }
+
+        // Read state file
+        let state_file_content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("MCP API: Failed to read state file {:?}: {}", path, e);
+                continue;
+            }
+        };
+
+        let file_state: serde_json::Value = match serde_json::from_str(&state_file_content) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("MCP API: Failed to parse state file {:?}: {}", path, e);
+                continue;
+            }
+        };
+
+        // Check status
+        let status = file_state
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        // Only resume sessions that are in running/starting state
+        if status != "running" && status != "starting" {
+            continue;
+        }
+
+        // Check restart_permitted
+        let restart_permitted = file_state
+            .get("restart_permitted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if !restart_permitted {
+            info!(
+                "MCP API: AI Developer session {} was interrupted but restart_permitted=false, skipping",
+                session_id
+            );
+
+            // Update state file to mark as failed due to restart
+            if let Err(e) = update_ai_developer_state_file(
+                &path.to_string_lossy(),
+                serde_json::json!({
+                    "status": "failed",
+                    "last_activity": chrono::Utc::now().to_rfc3339(),
+                    "failure_reason": "Runner restarted without restart_permitted. Set restart_permitted=true before triggering restarts."
+                }),
+            )
+            .await
+            {
+                warn!("MCP API: Failed to update state file: {}", e);
+            }
+            continue;
+        }
+
+        info!(
+            "MCP API: Resuming AI Developer session {} (status: {}, restart_permitted: true)",
+            session_id, status
+        );
+
+        // Read other fields from state file
+        let iteration = file_state
+            .get("iteration")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+        let max_iterations = file_state
+            .get("max_iterations")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10) as u32;
+        let uses_gui_automation = file_state
+            .get("uses_gui_automation")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let continuation_prompt = file_state
+            .get("continuation_prompt")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let started_at = file_state
+            .get("started_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Try to acquire GUI lock if needed
+        if uses_gui_automation {
+            if let Err(e) = state
+                .ai_developer_manager
+                .acquire_gui_lock(&session_id)
+                .await
+            {
+                warn!(
+                    "MCP API: Could not acquire GUI lock for session {}, skipping: {}",
+                    session_id, e
+                );
+                continue;
+            }
+        }
+
+        // Clear restart_permitted since we're resuming
+        if let Err(e) = update_ai_developer_state_file(
+            &path.to_string_lossy(),
+            serde_json::json!({
+                "restart_permitted": false,
+                "last_activity": chrono::Utc::now().to_rfc3339()
+            }),
+        )
+        .await
+        {
+            warn!("MCP API: Failed to clear restart_permitted: {}", e);
+        }
+
+        // Create session in manager
+        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+        let ai_session = AiDeveloperSession {
+            session_id: session_id.clone(),
+            status: AiDeveloperStatus::Running,
+            iteration,
+            max_iterations,
+            uses_gui_automation,
+            started_at,
+            last_activity: chrono::Utc::now().to_rfc3339(),
+            stop_requested: false,
+            state_file: path.to_string_lossy().to_string(),
+            log_file: log_file.to_string_lossy().to_string(),
+            prompt: "Resumed after restart".to_string(),
+            continuation_prompt,
+            errors_fixed: vec![],
+            errors_remaining: vec![],
+            activity_log: vec![format!(
+                "Session resumed after runner restart at {}",
+                chrono::Utc::now().to_rfc3339()
+            )],
+        };
+        state
+            .ai_developer_manager
+            .add_session(ai_session.clone())
+            .await;
+
+        // Spawn a continuation session for this iteration
+        let state_clone = state.clone();
+        let session_id_clone = session_id.clone();
+        let state_file_path = path.to_string_lossy().to_string();
+        let cont_prompt = ai_session.continuation_prompt.clone();
+
+        tokio::spawn(async move {
+            // Spawn continuation
+            if let Err(e) = spawn_ai_developer_continuation(
+                &state_file_path,
+                &session_id_clone,
+                iteration,
+                &cont_prompt,
+            )
+            .await
+            {
+                error!(
+                    "MCP API: Failed to spawn continuation for resumed session {}: {}",
+                    session_id_clone, e
+                );
+                finalize_ai_developer_session(
+                    &state_clone,
+                    &session_id_clone,
+                    AiDeveloperStatus::Failed,
+                )
+                .await;
+                return;
+            }
+
+            // Start monitoring
+            monitor_ai_developer_session(state_clone, session_id_clone).await;
+        });
+
+        sessions_resumed += 1;
+    }
+
+    info!(
+        "MCP API: Resumed {} AI Developer session(s) on startup",
+        sessions_resumed
+    );
 }
 
 /// Read the current state of an AI Developer session
@@ -1993,14 +3118,25 @@ async fn read_ai_developer_state_http(
 
 /// Request an AI Developer session to stop
 async fn stop_ai_developer_http(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<StopAiDeveloperRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let session_id = request.session_id;
+    let session_id = request.session_id.clone();
     info!(
         "MCP API: Requesting stop for AI Developer session: {}",
         session_id
     );
+
+    // Also update manager state
+    if let Some(mut session) = state.ai_developer_manager.get_session(&session_id).await {
+        session.stop_requested = true;
+        session.last_activity = chrono::Utc::now().to_rfc3339();
+        session.activity_log.push(format!(
+            "Stop requested at {}",
+            chrono::Utc::now().to_rfc3339()
+        ));
+        state.ai_developer_manager.update_session(session).await;
+    }
 
     let result = tokio::task::spawn_blocking(move || {
         let (_, dev_logs_path, _) = get_workspace_paths_internal()?;
@@ -2014,18 +3150,21 @@ async fn stop_ai_developer_http(
         let content = std::fs::read_to_string(&state_file)
             .map_err(|e| format!("Failed to read state file: {}", e))?;
 
-        let mut state: serde_json::Value = serde_json::from_str(&content)
+        let mut file_state: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse state file: {}", e))?;
 
         // Set stop_requested flag
-        state["stop_requested"] = serde_json::Value::Bool(true);
+        file_state["stop_requested"] = serde_json::Value::Bool(true);
 
         // Write back
-        std::fs::write(&state_file, serde_json::to_string_pretty(&state).unwrap())
-            .map_err(|e| format!("Failed to write state file: {}", e))?;
+        std::fs::write(
+            &state_file,
+            serde_json::to_string_pretty(&file_state).unwrap(),
+        )
+        .map_err(|e| format!("Failed to write state file: {}", e))?;
 
         info!("MCP API: Stop requested for session {}", session_id);
-        Ok(state)
+        Ok(file_state)
     })
     .await
     .map_err(|e| {
@@ -2037,9 +3176,39 @@ async fn stop_ai_developer_http(
     })?;
 
     match result {
-        Ok(state) => Ok(Json(ApiResponse::success(state))),
+        Ok(file_state) => Ok(Json(ApiResponse::success(file_state))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
+}
+
+/// Get all managed AI Developer sessions from the manager
+///
+/// Returns sessions that are actively being monitored by the runner.
+/// This includes more runtime info than just reading state files.
+async fn get_managed_ai_developer_sessions_http(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<Vec<AiDeveloperSession>>> {
+    let sessions = state.ai_developer_manager.get_all_sessions().await;
+    Json(ApiResponse::success(sessions))
+}
+
+/// Response for GUI lock status
+#[derive(Debug, Serialize)]
+struct GuiLockStatus {
+    locked: bool,
+    holder: Option<String>,
+}
+
+/// Get the current GUI automation lock status
+async fn get_gui_lock_status_http(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<GuiLockStatus>> {
+    let holder = state.ai_developer_manager.gui_lock_holder().await;
+    let status = GuiLockStatus {
+        locked: holder.is_some(),
+        holder,
+    };
+    Json(ApiResponse::success(status))
 }
 
 /// List all AI Developer sessions
@@ -2341,14 +3510,18 @@ async fn run_prompt(
         info!("MCP API: Prompt file created: {:?}", prompt_file);
 
         // Spawn Claude independently using the spawn script
-        let spawn_result = std::process::Command::new("python")
-            .arg(&spawn_script)
-            .arg("--file")
-            .arg(&prompt_file)
-            .arg("--session-id")
-            .arg(&session_id)
-            .current_dir(&workspace_root)
-            .spawn();
+        // Use spawn_python_with_console to ensure Claude CLI gets a console window
+        let spawn_result = spawn_python_with_console(
+            "python",
+            &[
+                spawn_script.as_os_str(),
+                std::ffi::OsStr::new("--file"),
+                prompt_file.as_os_str(),
+                std::ffi::OsStr::new("--session-id"),
+                std::ffi::OsStr::new(&session_id),
+            ],
+            &workspace_root,
+        );
 
         match spawn_result {
             Ok(child) => {
@@ -2362,6 +3535,8 @@ async fn run_prompt(
                     state_file: state_file.to_string_lossy().to_string(),
                     log_file: log_file.to_string_lossy().to_string(),
                     pid: Some(child.id()),
+                    uses_gui_automation: false,
+                    gui_lock_acquired: false,
                 })
             }
             Err(e) => {
@@ -2442,6 +3617,176 @@ async fn search_prompts(
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
     let results = prompts::search_prompts(query);
     Ok(Json(ApiResponse::success(results)))
+}
+
+// ============================================================================
+// Playwright Script Handlers
+// ============================================================================
+
+/// List all Playwright scripts
+async fn list_playwright_scripts(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<playwright::PlaywrightScript>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let scripts = playwright::get_all_scripts();
+    Ok(Json(ApiResponse::success(scripts)))
+}
+
+/// Get a single Playwright script by ID
+async fn get_playwright_script(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<playwright::PlaywrightScript>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match playwright::get_script(&id) {
+        Some(script) => Ok(Json(ApiResponse::success(script))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Playwright script not found: {}", id))),
+        )),
+    }
+}
+
+/// Create a new Playwright script
+async fn create_playwright_script(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<CreatePlaywrightScriptRequest>,
+) -> Result<Json<ApiResponse<playwright::PlaywrightScript>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match playwright::create_script(
+        request.name,
+        request.description,
+        request.ai_instructions,
+        request.target_url,
+        request.script_content,
+        request.category,
+        request.tags,
+        request.timeout_seconds,
+        request.display_mode,
+        request.browser,
+    ) {
+        Ok(script) => Ok(Json(ApiResponse::success(script))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Update an existing Playwright script
+async fn update_playwright_script(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<UpdatePlaywrightScriptRequest>,
+) -> Result<Json<ApiResponse<playwright::PlaywrightScript>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match playwright::update_script(
+        &id,
+        request.name,
+        request.description,
+        request.ai_instructions,
+        request.target_url,
+        request.script_content,
+        request.category,
+        request.tags,
+        request.timeout_seconds,
+        request.display_mode,
+        request.browser,
+    ) {
+        Ok(script) => Ok(Json(ApiResponse::success(script))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Delete a Playwright script
+async fn delete_playwright_script(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match playwright::delete_script(&id) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Run a Playwright script
+async fn run_playwright_script(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<RunPlaywrightScriptRequest>,
+) -> Result<Json<ApiResponse<playwright::PlaywrightResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let target_url_override = request.target_url_override;
+
+    // Run in spawn_blocking since it's a blocking operation
+    let result =
+        tokio::task::spawn_blocking(move || playwright::run_script(&id, target_url_override))
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Task error: {}", e))),
+                )
+            })?;
+
+    match result {
+        Ok(play_result) => Ok(Json(ApiResponse::success(play_result))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get Playwright script categories
+async fn get_playwright_categories(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let categories = playwright::get_categories();
+    Ok(Json(ApiResponse::success(categories)))
+}
+
+/// Get Playwright script tags
+async fn get_playwright_tags(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let tags = playwright::get_all_tags();
+    Ok(Json(ApiResponse::success(tags)))
+}
+
+/// Search Playwright scripts
+async fn search_playwright_scripts(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<playwright::PlaywrightScript>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let results = playwright::search_scripts(query);
+    Ok(Json(ApiResponse::success(results)))
+}
+
+/// Import Playwright scripts
+async fn import_playwright_scripts(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<ImportPlaywrightScriptsRequest>,
+) -> Result<Json<ApiResponse<Vec<playwright::PlaywrightScript>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    match playwright::import_scripts(&request.scripts_json) {
+        Ok(scripts) => Ok(Json(ApiResponse::success(scripts))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(api_error(e)))),
+    }
+}
+
+/// Export all Playwright scripts
+async fn export_playwright_scripts(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match playwright::export_scripts() {
+        Ok(json) => Ok(Json(ApiResponse::success(json))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Duplicate a Playwright script
+async fn duplicate_playwright_script(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<DuplicatePlaywrightScriptRequest>,
+) -> Result<Json<ApiResponse<playwright::PlaywrightScript>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match playwright::duplicate_script(&id, request.new_name) {
+        Ok(script) => Ok(Json(ApiResponse::success(script))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
 }
 
 /// Execute AI analysis via Claude CLI
@@ -2966,6 +4311,7 @@ fn execute_windows_native(
                     "Claude CLI process was unresponsive for {} seconds and was killed",
                     inactive_secs
                 )),
+                output: None,
             });
         }
 
@@ -3046,6 +4392,7 @@ fn execute_windows_native(
             success: true,
             message: "AI analysis completed successfully".to_string(),
             error: None,
+            output: Some(all_output),
         })
     } else {
         write_ai_debug_log(&format!(
@@ -3054,12 +4401,13 @@ fn execute_windows_native(
         ));
         Ok(TriggerAiAnalysisResponse {
             success: false,
-            message: all_output,
+            message: "AI analysis failed".to_string(),
             error: Some(if stderr_output.is_empty() {
                 format!("Claude Code exited with code {:?}", status.code())
             } else {
                 stderr_output
             }),
+            output: Some(all_output),
         })
     }
 }
@@ -3284,6 +4632,7 @@ fn execute_via_wsl(
             success: true,
             message: "AI analysis completed successfully".to_string(),
             error: None,
+            output: Some(all_output),
         })
     } else {
         write_ai_debug_log(&format!(
@@ -3292,12 +4641,13 @@ fn execute_via_wsl(
         ));
         Ok(TriggerAiAnalysisResponse {
             success: false,
-            message: all_output,
+            message: "AI analysis failed".to_string(),
             error: Some(if stderr_output.is_empty() {
                 format!("Claude Code exited with code {:?}", status.code())
             } else {
                 stderr_output
             }),
+            output: Some(all_output),
         })
     }
 }
@@ -3521,6 +4871,7 @@ fn execute_native(
             success: true,
             message: "AI analysis completed successfully".to_string(),
             error: None,
+            output: Some(all_output),
         })
     } else {
         write_ai_debug_log(&format!(
@@ -3529,12 +4880,13 @@ fn execute_native(
         ));
         Ok(TriggerAiAnalysisResponse {
             success: false,
-            message: all_output,
+            message: "AI analysis failed".to_string(),
             error: Some(if stderr_output.is_empty() {
                 format!("Claude Code exited with code {:?}", status.code())
             } else {
                 stderr_output
             }),
+            output: Some(all_output),
         })
     }
 }
@@ -3588,8 +4940,9 @@ async fn execute_claude_api(
 
         Ok(TriggerAiAnalysisResponse {
             success: true,
-            message: content.to_string(),
+            message: "AI analysis completed successfully".to_string(),
             error: None,
+            output: Some(content.to_string()),
         })
     } else {
         let status = response.status();
@@ -3615,8 +4968,225 @@ async fn execute_claude_api(
             success: false,
             message: "API call failed".to_string(),
             error: Some(error_message),
+            output: None,
         })
     }
+}
+
+// ============================================================================
+// Independent Session Helpers (for workflow prompts)
+// ============================================================================
+
+/// Result of spawning an independent workflow session
+#[derive(Debug)]
+struct IndependentSessionResult {
+    session_id: String,
+    log_file: std::path::PathBuf,
+    completion_marker: std::path::PathBuf,
+}
+
+/// Spawn a workflow session as an independent process using spawn-independent-claude.py.
+/// The session will continue running even if the runner restarts.
+fn spawn_workflow_session_independent(
+    prompt: &str,
+    session_id: &str,
+    app_handle: &tauri::AppHandle,
+    action_id: &str,
+) -> Result<IndependentSessionResult, String> {
+    info!(
+        "Spawning independent workflow session: {} (action_id: {})",
+        session_id, action_id
+    );
+    log_workflow_event(
+        action_id,
+        "session_spawn_independent",
+        &format!("Spawning independent session {}", session_id),
+    );
+
+    // Get workspace paths
+    let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
+    let spawn_script = scripts_path.join("spawn-independent-claude.py");
+
+    if !spawn_script.exists() {
+        return Err(format!(
+            "spawn-independent-claude.py not found at {:?}",
+            spawn_script
+        ));
+    }
+
+    // Write prompt to file
+    let prompt_file = dev_logs_path.join(format!("workflow-session-{}-prompt.txt", session_id));
+    std::fs::write(&prompt_file, prompt)
+        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+
+    // Define output paths
+    let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+    let completion_marker = dev_logs_path.join(format!("claude-session-{}.completed", session_id));
+
+    // Remove old completion marker if it exists
+    let _ = std::fs::remove_file(&completion_marker);
+
+    // Emit status to frontend
+    emit_ai_output(
+        app_handle,
+        &format!("🚀 Spawning independent session {}...", session_id),
+        "status",
+        Some(action_id),
+    );
+
+    // Spawn using Python script
+    // Use spawn_python_with_console to ensure Claude CLI gets a console window
+    let spawn_result = spawn_python_with_console(
+        "python",
+        &[
+            spawn_script.as_os_str(),
+            std::ffi::OsStr::new("--file"),
+            prompt_file.as_os_str(),
+            std::ffi::OsStr::new("--session-id"),
+            std::ffi::OsStr::new(session_id),
+        ],
+        &workspace_root,
+    );
+
+    match spawn_result {
+        Ok(child) => {
+            info!(
+                "Independent session {} spawned with PID: {}",
+                session_id,
+                child.id()
+            );
+            log_workflow_event(
+                action_id,
+                "session_spawned",
+                &format!("Session {} spawned with PID {}", session_id, child.id()),
+            );
+
+            emit_ai_output(
+                app_handle,
+                &format!(
+                    "✅ Session {} started (PID: {}). Output: {:?}",
+                    session_id,
+                    child.id(),
+                    log_file
+                ),
+                "status",
+                Some(action_id),
+            );
+
+            Ok(IndependentSessionResult {
+                session_id: session_id.to_string(),
+                log_file,
+                completion_marker,
+            })
+        }
+        Err(e) => {
+            error!("Failed to spawn independent session: {}", e);
+            Err(format!("Failed to spawn independent session: {}", e))
+        }
+    }
+}
+
+/// Wait for an independent session to complete by polling the completion marker file.
+/// Returns Ok(exit_code) when session completes, or Err if timeout.
+async fn wait_for_session_completion(
+    completion_marker: &std::path::Path,
+    app_handle: &tauri::AppHandle,
+    action_id: &str,
+    timeout_secs: u64,
+    poll_interval_secs: u64,
+) -> Result<i32, String> {
+    use tokio::time::{sleep, Duration};
+
+    let start_time = std::time::Instant::now();
+    let mut last_status_update = std::time::Instant::now();
+
+    info!(
+        "Waiting for session completion (marker: {:?}, timeout: {}s)",
+        completion_marker, timeout_secs
+    );
+
+    loop {
+        // Check if completion marker exists
+        if completion_marker.exists() {
+            // Read and parse the completion marker
+            match std::fs::read_to_string(completion_marker) {
+                Ok(content) => {
+                    info!("Session completed. Marker content: {}", content);
+
+                    // Parse JSON to get exit code
+                    let exit_code =
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            json.get("exit_code")
+                                .and_then(|v| v.as_i64())
+                                .map(|v| v as i32)
+                                .unwrap_or(0)
+                        } else {
+                            0
+                        };
+
+                    emit_ai_output(
+                        app_handle,
+                        &format!("✅ Session completed (exit code: {})", exit_code),
+                        "status",
+                        Some(action_id),
+                    );
+
+                    return Ok(exit_code);
+                }
+                Err(e) => {
+                    warn!("Failed to read completion marker: {}", e);
+                    // File might be being written, wait a bit
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+            }
+        }
+
+        // Check timeout
+        let elapsed = start_time.elapsed();
+        if elapsed.as_secs() >= timeout_secs {
+            error!("Session timed out after {}s", timeout_secs);
+            emit_ai_output(
+                app_handle,
+                &format!("⏰ Session timed out after {}s", timeout_secs),
+                "status",
+                Some(action_id),
+            );
+            return Err(format!("Session timed out after {}s", timeout_secs));
+        }
+
+        // Emit periodic status updates (every 60 seconds)
+        if last_status_update.elapsed().as_secs() >= 60 {
+            let mins = elapsed.as_secs() / 60;
+            let secs = elapsed.as_secs() % 60;
+            emit_ai_output(
+                app_handle,
+                &format!("⏳ Session running... ({}m {}s elapsed)", mins, secs),
+                "status",
+                Some(action_id),
+            );
+            last_status_update = std::time::Instant::now();
+        }
+
+        // Wait before next poll
+        sleep(Duration::from_secs(poll_interval_secs)).await;
+    }
+}
+
+/// Clean up session files after completion
+fn cleanup_session_files(session_id: &str) {
+    let (_, dev_logs_path, _) = match get_workspace_paths_internal() {
+        Ok(paths) => paths,
+        Err(_) => return,
+    };
+
+    // Remove completion marker (keep log file for debugging)
+    let completion_marker = dev_logs_path.join(format!("claude-session-{}.completed", session_id));
+    let _ = std::fs::remove_file(&completion_marker);
+
+    // Optionally remove prompt file
+    let prompt_file = dev_logs_path.join(format!("workflow-session-{}-prompt.txt", session_id));
+    let _ = std::fs::remove_file(&prompt_file);
 }
 
 // ============================================================================
@@ -3669,10 +5239,17 @@ async fn start_workflow_run(
     Ok(Json(ApiResponse::success(WorkflowRunResponse { run })))
 }
 
-/// Synchronous workflow execution loop
+/// Workflow execution loop using independent sessions.
 ///
-/// Runs sessions one after another, checking the checkpoint immediately after each
-/// session completes. This provides zero-latency continuation without polling.
+/// Spawns each session as an independent process using spawn-independent-claude.py.
+/// This allows sessions to survive runner restarts, making long-running workflows
+/// more robust.
+///
+/// The loop:
+/// 1. Spawns a session independently
+/// 2. Polls for completion (checking completion marker file)
+/// 3. Reads checkpoint to determine if workflow is complete
+/// 4. If not complete, spawns next session
 async fn run_workflow_loop(
     state: Arc<ApiState>,
     workflow_id: String,
@@ -3682,11 +5259,17 @@ async fn run_workflow_loop(
     let mut session_count = 0u32;
     let mut current_prompt_content = prompt.content.clone();
 
-    info!("Starting workflow execution loop for {}", workflow_id);
+    info!(
+        "Starting workflow execution loop for {} (independent mode)",
+        workflow_id
+    );
     log_workflow_event(
         &workflow_id,
         "loop_started",
-        &format!("Workflow execution loop started for '{}'", prompt.name),
+        &format!(
+            "Workflow execution loop started for '{}' (independent mode)",
+            prompt.name
+        ),
     );
 
     // Delete any existing checkpoint file to start fresh
@@ -3706,6 +5289,15 @@ async fn run_workflow_loop(
         }
     }
 
+    // Get timeout from settings (default to 30 minutes for workflow sessions)
+    let ai_settings = settings::get_ai_settings();
+    let timeout_secs = if ai_settings.claude_cli.timeout_seconds > 0 {
+        ai_settings.claude_cli.timeout_seconds
+    } else {
+        1800 // Default 30 minutes
+    };
+    let poll_interval_secs = 5; // Check every 5 seconds
+
     loop {
         session_count += 1;
         let session_id = if session_count == 1 {
@@ -3722,27 +5314,48 @@ async fn run_workflow_loop(
             .workflow_manager
             .set_active_session(&workflow_id, Some(session_id.clone()))
             .await;
+
+        // Persist state so we can recover if runner restarts
+        if let Err(e) = state.workflow_manager.persist_state().await {
+            warn!("Failed to persist workflow state: {}", e);
+        }
+
         log_workflow_event(
             &workflow_id,
             "session_started",
             &format!(
-                "Session {} started (#{} in workflow)",
+                "Session {} started (#{} in workflow, independent mode)",
                 session_id, session_count
             ),
         );
 
-        // Get CLI settings
-        let ai_settings = settings::get_ai_settings();
-        let cli_settings = ai_settings.claude_cli;
-
-        // Execute session (blocks until complete)
-        let result = execute_claude_cli(
-            &cli_settings,
+        // Spawn session as independent process
+        let spawn_result = spawn_workflow_session_independent(
             &current_prompt_content,
+            &session_id,
             &state.app_handle,
             &action_id,
-        )
-        .await;
+        );
+
+        let session_result = match spawn_result {
+            Ok(result) => {
+                // Wait for session to complete by polling completion marker
+                let wait_result = wait_for_session_completion(
+                    &result.completion_marker,
+                    &state.app_handle,
+                    &action_id,
+                    timeout_secs,
+                    poll_interval_secs,
+                )
+                .await;
+
+                // Clean up session files
+                cleanup_session_files(&session_id);
+
+                wait_result
+            }
+            Err(e) => Err(e),
+        };
 
         // Session ended - clear active session ID
         state
@@ -3751,7 +5364,7 @@ async fn run_workflow_loop(
             .await;
 
         // Handle session result
-        if let Err(e) = result {
+        if let Err(e) = session_result {
             error!(
                 "Workflow {} session {} failed: {}",
                 workflow_id, session_id, e
@@ -3762,6 +5375,8 @@ async fn run_workflow_loop(
                 &format!("Session {} failed: {}", session_id, e),
             );
             state.workflow_manager.fail_workflow(&workflow_id, &e).await;
+            // Clear persisted state since workflow failed
+            let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
             break;
         }
 
@@ -3818,6 +5433,8 @@ async fn run_workflow_loop(
                             })
                             .await;
                     }
+                    // Clear persisted state since workflow is complete
+                    let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
                     break;
                 }
 
@@ -3874,6 +5491,8 @@ async fn run_workflow_loop(
                         .workflow_manager
                         .fail_workflow(&workflow_id, &format!("Checkpoint error: {}", e))
                         .await;
+                    // Clear persisted state since workflow failed
+                    let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
                     break;
                 }
             }
@@ -3955,6 +5574,364 @@ struct DeleteAllResponse {
     deleted_count: usize,
 }
 
+/// Resume monitoring for an active workflow session after runner restart.
+/// This is called when we detect a workflow that was in progress when the runner restarted.
+///
+/// If the checkpoint contains `restart_permitted: true`, the workflow will auto-continue.
+/// Otherwise, it requires manual intervention to restart.
+async fn resume_workflow_monitoring(
+    state: Arc<ApiState>,
+    workflow_run: workflow_monitor::WorkflowRun,
+) {
+    let workflow_id = workflow_run.id.clone();
+    let checkpoint_path = workflow_run.checkpoint_path.clone();
+
+    // Use consistent action_id for all sessions in the workflow
+    let action_id = format!("workflow-{}", &workflow_id[..8]);
+
+    info!(
+        "Resuming workflow {} after runner restart (checkpoint: {})",
+        workflow_id, checkpoint_path
+    );
+
+    // Check if restart was permitted by the agent
+    let restart_permitted = workflow_monitor::read_restart_permission(&checkpoint_path);
+    let auto_continue = restart_permitted.is_some();
+
+    if let Some(ref permission) = restart_permitted {
+        info!(
+            "Restart permission found: reason={:?}, requested_at={:?}",
+            permission.reason, permission.requested_at
+        );
+        emit_ai_output(
+            &state.app_handle,
+            &format!(
+                "✅ Restart permission found in checkpoint. Auto-continuing workflow. Reason: {}",
+                permission.reason.as_deref().unwrap_or("Not specified")
+            ),
+            "status",
+            Some(&action_id),
+        );
+
+        // Clear the permission so it's not reused on subsequent restarts
+        if let Err(e) = workflow_monitor::clear_restart_permission(&checkpoint_path) {
+            warn!("Failed to clear restart permission: {}", e);
+        }
+    } else {
+        info!("No restart permission found - will require manual restart if needed");
+    }
+
+    // Get paths for the session
+    let (_, dev_logs_path, _) = match get_workspace_paths_internal() {
+        Ok(paths) => paths,
+        Err(e) => {
+            error!("Failed to get workspace paths: {}", e);
+            return;
+        }
+    };
+
+    // Check if there was an active session that we need to wait for
+    if let Some(session_id) = &workflow_run.active_session_id {
+        let completion_marker =
+            dev_logs_path.join(format!("claude-session-{}.completed", session_id));
+
+        if !completion_marker.exists() {
+            // Session is still running - resume polling
+            emit_ai_output(
+                &state.app_handle,
+                &format!(
+                    "🔄 Resuming monitoring for session {} (runner restarted)",
+                    session_id
+                ),
+                "status",
+                Some(&action_id),
+            );
+
+            // Get timeout from settings
+            let ai_settings = settings::get_ai_settings();
+            let timeout_secs = if ai_settings.claude_cli.timeout_seconds > 0 {
+                ai_settings.claude_cli.timeout_seconds
+            } else {
+                1800 // Default 30 minutes
+            };
+            let poll_interval_secs = 5;
+
+            // Wait for session to complete
+            let wait_result = wait_for_session_completion(
+                &completion_marker,
+                &state.app_handle,
+                &action_id,
+                timeout_secs,
+                poll_interval_secs,
+            )
+            .await;
+
+            // Clear active session
+            state
+                .workflow_manager
+                .set_active_session(&workflow_id, None)
+                .await;
+
+            cleanup_session_files(session_id);
+
+            if let Err(e) = wait_result {
+                error!("Resumed session {} failed: {}", session_id, e);
+                state.workflow_manager.fail_workflow(&workflow_id, &e).await;
+                let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+                return;
+            }
+        } else {
+            info!(
+                "Session {} already completed while runner was down",
+                session_id
+            );
+            // Clear the session
+            state
+                .workflow_manager
+                .set_active_session(&workflow_id, None)
+                .await;
+            cleanup_session_files(session_id);
+        }
+    }
+
+    // Check checkpoint to see where we are
+    let phase = match workflow_monitor::read_checkpoint_phase(&checkpoint_path, "current_phase") {
+        Ok(phase) => phase,
+        Err(e) => {
+            warn!("Could not read checkpoint after restart: {}", e);
+            state
+                .workflow_manager
+                .fail_workflow(
+                    &workflow_id,
+                    &format!("Could not read checkpoint after restart: {}", e),
+                )
+                .await;
+            let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+            return;
+        }
+    };
+
+    // Check if workflow is already complete
+    if phase >= workflow_run.completion_value {
+        info!(
+            "Workflow {} completed (phase {} >= {})",
+            workflow_id, phase, workflow_run.completion_value
+        );
+        if let Some(run) = state.workflow_manager.get_run(&workflow_id).await {
+            state
+                .workflow_manager
+                .update_run({
+                    let mut r = run;
+                    r.status = workflow_monitor::WorkflowStatus::Completed;
+                    r
+                })
+                .await;
+        }
+        let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+        return;
+    }
+
+    // Workflow needs continuation
+    info!(
+        "Workflow {} needs continuation (phase {} < {})",
+        workflow_id, phase, workflow_run.completion_value
+    );
+
+    if !auto_continue {
+        // No permission - require manual restart
+        emit_ai_output(
+            &state.app_handle,
+            &format!(
+                "⚠️ Runner restarted mid-workflow. Phase {} of {}. No restart permission found - please restart the workflow manually.",
+                phase, workflow_run.completion_value
+            ),
+            "warning",
+            Some(&action_id),
+        );
+        state
+            .workflow_manager
+            .fail_workflow(&workflow_id, &format!(
+                "Runner restarted mid-workflow. Phase {} of {}. No restart_permitted in checkpoint. Please restart the workflow manually, or have the agent write restart_permitted to the checkpoint before triggering restart.",
+                phase, workflow_run.completion_value
+            ))
+            .await;
+        let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+        return;
+    }
+
+    // Auto-continue: spawn continuation sessions until complete
+    emit_ai_output(
+        &state.app_handle,
+        &format!(
+            "🔄 Auto-continuing workflow from phase {} (target: {})",
+            phase, workflow_run.completion_value
+        ),
+        "status",
+        Some(&action_id),
+    );
+
+    // Get the workflow config to get continuation_prompt
+    let configs = state.workflow_manager.configs.read().await;
+    let continuation_prompt = configs
+        .get(&workflow_run.prompt_id)
+        .map(|c| c.continuation_prompt.clone())
+        .unwrap_or_default();
+    drop(configs);
+
+    // Get timeout from settings
+    let ai_settings = settings::get_ai_settings();
+    let timeout_secs = if ai_settings.claude_cli.timeout_seconds > 0 {
+        ai_settings.claude_cli.timeout_seconds
+    } else {
+        1800 // Default 30 minutes
+    };
+    let poll_interval_secs = 5;
+
+    // Track session count (starting from where we left off)
+    let mut session_count = workflow_run.sessions_spawned;
+    let mut current_phase = phase;
+
+    // Continuation loop
+    loop {
+        session_count += 1;
+        let session_id = format!("workflow-{}-cont-{}", &workflow_id[..8], session_count);
+
+        // Build continuation prompt
+        let prompt_content = if continuation_prompt.is_empty() {
+            format!(
+                "Continue the workflow. Read checkpoint from {} and resume from phase {}. Complete the next phase(s), update checkpoint, then exit.",
+                checkpoint_path, current_phase
+            )
+        } else {
+            continuation_prompt.clone()
+        };
+
+        // Mark session as active
+        state
+            .workflow_manager
+            .set_active_session(&workflow_id, Some(session_id.clone()))
+            .await;
+
+        // Persist state
+        if let Err(e) = state.workflow_manager.persist_state().await {
+            warn!("Failed to persist workflow state: {}", e);
+        }
+
+        log_workflow_event(
+            &workflow_id,
+            "session_started",
+            &format!(
+                "Continuation session {} started (#{} in workflow, after restart)",
+                session_id, session_count
+            ),
+        );
+
+        // Spawn session
+        let spawn_result = spawn_workflow_session_independent(
+            &prompt_content,
+            &session_id,
+            &state.app_handle,
+            &action_id,
+        );
+
+        let session_result = match spawn_result {
+            Ok(result) => {
+                let wait_result = wait_for_session_completion(
+                    &result.completion_marker,
+                    &state.app_handle,
+                    &action_id,
+                    timeout_secs,
+                    poll_interval_secs,
+                )
+                .await;
+                cleanup_session_files(&session_id);
+                wait_result
+            }
+            Err(e) => Err(e),
+        };
+
+        // Clear active session
+        state
+            .workflow_manager
+            .set_active_session(&workflow_id, None)
+            .await;
+
+        // Handle session result
+        if let Err(e) = session_result {
+            error!(
+                "Workflow {} continuation session {} failed: {}",
+                workflow_id, session_id, e
+            );
+            state.workflow_manager.fail_workflow(&workflow_id, &e).await;
+            let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+            break;
+        }
+
+        // Check checkpoint
+        match workflow_monitor::read_checkpoint_phase(&checkpoint_path, "current_phase") {
+            Ok(new_phase) => {
+                current_phase = new_phase;
+                info!(
+                    "Workflow {} checkpoint: phase {} (target: {})",
+                    workflow_id, new_phase, workflow_run.completion_value
+                );
+
+                // Update workflow manager
+                if let Some(run) = state.workflow_manager.get_run(&workflow_id).await {
+                    let mut updated_run = run;
+                    updated_run.current_phase = new_phase;
+                    updated_run.previous_phase = new_phase;
+                    updated_run.sessions_spawned = session_count;
+                    state.workflow_manager.update_run(updated_run).await;
+                }
+
+                // Check if complete
+                if new_phase >= workflow_run.completion_value {
+                    info!(
+                        "Workflow {} completed after auto-continue! Reached phase {}",
+                        workflow_id, new_phase
+                    );
+                    emit_ai_output(
+                        &state.app_handle,
+                        &format!("✅ Workflow completed! Reached phase {}", new_phase),
+                        "success",
+                        Some(&action_id),
+                    );
+                    if let Some(run) = state.workflow_manager.get_run(&workflow_id).await {
+                        state
+                            .workflow_manager
+                            .update_run({
+                                let mut r = run;
+                                r.status = workflow_monitor::WorkflowStatus::Completed;
+                                r
+                            })
+                            .await;
+                    }
+                    let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+                    break;
+                }
+
+                // Continue loop for next session
+                info!(
+                    "Workflow {} phase {} < {}, spawning next continuation",
+                    workflow_id, new_phase, workflow_run.completion_value
+                );
+            }
+            Err(e) => {
+                error!("Workflow {} checkpoint read failed: {}", workflow_id, e);
+                state
+                    .workflow_manager
+                    .fail_workflow(&workflow_id, &format!("Checkpoint error: {}", e))
+                    .await;
+                let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
+                break;
+            }
+        }
+    }
+
+    info!("Workflow {} resume/continuation complete", workflow_id);
+}
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -3964,10 +5941,56 @@ pub fn create_router(
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
-        app_handle,
+        app_handle: app_handle.clone(),
         ai_analysis_running: AtomicBool::new(false),
         ai_analysis_stop_requested: AtomicBool::new(false),
         workflow_manager: WorkflowManager::new(),
+        ai_developer_manager: AiDeveloperManager::new(),
+    });
+
+    // Try to restore persisted workflow state and resume monitoring
+    let state_for_restore = api_state.clone();
+    tokio::spawn(async move {
+        // Small delay to let the server fully start
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+
+        match state_for_restore.workflow_manager.restore_state().await {
+            Ok(Some(persisted_state)) => {
+                info!(
+                    "Restored {} workflow(s) from persisted state",
+                    persisted_state.runs.len()
+                );
+
+                // Resume monitoring for any workflows that need continuation
+                // This includes workflows with active sessions OR workflows that are
+                // in running/idle state (may need auto-continuation if restart_permitted)
+                for run in persisted_state.runs {
+                    let needs_resume = run.active_session_id.is_some()
+                        || matches!(
+                            run.status,
+                            workflow_monitor::WorkflowStatus::Running
+                                | workflow_monitor::WorkflowStatus::Idle
+                                | workflow_monitor::WorkflowStatus::ReadyToContinue
+                        );
+
+                    if needs_resume {
+                        let state_clone = state_for_restore.clone();
+                        tokio::spawn(async move {
+                            resume_workflow_monitoring(state_clone, run).await;
+                        });
+                    }
+                }
+            }
+            Ok(None) => {
+                info!("No workflows to restore on startup");
+            }
+            Err(e) => {
+                warn!("Failed to restore workflow state: {}", e);
+            }
+        }
+
+        // Also restore AI Developer sessions that need resumption
+        resume_ai_developer_sessions_on_startup(state_for_restore.clone()).await;
     });
 
     // Configure CORS to allow requests from WSL
@@ -3978,6 +6001,7 @@ pub fn create_router(
 
     Router::new()
         .route("/health", get(health))
+        .route("/launch-debug-chrome", post(launch_debug_chrome))
         .route("/status", get(get_status))
         .route("/monitors", get(get_monitors))
         .route("/load-config", post(load_config))
@@ -4002,6 +6026,11 @@ pub fn create_router(
         .route("/ai-developer/state", post(read_ai_developer_state_http))
         .route("/ai-developer/stop", post(stop_ai_developer_http))
         .route("/ai-developer/list", get(list_ai_developer_sessions_http))
+        .route(
+            "/ai-developer/managed",
+            get(get_managed_ai_developer_sessions_http),
+        )
+        .route("/ai-developer/gui-lock", get(get_gui_lock_status_http))
         .route("/ai-developer/log", post(read_claude_session_log_http))
         // Prompt Library routes
         .route("/prompts", get(list_prompts))
@@ -4027,6 +6056,28 @@ pub fn create_router(
             get(get_workflow_run).delete(delete_workflow_run),
         )
         .route("/workflows/:id/stop", post(stop_workflow_run))
+        // Playwright Script Library routes
+        .route("/playwright/scripts", get(list_playwright_scripts))
+        .route("/playwright/scripts", post(create_playwright_script))
+        .route("/playwright/scripts/search", get(search_playwright_scripts))
+        .route(
+            "/playwright/scripts/categories",
+            get(get_playwright_categories),
+        )
+        .route("/playwright/scripts/tags", get(get_playwright_tags))
+        .route(
+            "/playwright/scripts/import",
+            post(import_playwright_scripts),
+        )
+        .route("/playwright/scripts/export", get(export_playwright_scripts))
+        .route("/playwright/scripts/:id", get(get_playwright_script))
+        .route("/playwright/scripts/:id", put(update_playwright_script))
+        .route("/playwright/scripts/:id", delete(delete_playwright_script))
+        .route("/playwright/scripts/:id/run", post(run_playwright_script))
+        .route(
+            "/playwright/scripts/:id/duplicate",
+            post(duplicate_playwright_script),
+        )
         .layer(cors)
         .with_state(api_state)
 }

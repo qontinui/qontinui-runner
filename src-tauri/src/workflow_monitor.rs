@@ -160,8 +160,12 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
     for field in &status_fields {
         if let Some(status) = json.get(*field).and_then(|v| v.as_str()) {
             let upper = status.to_uppercase();
-            if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED" {
-                info!("Workflow completion detected via '{}' field: {}", field, status);
+            if upper == "COMPLETE" || upper == "COMPLETED" || upper == "DONE" || upper == "FINISHED"
+            {
+                info!(
+                    "Workflow completion detected via '{}' field: {}",
+                    field, status
+                );
                 return Ok(u32::MAX); // Signal completion
             }
         }
@@ -182,7 +186,10 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
         return Ok(num as u32);
     }
 
-    Err(format!("Field '{}' not found or not a valid phase value", phase_field))
+    Err(format!(
+        "Field '{}' not found or not a valid phase value",
+        phase_field
+    ))
 }
 
 /// Get the modification time of the checkpoint file
@@ -201,6 +208,165 @@ pub fn get_checkpoint_mtime(checkpoint_path: &str) -> Option<u64> {
 }
 
 // ============================================================================
+// Restart Permission
+// ============================================================================
+
+/// Information about a restart permission in the checkpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestartPermission {
+    /// Whether restart and auto-continuation is permitted
+    pub permitted: bool,
+    /// When the permission was requested
+    pub requested_at: Option<String>,
+    /// Reason for the restart
+    pub reason: Option<String>,
+}
+
+/// Check if the checkpoint has restart_permitted set to true.
+///
+/// Agents should write this field before triggering a runner restart
+/// to allow the workflow to auto-continue after restart.
+///
+/// Checkpoint format:
+/// ```json
+/// {
+///   "current_phase": 5,
+///   "restart_permitted": {
+///     "permitted": true,
+///     "requested_at": "2025-12-22T18:15:00Z",
+///     "reason": "Applying code changes to runner"
+///   }
+/// }
+/// ```
+pub fn read_restart_permission(checkpoint_path: &str) -> Option<RestartPermission> {
+    let path = Path::new(checkpoint_path);
+    if !path.exists() {
+        return None;
+    }
+
+    let content = fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    // Check for restart_permitted field
+    let restart_permitted = json.get("restart_permitted")?;
+
+    // Handle both simple boolean and object format
+    if let Some(permitted) = restart_permitted.as_bool() {
+        if permitted {
+            return Some(RestartPermission {
+                permitted: true,
+                requested_at: None,
+                reason: None,
+            });
+        }
+        return None;
+    }
+
+    // Object format
+    if let Some(obj) = restart_permitted.as_object() {
+        let permitted = obj
+            .get("permitted")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if permitted {
+            return Some(RestartPermission {
+                permitted: true,
+                requested_at: obj
+                    .get("requested_at")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                reason: obj.get("reason").and_then(|v| v.as_str()).map(String::from),
+            });
+        }
+    }
+
+    None
+}
+
+/// Clear the restart_permitted field from a checkpoint file.
+///
+/// Call this after successfully resuming a workflow to prevent
+/// the permission from being reused on subsequent restarts.
+pub fn clear_restart_permission(checkpoint_path: &str) -> Result<(), String> {
+    let path = Path::new(checkpoint_path);
+    if !path.exists() {
+        return Ok(()); // Nothing to clear
+    }
+
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read checkpoint: {}", e))?;
+
+    let mut json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?;
+
+    // Remove the restart_permitted field if it exists
+    if let Some(obj) = json.as_object_mut() {
+        if obj.remove("restart_permitted").is_some() {
+            let updated = serde_json::to_string_pretty(&json)
+                .map_err(|e| format!("Failed to serialize checkpoint: {}", e))?;
+
+            fs::write(path, updated).map_err(|e| format!("Failed to write checkpoint: {}", e))?;
+
+            info!(
+                "Cleared restart_permitted from checkpoint: {}",
+                checkpoint_path
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Write restart permission to a checkpoint file.
+///
+/// Agents should call this before triggering a runner restart
+/// to allow the workflow to auto-continue after restart.
+pub fn write_restart_permission(checkpoint_path: &str, reason: &str) -> Result<(), String> {
+    let path = Path::new(checkpoint_path);
+
+    // Read existing checkpoint or create new one
+    let mut json: serde_json::Value = if path.exists() {
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("Failed to read checkpoint: {}", e))?;
+        serde_json::from_str(&content)
+            .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?
+    } else {
+        serde_json::json!({})
+    };
+
+    // Add restart_permitted field
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Some(obj) = json.as_object_mut() {
+        obj.insert(
+            "restart_permitted".to_string(),
+            serde_json::json!({
+                "permitted": true,
+                "requested_at": now,
+                "reason": reason
+            }),
+        );
+    }
+
+    let updated = serde_json::to_string_pretty(&json)
+        .map_err(|e| format!("Failed to serialize checkpoint: {}", e))?;
+
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create checkpoint directory: {}", e))?;
+    }
+
+    fs::write(path, updated).map_err(|e| format!("Failed to write checkpoint: {}", e))?;
+
+    info!(
+        "Wrote restart_permitted to checkpoint: {} (reason: {})",
+        checkpoint_path, reason
+    );
+    Ok(())
+}
+
+// ============================================================================
 // Workflow Manager
 // ============================================================================
 
@@ -209,7 +375,8 @@ pub struct WorkflowManager {
     /// Active workflow runs, keyed by workflow run ID
     runs: Arc<RwLock<HashMap<String, WorkflowRun>>>,
     /// Workflow config cache (prompt_id -> WorkflowConfig)
-    configs: Arc<RwLock<HashMap<String, WorkflowConfig>>>,
+    /// Public so resume_workflow_monitoring can access continuation_prompt
+    pub configs: Arc<RwLock<HashMap<String, WorkflowConfig>>>,
 }
 
 impl WorkflowManager {
@@ -322,7 +489,10 @@ impl WorkflowManager {
                     } else {
                         phase.to_string()
                     };
-                    run.log_event("phase_update", &format!("Phase {} -> {}", old_phase, phase_str));
+                    run.log_event(
+                        "phase_update",
+                        &format!("Phase {} -> {}", old_phase, phase_str),
+                    );
                     // Track if phase advanced (progress was made)
                     if phase > run.previous_phase {
                         phase_advanced = true;
@@ -403,6 +573,163 @@ impl WorkflowManager {
             run.error_message = Some(error.to_string());
             run.set_status(WorkflowStatus::Failed, error);
         }
+    }
+}
+
+/// Persisted workflow state for recovery after runner restart
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedWorkflowState {
+    /// Active workflow runs
+    pub runs: Vec<WorkflowRun>,
+    /// Workflow configs (prompt_id -> WorkflowConfig)
+    pub configs: HashMap<String, WorkflowConfig>,
+    /// Timestamp when state was persisted
+    pub persisted_at: u64,
+}
+
+impl WorkflowManager {
+    /// Get the path to the workflow state file
+    fn get_state_file_path() -> Result<std::path::PathBuf, String> {
+        let exe_path =
+            std::env::current_exe().map_err(|e| format!("Failed to get exe path: {}", e))?;
+
+        let mut current = exe_path.as_path();
+        let runner_dir = loop {
+            if let Some(parent) = current.parent() {
+                if parent.join("src-tauri").exists()
+                    || parent.file_name().is_some_and(|n| n == "qontinui-runner")
+                {
+                    break parent.to_path_buf();
+                }
+                current = parent;
+            } else {
+                let cwd =
+                    std::env::current_dir().map_err(|e| format!("Failed to get cwd: {}", e))?;
+                break cwd;
+            }
+        };
+
+        let workspace_root = runner_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| runner_dir.clone());
+
+        let dev_logs = workspace_root.join(".dev-logs");
+        fs::create_dir_all(&dev_logs).map_err(|e| format!("Failed to create .dev-logs: {}", e))?;
+
+        Ok(dev_logs.join("workflow-state.json"))
+    }
+
+    /// Persist current workflow state to disk
+    /// Call this after any significant state change
+    pub async fn persist_state(&self) -> Result<(), String> {
+        let state_file = Self::get_state_file_path()?;
+
+        let runs: Vec<WorkflowRun> = {
+            let runs_guard = self.runs.read().await;
+            runs_guard.values().cloned().collect()
+        };
+
+        let configs: HashMap<String, WorkflowConfig> = {
+            let configs_guard = self.configs.read().await;
+            configs_guard.clone()
+        };
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let state = PersistedWorkflowState {
+            runs,
+            configs,
+            persisted_at: now,
+        };
+
+        let json = serde_json::to_string_pretty(&state)
+            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+
+        fs::write(&state_file, json).map_err(|e| format!("Failed to write state file: {}", e))?;
+
+        info!("Persisted workflow state to {:?}", state_file);
+        Ok(())
+    }
+
+    /// Restore workflow state from disk (call on startup)
+    /// Returns the restored state if any active workflows were found
+    pub async fn restore_state(&self) -> Result<Option<PersistedWorkflowState>, String> {
+        let state_file = Self::get_state_file_path()?;
+
+        if !state_file.exists() {
+            info!("No persisted workflow state found");
+            return Ok(None);
+        }
+
+        let json = fs::read_to_string(&state_file)
+            .map_err(|e| format!("Failed to read state file: {}", e))?;
+
+        let state: PersistedWorkflowState = serde_json::from_str(&json)
+            .map_err(|e| format!("Failed to parse state file: {}", e))?;
+
+        // Filter to only active workflows (Running or Idle)
+        let active_runs: Vec<WorkflowRun> = state
+            .runs
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    WorkflowStatus::Running
+                        | WorkflowStatus::Idle
+                        | WorkflowStatus::ReadyToContinue
+                )
+            })
+            .cloned()
+            .collect();
+
+        if active_runs.is_empty() {
+            info!("No active workflows to restore");
+            // Clear the state file since there's nothing active
+            let _ = fs::remove_file(&state_file);
+            return Ok(None);
+        }
+
+        info!(
+            "Restoring {} active workflow(s) from state",
+            active_runs.len()
+        );
+
+        // Restore runs
+        {
+            let mut runs_guard = self.runs.write().await;
+            for run in &active_runs {
+                runs_guard.insert(run.id.clone(), run.clone());
+            }
+        }
+
+        // Restore configs
+        {
+            let mut configs_guard = self.configs.write().await;
+            for (prompt_id, config) in &state.configs {
+                configs_guard.insert(prompt_id.clone(), config.clone());
+            }
+        }
+
+        Ok(Some(PersistedWorkflowState {
+            runs: active_runs,
+            configs: state.configs,
+            persisted_at: state.persisted_at,
+        }))
+    }
+
+    /// Clear persisted state file
+    pub fn clear_persisted_state() -> Result<(), String> {
+        let state_file = Self::get_state_file_path()?;
+        if state_file.exists() {
+            fs::remove_file(&state_file)
+                .map_err(|e| format!("Failed to remove state file: {}", e))?;
+            info!("Cleared persisted workflow state");
+        }
+        Ok(())
     }
 }
 

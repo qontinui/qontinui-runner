@@ -54,3 +54,24 @@ export type {
   ExtractionSession,
   BoundingBox,
 } from "./extraction";
+
+// Playwright script types
+export type {
+  SyncStatus,
+  DisplayMode,
+  TestSpec,
+  NetworkRequest,
+  StructuredTestOutput,
+  PlaywrightResult,
+  PlaywrightScript,
+  CreatePlaywrightScriptRequest,
+  UpdatePlaywrightScriptRequest,
+  RunPlaywrightScriptRequest,
+  PlaywrightApiResponse,
+  ScriptViewMode,
+  ScriptExecutionState,
+  ScriptBuilderFormState,
+  ScriptFilterState,
+} from "./playwright";
+
+export { DEFAULT_SCRIPT_VALUES } from "./playwright";

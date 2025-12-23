@@ -30,13 +30,15 @@ import {
   ChevronUp,
   GripVertical,
   Square,
-  // FileText, // unused
+  FileText,
   Settings,
   Activity,
   Code,
   ToggleLeft,
   ToggleRight,
   MousePointer2,
+  TestTube,
+  BookOpen,
 } from "lucide-react";
 import { useExecution } from "../contexts";
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
@@ -59,12 +61,32 @@ interface WorkflowInfo {
   category?: string;
 }
 
+/** Playwright script info for the dropdown */
+interface PlaywrightScriptInfo {
+  id: string;
+  name: string;
+  target_url: string;
+  description: string;
+}
+
+/** Saved prompt info for the dropdown */
+interface SavedPromptInfo {
+  id: string;
+  name: string;
+  description: string;
+  content: string;
+  category: string;
+}
+
 /** A single step in the execution sequence */
 interface ExecutionStep {
   id: string;
-  type: "workflow" | "state";
+  type: "workflow" | "state" | "playwright" | "prompt";
   name: string;
   takeScreenshot: boolean;
+  playwrightScriptId?: string;
+  promptId?: string;
+  promptContent?: string;
 }
 
 interface PromptHistoryEntry {
@@ -540,6 +562,13 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
   // Workspace paths (fetched from backend for portability)
   const [workspacePaths, setWorkspacePaths] = useState<WorkspacePaths | null>(null);
 
+  // Playwright scripts for the dropdown
+  const [playwrightScripts, setPlaywrightScripts] = useState<PlaywrightScriptInfo[]>([]);
+
+  // Saved prompts from the prompt library
+  const [savedPrompts, setSavedPrompts] = useState<SavedPromptInfo[]>([]);
+  const [showPromptSelector, setShowPromptSelector] = useState(false);
+
   // Session state - persist to localStorage to survive tab switches
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(() => {
     try {
@@ -651,6 +680,53 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
     fetchPaths();
   }, []);
 
+  // Fetch Playwright scripts for the dropdown
+  useEffect(() => {
+    const fetchPlaywrightScripts = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/playwright/scripts");
+        const result = await response.json();
+        if (result.success && result.data) {
+          setPlaywrightScripts(
+            result.data.map((s: { id: string; name: string; target_url: string; description: string }) => ({
+              id: s.id,
+              name: s.name,
+              target_url: s.target_url,
+              description: s.description,
+            }))
+          );
+        }
+      } catch (error) {
+        console.error("Failed to fetch Playwright scripts:", error);
+      }
+    };
+    fetchPlaywrightScripts();
+  }, []);
+
+  // Fetch saved prompts from the prompt library
+  useEffect(() => {
+    const fetchSavedPrompts = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/prompts");
+        const result = await response.json();
+        if (result.success && result.data) {
+          setSavedPrompts(
+            result.data.map((p: { id: string; name: string; description: string; content: string; category: string }) => ({
+              id: p.id,
+              name: p.name,
+              description: p.description,
+              content: p.content,
+              category: p.category,
+            }))
+          );
+        }
+      } catch (error) {
+        console.error("Failed to fetch saved prompts:", error);
+      }
+    };
+    fetchSavedPrompts();
+  }, []);
+
   // Sync input capture setting with Python executor when toggle changes
   useEffect(() => {
     const syncInputCapture = async () => {
@@ -759,12 +835,21 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
   }, [currentSessionId]);
 
   // Add a step to the execution list
-  const addStep = (type: "workflow" | "state", name: string) => {
+  const addStep = (
+    type: "workflow" | "state" | "playwright" | "prompt",
+    name: string,
+    scriptId?: string,
+    promptId?: string,
+    promptContent?: string
+  ) => {
     const newStep: ExecutionStep = {
       id: crypto.randomUUID(),
       type,
       name,
-      takeScreenshot: true, // Default to taking screenshots
+      takeScreenshot: type !== "prompt", // Screenshots don't apply to prompts
+      playwrightScriptId: scriptId,
+      promptId,
+      promptContent,
     };
     setExecutionSteps((prev) => [...prev, newStep]);
     setShowAddDropdown(false);
@@ -823,8 +908,45 @@ mcp__qontinui__run_workflow with workflow_name="${step.name}", timeout_seconds=3
 After the workflow completes, take a screenshot to capture the result.`;
           }
           return instruction;
+        } else if (step.type === "playwright") {
+          let instruction = `### Step ${stepNum}: Run Playwright Test "${step.name}"
+
+Execute the Playwright test script via the runner API:
+\`\`\`powershell
+$response = Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}/run" -Method POST -ContentType "application/json" -Body '{}' | ConvertFrom-Json
+$response | ConvertTo-Json -Depth 10
+\`\`\`
+
+Analyze the structured output:
+- Check \`success\` field for overall result
+- Check \`data.passed\` for test pass status
+- Check \`data.tests_passed\` and \`data.tests_failed\` counts
+- If tests fail, examine \`data.error\` and \`data.structured_output\` for details
+- Screenshots are saved to \`data.screenshots\` paths
+
+If tests fail, determine if the issue is:
+- **Application bug** → fix application code
+- **Test selector outdated** → update test script via PUT /playwright/scripts/:id
+- **Timing issue** → add waits/retries to test script`;
+          if (step.takeScreenshot) {
+            instruction += `
+
+After the test completes, take an additional screenshot to capture the current application state.`;
+          }
+          return instruction;
+        } else if (step.type === "prompt") {
+          // Prompt steps inject additional context/instructions into the AI prompt
+          const instruction = `### Step ${stepNum}: Follow Prompt Instructions "${step.name}"
+
+**Instructions from Prompt Library:**
+
+${step.promptContent || "(No content)"}
+
+---
+*Execute the instructions above before proceeding to the next step.*`;
+          return instruction;
         } else {
-          let instruction = `### Step ${stepNum}: Navigate to State "${step.name}"
+          const instruction = `### Step ${stepNum}: Navigate to State "${step.name}"
 
 Navigate to the state using the MCP tool:
 \`\`\`
@@ -1112,9 +1234,13 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
   const getHistorySummary = (entry: PromptHistoryEntry): string => {
     const workflowCount = entry.steps.filter((s) => s.type === "workflow").length;
     const stateCount = entry.steps.filter((s) => s.type === "state").length;
+    const playwrightCount = entry.steps.filter((s) => s.type === "playwright").length;
+    const promptCount = entry.steps.filter((s) => s.type === "prompt").length;
     const parts: string[] = [];
     if (workflowCount > 0) parts.push(`${workflowCount} workflow${workflowCount > 1 ? "s" : ""}`);
     if (stateCount > 0) parts.push(`${stateCount} state${stateCount > 1 ? "s" : ""}`);
+    if (playwrightCount > 0) parts.push(`${playwrightCount} test${playwrightCount > 1 ? "s" : ""}`);
+    if (promptCount > 0) parts.push(`${promptCount} prompt${promptCount > 1 ? "s" : ""}`);
     return parts.join(" • ") || "No steps";
   };
 
@@ -1219,6 +1345,56 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                           ))}
                         </>
                       )}
+
+                      {/* Playwright Scripts section */}
+                      {playwrightScripts.length > 0 && (
+                        <>
+                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                            <TestTube className="w-3 h-3" />
+                            Playwright Tests
+                          </div>
+                          {playwrightScripts.map((script) => (
+                            <button
+                              key={script.id}
+                              onClick={() => addStep("playwright", script.name, script.id)}
+                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                            >
+                              <TestTube className="w-4 h-4 text-green-500" />
+                              <span>{script.name}</span>
+                              {script.target_url && (
+                                <span className="text-xs text-muted-foreground ml-auto truncate max-w-20">
+                                  {script.target_url}
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        </>
+                      )}
+
+                      {/* Prompts section */}
+                      {savedPrompts.length > 0 && (
+                        <>
+                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                            <FileText className="w-3 h-3" />
+                            Prompts
+                          </div>
+                          {savedPrompts.map((prompt) => (
+                            <button
+                              key={prompt.id}
+                              onClick={() => addStep("prompt", prompt.name, undefined, prompt.id, prompt.content)}
+                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                            >
+                              <FileText className="w-4 h-4 text-amber-500" />
+                              <span className="truncate">{prompt.name}</span>
+                              {prompt.category && (
+                                <span className="text-xs text-muted-foreground ml-auto">
+                                  {prompt.category}
+                                </span>
+                              )}
+                            </button>
+                          ))}
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -1239,7 +1415,11 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       className={`flex items-center gap-2 p-2 rounded-md border ${
                         step.type === "workflow"
                           ? "bg-purple-500/5 border-purple-500/20"
-                          : "bg-primary/5 border-primary/20"
+                          : step.type === "playwright"
+                            ? "bg-green-500/5 border-green-500/20"
+                            : step.type === "prompt"
+                              ? "bg-amber-500/5 border-amber-500/20"
+                              : "bg-primary/5 border-primary/20"
                       }`}
                     >
                       {/* Step number */}
@@ -1250,6 +1430,10 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       {/* Icon */}
                       {step.type === "workflow" ? (
                         <Workflow className="w-4 h-4 text-purple-500 flex-shrink-0" />
+                      ) : step.type === "playwright" ? (
+                        <TestTube className="w-4 h-4 text-green-500 flex-shrink-0" />
+                      ) : step.type === "prompt" ? (
+                        <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
                       ) : (
                         <Target className="w-4 h-4 text-primary flex-shrink-0" />
                       )}
@@ -1257,18 +1441,20 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       {/* Name */}
                       <span className="flex-1 text-sm truncate">{step.name}</span>
 
-                      {/* Screenshot toggle */}
-                      <button
-                        onClick={() => toggleStepScreenshot(step.id)}
-                        className={`p-1 rounded transition-colors ${
-                          step.takeScreenshot
-                            ? "text-green-500 hover:text-green-400"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                        title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
-                      >
-                        <Camera className="w-4 h-4" />
-                      </button>
+                      {/* Screenshot toggle (not applicable to prompts) */}
+                      {step.type !== "prompt" && (
+                        <button
+                          onClick={() => toggleStepScreenshot(step.id)}
+                          className={`p-1 rounded transition-colors ${
+                            step.takeScreenshot
+                              ? "text-green-500 hover:text-green-400"
+                              : "text-muted-foreground hover:text-foreground"
+                          }`}
+                          title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
+                        >
+                          <Camera className="w-4 h-4" />
+                        </button>
+                      )}
 
                       {/* Move up */}
                       <button
@@ -1313,9 +1499,61 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
             {/* Goal */}
             <div className="card p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-accent" />
-                <span className="font-medium">Goal</span>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-accent" />
+                  <span className="font-medium">Goal</span>
+                </div>
+
+                {/* Load from Library dropdown */}
+                {savedPrompts.length > 0 && (
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowPromptSelector(!showPromptSelector)}
+                      className="flex items-center gap-1 px-2 py-1 text-xs bg-amber-500/10 text-amber-600 rounded hover:bg-amber-500/20 transition-colors"
+                    >
+                      <BookOpen className="w-3 h-3" />
+                      Load from Library
+                      <ChevronDown
+                        className={`w-3 h-3 transition-transform ${showPromptSelector ? "rotate-180" : ""}`}
+                      />
+                    </button>
+
+                    {showPromptSelector && (
+                      <div className="absolute right-0 z-20 w-72 mt-1 bg-card border border-border rounded-md shadow-lg max-h-64 overflow-y-auto">
+                        <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                          <FileText className="w-3 h-3" />
+                          Select a Prompt
+                        </div>
+                        {savedPrompts.map((prompt) => (
+                          <button
+                            key={prompt.id}
+                            onClick={() => {
+                              setGoal(prompt.content);
+                              setShowPromptSelector(false);
+                            }}
+                            className="w-full flex flex-col gap-1 px-3 py-2 text-left hover:bg-muted/30 transition-colors border-b border-border/50 last:border-0"
+                          >
+                            <div className="flex items-center gap-2">
+                              <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                              <span className="text-sm font-medium truncate">{prompt.name}</span>
+                              {prompt.category && (
+                                <span className="text-xs text-muted-foreground ml-auto">
+                                  {prompt.category}
+                                </span>
+                              )}
+                            </div>
+                            {prompt.description && (
+                              <p className="text-xs text-muted-foreground truncate pl-6">
+                                {prompt.description}
+                              </p>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <textarea

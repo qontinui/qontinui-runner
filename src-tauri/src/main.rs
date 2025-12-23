@@ -10,8 +10,10 @@ mod error;
 mod executor;
 mod logging;
 mod mcp_api;
+mod playwright;
 mod prompts;
 mod rag;
+mod secure_storage;
 mod settings;
 mod storage;
 mod video_recorder;
@@ -182,6 +184,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::storage::delete_old_sessions,
             commands::storage::clear_all_storage,
             commands::storage::get_storage_paths,
+            commands::storage::read_image_as_base64,
             // Web extraction commands
             commands::extraction::start_web_extraction,
             commands::extraction::stop_web_extraction,

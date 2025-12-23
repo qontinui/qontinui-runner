@@ -20,6 +20,7 @@ import {
   Package,
   Sparkles,
   BookOpen,
+  TestTube,
 } from "lucide-react";
 
 // Contexts
@@ -56,6 +57,7 @@ import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
 import { AiBuilderTab } from "./components/AiBuilderTab";
 import { PromptLibraryTab } from "./components/PromptLibraryTab";
+import { ScriptBuilderTab } from "./components/ScriptBuilderTab";
 
 // Styles
 import "./index.css";
@@ -68,6 +70,7 @@ type MainTab =
   | "dataset"
   | "ai-builder"
   | "prompts"
+  | "scripts"
   | "settings";
 type LogSubTab = "general" | "image" | "actions" | "ai" | "issues" | "rag" | "external";
 
@@ -96,6 +99,7 @@ function AppContent() {
         "dataset",
         "ai-builder",
         "prompts",
+        "scripts",
         "settings",
       ].includes(stored)
     ) {
@@ -337,6 +341,7 @@ function AppContent() {
     { id: "dataset" as const, label: "Dataset", icon: Package },
     { id: "ai-builder" as const, label: "AI Builder", icon: Sparkles },
     { id: "prompts" as const, label: "Prompts", icon: BookOpen },
+    { id: "scripts" as const, label: "Scripts", icon: TestTube },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
   ];
 
@@ -518,6 +523,15 @@ function AppContent() {
             className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
           >
             <PromptLibraryTab onLog={addLog} />
+          </Tabs.Content>
+
+          {/* Scripts Tab - forceMount keeps component alive during AI generation */}
+          <Tabs.Content
+            value="scripts"
+            forceMount
+            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
+            <ScriptBuilderTab onLog={addLog} />
           </Tabs.Content>
 
           {/* Settings Tab */}

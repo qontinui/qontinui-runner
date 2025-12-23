@@ -5,8 +5,11 @@
 //! - Querying storage usage statistics
 //! - Managing storage cleanup (deleting old sessions)
 //! - Getting storage configuration paths
+//! - Reading image files as base64 data URLs
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json;
+use std::fs;
 use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};
@@ -239,4 +242,49 @@ pub fn get_storage_paths(state: State<Arc<AppState>>) -> Result<CommandResponse,
             "auto_cleanup": config.auto_cleanup,
         })),
     })
+}
+
+/// Read an image file and return it as a base64 data URL.
+///
+/// This is used by the frontend to display local image files (like Playwright screenshots)
+/// that can't be accessed directly due to security restrictions.
+///
+/// # Arguments
+/// * `path` - Absolute path to the image file
+///
+/// # Returns
+/// * `Ok(String)` - Base64 data URL (e.g., "data:image/png;base64,...")
+/// * `Err(String)` - Error if file cannot be read
+#[tauri::command]
+pub fn read_image_as_base64(path: String) -> Result<String, String> {
+    info!("Reading image as base64: {}", path);
+
+    // Read the file
+    let data = fs::read(&path).map_err(|e| {
+        error!("Failed to read image file {}: {}", path, e);
+        format!("Failed to read file: {}", e)
+    })?;
+
+    // Determine MIME type from extension
+    let mime_type = if path.to_lowercase().ends_with(".png") {
+        "image/png"
+    } else if path.to_lowercase().ends_with(".jpg") || path.to_lowercase().ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.to_lowercase().ends_with(".gif") {
+        "image/gif"
+    } else if path.to_lowercase().ends_with(".webp") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    };
+
+    // Encode to base64 and return as data URL
+    let base64_data = STANDARD.encode(&data);
+    info!(
+        "Successfully encoded image: {} bytes -> {} base64 chars",
+        data.len(),
+        base64_data.len()
+    );
+
+    Ok(format!("data:{};base64,{}", mime_type, base64_data))
 }
