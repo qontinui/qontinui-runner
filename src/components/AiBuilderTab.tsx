@@ -688,12 +688,14 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
         const result = await response.json();
         if (result.success && result.data) {
           setPlaywrightScripts(
-            result.data.map((s: { id: string; name: string; target_url: string; description: string }) => ({
-              id: s.id,
-              name: s.name,
-              target_url: s.target_url,
-              description: s.description,
-            }))
+            result.data.map(
+              (s: { id: string; name: string; target_url: string; description: string }) => ({
+                id: s.id,
+                name: s.name,
+                target_url: s.target_url,
+                description: s.description,
+              }),
+            ),
           );
         }
       } catch (error) {
@@ -711,13 +713,21 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
         const result = await response.json();
         if (result.success && result.data) {
           setSavedPrompts(
-            result.data.map((p: { id: string; name: string; description: string; content: string; category: string }) => ({
-              id: p.id,
-              name: p.name,
-              description: p.description,
-              content: p.content,
-              category: p.category,
-            }))
+            result.data.map(
+              (p: {
+                id: string;
+                name: string;
+                description: string;
+                content: string;
+                category: string;
+              }) => ({
+                id: p.id,
+                name: p.name,
+                description: p.description,
+                content: p.content,
+                category: p.category,
+              }),
+            ),
           );
         }
       } catch (error) {
@@ -840,7 +850,7 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
     name: string,
     scriptId?: string,
     promptId?: string,
-    promptContent?: string
+    promptContent?: string,
   ) => {
     const newStep: ExecutionStep = {
       id: crypto.randomUUID(),
@@ -1244,8 +1254,6 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     return parts.join(" • ") || "No steps";
   };
 
-  const hasConfig = execution.configLoaded && (states.length > 0 || workflows.length > 0);
-
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
@@ -1261,737 +1269,726 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
         </div>
       </div>
 
-      {!hasConfig ? (
-        <div className="card p-8 text-center space-y-4">
-          <Info className="w-12 h-12 mx-auto text-muted-foreground" />
-          <div>
-            <h3 className="font-medium">No Configuration Loaded</h3>
-            <p className="text-sm text-muted-foreground mt-1">
-              Load a workflow configuration in the Run tab to use the AI Builder.
-            </p>
-          </div>
-        </div>
-      ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Left Panel - Configuration */}
-          <div className="space-y-4">
-            {/* Execution Steps */}
-            <div className="card p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Play className="w-4 h-4 text-primary" />
-                  <span className="font-medium">Execution Steps</span>
-                  <span className="text-xs text-muted-foreground">
-                    ({executionSteps.length} step{executionSteps.length !== 1 ? "s" : ""})
-                  </span>
-                </div>
-
-                {/* Add Step Dropdown */}
-                <div className="relative">
-                  <button
-                    onClick={() => setShowAddDropdown(!showAddDropdown)}
-                    className="flex items-center gap-1 px-2 py-1 text-sm bg-primary/10 text-primary rounded hover:bg-primary/20 transition-colors"
-                  >
-                    <Plus className="w-4 h-4" />
-                    Add Step
-                    <ChevronDown
-                      className={`w-3 h-3 transition-transform ${showAddDropdown ? "rotate-180" : ""}`}
-                    />
-                  </button>
-
-                  {showAddDropdown && (
-                    <div className="absolute right-0 z-20 w-64 mt-1 bg-card border border-border rounded-md shadow-lg max-h-80 overflow-y-auto">
-                      {/* Workflows section */}
-                      {workflows.length > 0 && (
-                        <>
-                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-                            <Workflow className="w-3 h-3" />
-                            Workflows
-                          </div>
-                          {workflows.map((workflow) => (
-                            <button
-                              key={workflow.id}
-                              onClick={() => addStep("workflow", workflow.name)}
-                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-                            >
-                              <Workflow className="w-4 h-4 text-purple-500" />
-                              <span>{workflow.name}</span>
-                            </button>
-                          ))}
-                        </>
-                      )}
-
-                      {/* States section */}
-                      {states.length > 0 && (
-                        <>
-                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-                            <Target className="w-3 h-3" />
-                            States
-                          </div>
-                          {states.map((state) => (
-                            <button
-                              key={state.name}
-                              onClick={() => addStep("state", state.name)}
-                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-                            >
-                              <Target className="w-4 h-4 text-primary" />
-                              <span>{state.name}</span>
-                              {state.images.length > 0 && (
-                                <span className="text-xs text-muted-foreground ml-auto">
-                                  {state.images.length} img
-                                </span>
-                              )}
-                            </button>
-                          ))}
-                        </>
-                      )}
-
-                      {/* Playwright Scripts section */}
-                      {playwrightScripts.length > 0 && (
-                        <>
-                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-                            <TestTube className="w-3 h-3" />
-                            Playwright Tests
-                          </div>
-                          {playwrightScripts.map((script) => (
-                            <button
-                              key={script.id}
-                              onClick={() => addStep("playwright", script.name, script.id)}
-                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-                            >
-                              <TestTube className="w-4 h-4 text-green-500" />
-                              <span>{script.name}</span>
-                              {script.target_url && (
-                                <span className="text-xs text-muted-foreground ml-auto truncate max-w-20">
-                                  {script.target_url}
-                                </span>
-                              )}
-                            </button>
-                          ))}
-                        </>
-                      )}
-
-                      {/* Prompts section */}
-                      {savedPrompts.length > 0 && (
-                        <>
-                          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-                            <FileText className="w-3 h-3" />
-                            Prompts
-                          </div>
-                          {savedPrompts.map((prompt) => (
-                            <button
-                              key={prompt.id}
-                              onClick={() => addStep("prompt", prompt.name, undefined, prompt.id, prompt.content)}
-                              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-                            >
-                              <FileText className="w-4 h-4 text-amber-500" />
-                              <span className="truncate">{prompt.name}</span>
-                              {prompt.category && (
-                                <span className="text-xs text-muted-foreground ml-auto">
-                                  {prompt.category}
-                                </span>
-                              )}
-                            </button>
-                          ))}
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
+      {/* AI Builder always shows the UI - works without a config (Playwright tests and prompts are independent) */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        {/* Left Panel - Configuration */}
+        <div className="space-y-4">
+          {/* Execution Steps */}
+          <div className="card p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Play className="w-4 h-4 text-primary" />
+                <span className="font-medium">Execution Steps</span>
+                <span className="text-xs text-muted-foreground">
+                  ({executionSteps.length} step{executionSteps.length !== 1 ? "s" : ""})
+                </span>
               </div>
 
-              {/* Steps List */}
-              {executionSteps.length === 0 ? (
-                <div className="text-center py-8 text-muted-foreground">
-                  <GripVertical className="w-8 h-8 mx-auto mb-2 opacity-30" />
-                  <p className="text-sm">No steps added yet</p>
-                  <p className="text-xs mt-1">Click "Add Step" to build your execution sequence</p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  {executionSteps.map((step, index) => (
-                    <div
-                      key={step.id}
-                      className={`flex items-center gap-2 p-2 rounded-md border ${
-                        step.type === "workflow"
-                          ? "bg-purple-500/5 border-purple-500/20"
-                          : step.type === "playwright"
-                            ? "bg-green-500/5 border-green-500/20"
-                            : step.type === "prompt"
-                              ? "bg-amber-500/5 border-amber-500/20"
-                              : "bg-primary/5 border-primary/20"
-                      }`}
-                    >
-                      {/* Step number */}
-                      <span className="w-6 h-6 flex items-center justify-center text-xs font-medium rounded bg-background">
-                        {index + 1}
-                      </span>
+              {/* Add Step Dropdown */}
+              <div className="relative">
+                <button
+                  onClick={() => setShowAddDropdown(!showAddDropdown)}
+                  className="flex items-center gap-1 px-2 py-1 text-sm bg-primary/10 text-primary rounded hover:bg-primary/20 transition-colors"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Step
+                  <ChevronDown
+                    className={`w-3 h-3 transition-transform ${showAddDropdown ? "rotate-180" : ""}`}
+                  />
+                </button>
 
-                      {/* Icon */}
-                      {step.type === "workflow" ? (
-                        <Workflow className="w-4 h-4 text-purple-500 flex-shrink-0" />
-                      ) : step.type === "playwright" ? (
-                        <TestTube className="w-4 h-4 text-green-500 flex-shrink-0" />
-                      ) : step.type === "prompt" ? (
-                        <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
-                      ) : (
-                        <Target className="w-4 h-4 text-primary flex-shrink-0" />
-                      )}
+                {showAddDropdown && (
+                  <div className="absolute right-0 z-20 w-64 mt-1 bg-card border border-border rounded-md shadow-lg max-h-80 overflow-y-auto">
+                    {/* Workflows section */}
+                    {workflows.length > 0 && (
+                      <>
+                        <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                          <Workflow className="w-3 h-3" />
+                          Workflows
+                        </div>
+                        {workflows.map((workflow) => (
+                          <button
+                            key={workflow.id}
+                            onClick={() => addStep("workflow", workflow.name)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                          >
+                            <Workflow className="w-4 h-4 text-purple-500" />
+                            <span>{workflow.name}</span>
+                          </button>
+                        ))}
+                      </>
+                    )}
 
-                      {/* Name */}
-                      <span className="flex-1 text-sm truncate">{step.name}</span>
+                    {/* States section */}
+                    {states.length > 0 && (
+                      <>
+                        <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                          <Target className="w-3 h-3" />
+                          States
+                        </div>
+                        {states.map((state) => (
+                          <button
+                            key={state.name}
+                            onClick={() => addStep("state", state.name)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                          >
+                            <Target className="w-4 h-4 text-primary" />
+                            <span>{state.name}</span>
+                            {state.images.length > 0 && (
+                              <span className="text-xs text-muted-foreground ml-auto">
+                                {state.images.length} img
+                              </span>
+                            )}
+                          </button>
+                        ))}
+                      </>
+                    )}
 
-                      {/* Screenshot toggle (not applicable to prompts) */}
-                      {step.type !== "prompt" && (
-                        <button
-                          onClick={() => toggleStepScreenshot(step.id)}
-                          className={`p-1 rounded transition-colors ${
-                            step.takeScreenshot
-                              ? "text-green-500 hover:text-green-400"
-                              : "text-muted-foreground hover:text-foreground"
-                          }`}
-                          title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
-                        >
-                          <Camera className="w-4 h-4" />
-                        </button>
-                      )}
+                    {/* Playwright Scripts section */}
+                    {playwrightScripts.length > 0 && (
+                      <>
+                        <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                          <TestTube className="w-3 h-3" />
+                          Playwright Tests
+                        </div>
+                        {playwrightScripts.map((script) => (
+                          <button
+                            key={script.id}
+                            onClick={() => addStep("playwright", script.name, script.id)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                          >
+                            <TestTube className="w-4 h-4 text-green-500" />
+                            <span>{script.name}</span>
+                            {script.target_url && (
+                              <span className="text-xs text-muted-foreground ml-auto truncate max-w-20">
+                                {script.target_url}
+                              </span>
+                            )}
+                          </button>
+                        ))}
+                      </>
+                    )}
 
-                      {/* Move up */}
-                      <button
-                        onClick={() => moveStepUp(index)}
-                        disabled={index === 0}
-                        className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                        title="Move up"
-                      >
-                        <ChevronUp className="w-4 h-4" />
-                      </button>
-
-                      {/* Move down */}
-                      <button
-                        onClick={() => moveStepDown(index)}
-                        disabled={index === executionSteps.length - 1}
-                        className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-                        title="Move down"
-                      >
-                        <ChevronDown className="w-4 h-4" />
-                      </button>
-
-                      {/* Remove */}
-                      <button
-                        onClick={() => removeStep(step.id)}
-                        className="p-1 text-muted-foreground hover:text-red-500 transition-colors"
-                        title="Remove step"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {executionSteps.length > 0 && (
-                <p className="text-xs text-muted-foreground">
-                  <Camera className="w-3 h-3 inline mr-1" />
-                  Click the camera icon to toggle screenshots for each step
-                </p>
-              )}
-            </div>
-
-            {/* Goal */}
-            <div className="card p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Sparkles className="w-4 h-4 text-accent" />
-                  <span className="font-medium">Goal</span>
-                </div>
-
-                {/* Load from Library dropdown */}
-                {savedPrompts.length > 0 && (
-                  <div className="relative">
-                    <button
-                      onClick={() => setShowPromptSelector(!showPromptSelector)}
-                      className="flex items-center gap-1 px-2 py-1 text-xs bg-amber-500/10 text-amber-600 rounded hover:bg-amber-500/20 transition-colors"
-                    >
-                      <BookOpen className="w-3 h-3" />
-                      Load from Library
-                      <ChevronDown
-                        className={`w-3 h-3 transition-transform ${showPromptSelector ? "rotate-180" : ""}`}
-                      />
-                    </button>
-
-                    {showPromptSelector && (
-                      <div className="absolute right-0 z-20 w-72 mt-1 bg-card border border-border rounded-md shadow-lg max-h-64 overflow-y-auto">
+                    {/* Prompts section */}
+                    {savedPrompts.length > 0 && (
+                      <>
                         <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
                           <FileText className="w-3 h-3" />
-                          Select a Prompt
+                          Prompts
                         </div>
                         {savedPrompts.map((prompt) => (
                           <button
                             key={prompt.id}
-                            onClick={() => {
-                              setGoal(prompt.content);
-                              setShowPromptSelector(false);
-                            }}
-                            className="w-full flex flex-col gap-1 px-3 py-2 text-left hover:bg-muted/30 transition-colors border-b border-border/50 last:border-0"
+                            onClick={() =>
+                              addStep("prompt", prompt.name, undefined, prompt.id, prompt.content)
+                            }
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
                           >
-                            <div className="flex items-center gap-2">
-                              <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
-                              <span className="text-sm font-medium truncate">{prompt.name}</span>
-                              {prompt.category && (
-                                <span className="text-xs text-muted-foreground ml-auto">
-                                  {prompt.category}
-                                </span>
-                              )}
-                            </div>
-                            {prompt.description && (
-                              <p className="text-xs text-muted-foreground truncate pl-6">
-                                {prompt.description}
-                              </p>
+                            <FileText className="w-4 h-4 text-amber-500" />
+                            <span className="truncate">{prompt.name}</span>
+                            {prompt.category && (
+                              <span className="text-xs text-muted-foreground ml-auto">
+                                {prompt.category}
+                              </span>
                             )}
                           </button>
                         ))}
-                      </div>
+                      </>
                     )}
-                  </div>
-                )}
-              </div>
-
-              <textarea
-                value={goal}
-                onChange={(e) => setGoal(e.target.value)}
-                placeholder="Describe what you want to verify or achieve..."
-                className="w-full h-24 px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary"
-              />
-            </div>
-
-            {/* Settings */}
-            <div className="card p-4 space-y-3">
-              <div className="flex items-center gap-2">
-                <Settings className="w-4 h-4 text-muted-foreground" />
-                <span className="font-medium">Settings</span>
-              </div>
-
-              {/* Project Logs Status */}
-              <div className="text-xs space-y-1">
-                {projectLogs.config?.logSources &&
-                projectLogs.config.logSources.filter((s) => s.enabled).length > 0 ? (
-                  <>
-                    <div className="flex items-center gap-2 text-green-600">
-                      <CheckCircle className="w-3 h-3" />
-                      <span>
-                        {projectLogs.config.logSources.filter((s) => s.enabled).length} log
-                        source(s) will be monitored
-                      </span>
-                    </div>
-                    <div className="text-muted-foreground pl-5">
-                      {projectLogs.config.logSources
-                        .filter((s) => s.enabled)
-                        .map((s) => s.name)
-                        .join(", ")}
-                    </div>
-                  </>
-                ) : (
-                  <div className="flex items-center gap-2 text-yellow-600">
-                    <Info className="w-3 h-3" />
-                    <span>No log sources configured. Configure in Logs → Project Logs.</span>
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Advanced Settings - Collapsible */}
-            <CollapsiblePanel
-              title="Advanced"
-              icon={<Code className="w-4 h-4" />}
-              defaultCollapsed={!persistentSession}
-              storageKey="ai-builder-advanced"
-            >
-              <div className="space-y-3">
-                {/* Persistent Session Toggle */}
-                <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
-                  <div className="flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-orange-500" />
-                    <div>
-                      <span className="text-sm font-medium">Persistent Session Mode</span>
-                      <p className="text-xs text-muted-foreground">
-                        {persistentSession
-                          ? "Multi-iteration loop with fresh AI sessions per iteration"
-                          : "Single iteration - AI runs once, output in AI Output tab"}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setPersistentSession(!persistentSession)}
-                    className={`flex items-center transition-colors ${persistentSession ? "text-orange-500" : "text-muted-foreground"}`}
-                    title={persistentSession ? "Persistent Session enabled" : "Inline Session"}
-                  >
-                    {persistentSession ? (
-                      <ToggleRight className="w-8 h-8" />
-                    ) : (
-                      <ToggleLeft className="w-8 h-8" />
-                    )}
-                  </button>
-                </div>
-
-                {/* When Persistent Session is enabled, show additional options */}
-                {persistentSession && (
-                  <div className="space-y-3 pl-2 border-l-2 border-orange-500/30">
-                    <div className="space-y-1">
-                      <p className="text-xs font-medium text-foreground">How it works:</p>
-                      <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
-                        <li>Each iteration spawns a <strong>new AI session</strong> (fresh context)</li>
-                        <li>AI runs automation → analyzes logs/screenshots → fixes issues</li>
-                        <li>If issues found: spawns next iteration automatically</li>
-                        <li>Loop continues until all checks pass or max iterations reached</li>
-                        <li>Sessions survive runner restarts (independent process)</li>
-                      </ul>
-                    </div>
-                    <div className="flex items-center gap-4 flex-wrap">
-                      <label className="flex items-center gap-2 text-sm">
-                        <span className="text-muted-foreground">Max Iterations:</span>
-                        <input
-                          type="number"
-                          min={1}
-                          max={50}
-                          value={maxIterations}
-                          onChange={(e) =>
-                            setMaxIterations(
-                              Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
-                            )
-                          }
-                          className="w-16 px-2 py-1 bg-background border border-border rounded text-sm"
-                        />
-                      </label>
-                    </div>
-                  </div>
-                )}
-
-                {/* When Persistent Session is disabled, show explanation */}
-                {!persistentSession && (
-                  <div className="space-y-1 pl-2 border-l-2 border-muted-foreground/30">
-                    <p className="text-xs font-medium text-foreground">How it works:</p>
-                    <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
-                      <li>Single AI session runs one iteration</li>
-                      <li>AI analyzes automation results and suggests/applies fixes</li>
-                      <li>If fixes applied, AI will instruct you to re-run manually</li>
-                      <li>Output appears in the "AI Output" tab</li>
-                    </ul>
-                  </div>
-                )}
-
-                {/* Input Capture for Coordinate Validation Toggle */}
-                <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
-                  <div className="flex items-center gap-2">
-                    <MousePointer2 className="w-4 h-4 text-purple-500" />
-                    <div>
-                      <span className="text-sm font-medium">Capture Input for Validation</span>
-                      <p className="text-xs text-muted-foreground">
-                        {captureInputValidation
-                          ? "Records actual mouse/keyboard to compare with reported positions"
-                          : "Disabled - only reported positions are logged"}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => setCaptureInputValidation(!captureInputValidation)}
-                    className={`flex items-center transition-colors ${captureInputValidation ? "text-purple-500" : "text-muted-foreground"}`}
-                    title={
-                      captureInputValidation ? "Input capture enabled" : "Input capture disabled"
-                    }
-                  >
-                    {captureInputValidation ? (
-                      <ToggleRight className="w-8 h-8" />
-                    ) : (
-                      <ToggleLeft className="w-8 h-8" />
-                    )}
-                  </button>
-                </div>
-
-                {/* When Input Capture is enabled, show explanation */}
-                {captureInputValidation && (
-                  <div className="space-y-2 pl-2 border-l-2 border-purple-500/30">
-                    <p className="text-xs text-muted-foreground">
-                      <strong>For Qontinui development:</strong> Captures actual mouse clicks during
-                      automation to detect coordinate calculation bugs (when reported click position
-                      differs from actual).
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      Captured input will be logged to{" "}
-                      <code className="bg-muted px-1 rounded">.dev-logs/input_events/</code>
-                    </p>
-                  </div>
-                )}
+            {/* Steps List */}
+            {executionSteps.length === 0 ? (
+              <div className="text-center py-8 text-muted-foreground">
+                <GripVertical className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                <p className="text-sm">No steps added yet</p>
+                <p className="text-xs mt-1">Click "Add Step" to build your execution sequence</p>
               </div>
-            </CollapsiblePanel>
-
-            {/* Actions */}
-            <div className="flex gap-3">
-              {isRunning && persistentSession ? (
-                // Persistent Session: Stop button for spawn sessions
-                <button
-                  onClick={stopSession}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
-                >
-                  <Square className="w-4 h-4" />
-                  Stop Session
-                </button>
-              ) : isRunning && !persistentSession ? (
-                // Standard Mode: Running indicator (uses AI Output tab)
-                <button
-                  disabled
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary/50 text-primary-foreground rounded-md font-medium cursor-not-allowed"
-                >
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Analysis Running...
-                </button>
-              ) : persistentSession &&
-                sessionState &&
-                (sessionState.status === "complete" || sessionState.status === "stopped") ? (
-                // Persistent Session: New session button
-                <button
-                  onClick={() => {
-                    setCurrentSessionId(null);
-                    setSessionState(null);
-                    setClaudeLog("");
-                    setClaudeLogInfo(null);
-                    setLastResult(null);
-                  }}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 transition-colors"
-                >
-                  <RefreshCw className="w-4 h-4" />
-                  New Session
-                </button>
-              ) : (
-                // Start button - different labels for each mode
-                <button
-                  onClick={runAutomation}
-                  disabled={isRunning}
-                  className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${
-                    persistentSession
-                      ? "bg-orange-500 text-white hover:bg-orange-600"
-                      : "bg-primary text-primary-foreground hover:bg-primary/90"
-                  }`}
-                >
-                  <Play className="w-4 h-4" />
-                  {persistentSession ? "Start Persistent Session" : "Start AI Analysis"}
-                </button>
-              )}
-
-              <button
-                onClick={copyPrompt}
-                className="flex items-center gap-2 px-4 py-3 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
-                title="Copy prompt to clipboard"
-              >
-                <Copy className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Session Status - Persistent Session only */}
-            {persistentSession && sessionState && (
-              <div className="card p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-primary" />
-                    <span className="font-medium">Session Status</span>
-                  </div>
-                  <span
-                    className={`text-xs px-2 py-1 rounded ${
-                      sessionState.status === "running"
-                        ? "bg-green-500/20 text-green-500"
-                        : sessionState.status === "complete"
-                          ? "bg-blue-500/20 text-blue-500"
-                          : sessionState.status === "stopped"
-                            ? "bg-gray-500/20 text-gray-500"
-                            : "bg-yellow-500/20 text-yellow-500"
+            ) : (
+              <div className="space-y-2">
+                {executionSteps.map((step, index) => (
+                  <div
+                    key={step.id}
+                    className={`flex items-center gap-2 p-2 rounded-md border ${
+                      step.type === "workflow"
+                        ? "bg-purple-500/5 border-purple-500/20"
+                        : step.type === "playwright"
+                          ? "bg-green-500/5 border-green-500/20"
+                          : step.type === "prompt"
+                            ? "bg-amber-500/5 border-amber-500/20"
+                            : "bg-primary/5 border-primary/20"
                     }`}
                   >
-                    {sessionState.status}
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-2 gap-2 text-sm">
-                  <div>
-                    <span className="text-muted-foreground">Iteration:</span>{" "}
-                    <span className="font-medium">
-                      {sessionState.iteration}/{sessionState.max_iterations}
+                    {/* Step number */}
+                    <span className="w-6 h-6 flex items-center justify-center text-xs font-medium rounded bg-background">
+                      {index + 1}
                     </span>
-                  </div>
-                  <div>
-                    <span className="text-muted-foreground">Errors Fixed:</span>{" "}
-                    <span className="font-medium text-green-500">
-                      {sessionState.errors_fixed.length}
-                    </span>
-                  </div>
-                </div>
 
-                {sessionState.current_action && (
-                  <div className="text-xs text-muted-foreground truncate">
-                    {sessionState.current_action}
-                  </div>
-                )}
+                    {/* Icon */}
+                    {step.type === "workflow" ? (
+                      <Workflow className="w-4 h-4 text-purple-500 flex-shrink-0" />
+                    ) : step.type === "playwright" ? (
+                      <TestTube className="w-4 h-4 text-green-500 flex-shrink-0" />
+                    ) : step.type === "prompt" ? (
+                      <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                    ) : (
+                      <Target className="w-4 h-4 text-primary flex-shrink-0" />
+                    )}
 
-                {sessionState.errors_fixed.length > 0 && (
-                  <div className="space-y-1 max-h-24 overflow-y-auto">
-                    <span className="text-xs text-muted-foreground">Recent fixes:</span>
-                    {sessionState.errors_fixed.slice(-3).map((fix, i) => (
-                      <div
-                        key={i}
-                        className="text-xs bg-green-500/10 text-green-600 p-1 rounded truncate"
+                    {/* Name */}
+                    <span className="flex-1 text-sm truncate">{step.name}</span>
+
+                    {/* Screenshot toggle (not applicable to prompts) */}
+                    {step.type !== "prompt" && (
+                      <button
+                        onClick={() => toggleStepScreenshot(step.id)}
+                        className={`p-1 rounded transition-colors ${
+                          step.takeScreenshot
+                            ? "text-green-500 hover:text-green-400"
+                            : "text-muted-foreground hover:text-foreground"
+                        }`}
+                        title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
                       >
-                        {fix.file}: {fix.description}
-                      </div>
-                    ))}
+                        <Camera className="w-4 h-4" />
+                      </button>
+                    )}
+
+                    {/* Move up */}
+                    <button
+                      onClick={() => moveStepUp(index)}
+                      disabled={index === 0}
+                      className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      title="Move up"
+                    >
+                      <ChevronUp className="w-4 h-4" />
+                    </button>
+
+                    {/* Move down */}
+                    <button
+                      onClick={() => moveStepDown(index)}
+                      disabled={index === executionSteps.length - 1}
+                      className="p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                      title="Move down"
+                    >
+                      <ChevronDown className="w-4 h-4" />
+                    </button>
+
+                    {/* Remove */}
+                    <button
+                      onClick={() => removeStep(step.id)}
+                      className="p-1 text-muted-foreground hover:text-red-500 transition-colors"
+                      title="Remove step"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
                   </div>
-                )}
+                ))}
               </div>
             )}
 
-            {/* Result message */}
-            {lastResult && (
-              <div
-                className={`flex items-center gap-2 p-3 rounded-md ${
-                  lastResult.success
-                    ? "bg-green-500/10 text-green-500"
-                    : "bg-red-500/10 text-red-500"
-                }`}
-              >
-                {lastResult.success ? (
-                  <CheckCircle className="w-4 h-4" />
-                ) : (
-                  <XCircle className="w-4 h-4" />
-                )}
-                <span className="text-sm">{lastResult.message}</span>
-              </div>
+            {executionSteps.length > 0 && (
+              <p className="text-xs text-muted-foreground">
+                <Camera className="w-3 h-3 inline mr-1" />
+                Click the camera icon to toggle screenshots for each step
+              </p>
             )}
           </div>
 
-          {/* Right Panel - Preview & History */}
-          <div className="space-y-4">
-            {/* Standard Mode: Direct user to AI Output tab */}
-            {!persistentSession && isRunning && (
-              <div className="card p-4 space-y-3 border-primary/50">
-                <div className="flex items-center gap-2">
-                  <Loader2 className="w-4 h-4 text-primary animate-spin" />
-                  <span className="font-medium">Analysis in Progress</span>
-                </div>
-                <p className="text-sm text-muted-foreground">
-                  View live output in the <strong>Logs → AI Output</strong> tab.
-                </p>
-                <p className="text-xs text-muted-foreground">
-                  The AI is executing your automation steps and analyzing results.
-                </p>
+          {/* Goal */}
+          <div className="card p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-accent" />
+                <span className="font-medium">Goal</span>
               </div>
+
+              {/* Load from Library dropdown */}
+              {savedPrompts.length > 0 && (
+                <div className="relative">
+                  <button
+                    onClick={() => setShowPromptSelector(!showPromptSelector)}
+                    className="flex items-center gap-1 px-2 py-1 text-xs bg-amber-500/10 text-amber-600 rounded hover:bg-amber-500/20 transition-colors"
+                  >
+                    <BookOpen className="w-3 h-3" />
+                    Load from Library
+                    <ChevronDown
+                      className={`w-3 h-3 transition-transform ${showPromptSelector ? "rotate-180" : ""}`}
+                    />
+                  </button>
+
+                  {showPromptSelector && (
+                    <div className="absolute right-0 z-20 w-72 mt-1 bg-card border border-border rounded-md shadow-lg max-h-64 overflow-y-auto">
+                      <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                        <FileText className="w-3 h-3" />
+                        Select a Prompt
+                      </div>
+                      {savedPrompts.map((prompt) => (
+                        <button
+                          key={prompt.id}
+                          onClick={() => {
+                            setGoal(prompt.content);
+                            setShowPromptSelector(false);
+                          }}
+                          className="w-full flex flex-col gap-1 px-3 py-2 text-left hover:bg-muted/30 transition-colors border-b border-border/50 last:border-0"
+                        >
+                          <div className="flex items-center gap-2">
+                            <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                            <span className="text-sm font-medium truncate">{prompt.name}</span>
+                            {prompt.category && (
+                              <span className="text-xs text-muted-foreground ml-auto">
+                                {prompt.category}
+                              </span>
+                            )}
+                          </div>
+                          {prompt.description && (
+                            <p className="text-xs text-muted-foreground truncate pl-6">
+                              {prompt.description}
+                            </p>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <textarea
+              value={goal}
+              onChange={(e) => setGoal(e.target.value)}
+              placeholder="Describe what you want to verify or achieve..."
+              className="w-full h-24 px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary"
+            />
+          </div>
+
+          {/* Settings */}
+          <div className="card p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <Settings className="w-4 h-4 text-muted-foreground" />
+              <span className="font-medium">Settings</span>
+            </div>
+
+            {/* Project Logs Status */}
+            <div className="text-xs space-y-1">
+              {projectLogs.config?.logSources &&
+              projectLogs.config.logSources.filter((s) => s.enabled).length > 0 ? (
+                <>
+                  <div className="flex items-center gap-2 text-green-600">
+                    <CheckCircle className="w-3 h-3" />
+                    <span>
+                      {projectLogs.config.logSources.filter((s) => s.enabled).length} log source(s)
+                      will be monitored
+                    </span>
+                  </div>
+                  <div className="text-muted-foreground pl-5">
+                    {projectLogs.config.logSources
+                      .filter((s) => s.enabled)
+                      .map((s) => s.name)
+                      .join(", ")}
+                  </div>
+                </>
+              ) : (
+                <div className="flex items-center gap-2 text-yellow-600">
+                  <Info className="w-3 h-3" />
+                  <span>No log sources configured. Configure in Logs → Project Logs.</span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Advanced Settings - Collapsible */}
+          <CollapsiblePanel
+            title="Advanced"
+            icon={<Code className="w-4 h-4" />}
+            defaultCollapsed={!persistentSession}
+            storageKey="ai-builder-advanced"
+          >
+            <div className="space-y-3">
+              {/* Persistent Session Toggle */}
+              <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-orange-500" />
+                  <div>
+                    <span className="text-sm font-medium">Persistent Session Mode</span>
+                    <p className="text-xs text-muted-foreground">
+                      {persistentSession
+                        ? "Multi-iteration loop with fresh AI sessions per iteration"
+                        : "Single iteration - AI runs once, output in AI Output tab"}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setPersistentSession(!persistentSession)}
+                  className={`flex items-center transition-colors ${persistentSession ? "text-orange-500" : "text-muted-foreground"}`}
+                  title={persistentSession ? "Persistent Session enabled" : "Inline Session"}
+                >
+                  {persistentSession ? (
+                    <ToggleRight className="w-8 h-8" />
+                  ) : (
+                    <ToggleLeft className="w-8 h-8" />
+                  )}
+                </button>
+              </div>
+
+              {/* When Persistent Session is enabled, show additional options */}
+              {persistentSession && (
+                <div className="space-y-3 pl-2 border-l-2 border-orange-500/30">
+                  <div className="space-y-1">
+                    <p className="text-xs font-medium text-foreground">How it works:</p>
+                    <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
+                      <li>
+                        Each iteration spawns a <strong>new AI session</strong> (fresh context)
+                      </li>
+                      <li>AI runs automation → analyzes logs/screenshots → fixes issues</li>
+                      <li>If issues found: spawns next iteration automatically</li>
+                      <li>Loop continues until all checks pass or max iterations reached</li>
+                      <li>Sessions survive runner restarts (independent process)</li>
+                    </ul>
+                  </div>
+                  <div className="flex items-center gap-4 flex-wrap">
+                    <label className="flex items-center gap-2 text-sm">
+                      <span className="text-muted-foreground">Max Iterations:</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={50}
+                        value={maxIterations}
+                        onChange={(e) =>
+                          setMaxIterations(
+                            Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
+                          )
+                        }
+                        className="w-16 px-2 py-1 bg-background border border-border rounded text-sm"
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {/* When Persistent Session is disabled, show explanation */}
+              {!persistentSession && (
+                <div className="space-y-1 pl-2 border-l-2 border-muted-foreground/30">
+                  <p className="text-xs font-medium text-foreground">How it works:</p>
+                  <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
+                    <li>Single AI session runs one iteration</li>
+                    <li>AI analyzes automation results and suggests/applies fixes</li>
+                    <li>If fixes applied, AI will instruct you to re-run manually</li>
+                    <li>Output appears in the "AI Output" tab</li>
+                  </ul>
+                </div>
+              )}
+
+              {/* Input Capture for Coordinate Validation Toggle */}
+              <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
+                <div className="flex items-center gap-2">
+                  <MousePointer2 className="w-4 h-4 text-purple-500" />
+                  <div>
+                    <span className="text-sm font-medium">Capture Input for Validation</span>
+                    <p className="text-xs text-muted-foreground">
+                      {captureInputValidation
+                        ? "Records actual mouse/keyboard to compare with reported positions"
+                        : "Disabled - only reported positions are logged"}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setCaptureInputValidation(!captureInputValidation)}
+                  className={`flex items-center transition-colors ${captureInputValidation ? "text-purple-500" : "text-muted-foreground"}`}
+                  title={
+                    captureInputValidation ? "Input capture enabled" : "Input capture disabled"
+                  }
+                >
+                  {captureInputValidation ? (
+                    <ToggleRight className="w-8 h-8" />
+                  ) : (
+                    <ToggleLeft className="w-8 h-8" />
+                  )}
+                </button>
+              </div>
+
+              {/* When Input Capture is enabled, show explanation */}
+              {captureInputValidation && (
+                <div className="space-y-2 pl-2 border-l-2 border-purple-500/30">
+                  <p className="text-xs text-muted-foreground">
+                    <strong>For Qontinui development:</strong> Captures actual mouse clicks during
+                    automation to detect coordinate calculation bugs (when reported click position
+                    differs from actual).
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Captured input will be logged to{" "}
+                    <code className="bg-muted px-1 rounded">.dev-logs/input_events/</code>
+                  </p>
+                </div>
+              )}
+            </div>
+          </CollapsiblePanel>
+
+          {/* Actions */}
+          <div className="flex gap-3">
+            {isRunning && persistentSession ? (
+              // Persistent Session: Stop button for spawn sessions
+              <button
+                onClick={stopSession}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
+              >
+                <Square className="w-4 h-4" />
+                Stop Session
+              </button>
+            ) : isRunning && !persistentSession ? (
+              // Standard Mode: Running indicator (uses AI Output tab)
+              <button
+                disabled
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary/50 text-primary-foreground rounded-md font-medium cursor-not-allowed"
+              >
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Analysis Running...
+              </button>
+            ) : persistentSession &&
+              sessionState &&
+              (sessionState.status === "complete" || sessionState.status === "stopped") ? (
+              // Persistent Session: New session button
+              <button
+                onClick={() => {
+                  setCurrentSessionId(null);
+                  setSessionState(null);
+                  setClaudeLog("");
+                  setClaudeLogInfo(null);
+                  setLastResult(null);
+                }}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 transition-colors"
+              >
+                <RefreshCw className="w-4 h-4" />
+                New Session
+              </button>
+            ) : (
+              // Start button - different labels for each mode
+              <button
+                onClick={runAutomation}
+                disabled={isRunning}
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${
+                  persistentSession
+                    ? "bg-orange-500 text-white hover:bg-orange-600"
+                    : "bg-primary text-primary-foreground hover:bg-primary/90"
+                }`}
+              >
+                <Play className="w-4 h-4" />
+                {persistentSession ? "Start Persistent Session" : "Start AI Analysis"}
+              </button>
             )}
 
-            {/* Claude Output - Persistent Session only (shown when spawn session is active) */}
-            {persistentSession && currentSessionId && (
-              <div className="card p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <Activity className="w-4 h-4 text-primary animate-pulse" />
-                    <span className="font-medium">Claude Output</span>
-                    {isRunning && (
-                      <span className="text-xs bg-green-500/20 text-green-500 px-2 py-0.5 rounded-full flex items-center gap-1">
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                        Running
-                      </span>
-                    )}
-                  </div>
-                  {claudeLogInfo && (
-                    <span className="text-xs text-muted-foreground">
-                      {claudeLogInfo.totalLines} lines
+            <button
+              onClick={copyPrompt}
+              className="flex items-center gap-2 px-4 py-3 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
+              title="Copy prompt to clipboard"
+            >
+              <Copy className="w-4 h-4" />
+            </button>
+          </div>
+
+          {/* Session Status - Persistent Session only */}
+          {persistentSession && sessionState && (
+            <div className="card p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-primary" />
+                  <span className="font-medium">Session Status</span>
+                </div>
+                <span
+                  className={`text-xs px-2 py-1 rounded ${
+                    sessionState.status === "running"
+                      ? "bg-green-500/20 text-green-500"
+                      : sessionState.status === "complete"
+                        ? "bg-blue-500/20 text-blue-500"
+                        : sessionState.status === "stopped"
+                          ? "bg-gray-500/20 text-gray-500"
+                          : "bg-yellow-500/20 text-yellow-500"
+                  }`}
+                >
+                  {sessionState.status}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                <div>
+                  <span className="text-muted-foreground">Iteration:</span>{" "}
+                  <span className="font-medium">
+                    {sessionState.iteration}/{sessionState.max_iterations}
+                  </span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Errors Fixed:</span>{" "}
+                  <span className="font-medium text-green-500">
+                    {sessionState.errors_fixed.length}
+                  </span>
+                </div>
+              </div>
+
+              {sessionState.current_action && (
+                <div className="text-xs text-muted-foreground truncate">
+                  {sessionState.current_action}
+                </div>
+              )}
+
+              {sessionState.errors_fixed.length > 0 && (
+                <div className="space-y-1 max-h-24 overflow-y-auto">
+                  <span className="text-xs text-muted-foreground">Recent fixes:</span>
+                  {sessionState.errors_fixed.slice(-3).map((fix, i) => (
+                    <div
+                      key={i}
+                      className="text-xs bg-green-500/10 text-green-600 p-1 rounded truncate"
+                    >
+                      {fix.file}: {fix.description}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Result message */}
+          {lastResult && (
+            <div
+              className={`flex items-center gap-2 p-3 rounded-md ${
+                lastResult.success ? "bg-green-500/10 text-green-500" : "bg-red-500/10 text-red-500"
+              }`}
+            >
+              {lastResult.success ? (
+                <CheckCircle className="w-4 h-4" />
+              ) : (
+                <XCircle className="w-4 h-4" />
+              )}
+              <span className="text-sm">{lastResult.message}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Right Panel - Preview & History */}
+        <div className="space-y-4">
+          {/* Standard Mode: Direct user to AI Output tab */}
+          {!persistentSession && isRunning && (
+            <div className="card p-4 space-y-3 border-primary/50">
+              <div className="flex items-center gap-2">
+                <Loader2 className="w-4 h-4 text-primary animate-spin" />
+                <span className="font-medium">Analysis in Progress</span>
+              </div>
+              <p className="text-sm text-muted-foreground">
+                View live output in the <strong>Logs → AI Output</strong> tab.
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The AI is executing your automation steps and analyzing results.
+              </p>
+            </div>
+          )}
+
+          {/* Claude Output - Persistent Session only (shown when spawn session is active) */}
+          {persistentSession && currentSessionId && (
+            <div className="card p-4 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-primary animate-pulse" />
+                  <span className="font-medium">Claude Output</span>
+                  {isRunning && (
+                    <span className="text-xs bg-green-500/20 text-green-500 px-2 py-0.5 rounded-full flex items-center gap-1">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      Running
                     </span>
                   )}
                 </div>
-
-                {claudeLog ? (
-                  <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-80 whitespace-pre-wrap font-mono">
-                    {claudeLog}
-                  </pre>
-                ) : (
-                  <div className="text-center py-6 text-muted-foreground">
-                    <Loader2 className="w-6 h-6 mx-auto mb-2 animate-spin" />
-                    <p className="text-sm">Waiting for Claude output...</p>
-                    <p className="text-xs mt-1">Claude is initializing in the background</p>
-                  </div>
+                {claudeLogInfo && (
+                  <span className="text-xs text-muted-foreground">
+                    {claudeLogInfo.totalLines} lines
+                  </span>
                 )}
               </div>
-            )}
 
-            {/* Prompt Preview */}
-            <CollapsiblePanel
-              title="Prompt Preview"
-              icon={<Sparkles className="w-4 h-4" />}
-              defaultCollapsed={currentSessionId !== null}
-              storageKey="ai-builder-preview"
-            >
-              <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-64 whitespace-pre-wrap">
-                {generatePrompt("preview-session")}
-              </pre>
-            </CollapsiblePanel>
-
-            {/* History */}
-            <CollapsiblePanel
-              title="Recent Runs"
-              icon={<History className="w-4 h-4" />}
-              defaultCollapsed={true}
-              storageKey="ai-builder-history"
-            >
-              {history.length === 0 ? (
-                <p className="text-sm text-muted-foreground p-3">No previous runs</p>
+              {claudeLog ? (
+                <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-80 whitespace-pre-wrap font-mono">
+                  {claudeLog}
+                </pre>
               ) : (
-                <div className="space-y-2 max-h-64 overflow-y-auto">
-                  {history.slice(0, 10).map((entry) => (
-                    <button
-                      key={entry.id}
-                      onClick={() => loadFromHistory(entry)}
-                      className="w-full text-left p-3 bg-background rounded-md hover:bg-muted/30 transition-colors"
-                    >
-                      <div className="flex items-center gap-2">
-                        {entry.success === true && (
-                          <CheckCircle className="w-4 h-4 text-green-500" />
-                        )}
-                        {entry.success === false && <XCircle className="w-4 h-4 text-red-500" />}
-                        {entry.success === undefined && (
-                          <RefreshCw className="w-4 h-4 text-muted-foreground" />
-                        )}
-                        <span className="text-sm font-medium truncate">{entry.goal}</span>
-                      </div>
-                      <div className="text-xs text-muted-foreground mt-1">
-                        {getHistorySummary(entry)}
-                        {" • "}
-                        {new Date(entry.timestamp).toLocaleString()}
-                      </div>
-                    </button>
-                  ))}
+                <div className="text-center py-6 text-muted-foreground">
+                  <Loader2 className="w-6 h-6 mx-auto mb-2 animate-spin" />
+                  <p className="text-sm">Waiting for Claude output...</p>
+                  <p className="text-xs mt-1">Claude is initializing in the background</p>
                 </div>
               )}
-            </CollapsiblePanel>
+            </div>
+          )}
 
-            {/* Available Images */}
-            {images.length > 0 && (
-              <CollapsiblePanel
-                title={`Available Images (${images.length})`}
-                icon={<ImageIcon className="w-4 h-4" />}
-                defaultCollapsed={true}
-                storageKey="ai-builder-images"
-              >
-                <div className="space-y-1 max-h-48 overflow-y-auto">
-                  {images.map((img) => (
-                    <div
-                      key={`${img.stateName}-${img.name}`}
-                      className="flex items-center justify-between text-sm p-2 bg-background rounded"
-                    >
-                      <span>{img.name}</span>
-                      <span className="text-xs text-muted-foreground">{img.stateName}</span>
+          {/* Prompt Preview */}
+          <CollapsiblePanel
+            title="Prompt Preview"
+            icon={<Sparkles className="w-4 h-4" />}
+            defaultCollapsed={currentSessionId !== null}
+            storageKey="ai-builder-preview"
+          >
+            <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-64 whitespace-pre-wrap">
+              {generatePrompt("preview-session")}
+            </pre>
+          </CollapsiblePanel>
+
+          {/* History */}
+          <CollapsiblePanel
+            title="Recent Runs"
+            icon={<History className="w-4 h-4" />}
+            defaultCollapsed={true}
+            storageKey="ai-builder-history"
+          >
+            {history.length === 0 ? (
+              <p className="text-sm text-muted-foreground p-3">No previous runs</p>
+            ) : (
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {history.slice(0, 10).map((entry) => (
+                  <button
+                    key={entry.id}
+                    onClick={() => loadFromHistory(entry)}
+                    className="w-full text-left p-3 bg-background rounded-md hover:bg-muted/30 transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      {entry.success === true && <CheckCircle className="w-4 h-4 text-green-500" />}
+                      {entry.success === false && <XCircle className="w-4 h-4 text-red-500" />}
+                      {entry.success === undefined && (
+                        <RefreshCw className="w-4 h-4 text-muted-foreground" />
+                      )}
+                      <span className="text-sm font-medium truncate">{entry.goal}</span>
                     </div>
-                  ))}
-                </div>
-              </CollapsiblePanel>
+                    <div className="text-xs text-muted-foreground mt-1">
+                      {getHistorySummary(entry)}
+                      {" • "}
+                      {new Date(entry.timestamp).toLocaleString()}
+                    </div>
+                  </button>
+                ))}
+              </div>
             )}
-          </div>
+          </CollapsiblePanel>
+
+          {/* Available Images */}
+          {images.length > 0 && (
+            <CollapsiblePanel
+              title={`Available Images (${images.length})`}
+              icon={<ImageIcon className="w-4 h-4" />}
+              defaultCollapsed={true}
+              storageKey="ai-builder-images"
+            >
+              <div className="space-y-1 max-h-48 overflow-y-auto">
+                {images.map((img) => (
+                  <div
+                    key={`${img.stateName}-${img.name}`}
+                    className="flex items-center justify-between text-sm p-2 bg-background rounded"
+                  >
+                    <span>{img.name}</span>
+                    <span className="text-xs text-muted-foreground">{img.stateName}</span>
+                  </div>
+                ))}
+              </div>
+            </CollapsiblePanel>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }
