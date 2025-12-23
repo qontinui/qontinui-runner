@@ -1215,6 +1215,7 @@ mod tests {
         let script = PlaywrightScript::with_details(
             "E2E Test".to_string(),
             "Tests the login flow".to_string(),
+            Some("Test the login flow end-to-end".to_string()),
             "http://localhost:3000".to_string(),
             "test content".to_string(),
             "E2E".to_string(),
