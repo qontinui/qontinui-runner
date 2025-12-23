@@ -9,6 +9,7 @@ import { useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { windowManager } from "../managers";
 import { Workflow } from "./useConfiguration";
+import type { CommandResponse } from "../types/displayProfile";
 
 interface UseExecutionControlOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -68,7 +69,7 @@ export function useExecutionControl(
         if (onConfigurationPanelCollapse) onConfigurationPanelCollapse(true);
         if (onExecutionPanelCollapse) onExecutionPanelCollapse(true);
 
-        const invokeParams: any = {
+        const invokeParams = {
           processId: selectedWorkflow,
           monitorIndices: selectedMonitors,
         };
@@ -96,7 +97,7 @@ export function useExecutionControl(
         }
 
         console.log("Invoking start_execution with params:", invokeParams);
-        const result: any = await invoke("start_execution", invokeParams);
+        const result = await invoke<CommandResponse>("start_execution", invokeParams);
         if (result.success) {
           setExecutionActive(true);
           const workflowInfo = ` (Workflow: ${workflowName})`;
@@ -130,7 +131,7 @@ export function useExecutionControl(
   const stopExecution = useCallback(async () => {
     try {
       console.log("[EXECUTION_CONTROL] Stop execution called");
-      const result: any = await invoke("stop_execution");
+      const result = await invoke<CommandResponse>("stop_execution");
       if (result.success) {
         setExecutionActive(false);
         onLog?.("info", "Execution stopped");

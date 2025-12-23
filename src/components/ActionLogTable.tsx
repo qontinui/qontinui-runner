@@ -41,7 +41,7 @@ interface ActionLogTableProps {
 /**
  * Safely extract a string value from a potentially nested object
  */
-function safeStringify(value: any): string {
+function safeStringify(value: unknown): string {
   if (value === null || value === undefined) {
     return "";
   }
@@ -53,15 +53,15 @@ function safeStringify(value: any): string {
   }
   if (typeof value === "object") {
     // If it's an object with an imageId property, extract that
-    if (value.imageId) {
+    if ("imageId" in value) {
       return safeStringify(value.imageId);
     }
     // If it's an object with a name property, extract that
-    if (value.name) {
+    if ("name" in value) {
       return safeStringify(value.name);
     }
     // If it's an object with an id property, extract that
-    if (value.id) {
+    if ("id" in value) {
       return safeStringify(value.id);
     }
     // Otherwise, return JSON representation
@@ -74,7 +74,7 @@ function safeStringify(value: any): string {
  * Extract the target description from an action
  */
 function formatTarget(action: ActionLogEntry): string {
-  const config = (action.metadata?.config || {}) as Record<string, any>;
+  const config = (action.metadata?.config || {}) as Record<string, unknown>;
 
   switch (action.action_type) {
     case "Outgoing Transition":
@@ -100,52 +100,78 @@ function formatTarget(action: ActionLogEntry): string {
         }
       }
       // Handle single image (includes backward compat string from enrichment)
-      if (config.imageName) {
+      if ("imageName" in config) {
         return safeStringify(config.imageName);
-      } else if (config.target?.imageName) {
+      } else if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "imageName" in config.target
+      ) {
         return safeStringify(config.target.imageName);
-      } else if (config.target?.imageId) {
+      } else if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "imageId" in config.target
+      ) {
         return safeStringify(config.target.imageId);
-      } else if (config.imageId) {
+      } else if ("imageId" in config) {
         return safeStringify(config.imageId);
-      } else if (config.target?.imageIds && Array.isArray(config.target.imageIds)) {
+      } else if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "imageIds" in config.target &&
+        Array.isArray(config.target.imageIds)
+      ) {
         // Fallback to IDs if names not available
-        const ids = config.target.imageIds;
+        const ids = config.target.imageIds as unknown[];
         if (ids.length === 1) {
           return safeStringify(ids[0]);
         } else {
           return `${ids.length} images`;
         }
-      } else if (config.imageIds && Array.isArray(config.imageIds)) {
+      } else if ("imageIds" in config && Array.isArray(config.imageIds)) {
         // Fallback to IDs if names not available
-        const ids = config.imageIds;
+        const ids = config.imageIds as unknown[];
         if (ids.length === 1) {
           return safeStringify(ids[0]);
         } else {
           return `${ids.length} images`;
         }
-      } else if (config.image) {
+      } else if ("image" in config) {
         return safeStringify(config.image);
       }
       return "-";
 
     case "TYPE": {
       // Show the actual text that was typed (from runtime) or configured text
-      const runtime = action.metadata?.runtime as Record<string, any> | undefined;
+      const runtime = action.metadata?.runtime as Record<string, unknown> | undefined;
 
       // First check runtime for the actual typed text
-      if (runtime?.typed_text) {
+      if (runtime && "typed_text" in runtime) {
         return `"${safeStringify(runtime.typed_text)}"`;
       }
 
       // Fall back to config values
-      if (config.text) {
+      if ("text" in config) {
         return `"${safeStringify(config.text)}"`;
-      } else if (config.textToType) {
+      } else if ("textToType" in config) {
         return `"${safeStringify(config.textToType)}"`;
-      } else if (config.textSource?.text) {
+      } else if (
+        "textSource" in config &&
+        config.textSource &&
+        typeof config.textSource === "object" &&
+        "text" in config.textSource
+      ) {
         return `"${safeStringify(config.textSource.text)}"`;
-      } else if (config.textSource?.stateId) {
+      } else if (
+        "textSource" in config &&
+        config.textSource &&
+        typeof config.textSource === "object" &&
+        "stateId" in config.textSource
+      ) {
         // Text from state reference - show the state name as fallback
         return `text from ${safeStringify(config.textSource.stateId)}`;
       }
@@ -153,13 +179,32 @@ function formatTarget(action: ActionLogEntry): string {
     }
 
     case "CLICK":
-      if (config.target?.type === "lastFindResult") {
+      if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "type" in config.target &&
+        config.target.type === "lastFindResult"
+      ) {
         return "last find result";
-      } else if (config.target?.type === "currentPosition") {
+      } else if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "type" in config.target &&
+        config.target.type === "currentPosition"
+      ) {
         return "current position";
-      } else if (config.target?.type === "image" && config.target.imageId) {
+      } else if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "type" in config.target &&
+        config.target.type === "image" &&
+        "imageId" in config.target
+      ) {
         return safeStringify(config.target.imageId);
-      } else if (config.x !== undefined && config.y !== undefined) {
+      } else if ("x" in config && "y" in config) {
         return `(${config.x}, ${config.y})`;
       }
       return "-";
@@ -175,7 +220,7 @@ function formatTarget(action: ActionLogEntry): string {
 
     case "RUN_WORKFLOW": {
       // Try to get workflow name from runtime data, fall back to ID
-      const workflowRuntime = action.metadata?.runtime as Record<string, any> | undefined;
+      const workflowRuntime = action.metadata?.runtime as Record<string, unknown> | undefined;
       if (workflowRuntime?.workflow_name) {
         return safeStringify(workflowRuntime.workflow_name);
       } else if (config.workflowName) {
@@ -189,27 +234,45 @@ function formatTarget(action: ActionLogEntry): string {
     }
 
     case "WAIT":
-      if (config.duration !== undefined) {
+      if ("duration" in config && typeof config.duration === "number") {
         const seconds = config.duration / 1000;
         return `${seconds}s`;
       }
       return "-";
 
     case "MOUSE_MOVE":
-      if (config.target?.type === "lastFindResult") {
+      if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "type" in config.target &&
+        config.target.type === "lastFindResult"
+      ) {
         return "to last find result";
-      } else if (config.target?.type === "image" && config.target.imageId) {
+      } else if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "type" in config.target &&
+        config.target.type === "image" &&
+        "imageId" in config.target
+      ) {
         return `to ${safeStringify(config.target.imageId)}`;
       }
       return "-";
 
     default:
       // Generic handling
-      if (config.target?.imageId) {
+      if (
+        "target" in config &&
+        config.target &&
+        typeof config.target === "object" &&
+        "imageId" in config.target
+      ) {
         return safeStringify(config.target.imageId);
-      } else if (config.imageId) {
+      } else if ("imageId" in config) {
         return safeStringify(config.imageId);
-      } else if (config.target) {
+      } else if ("target" in config) {
         return safeStringify(config.target);
       }
       return "-";
@@ -220,7 +283,7 @@ function formatTarget(action: ActionLogEntry): string {
  * Format the execution result based on action type and runtime data
  */
 function formatResult(action: ActionLogEntry): React.ReactNode {
-  const config = (action.metadata?.config || {}) as Record<string, any>;
+  const config = (action.metadata?.config || {}) as Record<string, unknown>;
 
   // Check status first
   if (action.status === "failed") {
@@ -237,24 +300,43 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
     switch (action.action_type) {
       case "FIND": {
         // Check for match result in metadata
-        const matchResult = action.metadata?.matchResult as any;
+        const matchResult = action.metadata?.matchResult;
         if (matchResult) {
           if (Array.isArray(matchResult)) {
             // Multiple matches
             const best = matchResult[0];
-            return (
-              <span className="text-green-500">
-                <span className="mr-1">✓</span>
-                found {matchResult.length} matches, best: {(best.confidence * 100).toFixed(1)}%
-              </span>
-            );
-          } else if (matchResult.x !== undefined) {
+            if (best && typeof best === "object" && "confidence" in best) {
+              const typedBest = best as { confidence: number };
+              return (
+                <span className="text-green-500">
+                  <span className="mr-1">✓</span>
+                  found {matchResult.length} matches, best:{" "}
+                  {(typedBest.confidence * 100).toFixed(1)}%
+                </span>
+              );
+            }
+          } else if (
+            typeof matchResult === "object" &&
+            matchResult !== null &&
+            "x" in matchResult &&
+            "y" in matchResult &&
+            "w" in matchResult &&
+            "h" in matchResult &&
+            "confidence" in matchResult
+          ) {
             // Single match
+            const typedMatch = matchResult as {
+              x: number;
+              y: number;
+              w: number;
+              h: number;
+              confidence: number;
+            };
             return (
               <span className="text-green-500">
                 <span className="mr-1">✓</span>
-                found [{matchResult.x},{matchResult.y},{matchResult.w},{matchResult.h}]{" "}
-                {(matchResult.confidence * 100).toFixed(1)}%
+                found [{typedMatch.x},{typedMatch.y},{typedMatch.w},{typedMatch.h}]{" "}
+                {(typedMatch.confidence * 100).toFixed(1)}%
               </span>
             );
           }
@@ -275,12 +357,18 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
         );
 
       case "CLICK": {
-        const clickPosition = action.metadata?.clickPosition as any;
-        if (clickPosition) {
+        const clickPosition = action.metadata?.clickPosition;
+        if (
+          clickPosition &&
+          typeof clickPosition === "object" &&
+          "x" in clickPosition &&
+          "y" in clickPosition
+        ) {
+          const typedPosition = clickPosition as { x: number; y: number };
           return (
             <span className="text-green-500">
               <span className="mr-1">✓</span>
-              clicked ({clickPosition.x},{clickPosition.y})
+              clicked ({typedPosition.x},{typedPosition.y})
             </span>
           );
         }

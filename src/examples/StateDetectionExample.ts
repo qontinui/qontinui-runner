@@ -178,8 +178,15 @@ function handleDetectionError(error: StateDetectionError): void {
 
     case StateDetectionErrorType.PROCESS_CRASHED:
       console.error("Python process crashed");
-      console.error("Exit code:", (error.details as any)?.exitCode);
-      console.error("Stderr:", (error.details as any)?.stderr);
+      if (
+        error.details &&
+        typeof error.details === "object" &&
+        "exitCode" in error.details &&
+        "stderr" in error.details
+      ) {
+        console.error("Exit code:", error.details.exitCode);
+        console.error("Stderr:", error.details.stderr);
+      }
       break;
 
     default:

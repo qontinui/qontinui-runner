@@ -20,6 +20,7 @@ import type {
   AiOutputLine,
 } from "./logging";
 import type { LogSourceContent } from "../types/projectLogs";
+import type { ImageRecognitionEventData } from "../types/eventPayloads";
 
 // Re-export types for backward compatibility
 export type { LogEntry, ImageRecognitionEntry, AiOutputEntry };
@@ -153,7 +154,7 @@ class LogManager {
    * Process raw image recognition data and add as log entry
    * This is a convenience method for EventHandlers
    */
-  processImageRecognitionData(data: any): void {
+  processImageRecognitionData(data: ImageRecognitionEventData): void {
     const entry = this.imageLogHandler.processImageRecognitionData(data);
     this.addImageLog(entry);
   }

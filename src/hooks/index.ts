@@ -26,7 +26,7 @@ export { usePythonExecutor } from "./usePythonExecutor";
 export type { PythonStatus } from "./usePythonExecutor";
 
 export { useConfiguration } from "./useConfiguration";
-export type { Config, Workflow } from "./useConfiguration";
+export type { Config, Workflow, ConfigImage, ConfigState } from "./useConfiguration";
 
 export { useWorkflowSelection } from "./useWorkflowSelection";
 

@@ -5,7 +5,9 @@
  * Provides a centralized, type-safe way to handle events from the backend.
  */
 
-type EventHandler = (payload: any) => void;
+import type { EventPayload } from "../types/eventPayloads";
+
+type EventHandler = (payload: EventPayload) => void;
 
 class EventRouter {
   private handlers = new Map<string, Set<EventHandler>>();
@@ -42,7 +44,7 @@ class EventRouter {
    * Route an event to all registered handlers for that event type
    * @param payload - The event payload from the backend
    */
-  route(payload: any): void {
+  route(payload: EventPayload): void {
     // Determine event type
     const eventType = payload.event || payload.type;
 
@@ -98,3 +100,6 @@ class EventRouter {
 
 // Export singleton instance
 export const eventRouter = new EventRouter();
+
+// Export class type for type annotations
+export type { EventRouter };

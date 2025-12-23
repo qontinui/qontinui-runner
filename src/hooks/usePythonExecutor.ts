@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "../types/displayProfile";
 
 export type PythonStatus = "stopped" | "running";
 
@@ -35,7 +36,7 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
       onLog?.("info", "Starting Python executor...");
 
       try {
-        const startResult: any = await invoke("start_python_executor");
+        const startResult = await invoke<CommandResponse>("start_python_executor");
         console.log("[PYTHON_EXECUTOR] Python start result:", startResult);
 
         if (startResult.success) {
@@ -74,7 +75,8 @@ export function usePythonExecutor(): UsePythonExecutorReturn {
   useEffect(() => {
     const checkPythonStatus = async () => {
       try {
-        const result: any = await invoke("get_executor_status");
+        const result =
+          await invoke<CommandResponse<{ python_running?: boolean }>>("get_executor_status");
         // python_running is inside the data field of CommandResponse
         if (result?.data?.python_running) {
           setPythonStatus("running");

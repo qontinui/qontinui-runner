@@ -5,6 +5,8 @@
  * Follows Single Responsibility Principle - handles only storage concerns.
  */
 
+import type { ImageRecognitionDebugData } from "../../types/eventPayloads";
+
 export interface LogEntry {
   id: string;
   timestamp: string;
@@ -36,7 +38,7 @@ export interface ImageRecognitionEntry {
   templatePath?: string;
   imageData?: string; // Base64 encoded template image
   matchedRegionImage?: string; // Base64 encoded cropped region from screenshot at match location
-  debug?: any; // Debug data with top_matches for displaying match details
+  debug?: ImageRecognitionDebugData; // Debug data with top_matches for displaying match details
   monitorIndex?: number | null; // Which monitor was captured (null = all monitors combined)
 }
 

@@ -242,7 +242,9 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
   // Check executor status and determine if AI is working
   const checkAiStatus = useCallback(async () => {
     try {
-      const result: any = await invoke("get_executor_status");
+      const result = (await invoke("get_executor_status")) as {
+        data?: { state?: string };
+      };
       const state = result?.data?.state || "unknown";
 
       const now = Date.now();

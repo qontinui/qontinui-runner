@@ -9,6 +9,7 @@ import { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { WebExtractionConfig, ExtractionStatus, ExtractionResult } from "../types/extraction";
+import type { CommandResponse } from "../types/displayProfile";
 
 interface UseWebExtractionReturn {
   extractionStatus: ExtractionStatus | null;
@@ -25,7 +26,15 @@ interface UseWebExtractionReturn {
 interface ExecutorEventPayload {
   event_type: string;
   event: string;
-  data: any;
+  data: {
+    extraction_id?: string;
+    total_pages?: number;
+    current_url?: string;
+    status?: ExtractionStatus;
+    result?: ExtractionResult;
+    error?: string;
+    [key: string]: unknown;
+  };
 }
 
 /**
@@ -45,7 +54,7 @@ export function useWebExtraction(): UseWebExtractionReturn {
       setError(null);
       setIsExtracting(true);
 
-      const result: any = await invoke("start_web_extraction", { config });
+      const result = await invoke<CommandResponse>("start_web_extraction", { config });
 
       if (!result.success) {
         throw new Error(result.message || "Failed to start web extraction");
@@ -67,7 +76,7 @@ export function useWebExtraction(): UseWebExtractionReturn {
     try {
       setError(null);
 
-      const result: any = await invoke("stop_web_extraction");
+      const result = await invoke<CommandResponse>("stop_web_extraction");
 
       if (!result.success) {
         throw new Error(result.message || "Failed to stop web extraction");
@@ -89,7 +98,7 @@ export function useWebExtraction(): UseWebExtractionReturn {
     try {
       setError(null);
 
-      const result: any = await invoke("get_extraction_status");
+      const result = await invoke<CommandResponse>("get_extraction_status");
 
       if (!result.success) {
         throw new Error(result.message || "Failed to get extraction status");
@@ -110,7 +119,7 @@ export function useWebExtraction(): UseWebExtractionReturn {
     try {
       setError(null);
 
-      const result: any = await invoke("list_extractions");
+      const result = await invoke<CommandResponse>("list_extractions");
 
       if (!result.success) {
         throw new Error(result.message || "Failed to list extractions");

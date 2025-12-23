@@ -136,7 +136,7 @@ export function ExtractionTab({
   // Listen for extraction events via EventRouter
   useEffect(() => {
     // Handler for extraction_started event
-    const handleExtractionStarted = (payload: any) => {
+    const handleExtractionStarted = (payload: unknown) => {
       console.log("[EXTRACTION_TAB] Extraction started:", payload);
       onLog("info", "Extraction process started");
       setIsExtracting(true);
@@ -144,22 +144,26 @@ export function ExtractionTab({
     };
 
     // Handler for extraction_progress event
-    const handleExtractionProgress = (payload: any) => {
+    const handleExtractionProgress = (payload: unknown) => {
       console.log("[EXTRACTION_TAB] Extraction progress:", payload);
-      const data = payload.data;
-      if (data) {
+      const data =
+        payload && typeof payload === "object" && "data" in payload ? payload.data : null;
+      if (data && typeof data === "object" && data !== null) {
+        const typedData = data as {
+          pages_extracted?: number;
+          total_pages?: number;
+          current_url?: string;
+        };
         setExtractionProgress({
-          pages_extracted: data.pages_extracted || 0,
-          total_pages: data.total_pages || urls.length,
-          current_url: data.current_url || "",
+          pages_extracted: typedData.pages_extracted || 0,
+          total_pages: typedData.total_pages || urls.length,
+          current_url: typedData.current_url || "",
         });
       }
     };
 
     // Handler for extraction_completed event
-    const handleExtractionCompleted = async (
-      payload: ExtractionCompletedPayload | { data?: ExtractionCompletedPayload },
-    ) => {
+    const handleExtractionCompleted = (payload: unknown) => {
       console.log("[EXTRACTION_TAB] Extraction completed:", payload);
       setIsExtracting(false);
       setExtractionSuccess(true);
@@ -167,29 +171,39 @@ export function ExtractionTab({
       onLog("success", "Web extraction completed successfully");
 
       // Extract data from payload (handle both direct and nested formats)
-      const data =
-        "data" in payload && payload.data ? payload.data : (payload as ExtractionCompletedPayload);
-      const sessionId = data.session_id || currentSessionId;
-      const stateStructure = data.state_structure;
+      let data: ExtractionCompletedPayload | null = null;
+      if (payload && typeof payload === "object") {
+        if ("data" in payload && payload.data && typeof payload.data === "object") {
+          data = payload.data as ExtractionCompletedPayload;
+        } else if ("session_id" in payload || "state_structure" in payload) {
+          data = payload as ExtractionCompletedPayload;
+        }
+      }
+
+      const sessionId = data?.session_id || currentSessionId;
+      const stateStructure = data?.state_structure;
 
       // Automatically upload state structure to qontinui-web if available
       if (sessionId && stateStructure) {
-        try {
-          onLog("info", "Uploading state structure to cloud...");
-          await invoke("upload_state_structure", {
-            request: {
-              extraction_id: sessionId,
-              state_structure: stateStructure,
-            },
-          });
-          onLog("success", "State structure uploaded successfully");
-        } catch (uploadErr) {
-          console.error("Failed to upload state structure:", uploadErr);
-          onLog(
-            "warning",
-            `Could not upload state structure: ${uploadErr}. The extraction data is still saved locally.`,
-          );
-        }
+        // Use Promise for async operation without making handler async
+        void (async () => {
+          try {
+            onLog("info", "Uploading state structure to cloud...");
+            await invoke("upload_state_structure", {
+              request: {
+                extraction_id: sessionId,
+                state_structure: stateStructure,
+              },
+            });
+            onLog("success", "State structure uploaded successfully");
+          } catch (uploadErr) {
+            console.error("Failed to upload state structure:", uploadErr);
+            onLog(
+              "warning",
+              `Could not upload state structure: ${uploadErr}. The extraction data is still saved locally.`,
+            );
+          }
+        })();
       } else if (stateStructure && !sessionId) {
         onLog(
           "warning",
@@ -203,9 +217,17 @@ export function ExtractionTab({
     };
 
     // Handler for extraction_error event
-    const handleExtractionError = (payload: any) => {
+    const handleExtractionError = (payload: unknown) => {
       console.log("[EXTRACTION_TAB] Extraction error:", payload);
-      const errorMsg = payload.data?.message || payload.message || "Extraction failed";
+      let errorMsg = "Extraction failed";
+      if (payload && typeof payload === "object") {
+        if ("data" in payload && payload.data && typeof payload.data === "object") {
+          const data = payload.data as { message?: string };
+          errorMsg = data.message || errorMsg;
+        } else if ("message" in payload && typeof payload.message === "string") {
+          errorMsg = payload.message;
+        }
+      }
       setIsExtracting(false);
       setExtractionError(errorMsg);
       onLog("error", `Extraction failed: ${errorMsg}`);

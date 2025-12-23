@@ -7,6 +7,10 @@
 
 import type { ImageRecognitionEntry } from "./LogStore";
 import { TimestampFormatter } from "./TimestampFormatter";
+import type {
+  ImageRecognitionEventData,
+  ImageRecognitionLocation,
+} from "../../types/eventPayloads";
 
 /**
  * Handles processing of image recognition data into log entries.
@@ -21,7 +25,7 @@ export class ImageLogHandler {
   /**
    * Process raw image recognition data into a structured log entry
    */
-  processImageRecognitionData(data: any): ImageRecognitionEntry {
+  processImageRecognitionData(data: ImageRecognitionEventData): ImageRecognitionEntry {
     // Format timestamps
     const timestamp = this.timestampFormatter.formatCurrentTime();
 
@@ -67,7 +71,7 @@ export class ImageLogHandler {
    * Parse location from various formats
    */
   private parseLocation(
-    location: any,
+    location: ImageRecognitionLocation | string | undefined,
   ): { x: number; y: number; width: number; height: number } | undefined {
     if (!location) {
       return undefined;
@@ -99,7 +103,7 @@ export class ImageLogHandler {
   /**
    * Calculate match quality metrics
    */
-  private calculateMatchMetrics(data: any): {
+  private calculateMatchMetrics(data: ImageRecognitionEventData): {
     gap?: number;
     percentOff?: number;
     bestMatchLocation?: string;
@@ -122,7 +126,7 @@ export class ImageLogHandler {
   /**
    * Extract node ID from hierarchy data
    */
-  private extractNodeId(data: any): string {
+  private extractNodeId(data: ImageRecognitionEventData): string {
     if (data.node_id) {
       return data.node_id;
     }

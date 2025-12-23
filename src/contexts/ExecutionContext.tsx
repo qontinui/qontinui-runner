@@ -20,10 +20,14 @@ import {
   useWorkflowSelection,
   useMonitorDetection,
   useExecutionControl,
+  type Config,
+  type Workflow,
+  type ConfigImage,
+  type ConfigState,
 } from "../hooks";
 
 // Re-export types for backward compatibility
-export type { Config, Workflow } from "../hooks";
+export type { Workflow, Config, ConfigImage, ConfigState };
 
 // Store context in window to survive HMR
 declare global {
@@ -40,14 +44,14 @@ interface ExecutionContextValue {
   // Configuration State
   configLoaded: boolean;
   setConfigLoaded: (loaded: boolean) => void;
-  config: any | null;
-  setConfig: (config: any | null) => void;
+  config: Config | null;
+  setConfig: (config: Config | null) => void;
   loadConfiguration: () => Promise<void>;
   loadLastConfiguration: () => Promise<void>;
 
   // Workflow State
-  workflows: any[];
-  setWorkflows: (workflows: any[]) => void;
+  workflows: Workflow[];
+  setWorkflows: (workflows: Workflow[]) => void;
   selectedWorkflow: string;
   setSelectedWorkflow: (id: string) => void;
   selectWorkflowWithPersistence: (id: string) => Promise<void>;

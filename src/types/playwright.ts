@@ -8,12 +8,7 @@
 /**
  * Sync status for cloud backup
  */
-export type SyncStatus =
-  | "local_only"
-  | "synced"
-  | "local_modified"
-  | "cloud_modified"
-  | "conflict";
+export type SyncStatus = "local_only" | "synced" | "local_modified" | "cloud_modified" | "conflict";
 
 /**
  * Display mode for Playwright test execution

@@ -7,6 +7,7 @@
 
 import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { CommandResponse } from "../types/displayProfile";
 
 interface UseMonitorDetectionOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -74,7 +75,8 @@ export function useMonitorDetection(
    */
   const detectSystemMonitors = useCallback(async () => {
     try {
-      const result: any = await invoke("get_monitors");
+      const result =
+        await invoke<CommandResponse<{ indices?: number[]; count?: number }>>("get_monitors");
       if (result.success && result.data) {
         const indices = result.data.indices || [0];
         setAvailableMonitors(indices);

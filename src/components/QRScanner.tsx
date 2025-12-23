@@ -94,8 +94,7 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
                 }, 800);
               });
             }
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-          } catch (_e) {
+          } catch {
             const errorMsg = "Invalid QR code. Please scan a valid connection QR code.";
             setError(errorMsg);
             setStatusMessage(errorMsg);
@@ -118,14 +117,16 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
         setScanning(true);
         setStatusMessage("Position QR code in front of camera");
         setError(null);
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error("Failed to start scanner:", err);
 
         let errorMsg = "Failed to start camera.";
-        if (err?.name === "NotAllowedError") {
-          errorMsg = "Camera access denied. Please grant camera permissions.";
-        } else if (err?.message) {
-          errorMsg = `Camera error: ${err.message}`;
+        if (err && typeof err === "object") {
+          if ("name" in err && err.name === "NotAllowedError") {
+            errorMsg = "Camera access denied. Please grant camera permissions.";
+          } else if ("message" in err && typeof err.message === "string") {
+            errorMsg = `Camera error: ${err.message}`;
+          }
         }
 
         setError(errorMsg);

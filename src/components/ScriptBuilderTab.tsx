@@ -5,7 +5,6 @@ import {
   Plus,
   Search,
   Play,
-  Pencil,
   Trash2,
   Copy,
   Tag,
@@ -22,12 +21,8 @@ import {
   CheckCircle,
   XCircle,
   Monitor,
-  Eye,
-  EyeOff,
   ChevronDown,
   ChevronUp,
-  Terminal,
-  Image,
   Sparkles,
   RefreshCw,
   Info,
@@ -88,7 +83,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   const [formBrowser, setFormBrowser] = useState<"chromium" | "firefox" | "webkit">("chromium");
 
   // Execution state
-  const [executingScriptId, setExecutingScriptId] = useState<string | null>(null);
+  const [_executingScriptId, setExecutingScriptId] = useState<string | null>(null);
   const [executionState, setExecutionState] = useState<ScriptExecutionState>("idle");
   const [executionResult, setExecutionResult] = useState<PlaywrightResult | null>(null);
 
@@ -115,7 +110,9 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
 
   // Track the description that was used to generate the current code
   // This is used to warn users if they try to run tests when description has changed
-  const [lastGeneratedFromDescription, setLastGeneratedFromDescription] = useState<string | null>(null);
+  const [lastGeneratedFromDescription, setLastGeneratedFromDescription] = useState<string | null>(
+    null,
+  );
 
   // Auto-save description when editing an existing script
   useEffect(() => {
@@ -228,7 +225,10 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
           target_url: formTargetUrl,
           script_content: formScriptContent,
           category: formCategory,
-          tags: formTags.split(",").map((t) => t.trim()).filter(Boolean),
+          tags: formTags
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean),
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
           browser: formBrowser,
@@ -246,40 +246,6 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
       }
     } catch (error) {
       onLog("error", `Failed to create script: ${error}`);
-    }
-  };
-
-  const updateScript = async () => {
-    if (!editingScript) return;
-    try {
-      const response = await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: formName,
-          description: formDescription,
-          ai_instructions: formAiInstructions || undefined,
-          target_url: formTargetUrl,
-          script_content: formScriptContent,
-          category: formCategory,
-          tags: formTags.split(",").map((t) => t.trim()).filter(Boolean),
-          timeout_seconds: formTimeoutSeconds,
-          display_mode: formDisplayMode,
-          browser: formBrowser,
-        }),
-      });
-      const result = await response.json();
-      if (result.success) {
-        onLog("success", `Updated script: ${formName}`);
-        loadScripts();
-        loadCategories();
-        resetForm();
-        setEditingScript(null);
-      } else {
-        onLog("error", `Failed to update script: ${result.error}`);
-      }
-    } catch (error) {
-      onLog("error", `Failed to update script: ${error}`);
     }
   };
 
@@ -339,7 +305,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
         setExecutionState(result.data.passed ? "completed" : "failed");
         onLog(
           result.data.passed ? "success" : "error",
-          `Test ${result.data.passed ? "passed" : "failed"}: ${result.data.tests_passed} passed, ${result.data.tests_failed} failed`
+          `Test ${result.data.passed ? "passed" : "failed"}: ${result.data.tests_passed} passed, ${result.data.tests_failed} failed`,
         );
         // Reload to get updated last_result
         loadScripts();
@@ -508,14 +474,20 @@ test('${formName || "test"}', async ({ page }) => {
           setViewMode("code"); // Switch to code view to show the result
           onLog("success", "Script generated successfully!");
         } else {
-          onLog("warning", "AI response didn't contain valid Playwright code. Check AI Output tab.");
+          onLog(
+            "warning",
+            "AI response didn't contain valid Playwright code. Check AI Output tab.",
+          );
           console.log("AI output:", output);
         }
       } else if (result.success) {
         // AI analysis completed but no output field - this shouldn't happen now
         onLog("info", "Script generation completed. Check AI Output tab for results.");
       } else {
-        onLog("error", `Failed to generate script: ${result.error || result.data?.error || "Unknown error"}`);
+        onLog(
+          "error",
+          `Failed to generate script: ${result.error || result.data?.error || "Unknown error"}`,
+        );
       }
     } catch (error) {
       onLog("error", `Failed to generate script: ${error}`);
@@ -535,10 +507,13 @@ test('${formName || "test"}', async ({ page }) => {
     onLog("info", "Refining Playwright script based on feedback...");
 
     // Build context from test results
-    const testErrors = executionResult?.structured_output?.specs
-      ?.filter((spec) => spec.status !== "expected" && spec.error)
-      .map((spec) => `Test "${spec.title}" failed:\n${spec.error}`)
-      .join("\n\n") || executionResult?.error || "";
+    const testErrors =
+      executionResult?.structured_output?.specs
+        ?.filter((spec) => spec.status !== "expected" && spec.error)
+        .map((spec) => `Test "${spec.title}" failed:\n${spec.error}`)
+        .join("\n\n") ||
+      executionResult?.error ||
+      "";
 
     // Include page snapshot if available (shows actual elements on the page)
     const pageSnapshot = executionResult?.structured_output?.page_snapshot || "";
@@ -641,8 +616,10 @@ import { test, expect } from '@playwright/test';
   const hasDescriptionChangedSinceGeneration = () => {
     // Only warn if we have a record of what description was used to generate the code
     // AND the current description is different
-    return lastGeneratedFromDescription !== null &&
-           formDescription.trim() !== lastGeneratedFromDescription.trim();
+    return (
+      lastGeneratedFromDescription !== null &&
+      formDescription.trim() !== lastGeneratedFromDescription.trim()
+    );
   };
 
   // Auto-refinement loop: runs test, refines on failure, repeats until success
@@ -656,8 +633,8 @@ import { test, expect } from '@playwright/test';
     if (hasDescriptionChangedSinceGeneration()) {
       const confirmed = confirm(
         "The description has changed since the code was generated.\n\n" +
-        "The test may not match your current description.\n\n" +
-        "Do you want to run anyway? (Click 'Generate Script' first to update the code)"
+          "The test may not match your current description.\n\n" +
+          "Do you want to run anyway? (Click 'Generate Script' first to update the code)",
       );
       if (!confirmed) {
         return;
@@ -715,7 +692,7 @@ import { test, expect } from '@playwright/test';
 
         // Extract and log the specific problem
         const failedSpecs = testResult.structured_output?.specs?.filter(
-          (spec) => spec.status !== "expected" && spec.error
+          (spec) => spec.status !== "expected" && spec.error,
         );
 
         if (failedSpecs && failedSpecs.length > 0) {
@@ -748,9 +725,10 @@ import { test, expect } from '@playwright/test';
         log(`Asking AI to fix the issue...`);
 
         // Build context from test results for AI
-        const testErrors = failedSpecs
-          ?.map((spec) => `Test "${spec.title}" failed:\n${spec.error}`)
-          .join("\n\n") || testResult.error || "";
+        const testErrors =
+          failedSpecs?.map((spec) => `Test "${spec.title}" failed:\n${spec.error}`).join("\n\n") ||
+          testResult.error ||
+          "";
 
         const pageSnapshot = testResult.structured_output?.page_snapshot || "";
         const pageSnapshotSection = pageSnapshot
@@ -881,7 +859,10 @@ import { test, expect } from '@playwright/test';
 
       if (iteration >= autoRefineMaxIterations) {
         log(`Reached maximum iterations (${autoRefineMaxIterations}). Test still failing.`);
-        onLog("warning", `Auto-refinement stopped after ${autoRefineMaxIterations} iterations without success`);
+        onLog(
+          "warning",
+          `Auto-refinement stopped after ${autoRefineMaxIterations} iterations without success`,
+        );
       }
 
       // Reload scripts to get latest state
@@ -909,8 +890,8 @@ import { test, expect } from '@playwright/test';
     if (hasDescriptionChangedSinceGeneration()) {
       const confirmed = confirm(
         "The description has changed since the code was generated.\n\n" +
-        "The test may not match your current description.\n\n" +
-        "Do you want to run anyway? (Click 'Generate Script' first to update the code)"
+          "The test may not match your current description.\n\n" +
+          "Do you want to run anyway? (Click 'Generate Script' first to update the code)",
       );
       if (!confirmed) {
         return;
@@ -929,7 +910,10 @@ import { test, expect } from '@playwright/test';
           target_url: formTargetUrl,
           script_content: formScriptContent,
           category: formCategory,
-          tags: formTags.split(",").map((t) => t.trim()).filter(Boolean),
+          tags: formTags
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean),
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
           browser: formBrowser,
@@ -1098,15 +1082,6 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     return matchesSearch && matchesCategory;
   });
 
-  // Format date
-  const formatDate = (dateStr: string) => {
-    try {
-      return new Date(dateStr).toLocaleDateString();
-    } catch {
-      return dateStr;
-    }
-  };
-
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
@@ -1270,7 +1245,8 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
               />
               <p className="text-xs text-muted-foreground mt-1">
-                Describe what you want to test, then click "Generate Script" to create the Playwright code.
+                Describe what you want to test, then click "Generate Script" to create the
+                Playwright code.
               </p>
 
               {/* AI Instructions (optional) */}
@@ -1404,7 +1380,12 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
                             <li>Close all Chrome windows first</li>
                             <li>Click the button below to restart Chrome with debugging, or:</li>
-                            <li>Create a shortcut with target: <code className="bg-muted px-1 rounded">chrome --remote-debugging-port=9222</code></li>
+                            <li>
+                              Create a shortcut with target:{" "}
+                              <code className="bg-muted px-1 rounded">
+                                chrome --remote-debugging-port=9222
+                              </code>
+                            </li>
                           </ol>
                         </div>
                       </div>
@@ -1413,7 +1394,11 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   <button
                     type="button"
                     onClick={async () => {
-                      if (!confirm("This will close all Chrome windows and relaunch with debugging enabled. Continue?")) {
+                      if (
+                        !confirm(
+                          "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
+                        )
+                      ) {
                         return;
                       }
                       try {
@@ -1423,7 +1408,10 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         });
                         const result = await response.json();
                         if (result.success) {
-                          onLog("success", "Chrome launched with debugging enabled. Navigate to your test page, then run the test.");
+                          onLog(
+                            "success",
+                            "Chrome launched with debugging enabled. Navigate to your test page, then run the test.",
+                          );
                         } else {
                           onLog("error", `Failed to launch Chrome: ${result.error}`);
                         }
@@ -1625,7 +1613,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   {viewMode === "natural_language" ? (
                     <div>
                       <div className="flex items-center justify-between mb-1">
-                        <label className="block text-sm font-medium">Description (Natural Language)</label>
+                        <label className="block text-sm font-medium">
+                          Description (Natural Language)
+                        </label>
                         <button
                           onClick={generateScript}
                           disabled={isGenerating || !formDescription.trim()}
@@ -1673,7 +1663,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   ) : (
                     <div>
                       <div className="flex items-center justify-between mb-1">
-                        <label className="block text-sm font-medium">Script Content (.spec.ts) *</label>
+                        <label className="block text-sm font-medium">
+                          Script Content (.spec.ts) *
+                        </label>
                         {formDescription.trim() && (
                           <button
                             onClick={generateScript}
@@ -1723,7 +1715,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                       </datalist>
                     </div>
                     <div>
-                      <label className="block text-sm font-medium mb-1">Tags (comma-separated)</label>
+                      <label className="block text-sm font-medium mb-1">
+                        Tags (comma-separated)
+                      </label>
                       <input
                         type="text"
                         value={formTags}
@@ -1779,7 +1773,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                               <Info className="w-3.5 h-3.5 text-amber-500 cursor-help" />
                               <div className="absolute right-0 bottom-full mb-2 hidden group-hover:block z-50 w-80">
                                 <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-xs">
-                                  <p className="font-medium mb-2">How to start Chrome with debugging:</p>
+                                  <p className="font-medium mb-2">
+                                    How to start Chrome with debugging:
+                                  </p>
                                   <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
                                     <li>Close all Chrome windows first</li>
                                     <li>Click the button below to restart Chrome with debugging</li>
@@ -1791,7 +1787,11 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           <button
                             type="button"
                             onClick={async () => {
-                              if (!confirm("This will close all Chrome windows and relaunch with debugging enabled. Continue?")) {
+                              if (
+                                !confirm(
+                                  "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
+                                )
+                              ) {
                                 return;
                               }
                               try {
@@ -1848,235 +1848,284 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   )}
 
                   {/* Execution Result */}
-                  {(executionState === "running" || executionResult) && editingScript?.id === script.id && (
-                    <div
-                      className={`p-4 rounded-lg border-2 ${
-                        executionState === "running"
-                          ? "border-blue-500/50 bg-blue-500/5"
-                          : executionResult?.passed
-                            ? "border-green-500/50 bg-green-500/5"
-                            : "border-red-500/50 bg-red-500/5"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between mb-3">
-                        <h4 className="font-medium flex items-center gap-2">
-                          {executionState === "running" ? (
-                            <>
-                              <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
-                              Running Test...
-                            </>
-                          ) : executionResult?.passed ? (
-                            <>
-                              <CheckCircle className="w-4 h-4 text-green-500" />
-                              Test Passed
-                            </>
-                          ) : (
-                            <>
-                              <XCircle className="w-4 h-4 text-red-500" />
-                              Test Failed
-                            </>
+                  {(executionState === "running" || executionResult) &&
+                    editingScript?.id === script.id && (
+                      <div
+                        className={`p-4 rounded-lg border-2 ${
+                          executionState === "running"
+                            ? "border-blue-500/50 bg-blue-500/5"
+                            : executionResult?.passed
+                              ? "border-green-500/50 bg-green-500/5"
+                              : "border-red-500/50 bg-red-500/5"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between mb-3">
+                          <h4 className="font-medium flex items-center gap-2">
+                            {executionState === "running" ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
+                                Running Test...
+                              </>
+                            ) : executionResult?.passed ? (
+                              <>
+                                <CheckCircle className="w-4 h-4 text-green-500" />
+                                Test Passed
+                              </>
+                            ) : (
+                              <>
+                                <XCircle className="w-4 h-4 text-red-500" />
+                                Test Failed
+                              </>
+                            )}
+                          </h4>
+                          {executionResult && (
+                            <button
+                              onClick={() => {
+                                setExecutionResult(null);
+                                setExpandedSpecs(new Set());
+                              }}
+                              className="p-1 hover:bg-card rounded"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
                           )}
-                        </h4>
+                        </div>
+
                         {executionResult && (
-                          <button
-                            onClick={() => {
-                              setExecutionResult(null);
-                              setExpandedSpecs(new Set());
-                            }}
-                            className="p-1 hover:bg-card rounded"
-                          >
-                            <X className="w-4 h-4" />
-                          </button>
-                        )}
-                      </div>
-
-                      {executionResult && (
-                        <>
-                          <div className="grid grid-cols-4 gap-3 mb-3">
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-xl font-bold text-green-500">{executionResult.tests_passed}</div>
-                              <div className="text-xs text-muted-foreground">Passed</div>
-                            </div>
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-xl font-bold text-red-500">{executionResult.tests_failed}</div>
-                              <div className="text-xs text-muted-foreground">Failed</div>
-                            </div>
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-xl font-bold text-muted-foreground">{executionResult.tests_skipped}</div>
-                              <div className="text-xs text-muted-foreground">Skipped</div>
-                            </div>
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-xl font-bold">{(executionResult.duration_ms / 1000).toFixed(1)}s</div>
-                              <div className="text-xs text-muted-foreground">Duration</div>
-                            </div>
-                          </div>
-
-                          {executionResult.structured_output?.specs && executionResult.structured_output.specs.length > 0 && (
-                            <div className="mb-3 space-y-2">
-                              <div className="text-sm font-medium mb-2">Test Results</div>
-                              {executionResult.structured_output.specs.map((spec, index) => (
-                                <div
-                                  key={index}
-                                  className={`border rounded-lg overflow-hidden ${
-                                    spec.status === "expected" ? "border-green-500/30 bg-green-500/5" : "border-red-500/30 bg-red-500/5"
-                                  }`}
-                                >
-                                  <button
-                                    onClick={() => {
-                                      const newExpanded = new Set(expandedSpecs);
-                                      if (newExpanded.has(index)) {
-                                        newExpanded.delete(index);
-                                      } else {
-                                        newExpanded.add(index);
-                                      }
-                                      setExpandedSpecs(newExpanded);
-                                    }}
-                                    className="w-full px-3 py-2 flex items-center justify-between text-left hover:bg-black/5"
-                                  >
-                                    <div className="flex items-center gap-2">
-                                      {spec.status === "expected" ? (
-                                        <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0" />
-                                      ) : (
-                                        <XCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
-                                      )}
-                                      <span className="text-sm font-medium truncate">{spec.title}</span>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-xs text-muted-foreground">{(spec.duration_ms / 1000).toFixed(1)}s</span>
-                                      {spec.error && (expandedSpecs.has(index) ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />)}
-                                    </div>
-                                  </button>
-                                  {spec.error && expandedSpecs.has(index) && (
-                                    <div className="px-3 py-2 border-t border-red-500/20 bg-red-500/5">
-                                      <pre className="text-xs text-red-400 whitespace-pre-wrap font-mono max-h-48 overflow-auto">{spec.error}</pre>
-                                    </div>
-                                  )}
+                          <>
+                            <div className="grid grid-cols-4 gap-3 mb-3">
+                              <div className="text-center p-2 bg-background rounded-lg">
+                                <div className="text-xl font-bold text-green-500">
+                                  {executionResult.tests_passed}
                                 </div>
-                              ))}
+                                <div className="text-xs text-muted-foreground">Passed</div>
+                              </div>
+                              <div className="text-center p-2 bg-background rounded-lg">
+                                <div className="text-xl font-bold text-red-500">
+                                  {executionResult.tests_failed}
+                                </div>
+                                <div className="text-xs text-muted-foreground">Failed</div>
+                              </div>
+                              <div className="text-center p-2 bg-background rounded-lg">
+                                <div className="text-xl font-bold text-muted-foreground">
+                                  {executionResult.tests_skipped}
+                                </div>
+                                <div className="text-xs text-muted-foreground">Skipped</div>
+                              </div>
+                              <div className="text-center p-2 bg-background rounded-lg">
+                                <div className="text-xl font-bold">
+                                  {(executionResult.duration_ms / 1000).toFixed(1)}s
+                                </div>
+                                <div className="text-xs text-muted-foreground">Duration</div>
+                              </div>
                             </div>
-                          )}
 
-                          {executionResult.error && (!executionResult.structured_output?.specs || executionResult.structured_output.specs.length === 0) && (
-                            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 mb-3">
-                              <div className="text-sm font-medium text-red-500 mb-1">Error</div>
-                              <pre className="text-xs text-red-400 whitespace-pre-wrap font-mono max-h-48 overflow-auto">{executionResult.error}</pre>
-                            </div>
-                          )}
-
-                          {/* Screenshot Display */}
-                          {executionResult.screenshots && executionResult.screenshots.length > 0 && (
-                            <div className="mb-3">
-                              <button
-                                onClick={() => setShowScreenshot(!showScreenshot)}
-                                className="flex items-center gap-2 text-sm font-medium mb-2 hover:text-primary transition-colors"
-                              >
-                                <ImageIcon className="w-4 h-4" />
-                                Last Screenshot ({executionResult.screenshots.length} total)
-                                {showScreenshot ? (
-                                  <ChevronUp className="w-4 h-4" />
-                                ) : (
-                                  <ChevronDown className="w-4 h-4" />
-                                )}
-                              </button>
-                              {showScreenshot && (
-                                <div className="border border-border rounded-lg overflow-hidden bg-background">
-                                  <div className="relative min-h-[100px]">
-                                    {screenshotLoading ? (
-                                      <div className="flex items-center justify-center p-8">
-                                        <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-                                      </div>
-                                    ) : screenshotError ? (
-                                      <div className="p-4 text-center text-muted-foreground text-sm">
-                                        <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                                        Failed to load screenshot
-                                        <div className="text-xs mt-1 text-red-400">{screenshotError}</div>
-                                      </div>
-                                    ) : screenshotDataUrl ? (
-                                      <img
-                                        src={screenshotDataUrl}
-                                        alt="Last test screenshot"
-                                        className="w-full h-auto max-h-96 object-contain"
-                                      />
-                                    ) : (
-                                      <div className="p-4 text-center text-muted-foreground text-sm">
-                                        <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                                        No screenshot available
-                                      </div>
-                                    )}
-                                  </div>
-                                  <div className="px-3 py-2 bg-muted/30 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
-                                    <span className="truncate flex-1 mr-2" title={executionResult.screenshots[executionResult.screenshots.length - 1]}>
-                                      {executionResult.screenshots[executionResult.screenshots.length - 1].split(/[/\\]/).pop()}
-                                    </span>
-                                    <button
-                                      onClick={async () => {
-                                        const path = executionResult.screenshots[executionResult.screenshots.length - 1];
-                                        await navigator.clipboard.writeText(path);
-                                        onLog("info", "Screenshot path copied to clipboard");
-                                      }}
-                                      className="flex items-center gap-1 px-2 py-1 hover:bg-muted rounded transition-colors"
-                                      title="Copy path to clipboard"
+                            {executionResult.structured_output?.specs &&
+                              executionResult.structured_output.specs.length > 0 && (
+                                <div className="mb-3 space-y-2">
+                                  <div className="text-sm font-medium mb-2">Test Results</div>
+                                  {executionResult.structured_output.specs.map((spec, index) => (
+                                    <div
+                                      key={index}
+                                      className={`border rounded-lg overflow-hidden ${
+                                        spec.status === "expected"
+                                          ? "border-green-500/30 bg-green-500/5"
+                                          : "border-red-500/30 bg-red-500/5"
+                                      }`}
                                     >
-                                      <Copy className="w-3 h-3" />
-                                      Copy Path
-                                    </button>
-                                  </div>
+                                      <button
+                                        onClick={() => {
+                                          const newExpanded = new Set(expandedSpecs);
+                                          if (newExpanded.has(index)) {
+                                            newExpanded.delete(index);
+                                          } else {
+                                            newExpanded.add(index);
+                                          }
+                                          setExpandedSpecs(newExpanded);
+                                        }}
+                                        className="w-full px-3 py-2 flex items-center justify-between text-left hover:bg-black/5"
+                                      >
+                                        <div className="flex items-center gap-2">
+                                          {spec.status === "expected" ? (
+                                            <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0" />
+                                          ) : (
+                                            <XCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                                          )}
+                                          <span className="text-sm font-medium truncate">
+                                            {spec.title}
+                                          </span>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                          <span className="text-xs text-muted-foreground">
+                                            {(spec.duration_ms / 1000).toFixed(1)}s
+                                          </span>
+                                          {spec.error &&
+                                            (expandedSpecs.has(index) ? (
+                                              <ChevronUp className="w-4 h-4" />
+                                            ) : (
+                                              <ChevronDown className="w-4 h-4" />
+                                            ))}
+                                        </div>
+                                      </button>
+                                      {spec.error && expandedSpecs.has(index) && (
+                                        <div className="px-3 py-2 border-t border-red-500/20 bg-red-500/5">
+                                          <pre className="text-xs text-red-400 whitespace-pre-wrap font-mono max-h-48 overflow-auto">
+                                            {spec.error}
+                                          </pre>
+                                        </div>
+                                      )}
+                                    </div>
+                                  ))}
                                 </div>
                               )}
-                            </div>
-                          )}
 
-                          {/* Manual Refinement */}
-                          {!executionResult.passed && !isAutoRefining && (
-                            <div className="border-t border-border pt-3 mt-3">
-                              <div className="text-sm font-medium mb-2 flex items-center gap-1 text-foreground">
-                                <Sparkles className="w-4 h-4 text-purple-500" />
-                                Manual Refinement
-                              </div>
-                              <div className="flex gap-2">
-                                <input
-                                  type="text"
-                                  value={refinementPrompt}
-                                  onChange={(e) => setRefinementPrompt(e.target.value)}
-                                  placeholder="Optional: describe how to fix the test"
-                                  className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Enter" && !isGenerating) {
-                                      refineScript();
-                                    }
-                                  }}
-                                />
-                                <button
-                                  onClick={refineScript}
-                                  disabled={isGenerating}
-                                  className="flex items-center gap-2 px-3 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
-                                >
-                                  {isGenerating ? (
-                                    <>
-                                      <Loader2 className="w-4 h-4 animate-spin" />
-                                      Refining...
-                                    </>
-                                  ) : (
-                                    <>
-                                      <RefreshCw className="w-4 h-4" />
-                                      Refine Once
-                                    </>
+                            {executionResult.error &&
+                              (!executionResult.structured_output?.specs ||
+                                executionResult.structured_output.specs.length === 0) && (
+                                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 mb-3">
+                                  <div className="text-sm font-medium text-red-500 mb-1">Error</div>
+                                  <pre className="text-xs text-red-400 whitespace-pre-wrap font-mono max-h-48 overflow-auto">
+                                    {executionResult.error}
+                                  </pre>
+                                </div>
+                              )}
+
+                            {/* Screenshot Display */}
+                            {executionResult.screenshots &&
+                              executionResult.screenshots.length > 0 && (
+                                <div className="mb-3">
+                                  <button
+                                    onClick={() => setShowScreenshot(!showScreenshot)}
+                                    className="flex items-center gap-2 text-sm font-medium mb-2 hover:text-primary transition-colors"
+                                  >
+                                    <ImageIcon className="w-4 h-4" />
+                                    Last Screenshot ({executionResult.screenshots.length} total)
+                                    {showScreenshot ? (
+                                      <ChevronUp className="w-4 h-4" />
+                                    ) : (
+                                      <ChevronDown className="w-4 h-4" />
+                                    )}
+                                  </button>
+                                  {showScreenshot && (
+                                    <div className="border border-border rounded-lg overflow-hidden bg-background">
+                                      <div className="relative min-h-[100px]">
+                                        {screenshotLoading ? (
+                                          <div className="flex items-center justify-center p-8">
+                                            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+                                          </div>
+                                        ) : screenshotError ? (
+                                          <div className="p-4 text-center text-muted-foreground text-sm">
+                                            <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                                            Failed to load screenshot
+                                            <div className="text-xs mt-1 text-red-400">
+                                              {screenshotError}
+                                            </div>
+                                          </div>
+                                        ) : screenshotDataUrl ? (
+                                          <img
+                                            src={screenshotDataUrl}
+                                            alt="Last test screenshot"
+                                            className="w-full h-auto max-h-96 object-contain"
+                                          />
+                                        ) : (
+                                          <div className="p-4 text-center text-muted-foreground text-sm">
+                                            <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50" />
+                                            No screenshot available
+                                          </div>
+                                        )}
+                                      </div>
+                                      <div className="px-3 py-2 bg-muted/30 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
+                                        <span
+                                          className="truncate flex-1 mr-2"
+                                          title={
+                                            executionResult.screenshots[
+                                              executionResult.screenshots.length - 1
+                                            ]
+                                          }
+                                        >
+                                          {executionResult.screenshots[
+                                            executionResult.screenshots.length - 1
+                                          ]
+                                            .split(/[/\\]/)
+                                            .pop()}
+                                        </span>
+                                        <button
+                                          onClick={async () => {
+                                            const path =
+                                              executionResult.screenshots[
+                                                executionResult.screenshots.length - 1
+                                              ];
+                                            await navigator.clipboard.writeText(path);
+                                            onLog("info", "Screenshot path copied to clipboard");
+                                          }}
+                                          className="flex items-center gap-1 px-2 py-1 hover:bg-muted rounded transition-colors"
+                                          title="Copy path to clipboard"
+                                        >
+                                          <Copy className="w-3 h-3" />
+                                          Copy Path
+                                        </button>
+                                      </div>
+                                    </div>
                                   )}
-                                </button>
+                                </div>
+                              )}
+
+                            {/* Manual Refinement */}
+                            {!executionResult.passed && !isAutoRefining && (
+                              <div className="border-t border-border pt-3 mt-3">
+                                <div className="text-sm font-medium mb-2 flex items-center gap-1 text-foreground">
+                                  <Sparkles className="w-4 h-4 text-purple-500" />
+                                  Manual Refinement
+                                </div>
+                                <div className="flex gap-2">
+                                  <input
+                                    type="text"
+                                    value={refinementPrompt}
+                                    onChange={(e) => setRefinementPrompt(e.target.value)}
+                                    placeholder="Optional: describe how to fix the test"
+                                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Enter" && !isGenerating) {
+                                        refineScript();
+                                      }
+                                    }}
+                                  />
+                                  <button
+                                    onClick={refineScript}
+                                    disabled={isGenerating}
+                                    className="flex items-center gap-2 px-3 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
+                                  >
+                                    {isGenerating ? (
+                                      <>
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        Refining...
+                                      </>
+                                    ) : (
+                                      <>
+                                        <RefreshCw className="w-4 h-4" />
+                                        Refine Once
+                                      </>
+                                    )}
+                                  </button>
+                                </div>
                               </div>
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
 
                   {/* Action buttons */}
                   <div className="flex justify-between gap-2 pt-2">
                     <div className="flex items-center gap-2">
                       <button
                         onClick={() => saveAndRunScript(script.id)}
-                        disabled={executionState === "running" || isAutoRefining || !formName || !formScriptContent}
+                        disabled={
+                          executionState === "running" ||
+                          isAutoRefining ||
+                          !formName ||
+                          !formScriptContent
+                        }
                         className="flex items-center gap-2 px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                         title="Save changes and run this test"
                       >
@@ -2123,7 +2172,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                     {/* Regenerate description from code button */}
                     <button
                       onClick={regenerateDescriptionFromCode}
-                      disabled={isRegeneratingDescription || isAutoRefining || executionState === "running"}
+                      disabled={
+                        isRegeneratingDescription || isAutoRefining || executionState === "running"
+                      }
                       className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                       title="Use AI to analyze the code and replace the description with what the code actually does"
                     >
@@ -2171,7 +2222,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   Current Description
                 </label>
                 <div className="p-3 bg-muted/30 border border-border rounded-lg text-sm">
-                  {formDescription || <span className="text-muted-foreground italic">No description</span>}
+                  {formDescription || (
+                    <span className="text-muted-foreground italic">No description</span>
+                  )}
                 </div>
               </div>
 

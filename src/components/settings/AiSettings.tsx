@@ -10,6 +10,16 @@ import type {
   LogFunction,
 } from "./types";
 
+interface TauriResult<T> {
+  success: boolean;
+  data?: T;
+  message?: string;
+}
+
+interface HasApiKeyData {
+  has_key: boolean;
+}
+
 interface AiSettingsProps {
   onLog: LogFunction;
 }
@@ -96,7 +106,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       setLoading(true);
       setError(null);
 
-      const result: any = await invoke("get_ai_settings");
+      const result = await invoke<TauriResult<AiSettingsType>>("get_ai_settings");
 
       if (result && result.success && result.data) {
         setSettings({
@@ -129,7 +139,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
   const checkApiKey = async () => {
     try {
-      const result: any = await invoke("has_ai_api_key", { provider: "claude_api" });
+      const result = await invoke<TauriResult<HasApiKeyData>>("has_ai_api_key", {
+        provider: "claude_api",
+      });
       if (result && result.success && result.data) {
         setHasApiKey(result.data.has_key || false);
       }
@@ -144,7 +156,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       setError(null);
       setSaveSuccess(false);
 
-      const result: any = await invoke("save_ai_settings", {
+      const result = await invoke<TauriResult<null>>("save_ai_settings", {
         provider: settings.provider,
         executionMode: settings.claude_cli.execution_mode,
         customPath: settings.claude_cli.custom_path || null,
@@ -181,7 +193,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       setSavingApiKey(true);
       setError(null);
 
-      const result: any = await invoke("save_ai_api_key_command", {
+      const result = await invoke<TauriResult<null>>("save_ai_api_key_command", {
         provider: "claude_api",
         apiKey: apiKey.trim(),
       });
@@ -206,7 +218,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
   const deleteApiKey = async () => {
     try {
-      const result: any = await invoke("delete_ai_api_key_command", { provider: "claude_api" });
+      const result = await invoke<TauriResult<null>>("delete_ai_api_key_command", {
+        provider: "claude_api",
+      });
 
       if (result && result.success) {
         setHasApiKey(false);
@@ -229,7 +243,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       setTestResult(null);
       setError(null);
 
-      const result: any = await invoke("test_ai_connection");
+      const result = await invoke<TauriResult<AiConnectionTestResult>>("test_ai_connection");
 
       if (result && result.data) {
         setTestResult(result.data);

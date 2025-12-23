@@ -109,6 +109,305 @@ fn spawn_python_with_console(
     cmd.spawn()
 }
 
+/// Run a Claude CLI session inline (as a child process) and wait for completion.
+/// Returns the session output when complete.
+///
+/// This is the new "in-runner" execution model that replaces independent process spawning.
+/// Claude runs as a child process, we wait for completion, then check checkpoint to continue.
+fn run_claude_session_inline(
+    working_dir: &str,
+    prompt: &str,
+    session_id: &str,
+    app_handle: &tauri::AppHandle,
+    timeout_seconds: u64,
+) -> Result<(bool, String), String> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    info!(
+        "Running Claude session inline: {} (timeout: {}s)",
+        session_id, timeout_seconds
+    );
+
+    // Write prompt to temp file
+    let temp_dir = std::env::temp_dir();
+    let prompt_file = temp_dir.join(format!("claude_session_{}.txt", session_id));
+    std::fs::write(&prompt_file, prompt)
+        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+
+    let prompt_content =
+        std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
+
+    // Spawn Claude CLI with stream-json output
+    let mut child = std::process::Command::new("cmd.exe")
+        .args([
+            "/c",
+            "claude",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--permission-mode",
+            "bypassPermissions",
+        ])
+        .current_dir(working_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
+
+    // Write prompt to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&prompt_content)
+            .map_err(|e| format!("Failed to write to Claude stdin: {}", e))?;
+    }
+
+    // Track activity for timeout
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last_activity = Arc::new(AtomicU64::new(now_secs));
+    let last_activity_stdout = last_activity.clone();
+
+    let has_output = Arc::new(AtomicBool::new(false));
+    let has_output_heartbeat = has_output.clone();
+
+    // Heartbeat thread
+    let app_handle_heartbeat = app_handle.clone();
+    let session_id_heartbeat = session_id.to_string();
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let start_time = Instant::now();
+
+    let heartbeat_handle = thread::spawn(move || {
+        let mut last_update = 0u64;
+        loop {
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+
+            if has_output_heartbeat.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            let elapsed_secs = start_time.elapsed().as_secs();
+            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
+                last_update = elapsed_secs;
+                let mins = elapsed_secs / 60;
+                let secs = elapsed_secs % 60;
+                let msg = if mins > 0 {
+                    format!(
+                        "⏳ Session {} processing... ({}m {}s)",
+                        session_id_heartbeat, mins, secs
+                    )
+                } else {
+                    format!(
+                        "⏳ Session {} processing... ({}s)",
+                        session_id_heartbeat, secs
+                    )
+                };
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    emit_ai_output(&app_handle_heartbeat, &msg, "status", None);
+                }));
+            }
+        }
+    });
+
+    // Stdout reader thread
+    let stdout = child.stdout.take();
+    let app_handle_stdout = app_handle.clone();
+    let has_output_stdout = has_output.clone();
+
+    let stdout_handle = thread::spawn(move || {
+        let mut all_text = String::new();
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            for line_result in reader.lines() {
+                if let Ok(line) = line_result {
+                    // Update activity time
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    last_activity_stdout.store(now, Ordering::Relaxed);
+
+                    // Extract text from JSON
+                    if let Some(text) = extract_text_from_stream_json(&line) {
+                        has_output_stdout.store(true, Ordering::Relaxed);
+                        if !text.is_empty() {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                emit_ai_output(&app_handle_stdout, &text, "claude", None);
+                            }));
+                            all_text.push_str(&text);
+                        }
+                    }
+                }
+            }
+        }
+        all_text
+    });
+
+    // Stderr reader thread
+    let stderr = child.stderr.take();
+    let stderr_handle = thread::spawn(move || {
+        let mut output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut output);
+        }
+        output
+    });
+
+    // Wait for process with inactivity timeout
+    let status = loop {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let last_activity_secs = last_activity.load(Ordering::Relaxed);
+        let inactive_secs = now_secs.saturating_sub(last_activity_secs);
+
+        if inactive_secs > timeout_seconds {
+            warn!(
+                "Session {} timed out after {}s of inactivity",
+                session_id, inactive_secs
+            );
+            let _ = child.kill();
+            thread::sleep(Duration::from_millis(500));
+            let _ = child.try_wait();
+            let _ = stop_tx.send(());
+            let _ = heartbeat_handle.join();
+            let _ = std::fs::remove_file(&prompt_file);
+            return Err(format!(
+                "Session timed out after {}s of inactivity",
+                inactive_secs
+            ));
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                let _ = stop_tx.send(());
+                let _ = heartbeat_handle.join();
+                let _ = std::fs::remove_file(&prompt_file);
+                return Err(format!("Failed to wait for Claude: {}", e));
+            }
+        }
+    };
+
+    // Cleanup
+    let _ = stop_tx.send(());
+    let _ = heartbeat_handle.join();
+    let all_output = stdout_handle.join().unwrap_or_default();
+    let stderr_output = stderr_handle.join().unwrap_or_default();
+    let _ = std::fs::remove_file(&prompt_file);
+
+    // Emit stderr if any
+    if !stderr_output.is_empty() {
+        for line in stderr_output.lines() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                emit_ai_output(app_handle, &format!("[stderr] {}", line), "claude", None);
+            }));
+        }
+    }
+
+    let success = status.success();
+    info!(
+        "Session {} completed: success={}, output_len={}",
+        session_id,
+        success,
+        all_output.len()
+    );
+
+    Ok((success, all_output))
+}
+
+/// Read the improve-all state file to check workflow progress
+fn read_improve_all_state(dev_logs_path: &std::path::Path) -> Option<serde_json::Value> {
+    let state_file = dev_logs_path.join("improve-all-state.json");
+    if !state_file.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&state_file).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// Check if the improve-all workflow is complete based on state file
+fn is_improve_all_complete(state: &serde_json::Value) -> bool {
+    // Check status field
+    if let Some(status) = state.get("status").and_then(|v| v.as_str()) {
+        if status == "completed" {
+            return true;
+        }
+    }
+
+    // Check current_part - if > 5, workflow is complete
+    if let Some(current_part) = state.get("current_part").and_then(|v| v.as_u64()) {
+        if current_part > 5 {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Get the continuation prompt for the next part of improve-all workflow
+fn get_improve_all_continuation_prompt(
+    state: &serde_json::Value,
+    scripts_path: &std::path::Path,
+) -> Option<String> {
+    let current_part = state.get("current_part").and_then(|v| v.as_u64())? as u32;
+
+    if current_part > 5 {
+        return None; // Workflow complete
+    }
+
+    // Part definitions matching improve-state.py
+    let (name, phases, command) = match current_part {
+        1 => ("Setup & Audit", "0-2", "/improve-part-1"),
+        2 => ("Security & Architecture", "3-4", "/improve-part-2"),
+        3 => ("Code Quality & Types", "5-6", "/improve-part-3"),
+        4 => ("TODOs & Features", "7-8", "/improve-part-4"),
+        5 => ("Final", "9-12", "/improve-part-5"),
+        _ => return None,
+    };
+
+    let state_file = scripts_path
+        .parent()?
+        .parent()?
+        .join(".dev-logs")
+        .join("improve-all-state.json");
+    let improve_state_script = scripts_path.join("improve-state.py");
+
+    Some(format!(
+        r#"{}
+
+Continue the improve-all sequential workflow.
+
+This is Part {}/5: {}
+Phases: {}
+
+Read the state file first to understand progress:
+Get-Content {}
+
+Work autonomously. Do not ask for user input.
+When done, run: python {} complete-part {}
+"#,
+        command,
+        current_part,
+        name,
+        phases,
+        state_file.display(),
+        improve_state_script.display(),
+        current_part
+    ))
+}
+
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
 
@@ -1572,6 +1871,24 @@ pub struct RestartRunnerRequest {
 // AI Developer (Persistent Mode) Request/Response Types
 // ============================================================================
 
+/// Execution mode for AI Developer sessions
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AiDeveloperExecutionMode {
+    /// Independent process mode (legacy) - spawns Claude as a separate process
+    Independent,
+    /// In-runner mode - runs Claude as a child process, waits for completion
+    /// Uses checkpoint-based continuation for multi-session workflows
+    InRunner,
+}
+
+impl Default for AiDeveloperExecutionMode {
+    fn default() -> Self {
+        // Default to in-runner mode (the new approach)
+        Self::InRunner
+    }
+}
+
 /// Request to spawn an AI Developer session (persistent mode)
 #[derive(Debug, Deserialize)]
 pub struct SpawnAiDeveloperRequest {
@@ -1591,6 +1908,14 @@ pub struct SpawnAiDeveloperRequest {
     /// If not provided, will use a default continuation prompt
     #[serde(default)]
     pub continuation_prompt: Option<String>,
+    /// Execution mode - in_runner (default) or independent
+    /// in_runner: Claude runs as child process, checkpoint-based continuation
+    /// independent: Claude runs as separate process (legacy)
+    #[serde(default)]
+    pub execution_mode: AiDeveloperExecutionMode,
+    /// Timeout in seconds for each session (default: 600)
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Response from spawning an AI Developer session
@@ -2197,9 +2522,10 @@ fn get_workspace_paths_internal(
 
 /// Spawn an AI Developer session (persistent mode)
 ///
-/// This creates a state file and spawns Claude as a completely independent process
-/// using spawn-independent-claude.py. The Claude process can restart any service
-/// including the runner itself.
+/// Supports two execution modes:
+/// - in_runner (default): Claude runs as a child process, waits for completion,
+///   uses checkpoint-based continuation for multi-session workflows
+/// - independent (legacy): Spawns Claude as a completely independent process
 ///
 /// If `uses_gui_automation` is true, the session will acquire an exclusive GUI lock
 /// to prevent multiple sessions from controlling mouse/keyboard simultaneously.
@@ -2219,10 +2545,12 @@ async fn spawn_ai_developer_http(
     let uses_gui_automation = request.uses_gui_automation;
     let continuation_prompt = request.continuation_prompt.clone();
     let prompt = request.prompt.clone();
+    let execution_mode = request.execution_mode;
+    let timeout_seconds = request.timeout_seconds.unwrap_or(600);
 
     info!(
-        "MCP API: Spawning AI Developer session: {} (max {} iterations, gui_automation: {})",
-        session_id, max_iterations, uses_gui_automation
+        "MCP API: Spawning AI Developer session: {} (mode: {:?}, max {} iterations, gui_automation: {}, timeout: {}s)",
+        session_id, execution_mode, max_iterations, uses_gui_automation, timeout_seconds
     );
 
     // Try to acquire GUI lock if needed
@@ -2251,6 +2579,366 @@ async fn spawn_ai_developer_http(
         }
     }
 
+    // Branch based on execution mode
+    match execution_mode {
+        AiDeveloperExecutionMode::InRunner => {
+            // In-runner mode: Run Claude as a child process with checkpoint-based continuation
+            spawn_ai_developer_in_runner(
+                state,
+                session_id,
+                prompt,
+                continuation_prompt,
+                max_iterations,
+                uses_gui_automation,
+                gui_lock_acquired,
+                timeout_seconds,
+            )
+            .await
+        }
+        AiDeveloperExecutionMode::Independent => {
+            // Independent mode: Spawn as separate process (legacy)
+            spawn_ai_developer_independent(
+                state,
+                session_id,
+                prompt,
+                continuation_prompt,
+                max_iterations,
+                uses_gui_automation,
+                gui_lock_acquired,
+            )
+            .await
+        }
+    }
+}
+
+/// Spawn AI Developer session in-runner mode (checkpoint-based continuation)
+///
+/// This runs Claude as a child process of the runner. When Claude exits,
+/// the runner checks the checkpoint file to determine if more work is needed.
+/// If so, it spawns another session automatically.
+async fn spawn_ai_developer_in_runner(
+    state: Arc<ApiState>,
+    session_id: String,
+    prompt: String,
+    continuation_prompt: Option<String>,
+    max_iterations: u32,
+    uses_gui_automation: bool,
+    gui_lock_acquired: bool,
+    timeout_seconds: u64,
+) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting in-runner AI Developer session: {}",
+        session_id
+    );
+
+    let (workspace_root, dev_logs_path, scripts_path) =
+        get_workspace_paths_internal().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get workspace paths: {}", e))),
+            )
+        })?;
+
+    let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
+    let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+
+    // Ensure .dev-logs directory exists
+    std::fs::create_dir_all(&dev_logs_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!(
+                "Failed to create dev-logs directory: {}",
+                e
+            ))),
+        )
+    })?;
+
+    // Create initial state file
+    let initial_state = serde_json::json!({
+        "session_id": session_id,
+        "iteration": 1,
+        "max_iterations": max_iterations,
+        "status": "running",
+        "execution_mode": "in_runner",
+        "started_at": chrono::Utc::now().to_rfc3339(),
+        "last_activity": chrono::Utc::now().to_rfc3339(),
+        "stop_requested": false,
+        "uses_gui_automation": uses_gui_automation,
+        "continuation_prompt": continuation_prompt.clone(),
+        "restart_permitted": false,
+        "current_action": "Running session",
+        "errors_fixed": [],
+        "errors_remaining": [],
+        "activity_log": ["Session started (in-runner mode)"]
+    });
+
+    std::fs::write(
+        &state_file,
+        serde_json::to_string_pretty(&initial_state).unwrap(),
+    )
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to write state file: {}", e))),
+        )
+    })?;
+
+    // Register session with manager
+    let ai_session = AiDeveloperSession {
+        session_id: session_id.clone(),
+        status: AiDeveloperStatus::Running,
+        iteration: 1,
+        max_iterations,
+        uses_gui_automation,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        last_activity: chrono::Utc::now().to_rfc3339(),
+        stop_requested: false,
+        state_file: state_file.to_string_lossy().to_string(),
+        log_file: log_file.to_string_lossy().to_string(),
+        prompt: prompt.clone(),
+        continuation_prompt: continuation_prompt.clone(),
+        errors_fixed: vec![],
+        errors_remaining: vec![],
+        activity_log: vec![format!(
+            "Session started (in-runner) at {}",
+            chrono::Utc::now().to_rfc3339()
+        )],
+    };
+    state.ai_developer_manager.add_session(ai_session).await;
+
+    // Spawn background task to run the workflow with checkpoint-based continuation
+    let state_clone = state.clone();
+    let session_id_for_task = session_id.clone();
+    let workspace_root_str = workspace_root.to_string_lossy().to_string();
+    let dev_logs_path_clone = dev_logs_path.clone();
+    let scripts_path_clone = scripts_path.clone();
+    let app_handle = state.app_handle.clone();
+
+    tokio::spawn(async move {
+        run_ai_developer_workflow_in_runner(
+            state_clone,
+            session_id_for_task,
+            prompt,
+            continuation_prompt,
+            max_iterations,
+            timeout_seconds,
+            workspace_root_str,
+            dev_logs_path_clone,
+            scripts_path_clone,
+            app_handle,
+        )
+        .await;
+    });
+
+    Ok(Json(ApiResponse::success(SpawnAiDeveloperResponse {
+        session_id,
+        state_file: state_file.to_string_lossy().to_string(),
+        log_file: log_file.to_string_lossy().to_string(),
+        pid: None, // No separate PID in in-runner mode
+        uses_gui_automation,
+        gui_lock_acquired,
+    })))
+}
+
+/// Run the AI Developer workflow in-runner with checkpoint-based continuation
+async fn run_ai_developer_workflow_in_runner(
+    state: Arc<ApiState>,
+    session_id: String,
+    initial_prompt: String,
+    continuation_prompt: Option<String>,
+    max_iterations: u32,
+    timeout_seconds: u64,
+    workspace_root: String,
+    dev_logs_path: std::path::PathBuf,
+    scripts_path: std::path::PathBuf,
+    app_handle: tauri::AppHandle,
+) {
+    info!(
+        "MCP API: Running in-runner workflow for session {}",
+        session_id
+    );
+
+    let mut iteration = 1u32;
+    let mut current_prompt = initial_prompt;
+
+    loop {
+        // Check if stop requested
+        if let Some(session) = state.ai_developer_manager.get_session(&session_id).await {
+            if session.stop_requested {
+                info!(
+                    "MCP API: Stop requested for session {}, ending workflow",
+                    session_id
+                );
+                finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Stopped)
+                    .await;
+                return;
+            }
+        } else {
+            warn!(
+                "MCP API: Session {} not found in manager, stopping",
+                session_id
+            );
+            return;
+        }
+
+        // Check iteration limit
+        if iteration > max_iterations {
+            info!(
+                "MCP API: Session {} reached max iterations ({})",
+                session_id, max_iterations
+            );
+            finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Completed).await;
+            return;
+        }
+
+        info!(
+            "MCP API: Running iteration {} of session {}",
+            iteration, session_id
+        );
+
+        // Emit status update
+        emit_ai_output(
+            &app_handle,
+            &format!(
+                "🚀 Starting iteration {} of session {}",
+                iteration, session_id
+            ),
+            "status",
+            None,
+        );
+
+        // Run Claude session inline (as child process)
+        let session_id_iter = format!("{}-iter{}", session_id, iteration);
+        let result = tokio::task::spawn_blocking({
+            let workspace_root = workspace_root.clone();
+            let current_prompt = current_prompt.clone();
+            let app_handle = app_handle.clone();
+            move || {
+                run_claude_session_inline(
+                    &workspace_root,
+                    &current_prompt,
+                    &session_id_iter,
+                    &app_handle,
+                    timeout_seconds,
+                )
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok((success, _output))) => {
+                if !success {
+                    warn!(
+                        "MCP API: Session {} iteration {} completed with error",
+                        session_id, iteration
+                    );
+                    // Continue anyway - Claude might have fixed something
+                }
+
+                // Update session state
+                if let Some(mut session) = state.ai_developer_manager.get_session(&session_id).await
+                {
+                    session.iteration = iteration;
+                    session.last_activity = chrono::Utc::now().to_rfc3339();
+                    session.activity_log.push(format!(
+                        "Iteration {} completed at {}",
+                        iteration,
+                        chrono::Utc::now().to_rfc3339()
+                    ));
+                    state.ai_developer_manager.update_session(session).await;
+                }
+
+                // Check checkpoint to determine if more work is needed
+                if let Some(improve_state) = read_improve_all_state(&dev_logs_path) {
+                    if is_improve_all_complete(&improve_state) {
+                        info!(
+                            "MCP API: Session {} workflow complete (checkpoint indicates done)",
+                            session_id
+                        );
+                        emit_ai_output(
+                            &app_handle,
+                            "✅ Workflow complete! All phases finished.",
+                            "status",
+                            None,
+                        );
+                        finalize_ai_developer_session(
+                            &state,
+                            &session_id,
+                            AiDeveloperStatus::Completed,
+                        )
+                        .await;
+                        return;
+                    }
+
+                    // Get next continuation prompt based on checkpoint
+                    if let Some(next_prompt) =
+                        get_improve_all_continuation_prompt(&improve_state, &scripts_path)
+                    {
+                        current_prompt = next_prompt;
+                        iteration += 1;
+
+                        // Small delay between iterations
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+
+                // No checkpoint-based continuation - use provided continuation prompt or end
+                if let Some(ref cont_prompt) = continuation_prompt {
+                    current_prompt = cont_prompt.clone();
+                    iteration += 1;
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    continue;
+                }
+
+                // No more work to do
+                info!(
+                    "MCP API: Session {} completed (no continuation needed)",
+                    session_id
+                );
+                finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Completed)
+                    .await;
+                return;
+            }
+            Ok(Err(e)) => {
+                error!(
+                    "MCP API: Session {} iteration {} failed: {}",
+                    session_id, iteration, e
+                );
+                emit_ai_output(
+                    &app_handle,
+                    &format!("❌ Session failed: {}", e),
+                    "status",
+                    None,
+                );
+                finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Failed).await;
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "MCP API: Session {} spawn_blocking error: {}",
+                    session_id, e
+                );
+                finalize_ai_developer_session(&state, &session_id, AiDeveloperStatus::Failed).await;
+                return;
+            }
+        }
+    }
+}
+
+/// Spawn AI Developer session in independent mode (legacy)
+///
+/// This spawns Claude as a completely independent process using spawn-independent-claude.py.
+/// The Claude process can restart any service including the runner itself.
+async fn spawn_ai_developer_independent(
+    state: Arc<ApiState>,
+    session_id: String,
+    prompt: String,
+    continuation_prompt: Option<String>,
+    max_iterations: u32,
+    uses_gui_automation: bool,
+    gui_lock_acquired: bool,
+) -> Result<Json<ApiResponse<SpawnAiDeveloperResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Clone values for the blocking task
     let session_id_clone = session_id.clone();
     let prompt_clone = prompt.clone();
@@ -2274,6 +2962,7 @@ async fn spawn_ai_developer_http(
             "iteration": 1,
             "max_iterations": max_iterations,
             "status": "starting",
+            "execution_mode": "independent",
             "started_at": chrono::Utc::now().to_rfc3339(),
             "last_activity": chrono::Utc::now().to_rfc3339(),
             "stop_requested": false,
@@ -3076,6 +3765,167 @@ async fn resume_ai_developer_sessions_on_startup(state: Arc<ApiState>) {
         "MCP API: Resumed {} AI Developer session(s) on startup",
         sessions_resumed
     );
+}
+
+/// Resume incomplete improve-all workflow on startup
+///
+/// This checks for an incomplete improve-all-state.json file and
+/// automatically starts a new session to continue the workflow.
+async fn resume_improve_all_workflow_on_startup(state: Arc<ApiState>) {
+    info!("MCP API: Checking for incomplete improve-all workflows...");
+
+    let (workspace_root, dev_logs_path, scripts_path) = match get_workspace_paths_internal() {
+        Ok(paths) => paths,
+        Err(e) => {
+            warn!(
+                "MCP API: Failed to get workspace paths for improve-all resume: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    // Check if improve-all-state.json exists and is incomplete
+    let improve_state = match read_improve_all_state(&dev_logs_path) {
+        Some(state) => state,
+        None => {
+            info!("MCP API: No improve-all state file found, nothing to resume");
+            return;
+        }
+    };
+
+    // Check if workflow is complete
+    if is_improve_all_complete(&improve_state) {
+        info!("MCP API: Improve-all workflow is already complete");
+        return;
+    }
+
+    // Check for restart_permitted flag
+    let restart_permitted = improve_state
+        .get("restart_permitted")
+        .and_then(|v| {
+            // Handle both object and bool formats
+            if let Some(b) = v.as_bool() {
+                return Some(b);
+            }
+            v.get("permitted").and_then(|p| p.as_bool())
+        })
+        .unwrap_or(false);
+
+    if !restart_permitted {
+        info!(
+            "MCP API: Improve-all workflow is incomplete but restart_permitted=false, not resuming"
+        );
+        // Emit notification to UI
+        emit_ai_output(
+            &state.app_handle,
+            "⚠️ Incomplete improve-all workflow found but restart not permitted. Set restart_permitted=true to resume.",
+            "status",
+            None,
+        );
+        return;
+    }
+
+    // Get continuation prompt for next part
+    let continuation_prompt =
+        match get_improve_all_continuation_prompt(&improve_state, &scripts_path) {
+            Some(prompt) => prompt,
+            None => {
+                info!("MCP API: Could not generate continuation prompt for improve-all");
+                return;
+            }
+        };
+
+    let current_part = improve_state
+        .get("current_part")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+
+    info!(
+        "MCP API: Resuming improve-all workflow at part {}",
+        current_part
+    );
+
+    // Emit status
+    emit_ai_output(
+        &state.app_handle,
+        &format!(
+            "🔄 Resuming improve-all workflow at part {}/5",
+            current_part
+        ),
+        "status",
+        None,
+    );
+
+    // Clear restart_permitted flag
+    let state_file = dev_logs_path.join("improve-all-state.json");
+    if let Ok(content) = std::fs::read_to_string(&state_file) {
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(obj) = json.as_object_mut() {
+                obj.remove("restart_permitted");
+                if let Ok(updated) = serde_json::to_string_pretty(&json) {
+                    let _ = std::fs::write(&state_file, updated);
+                }
+            }
+        }
+    }
+
+    // Generate session ID
+    let run_id = improve_state
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let session_id = format!("improve-all-resume-part{}-{}", current_part, run_id);
+
+    // Spawn the workflow
+    let workspace_root_str = workspace_root.to_string_lossy().to_string();
+    let dev_logs_path_clone = dev_logs_path.clone();
+    let scripts_path_clone = scripts_path.clone();
+    let app_handle = state.app_handle.clone();
+
+    // Register session with manager
+    let ai_session = AiDeveloperSession {
+        session_id: session_id.clone(),
+        status: AiDeveloperStatus::Running,
+        iteration: 1,
+        max_iterations: 10,
+        uses_gui_automation: false,
+        started_at: chrono::Utc::now().to_rfc3339(),
+        last_activity: chrono::Utc::now().to_rfc3339(),
+        stop_requested: false,
+        state_file: state_file.to_string_lossy().to_string(),
+        log_file: dev_logs_path
+            .join(format!("claude-session-{}.log", session_id))
+            .to_string_lossy()
+            .to_string(),
+        prompt: continuation_prompt.clone(),
+        continuation_prompt: None,
+        errors_fixed: vec![],
+        errors_remaining: vec![],
+        activity_log: vec![format!(
+            "Session resumed on startup at {}",
+            chrono::Utc::now().to_rfc3339()
+        )],
+    };
+    state.ai_developer_manager.add_session(ai_session).await;
+
+    // Start the workflow
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        run_ai_developer_workflow_in_runner(
+            state_clone,
+            session_id,
+            continuation_prompt,
+            None, // No custom continuation prompt - use checkpoint-based
+            10,   // max iterations
+            600,  // timeout
+            workspace_root_str,
+            dev_logs_path_clone,
+            scripts_path_clone,
+            app_handle,
+        )
+        .await;
+    });
 }
 
 /// Read the current state of an AI Developer session
@@ -5239,17 +6089,15 @@ async fn start_workflow_run(
     Ok(Json(ApiResponse::success(WorkflowRunResponse { run })))
 }
 
-/// Workflow execution loop using independent sessions.
+/// Workflow execution loop using in-runner sessions.
 ///
-/// Spawns each session as an independent process using spawn-independent-claude.py.
-/// This allows sessions to survive runner restarts, making long-running workflows
-/// more robust.
+/// Runs each session as a child process of the runner (no terminal window).
+/// Claude runs inline with streaming output to the UI.
 ///
 /// The loop:
-/// 1. Spawns a session independently
-/// 2. Polls for completion (checking completion marker file)
-/// 3. Reads checkpoint to determine if workflow is complete
-/// 4. If not complete, spawns next session
+/// 1. Runs Claude session inline (as child process)
+/// 2. Reads checkpoint to determine if workflow is complete
+/// 3. If not complete, runs next session
 async fn run_workflow_loop(
     state: Arc<ApiState>,
     workflow_id: String,
@@ -5260,14 +6108,14 @@ async fn run_workflow_loop(
     let mut current_prompt_content = prompt.content.clone();
 
     info!(
-        "Starting workflow execution loop for {} (independent mode)",
+        "Starting workflow execution loop for {} (in-runner mode)",
         workflow_id
     );
     log_workflow_event(
         &workflow_id,
         "loop_started",
         &format!(
-            "Workflow execution loop started for '{}' (independent mode)",
+            "Workflow execution loop started for '{}' (in-runner mode)",
             prompt.name
         ),
     );
@@ -5296,7 +6144,16 @@ async fn run_workflow_loop(
     } else {
         1800 // Default 30 minutes
     };
-    let poll_interval_secs = 5; // Check every 5 seconds
+
+    // Get workspace root for running Claude
+    let workspace_root = match get_workspace_paths_internal() {
+        Ok((root, _, _)) => root.to_string_lossy().to_string(),
+        Err(e) => {
+            error!("Failed to get workspace root: {}", e);
+            state.workflow_manager.fail_workflow(&workflow_id, &e).await;
+            return;
+        }
+    };
 
     loop {
         session_count += 1;
@@ -5324,44 +6181,60 @@ async fn run_workflow_loop(
             &workflow_id,
             "session_started",
             &format!(
-                "Session {} started (#{} in workflow, independent mode)",
+                "Session {} started (#{} in workflow, in-runner mode)",
                 session_id, session_count
             ),
         );
 
-        // Spawn session as independent process
-        let spawn_result = spawn_workflow_session_independent(
-            &current_prompt_content,
-            &session_id,
+        // Emit status to frontend
+        emit_ai_output(
             &state.app_handle,
-            &action_id,
+            &format!("🚀 Starting session {} (#{})...", session_id, session_count),
+            "status",
+            Some(&action_id),
         );
 
-        let session_result = match spawn_result {
-            Ok(result) => {
-                // Wait for session to complete by polling completion marker
-                let wait_result = wait_for_session_completion(
-                    &result.completion_marker,
-                    &state.app_handle,
-                    &action_id,
-                    timeout_secs,
-                    poll_interval_secs,
-                )
-                .await;
+        // Run session inline (as child process, no terminal window)
+        let workspace_root_clone = workspace_root.clone();
+        let current_prompt_clone = current_prompt_content.clone();
+        let session_id_clone = session_id.clone();
+        let app_handle = state.app_handle.clone();
+        let timeout = timeout_secs;
 
-                // Clean up session files
-                cleanup_session_files(&session_id);
-
-                wait_result
-            }
-            Err(e) => Err(e),
-        };
+        let session_result = tokio::task::spawn_blocking(move || {
+            run_claude_session_inline(
+                &workspace_root_clone,
+                &current_prompt_clone,
+                &session_id_clone,
+                &app_handle,
+                timeout,
+            )
+        })
+        .await;
 
         // Session ended - clear active session ID
         state
             .workflow_manager
             .set_active_session(&workflow_id, None)
             .await;
+
+        // Convert spawn_blocking result to session result
+        let session_result: Result<(), String> = match session_result {
+            Ok(Ok((success, _output))) => {
+                if success {
+                    Ok(())
+                } else {
+                    // Session completed but with error - continue anyway
+                    warn!(
+                        "Session {} completed with error, continuing workflow",
+                        session_id
+                    );
+                    Ok(())
+                }
+            }
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(format!("Task panicked: {}", e)),
+        };
 
         // Handle session result
         if let Err(e) = session_result {
@@ -5635,8 +6508,43 @@ async fn resume_workflow_monitoring(
         let completion_marker =
             dev_logs_path.join(format!("claude-session-{}.completed", session_id));
 
-        if !completion_marker.exists() {
-            // Session is still running - resume polling
+        if completion_marker.exists() {
+            info!(
+                "Session {} already completed while runner was down",
+                session_id
+            );
+            // Clear the session
+            state
+                .workflow_manager
+                .set_active_session(&workflow_id, None)
+                .await;
+            cleanup_session_files(session_id);
+        } else if auto_continue {
+            // CRITICAL FIX: When runner restarts, child processes (Claude CLI) are killed.
+            // Don't wait for a session that's no longer running - just clear it and continue.
+            // The continuation loop below will spawn a fresh session.
+            warn!(
+                "Session {} was active when runner restarted, but runner restart kills child processes. Skipping wait, will spawn new session.",
+                session_id
+            );
+            emit_ai_output(
+                &state.app_handle,
+                &format!(
+                    "⚠️ Previous session {} was interrupted by runner restart. Will spawn a new session to continue.",
+                    session_id
+                ),
+                "status",
+                Some(&action_id),
+            );
+
+            // Clear the session and clean up files
+            state
+                .workflow_manager
+                .set_active_session(&workflow_id, None)
+                .await;
+            cleanup_session_files(session_id);
+        } else {
+            // No auto_continue - we have to wait and hope the session is still running
             emit_ai_output(
                 &state.app_handle,
                 &format!(
@@ -5680,17 +6588,6 @@ async fn resume_workflow_monitoring(
                 let _ = workflow_monitor::WorkflowManager::clear_persisted_state();
                 return;
             }
-        } else {
-            info!(
-                "Session {} already completed while runner was down",
-                session_id
-            );
-            // Clear the session
-            state
-                .workflow_manager
-                .set_active_session(&workflow_id, None)
-                .await;
-            cleanup_session_files(session_id);
         }
     }
 
@@ -5991,6 +6888,9 @@ pub fn create_router(
 
         // Also restore AI Developer sessions that need resumption
         resume_ai_developer_sessions_on_startup(state_for_restore.clone()).await;
+
+        // Check for incomplete improve-all workflows and offer to resume
+        resume_improve_all_workflow_on_startup(state_for_restore.clone()).await;
     });
 
     // Configure CORS to allow requests from WSL

@@ -212,6 +212,7 @@ pub struct TaskTracker {
     start_time: Instant,
 }
 
+#[allow(dead_code)]
 impl TaskTracker {
     pub fn new(name: &str) -> Self {
         log_lifecycle("TASK", &format!("Started: {}", name));

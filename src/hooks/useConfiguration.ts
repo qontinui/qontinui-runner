@@ -9,15 +9,40 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { eventRouter } from "../managers";
+import type { CommandResponse } from "../types/displayProfile";
+
+export interface ConfigImage {
+  id: string;
+  name?: string;
+  path?: string;
+  data?: string;
+  [key: string]: unknown;
+}
+
+export interface StateImage {
+  id: string;
+  name?: string;
+  patterns?: unknown[];
+  [key: string]: unknown;
+}
+
+export interface ConfigState {
+  id: string;
+  name: string;
+  description?: string;
+  images?: ConfigImage[];
+  stateImages?: StateImage[];
+  [key: string]: unknown;
+}
 
 export interface Config {
   name: string;
   version: string;
   statesCount: number;
   workflowsCount: number;
-  workflows: any[];
-  images?: any[];
-  states?: any[];
+  workflows: Workflow[];
+  images?: ConfigImage[];
+  states?: ConfigState[];
   path: string;
 }
 
@@ -26,6 +51,30 @@ export interface Workflow {
   name: string;
   category?: string;
   visibility?: string;
+  [key: string]: unknown;
+}
+
+interface LoadConfigurationData {
+  states?: ConfigState[];
+  workflows?: Workflow[];
+  images?: ConfigImage[];
+}
+
+interface LoadConfigurationResponse extends CommandResponse<LoadConfigurationData> {
+  success: boolean;
+  message?: string;
+  data?: LoadConfigurationData;
+}
+
+interface ConfigLoadedEventPayload {
+  data?: {
+    path?: string;
+    config?: {
+      states?: ConfigState[];
+      workflows?: Workflow[];
+      images?: ConfigImage[];
+    };
+  };
 }
 
 interface UseConfigurationOptions {
@@ -70,7 +119,9 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
       onLog?.("info", `Loading configuration: ${configPath}`);
 
       try {
-        const result: any = await invoke("load_configuration", { path: configPath });
+        const result = await invoke<LoadConfigurationResponse>("load_configuration", {
+          path: configPath,
+        });
         console.log("[CONFIG] load_configuration result:", result);
 
         if (result.success) {
@@ -99,7 +150,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
           const allWorkflows = result.data?.workflows || [];
 
           console.log("All workflows loaded:", allWorkflows.length);
-          allWorkflows.forEach((w: any) => {
+          allWorkflows.forEach((w) => {
             console.log(
               `Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}", Visibility: "${w.visibility || "public"}"`,
             );
@@ -107,14 +158,14 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
           // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
           const mainWorkflows = allWorkflows.filter(
-            (w: any) =>
+            (w) =>
               w.category &&
               w.category.toLowerCase() === "main" &&
               (!w.visibility || w.visibility !== "internal"),
           );
 
           console.log("Filtered main workflows:", mainWorkflows.length);
-          mainWorkflows.forEach((w: any) => {
+          mainWorkflows.forEach((w) => {
             console.log(`Main workflow: ${w.name} (ID: ${w.id})`);
           });
 
@@ -134,7 +185,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
           if (allWorkflows.length > 0) {
             const categoryCounts: { [key: string]: number } = {};
             const visibilityCounts: { [key: string]: number } = {};
-            allWorkflows.forEach((w: any) => {
+            allWorkflows.forEach((w) => {
               const cat = w.category || "No category";
               const vis = w.visibility || "public";
               categoryCounts[cat] = (categoryCounts[cat] || 0) + 1;
@@ -196,13 +247,21 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
   const autoLoadLastConfig = useCallback(async () => {
     try {
       // Check if auto-load is enabled
-      const autoLoadResult: any = await invoke("get_auto_load_last_config");
+      const autoLoadResult = await invoke<CommandResponse<{ enabled?: boolean }>>(
+        "get_auto_load_last_config",
+      );
       if (!autoLoadResult.success || !autoLoadResult.data?.enabled) {
         console.log("[CONFIG] Auto-load last config is disabled");
         return;
       }
 
-      const result: any = await invoke("get_last_config_path");
+      const result = await invoke<
+        CommandResponse<{
+          path?: string;
+          workflow_id?: string | null;
+          monitor_index?: number | null;
+        }>
+      >("get_last_config_path");
       if (result.success && result.data?.path) {
         const workflowId = result.data?.workflow_id || null;
         const monitorIndex = result.data?.monitor_index ?? null;
@@ -253,7 +312,13 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
   const loadLastConfiguration = useCallback(async () => {
     console.log("[CONFIG] loadLastConfiguration called");
     try {
-      const result: any = await invoke("get_last_config_path");
+      const result = await invoke<
+        CommandResponse<{
+          path?: string;
+          workflow_id?: string | null;
+          monitor_index?: number | null;
+        }>
+      >("get_last_config_path");
       if (result.success && result.data?.path) {
         const workflowId = result.data?.workflow_id || null;
         const monitorIndex = result.data?.monitor_index ?? null;
@@ -286,7 +351,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
    * This allows the frontend to update when config is loaded via HTTP API
    */
   useEffect(() => {
-    const handleConfigLoaded = (payload: any) => {
+    const handleConfigLoaded = (payload: ConfigLoadedEventPayload) => {
       console.log("[CONFIG] Received config_loaded event from MCP API:", payload);
 
       const configPath = payload.data?.path;
@@ -333,7 +398,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
       // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
       const mainWorkflows = allWorkflows.filter(
-        (w: any) =>
+        (w) =>
           w.category &&
           w.category.toLowerCase() === "main" &&
           (!w.visibility || w.visibility !== "internal"),

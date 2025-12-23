@@ -102,7 +102,7 @@ function Section({ title, children, className }: SectionProps) {
  * Code block component for JSON display
  */
 interface CodeBlockProps {
-  data: any;
+  data: unknown;
   title?: string;
 }
 
@@ -352,19 +352,35 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                               Match Results ({topMatches.length} found):
                             </div>
                             <div className="space-y-1 pl-4">
-                              {topMatches.map((match: any, idx: number) => (
-                                <div
-                                  key={idx}
-                                  className="text-xs font-mono bg-muted/20 p-2 rounded border border-border"
-                                >
-                                  <span className="text-muted-foreground">{idx + 1}.</span> [
-                                  {match.location.x}, {match.location.y}, {match.dimensions.w},{" "}
-                                  {match.dimensions.h}]{" "}
-                                  <span className="text-green-400">
-                                    confidence: {(match.confidence * 100).toFixed(1)}%
-                                  </span>
-                                </div>
-                              ))}
+                              {topMatches.map((match: unknown, idx: number) => {
+                                if (
+                                  typeof match !== "object" ||
+                                  match === null ||
+                                  !("location" in match) ||
+                                  !("dimensions" in match) ||
+                                  !("confidence" in match)
+                                ) {
+                                  return null;
+                                }
+                                const typedMatch = match as {
+                                  location: { x: number; y: number };
+                                  dimensions: { w: number; h: number };
+                                  confidence: number;
+                                };
+                                return (
+                                  <div
+                                    key={idx}
+                                    className="text-xs font-mono bg-muted/20 p-2 rounded border border-border"
+                                  >
+                                    <span className="text-muted-foreground">{idx + 1}.</span> [
+                                    {typedMatch.location.x}, {typedMatch.location.y},{" "}
+                                    {typedMatch.dimensions.w}, {typedMatch.dimensions.h}]{" "}
+                                    <span className="text-green-400">
+                                      confidence: {(typedMatch.confidence * 100).toFixed(1)}%
+                                    </span>
+                                  </div>
+                                );
+                              })}
                             </div>
                           </div>
                         ) as React.ReactNode;
@@ -401,9 +417,10 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                               if (!location || typeof location !== "object" || location === null)
                                 return null;
                               if (!("x" in location) || !("y" in location)) return null;
+                              const typedLocation = location as { x: number; y: number };
                               return (
                                 <div>
-                                  Location: ({(location as any).x}, {(location as any).y})
+                                  Location: ({typedLocation.x}, {typedLocation.y})
                                 </div>
                               ) as React.ReactNode;
                             })()}
@@ -415,9 +432,10 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                               )
                                 return null;
                               if (!("w" in dimensions) || !("h" in dimensions)) return null;
+                              const typedDimensions = dimensions as { w: number; h: number };
                               return (
                                 <div>
-                                  Dimensions: {(dimensions as any).w} x {(dimensions as any).h}
+                                  Dimensions: {typedDimensions.w} x {typedDimensions.h}
                                 </div>
                               ) as React.ReactNode;
                             })()}
@@ -464,12 +482,13 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                         return null;
                       }
 
+                      const typedClickedAt = clickedAt as { x: number; y: number };
                       return (
                         <div>
                           <div className="font-medium mb-1">Click Details:</div>
                           <div className="pl-4 space-y-1 text-xs">
                             <div>
-                              Position: ({(clickedAt as any).x}, {(clickedAt as any).y})
+                              Position: ({typedClickedAt.x}, {typedClickedAt.y})
                             </div>
                             {button && <div>Button: {button}</div>}
                             {targetType && <div>Target Type: {targetType}</div>}

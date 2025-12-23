@@ -4,6 +4,16 @@ import { Settings as SettingsIcon } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { AppSettings, LogFunction } from "./types";
 
+interface TauriResult<T> {
+  success: boolean;
+  data?: T;
+  message?: string;
+}
+
+interface AutoLoadConfigData {
+  enabled: boolean;
+}
+
 interface GeneralSettingsProps {
   onLog: LogFunction;
 }
@@ -19,7 +29,7 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
 
   const loadAppSettings = async () => {
     try {
-      const result: any = await invoke("get_auto_load_last_config");
+      const result = await invoke<TauriResult<AutoLoadConfigData>>("get_auto_load_last_config");
       if (result && result.success && result.data) {
         setAppSettings({
           auto_load_last_config: result.data.enabled || false,
@@ -38,7 +48,9 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
     }));
 
     try {
-      const result: any = await invoke("save_auto_load_last_config", { enabled: newValue });
+      const result = await invoke<TauriResult<null>>("save_auto_load_last_config", {
+        enabled: newValue,
+      });
       if (result && result.success) {
         onLog("success", `Auto-load last config ${newValue ? "enabled" : "disabled"}`);
       } else {

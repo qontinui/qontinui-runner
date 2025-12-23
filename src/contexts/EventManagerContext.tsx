@@ -6,6 +6,7 @@
  */
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
+import { Event } from "@tauri-apps/api/event";
 import { eventRouter, logManager } from "../managers";
 import { verificationService } from "../services";
 
@@ -104,7 +105,7 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
         console.log("[EVENT_MGR] Setting up Tauri event listeners");
 
         // Listen for executor events
-        const unlistenExecutorFn = await listen("executor-event", (event: any) => {
+        const unlistenExecutorFn = await listen("executor-event", (event: Event<unknown>) => {
           // Prevent processing events if component is unmounted
           if (!isMounted) {
             console.log("[EVENT_MGR] Component unmounted, ignoring event");
@@ -118,19 +119,22 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
         });
 
         // Listen for AI output events
-        const unlistenAiOutputFn = await listen("ai-output", (event: any) => {
-          if (!isMounted) {
-            return;
-          }
+        const unlistenAiOutputFn = await listen(
+          "ai-output",
+          (event: Event<{ line?: string; source?: string; actionId?: string }>) => {
+            if (!isMounted) {
+              return;
+            }
 
-          const data = event.payload;
-          console.log("[EVENT_MGR] AI output event:", data.source, data.line?.substring(0, 50));
+            const data = event.payload;
+            console.log("[EVENT_MGR] AI output event:", data.source, data.line?.substring(0, 50));
 
-          // Route AI output to LogManager
-          if (data.line !== undefined && data.source !== undefined) {
-            logManager.addAiOutputLog(data.line, data.source, data.actionId);
-          }
-        });
+            // Route AI output to LogManager
+            if (data.line !== undefined && data.source !== undefined) {
+              logManager.addAiOutputLog(data.line, data.source, data.actionId);
+            }
+          },
+        );
 
         unlistenExecutor = unlistenExecutorFn;
         unlistenAiOutput = unlistenAiOutputFn;

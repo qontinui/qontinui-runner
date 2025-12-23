@@ -6,6 +6,14 @@
  */
 
 import { logManager, actionLogManager, windowManager } from "./index";
+import type { EventRouter } from "./EventRouter";
+import type {
+  ErrorEventPayload,
+  LogEventPayload,
+  ImageRecognitionEventPayload,
+  ActionEventPayload,
+  AiOutputStreamEventPayload,
+} from "../types/eventPayloads";
 
 interface ExecutionContextActions {
   setPythonStatus: (status: "stopped" | "running") => void;
@@ -20,7 +28,7 @@ interface ExecutionContextActions {
  * @returns Cleanup function to unsubscribe all handlers
  */
 export function setupEventHandlers(
-  eventRouter: any,
+  eventRouter: EventRouter,
   executionActions: ExecutionContextActions,
 ): () => void {
   const { setPythonStatus, setConfigLoaded, setExecutionActive } = executionActions;
@@ -68,7 +76,7 @@ export function setupEventHandlers(
 
   // Handler for "error" event
   unsubscribers.push(
-    eventRouter.subscribe("error", (payload: any) => {
+    eventRouter.subscribe("error", (payload: ErrorEventPayload) => {
       console.log("[EVENT_HANDLER] error event received:", payload.data);
       const errorMessage = payload.data?.message || "Unknown error occurred";
       logManager.addLog("error", errorMessage);
@@ -77,10 +85,18 @@ export function setupEventHandlers(
 
   // Handler for "log" event
   unsubscribers.push(
-    eventRouter.subscribe("log", (payload: any) => {
+    eventRouter.subscribe("log", (payload: LogEventPayload) => {
       console.log("[EVENT_HANDLER] log event received");
-      const level = payload.data?.level || "info";
+      const levelStr = payload.data?.level || "info";
       const message = payload.data?.message || "";
+
+      // Type guard to ensure level is a valid log level
+      const validLevels = ["info", "warning", "error", "debug", "success"] as const;
+      type ValidLevel = (typeof validLevels)[number];
+      const level: ValidLevel = validLevels.includes(levelStr as ValidLevel)
+        ? (levelStr as ValidLevel)
+        : "info";
+
       logManager.addLog(level, message);
     }),
   );
@@ -95,7 +111,7 @@ export function setupEventHandlers(
 
   // Handler for "image_recognition" event
   unsubscribers.push(
-    eventRouter.subscribe("image_recognition", (payload: any) => {
+    eventRouter.subscribe("image_recognition", (payload: ImageRecognitionEventPayload) => {
       console.log("[EVENT_HANDLER] image_recognition event received");
       const data = payload.data;
 
@@ -111,7 +127,7 @@ export function setupEventHandlers(
 
   // Handler for "action_started" event
   unsubscribers.push(
-    eventRouter.subscribe("action_started", (payload: any) => {
+    eventRouter.subscribe("action_started", (payload: ActionEventPayload) => {
       const actionType = payload.data?.action_type || payload.data?.type || "Unknown";
       logManager.addLog("debug", `Action started: ${actionType}`);
     }),
@@ -119,7 +135,7 @@ export function setupEventHandlers(
 
   // Handler for "action_completed" event
   unsubscribers.push(
-    eventRouter.subscribe("action_completed", (payload: any) => {
+    eventRouter.subscribe("action_completed", (payload: ActionEventPayload) => {
       const actionType = payload.data?.action_type || payload.data?.type || "Unknown";
       logManager.addLog("debug", `Action completed: ${actionType}`);
     }),
@@ -127,7 +143,7 @@ export function setupEventHandlers(
 
   // Handler for "ai_output_stream" event - streams Claude's output in real-time
   unsubscribers.push(
-    eventRouter.subscribe("ai_output_stream", (payload: any) => {
+    eventRouter.subscribe("ai_output_stream", (payload: AiOutputStreamEventPayload) => {
       const data = payload.data;
       if (!data) {
         console.warn("[EVENT_HANDLER] ai_output_stream event has no data");

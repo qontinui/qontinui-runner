@@ -4,6 +4,27 @@ import { HardDrive, FolderOpen, Trash2, Trash } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { StorageUsage, StoragePaths, LogFunction } from "./types";
 
+interface TauriResult<T> {
+  success: boolean;
+  data?: T;
+  message?: string;
+}
+
+interface StorageUsageData {
+  screenshots_mb: number;
+  videos_mb: number;
+  screenshot_count: number;
+  video_count: number;
+}
+
+interface StoragePathsData {
+  screenshot_path: string;
+  video_path: string;
+  max_screenshot_mb: number;
+  max_video_mb: number;
+  auto_cleanup: boolean;
+}
+
 interface StorageSettingsProps {
   onLog: LogFunction;
 }
@@ -32,7 +53,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
     try {
       setStorageLoading(true);
 
-      const usageResult: any = await invoke("get_local_storage_usage");
+      const usageResult = await invoke<TauriResult<StorageUsageData>>("get_local_storage_usage");
       if (usageResult && usageResult.success && usageResult.data) {
         setStorageUsage({
           screenshots: usageResult.data.screenshots_mb || 0,
@@ -42,7 +63,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
         });
       }
 
-      const pathsResult: any = await invoke("get_storage_paths");
+      const pathsResult = await invoke<TauriResult<StoragePathsData>>("get_storage_paths");
       if (pathsResult && pathsResult.success && pathsResult.data) {
         setStoragePaths({
           screenshot_path: pathsResult.data.screenshot_path || "",
@@ -61,7 +82,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
 
   const handleDeleteOldSessions = async (type: "screenshots" | "videos", days: number) => {
     try {
-      const result: any = await invoke("delete_old_sessions", {
+      const result = await invoke<TauriResult<null>>("delete_old_sessions", {
         storageType: type,
         olderThanDays: days,
       });
@@ -86,7 +107,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
     }
 
     try {
-      const result: any = await invoke("clear_all_storage");
+      const result = await invoke<TauriResult<null>>("clear_all_storage");
 
       if (result && result.success) {
         onLog("success", "All storage cleared successfully");

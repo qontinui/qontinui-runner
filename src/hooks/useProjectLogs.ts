@@ -14,7 +14,7 @@ import type {
   LogSourceContent,
   ProjectLogsState,
 } from "../types/projectLogs";
-import { createLogSource, createProjectLogConfig, generateLogSourceId } from "../types/projectLogs";
+import { createLogSource, createProjectLogConfig } from "../types/projectLogs";
 
 interface CommandResponse {
   success: boolean;

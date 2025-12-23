@@ -14,6 +14,20 @@ import type { ConnectionInfo, Project } from "../../types/auth";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 
+interface TauriResult<T> {
+  success: boolean;
+  data?: T;
+  message?: string;
+}
+
+interface WebSocketConfig {
+  enabled: boolean;
+  url: string;
+  token: string;
+  project_id: string | null;
+  runner_name: string | null;
+}
+
 interface AuthConnectionSettingsProps {
   onLog: (level: "success" | "error" | "info", message: string) => void;
   projects: Project[];
@@ -157,14 +171,15 @@ export function AuthConnectionSettings({
       console.log("[AUTH_CONNECTION] Configuring WebSocket with auth token...");
 
       // Configure WebSocket with auth token
-      const configResult: any = await invoke("configure_websocket", {
-        config: {
-          enabled: true,
-          url: connectionInfo.websocket_url,
-          token: accessToken,
-          project_id: selectedProjectId,
-          runner_name: runnerName || null,
-        },
+      const config: WebSocketConfig = {
+        enabled: true,
+        url: connectionInfo.websocket_url,
+        token: accessToken,
+        project_id: selectedProjectId,
+        runner_name: runnerName || null,
+      };
+      const configResult = await invoke<TauriResult<null>>("configure_websocket", {
+        config,
       });
 
       if (!configResult.success) {
@@ -174,7 +189,7 @@ export function AuthConnectionSettings({
       console.log("[AUTH_CONNECTION] Connecting...");
 
       // Connect WebSocket
-      const connectResult: any = await invoke("connect_websocket");
+      const connectResult = await invoke<TauriResult<null>>("connect_websocket");
 
       if (!connectResult.success) {
         throw new Error(connectResult.message || "Failed to connect WebSocket");
@@ -237,7 +252,7 @@ export function AuthConnectionSettings({
       userDisconnectedRef.current = true;
       console.log("[AUTH_CONNECTION] User initiated disconnect - auto-reconnect disabled");
 
-      const result: any = await invoke("disconnect_websocket");
+      const result = await invoke<TauriResult<null>>("disconnect_websocket");
       if (result && result.success) {
         setConnected(false);
         onLog("success", "Disconnected from qontinui.io");

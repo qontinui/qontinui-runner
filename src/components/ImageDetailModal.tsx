@@ -354,10 +354,17 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                           Match Details (showing {entry.debug.top_matches.length} candidates)
                         </div>
                         <div className="space-y-1 text-xs">
-                          {entry.debug.top_matches.map((match: any, idx: number) => {
-                            const confidence = match.confidence || 0;
+                          {entry.debug.top_matches.map((match: unknown, idx: number) => {
+                            if (typeof match !== "object" || match === null) {
+                              return null;
+                            }
+                            const typedMatch = match as {
+                              confidence?: number;
+                              location?: { x?: number; y?: number };
+                            };
+                            const confidence = typedMatch.confidence || 0;
                             const meetsThreshold = confidence >= entry.threshold;
-                            const location = match.location || {};
+                            const location = typedMatch.location || {};
 
                             return (
                               <div

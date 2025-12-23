@@ -10,6 +10,12 @@ interface DeviceInfo {
   platform: string;
 }
 
+interface TauriResult<T> {
+  success: boolean;
+  data?: T;
+  message?: string;
+}
+
 interface AdvancedSettingsProps {
   onLog: LogFunction;
   onDebugModeChange: (enabled: boolean) => void;
@@ -40,7 +46,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       setLoading(true);
       setError(null);
 
-      const result: any = await invoke("get_debug_settings");
+      const result = await invoke<TauriResult<DebugSettings>>("get_debug_settings");
 
       if (result && result.success && result.data) {
         const loadedSettings: DebugSettings = {
@@ -93,7 +99,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       setError(null);
       setSaveSuccess(false);
 
-      const result: any = await invoke("set_debug_settings", {
+      const result = await invoke<TauriResult<null>>("set_debug_settings", {
         enableImageDebug: settings.enable_image_debug,
         topMatchesCount: settings.top_matches_count,
       });
