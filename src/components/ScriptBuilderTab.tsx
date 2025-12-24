@@ -108,11 +108,18 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   // Track if description was manually changed (to trigger auto-save)
   const descriptionChangedByUser = useRef(false);
 
+  // Track if name was manually changed (to trigger auto-save)
+  const nameChangedByUser = useRef(false);
+
   // Track the description that was used to generate the current code
   // This is used to warn users if they try to run tests when description has changed
   const [lastGeneratedFromDescription, setLastGeneratedFromDescription] = useState<string | null>(
     null,
   );
+
+  // Coverage validation state - warnings about missing functionality
+  const [coverageWarnings, setCoverageWarnings] = useState<string[]>([]);
+  const [isValidatingCoverage, setIsValidatingCoverage] = useState(false);
 
   // Auto-save description when editing an existing script
   useEffect(() => {
@@ -136,6 +143,36 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
 
     return () => clearTimeout(timeoutId);
   }, [formDescription, editingScript]);
+
+  // Auto-save name when editing an existing script
+  useEffect(() => {
+    // Only auto-save if editing an existing script and name was changed by user
+    if (!editingScript || !nameChangedByUser.current) {
+      return;
+    }
+
+    const timeoutId = setTimeout(async () => {
+      try {
+        const response = await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: formName }),
+        });
+        if (response.ok) {
+          // Reload scripts to update the list display
+          const scriptsResponse = await fetch(`${API_BASE}/playwright/scripts`);
+          const result = await scriptsResponse.json();
+          if (result.success) {
+            setScripts(result.data || []);
+          }
+        }
+      } catch (error) {
+        console.error("Failed to auto-save name:", error);
+      }
+    }, 500); // 500ms debounce
+
+    return () => clearTimeout(timeoutId);
+  }, [formName, editingScript]);
 
   // Expanded sections in execution result
   const [expandedSpecs, setExpandedSpecs] = useState<Set<number>>(new Set());
@@ -473,6 +510,11 @@ test('${formName || "test"}', async ({ page }) => {
           setLastGeneratedFromDescription(formDescription); // Track which description generated this code
           setViewMode("code"); // Switch to code view to show the result
           onLog("success", "Script generated successfully!");
+
+          // Validate that the generated code covers all requirements
+          setCoverageWarnings([]); // Clear previous warnings
+          const warnings = await validateCoverage(generatedCode, formDescription);
+          setCoverageWarnings(warnings);
         } else {
           onLog(
             "warning",
@@ -494,6 +536,93 @@ test('${formName || "test"}', async ({ page }) => {
     } finally {
       setIsGenerating(false);
     }
+  };
+
+  // Validate that generated code covers all requirements from the description
+  const validateCoverage = async (code: string, description: string): Promise<string[]> => {
+    if (!description.trim() || !code.trim()) {
+      return [];
+    }
+
+    setIsValidatingCoverage(true);
+    onLog("info", "Validating script covers all requirements...");
+
+    const prompt = `Analyze this Playwright test script and verify it implements ALL functionality from the description.
+
+## Test Description (What the script SHOULD do)
+${description}
+
+## Generated Script Code (What the script ACTUALLY does)
+\`\`\`typescript
+${code}
+\`\`\`
+
+## Task
+Compare the description with the code and identify ANY missing functionality.
+
+## Output Format
+If the script implements ALL requirements from the description, respond with exactly:
+COVERAGE: COMPLETE
+
+If there are missing requirements, respond with:
+COVERAGE: INCOMPLETE
+MISSING:
+- [First missing functionality]
+- [Second missing functionality]
+- [etc.]
+
+Be thorough - check each action, assertion, and behavior mentioned in the description.`;
+
+    try {
+      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          display_prompt: "Validating script coverage",
+          timeout_seconds: 60,
+          wait_for_completion: true,
+        }),
+      });
+
+      const result = await response.json();
+
+      if (result.success && result.data?.output) {
+        const output = result.data.output;
+
+        if (output.includes("COVERAGE: COMPLETE")) {
+          onLog("success", "Script implements all requirements from description!");
+          return [];
+        }
+
+        // Extract missing items
+        const missingMatch = output.match(/MISSING:\s*([\s\S]*?)(?:$|(?=\n\n))/i);
+        if (missingMatch) {
+          const missingText = missingMatch[1];
+          const missingItems = missingText
+            .split("\n")
+            .map((line: string) => line.replace(/^[-*•]\s*/, "").trim())
+            .filter((line: string) => line.length > 0);
+
+          if (missingItems.length > 0) {
+            onLog("warning", `Found ${missingItems.length} missing requirement(s) in generated code`);
+            return missingItems;
+          }
+        }
+
+        // Fallback: if we can't parse but it says incomplete
+        if (output.includes("COVERAGE: INCOMPLETE")) {
+          onLog("warning", "Script may be missing some requirements - check the description");
+          return ["Some requirements from the description may not be implemented"];
+        }
+      }
+    } catch (error) {
+      onLog("error", `Coverage validation failed: ${error}`);
+    } finally {
+      setIsValidatingCoverage(false);
+    }
+
+    return [];
   };
 
   // Refine script based on test results
@@ -740,24 +869,31 @@ import { test, expect } from '@playwright/test';
           ? `\n## AI Instructions (Important - Follow These)\n${formAiInstructions}\n`
           : "";
 
+        // Include the original description so AI knows the full goal
+        const descriptionSection = formDescription.trim()
+          ? `\n## Original Test Description (IMPORTANT - Ensure ALL requirements are met)\n${formDescription}\n`
+          : "";
+
         const prompt = `Refine this Playwright test script based on the test results.
 
 ## Current Script
 \`\`\`typescript
 ${currentScriptContent}
 \`\`\`
-
+${descriptionSection}
 ## Test Results
 Tests failed with the following errors:
 ${testErrors}
 ${pageSnapshotSection}${aiInstructionsSection}
 ## Requirements
 1. Fix the issues identified in the test results
-2. Keep the overall test structure and intent
-3. Use the Page Snapshot above to find the correct element roles and names
-4. Use more robust selectors if elements weren't found (check if 'link' should be 'button', etc.)
-5. Add appropriate waits if there were timing issues
-6. Update assertions to match actual behavior if needed
+2. **Verify the script implements ALL functionality from the Original Test Description above**
+3. Keep the overall test structure and intent
+4. Use the Page Snapshot above to find the correct element roles and names
+5. Use more robust selectors if elements weren't found (check if 'link' should be 'button', etc.)
+6. Add appropriate waits if there were timing issues
+7. Update assertions to match actual behavior if needed
+8. **If any functionality from the description is missing, ADD it to the script**
 
 ## Output Format
 First, write a single line starting with "CHANGES:" that briefly describes what you changed (e.g., "CHANGES: Fixed button selector from 'link' to 'button', added waitForLoadState").
@@ -1047,6 +1183,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
 
   const startEditing = (script: PlaywrightScript) => {
     descriptionChangedByUser.current = false; // Reset flag when loading a script
+    nameChangedByUser.current = false; // Reset flag when loading a script
     setLastGeneratedFromDescription(null); // We don't know if existing code matches description
     setEditingScript(script);
     setFormName(script.name);
@@ -1299,6 +1436,55 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
                 spellCheck={false}
               />
+
+              {/* Coverage validation status */}
+              {isValidatingCoverage && (
+                <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Validating script covers all requirements...
+                </div>
+              )}
+
+              {/* Coverage warnings */}
+              {coverageWarnings.length > 0 && (
+                <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+                  <div className="flex items-start gap-2">
+                    <Info className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
+                    <div className="flex-1">
+                      <div className="text-sm font-medium text-amber-500 mb-1">
+                        Missing Requirements Detected
+                      </div>
+                      <div className="text-sm text-amber-400/80 mb-2">
+                        The generated code may not implement all functionality from the description:
+                      </div>
+                      <ul className="text-sm text-amber-400/80 list-disc list-inside space-y-1">
+                        {coverageWarnings.map((warning, i) => (
+                          <li key={i}>{warning}</li>
+                        ))}
+                      </ul>
+                      <button
+                        onClick={() => {
+                          // Re-generate with emphasis on missing requirements
+                          const missingItems = coverageWarnings.join(", ");
+                          setFormAiInstructions(
+                            (prev) =>
+                              prev +
+                              (prev ? "\n\n" : "") +
+                              `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`
+                          );
+                          setCoverageWarnings([]);
+                          generateScript();
+                        }}
+                        disabled={isGenerating}
+                        className="mt-2 px-3 py-1.5 text-sm bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        <RefreshCw className="w-3 h-3 inline mr-1.5" />
+                        Regenerate with missing requirements
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -1590,7 +1776,10 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                       <input
                         type="text"
                         value={formName}
-                        onChange={(e) => setFormName(e.target.value)}
+                        onChange={(e) => {
+                          nameChangedByUser.current = true;
+                          setFormName(e.target.value);
+                        }}
                         placeholder="Login Flow Test"
                         className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
                       />

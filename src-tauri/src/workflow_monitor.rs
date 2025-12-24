@@ -154,7 +154,16 @@ pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result
     let json: serde_json::Value = serde_json::from_str(&content)
         .map_err(|e| format!("Failed to parse checkpoint JSON: {}", e))?;
 
-    // FIRST check for completion status fields - AI might mark status=COMPLETED
+    // FIRST check for explicit "completed" boolean field
+    // Many checkpoint formats use { "completed": true, "current_phase": N }
+    if let Some(completed) = json.get("completed").and_then(|v| v.as_bool()) {
+        if completed {
+            info!("Workflow completion detected via 'completed' boolean field");
+            return Ok(u32::MAX); // Signal completion
+        }
+    }
+
+    // Also check for completion status fields - AI might mark status=COMPLETED
     // before updating current_phase
     let status_fields = ["status", "workflow_status"];
     for field in &status_fields {

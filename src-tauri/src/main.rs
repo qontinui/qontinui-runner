@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod ai_workflows;
 mod auth;
 mod commands;
 mod config;
@@ -14,6 +15,7 @@ mod playwright;
 mod prompts;
 mod rag;
 mod secure_storage;
+mod session_manager;
 mod settings;
 mod storage;
 mod video_recorder;

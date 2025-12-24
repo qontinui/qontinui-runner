@@ -1,29 +1,24 @@
 /**
  * LogsTab.tsx
  *
- * Dedicated tab for all log viewing functionality.
- * Contains sub-tabs for General, Image Recognition, and Actions logs.
+ * Dedicated tab for log viewing functionality.
+ * Contains sub-tabs for General, Image Recognition, Actions, and RAG.
  */
 
-import { useRef, useState, useEffect } from "react";
+import { useRef } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { FileText, Image, Zap, Brain, FolderOpen, Database, AlertTriangle } from "lucide-react";
+import { FileText, Image, Zap, Database } from "lucide-react";
 import { GeneralLogTab } from "./GeneralLogTab";
 import ImageLogTable from "./ImageLogTable";
 import ActionLogTable from "./ActionLogTable";
-import { AiOutputTab, type AiOutputLine } from "./AiOutputTab";
-import { ExternalLogsTab } from "./ExternalLogsTab";
 import { RagLogTab, type RagProcessingState } from "./RagLogTab";
-import { IssuesPanel } from "./IssuesPanel";
 import { LogTabActions } from "./LogTabActions";
 import { useAutoScroll } from "../hooks";
-import { issueTracker } from "../services";
 import type { LogEntry, ImageRecognitionEntry } from "../managers/LogManager";
 import type { ActionLogEntry } from "../types/displayProfile";
 import type { LogLevel } from "../hooks/useLogFilter";
-import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
 
-type LogSubTab = "general" | "image" | "actions" | "ai" | "issues" | "rag" | "external";
+type LogSubTab = "general" | "image" | "actions" | "rag";
 
 interface LogsTabProps {
   // General logs
@@ -47,19 +42,6 @@ interface LogsTabProps {
   actionLogError: string | null;
   onActionRowClick: (action: ActionLogEntry) => void;
 
-  // AI output
-  aiOutputLines: AiOutputLine[];
-  onClearAiOutput: () => void;
-
-  // External logs (project logs)
-  projectLogConfig: ProjectLogConfig | null;
-  projectLogSources: LogSourceContent[];
-  projectLogsLoading: boolean;
-  projectLogsError?: string;
-  projectLogsLastRefresh?: string;
-  onRefreshProjectLogs: () => void;
-  onConfigureProjectLogs: () => void;
-
   // RAG processing
   ragState: RagProcessingState;
   onStartRagProcessing: () => void;
@@ -70,9 +52,7 @@ interface LogsTabProps {
   logCount: number;
   imageLogCount: number;
   actionCount: number;
-  aiOutputCount: number;
   ragLogCount: number;
-  externalLogCount: number;
 
   // Clear/copy actions
   onClearGeneralLogs: () => void;
@@ -100,15 +80,6 @@ export function LogsTab({
   actionLogLoading,
   actionLogError,
   onActionRowClick,
-  aiOutputLines,
-  onClearAiOutput,
-  projectLogConfig,
-  projectLogSources,
-  projectLogsLoading,
-  projectLogsError,
-  projectLogsLastRefresh,
-  onRefreshProjectLogs,
-  onConfigureProjectLogs,
   ragState,
   onStartRagProcessing,
   onClearRagLogs,
@@ -116,9 +87,7 @@ export function LogsTab({
   logCount,
   imageLogCount,
   actionCount,
-  aiOutputCount,
   ragLogCount,
-  externalLogCount,
   onClearGeneralLogs,
   onClearImageLogs,
   onClearActionLogs,
@@ -136,33 +105,11 @@ export function LogsTab({
     dependencies: [logs],
   });
 
-  // Track issue count from IssueTracker
-  const [issueCount, setIssueCount] = useState(issueTracker.count);
-  const [unresolvedCount, setUnresolvedCount] = useState(issueTracker.unresolvedCount);
-
-  useEffect(() => {
-    const updateCounts = () => {
-      setIssueCount(issueTracker.count);
-      setUnresolvedCount(issueTracker.unresolvedCount);
-    };
-    const unsubscribe = issueTracker.subscribe(updateCounts);
-    return unsubscribe;
-  }, []);
-
   const subTabs = [
     { id: "general" as const, label: "General", icon: FileText, count: logCount },
     { id: "image" as const, label: "Image Recognition", icon: Image, count: imageLogCount },
     { id: "actions" as const, label: "Actions", icon: Zap, count: actionCount },
-    { id: "ai" as const, label: "AI Output", icon: Brain, count: aiOutputCount },
-    {
-      id: "issues" as const,
-      label: "Issues",
-      icon: AlertTriangle,
-      count: issueCount,
-      highlight: unresolvedCount > 0,
-    },
     { id: "rag" as const, label: "RAG", icon: Database, count: ragLogCount },
-    { id: "external" as const, label: "Project Logs", icon: FolderOpen, count: externalLogCount },
   ];
 
   return (
@@ -176,7 +123,6 @@ export function LogsTab({
         <Tabs.List className="flex">
           {subTabs.map((tab) => {
             const Icon = tab.icon;
-            const hasHighlight = "highlight" in tab && tab.highlight;
             return (
               <Tabs.Trigger
                 key={tab.id}
@@ -189,14 +135,10 @@ export function LogsTab({
                   data-[state=inactive]:hover:text-foreground
                 `}
               >
-                <Icon className={`w-4 h-4 ${hasHighlight ? "text-red-500" : ""}`} />
+                <Icon className="w-4 h-4" />
                 {tab.label}
                 {tab.count > 0 && (
-                  <span
-                    className={`ml-1 px-1.5 py-0.5 text-xs rounded-full ${
-                      hasHighlight ? "bg-red-500/20 text-red-400" : "bg-muted"
-                    }`}
-                  >
+                  <span className="ml-1 px-1.5 py-0.5 text-xs rounded-full bg-muted">
                     {tab.count}
                   </span>
                 )}
@@ -253,20 +195,6 @@ export function LogsTab({
         </Tabs.Content>
 
         <Tabs.Content
-          value="ai"
-          className="flex-1 flex flex-col p-4 outline-none overflow-hidden data-[state=inactive]:hidden"
-        >
-          <AiOutputTab lines={aiOutputLines} onClear={onClearAiOutput} />
-        </Tabs.Content>
-
-        <Tabs.Content
-          value="issues"
-          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
-        >
-          <IssuesPanel />
-        </Tabs.Content>
-
-        <Tabs.Content
           value="rag"
           className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
         >
@@ -275,21 +203,6 @@ export function LogsTab({
             onStartProcessing={onStartRagProcessing}
             onClearLogs={onClearRagLogs}
             canStartProcessing={canStartRagProcessing}
-          />
-        </Tabs.Content>
-
-        <Tabs.Content
-          value="external"
-          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
-        >
-          <ExternalLogsTab
-            config={projectLogConfig}
-            sources={projectLogSources}
-            loading={projectLogsLoading}
-            error={projectLogsError}
-            lastRefresh={projectLogsLastRefresh}
-            onRefresh={onRefreshProjectLogs}
-            onConfigureSources={onConfigureProjectLogs}
           />
         </Tabs.Content>
       </div>

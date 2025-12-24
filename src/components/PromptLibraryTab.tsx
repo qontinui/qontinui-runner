@@ -50,7 +50,46 @@ interface SavedPrompt {
   modified_at: string;
 }
 
-// Types for workflow runs
+// Types for unified sessions (replaces WorkflowRun)
+interface SessionCheckpoint {
+  session_id: string;
+  session_type: string;
+  current_phase: number;
+  total_phases: number;
+  completed: boolean;
+  status: string;
+  started_at: string;
+  last_activity: string;
+  sessions_spawned: number;
+  restart_permitted: boolean;
+  error_message: string | null;
+  custom_data: Record<string, unknown>;
+  activity_log: string[];
+}
+
+interface SessionConfig {
+  session_type: string;
+  prompt: string;
+  continuation_prompt: string | null;
+  total_phases: number;
+  uses_gui: boolean;
+  timeout_seconds: number;
+  stall_threshold_seconds: number;
+  name: string;
+  description: string;
+  custom_config: Record<string, unknown>;
+}
+
+interface Session {
+  id: string;
+  config: SessionConfig;
+  status: "starting" | "running" | "completed" | "failed" | "stopped" | "waiting_for_continuation" | "stalled";
+  checkpoint: SessionCheckpoint;
+  active_subprocess_id: string | null;
+  event_log: { timestamp: number; event_type: string; message: string }[];
+}
+
+// Legacy type alias for backward compatibility in UI
 interface WorkflowRun {
   id: string;
   prompt_id: string;
@@ -66,6 +105,36 @@ interface WorkflowRun {
   sessions_spawned: number;
   error_message: string | null;
   event_log: { timestamp: number; event_type: string; message: string }[];
+}
+
+// Convert Session to WorkflowRun for UI compatibility
+function sessionToWorkflowRun(session: Session, promptId?: string): WorkflowRun {
+  const statusMap: Record<string, WorkflowRun["status"]> = {
+    "starting": "running",
+    "running": "running",
+    "completed": "completed",
+    "failed": "failed",
+    "stopped": "failed",
+    "waiting_for_continuation": "idle",
+    "stalled": "stalled",
+  };
+
+  return {
+    id: session.id,
+    prompt_id: promptId || session.id,
+    prompt_name: session.config.name,
+    status: statusMap[session.status] || "running",
+    current_phase: session.checkpoint.current_phase,
+    completion_value: session.config.total_phases,
+    checkpoint_path: "",
+    active_session_id: session.active_subprocess_id,
+    started_at: new Date(session.checkpoint.started_at).getTime() / 1000,
+    last_checkpoint_update: null,
+    last_activity: new Date(session.checkpoint.last_activity).getTime() / 1000,
+    sessions_spawned: session.checkpoint.sessions_spawned,
+    error_message: session.checkpoint.error_message,
+    event_log: session.event_log,
+  };
 }
 
 interface SpawnResponse {
@@ -178,10 +247,16 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
 
   const loadWorkflowRuns = async () => {
     try {
-      const response = await fetch(`${API_BASE}/workflows`);
+      // Use new unified sessions API
+      const response = await fetch(`${API_BASE}/sessions`);
       const result = await response.json();
       if (result.success) {
-        setWorkflowRuns(result.data?.runs || []);
+        // Filter to only prompt_workflow sessions and convert to WorkflowRun format
+        const sessions: Session[] = result.data || [];
+        const promptWorkflows = sessions
+          .filter((s: Session) => s.config.session_type === "prompt_workflow")
+          .map((s: Session) => sessionToWorkflowRun(s));
+        setWorkflowRuns(promptWorkflows);
       }
     } catch (error) {
       console.error("Failed to load workflow runs:", error);
@@ -353,15 +428,24 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     onLog("info", `Starting workflow: ${prompt.name}`);
 
     try {
-      const response = await fetch(`${API_BASE}/workflows/start`, {
+      // Use new unified sessions API
+      const response = await fetch(`${API_BASE}/sessions/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt_id: prompt.id }),
+        body: JSON.stringify({
+          session_type: "prompt_workflow",
+          name: prompt.name,
+          prompt: prompt.content,
+          continuation_prompt: prompt.workflow.continuation_prompt || null,
+          total_phases: prompt.workflow.completion_value,
+          uses_gui: false,
+          timeout_seconds: 1800,
+        }),
       });
       const result = await response.json();
       if (result.success) {
-        const run = result.data?.run as WorkflowRun;
-        onLog("success", `Started workflow: ${run.id}`);
+        const session = result.data?.session as Session;
+        onLog("success", `Started workflow: ${session.id}`);
         setShowWorkflowRuns(true);
         loadWorkflowRuns();
       } else {
@@ -377,7 +461,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   // Stop a running workflow
   const stopWorkflow = async (runId: string) => {
     try {
-      const response = await fetch(`${API_BASE}/workflows/${runId}/stop`, {
+      // Use new unified sessions API
+      const response = await fetch(`${API_BASE}/sessions/${runId}/stop`, {
         method: "POST",
       });
       const result = await response.json();
@@ -395,7 +480,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   // Delete a workflow run record
   const deleteWorkflow = async (runId: string) => {
     try {
-      const response = await fetch(`${API_BASE}/workflows/${runId}`, {
+      // Use new unified sessions API
+      const response = await fetch(`${API_BASE}/sessions/${runId}`, {
         method: "DELETE",
       });
       const result = await response.json();
@@ -412,16 +498,32 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   // Delete all workflow run records
   const deleteAllWorkflows = async () => {
     try {
-      const response = await fetch(`${API_BASE}/workflows`, {
-        method: "DELETE",
-      });
-      const result = await response.json();
-      if (result.success) {
-        onLog("success", `Deleted ${result.data.deleted_count} workflow(s)`);
-        loadWorkflowRuns();
-      } else {
-        onLog("error", `Failed to delete workflows: ${result.error}`);
+      // Get all sessions and delete prompt_workflow ones
+      const listResponse = await fetch(`${API_BASE}/sessions`);
+      const listResult = await listResponse.json();
+      if (!listResult.success) {
+        onLog("error", `Failed to list sessions: ${listResult.error}`);
+        return;
       }
+
+      const sessions: Session[] = listResult.data || [];
+      const promptWorkflows = sessions.filter(
+        (s: Session) => s.config.session_type === "prompt_workflow"
+      );
+
+      let deletedCount = 0;
+      for (const session of promptWorkflows) {
+        const response = await fetch(`${API_BASE}/sessions/${session.id}`, {
+          method: "DELETE",
+        });
+        const result = await response.json();
+        if (result.success) {
+          deletedCount++;
+        }
+      }
+
+      onLog("success", `Deleted ${deletedCount} workflow(s)`);
+      loadWorkflowRuns();
     } catch (error) {
       onLog("error", `Failed to delete workflows: ${error}`);
     }

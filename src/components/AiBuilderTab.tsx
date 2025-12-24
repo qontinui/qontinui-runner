@@ -22,6 +22,7 @@ import {
   CheckCircle,
   XCircle,
   Copy,
+  Save,
   History,
   Workflow,
   Camera,
@@ -39,6 +40,7 @@ import {
   MousePointer2,
   TestTube,
   BookOpen,
+  X,
 } from "lucide-react";
 import { useExecution } from "../contexts";
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
@@ -67,6 +69,7 @@ interface PlaywrightScriptInfo {
   name: string;
   target_url: string;
   description: string;
+  script_content: string;
 }
 
 /** Saved prompt info for the dropdown */
@@ -78,6 +81,22 @@ interface SavedPromptInfo {
   category: string;
 }
 
+/** Saved AI Workflow from the AI Workflows library */
+interface SavedAiWorkflow {
+  id: string;
+  name: string;
+  description: string;
+  steps: ExecutionStep[];
+  goal: string;
+  max_iterations: number;
+  persistent_session: boolean;
+  capture_input_validation: boolean;
+  category: string;
+  tags: string[];
+  created_at: string;
+  modified_at: string;
+}
+
 /** A single step in the execution sequence */
 interface ExecutionStep {
   id: string;
@@ -85,6 +104,8 @@ interface ExecutionStep {
   name: string;
   takeScreenshot: boolean;
   playwrightScriptId?: string;
+  playwrightScriptContent?: string;
+  playwrightTargetUrl?: string;
   promptId?: string;
   promptContent?: string;
 }
@@ -512,17 +533,75 @@ interface AiDeveloperState {
   errors_remaining: Array<{ file: string; error_type: string; context: string }>;
 }
 
+// Types for unified sessions API
+interface SessionCheckpoint {
+  session_id: string;
+  session_type: string;
+  current_phase: number;
+  total_phases: number;
+  completed: boolean;
+  status: string;
+  started_at: string;
+  last_activity: string;
+  sessions_spawned: number;
+  restart_permitted: boolean;
+  error_message: string | null;
+  custom_data: Record<string, unknown>;
+  activity_log: string[];
+}
+
+interface SessionConfig {
+  session_type: string;
+  prompt: string;
+  continuation_prompt: string | null;
+  total_phases: number;
+  uses_gui: boolean;
+  timeout_seconds: number;
+  stall_threshold_seconds: number;
+  name: string;
+  description: string;
+  custom_config: Record<string, unknown>;
+}
+
+interface Session {
+  id: string;
+  config: SessionConfig;
+  status: "starting" | "running" | "completed" | "failed" | "stopped" | "waiting_for_continuation" | "stalled";
+  checkpoint: SessionCheckpoint;
+  active_subprocess_id: string | null;
+  event_log: { timestamp: number; event_type: string; message: string }[];
+}
+
+// Convert Session to AiDeveloperState for UI compatibility
+function sessionToAiDeveloperState(session: Session): AiDeveloperState {
+  return {
+    session_id: session.id,
+    iteration: session.checkpoint.current_phase,
+    max_iterations: session.config.total_phases,
+    status: session.status === "waiting_for_continuation" ? "idle" : session.status,
+    started_at: session.checkpoint.started_at,
+    stop_requested: false,
+    current_action: session.event_log.length > 0
+      ? session.event_log[session.event_log.length - 1].message
+      : "",
+    errors_fixed: [],
+    errors_remaining: [],
+  };
+}
+
 interface AiBuilderTabProps {
   /** Project logs hook from App.tsx (shared with Logs tab) */
   projectLogs: UseProjectLogsReturn;
+  /** Navigate to Log Locations sub-tab */
+  onNavigateToLogLocations: () => void;
 }
 
-export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
+export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilderTabProps) {
   const execution = useExecution();
 
   // Session Mode - persisted to localStorage
   // Inline (false): Uses /trigger-ai-analysis, output in AI Output tab, ends if runner restarts
-  // Persistent (true): Independent process, survives restarts, has state file tracking
+  // Persistent (true): Uses checkpoint files, can resume from where it left off after runner restarts
   const [persistentSession, setPersistentSession] = useState<boolean>(() => {
     try {
       return localStorage.getItem("qontinui-ai-persistent-session") === "true";
@@ -554,10 +633,53 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
     );
   }, [captureInputValidation]);
 
-  // Ordered execution steps
-  const [executionSteps, setExecutionSteps] = useState<ExecutionStep[]>([]);
-  const [goal, setGoal] = useState("");
-  const [maxIterations, setMaxIterations] = useState(10);
+  // Ordered execution steps - persisted to localStorage
+  const [executionSteps, setExecutionSteps] = useState<ExecutionStep[]>(() => {
+    try {
+      const saved = localStorage.getItem("qontinui-ai-execution-steps");
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Goal - persisted to localStorage
+  const [goal, setGoal] = useState(() => {
+    try {
+      return localStorage.getItem("qontinui-ai-goal") || "";
+    } catch {
+      return "";
+    }
+  });
+
+  // Max iterations - persisted to localStorage
+  const [maxIterations, setMaxIterations] = useState(() => {
+    try {
+      const saved = localStorage.getItem("qontinui-ai-max-iterations");
+      return saved ? parseInt(saved, 10) : 10;
+    } catch {
+      return 10;
+    }
+  });
+
+  // Persist execution steps to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem("qontinui-ai-execution-steps", JSON.stringify(executionSteps));
+    } catch (e) {
+      console.error("Failed to persist execution steps:", e);
+    }
+  }, [executionSteps]);
+
+  // Persist goal to localStorage
+  useEffect(() => {
+    localStorage.setItem("qontinui-ai-goal", goal);
+  }, [goal]);
+
+  // Persist max iterations to localStorage
+  useEffect(() => {
+    localStorage.setItem("qontinui-ai-max-iterations", maxIterations.toString());
+  }, [maxIterations]);
 
   // Workspace paths (fetched from backend for portability)
   const [workspacePaths, setWorkspacePaths] = useState<WorkspacePaths | null>(null);
@@ -565,9 +687,18 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
   // Playwright scripts for the dropdown
   const [playwrightScripts, setPlaywrightScripts] = useState<PlaywrightScriptInfo[]>([]);
 
-  // Saved prompts from the prompt library
+  // Saved prompts from the prompt library (used for adding prompt steps)
   const [savedPrompts, setSavedPrompts] = useState<SavedPromptInfo[]>([]);
-  const [showPromptSelector, setShowPromptSelector] = useState(false);
+
+  // Save workflow dialog state
+  const [showSaveDialog, setShowSaveDialog] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [saveDescription, setSaveDescription] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Saved AI Workflows from the AI Workflows library
+  const [savedAiWorkflows, setSavedAiWorkflows] = useState<SavedAiWorkflow[]>([]);
+  const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
 
   // Session state - persist to localStorage to survive tab switches
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(() => {
@@ -689,11 +820,18 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
         if (result.success && result.data) {
           setPlaywrightScripts(
             result.data.map(
-              (s: { id: string; name: string; target_url: string; description: string }) => ({
+              (s: {
+                id: string;
+                name: string;
+                target_url: string;
+                description: string;
+                script_content: string;
+              }) => ({
                 id: s.id,
                 name: s.name,
                 target_url: s.target_url,
                 description: s.description,
+                script_content: s.script_content,
               }),
             ),
           );
@@ -737,6 +875,23 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
     fetchSavedPrompts();
   }, []);
 
+  // Fetch saved AI workflows from the AI Workflows library
+  const fetchSavedAiWorkflows = async () => {
+    try {
+      const response = await fetch("http://localhost:9876/ai-workflows");
+      const result = await response.json();
+      if (result.success && result.data) {
+        setSavedAiWorkflows(result.data);
+      }
+    } catch (error) {
+      console.error("Failed to fetch saved AI workflows:", error);
+    }
+  };
+
+  useEffect(() => {
+    fetchSavedAiWorkflows();
+  }, []);
+
   // Sync input capture setting with Python executor when toggle changes
   useEffect(() => {
     const syncInputCapture = async () => {
@@ -760,22 +915,22 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
 
     const pollState = async () => {
       try {
-        const response = await invoke<{ success: boolean; data?: AiDeveloperState }>(
-          "read_ai_developer_state",
-          { sessionId: currentSessionId },
-        );
-        if (response.success && response.data) {
-          setSessionState(response.data);
+        // Use new unified sessions API
+        const response = await fetch(`http://localhost:9876/sessions/${currentSessionId}`);
+        const result = await response.json();
 
-          // Update isRunning based on status AND recency
-          // A session is only considered running if it has an active status
-          // AND was started within the last 10 minutes (to handle stale state files)
-          const activeStatuses = ["starting", "running", "spawning_next"];
-          const isActiveStatus = activeStatuses.includes(response.data.status);
+        if (result.success && result.data) {
+          const session = result.data as Session;
+          const state = sessionToAiDeveloperState(session);
+          setSessionState(state);
+
+          // Update isRunning based on session status
+          const activeStatuses = ["starting", "running", "waiting_for_continuation"];
+          const isActiveStatus = activeStatuses.includes(session.status);
 
           let isRecent = false;
-          if (response.data.started_at) {
-            const startedAt = new Date(response.data.started_at).getTime();
+          if (session.checkpoint.started_at) {
+            const startedAt = new Date(session.checkpoint.started_at).getTime();
             const tenMinutesAgo = Date.now() - 10 * 60 * 1000;
             isRecent = startedAt > tenMinutesAgo;
           }
@@ -784,13 +939,13 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
           setIsRunning(isActiveStatus && isRecent);
 
           // Clear session if it's complete/stopped (but keep showing final state)
-          if (response.data.status === "complete" || response.data.status === "stopped") {
+          if (session.status === "completed" || session.status === "stopped" || session.status === "failed") {
             // Don't clear immediately - let user see the final state
             // They can start a new session which will clear it
           }
-        } else if (!response.success) {
-          // Session file not found - clear the session
-          console.log("Session file not found, clearing session");
+        } else if (!result.success) {
+          // Session not found - clear the session
+          console.log("Session not found, clearing session");
           setCurrentSessionId(null);
           setSessionState(null);
           setIsRunning(false);
@@ -849,6 +1004,8 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
     type: "workflow" | "state" | "playwright" | "prompt",
     name: string,
     scriptId?: string,
+    scriptContent?: string,
+    scriptTargetUrl?: string,
     promptId?: string,
     promptContent?: string,
   ) => {
@@ -858,6 +1015,8 @@ export function AiBuilderTab({ projectLogs }: AiBuilderTabProps) {
       name,
       takeScreenshot: type !== "prompt", // Screenshots don't apply to prompts
       playwrightScriptId: scriptId,
+      playwrightScriptContent: scriptContent,
+      playwrightTargetUrl: scriptTargetUrl,
       promptId,
       promptContent,
     };
@@ -921,6 +1080,14 @@ After the workflow completes, take a screenshot to capture the result.`;
         } else if (step.type === "playwright") {
           let instruction = `### Step ${stepNum}: Run Playwright Test "${step.name}"
 
+**Script ID:** ${step.playwrightScriptId}
+**Target URL:** ${step.playwrightTargetUrl || "(not specified)"}
+
+**Current Script Content:**
+\`\`\`typescript
+${step.playwrightScriptContent || "// Script content not available"}
+\`\`\`
+
 Execute the Playwright test script via the runner API:
 \`\`\`powershell
 $response = Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}/run" -Method POST -ContentType "application/json" -Body '{}' | ConvertFrom-Json
@@ -936,8 +1103,16 @@ Analyze the structured output:
 
 If tests fail, determine if the issue is:
 - **Application bug** → fix application code
-- **Test selector outdated** → update test script via PUT /playwright/scripts/:id
-- **Timing issue** → add waits/retries to test script`;
+- **Test selector outdated** → update test script via PUT /playwright/scripts/${step.playwrightScriptId}
+- **Timing issue** → add waits/retries to test script
+
+**To update the script**, use:
+\`\`\`powershell
+$body = @{ script_content = @"
+// Your updated TypeScript code here
+"@ } | ConvertTo-Json
+Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}" -Method PUT -ContentType "application/json" -Body $body
+\`\`\``;
           if (step.takeScreenshot) {
             instruction += `
 
@@ -1096,6 +1271,87 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     setTimeout(() => setLastResult(null), 3000);
   };
 
+  // Load an AI Workflow from the AI Workflows library
+  const loadAiWorkflow = (workflow: SavedAiWorkflow) => {
+    setExecutionSteps(workflow.steps);
+    setGoal(workflow.goal);
+    setMaxIterations(workflow.max_iterations);
+    setPersistentSession(workflow.persistent_session);
+    setCaptureInputValidation(workflow.capture_input_validation);
+    setShowWorkflowsPanel(false);
+    setLastResult({ success: true, message: `Loaded workflow "${workflow.name}"` });
+    setTimeout(() => setLastResult(null), 3000);
+  };
+
+  // Delete an AI Workflow
+  const deleteAiWorkflow = async (workflowId: string) => {
+    try {
+      const response = await fetch(`http://localhost:9876/ai-workflows/${workflowId}`, {
+        method: "DELETE",
+      });
+      const result = await response.json();
+      if (result.success) {
+        await fetchSavedAiWorkflows();
+        setLastResult({ success: true, message: "Workflow deleted" });
+        setTimeout(() => setLastResult(null), 3000);
+      } else {
+        throw new Error(result.error || "Failed to delete workflow");
+      }
+    } catch (error) {
+      setLastResult({
+        success: false,
+        message: `Error deleting: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  };
+
+  // Save workflow to AI Workflows Library
+  const saveWorkflow = async () => {
+    if (!saveName.trim()) {
+      setLastResult({ success: false, message: "Please enter a name for the workflow" });
+      return;
+    }
+
+    setIsSaving(true);
+    try {
+      const response = await fetch("http://localhost:9876/ai-workflows", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: saveName.trim(),
+          description: saveDescription.trim(),
+          steps: executionSteps,
+          goal: goal.trim(),
+          max_iterations: maxIterations,
+          persistent_session: persistentSession,
+          capture_input_validation: captureInputValidation,
+          category: "",
+          tags: [],
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success) {
+        setLastResult({ success: true, message: `Workflow "${saveName}" saved!` });
+        setShowSaveDialog(false);
+        setSaveName("");
+        setSaveDescription("");
+
+        // Refresh the saved workflows list
+        await fetchSavedAiWorkflows();
+      } else {
+        throw new Error(result.error || "Failed to save workflow");
+      }
+    } catch (error) {
+      setLastResult({
+        success: false,
+        message: `Error saving: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
   // Run automation in standard mode (inline via MCP API, output goes to AI Output tab)
   const runStandardMode = async (sessionId: string, prompt: string) => {
     console.log("[AI_BUILDER] Running in STANDARD mode via MCP API...");
@@ -1130,30 +1386,37 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     }
   };
 
-  // Run automation in persistent mode (spawn independent Claude, survives runner restarts)
+  // Run automation in persistent mode (uses checkpoint files for resuming after runner restarts)
   const runPersistentMode = async (sessionId: string, prompt: string) => {
-    console.log("[AI_BUILDER] Running in PERSISTENT mode via spawn mechanism...");
+    console.log("[AI_BUILDER] Running in PERSISTENT mode via unified sessions API...");
 
-    const response = await invoke<{
-      success: boolean;
-      message?: string;
-      data?: { session_id: string };
-    }>("spawn_ai_developer", {
-      prompt,
-      sessionId,
-      maxIterations: maxIterations,
+    // Use new unified sessions API
+    const response = await fetch("http://localhost:9876/sessions/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_type: "ai_builder",
+        name: goal.trim() || "AI Builder Session",
+        prompt: prompt,
+        continuation_prompt: null,
+        total_phases: maxIterations,
+        uses_gui: false,
+        timeout_seconds: 1800,
+      }),
     });
-    console.log("[AI_BUILDER] spawn_ai_developer response:", response);
+    const result = await response.json();
+    console.log("[AI_BUILDER] sessions/start response:", result);
 
-    if (response.success) {
-      setCurrentSessionId(sessionId);
+    if (result.success && result.data?.session) {
+      const session = result.data.session as Session;
+      setCurrentSessionId(session.id);
       setLastResult({
         success: true,
-        message: `Persistent session ${sessionId} started! (survives runner restarts)`,
+        message: `AI Builder session ${session.id} started!`,
       });
       setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
     } else {
-      throw new Error(response.message || "Failed to start developer session");
+      throw new Error(result.error || "Failed to start AI Builder session");
     }
   };
 
@@ -1216,16 +1479,19 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     if (!currentSessionId) return;
 
     try {
-      const response = await invoke<{ success: boolean; message?: string }>("stop_ai_developer", {
-        sessionId: currentSessionId,
+      // Use new unified sessions API
+      const response = await fetch(`http://localhost:9876/sessions/${currentSessionId}/stop`, {
+        method: "POST",
       });
+      const result = await response.json();
 
-      if (response.success) {
+      if (result.success) {
         setLastResult({ success: true, message: "Stop requested. Session will exit gracefully." });
+        setIsRunning(false);
       } else {
         setLastResult({
           success: false,
-          message: response.message || "Failed to stop session",
+          message: result.error || "Failed to stop session",
         });
       }
     } catch (error) {
@@ -1354,7 +1620,15 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                         {playwrightScripts.map((script) => (
                           <button
                             key={script.id}
-                            onClick={() => addStep("playwright", script.name, script.id)}
+                            onClick={() =>
+                              addStep(
+                                "playwright",
+                                script.name,
+                                script.id,
+                                script.script_content,
+                                script.target_url,
+                              )
+                            }
                             className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
                           >
                             <TestTube className="w-4 h-4 text-green-500" />
@@ -1380,7 +1654,15 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                           <button
                             key={prompt.id}
                             onClick={() =>
-                              addStep("prompt", prompt.name, undefined, prompt.id, prompt.content)
+                              addStep(
+                                "prompt",
+                                prompt.name,
+                                undefined,
+                                undefined,
+                                undefined,
+                                prompt.id,
+                                prompt.content,
+                              )
                             }
                             className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
                           >
@@ -1497,63 +1779,70 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             )}
           </div>
 
-          {/* Goal */}
+          {/* Saved Workflows */}
           <div className="card p-4 space-y-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-accent" />
-                <span className="font-medium">Goal</span>
+                <BookOpen className="w-4 h-4 text-green-500" />
+                <span className="font-medium">Saved Workflows</span>
+                <span className="text-xs text-muted-foreground">({savedAiWorkflows.length})</span>
               </div>
+              <button
+                onClick={() => setShowWorkflowsPanel(!showWorkflowsPanel)}
+                className="flex items-center gap-1 px-2 py-1 text-xs bg-green-500/10 text-green-600 rounded hover:bg-green-500/20 transition-colors"
+              >
+                {showWorkflowsPanel ? "Hide" : "Show"}
+                <ChevronDown
+                  className={`w-3 h-3 transition-transform ${showWorkflowsPanel ? "rotate-180" : ""}`}
+                />
+              </button>
+            </div>
 
-              {/* Load from Library dropdown */}
-              {savedPrompts.length > 0 && (
-                <div className="relative">
-                  <button
-                    onClick={() => setShowPromptSelector(!showPromptSelector)}
-                    className="flex items-center gap-1 px-2 py-1 text-xs bg-amber-500/10 text-amber-600 rounded hover:bg-amber-500/20 transition-colors"
-                  >
-                    <BookOpen className="w-3 h-3" />
-                    Load from Library
-                    <ChevronDown
-                      className={`w-3 h-3 transition-transform ${showPromptSelector ? "rotate-180" : ""}`}
-                    />
-                  </button>
-
-                  {showPromptSelector && (
-                    <div className="absolute right-0 z-20 w-72 mt-1 bg-card border border-border rounded-md shadow-lg max-h-64 overflow-y-auto">
-                      <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-                        <FileText className="w-3 h-3" />
-                        Select a Prompt
+            {showWorkflowsPanel && (
+              <div className="space-y-2 max-h-48 overflow-y-auto">
+                {savedAiWorkflows.length === 0 ? (
+                  <p className="text-sm text-muted-foreground text-center py-4">
+                    No saved workflows yet. Use the Save button to save your current workflow.
+                  </p>
+                ) : (
+                  savedAiWorkflows.map((workflow) => (
+                    <div
+                      key={workflow.id}
+                      className="flex items-center gap-2 p-2 bg-background rounded-md border border-border/50 hover:border-green-500/30 transition-colors"
+                    >
+                      <Sparkles className="w-4 h-4 text-green-500 flex-shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium truncate">{workflow.name}</p>
+                        <p className="text-xs text-muted-foreground truncate">
+                          {workflow.steps.length} step{workflow.steps.length !== 1 ? "s" : ""} •{" "}
+                          {workflow.persistent_session ? "Persistent" : "Standard"}
+                        </p>
                       </div>
-                      {savedPrompts.map((prompt) => (
-                        <button
-                          key={prompt.id}
-                          onClick={() => {
-                            setGoal(prompt.content);
-                            setShowPromptSelector(false);
-                          }}
-                          className="w-full flex flex-col gap-1 px-3 py-2 text-left hover:bg-muted/30 transition-colors border-b border-border/50 last:border-0"
-                        >
-                          <div className="flex items-center gap-2">
-                            <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
-                            <span className="text-sm font-medium truncate">{prompt.name}</span>
-                            {prompt.category && (
-                              <span className="text-xs text-muted-foreground ml-auto">
-                                {prompt.category}
-                              </span>
-                            )}
-                          </div>
-                          {prompt.description && (
-                            <p className="text-xs text-muted-foreground truncate pl-6">
-                              {prompt.description}
-                            </p>
-                          )}
-                        </button>
-                      ))}
+                      <button
+                        onClick={() => loadAiWorkflow(workflow)}
+                        className="px-2 py-1 text-xs bg-green-500/10 text-green-600 rounded hover:bg-green-500/20 transition-colors"
+                      >
+                        Load
+                      </button>
+                      <button
+                        onClick={() => deleteAiWorkflow(workflow.id)}
+                        className="p-1 text-muted-foreground hover:text-red-500 transition-colors"
+                        title="Delete workflow"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
                     </div>
-                  )}
-                </div>
-              )}
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Goal */}
+          <div className="card p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-accent" />
+              <span className="font-medium">Goal</span>
             </div>
 
             <textarea
@@ -1593,7 +1882,15 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
               ) : (
                 <div className="flex items-center gap-2 text-yellow-600">
                   <Info className="w-3 h-3" />
-                  <span>No log sources configured. Configure in Logs → Project Logs.</span>
+                  <span>
+                    No log sources configured.{" "}
+                    <button
+                      onClick={onNavigateToLogLocations}
+                      className="underline hover:text-yellow-500 transition-colors"
+                    >
+                      Configure in Log Locations
+                    </button>
+                  </span>
                 </div>
               )}
             </div>
@@ -1645,7 +1942,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       <li>AI runs automation → analyzes logs/screenshots → fixes issues</li>
                       <li>If issues found: spawns next iteration automatically</li>
                       <li>Loop continues until all checks pass or max iterations reached</li>
-                      <li>Sessions survive runner restarts (independent process)</li>
+                      <li>Sessions can resume from checkpoint after runner restarts</li>
                     </ul>
                   </div>
                   <div className="flex items-center gap-4 flex-wrap">
@@ -1786,6 +2083,17 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             >
               <Copy className="w-4 h-4" />
             </button>
+
+            <button
+              onClick={() => {
+                setSaveName(goal.trim() || "AI Builder Workflow");
+                setShowSaveDialog(true);
+              }}
+              className="flex items-center gap-2 px-4 py-3 bg-green-500/10 text-green-600 rounded-md font-medium hover:bg-green-500/20 transition-colors"
+              title="Save workflow to Prompt Library"
+            >
+              <Save className="w-4 h-4" />
+            </button>
           </div>
 
           {/* Session Status - Persistent Session only */}
@@ -1867,54 +2175,19 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
         {/* Right Panel - Preview & History */}
         <div className="space-y-4">
-          {/* Standard Mode: Direct user to AI Output tab */}
-          {!persistentSession && isRunning && (
+          {/* Running indicator - Direct user to AI Output sub-tab */}
+          {isRunning && (
             <div className="card p-4 space-y-3 border-primary/50">
               <div className="flex items-center gap-2">
                 <Loader2 className="w-4 h-4 text-primary animate-spin" />
                 <span className="font-medium">Analysis in Progress</span>
               </div>
               <p className="text-sm text-muted-foreground">
-                View live output in the <strong>Logs → AI Output</strong> tab.
+                View live output in the <strong>AI Output</strong> sub-tab.
               </p>
               <p className="text-xs text-muted-foreground">
                 The AI is executing your automation steps and analyzing results.
               </p>
-            </div>
-          )}
-
-          {/* Claude Output - Persistent Session only (shown when spawn session is active) */}
-          {persistentSession && currentSessionId && (
-            <div className="card p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-primary animate-pulse" />
-                  <span className="font-medium">Claude Output</span>
-                  {isRunning && (
-                    <span className="text-xs bg-green-500/20 text-green-500 px-2 py-0.5 rounded-full flex items-center gap-1">
-                      <Loader2 className="w-3 h-3 animate-spin" />
-                      Running
-                    </span>
-                  )}
-                </div>
-                {claudeLogInfo && (
-                  <span className="text-xs text-muted-foreground">
-                    {claudeLogInfo.totalLines} lines
-                  </span>
-                )}
-              </div>
-
-              {claudeLog ? (
-                <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-80 whitespace-pre-wrap font-mono">
-                  {claudeLog}
-                </pre>
-              ) : (
-                <div className="text-center py-6 text-muted-foreground">
-                  <Loader2 className="w-6 h-6 mx-auto mb-2 animate-spin" />
-                  <p className="text-sm">Waiting for Claude output...</p>
-                  <p className="text-xs mt-1">Claude is initializing in the background</p>
-                </div>
-              )}
             </div>
           )}
 
@@ -1989,6 +2262,97 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           )}
         </div>
       </div>
+
+      {/* Save Workflow Dialog */}
+      {showSaveDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setShowSaveDialog(false)}
+          />
+
+          {/* Dialog */}
+          <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Save className="w-5 h-5 text-green-500" />
+                <h3 className="text-lg font-semibold">Save Workflow</h3>
+              </div>
+              <button
+                onClick={() => setShowSaveDialog(false)}
+                className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-muted-foreground">
+              Save this workflow to the Prompt Library for easy reuse.
+            </p>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <input
+                  type="text"
+                  value={saveName}
+                  onChange={(e) => setSaveName(e.target.value)}
+                  placeholder="Enter workflow name..."
+                  className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  autoFocus
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Description (optional)</label>
+                <textarea
+                  value={saveDescription}
+                  onChange={(e) => setSaveDescription(e.target.value)}
+                  placeholder="Describe what this workflow does..."
+                  className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none h-20 focus:outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+
+              <div className="text-xs text-muted-foreground bg-muted/30 p-2 rounded">
+                <p><strong>Includes:</strong></p>
+                <ul className="list-disc list-inside mt-1 space-y-0.5">
+                  <li>{executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}</li>
+                  <li>Goal: {goal.trim() || "(none set)"}</li>
+                  <li>Mode: {persistentSession ? "Persistent Session" : "Standard"}</li>
+                  <li>Max iterations: {maxIterations}</li>
+                </ul>
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={() => setShowSaveDialog(false)}
+                className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={saveWorkflow}
+                disabled={isSaving || !saveName.trim()}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-500 text-white rounded-md font-medium hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {isSaving ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save className="w-4 h-4" />
+                    Save to Library
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

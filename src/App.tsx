@@ -19,8 +19,6 @@ import {
   Globe,
   Package,
   Sparkles,
-  BookOpen,
-  TestTube,
 } from "lucide-react";
 
 // Contexts
@@ -55,9 +53,7 @@ import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
-import { AiBuilderTab } from "./components/AiBuilderTab";
-import { PromptLibraryTab } from "./components/PromptLibraryTab";
-import { ScriptBuilderTab } from "./components/ScriptBuilderTab";
+import { AiWorkflowsTab } from "./components/AiWorkflowsTab";
 
 // Styles
 import "./index.css";
@@ -68,11 +64,9 @@ type MainTab =
   | "capture"
   | "extract"
   | "dataset"
-  | "ai-builder"
-  | "prompts"
-  | "scripts"
+  | "ai-workflows"
   | "settings";
-type LogSubTab = "general" | "image" | "actions" | "ai" | "issues" | "rag" | "external";
+type LogSubTab = "general" | "image" | "actions" | "rag";
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
 
@@ -89,6 +83,10 @@ function AppContent() {
   // Main tab state
   const [activeMainTab, setActiveMainTab] = useState<MainTab>(() => {
     const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
+    // Map old tab names to new ones
+    if (stored === "ai-builder" || stored === "prompts" || stored === "scripts") {
+      return "ai-workflows";
+    }
     if (
       stored &&
       [
@@ -97,9 +95,7 @@ function AppContent() {
         "capture",
         "extract",
         "dataset",
-        "ai-builder",
-        "prompts",
-        "scripts",
+        "ai-workflows",
         "settings",
       ].includes(stored)
     ) {
@@ -267,16 +263,9 @@ function AppContent() {
       case "actions":
         success = await copyLogs("actions", { actionLogs: actionLogViewData?.actions });
         break;
-      case "ai":
-        success = await copyLogs("ai", { aiOutputLines: aiOutputLogs });
-        break;
-      case "external":
-        success = await copyLogs("external", { externalSources: projectLogs.logsState.sources });
-        break;
-      // Issues and RAG tabs don't have copyable log content
-      case "issues":
+      // RAG tab doesn't have copyable log content
       case "rag":
-        // No-op for these tabs
+        // No-op for this tab
         break;
     }
 
@@ -339,9 +328,7 @@ function AppContent() {
     { id: "capture" as const, label: "Capture", icon: Camera },
     { id: "extract" as const, label: "Extract", icon: Globe },
     { id: "dataset" as const, label: "Dataset", icon: Package },
-    { id: "ai-builder" as const, label: "AI Builder", icon: Sparkles },
-    { id: "prompts" as const, label: "Prompts", icon: BookOpen },
-    { id: "scripts" as const, label: "Scripts", icon: TestTube },
+    { id: "ai-workflows" as const, label: "AI Workflows", icon: Sparkles },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
   ];
 
@@ -444,15 +431,6 @@ function AppContent() {
                 actionLogLoading={actionLogLoading}
                 actionLogError={actionLogError}
                 onActionRowClick={modalState.openActionModal}
-                aiOutputLines={aiOutputLogs}
-                onClearAiOutput={clearAiOutputLogs}
-                projectLogConfig={projectLogs.config}
-                projectLogSources={projectLogs.logsState.sources}
-                projectLogsLoading={projectLogs.logsState.loading}
-                projectLogsError={projectLogs.error || undefined}
-                projectLogsLastRefresh={undefined}
-                onRefreshProjectLogs={projectLogs.refreshLogs}
-                onConfigureProjectLogs={() => setShowLogSourceManager(true)}
                 ragState={ragProcessing.state}
                 onStartRagProcessing={ragProcessing.startProcessing}
                 onClearRagLogs={ragProcessing.clearLogs}
@@ -460,9 +438,7 @@ function AppContent() {
                 logCount={logCount}
                 imageLogCount={imageLogCount}
                 actionCount={actionLogViewData?.visible_count || 0}
-                aiOutputCount={aiOutputLogCount}
                 ragLogCount={ragProcessing.state.logs.length}
-                externalLogCount={projectLogs.logsState.sources.length}
                 onClearGeneralLogs={clearGeneralLogs}
                 onClearImageLogs={clearImageLogs}
                 onClearActionLogs={clearActionLogs}
@@ -509,29 +485,19 @@ function AppContent() {
             <DatasetPackager />
           </Tabs.Content>
 
-          {/* AI Builder Tab */}
+          {/* AI Workflows Tab */}
           <Tabs.Content
-            value="ai-builder"
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <AiBuilderTab projectLogs={projectLogs} />
-          </Tabs.Content>
-
-          {/* Prompts Tab */}
-          <Tabs.Content
-            value="prompts"
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <PromptLibraryTab onLog={addLog} />
-          </Tabs.Content>
-
-          {/* Scripts Tab - forceMount keeps component alive during AI generation */}
-          <Tabs.Content
-            value="scripts"
+            value="ai-workflows"
             forceMount
             className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
           >
-            <ScriptBuilderTab onLog={addLog} />
+            <AiWorkflowsTab
+              projectLogs={projectLogs}
+              aiOutputLines={aiOutputLogs}
+              onClearAiOutput={clearAiOutputLogs}
+              onLog={addLog}
+              onConfigureLogLocations={() => setShowLogSourceManager(true)}
+            />
           </Tabs.Content>
 
           {/* Settings Tab */}
