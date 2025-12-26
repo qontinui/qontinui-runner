@@ -364,6 +364,7 @@ impl PythonBridge {
         Ok(())
     }
 
+    #[allow(dead_code)] // Reserved for future use - test results configuration
     pub fn configure_test_results(
         &mut self,
         enabled: bool,

@@ -71,6 +71,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
 
 use regex::Regex;
@@ -79,6 +80,7 @@ use crate::commands::rag::{send_embeddings_to_web, RAGState};
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
+use crate::scriptlets;
 use crate::session_manager::SessionManager;
 use crate::settings;
 // WorkflowManager import removed - using unified SessionManager instead
@@ -232,24 +234,22 @@ fn run_claude_session_inline(
         let mut all_text = String::new();
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
-            for line_result in reader.lines() {
-                if let Ok(line) = line_result {
-                    // Update activity time
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    last_activity_stdout.store(now, Ordering::Relaxed);
+            for line in reader.lines().map_while(Result::ok) {
+                // Update activity time
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                last_activity_stdout.store(now, Ordering::Relaxed);
 
-                    // Extract text from JSON
-                    if let Some(text) = extract_text_from_stream_json(&line) {
-                        has_output_stdout.store(true, Ordering::Relaxed);
-                        if !text.is_empty() {
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                emit_ai_output(&app_handle_stdout, &text, "claude", None);
-                            }));
-                            all_text.push_str(&text);
-                        }
+                // Extract text from JSON
+                if let Some(text) = extract_text_from_stream_json(&line) {
+                    has_output_stdout.store(true, Ordering::Relaxed);
+                    if !text.is_empty() {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            emit_ai_output(&app_handle_stdout, &text, "claude", None);
+                        }));
+                        all_text.push_str(&text);
                     }
                 }
             }
@@ -1245,6 +1245,217 @@ async fn stop_execution(
 }
 
 // ============================================================================
+// Web Extraction API Endpoints
+// ============================================================================
+
+/// Request to start web extraction
+#[derive(Debug, Deserialize)]
+pub struct StartExtractionRequest {
+    /// URLs to extract from
+    pub urls: Vec<String>,
+    /// Viewport sizes as [width, height] pairs
+    #[serde(default)]
+    pub viewports: Vec<(u32, u32)>,
+    /// Whether to capture hover states
+    #[serde(default = "default_true")]
+    pub capture_hover_states: bool,
+    /// Whether to capture focus states
+    #[serde(default = "default_true")]
+    pub capture_focus_states: bool,
+    /// Maximum crawl depth
+    #[serde(default = "default_max_depth")]
+    pub max_depth: u32,
+    /// Maximum pages to crawl
+    #[serde(default = "default_max_pages")]
+    pub max_pages: u32,
+    /// Backend session ID to update with progress
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Backend API URL for progress updates
+    #[serde(default)]
+    pub backend_url: Option<String>,
+    /// Auth token for backend API calls
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_depth() -> u32 {
+    5
+}
+
+fn default_max_pages() -> u32 {
+    100
+}
+
+/// Response from extraction status endpoint
+#[derive(Debug, Serialize)]
+pub struct ExtractionStatusResponse {
+    pub is_running: bool,
+    pub extraction_id: Option<String>,
+    pub stats: Option<ExtractionStats>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExtractionStats {
+    pub states_found: u32,
+    pub transitions_found: u32,
+    pub pages_extracted: u32,
+    pub errors: u32,
+}
+
+/// Start web extraction
+async fn start_web_extraction(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartExtractionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting web extraction for {} URLs",
+        request.urls.len()
+    );
+
+    // Build extraction params
+    let params = serde_json::json!({
+        "urls": request.urls,
+        "viewports": request.viewports,
+        "capture_hover_states": request.capture_hover_states,
+        "capture_focus_states": request.capture_focus_states,
+        "max_depth": request.max_depth,
+        "max_pages": request.max_pages,
+        "session_id": request.session_id,
+        "backend_url": request.backend_url,
+        "auth_token": request.auth_token,
+    });
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command("start_web_extraction", Some(params))
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: Web extraction started");
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "started": true,
+                "message": "Web extraction started"
+            }))))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start web extraction: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Stop web extraction
+async fn stop_web_extraction(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Stopping web extraction");
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command("stop_web_extraction", None)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: Web extraction stopped");
+            Ok(Json(ApiResponse::success(
+                "Web extraction stopped".to_string(),
+            )))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to stop web extraction: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get extraction status
+async fn get_extraction_status(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<ExtractionStatusResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command("get_extraction_status", None)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            // Note: send_command doesn't return data, so we return a default status
+            // TODO: Implement proper extraction status tracking in app state
+            Ok(Json(ApiResponse::success(ExtractionStatusResponse {
+                is_running: false,
+                extraction_id: None,
+                stats: None,
+            })))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get extraction status: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
 // RAG API Endpoints
 // ============================================================================
 
@@ -2009,6 +2220,36 @@ pub struct DuplicatePlaywrightScriptRequest {
     pub new_name: Option<String>,
 }
 
+// ============================================================================
+// Scriptlet Request Types
+// ============================================================================
+
+/// Request to create a new scriptlet
+#[derive(Debug, Deserialize)]
+pub struct CreateScriptletRequest {
+    pub name: String,
+    pub content: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub source_log_ids: Option<Vec<String>>,
+}
+
+/// Request to update an existing scriptlet
+#[derive(Debug, Deserialize)]
+pub struct UpdateScriptletRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
 /// Emit AI output event to frontend
 fn emit_ai_output(
     app_handle: &tauri::AppHandle,
@@ -2362,6 +2603,7 @@ fn get_workspace_paths_internal(
 // Prompt Library HTTP Endpoints
 // ============================================================================
 
+use crate::backup;
 use crate::prompts;
 
 /// List all prompts
@@ -2896,6 +3138,235 @@ async fn duplicate_playwright_script(
 }
 
 // ============================================================================
+// Scriptlet HTTP Endpoints
+// ============================================================================
+
+/// List all scriptlets
+async fn list_scriptlets(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<scriptlets::Scriptlet>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let scriptlets = scriptlets::get_all_scriptlets();
+    Ok(Json(ApiResponse::success(scriptlets)))
+}
+
+/// Get a single scriptlet by ID
+async fn get_scriptlet(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<scriptlets::Scriptlet>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scriptlets::get_scriptlet(&id) {
+        Some(scriptlet) => Ok(Json(ApiResponse::success(scriptlet))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Scriptlet not found: {}", id))),
+        )),
+    }
+}
+
+/// Create a new scriptlet
+async fn create_scriptlet(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<CreateScriptletRequest>,
+) -> Result<Json<ApiResponse<scriptlets::Scriptlet>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scriptlets::create_scriptlet(
+        request.name,
+        request.content,
+        request.category,
+        request.tags,
+        request.source_log_ids,
+    ) {
+        Ok(scriptlet) => Ok(Json(ApiResponse::success(scriptlet))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Update an existing scriptlet
+async fn update_scriptlet(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<UpdateScriptletRequest>,
+) -> Result<Json<ApiResponse<scriptlets::Scriptlet>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scriptlets::update_scriptlet(
+        &id,
+        request.name,
+        request.content,
+        request.category,
+        request.tags,
+    ) {
+        Ok(scriptlet) => Ok(Json(ApiResponse::success(scriptlet))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Delete a scriptlet
+async fn delete_scriptlet(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scriptlets::delete_scriptlet(&id) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
+    }
+}
+
+/// Get all scriptlet categories
+async fn get_scriptlet_categories(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let categories = scriptlets::get_categories();
+    Ok(Json(ApiResponse::success(categories)))
+}
+
+/// Search scriptlets
+async fn search_scriptlets(
+    State(_state): State<Arc<ApiState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<Vec<scriptlets::Scriptlet>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
+    let results = scriptlets::search_scriptlets(query);
+    Ok(Json(ApiResponse::success(results)))
+}
+
+// ============================================================================
+// Backup and Restore HTTP Endpoints
+// ============================================================================
+
+/// Response for backup creation
+#[derive(Debug, Serialize)]
+struct BackupResponse {
+    /// Base64-encoded ZIP file data
+    data: String,
+    /// Original filename suggestion
+    filename: String,
+    /// Backup result with details
+    result: backup::BackupResult,
+}
+
+/// Request for restore operation
+#[derive(Debug, Deserialize)]
+struct RestoreRequest {
+    /// Base64-encoded ZIP file data
+    data: String,
+}
+
+/// Create a backup of all user data
+///
+/// Returns the backup as base64-encoded ZIP data along with metadata.
+async fn create_backup_handler(
+    State(_state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<BackupResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Creating backup");
+
+    match backup::create_backup() {
+        Ok((zip_data, result)) => {
+            // Encode ZIP data as base64
+            let base64_data =
+                base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &zip_data);
+
+            // Generate filename with timestamp
+            let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let filename = format!("qontinui_backup_{}.zip", timestamp);
+
+            info!(
+                "MCP API: Backup created successfully ({} bytes, {} files)",
+                zip_data.len(),
+                result.files_backed_up.len()
+            );
+
+            Ok(Json(ApiResponse::success(BackupResponse {
+                data: base64_data,
+                filename,
+                result,
+            })))
+        }
+        Err(e) => {
+            error!("MCP API: Backup failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get information about a backup without restoring it
+async fn get_backup_info_handler(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<RestoreRequest>,
+) -> Result<Json<ApiResponse<backup::BackupManifest>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Getting backup info");
+
+    // Decode base64 data
+    let zip_data =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &request.data) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("MCP API: Failed to decode backup data: {}", e);
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!("Invalid base64 data: {}", e))),
+                ));
+            }
+        };
+
+    match backup::get_backup_info(&zip_data) {
+        Ok(manifest) => {
+            info!(
+                "MCP API: Backup info retrieved - version {}, {} files",
+                manifest.version,
+                manifest.files.len()
+            );
+            Ok(Json(ApiResponse::success(manifest)))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get backup info: {}", e);
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e))))
+        }
+    }
+}
+
+/// Restore user data from a backup
+///
+/// Accepts base64-encoded ZIP data and restores all files to their original locations.
+async fn restore_backup_handler(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<RestoreRequest>,
+) -> Result<Json<ApiResponse<backup::RestoreResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Restoring from backup");
+
+    // Decode base64 data
+    let zip_data =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &request.data) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("MCP API: Failed to decode backup data: {}", e);
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(format!("Invalid base64 data: {}", e))),
+                ));
+            }
+        };
+
+    match backup::restore_backup(&zip_data) {
+        Ok(result) => {
+            if result.success {
+                info!(
+                    "MCP API: Restore completed successfully - {} files restored",
+                    result.files_restored.len()
+                );
+            } else {
+                warn!(
+                    "MCP API: Restore completed with errors: {:?}",
+                    result.errors
+                );
+            }
+            Ok(Json(ApiResponse::success(result)))
+        }
+        Err(e) => {
+            error!("MCP API: Restore failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
 // Trace and Video Extraction Utilities
 // ============================================================================
 
@@ -3030,7 +3501,7 @@ fn extract_video_frames(video_path: &str, max_frames: u32) -> Result<Vec<String>
             let mut frames = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&temp_dir) {
                 for entry in entries.flatten() {
-                    if entry.path().extension().map_or(false, |e| e == "png") {
+                    if entry.path().extension().is_some_and(|e| e == "png") {
                         frames.push(entry.path().to_string_lossy().to_string());
                     }
                 }
@@ -4374,6 +4845,21 @@ struct StartSessionRequest {
     /// Timeout per phase in seconds (default 1800 = 30 min)
     #[serde(default = "default_session_timeout")]
     timeout_seconds: u64,
+
+    // Multi-session workflow configuration
+    /// Path to external checkpoint file for cross-session workflows
+    #[serde(default)]
+    checkpoint_path: Option<String>,
+    /// JSON field name in checkpoint that tracks current phase (default: "current_phase")
+    #[serde(default = "default_phase_field")]
+    phase_field: String,
+    /// Workflow is complete when phase_field reaches this value
+    #[serde(default)]
+    completion_value: Option<u32>,
+}
+
+fn default_phase_field() -> String {
+    "current_phase".to_string()
 }
 
 fn default_session_timeout() -> u64 {
@@ -4426,6 +4912,20 @@ async fn start_session(
         }
     };
 
+    // Clone values BEFORE moving them into config (for potential continuation sessions)
+    let original_prompt = request.prompt.clone();
+    let continuation_prompt_template = request.continuation_prompt.clone();
+    let session_type_str = request.session_type.clone();
+    let total_phases = request.total_phases;
+    let uses_gui = request.uses_gui;
+    let timeout_seconds = request.timeout_seconds;
+    let session_name = request.name.clone();
+
+    // Multi-session workflow config
+    let workflow_checkpoint_path = request.checkpoint_path.clone();
+    let workflow_phase_field = request.phase_field.clone();
+    let workflow_completion_value = request.completion_value;
+
     let config = SessionConfig {
         session_type,
         prompt: request.prompt,
@@ -4451,7 +4951,216 @@ async fn start_session(
                 .unwrap_or_else(|_| ".".to_string());
 
             tokio::spawn(async move {
-                run_unified_session_loop(state_clone, session_id, workspace_root).await;
+                // =====================================================================
+                // CROSS-SESSION CONTINUATION LOOP (Deterministic, Runner-Managed)
+                // =====================================================================
+                //
+                // This outer loop handles continuation ACROSS sessions (spawning new
+                // sessions when one ends). This is different from the inner phase loop
+                // in run_unified_session_loop which handles phases WITHIN a single session.
+                //
+                // Why this is here (not in the AI):
+                // - The AI might crash, timeout, or hit context limits mid-work
+                // - The runner ALWAYS runs after the session ends
+                // - The runner can reliably check the checkpoint and continue
+                // - The AI just needs to save progress; the runner handles continuation
+                //
+                // Multi-session workflows are configured with:
+                // - checkpoint_path: Path to the checkpoint JSON file
+                // - phase_field: JSON field name containing current phase (e.g., "current_phase")
+                // - completion_value: Workflow is complete when phase_field >= this value
+                //
+                // Max sessions is a safety limit to prevent infinite loops.
+                // =====================================================================
+
+                // Check if multi-session workflow is enabled
+                let has_workflow_config =
+                    workflow_checkpoint_path.is_some() && workflow_completion_value.is_some();
+
+                if !has_workflow_config {
+                    // No workflow config - run single session and exit
+                    info!("No multi-session workflow config. Running single session.");
+                    run_unified_session_loop(
+                        state_clone.clone(),
+                        session_id.clone(),
+                        workspace_root.clone(),
+                    )
+                    .await;
+                    return;
+                }
+
+                // Multi-session workflow enabled
+                let checkpoint_path_str = workflow_checkpoint_path.unwrap();
+                let checkpoint_path = std::path::PathBuf::from(&checkpoint_path_str);
+                let phase_field = workflow_phase_field;
+                let completion_value = workflow_completion_value.unwrap();
+
+                const MAX_CROSS_SESSION_ITERATIONS: u32 = 20; // Safety limit
+                let mut cross_session_count = 0u32;
+                let mut current_session_id = session_id.clone();
+
+                // Save active workflow config for resume-on-startup
+                let active_config = ActiveWorkflowConfig {
+                    session_type: session_type_str.clone(),
+                    name: session_name.clone(),
+                    prompt: original_prompt.clone(),
+                    continuation_prompt: continuation_prompt_template.clone(),
+                    total_phases,
+                    uses_gui,
+                    timeout_seconds,
+                    checkpoint_path: checkpoint_path_str.clone(),
+                    phase_field: phase_field.clone(),
+                    completion_value,
+                    started_at: chrono::Utc::now().to_rfc3339(),
+                    cross_session_count: 0,
+                };
+                if let Err(e) = save_active_workflow_config(&active_config) {
+                    warn!("Failed to save active workflow config: {}", e);
+                }
+
+                loop {
+                    cross_session_count += 1;
+                    info!(
+                        "Starting cross-session iteration {} (session: {})",
+                        cross_session_count, current_session_id
+                    );
+
+                    // Run the session loop (handles phases within this session)
+                    run_unified_session_loop(
+                        state_clone.clone(),
+                        current_session_id.clone(),
+                        workspace_root.clone(),
+                    )
+                    .await;
+
+                    // After session ends, check if we should spawn a continuation
+                    if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
+                        &checkpoint_path,
+                        &phase_field,
+                        completion_value,
+                    ) {
+                        if is_complete {
+                            info!(
+                                "Workflow complete: {}={} >= completion_value={}. Finished after {} sessions.",
+                                phase_field, current_phase, completion_value, cross_session_count
+                            );
+                            emit_ai_output(
+                                &state_clone.app_handle,
+                                &format!(
+                                    "✅ Workflow completed after {} sessions (phase {} >= {})",
+                                    cross_session_count, current_phase, completion_value
+                                ),
+                                "status",
+                                Some(&current_session_id),
+                            );
+                            // Delete the active workflow config since workflow is complete
+                            delete_active_workflow_config();
+                            break;
+                        }
+
+                        // Not complete - check if we should continue
+                        if cross_session_count >= MAX_CROSS_SESSION_ITERATIONS {
+                            warn!(
+                                "Reached max cross-session iterations ({}). Stopping to prevent infinite loop.",
+                                MAX_CROSS_SESSION_ITERATIONS
+                            );
+                            emit_ai_output(
+                                &state_clone.app_handle,
+                                &format!(
+                                    "⚠️ Reached max sessions ({}). Phase {} of {}.",
+                                    MAX_CROSS_SESSION_ITERATIONS, current_phase, completion_value
+                                ),
+                                "warning",
+                                Some(&current_session_id),
+                            );
+                            break;
+                        }
+
+                        // Spawn a continuation session
+                        info!(
+                            "Workflow not complete (phase {} < {}). Spawning continuation session ({}/{})",
+                            current_phase, completion_value, cross_session_count + 1, MAX_CROSS_SESSION_ITERATIONS
+                        );
+
+                        // Create continuation config with modified prompt
+                        let continuation_config = SessionConfig {
+                            session_type: match session_type_str.as_str() {
+                                "prompt_workflow" => SessionType::PromptWorkflow,
+                                "ai_builder" => SessionType::AiBuilder,
+                                _ => SessionType::OneShot,
+                            },
+                            prompt: format!(
+                                "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n",
+                                original_prompt,
+                                cross_session_count + 1,
+                                phase_field,
+                                current_phase,
+                                checkpoint_path.display(),
+                                phase_field,
+                                completion_value
+                            ),
+                            continuation_prompt: continuation_prompt_template.clone(),
+                            total_phases,
+                            uses_gui,
+                            timeout_seconds,
+                            stall_threshold_seconds: 300,
+                            name: format!("{}-cont-{}", session_name, cross_session_count + 1),
+                            description: format!("Continuation session {} of workflow (phase {}/{})", cross_session_count + 1, current_phase, completion_value),
+                            custom_config: serde_json::json!({}),
+                        };
+
+                        match state_clone
+                            .session_manager
+                            .start_session(continuation_config)
+                            .await
+                        {
+                            Ok(new_session) => {
+                                current_session_id = new_session.id.clone();
+                                emit_ai_output(
+                                    &state_clone.app_handle,
+                                    &format!(
+                                        "🔄 Continuation session {} (phase {}/{}, id: {})",
+                                        cross_session_count + 1,
+                                        current_phase,
+                                        completion_value,
+                                        current_session_id
+                                    ),
+                                    "status",
+                                    Some(&current_session_id),
+                                );
+                                // Update the cross_session_count in the active workflow config
+                                update_active_workflow_cross_session_count(cross_session_count + 1);
+                                // Continue the loop - this will run run_unified_session_loop again
+                            }
+                            Err(e) => {
+                                error!("Failed to create continuation session: {}", e);
+                                emit_ai_output(
+                                    &state_clone.app_handle,
+                                    &format!("❌ Failed to spawn continuation: {}", e),
+                                    "error",
+                                    Some(&current_session_id),
+                                );
+                                break;
+                            }
+                        }
+                    } else {
+                        // Checkpoint file not found or unreadable
+                        warn!(
+                            "Checkpoint not found or unreadable at {:?}. Stopping workflow.",
+                            checkpoint_path
+                        );
+                        emit_ai_output(
+                            &state_clone.app_handle,
+                            &format!(
+                                "⚠️ Checkpoint not found: {}. Session complete.",
+                                checkpoint_path.display()
+                            ),
+                            "warning",
+                            Some(&current_session_id),
+                        );
+                        break;
+                    }
+                }
             });
 
             Ok(Json(ApiResponse::success(StartSessionResponse { session })))
@@ -4525,6 +5234,687 @@ fn check_goal_completion_markers(output: &str) -> bool {
     }
 
     false
+}
+
+// ============================================================================
+// Active Workflow Persistence (for Resume-on-Startup)
+// ============================================================================
+
+/// Configuration for an active multi-session workflow that should be resumed on startup.
+/// This is persisted to `.dev-logs/active-workflow.json` when a multi-session workflow starts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveWorkflowConfig {
+    /// Session type ("prompt_workflow", "ai_builder", "one_shot")
+    session_type: String,
+    /// Display name for the workflow
+    name: String,
+    /// Original prompt content
+    prompt: String,
+    /// Continuation prompt template (if any)
+    continuation_prompt: Option<String>,
+    /// Total phases/iterations per session (0 = unlimited)
+    total_phases: u32,
+    /// Whether this workflow uses GUI automation
+    uses_gui: bool,
+    /// Timeout per phase in seconds
+    timeout_seconds: u64,
+    /// Path to the checkpoint JSON file
+    checkpoint_path: String,
+    /// JSON field name in checkpoint that tracks current phase
+    phase_field: String,
+    /// Workflow is complete when phase_field >= this value
+    completion_value: u32,
+    /// When the workflow was started
+    started_at: String,
+    /// Number of cross-session continuations so far
+    cross_session_count: u32,
+}
+
+/// Get the path to the active workflow config file
+fn get_active_workflow_config_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\active-workflow.json",
+    )
+}
+
+/// Save an active workflow config (called when starting a multi-session workflow)
+fn save_active_workflow_config(config: &ActiveWorkflowConfig) -> Result<(), String> {
+    let path = get_active_workflow_config_path();
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize workflow config: {}", e))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Failed to write workflow config to {:?}: {}", path, e))?;
+    info!("Saved active workflow config to {:?}", path);
+    Ok(())
+}
+
+/// Load an active workflow config (called on startup to check for resumption)
+fn load_active_workflow_config() -> Option<ActiveWorkflowConfig> {
+    let path = get_active_workflow_config_path();
+    if !path.exists() {
+        return None;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<ActiveWorkflowConfig>(&contents) {
+            Ok(config) => {
+                info!(
+                    "Loaded active workflow config: {} (phase_field={}, completion_value={})",
+                    config.name, config.phase_field, config.completion_value
+                );
+                Some(config)
+            }
+            Err(e) => {
+                warn!("Failed to parse active workflow config: {}", e);
+                None
+            }
+        },
+        Err(e) => {
+            warn!("Failed to read active workflow config: {}", e);
+            None
+        }
+    }
+}
+
+/// Delete the active workflow config (called when workflow completes or is stopped)
+fn delete_active_workflow_config() {
+    let path = get_active_workflow_config_path();
+    if path.exists() {
+        if let Err(e) = std::fs::remove_file(&path) {
+            warn!("Failed to delete active workflow config: {}", e);
+        } else {
+            info!("Deleted active workflow config (workflow complete)");
+        }
+    }
+}
+
+/// Update the cross_session_count in the active workflow config
+fn update_active_workflow_cross_session_count(count: u32) {
+    if let Some(mut config) = load_active_workflow_config() {
+        config.cross_session_count = count;
+        if let Err(e) = save_active_workflow_config(&config) {
+            warn!("Failed to update cross_session_count: {}", e);
+        }
+    }
+}
+
+/// Response for resumable workflow check
+#[derive(Debug, Serialize)]
+struct ResumableWorkflowInfo {
+    /// Whether a resumable workflow exists
+    has_resumable: bool,
+    /// Workflow name (if resumable)
+    name: Option<String>,
+    /// Session type
+    session_type: Option<String>,
+    /// Current phase/iteration
+    current_phase: Option<u32>,
+    /// Total phases (0 = unlimited)
+    total_phases: Option<u32>,
+    /// When the workflow was started
+    started_at: Option<String>,
+    /// Number of cross-session continuations
+    cross_session_count: Option<u32>,
+    /// Status from checkpoint
+    status: Option<String>,
+}
+
+/// Get information about any resumable workflow
+async fn get_resumable_workflow(
+    State(_state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<ResumableWorkflowInfo>> {
+    // Load the active workflow config
+    let config = match load_active_workflow_config() {
+        Some(c) => c,
+        None => {
+            return Json(ApiResponse::success(ResumableWorkflowInfo {
+                has_resumable: false,
+                name: None,
+                session_type: None,
+                current_phase: None,
+                total_phases: None,
+                started_at: None,
+                cross_session_count: None,
+                status: None,
+            }));
+        }
+    };
+
+    // Check if restart is permitted
+    let checkpoint_path = std::path::PathBuf::from(&config.checkpoint_path);
+    if !check_workflow_restart_permitted(&checkpoint_path) {
+        return Json(ApiResponse::success(ResumableWorkflowInfo {
+            has_resumable: false,
+            name: None,
+            session_type: None,
+            current_phase: None,
+            total_phases: None,
+            started_at: None,
+            cross_session_count: None,
+            status: None,
+        }));
+    }
+
+    // Check if the workflow is already complete
+    if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
+        &checkpoint_path,
+        &config.phase_field,
+        config.completion_value,
+    ) {
+        if is_complete {
+            // Workflow is complete, clean up
+            delete_active_workflow_config();
+            return Json(ApiResponse::success(ResumableWorkflowInfo {
+                has_resumable: false,
+                name: None,
+                session_type: None,
+                current_phase: None,
+                total_phases: None,
+                started_at: None,
+                cross_session_count: None,
+                status: None,
+            }));
+        }
+
+        // Get status from checkpoint
+        let status = std::fs::read_to_string(&checkpoint_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("status")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string())
+            });
+
+        return Json(ApiResponse::success(ResumableWorkflowInfo {
+            has_resumable: true,
+            name: Some(config.name),
+            session_type: Some(config.session_type),
+            current_phase: Some(current_phase),
+            total_phases: Some(config.total_phases),
+            started_at: Some(config.started_at),
+            cross_session_count: Some(config.cross_session_count),
+            status,
+        }));
+    }
+
+    // No valid checkpoint
+    Json(ApiResponse::success(ResumableWorkflowInfo {
+        has_resumable: false,
+        name: None,
+        session_type: None,
+        current_phase: None,
+        total_phases: None,
+        started_at: None,
+        cross_session_count: None,
+        status: None,
+    }))
+}
+
+/// Response type for resume workflow
+#[derive(Debug, Serialize)]
+struct ResumeWorkflowResponse {
+    message: String,
+    name: String,
+}
+
+/// Manually resume an active workflow
+async fn resume_workflow(
+    State(state): State<Arc<ApiState>>,
+) -> Json<ApiResponse<ResumeWorkflowResponse>> {
+    // Check if AI analysis is already running
+    if state
+        .ai_analysis_running
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(
+                "AI analysis is already running. Stop it first before resuming a workflow."
+                    .to_string(),
+            ),
+        });
+    }
+
+    // Load the active workflow config
+    let config = match load_active_workflow_config() {
+        Some(c) => c,
+        None => {
+            return Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some("No active workflow to resume".to_string()),
+            });
+        }
+    };
+
+    // Check if restart is permitted
+    let checkpoint_path = std::path::PathBuf::from(&config.checkpoint_path);
+    if !check_workflow_restart_permitted(&checkpoint_path) {
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(
+                "Workflow restart not permitted (restart_permitted=false in checkpoint)"
+                    .to_string(),
+            ),
+        });
+    }
+
+    // Check if the workflow is already complete
+    if let Some((is_complete, _)) = check_external_checkpoint_status(
+        &checkpoint_path,
+        &config.phase_field,
+        config.completion_value,
+    ) {
+        if is_complete {
+            delete_active_workflow_config();
+            return Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some("Workflow is already complete".to_string()),
+            });
+        }
+    }
+
+    info!("Manually resuming workflow: {}", config.name);
+    let workflow_name = config.name.clone();
+
+    // Call the resume function (spawn it so we don't block)
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        resume_active_workflow_on_startup(state_clone).await;
+    });
+
+    Json(ApiResponse::success(ResumeWorkflowResponse {
+        message: format!("Resuming workflow: {}", workflow_name),
+        name: workflow_name,
+    }))
+}
+
+/// Response for auto-continue setting
+#[derive(Debug, Serialize)]
+struct AutoContinueSettingResponse {
+    enabled: bool,
+}
+
+/// Get the auto-continue AI workflow setting
+async fn get_auto_continue_setting() -> Json<ApiResponse<AutoContinueSettingResponse>> {
+    let enabled = settings::get_auto_continue_ai_workflow();
+    Json(ApiResponse::success(AutoContinueSettingResponse {
+        enabled,
+    }))
+}
+
+/// Request body for setting auto-continue
+#[derive(Debug, Deserialize)]
+struct SetAutoContinueRequest {
+    enabled: bool,
+}
+
+/// Set the auto-continue AI workflow setting
+async fn set_auto_continue_setting(
+    Json(body): Json<SetAutoContinueRequest>,
+) -> Json<ApiResponse<AutoContinueSettingResponse>> {
+    match settings::save_auto_continue_ai_workflow(body.enabled) {
+        Ok(_) => {
+            info!(
+                "Auto-continue AI workflow setting updated to: {}",
+                body.enabled
+            );
+            Json(ApiResponse::success(AutoContinueSettingResponse {
+                enabled: body.enabled,
+            }))
+        }
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Failed to save setting: {}", e)),
+        }),
+    }
+}
+
+/// Check the active workflow checkpoint for restart_permitted flag
+/// Returns true if restart is permitted (or if the flag is absent)
+fn check_workflow_restart_permitted(checkpoint_path: &std::path::Path) -> bool {
+    if !checkpoint_path.exists() {
+        return false;
+    }
+    match std::fs::read_to_string(checkpoint_path) {
+        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+            Ok(json) => {
+                // If restart_permitted is explicitly false, don't resume
+                // If absent or true, resume
+                json.get("restart_permitted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Resume an active workflow on startup if one exists and should be resumed.
+/// This is called during server startup to check for workflows that were interrupted
+/// (e.g., by runner restart during code changes).
+async fn resume_active_workflow_on_startup(state: Arc<ApiState>) {
+    // Load the active workflow config
+    let config = match load_active_workflow_config() {
+        Some(c) => c,
+        None => {
+            info!("No active workflow to resume on startup");
+            return;
+        }
+    };
+
+    info!(
+        "Found active workflow '{}' to potentially resume (checkpoint: {}, phase_field: {}, completion_value: {})",
+        config.name, config.checkpoint_path, config.phase_field, config.completion_value
+    );
+
+    // Check if restart is permitted
+    let checkpoint_path = std::path::PathBuf::from(&config.checkpoint_path);
+    if !check_workflow_restart_permitted(&checkpoint_path) {
+        info!("Workflow restart not permitted (restart_permitted=false). Not resuming.");
+        return;
+    }
+
+    // Check if the workflow is already complete
+    if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
+        &checkpoint_path,
+        &config.phase_field,
+        config.completion_value,
+    ) {
+        if is_complete {
+            info!(
+                "Workflow already complete ({}={} >= {}). Cleaning up.",
+                config.phase_field, current_phase, config.completion_value
+            );
+            delete_active_workflow_config();
+            return;
+        }
+
+        // Workflow is not complete - resume it
+        info!(
+            "Resuming workflow '{}' from phase {} (target: {})",
+            config.name, current_phase, config.completion_value
+        );
+
+        emit_ai_output(
+            &state.app_handle,
+            &format!(
+                "🔄 Resuming workflow '{}' from phase {} (interrupted by restart)",
+                config.name, current_phase
+            ),
+            "status",
+            None,
+        );
+
+        // Create a continuation session config
+        let continuation_config = SessionConfig {
+            session_type: match config.session_type.as_str() {
+                "prompt_workflow" => SessionType::PromptWorkflow,
+                "ai_builder" => SessionType::AiBuilder,
+                _ => SessionType::OneShot,
+            },
+            prompt: format!(
+                "{}\n\n## Resume After Runner Restart\n\nThis session is resuming after a runner restart. Read the checkpoint file and continue from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n",
+                config.prompt,
+                config.phase_field,
+                current_phase,
+                config.checkpoint_path,
+                config.phase_field,
+                config.completion_value
+            ),
+            continuation_prompt: config.continuation_prompt.clone(),
+            total_phases: config.total_phases,
+            uses_gui: config.uses_gui,
+            timeout_seconds: config.timeout_seconds,
+            stall_threshold_seconds: 300,
+            name: format!("{}-resume", config.name),
+            description: format!("Resumed after runner restart (phase {}/{})", current_phase, config.completion_value),
+            custom_config: serde_json::json!({}),
+        };
+
+        // Start the continuation session
+        match state
+            .session_manager
+            .start_session(continuation_config)
+            .await
+        {
+            Ok(session) => {
+                info!("Started resume session: {}", session.id);
+                let session_id = session.id.clone();
+                let workspace_root = get_workspace_paths_internal()
+                    .map(|(root, _, _)| root.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
+
+                // Spawn the cross-session continuation loop
+                let state_clone = state.clone();
+                let original_prompt = config.prompt.clone();
+                let continuation_prompt_template = config.continuation_prompt.clone();
+                let session_type_str = config.session_type.clone();
+                let session_name = config.name.clone();
+                let total_phases = config.total_phases;
+                let uses_gui = config.uses_gui;
+                let timeout_seconds = config.timeout_seconds;
+                let checkpoint_path_str = config.checkpoint_path.clone();
+                let phase_field = config.phase_field.clone();
+                let completion_value = config.completion_value;
+                let initial_cross_session_count = config.cross_session_count;
+
+                tokio::spawn(async move {
+                    const MAX_CROSS_SESSION_ITERATIONS: u32 = 20;
+                    let mut cross_session_count = initial_cross_session_count;
+                    let mut current_session_id = session_id.clone();
+                    let checkpoint_path = std::path::PathBuf::from(&checkpoint_path_str);
+
+                    loop {
+                        cross_session_count += 1;
+                        info!(
+                            "Resume: Starting cross-session iteration {} (session: {})",
+                            cross_session_count, current_session_id
+                        );
+
+                        // Run the session loop
+                        run_unified_session_loop(
+                            state_clone.clone(),
+                            current_session_id.clone(),
+                            workspace_root.clone(),
+                        )
+                        .await;
+
+                        // Check if we should spawn a continuation
+                        if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
+                            &checkpoint_path,
+                            &phase_field,
+                            completion_value,
+                        ) {
+                            if is_complete {
+                                info!(
+                                    "Resume workflow complete: {}={} >= {}. Finished after {} sessions.",
+                                    phase_field, current_phase, completion_value, cross_session_count
+                                );
+                                emit_ai_output(
+                                    &state_clone.app_handle,
+                                    &format!(
+                                        "✅ Resumed workflow completed after {} sessions (phase {} >= {})",
+                                        cross_session_count, current_phase, completion_value
+                                    ),
+                                    "status",
+                                    Some(&current_session_id),
+                                );
+                                delete_active_workflow_config();
+                                break;
+                            }
+
+                            if cross_session_count >= MAX_CROSS_SESSION_ITERATIONS {
+                                warn!(
+                                    "Resume: Reached max cross-session iterations ({}). Stopping.",
+                                    MAX_CROSS_SESSION_ITERATIONS
+                                );
+                                emit_ai_output(
+                                    &state_clone.app_handle,
+                                    &format!(
+                                        "⚠️ Reached max sessions ({}). Phase {} of {}.",
+                                        MAX_CROSS_SESSION_ITERATIONS,
+                                        current_phase,
+                                        completion_value
+                                    ),
+                                    "warning",
+                                    Some(&current_session_id),
+                                );
+                                break;
+                            }
+
+                            // Spawn a continuation session
+                            let continuation_config = SessionConfig {
+                                session_type: match session_type_str.as_str() {
+                                    "prompt_workflow" => SessionType::PromptWorkflow,
+                                    "ai_builder" => SessionType::AiBuilder,
+                                    _ => SessionType::OneShot,
+                                },
+                                prompt: format!(
+                                    "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n",
+                                    original_prompt,
+                                    cross_session_count + 1,
+                                    phase_field,
+                                    current_phase,
+                                    checkpoint_path.display(),
+                                    phase_field,
+                                    completion_value
+                                ),
+                                continuation_prompt: continuation_prompt_template.clone(),
+                                total_phases,
+                                uses_gui,
+                                timeout_seconds,
+                                stall_threshold_seconds: 300,
+                                name: format!("{}-cont-{}", session_name, cross_session_count + 1),
+                                description: format!("Continuation session {} (phase {}/{})", cross_session_count + 1, current_phase, completion_value),
+                                custom_config: serde_json::json!({}),
+                            };
+
+                            match state_clone
+                                .session_manager
+                                .start_session(continuation_config)
+                                .await
+                            {
+                                Ok(new_session) => {
+                                    current_session_id = new_session.id.clone();
+                                    emit_ai_output(
+                                        &state_clone.app_handle,
+                                        &format!(
+                                            "🔄 Continuation session {} (phase {}/{}, id: {})",
+                                            cross_session_count + 1,
+                                            current_phase,
+                                            completion_value,
+                                            current_session_id
+                                        ),
+                                        "status",
+                                        Some(&current_session_id),
+                                    );
+                                    update_active_workflow_cross_session_count(
+                                        cross_session_count + 1,
+                                    );
+                                }
+                                Err(e) => {
+                                    error!("Resume: Failed to create continuation session: {}", e);
+                                    break;
+                                }
+                            }
+                        } else {
+                            warn!("Resume: Checkpoint not found or unreadable. Stopping.");
+                            break;
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to start resume session: {}", e);
+                emit_ai_output(
+                    &state.app_handle,
+                    &format!("❌ Failed to resume workflow: {}", e),
+                    "error",
+                    None,
+                );
+            }
+        }
+    } else {
+        warn!("Could not read checkpoint for resumption. Not resuming.");
+    }
+}
+
+/// Check external checkpoint file for workflow completion status.
+///
+/// # Why This Is Deterministic (Not AI-Managed)
+///
+/// We check the external checkpoint file from the RUNNER, not from the AI, because:
+///
+/// 1. **Reliability**: The AI might forget to spawn a continuation, timeout before
+///    doing so, or exit without saving state. The runner ALWAYS runs after each
+///    Claude session ends, so it can reliably check and continue.
+///
+/// 2. **Edge Case Handling**: If the AI crashes, times out, or hits context limits,
+///    the runner can still read the checkpoint and spawn a continuation. The AI
+///    cannot handle its own failure.
+///
+/// 3. **Iteration Limits**: The runner enforces max_iterations to prevent infinite
+///    loops. The AI might not track this correctly across sessions.
+///
+/// 4. **Single Source of Truth**: The checkpoint file is the authoritative state.
+///    The runner reads it deterministically; the AI just writes to it.
+///
+/// 5. **User Experience**: The user starts improve-all once and walks away.
+///    Multiple sessions may run, but the user is never asked to intervene.
+///
+/// # Arguments
+/// * `checkpoint_path` - Path to the checkpoint JSON file
+/// * `phase_field` - JSON field name that contains the current phase (e.g., "current_phase")
+/// * `completion_value` - Workflow is complete when phase_field >= this value
+///
+/// # Returns
+/// * `Some((true, phase))` - Checkpoint exists and workflow is complete (phase >= completion_value)
+/// * `Some((false, phase))` - Checkpoint exists and workflow is NOT complete (continue)
+/// * `None` - Checkpoint doesn't exist or couldn't be read
+fn check_external_checkpoint_status(
+    checkpoint_path: &std::path::Path,
+    phase_field: &str,
+    completion_value: u32,
+) -> Option<(bool, u32)> {
+    if !checkpoint_path.exists() {
+        return None;
+    }
+
+    match std::fs::read_to_string(checkpoint_path) {
+        Ok(contents) => {
+            match serde_json::from_str::<serde_json::Value>(&contents) {
+                Ok(json) => {
+                    // Get current phase from the configured field
+                    let current_phase =
+                        json.get(phase_field).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+
+                    // Workflow is complete when current_phase >= completion_value
+                    let is_complete = current_phase >= completion_value;
+
+                    info!(
+                        "External checkpoint status: {}={}, completion_value={}, is_complete={}",
+                        phase_field, current_phase, completion_value, is_complete
+                    );
+
+                    Some((is_complete, current_phase))
+                }
+                Err(e) => {
+                    warn!("Failed to parse external checkpoint: {}", e);
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to read external checkpoint: {}", e);
+            None
+        }
+    }
 }
 
 /// Run the unified session execution loop
@@ -4609,6 +5999,12 @@ async fn run_unified_session_loop(
                 if !success {
                     warn!("Phase {} completed with errors, continuing...", phase);
                 }
+
+                // Note: External checkpoint is now checked by the CROSS-SESSION loop
+                // (in start_session's tokio::spawn), not here. This allows:
+                // - Better separation of concerns: within-session vs cross-session
+                // - The cross-session loop uses configurable completion_value
+                // - Sessions end naturally via total_phases or goal markers
 
                 // Check session checkpoint for completion
                 if let Some(mut s) = state.session_manager.get_session(&session_id).await {
@@ -4760,6 +6156,17 @@ pub fn create_router(
                 );
             }
         }
+
+        // Check for active workflows to resume after runner restart
+        // This runs after session restore, with a small additional delay
+        // Only auto-resume if the setting is enabled
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        if settings::get_auto_continue_ai_workflow() {
+            info!("Auto-continue is enabled, checking for workflows to resume...");
+            resume_active_workflow_on_startup(state_for_restore).await;
+        } else {
+            info!("Auto-continue is disabled, skipping automatic workflow resume");
+        }
     });
 
     // Configure CORS to allow requests from WSL
@@ -4779,6 +6186,10 @@ pub fn create_router(
         .route("/load-last-config", post(load_last_config))
         .route("/run-workflow", post(run_workflow))
         .route("/stop-execution", post(stop_execution))
+        // Web extraction routes
+        .route("/extraction/start", post(start_web_extraction))
+        .route("/extraction/stop", post(stop_web_extraction))
+        .route("/extraction/status", get(get_extraction_status))
         // RAG routes
         .route("/rag/import", post(import_rag))
         .route("/rag/list", get(list_rag_configs))
@@ -4845,7 +6256,27 @@ pub fn create_router(
             "/playwright/scripts/:id/duplicate",
             post(duplicate_playwright_script),
         )
+        // Scriptlet routes
+        .route("/scriptlets", get(list_scriptlets))
+        .route("/scriptlets", post(create_scriptlet))
+        .route("/scriptlets/search", get(search_scriptlets))
+        .route("/scriptlets/categories", get(get_scriptlet_categories))
+        .route("/scriptlets/:id", get(get_scriptlet))
+        .route("/scriptlets/:id", put(update_scriptlet))
+        .route("/scriptlets/:id", delete(delete_scriptlet))
+        // Workflow resume routes
+        .route("/workflow/resumable", get(get_resumable_workflow))
+        .route("/workflow/resume", post(resume_workflow))
+        // Auto-continue setting routes
+        .route("/workflow/auto-continue", get(get_auto_continue_setting))
+        .route("/workflow/auto-continue", post(set_auto_continue_setting))
+        // Backup and Restore routes
+        .route("/backup", get(create_backup_handler))
+        .route("/backup/info", post(get_backup_info_handler))
+        .route("/restore", post(restore_backup_handler))
         .layer(cors)
+        // Allow up to 100MB request bodies for configs with embedded images
+        .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
         .with_state(api_state)
 }
 

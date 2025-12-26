@@ -451,7 +451,9 @@ pub struct ExecutionRunCompleteResponse {
 ///
 /// The created execution run with its assigned ID
 #[tauri::command]
-pub async fn create_execution_run(input: ExecutionRunCreateInput) -> Result<ExecutionRunResponse, String> {
+pub async fn create_execution_run(
+    input: ExecutionRunCreateInput,
+) -> Result<ExecutionRunResponse, String> {
     info!(
         "Creating {} execution run '{}' for project {}",
         format!("{:?}", input.run_type).to_lowercase(),
@@ -502,7 +504,10 @@ pub async fn create_execution_run(input: ExecutionRunCreateInput) -> Result<Exec
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("Create execution run failed with status {}: {}", status, error_text);
+        error!(
+            "Create execution run failed with status {}: {}",
+            status, error_text
+        );
         return Err(format!("Failed to create execution run: {}", error_text));
     }
 
@@ -589,7 +594,10 @@ pub async fn report_action_executions(
         format!("Invalid response from server: {}", e)
     })?;
 
-    info!("Actions reported successfully: {} recorded", result.recorded);
+    info!(
+        "Actions reported successfully: {} recorded",
+        result.recorded
+    );
 
     Ok(result)
 }
@@ -710,11 +718,7 @@ pub async fn report_execution_issues(
         });
     }
 
-    info!(
-        "Reporting {} issues for run {}",
-        issues.len(),
-        run_id
-    );
+    info!("Reporting {} issues for run {}", issues.len(), run_id);
 
     let auth_manager = AuthManager::new();
 

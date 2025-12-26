@@ -43,6 +43,7 @@ import {
   X,
   FilePlus2,
   AlertTriangle,
+  RotateCcw,
 } from "lucide-react";
 import { useExecution } from "../contexts";
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
@@ -120,12 +121,19 @@ interface PromptHistoryEntry {
   success?: boolean;
 }
 
-// Standard Mode Prompt Template - ONE iteration per session, spawns new session to continue
-const STANDARD_PROMPT_TEMPLATE = `# AI Automation Analysis (Single Iteration)
+// Standard Mode Prompt Template - Runner handles multi-session continuation
+const STANDARD_PROMPT_TEMPLATE = `# AI Automation Analysis
 
-Execute automation, analyze results, fix issues. If fixes applied, spawn a NEW session to re-run.
+Execute automation, analyze results, fix issues. The runner handles session continuation automatically.
 
-**IMPORTANT**: This session handles ONE iteration only. Fresh sessions prevent context overflow.
+## Runner-Managed Continuation
+
+**You don't need to spawn new sessions.** The runner will:
+1. Check the checkpoint file after your session ends
+2. If \`completed: false\` → automatically spawn next session
+3. If \`completed: true\` → stop (workflow done)
+
+Your job: Do the work, update the checkpoint file when done.
 
 ## Goal
 {{GOAL}}
@@ -252,19 +260,17 @@ Based on analysis, choose ONE path:
 
 ### Path A: ALL PASS (No issues found)
 If automation succeeded with no anomalies:
-1. Report success
-2. Exit - no further action needed
+1. Update checkpoint: \`completed: true\`
+2. Report success and exit
 
 ### Path B: ISSUES FOUND
 If any bugs or anomalies were detected:
 1. **Fix the issues** (see Phase 4)
-2. **Spawn new session** to re-run (see Phase 5)
-3. Exit this session
+2. Update checkpoint with progress (keep \`completed: false\`)
+3. Exit - runner will spawn next session automatically
 
-### Path C: MAX ITERATIONS REACHED
-If iteration {{ITERATION}} >= {{MAX_ITERATIONS}}:
-1. Report failure with remaining issues
-2. Exit - let user review
+### Path C: MAX ITERATIONS
+The runner enforces iteration limits. If you're at max iterations, just report and exit.
 
 ---
 
@@ -286,37 +292,27 @@ If iteration {{ITERATION}} >= {{MAX_ITERATIONS}}:
 
 ---
 
-## Phase 5: Spawn New Session to Continue (Path B only)
+## Phase 5: Update Checkpoint
 
-**CRITICAL**: After fixing, spawn a FRESH Claude session to re-run automation.
+**After fixing issues or completing successfully, update the checkpoint:**
 
-Write the continuation prompt and spawn:
 \`\`\`powershell
-# Write continuation prompt to file
-$nextIteration = {{ITERATION}} + 1
-$prompt = @"
-Continue AI automation analysis loop.
+# Update checkpoint file - runner reads this to decide continuation
+$checkpointPath = "{{DEV_LOGS_ESCAPED}}\\improve-all-checkpoint.json"
+$checkpoint = if (Test-Path $checkpointPath) { Get-Content $checkpointPath | ConvertFrom-Json } else { @{} }
 
-Previous iteration: {{ITERATION}}
-Current iteration: $nextIteration
-Max iterations: {{MAX_ITERATIONS}}
+# Update progress
+$checkpoint.current_phase = {{ITERATION}}
+$checkpoint.completed = $false  # Set to $true only if ALL work is done
+$checkpoint.last_update = (Get-Date -Format "o")
+$checkpoint.work_completed = @{
+    fixes_applied = @("fix1", "fix2")  # List what you fixed
+}
 
-Fixes applied in previous iteration:
-- [List what you fixed here]
-
-INSTRUCTIONS:
-1. Re-run the workflow: mcp__qontinui__run_workflow with workflow_name="{{WORKFLOW_NAME}}" {{MONITOR_PARAM}}
-2. Analyze results for remaining issues
-3. Fix any new issues found
-4. If still failing, spawn another session (up to max iterations)
-"@
-$prompt | Set-Content "{{DEV_LOGS_ESCAPED}}\\ai-builder-continuation.txt"
-
-# Spawn fresh Claude session
-python "{{SPAWN_SCRIPT_ESCAPED}}" --file "{{DEV_LOGS_ESCAPED}}\\ai-builder-continuation.txt"
+$checkpoint | ConvertTo-Json -Depth 10 | Out-File -Encoding UTF8 $checkpointPath
 \`\`\`
 
-**Then EXIT this session.** The new session will continue with fresh context.
+**If goal is achieved:** Set \`completed: true\` and the runner will stop spawning sessions.
 
 ---
 
@@ -342,7 +338,7 @@ Always end with a summary before exiting:
 2. ...
 
 ### Next Action
-[SUCCESS - done / SPAWNED new session / MAX_ITERATIONS reached]
+[SUCCESS - checkpoint.completed=true / CONTINUING - checkpoint.completed=false]
 \`\`\`
 
 ---
@@ -350,23 +346,33 @@ Always end with a summary before exiting:
 ## Rules
 
 - **Work AUTONOMOUSLY** - never ask the user questions
-- **ONE ITERATION per session** - spawn new session to continue
+- **UPDATE CHECKPOINT** - runner reads it to decide continuation
 - **FIX issues found** - don't just report them
 - **Look for ANOMALIES** - not just explicit errors
 - **View screenshots** - they show visual match quality
-- **EXIT after spawning** - don't loop in same session
+- **Set completed: true when done** - runner stops spawning sessions
+- **Don't spawn sessions yourself** - runner handles this deterministically
 `;
 
-// Developer Mode Prompt Template - uses placeholders that get replaced with dynamic paths
+// Developer Mode Prompt Template - Runner handles continuation deterministically
 const DEVELOPER_PROMPT_TEMPLATE = `# AI Developer Loop
 
-Execute automation steps, analyze results, fix issues, and continue until success.
+Execute automation steps, analyze results, fix issues. The runner handles session continuation.
+
+## Runner-Managed Continuation
+
+**You don't need to spawn new sessions or manage state files.** The runner will:
+1. Check the checkpoint file after your session ends
+2. If \`completed: false\` → automatically spawn next session
+3. If \`completed: true\` → stop (goal achieved)
+
+Your job: Do the work, update checkpoint when done.
 
 ## Session Info
 
 **Session ID:** {{SESSION_ID}}
 **Iteration:** {{ITERATION}}/{{MAX_ITERATIONS}}
-**State File:** {{STATE_FILE}}
+**Checkpoint:** {{DEV_LOGS_ESCAPED}}\\improve-all-checkpoint.json
 
 ## Configuration
 
@@ -374,28 +380,11 @@ Execute automation steps, analyze results, fix issues, and continue until succes
 **Goal:** {{GOAL}}
 {{LOG_MONITORING_SECTION}}
 
-## Step 1: Check for Stop Request
-
-Before doing any work, check if stop was requested:
-\`\`\`powershell
-$state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
-if ($state.stop_requested) { Write-Host "Stop requested. Exiting."; exit 0 }
-\`\`\`
-
-## Step 2: Update State to Running
-
-\`\`\`powershell
-$state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
-$state.status = "running"
-$state.current_action = "Starting iteration {{ITERATION}}"
-$state | ConvertTo-Json -Depth 10 | Set-Content "{{STATE_FILE}}"
-\`\`\`
-
-## Step 3: Execute Automation Steps
+## Step 1: Execute Automation Steps
 
 {{EXECUTION_STEPS}}
 
-## Step 4: Analyze Results
+## Step 2: Analyze Results
 
 ### Check Logs for Errors
 
@@ -417,26 +406,13 @@ Get-ChildItem "{{DEV_LOGS_ESCAPED}}\\screenshots" -Filter "*.png" | Sort-Object 
 
 Use the Read tool to view the most recent screenshots.
 
-## Step 5: Fix Issues
+## Step 3: Fix Issues
 
 If any errors were found:
 1. Identify the root cause from logs and screenshots
 2. Read the relevant source code
 3. Make the fix
-4. Update state with what you fixed:
-
-\`\`\`powershell
-$state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
-$state.errors_fixed += @{
-    file = "path/to/file.ts"
-    line = 42
-    description = "Fixed the issue"
-    fixed_at = (Get-Date -Format "o")
-}
-$state | ConvertTo-Json -Depth 10 | Set-Content "{{STATE_FILE}}"
-\`\`\`
-
-5. Restart affected services as needed:
+4. Restart affected services as needed:
 
 \`\`\`powershell
 # Restart any service - you are running independently
@@ -450,64 +426,47 @@ Start-Sleep -Seconds 3
 cd {{WORKSPACE_ESCAPED}}\\qontinui-runner; Start-Process npm -ArgumentList "run","tauri","dev"
 \`\`\`
 
-## Step 6: Decide Next Action
+## Step 4: Update Checkpoint
 
-**Check for stop request again:**
+**After completing work, update the checkpoint file. The runner reads this to decide what to do next.**
+
 \`\`\`powershell
-$state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
-if ($state.stop_requested) {
-    $state.status = "stopped"
-    $state | ConvertTo-Json -Depth 10 | Set-Content "{{STATE_FILE}}"
-    Write-Host "Stop requested. Exiting."
-    exit 0
+$checkpointPath = "{{DEV_LOGS_ESCAPED}}\\improve-all-checkpoint.json"
+$checkpoint = if (Test-Path $checkpointPath) { Get-Content $checkpointPath | ConvertFrom-Json } else { @{} }
+
+# Update progress
+$checkpoint.current_phase = {{ITERATION}}
+$checkpoint.last_update = (Get-Date -Format "o")
+
+# Set completed based on whether goal is achieved
+if ($goalAchieved) {
+    $checkpoint.completed = $true
+    $checkpoint.goal_achieved = $true
+} else {
+    $checkpoint.completed = $false
+    $checkpoint.work_completed = @{
+        fixes_applied = @("fix1", "fix2")  # List what you fixed
+        issues_remaining = @("issue1")      # What's left
+    }
 }
+
+$checkpoint | ConvertTo-Json -Depth 10 | Out-File -Encoding UTF8 $checkpointPath
 \`\`\`
 
-**If all issues fixed and automation passes:** Output the goal completion marker and update state:
-\`\`\`
-[GOAL_COMPLETE]
-\`\`\`
-
-Then update state file:
-\`\`\`powershell
-$state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
-$state.status = "complete"
-$state.goal_achieved = $true
-$state.completed_at = (Get-Date -Format "o")
-$state | ConvertTo-Json -Depth 10 | Set-Content "{{STATE_FILE}}"
-\`\`\`
-
-**IMPORTANT:** The \`[GOAL_COMPLETE]\` marker is detected by the runner and will stop further iterations.
-
-**If more work needed:** Spawn fresh session and exit:
-\`\`\`powershell
-$state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
-$state.iteration = $state.iteration + 1
-$state.status = "spawning_next"
-$state | ConvertTo-Json -Depth 10 | Set-Content "{{STATE_FILE}}"
-
-# Write continuation prompt
-@"
-Continue AI Developer session {{SESSION_ID}}.
-Read state file first: Get-Content "{{STATE_FILE}}" | ConvertFrom-Json
-Previous fixes: [list what you fixed]
-Remaining: [what's left]
-"@ | Set-Content "{{DEV_LOGS_ESCAPED}}\\ai-developer-continuation.txt"
-
-# Spawn fresh Claude
-python {{SPAWN_SCRIPT_ESCAPED}} --file "{{DEV_LOGS_ESCAPED}}\\ai-developer-continuation.txt"
-\`\`\`
+**Key points:**
+- \`completed: true\` → Runner stops, workflow done
+- \`completed: false\` → Runner spawns next session automatically
+- You don't need to spawn sessions yourself
 
 ## Rules
 
 - Execute steps IN THE EXACT ORDER specified
-- ALWAYS check for stop request before and after main work
-- ALWAYS update state file with progress
 - ALWAYS analyze logs and screenshots after execution
 - You are INDEPENDENT - you CAN restart any service including the runner
-- STOP when iteration reaches {{MAX_ITERATIONS}}
 - Work AUTONOMOUSLY - never ask the user
-- **IMPORTANT:** When the goal is achieved, output \`[GOAL_COMPLETE]\` to stop the workflow early
+- **UPDATE CHECKPOINT** when done - runner reads it to decide continuation
+- **Set completed: true** when goal is achieved
+- **Don't spawn sessions yourself** - runner handles this deterministically
 
 ## Issue Tracking
 
@@ -520,25 +479,15 @@ When you fix an issue:
 \`\`\`
 [ISSUE:RESOLVED] {"title":"Brief title","resolution":"How you fixed it"}
 \`\`\`
-
-## Goal Completion
-
-When the goal is achieved and all tests pass, output this marker to stop the workflow:
-\`\`\`
-[GOAL_COMPLETE]
-\`\`\`
-
-This marker is detected by the runner and will immediately stop further iterations, even if max_iterations hasn't been reached.
 `;
 
 interface WorkspacePaths {
   workspace_root: string;
   dev_logs_path: string;
   scripts_path: string;
-  spawn_script: string;
   workspace_root_escaped: string;
   dev_logs_path_escaped: string;
-  spawn_script_escaped: string;
+  // Note: spawn_script fields removed - runner handles spawning deterministically
 }
 
 interface AiDeveloperState {
@@ -586,7 +535,14 @@ interface SessionConfig {
 interface Session {
   id: string;
   config: SessionConfig;
-  status: "starting" | "running" | "completed" | "failed" | "stopped" | "waiting_for_continuation" | "stalled";
+  status:
+    | "starting"
+    | "running"
+    | "completed"
+    | "failed"
+    | "stopped"
+    | "waiting_for_continuation"
+    | "stalled";
   checkpoint: SessionCheckpoint;
   active_subprocess_id: string | null;
   event_log: { timestamp: number; event_type: string; message: string }[];
@@ -601,9 +557,8 @@ function sessionToAiDeveloperState(session: Session): AiDeveloperState {
     status: session.status === "waiting_for_continuation" ? "idle" : session.status,
     started_at: session.checkpoint.started_at,
     stop_requested: false,
-    current_action: session.event_log.length > 0
-      ? session.event_log[session.event_log.length - 1].message
-      : "",
+    current_action:
+      session.event_log.length > 0 ? session.event_log[session.event_log.length - 1].message : "",
     errors_fixed: [],
     errors_remaining: [],
   };
@@ -745,9 +700,21 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
   const [isRunning, setIsRunning] = useState(false);
   const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
 
+  // Resumable workflow state (for continuing after runner restart)
+  const [resumableWorkflow, setResumableWorkflow] = useState<{
+    name: string;
+    currentPhase: number;
+    totalPhases: number;
+    status: string;
+  } | null>(null);
+  const [isResuming, setIsResuming] = useState(false);
+  const [autoContinueEnabled, setAutoContinueEnabled] = useState(false);
+  const [autoContinueLoading, setAutoContinueLoading] = useState(false);
+
   // Claude output log (real-time visibility)
-  const [claudeLog, setClaudeLog] = useState<string>("");
-  const [claudeLogInfo, setClaudeLogInfo] = useState<{
+  // Note: These values are polled but not displayed in UI yet
+  const [, setClaudeLog] = useState<string>("");
+  const [, setClaudeLogInfo] = useState<{
     totalLines: number;
     lastModified: number;
   } | null>(null);
@@ -905,6 +872,107 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     fetchSavedPrompts();
   }, []);
 
+  // Check for resumable workflows on mount and periodically
+  useEffect(() => {
+    const checkResumableWorkflow = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/workflow/resumable");
+        const result = await response.json();
+        if (result.success && result.data?.has_resumable) {
+          setResumableWorkflow({
+            name: result.data.name || "Unknown Workflow",
+            currentPhase: result.data.current_phase || 0,
+            totalPhases: result.data.total_phases || 0,
+            status: result.data.status || "unknown",
+          });
+        } else {
+          setResumableWorkflow(null);
+        }
+      } catch (error) {
+        console.error("Failed to check resumable workflow:", error);
+        setResumableWorkflow(null);
+      }
+    };
+
+    // Check on mount
+    checkResumableWorkflow();
+
+    // Check periodically (every 30 seconds)
+    const interval = setInterval(checkResumableWorkflow, 30000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  // Handler to resume a workflow
+  const handleResumeWorkflow = async () => {
+    if (!resumableWorkflow || isResuming) return;
+
+    setIsResuming(true);
+    try {
+      const response = await fetch("http://localhost:9876/workflow/resume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      const result = await response.json();
+
+      if (result.success) {
+        // Clear the resumable state since we're now running
+        setResumableWorkflow(null);
+        setIsRunning(true);
+        setLastResult({ success: true, message: `Resuming workflow: ${resumableWorkflow.name}` });
+      } else {
+        setLastResult({
+          success: false,
+          message: result.error || "Failed to resume workflow",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to resume workflow:", error);
+      setLastResult({
+        success: false,
+        message: `Failed to resume: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setIsResuming(false);
+    }
+  };
+
+  // Fetch auto-continue setting on mount
+  useEffect(() => {
+    const fetchAutoContinueSetting = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/workflow/auto-continue");
+        const result = await response.json();
+        if (result.success && result.data) {
+          setAutoContinueEnabled(result.data.enabled);
+        }
+      } catch (error) {
+        console.error("Failed to fetch auto-continue setting:", error);
+      }
+    };
+    fetchAutoContinueSetting();
+  }, []);
+
+  // Handler to toggle auto-continue setting
+  const handleToggleAutoContinue = async () => {
+    setAutoContinueLoading(true);
+    try {
+      const response = await fetch("http://localhost:9876/workflow/auto-continue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !autoContinueEnabled }),
+      });
+      const result = await response.json();
+      if (result.success && result.data) {
+        setAutoContinueEnabled(result.data.enabled);
+      }
+    } catch (error) {
+      console.error("Failed to toggle auto-continue setting:", error);
+    } finally {
+      setAutoContinueLoading(false);
+    }
+  };
+
   // Fetch saved AI workflows from the AI Workflows library
   const fetchSavedAiWorkflows = async () => {
     try {
@@ -969,7 +1037,11 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
           setIsRunning(isActiveStatus && isRecent);
 
           // Clear session if it's complete/stopped (but keep showing final state)
-          if (session.status === "completed" || session.status === "stopped" || session.status === "failed") {
+          if (
+            session.status === "completed" ||
+            session.status === "stopped" ||
+            session.status === "failed"
+          ) {
             // Don't clear immediately - let user see the final state
             // They can start a new session which will clear it
           }
@@ -1226,10 +1298,10 @@ if (Test-Path $inputEventsDir) {
 
   // Generate standard mode prompt (for inline execution via MCP API)
   // iteration parameter allows continuation prompts to pass current iteration
+  // Note: Runner handles session continuation deterministically via checkpoint file
   const generateStandardPrompt = (iteration: number = 1) => {
     const goalStr = goal.trim() || "Verify automation works correctly";
     const devLogsEscaped = workspacePaths?.dev_logs_path_escaped || "{{DEV_LOGS_ESCAPED}}";
-    const spawnScriptEscaped = workspacePaths?.spawn_script_escaped || "{{SPAWN_SCRIPT_ESCAPED}}";
 
     // Get workflow name for re-run (use first workflow step, or placeholder)
     const workflowStep = executionSteps.find((s) => s.type === "workflow");
@@ -1242,25 +1314,20 @@ if (Test-Path $inputEventsDir) {
       .replace("{{STEP_COUNT}}", String(executionSteps.length))
       .replace("{{EXECUTION_STEPS}}", generateExecutionInstructions())
       .replace(/\{\{DEV_LOGS_ESCAPED\}\}/g, devLogsEscaped)
-      .replace(/\{\{SPAWN_SCRIPT_ESCAPED\}\}/g, spawnScriptEscaped)
       .replace("{{LOG_CHECK_COMMANDS}}", generateLogCheckCommands())
       .replace("{{INPUT_CAPTURE_SECTION}}", generateInputCaptureSection())
       .replace(/\{\{WORKFLOW_NAME\}\}/g, workflowName)
       .replace(/\{\{MONITOR_PARAM\}\}/g, monitorParam);
   };
 
-  // Generate developer mode prompt (for spawn mechanism)
+  // Generate developer mode prompt
+  // Note: Runner handles session continuation deterministically via checkpoint file
   const generateDeveloperPrompt = (sessionId: string) => {
     const goalStr = goal.trim() || "Verify automation works correctly";
 
     // Get paths - use placeholders if not loaded yet (for preview before paths are fetched)
     const devLogsEscaped = workspacePaths?.dev_logs_path_escaped || "{{DEV_LOGS_ESCAPED}}";
-    const spawnScriptEscaped = workspacePaths?.spawn_script_escaped || "{{SPAWN_SCRIPT_ESCAPED}}";
     const workspaceEscaped = workspacePaths?.workspace_root_escaped || "{{WORKSPACE_ESCAPED}}";
-    const devLogsPath = workspacePaths?.dev_logs_path || ".dev-logs";
-
-    // State file path
-    const stateFile = `${devLogsPath}\\\\ai-developer-${sessionId}.json`;
 
     // Generate log monitoring section from Project Logs configuration
     let logMonitoringSection = "";
@@ -1281,14 +1348,12 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       .replace(/\{\{ITERATION\}\}/g, "1")
       .replace("{{MAX_ITERATIONS}}", String(maxIterations))
       .replace(/\{\{MAX_ITERATIONS\}\}/g, String(maxIterations))
-      .replace(/\{\{STATE_FILE\}\}/g, stateFile)
       .replace("{{STEP_COUNT}}", String(executionSteps.length))
       .replace("{{EXECUTION_STEPS}}", generateExecutionInstructions())
       .replace("{{GOAL}}", goalStr)
       .replace("{{LOG_MONITORING_SECTION}}", logMonitoringSection)
       .replace("{{LOG_CHECK_COMMANDS}}", generateLogCheckCommands())
       .replace(/\{\{DEV_LOGS_ESCAPED\}\}/g, devLogsEscaped)
-      .replace(/\{\{SPAWN_SCRIPT_ESCAPED\}\}/g, spawnScriptEscaped)
       .replace(/\{\{WORKSPACE_ESCAPED\}\}/g, workspaceEscaped);
   };
 
@@ -2019,6 +2084,35 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                 </div>
               )}
             </div>
+
+            {/* Auto-Continue Toggle */}
+            <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
+              <div className="flex items-center gap-2">
+                <RotateCcw className="w-4 h-4 text-orange-500" />
+                <div>
+                  <span className="text-sm font-medium">Auto-Continue on Restart</span>
+                  <p className="text-xs text-muted-foreground">
+                    {autoContinueEnabled
+                      ? "Workflows resume automatically after runner restart"
+                      : "Use the Continue button to resume after restart"}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={handleToggleAutoContinue}
+                disabled={autoContinueLoading}
+                className={`flex items-center transition-colors ${autoContinueEnabled ? "text-orange-500" : "text-muted-foreground"} ${autoContinueLoading ? "opacity-50" : ""}`}
+                title={autoContinueEnabled ? "Auto-continue enabled" : "Auto-continue disabled"}
+              >
+                {autoContinueLoading ? (
+                  <Loader2 className="w-8 h-8 animate-spin" />
+                ) : autoContinueEnabled ? (
+                  <ToggleRight className="w-8 h-8" />
+                ) : (
+                  <ToggleLeft className="w-8 h-8" />
+                )}
+              </button>
+            </div>
           </div>
 
           {/* Advanced Settings - Collapsible */}
@@ -2155,6 +2249,49 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             </div>
           </CollapsiblePanel>
 
+          {/* Continue Workflow Button - Shows when there's a resumable workflow */}
+          {resumableWorkflow && !isRunning && (
+            <div className="card p-4 border-2 border-orange-500/50 bg-orange-500/5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-orange-500/20 rounded-lg">
+                    <RotateCcw className="w-5 h-5 text-orange-500" />
+                  </div>
+                  <div>
+                    <h4 className="font-medium text-foreground">Continue Previous Workflow</h4>
+                    <p className="text-sm text-muted-foreground">
+                      <span className="font-medium">{resumableWorkflow.name}</span>
+                      {resumableWorkflow.totalPhases > 0 && (
+                        <span className="ml-2">
+                          • Phase {resumableWorkflow.currentPhase} of{" "}
+                          {resumableWorkflow.totalPhases}
+                        </span>
+                      )}
+                      <span className="ml-2 capitalize">• {resumableWorkflow.status}</span>
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={handleResumeWorkflow}
+                  disabled={isResuming}
+                  className="flex items-center gap-2 px-4 py-2 bg-orange-500 text-white rounded-md font-medium hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {isResuming ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Resuming...
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" />
+                      Continue
+                    </>
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Actions */}
           <div className="flex gap-3">
             {isRunning && persistentSession ? (
@@ -2230,7 +2367,11 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
               className="flex items-center gap-2 px-4 py-3 bg-green-500/10 text-green-600 rounded-md font-medium hover:bg-green-500/20 disabled:opacity-50 transition-colors"
               title={currentWorkflowId ? `Save "${currentWorkflowName}"` : "Save workflow"}
             >
-              {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+              {isSaving ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Save className="w-4 h-4" />
+              )}
             </button>
           </div>
 
@@ -2405,10 +2546,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       {showSaveDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           {/* Backdrop */}
-          <div
-            className="absolute inset-0 bg-black/50"
-            onClick={() => setShowSaveDialog(false)}
-          />
+          <div className="absolute inset-0 bg-black/50" onClick={() => setShowSaveDialog(false)} />
 
           {/* Dialog */}
           <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
@@ -2453,9 +2591,13 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
               </div>
 
               <div className="text-xs text-muted-foreground bg-muted/30 p-2 rounded">
-                <p><strong>Includes:</strong></p>
+                <p>
+                  <strong>Includes:</strong>
+                </p>
                 <ul className="list-disc list-inside mt-1 space-y-0.5">
-                  <li>{executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}</li>
+                  <li>
+                    {executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}
+                  </li>
                   <li>Goal: {goal.trim() || "(none set)"}</li>
                   <li>Mode: {persistentSession ? "Persistent Session" : "Standard"}</li>
                   <li>Max iterations: {maxIterations}</li>
@@ -2517,14 +2659,24 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             </div>
 
             <p className="text-sm text-muted-foreground">
-              You have unsaved changes to your current workflow. Creating a new workflow will discard these changes.
+              You have unsaved changes to your current workflow. Creating a new workflow will
+              discard these changes.
             </p>
 
             <div className="text-xs text-muted-foreground bg-yellow-500/10 border border-yellow-500/20 p-3 rounded">
-              <p><strong>Current workflow includes:</strong></p>
+              <p>
+                <strong>Current workflow includes:</strong>
+              </p>
               <ul className="list-disc list-inside mt-1 space-y-0.5">
-                <li>{executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}</li>
-                {goal.trim() && <li>Goal: {goal.trim().slice(0, 50)}{goal.trim().length > 50 ? "..." : ""}</li>}
+                <li>
+                  {executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}
+                </li>
+                {goal.trim() && (
+                  <li>
+                    Goal: {goal.trim().slice(0, 50)}
+                    {goal.trim().length > 50 ? "..." : ""}
+                  </li>
+                )}
               </ul>
             </div>
 

@@ -226,9 +226,7 @@ class GUIAutomation:
                 state_names = config.get("stateNames", [])
                 state_ids = config.get("stateIds", [])
                 target_state = (
-                    state_names[0]
-                    if state_names
-                    else (state_ids[0] if state_ids else "unknown")
+                    state_names[0] if state_names else (state_ids[0] if state_ids else "unknown")
                 )
                 error_message = f"Navigation to state '{target_state}' failed - no path found or transition execution failed"
 
@@ -249,9 +247,7 @@ class GUIAutomation:
                 state_names = config.get("stateNames", [])
                 state_ids = config.get("stateIds", [])
                 target_state = (
-                    state_names[0]
-                    if state_names
-                    else (state_ids[0] if state_ids else "unknown")
+                    state_names[0] if state_names else (state_ids[0] if state_ids else "unknown")
                 )
                 from_state = self.state_executor.current_state if self.state_executor else None
 

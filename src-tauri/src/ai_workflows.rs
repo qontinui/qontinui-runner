@@ -108,6 +108,7 @@ impl AiWorkflow {
     }
 
     /// Create a new workflow with all fields specified
+    #[allow(clippy::too_many_arguments)]
     pub fn with_details(
         name: String,
         description: String,
@@ -199,6 +200,7 @@ fn save_workflows(workflows: &[AiWorkflow]) -> Result<(), String> {
 }
 
 /// Create a new AI workflow
+#[allow(clippy::too_many_arguments)]
 pub fn create_workflow(
     name: String,
     description: String,
@@ -238,6 +240,7 @@ pub fn get_workflow(id: &str) -> Option<AiWorkflow> {
 }
 
 /// Update an existing AI workflow
+#[allow(clippy::too_many_arguments)]
 pub fn update_workflow(
     id: &str,
     name: Option<String>,

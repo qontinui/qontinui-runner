@@ -369,9 +369,7 @@ async def test_thumbnail_streaming():
         print("PIL not available, skipping thumbnail test")
         return
 
-    CloudStreamingService(
-        config=StreamConfig(thumbnail_size=(320, 180), thumbnail_quality=85)
-    )
+    CloudStreamingService(config=StreamConfig(thumbnail_size=(320, 180), thumbnail_quality=85))
 
     # Create test image
     full_size_image = create_test_image(width=1920, height=1080)

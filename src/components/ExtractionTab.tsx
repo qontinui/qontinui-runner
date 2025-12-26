@@ -116,12 +116,15 @@ export function ExtractionTab({
         }>("get_monitors");
 
         if (response.success && response.data?.monitors) {
-          const monitors = response.data.monitors;
-          setAvailableMonitors(monitors);
-          // Default to primary monitor or first one
-          const primaryIndex = monitors.findIndex((m) => m.is_primary);
-          setSelectedMonitor(primaryIndex >= 0 ? primaryIndex : 0);
-          onLog("debug", `Found ${monitors.length} monitor(s)`);
+          // Sort monitors by x position (left to right) for consistent spatial ordering
+          const sortedMonitors = [...response.data.monitors].sort((a, b) => a.x - b.x);
+          setAvailableMonitors(sortedMonitors);
+          // Default to primary monitor or first one (find in sorted array)
+          const primaryMonitor = sortedMonitors.find((m) => m.is_primary);
+          setSelectedMonitor(
+            primaryMonitor ? primaryMonitor.index : (sortedMonitors[0]?.index ?? 0),
+          );
+          onLog("debug", `Found ${sortedMonitors.length} monitor(s)`);
         } else {
           onLog("error", "No monitors found in response");
         }
@@ -321,7 +324,8 @@ export function ExtractionTab({
 
   // Get physical resolution from selected monitor
   const getMonitorResolution = (): [number, number] => {
-    const monitor = availableMonitors[selectedMonitor];
+    // Find monitor by its system index (not array position)
+    const monitor = availableMonitors.find((m) => m.index === selectedMonitor);
     if (monitor) {
       return [monitor.width, monitor.height];
     }

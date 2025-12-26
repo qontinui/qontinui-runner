@@ -128,6 +128,9 @@ pub struct Settings {
     last_monitor_indices: Option<Vec<i32>>,
     #[serde(default = "default_auto_load_last_config")]
     pub auto_load_last_config: bool,
+    /// Auto-continue AI Developer workflows after runner restart (default: false)
+    #[serde(default)]
+    pub auto_continue_ai_workflow: bool,
     #[serde(default)]
     pub debug: DebugSettings,
     #[serde(default)]
@@ -302,6 +305,21 @@ pub fn save_ai_settings(ai_settings: AiSettings) -> Result<(), String> {
     info!("Saving AI settings: {:?}", ai_settings);
     let mut settings = load_settings();
     settings.ai = ai_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the auto-continue AI workflow setting
+pub fn get_auto_continue_ai_workflow() -> bool {
+    let settings = load_settings();
+    settings.auto_continue_ai_workflow
+}
+
+/// Save the auto-continue AI workflow setting
+pub fn save_auto_continue_ai_workflow(enabled: bool) -> Result<(), String> {
+    info!("Saving auto-continue AI workflow setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.auto_continue_ai_workflow = enabled;
     save_settings(&settings)?;
     Ok(())
 }

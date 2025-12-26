@@ -3,6 +3,7 @@
 
 mod ai_workflows;
 mod auth;
+mod backup;
 mod commands;
 mod config;
 mod debug_lifecycle;
@@ -14,6 +15,7 @@ mod mcp_api;
 mod playwright;
 mod prompts;
 mod rag;
+mod scriptlets;
 mod secure_storage;
 mod session_manager;
 mod settings;
@@ -159,6 +161,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Input validation commands
             commands::execution::set_input_capture_enabled,
             commands::execution::get_input_validation_status,
+            // Initial states resolution
+            commands::execution::get_resolved_initial_states,
             // State machine commands
             commands::state_machine::execute_transition,
             commands::state_machine::navigate_to_state,

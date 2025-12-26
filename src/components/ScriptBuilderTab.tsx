@@ -36,6 +36,7 @@ import type {
   ScriptExecutionState,
   DisplayMode,
 } from "../types";
+import { ScriptletSelector, useScriptletMention } from "./ScriptletSelector";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -106,6 +107,18 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   const [autoRefineLog, setAutoRefineLog] = useState<string[]>([]);
   const autoRefineAbortRef = useRef(false);
 
+  // Cumulative stats across all auto-refine iterations
+  const [autoRefineCumulativeStats, setAutoRefineCumulativeStats] = useState({
+    totalRuns: 0,
+    totalPassed: 0,
+    totalFailed: 0,
+    totalSkipped: 0,
+    totalDurationMs: 0,
+  });
+
+  // User hint for auto-refine - gets included in next AI call
+  const [autoRefineUserHint, setAutoRefineUserHint] = useState("");
+
   // Visual context settings for auto-refine (persisted to localStorage)
   const [includeScreenshot, setIncludeScreenshot] = useState(() => {
     const saved = localStorage.getItem("qontinui-autorefine-include-screenshot");
@@ -175,8 +188,14 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   // Track if description was manually changed (to trigger auto-save)
   const descriptionChangedByUser = useRef(false);
 
+  // Ref for description textarea (for scriptlet insertion)
+  const descriptionTextareaRef = useRef<HTMLTextAreaElement>(null);
+
   // Track if name was manually changed (to trigger auto-save)
   const nameChangedByUser = useRef(false);
+
+  // Track if AI instructions was manually changed (to trigger auto-save)
+  const aiInstructionsChangedByUser = useRef(false);
 
   // Track the description that was used to generate the current code
   // This is used to warn users if they try to run tests when description has changed
@@ -187,6 +206,56 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   // Coverage validation state - warnings about missing functionality
   const [coverageWarnings, setCoverageWarnings] = useState<string[]>([]);
   const [isValidatingCoverage, setIsValidatingCoverage] = useState(false);
+
+  // Scriptlet insertion - insert at cursor position
+  const insertScriptletAtCursor = useCallback(
+    (content: string) => {
+      const textarea = descriptionTextareaRef.current;
+      if (!textarea) {
+        // Fallback: append to end
+        setFormDescription((prev) => prev + (prev ? "\n\n" : "") + content);
+        descriptionChangedByUser.current = true;
+        return;
+      }
+
+      const start = textarea.selectionStart;
+      const end = textarea.selectionEnd;
+      const currentValue = formDescription;
+
+      const newValue = currentValue.slice(0, start) + content + currentValue.slice(end);
+      setFormDescription(newValue);
+      descriptionChangedByUser.current = true;
+
+      // Restore cursor position after inserted text
+      setTimeout(() => {
+        textarea.selectionStart = textarea.selectionEnd = start + content.length;
+        textarea.focus();
+      }, 0);
+    },
+    [formDescription],
+  );
+
+  // @-mention hook for scriptlet insertion
+  const scriptletMention = useScriptletMention(
+    descriptionTextareaRef,
+    (content, triggerStart, triggerEnd) => {
+      // Replace @query with the scriptlet content
+      const currentValue = formDescription;
+      const newValue =
+        currentValue.slice(0, triggerStart) + content + currentValue.slice(triggerEnd);
+      setFormDescription(newValue);
+      descriptionChangedByUser.current = true;
+
+      // Focus back on textarea
+      setTimeout(() => {
+        const textarea = descriptionTextareaRef.current;
+        if (textarea) {
+          textarea.selectionStart = textarea.selectionEnd = triggerStart + content.length;
+          textarea.focus();
+        }
+      }, 0);
+    },
+  );
 
   // Auto-save description when editing an existing script
   useEffect(() => {
@@ -240,6 +309,29 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
 
     return () => clearTimeout(timeoutId);
   }, [formName, editingScript]);
+
+  // Auto-save AI instructions when editing an existing script
+  useEffect(() => {
+    // Only auto-save if editing an existing script and AI instructions was changed by user
+    if (!editingScript || !aiInstructionsChangedByUser.current) {
+      return;
+    }
+
+    const timeoutId = setTimeout(async () => {
+      try {
+        await fetch(`${API_BASE}/playwright/scripts/${editingScript.id}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ai_instructions: formAiInstructions || null }),
+        });
+        // Don't show a log message for auto-save to avoid noise
+      } catch (error) {
+        console.error("Failed to auto-save AI instructions:", error);
+      }
+    }, 500); // 500ms debounce
+
+    return () => clearTimeout(timeoutId);
+  }, [formAiInstructions, editingScript]);
 
   // Expanded sections in execution result
   const [expandedSpecs, setExpandedSpecs] = useState<Set<number>>(new Set());
@@ -544,13 +636,30 @@ test('${formName || "test"}', async ({ page }) => {
         // Try multiple extraction patterns
         let generatedCode: string | null = null;
 
-        // Pattern 1: Code block with language tag
-        const codeBlockMatch = output.match(/```(?:typescript|ts|javascript|js)?\s*([\s\S]*?)```/);
-        if (codeBlockMatch && codeBlockMatch[1]) {
-          generatedCode = codeBlockMatch[1].trim();
+        // Pattern 1: Code block with explicit TypeScript/JavaScript language tag
+        const typedCodeBlockMatch = output.match(
+          /```(?:typescript|ts|javascript|js)\s*([\s\S]*?)```/,
+        );
+        if (typedCodeBlockMatch && typedCodeBlockMatch[1]) {
+          generatedCode = typedCodeBlockMatch[1].trim();
         }
 
-        // Pattern 2: If no code block found, look for import statement and extract from there
+        // Pattern 2: Look for any code block containing Playwright test code
+        if (!generatedCode) {
+          const allCodeBlocks = [...output.matchAll(/```(?:\w*)?\s*([\s\S]*?)```/g)];
+          for (const match of allCodeBlocks) {
+            const content = match[1]?.trim();
+            if (
+              content &&
+              (content.includes("import { test, expect }") || content.includes("test("))
+            ) {
+              generatedCode = content;
+              break;
+            }
+          }
+        }
+
+        // Pattern 3: If no code block found, look for import statement and extract from there
         if (!generatedCode && output.includes("import { test, expect }")) {
           const importIndex = output.indexOf("import { test, expect }");
           // Find the end - either the next ``` or end of content
@@ -569,7 +678,7 @@ test('${formName || "test"}', async ({ page }) => {
           }
         }
 
-        // Pattern 3: Look for test() function
+        // Pattern 4: Look for test() function directly
         if (!generatedCode && output.includes("test(")) {
           const testIndex = output.indexOf("test(");
           generatedCode = output.substring(testIndex).trim();
@@ -675,7 +784,10 @@ Be thorough - check each action, assertion, and behavior mentioned in the descri
             .filter((line: string) => line.length > 0);
 
           if (missingItems.length > 0) {
-            onLog("warning", `Found ${missingItems.length} missing requirement(s) in generated code`);
+            onLog(
+              "warning",
+              `Found ${missingItems.length} missing requirement(s) in generated code`,
+            );
             return missingItems;
           }
         }
@@ -772,12 +884,30 @@ import { test, expect } from '@playwright/test';
         const output = result.data.output;
         let generatedCode: string | null = null;
 
-        // Extract code from response
-        const codeBlockMatch = output.match(/```(?:typescript|ts|javascript|js)?\s*([\s\S]*?)```/);
-        if (codeBlockMatch && codeBlockMatch[1]) {
-          generatedCode = codeBlockMatch[1].trim();
+        // Extract code from response - first try explicit TypeScript/JavaScript blocks
+        const typedCodeBlockMatch = output.match(
+          /```(?:typescript|ts|javascript|js)\s*([\s\S]*?)```/,
+        );
+        if (typedCodeBlockMatch && typedCodeBlockMatch[1]) {
+          generatedCode = typedCodeBlockMatch[1].trim();
         }
 
+        // Fallback: look for any code block containing Playwright test code
+        if (!generatedCode) {
+          const allCodeBlocks = [...output.matchAll(/```(?:\w*)?\s*([\s\S]*?)```/g)];
+          for (const match of allCodeBlocks) {
+            const content = match[1]?.trim();
+            if (
+              content &&
+              (content.includes("import { test, expect }") || content.includes("test("))
+            ) {
+              generatedCode = content;
+              break;
+            }
+          }
+        }
+
+        // Pattern 3: If no code block found, look for import statement directly
         if (!generatedCode && output.includes("import { test, expect }")) {
           const importIndex = output.indexOf("import { test, expect }");
           const endIndex = output.indexOf("```", importIndex);
@@ -825,7 +955,7 @@ import { test, expect } from '@playwright/test';
   const verifyWorkflowObjective = async (
     testResult: PlaywrightResult,
     objective: string,
-    successCriteria: string[]
+    successCriteria: string[],
   ): Promise<{ verified: boolean; notes: string }> => {
     const prompt = `You are verifying whether a workflow automation objective was achieved.
 
@@ -836,17 +966,17 @@ Now you must verify whether the ACTUAL OBJECTIVE was achieved.
 ${objective}
 
 ## Success Criteria to Verify
-${successCriteria.length > 0 ? successCriteria.map((c, i) => `${i + 1}. ${c}`).join('\n') : 'No specific criteria - verify the objective was met based on available evidence.'}
+${successCriteria.length > 0 ? successCriteria.map((c, i) => `${i + 1}. ${c}`).join("\n") : "No specific criteria - verify the objective was met based on available evidence."}
 
 ## Available Evidence
 
 ### Page Snapshot (Current DOM State)
 \`\`\`yaml
-${testResult.structured_output?.page_snapshot || 'Not available'}
+${testResult.structured_output?.page_snapshot || "Not available"}
 \`\`\`
 
 ### Console Output
-${testResult.structured_output?.console_output?.join('\n') || 'None'}
+${testResult.structured_output?.console_output?.join("\n") || "None"}
 
 ### Screenshots Available
 ${testResult.screenshots?.length || 0} screenshot(s) captured
@@ -918,6 +1048,13 @@ OR
     setIsAutoRefining(true);
     setAutoRefineIteration(0);
     setAutoRefineLog([]);
+    setAutoRefineCumulativeStats({
+      totalRuns: 0,
+      totalPassed: 0,
+      totalFailed: 0,
+      totalSkipped: 0,
+      totalDurationMs: 0,
+    });
     const log = (msg: string) => {
       setAutoRefineLog((prev) => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
       onLog("info", msg);
@@ -927,7 +1064,40 @@ OR
     let scriptId = editingScript.id;
     let iteration = 0;
 
+    // Save current form state to backend before first iteration
+    // This ensures the backend has the latest code (especially important after copying a script)
     try {
+      log("Saving current script state...");
+      const preSaveResponse = await fetch(`${API_BASE}/playwright/scripts/${scriptId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: formName,
+          description: formDescription,
+          ai_instructions: formAiInstructions || undefined,
+          target_url: formTargetUrl,
+          script_content: formScriptContent,
+          category: formCategory,
+          tags: formTags
+            .split(",")
+            .map((t) => t.trim())
+            .filter(Boolean),
+          timeout_seconds: formTimeoutSeconds,
+          display_mode: formDisplayMode,
+          browser: formBrowser,
+          workflow_objective: formWorkflowObjective || undefined,
+          success_criteria: formSuccessCriteria.length > 0 ? formSuccessCriteria : undefined,
+          is_workflow_automation: formIsWorkflowAutomation,
+        }),
+      });
+      const preSaveResult = await preSaveResponse.json();
+      if (!preSaveResult.success) {
+        log(`Failed to save script before run: ${preSaveResult.error}`);
+        onLog("error", `Failed to save script before auto-refinement: ${preSaveResult.error}`);
+        setIsAutoRefining(false);
+        return;
+      }
+
       while (iteration < autoRefineMaxIterations && !autoRefineAbortRef.current) {
         iteration++;
         setAutoRefineIteration(iteration);
@@ -951,6 +1121,15 @@ OR
         setExecutionResult(testResult);
         setExecutionState(testResult.passed ? "completed" : "failed");
 
+        // Update cumulative stats across all iterations
+        setAutoRefineCumulativeStats((prev) => ({
+          totalRuns: prev.totalRuns + 1,
+          totalPassed: prev.totalPassed + testResult.tests_passed,
+          totalFailed: prev.totalFailed + testResult.tests_failed,
+          totalSkipped: prev.totalSkipped + testResult.tests_skipped,
+          totalDurationMs: prev.totalDurationMs + testResult.duration_ms,
+        }));
+
         // Check if stopped by user
         if (autoRefineAbortRef.current) {
           log("Stopped by user");
@@ -959,7 +1138,8 @@ OR
 
         if (testResult.passed) {
           // Check if this is workflow automation requiring objective verification
-          const isWorkflowAutomation = editingScript?.is_workflow_automation || !!editingScript?.workflow_objective;
+          const isWorkflowAutomation =
+            editingScript?.is_workflow_automation || !!editingScript?.workflow_objective;
 
           if (isWorkflowAutomation && editingScript?.workflow_objective) {
             log(`Script execution passed (expected). Verifying workflow objective...`);
@@ -967,7 +1147,7 @@ OR
             const verification = await verifyWorkflowObjective(
               testResult,
               editingScript.workflow_objective,
-              editingScript.success_criteria || []
+              editingScript.success_criteria || [],
             );
 
             if (verification.verified) {
@@ -1037,6 +1217,11 @@ OR
           ? `\n## AI Instructions (Important - Follow These)\n${formAiInstructions}\n`
           : "";
 
+        // Include user hint if provided (for real-time guidance during auto-refine)
+        const userHintSection = autoRefineUserHint.trim()
+          ? `\n## User Hint (IMPORTANT - From the user watching this iteration)\n${autoRefineUserHint}\n`
+          : "";
+
         // Include the original description so AI knows the full goal
         const descriptionSection = formDescription.trim()
           ? `\n## Original Test Description (IMPORTANT - Ensure ALL requirements are met)\n${formDescription}\n`
@@ -1052,7 +1237,7 @@ ${descriptionSection}
 ## Test Results
 Tests failed with the following errors:
 ${testErrors}
-${pageSnapshotSection}${aiInstructionsSection}
+${pageSnapshotSection}${aiInstructionsSection}${userHintSection}
 ## Requirements
 1. Fix the issues identified in the test results
 2. **Verify the script implements ALL functionality from the Original Test Description above**
@@ -1119,6 +1304,12 @@ import { test, expect } from '@playwright/test';
         });
         setIsGenerating(false);
 
+        // Clear user hint after it's been sent to AI
+        if (autoRefineUserHint.trim()) {
+          log(`User hint included: "${autoRefineUserHint.trim().substring(0, 50)}..."`);
+          setAutoRefineUserHint("");
+        }
+
         const aiResult = await aiResponse.json();
 
         // Check if stopped by user
@@ -1129,11 +1320,13 @@ import { test, expect } from '@playwright/test';
 
         if (!aiResult.success || !aiResult.data?.output) {
           log(`AI refinement failed: ${aiResult.error || "No output"}`);
+          console.error("[AUTO-REFINE] AI failed:", aiResult);
           break;
         }
 
         // Extract code and changes summary from AI response
         const output = aiResult.data.output;
+        console.log("[AUTO-REFINE] AI output length:", output?.length);
         let generatedCode: string | null = null;
 
         // Extract CHANGES summary
@@ -1143,11 +1336,30 @@ import { test, expect } from '@playwright/test';
           log(`FIX: ${changesSummary}`);
         }
 
-        const codeBlockMatch = output.match(/```(?:typescript|ts|javascript|js)?\s*([\s\S]*?)```/);
-        if (codeBlockMatch && codeBlockMatch[1]) {
-          generatedCode = codeBlockMatch[1].trim();
+        // First try to match explicitly typed TypeScript/JavaScript code blocks
+        const typedCodeBlockMatch = output.match(
+          /```(?:typescript|ts|javascript|js)\s*([\s\S]*?)```/,
+        );
+        if (typedCodeBlockMatch && typedCodeBlockMatch[1]) {
+          generatedCode = typedCodeBlockMatch[1].trim();
         }
 
+        // Fallback: look for any code block containing Playwright test code
+        if (!generatedCode) {
+          const allCodeBlocks = [...output.matchAll(/```(?:\w*)?\s*([\s\S]*?)```/g)];
+          for (const match of allCodeBlocks) {
+            const content = match[1]?.trim();
+            if (
+              content &&
+              (content.includes("import { test, expect }") || content.includes("test("))
+            ) {
+              generatedCode = content;
+              break;
+            }
+          }
+        }
+
+        // Pattern 3: If no code block found, look for import statement directly
         if (!generatedCode && output.includes("import { test, expect }")) {
           const importIndex = output.indexOf("import { test, expect }");
           const endIndex = output.indexOf("```", importIndex);
@@ -1165,8 +1377,14 @@ import { test, expect } from '@playwright/test';
 
         if (!generatedCode || !generatedCode.includes("test(")) {
           log("AI response didn't contain valid code");
+          console.error(
+            "[AUTO-REFINE] Invalid code. generatedCode:",
+            generatedCode?.substring(0, 200),
+          );
+          console.error("[AUTO-REFINE] Full output:", output?.substring(0, 500));
           break;
         }
+        console.log("[AUTO-REFINE] Extracted valid code, length:", generatedCode.length);
 
         currentScriptContent = generatedCode;
         setFormScriptContent(generatedCode);
@@ -1184,8 +1402,10 @@ import { test, expect } from '@playwright/test';
 
         if (!saveResult.success) {
           log(`Failed to save script: ${saveResult.error}`);
+          console.error("[AUTO-REFINE] Save failed:", saveResult);
           break;
         }
+        console.log("[AUTO-REFINE] Save successful, continuing to next iteration");
 
         log("Re-running test with fixes...");
         // Small delay before next iteration
@@ -1213,10 +1433,22 @@ import { test, expect } from '@playwright/test';
   };
 
   // Stop auto-refinement loop
-  const stopAutoRefine = () => {
+  const stopAutoRefine = async () => {
     autoRefineAbortRef.current = true;
     setIsAutoRefining(false);
+    setIsGenerating(false);
+    setExecutionState("idle");
     onLog("info", "Auto-refinement stopped by user");
+
+    // Stop the AI analysis if it's running
+    try {
+      await fetch(`${API_BASE}/stop-ai-analysis`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (error) {
+      console.error("Failed to stop AI analysis:", error);
+    }
   };
 
   // Save and run: saves current form state, then runs the test
@@ -1389,6 +1621,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
   const startEditing = (script: PlaywrightScript) => {
     descriptionChangedByUser.current = false; // Reset flag when loading a script
     nameChangedByUser.current = false; // Reset flag when loading a script
+    aiInstructionsChangedByUser.current = false; // Reset flag when loading a script
     setLastGeneratedFromDescription(null); // We don't know if existing code matches description
     setEditingScript(script);
     setFormName(script.name);
@@ -1628,7 +1861,8 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                       className="w-4 h-4 rounded border-blue-500/50 text-blue-600 focus:ring-blue-500"
                     />
                     <label htmlFor="is-workflow-automation" className="text-sm">
-                      This is workflow automation (script success is expected, verify objective instead)
+                      This is workflow automation (script success is expected, verify objective
+                      instead)
                     </label>
                   </div>
 
@@ -1644,7 +1878,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium mb-1">Success Criteria (one per line)</label>
+                    <label className="block text-sm font-medium mb-1">
+                      Success Criteria (one per line)
+                    </label>
                     <textarea
                       value={formSuccessCriteria.join("\n")}
                       onChange={(e) =>
@@ -1652,7 +1888,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           e.target.value
                             .split("\n")
                             .map((s) => s.trim())
-                            .filter(Boolean)
+                            .filter(Boolean),
                         )
                       }
                       placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
@@ -1662,8 +1898,8 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   </div>
 
                   <p className="text-xs text-muted-foreground">
-                    When enabled, script execution success is expected. After the script passes,
-                    AI will verify whether the workflow objective was actually achieved.
+                    When enabled, script execution success is expected. After the script passes, AI
+                    will verify whether the workflow objective was actually achieved.
                   </p>
                 </div>
               </details>
@@ -1734,7 +1970,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                             (prev) =>
                               prev +
                               (prev ? "\n\n" : "") +
-                              `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`
+                              `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`,
                           );
                           setCoverageWarnings([]);
                           generateScript();
@@ -2069,34 +2305,52 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         <label className="block text-sm font-medium">
                           Description (Natural Language)
                         </label>
-                        <button
-                          onClick={generateScript}
-                          disabled={isGenerating || !formDescription.trim()}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                        >
-                          {isGenerating ? (
-                            <>
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                              Generating...
-                            </>
-                          ) : (
-                            <>
-                              <Sparkles className="w-4 h-4" />
-                              Generate Script
-                            </>
-                          )}
-                        </button>
+                        <div className="flex items-center gap-2">
+                          <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
+                          <button
+                            onClick={generateScript}
+                            disabled={isGenerating || !formDescription.trim()}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                          >
+                            {isGenerating ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Generating...
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="w-4 h-4" />
+                                Generate Script
+                              </>
+                            )}
+                          </button>
+                        </div>
                       </div>
-                      <textarea
-                        value={formDescription}
-                        onChange={(e) => {
-                          descriptionChangedByUser.current = true;
-                          setFormDescription(e.target.value);
-                        }}
-                        placeholder="Describe what this test should do in plain English..."
-                        rows={4}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                      />
+                      <div className="relative">
+                        <textarea
+                          ref={descriptionTextareaRef}
+                          value={formDescription}
+                          onChange={(e) => {
+                            descriptionChangedByUser.current = true;
+                            setFormDescription(e.target.value);
+                          }}
+                          onKeyDown={scriptletMention.handleKeyDown}
+                          onInput={scriptletMention.handleInput}
+                          placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)"
+                          rows={4}
+                          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        />
+                        {/* @-mention popup for scriptlet insertion */}
+                        {scriptletMention.isActive && (
+                          <ScriptletSelector
+                            mode="popup"
+                            onSelect={scriptletMention.handleSelect}
+                            onClose={scriptletMention.handleClose}
+                            searchQuery={scriptletMention.searchQuery}
+                            position={scriptletMention.position}
+                          />
+                        )}
+                      </div>
 
                       {/* AI Instructions (optional) */}
                       <div className="mt-3">
@@ -2106,7 +2360,10 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         </label>
                         <textarea
                           value={formAiInstructions}
-                          onChange={(e) => setFormAiInstructions(e.target.value)}
+                          onChange={(e) => {
+                            setFormAiInstructions(e.target.value);
+                            aiInstructionsChangedByUser.current = true;
+                          }}
                           placeholder="Additional context for the AI (e.g., 'Feature is broken - capture state for debugging')"
                           rows={2}
                           className="w-full px-3 py-2 bg-purple-500/5 border border-purple-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
@@ -2297,6 +2554,67 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                           ))}
                         </div>
                       )}
+
+                      {/* Cumulative stats across all iterations */}
+                      {autoRefineCumulativeStats.totalRuns > 0 && (
+                        <div className="mt-3">
+                          <div className="text-xs text-muted-foreground mb-2">
+                            Cumulative Stats (All {autoRefineCumulativeStats.totalRuns} Runs)
+                          </div>
+                          <div className="grid grid-cols-4 gap-2">
+                            <div className="text-center p-2 bg-background rounded-lg">
+                              <div className="text-lg font-bold text-green-500">
+                                {autoRefineCumulativeStats.totalPassed}
+                              </div>
+                              <div className="text-xs text-muted-foreground">Total Passed</div>
+                            </div>
+                            <div className="text-center p-2 bg-background rounded-lg">
+                              <div className="text-lg font-bold text-red-500">
+                                {autoRefineCumulativeStats.totalFailed}
+                              </div>
+                              <div className="text-xs text-muted-foreground">Total Failed</div>
+                            </div>
+                            <div className="text-center p-2 bg-background rounded-lg">
+                              <div className="text-lg font-bold text-muted-foreground">
+                                {autoRefineCumulativeStats.totalSkipped}
+                              </div>
+                              <div className="text-xs text-muted-foreground">Total Skipped</div>
+                            </div>
+                            <div className="text-center p-2 bg-background rounded-lg">
+                              <div className="text-lg font-bold">
+                                {(autoRefineCumulativeStats.totalDurationMs / 1000).toFixed(1)}s
+                              </div>
+                              <div className="text-xs text-muted-foreground">Total Time</div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* User hint input for guiding AI during auto-refine */}
+                      <div className="mt-3">
+                        <label className="text-xs text-muted-foreground block mb-1">
+                          Add hint for next AI iteration (optional)
+                        </label>
+                        <div className="flex gap-2">
+                          <input
+                            type="text"
+                            value={autoRefineUserHint}
+                            onChange={(e) => setAutoRefineUserHint(e.target.value)}
+                            placeholder="e.g., The button is actually called 'Submit' not 'Send'"
+                            className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                              }
+                            }}
+                          />
+                          {autoRefineUserHint.trim() && (
+                            <span className="text-xs text-purple-400 self-center whitespace-nowrap">
+                              Will be sent with next iteration
+                            </span>
+                          )}
+                        </div>
+                      </div>
                     </div>
                   )}
 

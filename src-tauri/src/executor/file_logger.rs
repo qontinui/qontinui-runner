@@ -148,6 +148,27 @@ pub struct PlaywrightTestSpec {
     pub error: Option<String>,
 }
 
+/// Parameters for logging a Playwright test execution
+pub struct PlaywrightLogParams<'a> {
+    pub script_id: &'a str,
+    pub script_name: &'a str,
+    pub target_url: Option<&'a str>,
+    pub display_mode: Option<&'a str>,
+    pub browser: Option<&'a str>,
+    pub passed: bool,
+    pub tests_passed: u32,
+    pub tests_failed: u32,
+    pub tests_skipped: u32,
+    pub duration_ms: u64,
+    pub error: Option<&'a str>,
+    pub original_screenshots: &'a [String],
+    pub console_output: &'a [String],
+    /// (title, status, duration_ms, error)
+    pub specs: &'a [(String, String, u64, Option<String>)],
+    pub page_snapshot: Option<&'a str>,
+    pub workflow_status: Option<WorkflowStatus>,
+}
+
 /// File logger for persisting runner events to disk
 pub struct FileLogger;
 
@@ -315,24 +336,7 @@ impl FileLogger {
     }
 
     /// Log a Playwright test execution, copying screenshots to .dev-logs
-    pub fn log_playwright_execution(
-        script_id: &str,
-        script_name: &str,
-        target_url: Option<&str>,
-        display_mode: Option<&str>,
-        browser: Option<&str>,
-        passed: bool,
-        tests_passed: u32,
-        tests_failed: u32,
-        tests_skipped: u32,
-        duration_ms: u64,
-        error: Option<&str>,
-        original_screenshots: &[String],
-        console_output: &[String],
-        specs: &[(String, String, u64, Option<String>)], // (title, status, duration_ms, error)
-        page_snapshot: Option<&str>,
-        workflow_status: Option<WorkflowStatus>,
-    ) {
+    pub fn log_playwright_execution(params: &PlaywrightLogParams<'_>) {
         if let Err(e) = ensure_dirs() {
             error!("Failed to ensure log directories: {}", e);
             return;
@@ -342,11 +346,11 @@ impl FileLogger {
         let timestamp_ms = chrono::Utc::now().timestamp_millis();
         let mut copied_screenshots = Vec::new();
 
-        for (idx, original_path) in original_screenshots.iter().enumerate() {
+        for (idx, original_path) in params.original_screenshots.iter().enumerate() {
             let source = std::path::Path::new(original_path);
             if source.exists() {
                 let ext = source.extension().and_then(|e| e.to_str()).unwrap_or("png");
-                let dest_name = format!("pw-{}-{}-{}.{}", timestamp_ms, script_id, idx, ext);
+                let dest_name = format!("pw-{}-{}-{}.{}", timestamp_ms, params.script_id, idx, ext);
                 let dest_path = get_playwright_screenshots_dir().join(&dest_name);
 
                 match fs::copy(source, &dest_path) {
@@ -361,7 +365,8 @@ impl FileLogger {
             }
         }
 
-        let spec_entries: Vec<PlaywrightTestSpec> = specs
+        let spec_entries: Vec<PlaywrightTestSpec> = params
+            .specs
             .iter()
             .map(|(title, status, dur, err)| PlaywrightTestSpec {
                 title: title.clone(),
@@ -374,28 +379,28 @@ impl FileLogger {
         let entry = PlaywrightLogEntry {
             id: format!("pw-{}", uuid::Uuid::new_v4()),
             timestamp: format_timestamp_now(),
-            script_id: script_id.to_string(),
-            script_name: script_name.to_string(),
-            passed,
-            tests_passed,
-            tests_failed,
-            tests_skipped,
-            duration_ms,
-            error: error.map(String::from),
-            target_url: target_url.map(String::from),
-            display_mode: display_mode.map(String::from),
-            browser: browser.map(String::from),
+            script_id: params.script_id.to_string(),
+            script_name: params.script_name.to_string(),
+            passed: params.passed,
+            tests_passed: params.tests_passed,
+            tests_failed: params.tests_failed,
+            tests_skipped: params.tests_skipped,
+            duration_ms: params.duration_ms,
+            error: params.error.map(String::from),
+            target_url: params.target_url.map(String::from),
+            display_mode: params.display_mode.map(String::from),
+            browser: params.browser.map(String::from),
             screenshot_paths: copied_screenshots,
-            console_output: console_output.to_vec(),
+            console_output: params.console_output.to_vec(),
             specs: spec_entries,
-            page_snapshot: page_snapshot.map(String::from),
-            workflow_status,
+            page_snapshot: params.page_snapshot.map(String::from),
+            workflow_status: params.workflow_status.clone(),
         };
 
         Self::append_to_jsonl("runner-playwright.jsonl", &entry);
         debug!(
             "Logged Playwright execution: {} (passed: {})",
-            script_name, passed
+            params.script_name, params.passed
         );
     }
 

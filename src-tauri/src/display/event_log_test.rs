@@ -99,7 +99,7 @@ mod tests {
             "ActionLogProfile should return visible actions"
         );
         assert!(
-            view_data.actions.len() > 0,
+            !view_data.actions.is_empty(),
             "ActionLogProfile should return action entries"
         );
 
@@ -319,7 +319,7 @@ mod tests {
         // Verify workflow appears
         assert!(view_data.visible_count > 0, "Workflows should be visible");
         assert!(
-            view_data.actions.len() > 0,
+            !view_data.actions.is_empty(),
             "Should return workflow entries"
         );
 

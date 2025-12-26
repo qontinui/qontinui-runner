@@ -19,6 +19,7 @@ import {
   Globe,
   Package,
   Sparkles,
+  HelpCircle,
 } from "lucide-react";
 
 // Contexts
@@ -54,6 +55,7 @@ import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
 import { AiWorkflowsTab } from "./components/AiWorkflowsTab";
+import { HelpTab } from "./components/HelpTab";
 
 // Styles
 import "./index.css";
@@ -65,7 +67,8 @@ type MainTab =
   | "extract"
   | "dataset"
   | "ai-workflows"
-  | "settings";
+  | "settings"
+  | "help";
 type LogSubTab = "general" | "image" | "actions" | "rag";
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
@@ -89,15 +92,9 @@ function AppContent() {
     }
     if (
       stored &&
-      [
-        "run",
-        "logs",
-        "capture",
-        "extract",
-        "dataset",
-        "ai-workflows",
-        "settings",
-      ].includes(stored)
+      ["run", "logs", "capture", "extract", "dataset", "ai-workflows", "settings", "help"].includes(
+        stored,
+      )
     ) {
       return stored as MainTab;
     }
@@ -124,7 +121,7 @@ function AppContent() {
     copyLogs,
     logCount,
     imageLogCount,
-    aiOutputLogCount,
+    aiOutputLogCount: _aiOutputLogCount,
   } = useLogManager();
 
   // Action log view
@@ -330,11 +327,12 @@ function AppContent() {
     { id: "dataset" as const, label: "Dataset", icon: Package },
     { id: "ai-workflows" as const, label: "AI Workflows", icon: Sparkles },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
+    { id: "help" as const, label: "Help", icon: HelpCircle },
   ];
 
   return (
-    <div className="min-h-screen bg-background grid-dots flex flex-col">
-      {/* Status Bar */}
+    <div className="h-screen bg-background grid-dots flex flex-col overflow-hidden">
+      {/* Status Bar - Sticky */}
       <StatusIndicator
         pythonStatus={execution.pythonStatus}
         configLoaded={execution.configLoaded}
@@ -345,10 +343,10 @@ function AppContent() {
       <Tabs.Root
         value={activeMainTab}
         onValueChange={(value) => setActiveMainTab(value as MainTab)}
-        className="flex-1 flex flex-col container mx-auto"
+        className="flex-1 flex flex-col container mx-auto min-h-0"
       >
-        {/* Main Tab Navigation */}
-        <Tabs.List className="flex border-b border-border bg-card/30 px-4">
+        {/* Main Tab Navigation - Sticky */}
+        <Tabs.List className="flex border-b border-border bg-card/30 px-4 flex-shrink-0">
           {mainTabs.map((tab) => {
             const Icon = tab.icon;
             return (
@@ -407,6 +405,11 @@ function AppContent() {
                   executionActive={execution.executionActive}
                   onStartExecution={execution.startExecution}
                   onStopExecution={execution.stopExecution}
+                  // Initial states management
+                  states={execution.config?.states}
+                  resolvedInitialStates={execution.resolvedInitialStates}
+                  initialStatesOverride={execution.initialStatesOverride}
+                  onInitialStatesOverrideChange={execution.setInitialStatesOverride}
                 />
               </div>
             </div>
@@ -489,7 +492,7 @@ function AppContent() {
           <Tabs.Content
             value="ai-workflows"
             forceMount
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
           >
             <AiWorkflowsTab
               projectLogs={projectLogs}
@@ -503,7 +506,7 @@ function AppContent() {
           {/* Settings Tab */}
           <Tabs.Content
             value="settings"
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
+            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
           >
             <div className="h-full">
               <Settings
@@ -527,6 +530,14 @@ function AppContent() {
                 onLoadProjects={projectSelection.loadProjects}
               />
             </div>
+          </Tabs.Content>
+
+          {/* Help Tab */}
+          <Tabs.Content
+            value="help"
+            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
+          >
+            <HelpTab />
           </Tabs.Content>
         </div>
       </Tabs.Root>

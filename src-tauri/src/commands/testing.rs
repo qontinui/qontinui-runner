@@ -181,9 +181,13 @@ pub struct CompleteTestRunInput {
     pub unique_transitions_covered: i32,
     #[serde(default)]
     pub coverage_percentage: f64,
+    /// Reserved for future state coverage metrics - deserialized from TypeScript but not yet used
     #[serde(default)]
+    #[allow(dead_code)]
     pub states_covered: i32,
+    /// Reserved for future state coverage metrics - deserialized from TypeScript but not yet used
     #[serde(default)]
+    #[allow(dead_code)]
     pub total_states: i32,
     #[serde(default)]
     pub deficiencies_found: i32,
@@ -235,7 +239,11 @@ pub async fn create_test_run(input: CreateTestRunInput) -> Result<CreateTestRunR
 
     let request = CreateTestRunRequest {
         project_id: input.project_id,
-        run_name: format!("{} - {}", input.workflow_name, chrono::Utc::now().format("%Y-%m-%d %H:%M")),
+        run_name: format!(
+            "{} - {}",
+            input.workflow_name,
+            chrono::Utc::now().format("%Y-%m-%d %H:%M")
+        ),
         description: input.description,
         runner_metadata: RunnerMetadata {
             runner_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -274,7 +282,10 @@ pub async fn create_test_run(input: CreateTestRunInput) -> Result<CreateTestRunR
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("Create test run failed with status {}: {}", status, error_text);
+        error!(
+            "Create test run failed with status {}: {}",
+            status, error_text
+        );
         return Err(format!("Failed to create test run: {}", error_text));
     }
 
@@ -360,7 +371,10 @@ pub async fn report_test_transitions(
         format!("Invalid response from server: {}", e)
     })?;
 
-    info!("Transitions reported successfully: {} recorded", result.recorded);
+    info!(
+        "Transitions reported successfully: {} recorded",
+        result.recorded
+    );
 
     Ok(result)
 }
@@ -371,7 +385,9 @@ pub async fn report_test_transitions(
 ///
 /// * `input` - Test run completion parameters
 #[tauri::command]
-pub async fn complete_test_run(input: CompleteTestRunInput) -> Result<CompleteTestRunResponse, String> {
+pub async fn complete_test_run(
+    input: CompleteTestRunInput,
+) -> Result<CompleteTestRunResponse, String> {
     info!(
         "Completing test run {} with status: {}",
         input.run_id,
@@ -561,10 +577,7 @@ pub async fn report_image_recognitions(
 
     let client = reqwest::Client::new();
     let response = client
-        .post(format!(
-            "{}/api/v1/historical/actions",
-            get_api_base_url()
-        ))
+        .post(format!("{}/api/v1/historical/actions", get_api_base_url()))
         .bearer_auth(&access_token)
         .json(&request)
         .send()

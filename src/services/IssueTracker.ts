@@ -26,6 +26,7 @@ export type IssueTrackerEventType =
   | "issue_detected"
   | "issue_updated"
   | "issue_resolved"
+  | "issue_removed"
   | "issues_cleared";
 
 export interface IssueTrackerEvent {
@@ -43,6 +44,7 @@ const ISSUE_DETECTED_WITH_JSON_PATTERN = /\[ISSUE:DETECTED\]\s*(\{[\s\S]*?\})/;
 const _ISSUE_DETECTED_SIMPLE_PATTERN = /\[ISSUE:DETECTED\](?!\s*\{)/;
 const ISSUE_RESOLVED_PATTERN = /\[ISSUE:RESOLVED\]\s*(\{[\s\S]*?\})/;
 const ISSUE_PROGRESS_PATTERN = /\[ISSUE:PROGRESS\]\s*(\{[\s\S]*?\})/;
+const ISSUE_REMOVED_PATTERN = /\[ISSUE:REMOVED\]\s*(\{[\s\S]*?\})/;
 
 /** Regex patterns for parsing verification markers */
 const VERIFICATION_PENDING_PATTERN = /\[VERIFICATION:PENDING\]\s*(\{[\s\S]*?\})/;
@@ -160,6 +162,25 @@ export class IssueTracker {
       }
     }
 
+    // Check for [ISSUE:REMOVED] - AI determined issue is invalid/false positive
+    const removedMatch = line.match(ISSUE_REMOVED_PATTERN);
+    if (removedMatch) {
+      try {
+        const payload = JSON.parse(removedMatch[1]) as { id: string; reason?: string };
+        if (payload.id) {
+          const removed = this.removeIssue(payload.id);
+          if (removed) {
+            console.log(
+              `[IssueTracker] Issue removed via marker: ${payload.id} - ${payload.reason || "No reason provided"}`,
+            );
+          }
+        }
+      } catch (error) {
+        console.error("[IssueTracker] Failed to parse ISSUE:REMOVED:", error);
+      }
+      return null;
+    }
+
     // Check for [VERIFICATION:PENDING] - AI wants to save verification state
     const verificationPendingMatch = line.match(VERIFICATION_PENDING_PATTERN);
     if (verificationPendingMatch) {
@@ -215,6 +236,12 @@ export class IssueTracker {
    * Add a new detected issue
    */
   addIssue(payload: IssueDetectedPayload): DetectedIssue {
+    // Ensure source has a default value if not provided
+    const source = payload.source ?? {
+      type: "ai_analysis" as const,
+      description: "Detected from AI output",
+    };
+
     const issue: DetectedIssue = {
       id: crypto.randomUUID(),
       session_id: this.currentSessionId,
@@ -224,7 +251,7 @@ export class IssueTracker {
       description: payload.description,
       file: payload.file,
       line: payload.line,
-      source: payload.source,
+      source,
       status: "detected",
       detected_at: Date.now(),
     };
@@ -280,6 +307,37 @@ export class IssueTracker {
    */
   skipIssue(id: string): DetectedIssue | null {
     return this.updateIssueStatus(id, "skipped");
+  }
+
+  /**
+   * Remove an issue entirely (for invalid/false positive issues)
+   * @returns true if issue was removed, false if not found
+   */
+  removeIssue(id: string): boolean {
+    const issue = this.issues.get(id);
+    if (!issue) {
+      console.warn(`[IssueTracker] Issue not found for removal: ${id}`);
+      return false;
+    }
+
+    this.issues.delete(id);
+    this.emit({ type: "issue_removed", issue });
+    console.log(`[IssueTracker] Issue removed: ${issue.title} (${id})`);
+    return true;
+  }
+
+  /**
+   * Remove multiple issues at once
+   * @returns number of issues removed
+   */
+  removeIssues(ids: string[]): number {
+    let removed = 0;
+    for (const id of ids) {
+      if (this.removeIssue(id)) {
+        removed++;
+      }
+    }
+    return removed;
   }
 
   /**

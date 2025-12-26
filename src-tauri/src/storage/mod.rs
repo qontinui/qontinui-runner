@@ -110,7 +110,7 @@ impl LocalStorage {
         // Create file path with timestamp
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let file_path = self
             .config

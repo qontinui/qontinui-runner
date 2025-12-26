@@ -567,8 +567,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
             />
             <p className="text-sm text-muted-foreground">
-              Default number of failed iterations before including video frames in AI analysis.
-              Set to 0 to never include video. This value is used as the default for new scripts.
+              Default number of failed iterations before including video frames in AI analysis. Set
+              to 0 to never include video. This value is used as the default for new scripts.
             </p>
           </div>
 

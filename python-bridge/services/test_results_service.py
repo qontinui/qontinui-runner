@@ -305,9 +305,7 @@ class TestResultsService:
         self._pending_transitions.clear()
         await self._submit_transitions(run_id, transitions)
 
-    async def _submit_transitions(
-        self, run_id: str, transitions: list[TransitionResult]
-    ) -> None:
+    async def _submit_transitions(self, run_id: str, transitions: list[TransitionResult]) -> None:
         """Submit transitions to the backend API."""
         if not transitions:
             return
@@ -348,9 +346,7 @@ class TestResultsService:
         self._pending_deficiencies.clear()
         await self._submit_deficiencies(run_id, deficiencies)
 
-    async def _submit_deficiencies(
-        self, run_id: str, deficiencies: list[DeficiencyReport]
-    ) -> None:
+    async def _submit_deficiencies(self, run_id: str, deficiencies: list[DeficiencyReport]) -> None:
         """Submit deficiencies to the backend API."""
         if not deficiencies:
             return
@@ -392,9 +388,7 @@ class TestResultsService:
         }
 
         logger.info(f"Completing test run {run_id} with status: {status}")
-        response = await self.client.put(
-            f"/api/v1/testing/runs/{run_id}/complete", json=payload
-        )
+        response = await self.client.put(f"/api/v1/testing/runs/{run_id}/complete", json=payload)
         response.raise_for_status()
         logger.info(f"Test run completed: {response.json()}")
 
@@ -402,9 +396,7 @@ class TestResultsService:
     # Action Data Submission (for Config Testing / Historical Data)
     # ========================================================================
 
-    async def report_action(
-        self, run_id: str, action: ActionData, batch: bool = True
-    ) -> None:
+    async def report_action(self, run_id: str, action: ActionData, batch: bool = True) -> None:
         """Report an action execution for historical indexing.
 
         This data is used by Config Testing to provide historical results
@@ -445,9 +437,7 @@ class TestResultsService:
         }
 
         logger.info(f"Submitting {len(actions)} actions for historical indexing")
-        response = await self.client.post(
-            "/api/v1/testing/historical/actions", json=payload
-        )
+        response = await self.client.post("/api/v1/testing/historical/actions", json=payload)
         response.raise_for_status()
         logger.debug(f"Actions indexed: {response.json()}")
 

@@ -1,16 +1,18 @@
 /**
  * ExecutionControlPanel Component
  *
- * Handles workflow execution controls (workflow selector, monitor selector, start/stop).
+ * Handles workflow execution controls (workflow selector, monitor selector, initial states, start/stop).
  * Single responsibility: Execution control UI.
  */
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Play, Square, Cpu, ChevronDown } from "lucide-react";
+import { Play, Square, Cpu, ChevronDown, CircleDot } from "lucide-react";
 import CollapsiblePanel from "./CollapsiblePanel";
 import { MonitorSelector } from "./MonitorSelector";
-import type { Workflow } from "../contexts/ExecutionContext";
+import { InitialStatesSelector } from "./InitialStatesSelector";
+import type { Workflow, ConfigState } from "../contexts/ExecutionContext";
+import type { ResolvedInitialStates } from "../types/state-machine";
 
 export interface ExecutionControlPanelProps {
   collapsed: boolean;
@@ -36,6 +38,12 @@ export interface ExecutionControlPanelProps {
   executionActive: boolean;
   onStartExecution: () => void;
   onStopExecution: () => void;
+
+  // Initial states (optional - only show if provided)
+  states?: ConfigState[];
+  resolvedInitialStates?: ResolvedInitialStates;
+  initialStatesOverride?: string[] | null;
+  onInitialStatesOverrideChange?: (ids: string[] | null) => void;
 }
 
 export function ExecutionControlPanel({
@@ -54,10 +62,19 @@ export function ExecutionControlPanel({
   executionActive,
   onStartExecution,
   onStopExecution,
+  states,
+  resolvedInitialStates,
+  initialStatesOverride,
+  onInitialStatesOverrideChange,
 }: ExecutionControlPanelProps) {
   const [calculatedScreens, setCalculatedScreens] = useState<number[]>([]);
   const [isCalculating, setIsCalculating] = useState(false);
   const [availableMonitors, setAvailableMonitors] = useState<number[]>([]);
+  const [initialStatesExpanded, setInitialStatesExpanded] = useState(false);
+
+  // Show initial states section only if all required props are provided
+  const showInitialStates =
+    states && resolvedInitialStates && onInitialStatesOverrideChange && selectedWorkflow;
 
   // Load available monitors on mount
   useEffect(() => {
@@ -178,6 +195,44 @@ export function ExecutionControlPanel({
             readOnly={!!selectedWorkflow}
           />
         </div>
+
+        {/* Initial States Section */}
+        {showInitialStates && (
+          <div className="border border-border/50 rounded-lg overflow-hidden">
+            <button
+              onClick={() => setInitialStatesExpanded(!initialStatesExpanded)}
+              className="w-full flex items-center justify-between p-2 bg-muted/30 hover:bg-muted/50 transition-colors"
+            >
+              <div className="flex items-center gap-2">
+                <CircleDot className="w-4 h-4 text-muted-foreground" />
+                <span className="text-sm font-medium">Initial States</span>
+                {resolvedInitialStates.stateIds.length > 0 && (
+                  <span className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                    {initialStatesOverride !== null
+                      ? `${initialStatesOverride.length} (override)`
+                      : `${resolvedInitialStates.stateIds.length}`}
+                  </span>
+                )}
+              </div>
+              <ChevronDown
+                className={`w-4 h-4 text-muted-foreground transition-transform ${
+                  initialStatesExpanded ? "rotate-180" : ""
+                }`}
+              />
+            </button>
+            {initialStatesExpanded && (
+              <div className="p-3 border-t border-border/50">
+                <InitialStatesSelector
+                  states={states}
+                  resolvedStates={resolvedInitialStates}
+                  overrideStateIds={initialStatesOverride ?? null}
+                  onOverrideChange={onInitialStatesOverrideChange}
+                  disabled={executionActive}
+                />
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Auto-minimize Toggle */}
         {selectedMonitors.length === 1 && (

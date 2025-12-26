@@ -383,28 +383,34 @@ export function CaptureTab({
             </div>
             <div className="flex flex-wrap gap-3">
               {monitors.length > 0 ? (
-                monitors.map((monitor) => (
-                  <button
-                    key={monitor.index}
-                    onClick={() => setSelectedCaptureMonitor(monitor.index)}
-                    className={`flex flex-col items-center gap-1 p-3 rounded-lg border transition-colors min-w-[100px] ${
-                      selectedCaptureMonitor === monitor.index
-                        ? "bg-primary/20 border-primary text-primary"
-                        : "bg-input border-border/50 hover:border-primary/50"
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <Monitor className="w-5 h-5" />
-                      <span className="font-medium">
-                        #{monitor.index}
-                        {monitor.is_primary && <span className="text-primary ml-1">(primary)</span>}
+                monitors.map((monitor, spatialIndex) => {
+                  // Display spatial position (1-indexed, left to right) instead of Windows enumeration index
+                  const displayNumber = spatialIndex + 1;
+                  return (
+                    <button
+                      key={monitor.index}
+                      onClick={() => setSelectedCaptureMonitor(monitor.index)}
+                      className={`flex flex-col items-center gap-1 p-3 rounded-lg border transition-colors min-w-[100px] ${
+                        selectedCaptureMonitor === monitor.index
+                          ? "bg-primary/20 border-primary text-primary"
+                          : "bg-input border-border/50 hover:border-primary/50"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <Monitor className="w-5 h-5" />
+                        <span className="font-medium">
+                          #{displayNumber}
+                          {monitor.is_primary && (
+                            <span className="text-primary ml-1">(primary)</span>
+                          )}
+                        </span>
+                      </div>
+                      <span className="text-xs text-muted-foreground">
+                        {monitor.width}x{monitor.height}
                       </span>
-                    </div>
-                    <span className="text-xs text-muted-foreground">
-                      {monitor.width}x{monitor.height}
-                    </span>
-                  </button>
-                ))
+                    </button>
+                  );
+                })
               ) : (
                 <div className="text-sm text-muted-foreground">Loading monitors...</div>
               )}

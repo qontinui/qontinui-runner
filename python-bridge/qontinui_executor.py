@@ -1409,7 +1409,7 @@ class QontinuiExecutor:
 
             # Try to use SAM3 via SegmentVectorizer
             try:
-                from qontinui.rag.segment_vectorizer import SegmentVectorizer, HAS_SAM3
+                from qontinui.rag.segment_vectorizer import HAS_SAM3, SegmentVectorizer
 
                 # Get options
                 min_area = params.get("min_area", 100)

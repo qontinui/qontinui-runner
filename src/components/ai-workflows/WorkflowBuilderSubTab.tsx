@@ -13,6 +13,11 @@ interface WorkflowBuilderSubTabProps {
   onNavigateToLogLocations: () => void;
 }
 
-export function WorkflowBuilderSubTab({ projectLogs, onNavigateToLogLocations }: WorkflowBuilderSubTabProps) {
-  return <AiBuilderTab projectLogs={projectLogs} onNavigateToLogLocations={onNavigateToLogLocations} />;
+export function WorkflowBuilderSubTab({
+  projectLogs,
+  onNavigateToLogLocations,
+}: WorkflowBuilderSubTabProps) {
+  return (
+    <AiBuilderTab projectLogs={projectLogs} onNavigateToLogLocations={onNavigateToLogLocations} />
+  );
 }

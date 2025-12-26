@@ -20,6 +20,8 @@ import {
   Brain,
   HelpCircle,
   Trash2,
+  Bot,
+  Loader2,
 } from "lucide-react";
 import {
   DetectedIssue,
@@ -54,10 +56,45 @@ const STATUS_ICONS: Record<string, React.ReactNode> = {
   skipped: <XCircle className="w-4 h-4" />,
 };
 
+/** Build the analysis prompt for AI to analyze and fix issues */
+function buildAnalyzePrompt(issuesJson: string): string {
+  return `You are analyzing detected issues from a qontinui-runner session.
+
+## Your Task
+
+1. **Analyze** each issue to determine if it's a real problem that needs fixing
+2. **Fix** issues that you can fix by making code changes
+3. **Report** on what you fixed
+4. **Remove** issues that are no longer valid (false positives, already fixed, or duplicates)
+
+## Current Issues
+
+${issuesJson}
+
+## Instructions
+
+For each issue:
+- If it's a REAL problem: Fix it in the code, then output:
+  [ISSUE:RESOLVED] {"id": "<issue_id>", "resolution": "<what you fixed>"}
+
+- If it's NOT a real problem (false positive, already fixed, duplicate): Output:
+  [ISSUE:REMOVED] {"id": "<issue_id>", "reason": "<why it's not a real issue>"}
+
+- If you need more context, read the relevant files first.
+
+After processing all issues, provide a summary of:
+- How many issues were fixed
+- How many issues were removed (false positives)
+- Any issues that couldn't be fixed and why
+
+Work autonomously. Fix what you can, remove what's invalid, and explain your reasoning.`;
+}
+
 export function IssuesPanel({ onIssueClick: _onIssueClick }: IssuesPanelProps) {
   const [issues, setIssues] = useState<DetectedIssue[]>([]);
   const [summary, setSummary] = useState<IssueSessionSummary | null>(null);
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   // Subscribe to issue changes
   useEffect(() => {
@@ -106,6 +143,54 @@ export function IssuesPanel({ onIssueClick: _onIssueClick }: IssuesPanelProps) {
     issueTracker.clearSession();
   }, []);
 
+  const handleAnalyzeAndFix = useCallback(async () => {
+    setIsAnalyzing(true);
+    try {
+      const currentIssues = issueTracker.getSessionIssues();
+
+      // Build prompt with issues data (only include relevant fields)
+      const issuesJson = JSON.stringify(
+        currentIssues.map((i) => ({
+          id: i.id,
+          type: i.type,
+          severity: i.severity,
+          title: i.title,
+          description: i.description,
+          file: i.file,
+          line: i.line,
+          source: i.source,
+          status: i.status,
+        })),
+        null,
+        2,
+      );
+
+      const prompt = buildAnalyzePrompt(issuesJson);
+
+      // Trigger AI analysis via HTTP endpoint
+      const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          display_prompt: "Analyze and fix detected issues",
+          timeout_seconds: 600,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`AI analysis failed: ${response.statusText}`);
+      }
+
+      // The AI output will contain [ISSUE:RESOLVED] and [ISSUE:REMOVED] markers
+      // that are processed by IssueTracker.processLine() in AiOutputTab
+    } catch (error) {
+      console.error("Failed to analyze issues:", error);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  }, []);
+
   if (issues.length === 0) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground">
@@ -123,14 +208,34 @@ export function IssuesPanel({ onIssueClick: _onIssueClick }: IssuesPanelProps) {
         <div className="flex-shrink-0 p-4 border-b border-border">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold">Session Summary</h3>
-            <button
-              onClick={handleClearAll}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-              title="Clear all issues"
-            >
-              <Trash2 className="w-3 h-3" />
-              Clear
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleAnalyzeAndFix}
+                disabled={isAnalyzing || issues.length === 0}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs bg-purple-500 hover:bg-purple-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded transition-colors"
+                title="AI will analyze issues, fix what's fixable, and remove invalid issues"
+              >
+                {isAnalyzing ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    <span>Analyzing...</span>
+                  </>
+                ) : (
+                  <>
+                    <Bot className="w-3 h-3" />
+                    <span>Analyze & Fix</span>
+                  </>
+                )}
+              </button>
+              <button
+                onClick={handleClearAll}
+                className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                title="Clear all issues"
+              >
+                <Trash2 className="w-3 h-3" />
+                Clear
+              </button>
+            </div>
           </div>
 
           {/* Status counts */}

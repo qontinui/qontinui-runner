@@ -8,7 +8,7 @@
 //! - Execute tests via Node.js subprocess with JSON reporter
 //! - Optional cloud sync with qontinui-web
 
-use crate::executor::file_logger::FileLogger;
+use crate::executor::file_logger::{FileLogger, PlaywrightLogParams};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -886,7 +886,7 @@ pub fn run_script(
         "test".to_string(),
         script_filename,
         "--reporter=json".to_string(),
-        format!("--output={}", output_dir.to_str().unwrap()),
+        format!("--output={}", output_dir.to_string_lossy()),
         format!("--timeout={}", script.timeout_seconds * 1000),
     ];
 
@@ -908,7 +908,7 @@ pub fn run_script(
     let output = if system == "windows" {
         // On Windows, use cmd.exe to ensure npx is found via PATH
         let npx_args = std::iter::once("npx".to_string())
-            .chain(args.into_iter())
+            .chain(args)
             .collect::<Vec<_>>()
             .join(" ");
 
@@ -1086,24 +1086,25 @@ pub fn run_script(
         .as_ref()
         .and_then(|so| so.page_snapshot.as_deref());
 
-    FileLogger::log_playwright_execution(
-        &script.id,
-        &script.name,
-        Some(&script.target_url),
-        Some(display_mode_str),
-        Some(&script.browser),
-        result.passed,
-        result.tests_passed,
-        result.tests_failed,
-        result.tests_skipped,
-        result.duration_ms,
-        result.error.as_deref(),
-        &result.screenshots,
-        &console_output,
-        &spec_tuples,
+    let log_params = PlaywrightLogParams {
+        script_id: &script.id,
+        script_name: &script.name,
+        target_url: Some(&script.target_url),
+        display_mode: Some(display_mode_str),
+        browser: Some(&script.browser),
+        passed: result.passed,
+        tests_passed: result.tests_passed,
+        tests_failed: result.tests_failed,
+        tests_skipped: result.tests_skipped,
+        duration_ms: result.duration_ms,
+        error: result.error.as_deref(),
+        original_screenshots: &result.screenshots,
+        console_output: &console_output,
+        specs: &spec_tuples,
         page_snapshot,
-        result.workflow_status.clone(),
-    );
+        workflow_status: result.workflow_status.clone(),
+    };
+    FileLogger::log_playwright_execution(&log_params);
 
     Ok(result)
 }
@@ -1172,7 +1173,7 @@ fn parse_playwright_json(output: &str) -> (u32, u32, u32, Vec<TestSpec>, Option<
                                         .and_then(|r| r.get("error"))
                                         .and_then(|e| e.get("message"))
                                         .and_then(|m| m.as_str())
-                                        .map(|s| strip_ansi_codes(s));
+                                        .map(strip_ansi_codes);
 
                                     match status.as_str() {
                                         "passed" | "expected" => passed += 1,
@@ -1263,7 +1264,7 @@ fn collect_error_context(output_dir: &PathBuf) -> Option<String> {
                     if let Some(found) = find_in_dir(&path) {
                         return Some(found);
                     }
-                } else if path.file_name().map_or(false, |n| n == "error-context.md") {
+                } else if path.file_name().is_some_and(|n| n == "error-context.md") {
                     if let Ok(content) = fs::read_to_string(&path) {
                         return Some(content);
                     }
@@ -1288,7 +1289,7 @@ fn find_trace_file(output_dir: &PathBuf) -> Option<String> {
                         return Some(found);
                     }
                 } else if let Some(ext) = path.extension() {
-                    if ext == "zip" && path.to_str().map_or(false, |s| s.contains("trace")) {
+                    if ext == "zip" && path.to_str().is_some_and(|s| s.contains("trace")) {
                         return path.to_str().map(String::from);
                     }
                 }

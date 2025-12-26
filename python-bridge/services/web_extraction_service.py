@@ -52,6 +52,11 @@ class WebExtractionService:
             None  # Track current extraction task for cancellation
         )
 
+        # Backend integration for status updates
+        self._backend_session_id: str | None = None
+        self._backend_url: str | None = None
+        self._backend_auth_token: str | None = None
+
         # Store extraction results
         self._extraction_results: dict[str, Any] = {}  # extraction_id -> ExtractionResult
         self._composite_results: dict[str, dict] = {}  # composite_id -> composite structure
@@ -168,6 +173,18 @@ class WebExtractionService:
             self._orchestrator = ExtractionOrchestrator()
             self._current_extraction_id = str(uuid.uuid4())
             self._is_running = True
+
+            # Store backend integration info for status updates
+            self._backend_session_id = config.get("session_id")
+            self._backend_url = config.get("backend_url")
+            self._backend_auth_token = config.get("auth_token")
+
+            # Update backend session to 'running' status
+            if self._backend_session_id and self._backend_url:
+                await self._update_backend_session(
+                    status="running",
+                    stats={"pages_extracted": 0, "states_found": 0},
+                )
 
             # Store app metadata
             app_id = config.get("app_id", self._current_extraction_id)
@@ -367,6 +384,27 @@ class WebExtractionService:
 
                 logger.info(f"Built state_structure with {len(result.states)} states")
 
+                # Serialize states and transitions for backend
+                serialized_states = [self._serialize_state(s) for s in result.states]
+                serialized_transitions = [self._serialize_transition(t) for t in result.transitions]
+
+                # Save annotations to backend
+                await self._save_annotations_to_backend(serialized_states, serialized_transitions)
+
+                # Update backend session to completed with stats
+                await self._update_backend_session(
+                    status="completed",
+                    stats={
+                        "pages_extracted": 1,  # TODO: track actual pages
+                        "states_found": len(result.states),
+                        "elements_found": (
+                            len(result.runtime_extraction.elements)
+                            if result.runtime_extraction
+                            else 0
+                        ),
+                    },
+                )
+
                 # Emit completion event with state_structure
                 await self._emit_event(
                     "extraction_completed",  # Use extraction_completed to match frontend handler
@@ -393,6 +431,11 @@ class WebExtractionService:
         except asyncio.CancelledError:
             # Handle cancellation gracefully
             logger.info(f"Extraction {self._current_extraction_id} was cancelled")
+            # Update backend to failed status
+            await self._update_backend_session(
+                status="failed",
+                error_message="Extraction cancelled by user",
+            )
             await self._emit_event(
                 "extraction_cancelled",
                 {
@@ -405,6 +448,11 @@ class WebExtractionService:
 
         except Exception as e:
             logger.error(f"Extraction failed: {e}", exc_info=True)
+            # Update backend to failed status
+            await self._update_backend_session(
+                status="failed",
+                error_message=str(e),
+            )
             await self._emit_event(
                 "extraction_error",
                 {
@@ -953,3 +1001,111 @@ class WebExtractionService:
             "confidence": transition.confidence,
             "metadata": transition.metadata,
         }
+
+    async def _update_backend_session(
+        self,
+        status: str,
+        stats: dict[str, Any] | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """
+        Update the backend extraction session with new status/stats.
+
+        Args:
+            status: Session status ('running', 'completed', 'failed')
+            stats: Optional stats dict with pages_extracted, states_found, etc.
+            error_message: Optional error message for failed status
+        """
+        if not self._backend_session_id or not self._backend_url:
+            logger.debug("No backend session configured, skipping update")
+            return
+
+        import httpx
+
+        try:
+            url = f"{self._backend_url}/api/v1/extractions/{self._backend_session_id}"
+            payload: dict[str, Any] = {"status": status}
+
+            if stats:
+                payload["stats"] = stats
+            if error_message:
+                payload["error_message"] = error_message
+
+            # Build headers with auth token if available
+            headers = {"Content-Type": "application/json"}
+            if self._backend_auth_token:
+                headers["Authorization"] = f"Bearer {self._backend_auth_token}"
+
+            logger.info(f"Updating backend session {self._backend_session_id} to status={status}")
+
+            async with httpx.AsyncClient() as client:
+                response = await client.patch(url, json=payload, headers=headers, timeout=30.0)
+                if response.status_code == 200:
+                    logger.info(f"Successfully updated backend session to {status}")
+                else:
+                    logger.warning(
+                        f"Failed to update backend session: {response.status_code} - {response.text}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Failed to update backend session: {e}")
+
+    async def _save_annotations_to_backend(
+        self,
+        states: list[dict[str, Any]],
+        transitions: list[dict[str, Any]],
+    ) -> None:
+        """
+        Save extraction annotations to the backend.
+
+        Args:
+            states: List of serialized state dicts
+            transitions: List of serialized transition dicts
+        """
+        if not self._backend_session_id or not self._backend_url:
+            logger.debug("No backend session configured, skipping annotation save")
+            return
+
+        import httpx
+
+        # Group states by URL to create annotations per page
+        states_by_url: dict[str, list[dict[str, Any]]] = {}
+        for state in states:
+            state_url = state.get("url", "unknown")
+            if state_url not in states_by_url:
+                states_by_url[state_url] = []
+            states_by_url[state_url].append(state)
+
+        # Build headers with auth token if available
+        headers = {"Content-Type": "application/json"}
+        if self._backend_auth_token:
+            headers["Authorization"] = f"Bearer {self._backend_auth_token}"
+
+        try:
+            async with httpx.AsyncClient() as client:
+                for source_url, url_states in states_by_url.items():
+                    # Generate a screenshot ID for this URL (could be improved with actual screenshots)
+                    screenshot_id = str(uuid.uuid4())
+
+                    annotation_data = {
+                        "screenshot_id": screenshot_id,
+                        "elements": [],  # Elements are embedded in states
+                        "states": url_states,
+                    }
+
+                    url = f"{self._backend_url}/api/v1/extractions/{self._backend_session_id}/annotations"
+
+                    response = await client.put(
+                        url, json=annotation_data, headers=headers, timeout=30.0
+                    )
+                    if response.status_code == 200:
+                        logger.info(
+                            f"Saved annotation for {source_url} with {len(url_states)} states"
+                        )
+                    else:
+                        logger.warning(
+                            f"Failed to save annotation: {response.status_code} - {response.text}"
+                        )
+
+        except Exception as e:
+            logger.warning(f"Failed to save annotations to backend: {e}")

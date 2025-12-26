@@ -23,6 +23,7 @@ import {
   AlertTriangle,
   FolderOpen,
   Lightbulb,
+  Puzzle,
 } from "lucide-react";
 
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
@@ -36,10 +37,20 @@ import { PromptsSubTab } from "./ai-workflows/PromptsSubTab";
 import { ScriptsSubTab } from "./ai-workflows/ScriptsSubTab";
 import { AiOutputSubTab } from "./ai-workflows/AiOutputSubTab";
 import { LearningsSubTab } from "./ai-workflows/LearningsSubTab";
+import { ScriptletsSubTab } from "./ai-workflows/ScriptletsSubTab";
 import { IssuesPanel } from "./IssuesPanel";
 import { ExternalLogsTab } from "./ExternalLogsTab";
 
-type AiWorkflowSubTab = "builder" | "library" | "prompts" | "scripts" | "output" | "issues" | "learnings" | "log-locations";
+type AiWorkflowSubTab =
+  | "builder"
+  | "library"
+  | "prompts"
+  | "scripts"
+  | "output"
+  | "issues"
+  | "learnings"
+  | "scriptlets"
+  | "log-locations";
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
 const SUB_TAB_STORAGE_KEY = "qontinui-ai-workflows-sub-tab";
@@ -61,21 +72,44 @@ export function AiWorkflowsTab({
 }: AiWorkflowsTabProps) {
   const [activeSubTab, setActiveSubTab] = useState<AiWorkflowSubTab>(() => {
     const stored = localStorage.getItem(SUB_TAB_STORAGE_KEY);
-    if (stored && ["builder", "library", "prompts", "scripts", "output", "issues", "learnings", "log-locations"].includes(stored)) {
+    if (
+      stored &&
+      [
+        "builder",
+        "library",
+        "prompts",
+        "scripts",
+        "output",
+        "issues",
+        "learnings",
+        "scriptlets",
+        "log-locations",
+      ].includes(stored)
+    ) {
       return stored as AiWorkflowSubTab;
     }
     return "builder";
   });
 
-  // Track issue count from IssueTracker
-  const [issueCount, setIssueCount] = useState(issueTracker.count);
-  const [unresolvedCount, setUnresolvedCount] = useState(issueTracker.unresolvedCount);
+  // Track issue count from IssueTracker (using session-filtered counts to match IssuesPanel)
+  const [issueCount, setIssueCount] = useState(() => issueTracker.getSessionIssues().length);
+  const [unresolvedCount, setUnresolvedCount] = useState(
+    () =>
+      issueTracker
+        .getSessionIssues()
+        .filter((i) => i.status === "detected" || i.status === "in_progress").length,
+  );
 
   useEffect(() => {
     const updateCounts = () => {
-      setIssueCount(issueTracker.count);
-      setUnresolvedCount(issueTracker.unresolvedCount);
+      const sessionIssues = issueTracker.getSessionIssues();
+      setIssueCount(sessionIssues.length);
+      setUnresolvedCount(
+        sessionIssues.filter((i) => i.status === "detected" || i.status === "in_progress").length,
+      );
     };
+    // Initial update
+    updateCounts();
     const unsubscribe = issueTracker.subscribe(updateCounts);
     return unsubscribe;
   }, []);
@@ -91,20 +125,27 @@ export function AiWorkflowsTab({
     { id: "prompts" as const, label: "Prompts", icon: FileText },
     { id: "scripts" as const, label: "Scripts", icon: TestTube },
     { id: "output" as const, label: "AI Output", icon: MessageSquare },
-    { id: "issues" as const, label: "Issues", icon: AlertTriangle, count: issueCount, highlight: unresolvedCount > 0 },
+    {
+      id: "issues" as const,
+      label: "Issues",
+      icon: AlertTriangle,
+      count: issueCount,
+      highlight: unresolvedCount > 0,
+    },
     { id: "learnings" as const, label: "Learnings", icon: Lightbulb },
+    { id: "scriptlets" as const, label: "Scriptlets", icon: Puzzle },
     { id: "log-locations" as const, label: "Log Locations", icon: FolderOpen },
   ];
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col overflow-hidden">
       <Tabs.Root
         value={activeSubTab}
         onValueChange={(value) => setActiveSubTab(value as AiWorkflowSubTab)}
-        className="flex-1 flex flex-col"
+        className="flex-1 flex flex-col min-h-0"
       >
-        {/* Sub-Tab Navigation */}
-        <Tabs.List className="flex border-b border-border bg-card/50 px-4">
+        {/* Sub-Tab Navigation - Fixed */}
+        <Tabs.List className="flex border-b border-border bg-card/50 px-4 flex-shrink-0">
           {subTabs.map((tab) => {
             const Icon = tab.icon;
             const hasCount = "count" in tab && typeof tab.count === "number";
@@ -138,7 +179,7 @@ export function AiWorkflowsTab({
         </Tabs.List>
 
         {/* Sub-Tab Content */}
-        <div className="flex-1 overflow-hidden">
+        <div className="flex-1 min-h-0 overflow-hidden">
           {/* Workflow Builder */}
           <Tabs.Content
             value="builder"
@@ -180,10 +221,7 @@ export function AiWorkflowsTab({
             value="output"
             className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
           >
-            <AiOutputSubTab
-              aiOutputLines={aiOutputLines}
-              onClearAiOutput={onClearAiOutput}
-            />
+            <AiOutputSubTab aiOutputLines={aiOutputLines} onClearAiOutput={onClearAiOutput} />
           </Tabs.Content>
 
           {/* Issues */}
@@ -202,6 +240,14 @@ export function AiWorkflowsTab({
             className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
             <LearningsSubTab aiOutputLines={aiOutputLines} />
+          </Tabs.Content>
+
+          {/* Scriptlets */}
+          <Tabs.Content
+            value="scriptlets"
+            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
+            <ScriptletsSubTab onLog={onLog} aiOutputLines={aiOutputLines} />
           </Tabs.Content>
 
           {/* Log Locations */}

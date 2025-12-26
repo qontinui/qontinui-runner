@@ -67,13 +67,10 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
         for state in states {
             if let Some(state_images) = state.get("stateImages").and_then(|si| si.as_array()) {
                 for state_image in state_images {
-                    let state_image_id = state_image
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let state_image_id =
+                        state_image.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
-                    if let Some(patterns) = state_image.get("patterns").and_then(|p| p.as_array())
-                    {
+                    if let Some(patterns) = state_image.get("patterns").and_then(|p| p.as_array()) {
                         for pattern in patterns {
                             if let Some(pattern_id) = pattern.get("id").and_then(|v| v.as_str()) {
                                 pattern_to_state_image
@@ -111,10 +108,7 @@ pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
             .unwrap_or("");
 
         if state_image_id.is_empty() {
-            warn!(
-                "No stateImage mapping found for pattern: {}",
-                pattern_id
-            );
+            warn!("No stateImage mapping found for pattern: {}", pattern_id);
             continue;
         }
 
@@ -548,34 +542,37 @@ pub async fn search_rag_elements_semantic(
         let project_id = project_id.clone();
         let query = query.clone();
 
-        move || {
+        move || -> Result<_, String> {
             // Lock inside the blocking task
-            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|e| format!("Failed to create runtime: {}", e))?;
             let semantic_search = runtime.block_on(semantic_search_arc.lock());
-            semantic_search.search(&project_id, &query, limit, min_similarity)
+            semantic_search
+                .search(&project_id, &query, limit, min_similarity)
+                .map_err(|e| match e {
+                    crate::rag::SearchError::EmbeddingsNotFound(msg) => {
+                        format!(
+                            "Embeddings not found. Please generate embeddings first. Details: {}",
+                            msg
+                        )
+                    }
+                    _ => format!("Semantic search failed: {}", e),
+                })
         }
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
-    .map_err(|e| match e {
-        crate::rag::SearchError::EmbeddingsNotFound(msg) => {
-            format!(
-                "Embeddings not found. Please generate embeddings first. Details: {}",
-                msg
-            )
-        }
-        _ => format!("Semantic search failed: {}", e),
-    })?;
+    .map_err(|e| format!("Task join error: {}", e))??;
 
-    info!("Semantic search found {} results", results.len());
+    // Results have already been error-mapped inside the closure
+    let results_for_response = results;
 
     Ok(CommandResponse {
         success: true,
         message: Some(format!(
-            "Found {} semantically similar elements",
-            results.len()
+            "Found {} semantically similar results",
+            results_for_response.len()
         )),
-        data: Some(serde_json::to_value(results).unwrap()),
+        data: Some(serde_json::to_value(results_for_response).unwrap()),
     })
 }
 

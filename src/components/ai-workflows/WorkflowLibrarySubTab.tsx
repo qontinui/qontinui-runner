@@ -167,7 +167,9 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
     lines.push("");
     lines.push(`## Execution Steps`);
     workflow.steps.forEach((step, index) => {
-      lines.push(`${index + 1}. [${step.type}] ${step.name}${step.takeScreenshot ? " (screenshot)" : ""}`);
+      lines.push(
+        `${index + 1}. [${step.type}] ${step.name}${step.takeScreenshot ? " (screenshot)" : ""}`,
+      );
     });
     lines.push("");
     lines.push(`## Settings`);
@@ -185,7 +187,11 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
 
   const formatDate = (dateStr: string) => {
     const date = new Date(dateStr);
-    return date.toLocaleDateString() + " " + date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return (
+      date.toLocaleDateString() +
+      " " +
+      date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    );
   };
 
   if (loading) {
@@ -239,10 +245,7 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
       ) : (
         <div className="space-y-3">
           {filteredWorkflows.map((workflow) => (
-            <div
-              key={workflow.id}
-              className="card border border-border/50 overflow-hidden"
-            >
+            <div key={workflow.id} className="card border border-border/50 overflow-hidden">
               {/* Workflow Header */}
               <div className="p-4 flex items-center gap-4">
                 <Sparkles className="w-5 h-5 text-green-500 flex-shrink-0" />
@@ -314,14 +317,18 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
                   {/* Goal */}
                   {workflow.goal && (
                     <div>
-                      <h4 className="text-xs font-semibold text-muted-foreground uppercase mb-1">Goal</h4>
+                      <h4 className="text-xs font-semibold text-muted-foreground uppercase mb-1">
+                        Goal
+                      </h4>
                       <p className="text-sm">{workflow.goal}</p>
                     </div>
                   )}
 
                   {/* Steps */}
                   <div>
-                    <h4 className="text-xs font-semibold text-muted-foreground uppercase mb-2">Steps</h4>
+                    <h4 className="text-xs font-semibold text-muted-foreground uppercase mb-2">
+                      Steps
+                    </h4>
                     <div className="space-y-1">
                       {workflow.steps.map((step, index) => (
                         <div

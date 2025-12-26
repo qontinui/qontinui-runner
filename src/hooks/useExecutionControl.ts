@@ -27,6 +27,8 @@ interface UseExecutionControlReturn {
     selectedMonitors: number[];
     workflows: Workflow[];
     availableMonitors: number[];
+    /** Optional override for initial active states (highest priority) */
+    initialStateIds?: string[] | null;
   }) => Promise<void>;
   stopExecution: () => Promise<void>;
 }
@@ -51,9 +53,11 @@ export function useExecutionControl(
       selectedMonitors: number[];
       workflows: Workflow[];
       availableMonitors: number[];
+      initialStateIds?: string[] | null;
     }) => {
       console.log("[EXECUTION_CONTROL] startExecution called");
-      const { selectedWorkflow, selectedMonitors, workflows, availableMonitors } = params;
+      const { selectedWorkflow, selectedMonitors, workflows, availableMonitors, initialStateIds } =
+        params;
 
       try {
         if (!selectedWorkflow) {
@@ -69,10 +73,21 @@ export function useExecutionControl(
         if (onConfigurationPanelCollapse) onConfigurationPanelCollapse(true);
         if (onExecutionPanelCollapse) onExecutionPanelCollapse(true);
 
-        const invokeParams = {
+        // Build invoke params, including initial states if override is active
+        const invokeParams: {
+          processId: string;
+          monitorIndices: number[];
+          initialStateIds?: string[];
+        } = {
           processId: selectedWorkflow,
           monitorIndices: selectedMonitors,
         };
+
+        // Add initial state IDs if provided (session override)
+        if (initialStateIds && initialStateIds.length > 0) {
+          invokeParams.initialStateIds = initialStateIds;
+          console.log("[EXECUTION_CONTROL] Using initial state override:", initialStateIds);
+        }
 
         const workflowName = workflows.find((w) => w.id === selectedWorkflow)?.name;
         console.log("Starting execution with workflow:", selectedWorkflow, workflowName);

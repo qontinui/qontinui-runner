@@ -135,9 +135,11 @@ export function MonitorSelector({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        {monitors.map((monitor) => {
+        {monitors.map((monitor, spatialIndex) => {
           const isSelected = selectedMonitors.includes(monitor.index);
           const position = getPositionLabel(monitor, monitors);
+          // Display spatial position (1-indexed, left to right) instead of Windows enumeration index
+          const displayNumber = spatialIndex + 1;
 
           return (
             <button
@@ -152,7 +154,7 @@ export function MonitorSelector({
             >
               <div className="flex items-center gap-1.5">
                 <Monitor className={iconSize} />
-                <span className="font-medium">#{monitor.index}</span>
+                <span className="font-medium">#{displayNumber}</span>
                 {multiSelect && isSelected && <Check className={`${iconSize} text-primary`} />}
               </div>
               <div className={`${textSize} text-muted-foreground space-y-0.5`}>

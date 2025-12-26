@@ -6,6 +6,7 @@
  */
 
 import { logManager, actionLogManager, windowManager, configManager } from "./index";
+import { APP_VERSION } from "../lib/appInfo";
 import type { EventRouter } from "./EventRouter";
 import type {
   ErrorEventPayload,
@@ -18,19 +19,17 @@ import type { TreeEventData } from "../types/treeEvents";
 import { syncIssuesToBackend } from "../services/IssueSyncService";
 import { issueTracker } from "../services/IssueTracker";
 // Legacy service - deprecated, use ExecutionReportingService instead
-import { testRunReportingService, type TransitionData, type ImageRecognitionData } from "../services/TestRunReportingService";
+import {
+  testRunReportingService,
+  type TransitionData,
+  type ImageRecognitionData,
+} from "../services/TestRunReportingService";
 // New unified execution reporting service
 import {
   executionReportingService,
   type ActionExecutionCreate,
 } from "../services/ExecutionReportingService";
-import {
-  RunType,
-  RunStatus,
-  ActionType,
-  ActionStatus,
-  ErrorType,
-} from "../types/execution";
+import { RunType, RunStatus, ActionType, ActionStatus, ErrorType } from "../types/execution";
 
 interface ExecutionContextActions {
   setPythonStatus: (status: "stopped" | "running") => void;
@@ -73,70 +72,81 @@ export function setupEventHandlers(
 
   // Handler for "execution_started" event
   unsubscribers.push(
-    eventRouter.subscribe("execution_started", async (payload: { data?: { workflow_id?: string; workflow_name?: string; run_type?: string } }) => {
-      console.log("[EVENT_HANDLER] execution_started event received");
-      setExecutionActive(true);
+    eventRouter.subscribe(
+      "execution_started",
+      async (payload: {
+        data?: { workflow_id?: string; workflow_name?: string; run_type?: string };
+      }) => {
+        console.log("[EVENT_HANDLER] execution_started event received");
+        setExecutionActive(true);
 
-      // Start execution run reporting using the new unified service
-      const projectId = configManager.getProjectId();
-      if (projectId) {
-        const workflowId = payload?.data?.workflow_id || `workflow-${Date.now()}`;
-        const workflowName = payload?.data?.workflow_name || "Workflow Execution";
-        const runTypeStr = payload?.data?.run_type || "live_automation";
+        // Start execution run reporting using the new unified service
+        const projectId = configManager.getProjectId();
+        if (projectId) {
+          const workflowId = payload?.data?.workflow_id || `workflow-${Date.now()}`;
+          const workflowName = payload?.data?.workflow_name || "Workflow Execution";
+          const runTypeStr = payload?.data?.run_type || "live_automation";
 
-        // Map run type string to enum
-        let runType: RunType;
-        switch (runTypeStr) {
-          case "qa_test":
-            runType = RunType.QA_TEST;
-            break;
-          case "integration_test":
-            runType = RunType.INTEGRATION_TEST;
-            break;
-          case "recording":
-            runType = RunType.RECORDING;
-            break;
-          case "debug":
-            runType = RunType.DEBUG;
-            break;
-          default:
-            runType = RunType.LIVE_AUTOMATION;
+          // Map run type string to enum
+          let runType: RunType;
+          switch (runTypeStr) {
+            case "qa_test":
+              runType = RunType.QA_TEST;
+              break;
+            case "integration_test":
+              runType = RunType.INTEGRATION_TEST;
+              break;
+            case "recording":
+              runType = RunType.RECORDING;
+              break;
+            case "debug":
+              runType = RunType.DEBUG;
+              break;
+            default:
+              runType = RunType.LIVE_AUTOMATION;
+          }
+
+          // Get runner metadata
+          const runnerMetadata = {
+            runner_version: APP_VERSION,
+            os: navigator.platform || "unknown",
+            hostname: "qontinui-runner",
+          };
+
+          // Get workflow metadata
+          const workflowMetadata = {
+            workflow_id: workflowId,
+            workflow_name: workflowName,
+          };
+
+          console.log(
+            `[EVENT_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}`,
+          );
+
+          // Start using new unified service
+          await executionReportingService
+            .startRun(
+              projectId,
+              runType,
+              `${workflowName} - ${new Date().toISOString().slice(0, 16)}`,
+              runnerMetadata,
+              workflowMetadata,
+            )
+            .catch((error) => {
+              console.error("[EVENT_HANDLER] Failed to start execution run:", error);
+            });
+
+          // Also start legacy test run for backward compatibility
+          await testRunReportingService
+            .startTestRun(projectId, workflowId, workflowName)
+            .catch((error) => {
+              console.error("[EVENT_HANDLER] Failed to start legacy test run:", error);
+            });
+        } else {
+          console.log("[EVENT_HANDLER] No project selected, skipping execution run reporting");
         }
-
-        // Get runner metadata
-        const runnerMetadata = {
-          runner_version: "0.1.0", // TODO: Get from package.json or Tauri
-          os: navigator.platform || "unknown",
-          hostname: "qontinui-runner",
-        };
-
-        // Get workflow metadata
-        const workflowMetadata = {
-          workflow_id: workflowId,
-          workflow_name: workflowName,
-        };
-
-        console.log(`[EVENT_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}`);
-
-        // Start using new unified service
-        await executionReportingService.startRun(
-          projectId,
-          runType,
-          `${workflowName} - ${new Date().toISOString().slice(0, 16)}`,
-          runnerMetadata,
-          workflowMetadata
-        ).catch((error) => {
-          console.error("[EVENT_HANDLER] Failed to start execution run:", error);
-        });
-
-        // Also start legacy test run for backward compatibility
-        await testRunReportingService.startTestRun(projectId, workflowId, workflowName).catch((error) => {
-          console.error("[EVENT_HANDLER] Failed to start legacy test run:", error);
-        });
-      } else {
-        console.log("[EVENT_HANDLER] No project selected, skipping execution run reporting");
-      }
-    }),
+      },
+    ),
   );
 
   // Handler for "execution_completed" event
@@ -173,9 +183,15 @@ export function setupEventHandlers(
           .then((result) => {
             if (result.errors.length > 0) {
               console.warn("[EVENT_HANDLER] Issue sync had errors:", result.errors);
-              logManager.addLog("warning", `Issue sync completed with errors: ${result.errors.join(", ")}`);
+              logManager.addLog(
+                "warning",
+                `Issue sync completed with errors: ${result.errors.join(", ")}`,
+              );
             } else if (result.synced > 0 || result.updated > 0) {
-              logManager.addLog("info", `Synced ${result.synced} new, ${result.updated} updated issues to cloud`);
+              logManager.addLog(
+                "info",
+                `Synced ${result.synced} new, ${result.updated} updated issues to cloud`,
+              );
             }
           })
           .catch((error) => {
@@ -188,28 +204,33 @@ export function setupEventHandlers(
 
   // Handler for "execution_failed" event (if execution fails)
   unsubscribers.push(
-    eventRouter.subscribe("execution_failed", async (payload: { data?: { error_message?: string } }) => {
-      console.log("[EVENT_HANDLER] execution_failed event received");
-      setExecutionActive(false);
+    eventRouter.subscribe(
+      "execution_failed",
+      async (payload: { data?: { error_message?: string } }) => {
+        console.log("[EVENT_HANDLER] execution_failed event received");
+        setExecutionActive(false);
 
-      const errorMessage = payload?.data?.error_message;
+        const errorMessage = payload?.data?.error_message;
 
-      // Complete execution run using new unified service (failure)
-      if (executionReportingService.isActive) {
-        console.log("[EVENT_HANDLER] Completing execution run (failed)");
-        await executionReportingService.completeRun(RunStatus.FAILED, undefined, undefined, errorMessage).catch((error) => {
-          console.error("[EVENT_HANDLER] Failed to complete execution run:", error);
-        });
-      }
+        // Complete execution run using new unified service (failure)
+        if (executionReportingService.isActive) {
+          console.log("[EVENT_HANDLER] Completing execution run (failed)");
+          await executionReportingService
+            .completeRun(RunStatus.FAILED, undefined, undefined, errorMessage)
+            .catch((error) => {
+              console.error("[EVENT_HANDLER] Failed to complete execution run:", error);
+            });
+        }
 
-      // Complete legacy test run reporting (failure) for backward compatibility
-      if (testRunReportingService.isActive) {
-        console.log("[EVENT_HANDLER] Completing legacy test run (failed)");
-        await testRunReportingService.completeTestRun(false).catch((error) => {
-          console.error("[EVENT_HANDLER] Failed to complete legacy test run:", error);
-        });
-      }
-    }),
+        // Complete legacy test run reporting (failure) for backward compatibility
+        if (testRunReportingService.isActive) {
+          console.log("[EVENT_HANDLER] Completing legacy test run (failed)");
+          await testRunReportingService.completeTestRun(false).catch((error) => {
+            console.error("[EVENT_HANDLER] Failed to complete legacy test run:", error);
+          });
+        }
+      },
+    ),
   );
 
   // Handler for "error" event
@@ -251,10 +272,7 @@ export function setupEventHandlers(
         const eventType = eventData.event_type;
 
         // Report on action completion (success or failure)
-        if (
-          (eventType === "action_completed" || eventType === "action_failed") &&
-          eventData.node
-        ) {
+        if ((eventType === "action_completed" || eventType === "action_failed") && eventData.node) {
           const node = eventData.node;
           const metadata = node.metadata || {};
           const stateContext = metadata.state_context;
@@ -281,7 +299,8 @@ export function setupEventHandlers(
             else if (typeToCheck.includes("go_to_state")) actionType = ActionType.GO_TO_STATE;
 
             // Map node status to ActionStatus
-            const actionStatus: ActionStatus = node.status === "success" ? ActionStatus.SUCCESS : ActionStatus.FAILED;
+            const actionStatus: ActionStatus =
+              node.status === "success" ? ActionStatus.SUCCESS : ActionStatus.FAILED;
 
             // Build action execution data
             const actionExecution: ActionExecutionCreate = {
@@ -324,7 +343,7 @@ export function setupEventHandlers(
               completed_at: completedAt.toISOString(),
               duration_ms: durationMs,
               error_message: node.error,
-              error_type: node.error ? "other" : undefined,  // Backend allows: element_not_found, timeout, assertion_failed, crash, other
+              error_type: node.error ? "other" : undefined, // Backend allows: element_not_found, timeout, assertion_failed, crash, other
               screenshot_id: metadata.screenshot_reference,
               metadata: {
                 node_id: node.id,
@@ -374,9 +393,16 @@ export function setupEventHandlers(
         // Extract hierarchy data for active states
         let activeStates: string[] = [];
         if (data.hierarchy) {
-          const hierarchy = typeof data.hierarchy === "string"
-            ? (() => { try { return JSON.parse(data.hierarchy); } catch { return null; } })()
-            : data.hierarchy;
+          const hierarchy =
+            typeof data.hierarchy === "string"
+              ? (() => {
+                  try {
+                    return JSON.parse(data.hierarchy);
+                  } catch {
+                    return null;
+                  }
+                })()
+              : data.hierarchy;
           if (hierarchy?.active_states && Array.isArray(hierarchy.active_states)) {
             activeStates = hierarchy.active_states;
           }

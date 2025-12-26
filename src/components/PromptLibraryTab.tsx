@@ -83,7 +83,14 @@ interface SessionConfig {
 interface Session {
   id: string;
   config: SessionConfig;
-  status: "starting" | "running" | "completed" | "failed" | "stopped" | "waiting_for_continuation" | "stalled";
+  status:
+    | "starting"
+    | "running"
+    | "completed"
+    | "failed"
+    | "stopped"
+    | "waiting_for_continuation"
+    | "stalled";
   checkpoint: SessionCheckpoint;
   active_subprocess_id: string | null;
   event_log: { timestamp: number; event_type: string; message: string }[];
@@ -110,13 +117,13 @@ interface WorkflowRun {
 // Convert Session to WorkflowRun for UI compatibility
 function sessionToWorkflowRun(session: Session, promptId?: string): WorkflowRun {
   const statusMap: Record<string, WorkflowRun["status"]> = {
-    "starting": "running",
-    "running": "running",
-    "completed": "completed",
-    "failed": "failed",
-    "stopped": "failed",
-    "waiting_for_continuation": "idle",
-    "stalled": "stalled",
+    starting: "running",
+    running: "running",
+    completed: "completed",
+    failed: "failed",
+    stopped: "failed",
+    waiting_for_continuation: "idle",
+    stalled: "stalled",
   };
 
   return {
@@ -440,6 +447,10 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
           total_phases: prompt.workflow.completion_value,
           uses_gui: false,
           timeout_seconds: 1800,
+          // Multi-session workflow config (runner handles continuation)
+          checkpoint_path: prompt.workflow.enabled ? prompt.workflow.checkpoint_path : null,
+          phase_field: prompt.workflow.phase_field || "current_phase",
+          completion_value: prompt.workflow.enabled ? prompt.workflow.completion_value : null,
         }),
       });
       const result = await response.json();
@@ -508,7 +519,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
 
       const sessions: Session[] = listResult.data || [];
       const promptWorkflows = sessions.filter(
-        (s: Session) => s.config.session_type === "prompt_workflow"
+        (s: Session) => s.config.session_type === "prompt_workflow",
       );
 
       let deletedCount = 0;

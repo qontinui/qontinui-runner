@@ -20,11 +20,14 @@ import {
   useWorkflowSelection,
   useMonitorDetection,
   useExecutionControl,
+  useInitialStatesOverride,
   type Config,
   type Workflow,
   type ConfigImage,
   type ConfigState,
 } from "../hooks";
+import type { ResolvedInitialStates, InitialStatesSource } from "../types/state-machine";
+import { getResolvedInitialStates } from "../types/state-machine";
 
 // Re-export types for backward compatibility
 export type { Workflow, Config, ConfigImage, ConfigState };
@@ -78,6 +81,18 @@ interface ExecutionContextValue {
   setAutoMinimize: (enabled: boolean) => void;
   startExecution: () => Promise<void>;
   stopExecution: () => Promise<void>;
+
+  // Initial States Management
+  /** Resolved initial states from config (without override) */
+  resolvedInitialStates: ResolvedInitialStates;
+  /** Current override state IDs (null = no override) */
+  initialStatesOverride: string[] | null;
+  /** Set the initial states override */
+  setInitialStatesOverride: (ids: string[] | null) => void;
+  /** Clear the initial states override */
+  clearInitialStatesOverride: () => void;
+  /** Whether an initial states override is active */
+  hasInitialStatesOverride: boolean;
 }
 
 // Create context once and store in window to survive HMR reloads
@@ -169,6 +184,24 @@ export function ExecutionProvider({
   const { selectedWorkflow, setSelectedWorkflow, selectWorkflowWithPersistence } =
     useWorkflowSelection();
 
+  // Track config load count for initial states override reset
+  const [configLoadCount, setConfigLoadCount] = useState(0);
+
+  // Initial States Override Hook (session-only override)
+  const {
+    overrideStateIds: initialStatesOverride,
+    setOverrideStateIds: setInitialStatesOverride,
+    clearOverride: clearInitialStatesOverride,
+    hasOverride: hasInitialStatesOverride,
+  } = useInitialStatesOverride(selectedWorkflow, configLoadCount);
+
+  // Resolved initial states from config (without override)
+  const [resolvedInitialStates, setResolvedInitialStates] = useState<ResolvedInitialStates>({
+    stateIds: [],
+    source: "defaults" as InitialStatesSource,
+    states: [],
+  });
+
   // Monitor Detection Hook (multi-monitor support)
   const {
     selectedMonitors,
@@ -223,6 +256,54 @@ export function ExecutionProvider({
     }
   }, [pendingMonitorIndices, availableMonitors, setSelectedMonitors]);
 
+  // Increment config load count when config is loaded (for initial states override reset)
+  useEffect(() => {
+    if (configLoaded) {
+      setConfigLoadCount((prev) => prev + 1);
+      console.log("[EXECUTION_CONTEXT] Config loaded, incrementing config load count");
+    }
+  }, [configLoaded]);
+
+  // Fetch resolved initial states when workflow changes
+  useEffect(() => {
+    if (!selectedWorkflow || !configLoaded) {
+      setResolvedInitialStates({
+        stateIds: [],
+        source: "defaults",
+        states: [],
+      });
+      return;
+    }
+
+    const fetchResolvedStates = async () => {
+      console.log("[EXECUTION_CONTEXT] Fetching resolved initial states for:", selectedWorkflow);
+      const result = await getResolvedInitialStates(selectedWorkflow);
+      if (result.success) {
+        setResolvedInitialStates({
+          stateIds: result.stateIds,
+          source: result.source,
+          states: result.states,
+          workflowId: result.workflowId,
+        });
+        console.log(
+          "[EXECUTION_CONTEXT] Resolved initial states:",
+          result.stateIds,
+          "source:",
+          result.source,
+        );
+      } else {
+        console.warn("[EXECUTION_CONTEXT] Failed to fetch resolved initial states:", result.error);
+        setResolvedInitialStates({
+          stateIds: [],
+          source: "defaults",
+          states: [],
+        });
+      }
+    };
+
+    fetchResolvedStates();
+  }, [selectedWorkflow, configLoaded]);
+
   // Execution Control Hook
   const {
     executionActive,
@@ -241,13 +322,30 @@ export function ExecutionProvider({
    * Wrapped startExecution that gathers all required state
    */
   const startExecution = useCallback(async () => {
+    // Determine effective initial states (override takes precedence)
+    const effectiveInitialStates = hasInitialStatesOverride
+      ? initialStatesOverride
+      : resolvedInitialStates.stateIds.length > 0
+        ? resolvedInitialStates.stateIds
+        : null;
+
     await startExecutionHook({
       selectedWorkflow,
       selectedMonitors,
       workflows,
       availableMonitors,
+      initialStateIds: effectiveInitialStates,
     });
-  }, [startExecutionHook, selectedWorkflow, selectedMonitors, workflows, availableMonitors]);
+  }, [
+    startExecutionHook,
+    selectedWorkflow,
+    selectedMonitors,
+    workflows,
+    availableMonitors,
+    hasInitialStatesOverride,
+    initialStatesOverride,
+    resolvedInitialStates.stateIds,
+  ]);
 
   const value: ExecutionContextValue = {
     // Python Executor
@@ -288,6 +386,13 @@ export function ExecutionProvider({
     setAutoMinimize,
     startExecution,
     stopExecution: stopExecutionHook,
+
+    // Initial States Management
+    resolvedInitialStates,
+    initialStatesOverride,
+    setInitialStatesOverride,
+    clearInitialStatesOverride,
+    hasInitialStatesOverride,
   };
 
   return <ExecutionContext.Provider value={value}>{children}</ExecutionContext.Provider>;

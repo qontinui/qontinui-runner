@@ -45,3 +45,6 @@ export { useWebExtraction } from "./useWebExtraction";
 export { useExtractionState } from "./useExtractionState";
 
 export { useRagProcessing } from "./useRagProcessing";
+
+export { useInitialStatesOverride } from "./useInitialStatesOverride";
+export type { UseInitialStatesOverrideReturn } from "./useInitialStatesOverride";

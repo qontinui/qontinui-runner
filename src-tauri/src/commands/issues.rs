@@ -112,8 +112,10 @@ pub struct SyncIssuesResponse {
 /// Convert Unix timestamp (milliseconds) to ISO 8601 datetime string
 fn timestamp_to_iso(timestamp_ms: i64) -> String {
     use chrono::{TimeZone, Utc};
-    let dt = Utc.timestamp_millis_opt(timestamp_ms).unwrap();
-    dt.to_rfc3339()
+    Utc.timestamp_millis_opt(timestamp_ms)
+        .single()
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| Utc::now().to_rfc3339())
 }
 
 /// Sync detected issues to the qontinui-web backend.

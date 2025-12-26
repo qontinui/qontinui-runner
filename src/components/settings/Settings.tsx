@@ -7,13 +7,22 @@
 
 import { useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Wifi, Settings as SettingsIcon, HardDrive, Wrench, Download, Bot } from "lucide-react";
+import {
+  Wifi,
+  Settings as SettingsIcon,
+  HardDrive,
+  Wrench,
+  Download,
+  Bot,
+  Archive,
+} from "lucide-react";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
 import { UpdateSettings } from "./UpdateSettings";
 import { AiSettings } from "./AiSettings";
+import { BackupSettings } from "./BackupSettings";
 import type { Project } from "../../types/auth";
 
 interface SettingsProps {
@@ -25,7 +34,7 @@ interface SettingsProps {
   onLoadProjects: () => Promise<void>;
 }
 
-type SettingsTab = "connection" | "ai" | "general" | "storage" | "advanced" | "updates";
+type SettingsTab = "connection" | "ai" | "general" | "storage" | "backup" | "advanced" | "updates";
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
@@ -42,7 +51,7 @@ export function Settings({
     const stored = localStorage.getItem(STORAGE_KEY);
     if (
       stored &&
-      ["connection", "ai", "general", "storage", "advanced", "updates"].includes(stored)
+      ["connection", "ai", "general", "storage", "backup", "advanced", "updates"].includes(stored)
     ) {
       return stored as SettingsTab;
     }
@@ -59,6 +68,7 @@ export function Settings({
     { id: "ai" as const, label: "AI", icon: Bot },
     { id: "general" as const, label: "Preferences", icon: SettingsIcon },
     { id: "storage" as const, label: "Storage", icon: HardDrive },
+    { id: "backup" as const, label: "Backup", icon: Archive },
     { id: "advanced" as const, label: "Debug", icon: Wrench },
     { id: "updates" as const, label: "Updates", icon: Download },
   ];
@@ -130,6 +140,10 @@ export function Settings({
 
         <Tabs.Content value="storage" className="outline-none">
           <StorageSettings onLog={onLog} />
+        </Tabs.Content>
+
+        <Tabs.Content value="backup" className="outline-none">
+          <BackupSettings onLog={onLog} />
         </Tabs.Content>
 
         <Tabs.Content value="advanced" className="outline-none">

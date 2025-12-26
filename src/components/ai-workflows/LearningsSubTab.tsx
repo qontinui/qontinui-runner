@@ -65,10 +65,12 @@ export function LearningsSubTab({ aiOutputLines }: LearningsSubTabProps) {
 
   // Get full text content of a loop for analysis
   const getLoopContent = (loop: AiLoop): string => {
-    return loop.entries.map((e) => {
-      const prefix = e.source === "prompt" ? "## User Prompt\n" : "";
-      return prefix + e.line;
-    }).join("\n\n");
+    return loop.entries
+      .map((e) => {
+        const prefix = e.source === "prompt" ? "## User Prompt\n" : "";
+        return prefix + e.line;
+      })
+      .join("\n\n");
   };
 
   // Analyze selected loop
@@ -178,10 +180,23 @@ Format your response as markdown with clear sections.`;
         {/* Left Panel: Loop Selection */}
         <div className="w-80 flex flex-col border border-border rounded-lg overflow-hidden">
           <div className="p-3 border-b border-border bg-muted/30">
-            <h3 className="text-sm font-medium">Select a Loop to Analyze</h3>
-            <p className="text-xs text-muted-foreground mt-1">
-              {loops.length} loop{loops.length !== 1 ? "s" : ""} available
-            </p>
+            <button
+              onClick={analyzeLoop}
+              disabled={!selectedLoop || isAnalyzing}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {isAnalyzing ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Analyzing...
+                </>
+              ) : (
+                <>
+                  <Play className="w-4 h-4" />
+                  Analyze Selected Loop
+                </>
+              )}
+            </button>
           </div>
 
           <div className="flex-1 overflow-y-auto">
@@ -230,27 +245,6 @@ Format your response as markdown with clear sections.`;
                 ))}
               </div>
             )}
-          </div>
-
-          {/* Analyze Button */}
-          <div className="p-3 border-t border-border bg-muted/30">
-            <button
-              onClick={analyzeLoop}
-              disabled={!selectedLoop || isAnalyzing}
-              className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            >
-              {isAnalyzing ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Analyzing...
-                </>
-              ) : (
-                <>
-                  <Play className="w-4 h-4" />
-                  Analyze Selected Loop
-                </>
-              )}
-            </button>
           </div>
         </div>
 
@@ -303,7 +297,7 @@ Format your response as markdown with clear sections.`;
                         <button
                           onClick={() =>
                             setExpandedLearningId(
-                              expandedLearningId === learning.id ? null : learning.id
+                              expandedLearningId === learning.id ? null : learning.id,
                             )
                           }
                           className="p-1.5 text-muted-foreground hover:text-foreground transition-colors"
