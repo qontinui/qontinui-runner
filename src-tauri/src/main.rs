@@ -98,6 +98,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     let rag_state =
         Arc::new(commands::rag::RAGState::new().expect("Failed to initialize RAG state"));
 
+    // Create broadcast channel for WebSocket event streaming
+    // Capacity of 256 allows for burst events without dropping
+    let (event_broadcast, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
         python_bridge: Mutex::new(None),
@@ -105,6 +109,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         display_processor,
         local_storage,
         video_recorder,
+        event_broadcast,
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -135,12 +140,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::get_auto_load_last_config,
             commands::config::save_auto_load_last_config,
             commands::config::get_workspace_paths,
-            // AI Developer commands
-            commands::config::spawn_ai_developer,
-            commands::config::read_ai_developer_state,
-            commands::config::stop_ai_developer,
-            commands::config::list_ai_developer_sessions,
-            commands::config::read_claude_session_log,
             // Dataset commands
             commands::dataset::scan_local_images,
             commands::dataset::package_dataset,
@@ -242,6 +241,19 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::delete_ai_api_key_command,
             commands::ai_settings::has_ai_api_key,
             commands::ai_settings::test_ai_connection,
+            // Issues sync commands
+            commands::issues::sync_issues_to_backend,
+            // Test run reporting commands (deprecated - use execution_reporting)
+            commands::testing::create_test_run,
+            commands::testing::report_test_transitions,
+            commands::testing::complete_test_run,
+            commands::testing::report_image_recognitions,
+            // Unified execution reporting commands
+            commands::execution_reporting::create_execution_run,
+            commands::execution_reporting::report_action_executions,
+            commands::execution_reporting::upload_execution_screenshot,
+            commands::execution_reporting::report_execution_issues,
+            commands::execution_reporting::complete_execution_run,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

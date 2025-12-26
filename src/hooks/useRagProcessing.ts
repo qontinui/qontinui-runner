@@ -9,37 +9,23 @@ import { useState, useCallback, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 import type { RagProcessingState, RagLogEntry, RagProcessingStatus } from "../components/RagLogTab";
+import {
+  RagProcessingStatus as SharedRagProcessingStatus,
+  type RagProgressEvent as SharedRagProgressEvent,
+  type RagCompletionEvent as SharedRagCompletionEvent,
+  type EmbeddingResultItem,
+} from "@qontinui/schemas/rag";
 
-interface RagProgressEvent {
-  project_id: string;
-  status: "in_progress" | "completed" | "failed" | "not_started";
-  message: string;
-  percent?: number;
-  elements_processed?: number;
-  total_elements?: number;
-  error?: string;
-}
-
-interface EmbeddingResult {
-  state_image_id: string;
+// Extend the shared type to include state_image_name for UI display
+interface EmbeddingResultWithName extends EmbeddingResultItem {
   state_image_name?: string;
-  success: boolean;
-  image_embedding?: number[];
-  text_embedding?: number[];
-  ocr_text?: string;
-  ocr_confidence?: number;
-  error?: string;
 }
 
-interface RagCompletionEvent {
-  project_id: string;
-  success: boolean;
-  results: EmbeddingResult[];
-  total_processed: number;
-  successful: number;
-  failed: number;
-  web_sync_success?: boolean;
-  web_sync_error?: string;
+// Tauri event payloads - use shared types with minor extensions
+type RagProgressEvent = SharedRagProgressEvent;
+
+interface RagCompletionEvent extends Omit<SharedRagCompletionEvent, "results"> {
+  results: EmbeddingResultWithName[];
 }
 
 const initialState: RagProcessingState = {
@@ -182,15 +168,16 @@ export function useRagProcessing() {
         const payload = event.payload;
 
         // Update state based on status
+        // Map shared status to internal UI status
         let newStatus: RagProcessingStatus = "idle";
         switch (payload.status) {
-          case "in_progress":
+          case SharedRagProcessingStatus.IN_PROGRESS:
             newStatus = "processing";
             break;
-          case "completed":
+          case SharedRagProcessingStatus.COMPLETED:
             newStatus = "completed";
             break;
-          case "failed":
+          case SharedRagProcessingStatus.FAILED:
             newStatus = "failed";
             break;
           default:
@@ -207,16 +194,16 @@ export function useRagProcessing() {
         }));
 
         // Add log entry
-        if (payload.status === "in_progress") {
+        if (payload.status === SharedRagProcessingStatus.IN_PROGRESS) {
           addLog("progress", payload.message, {
             projectId: payload.project_id,
             percent: payload.percent,
             elementsProcessed: payload.elements_processed,
             totalElements: payload.total_elements,
           });
-        } else if (payload.status === "completed") {
+        } else if (payload.status === SharedRagProcessingStatus.COMPLETED) {
           addLog("success", payload.message);
-        } else if (payload.status === "failed") {
+        } else if (payload.status === SharedRagProcessingStatus.FAILED) {
           addLog("error", payload.message || payload.error || "Unknown error");
         }
       });

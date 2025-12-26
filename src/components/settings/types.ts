@@ -116,6 +116,8 @@ export interface AiSettings {
   provider: AiProvider;
   claude_cli: ClaudeCliSettings;
   claude_api: ClaudeApiSettings;
+  /** Default iteration threshold for including video in auto-refine (0 = never) */
+  auto_refine_video_after_iterations: number;
 }
 
 export interface AiConnectionTestResult {

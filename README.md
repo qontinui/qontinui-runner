@@ -12,7 +12,7 @@ Built with Tauri (Rust) + React (TypeScript) for a native, performant desktop ex
 
 - 🚀 Execute automation configurations locally
 - 📊 Real-time execution monitoring
-- 🔄 Mock and real execution modes
+
 - 💾 Load and manage JSON configurations
 - 🖥️ Cross-platform support (Windows, macOS, Linux)
 
@@ -125,7 +125,7 @@ npm run tauri dev
 
 2. **Start Python Executor**
    - Click "Start Executor" button
-   - Choose execution mode (Mock or Real)
+
 
 3. **Load Configuration**
    - Click "Load Config"

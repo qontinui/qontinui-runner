@@ -318,6 +318,14 @@ impl DisplayProfile for ActionLogProfile {
                                 if action_info.error.is_some() {
                                     existing.error = action_info.error.clone();
                                 }
+                                // Update timestamp from completion event - this handles the case
+                                // where a parent action's timestamp was synced with its first child
+                                // after the action_started event was emitted
+                                if event.event_type == "action_completed"
+                                    || event.event_type == "action_failed"
+                                {
+                                    existing.timestamp = action_info.timestamp;
+                                }
                                 // Merge metadata
                                 if let Some(new_meta) = &action_info.metadata {
                                     if let Some(existing_meta) = &mut existing.metadata {

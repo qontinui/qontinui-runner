@@ -27,6 +27,7 @@ import {
   RefreshCw,
   Info,
   ImageIcon,
+  CheckSquare,
 } from "lucide-react";
 import type {
   PlaywrightScript,
@@ -82,6 +83,11 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   const [formDisplayMode, setFormDisplayMode] = useState<DisplayMode>("headless");
   const [formBrowser, setFormBrowser] = useState<"chromium" | "firefox" | "webkit">("chromium");
 
+  // Workflow automation fields
+  const [formWorkflowObjective, setFormWorkflowObjective] = useState("");
+  const [formSuccessCriteria, setFormSuccessCriteria] = useState<string[]>([]);
+  const [formIsWorkflowAutomation, setFormIsWorkflowAutomation] = useState(false);
+
   // Execution state
   const [_executingScriptId, setExecutingScriptId] = useState<string | null>(null);
   const [executionState, setExecutionState] = useState<ScriptExecutionState>("idle");
@@ -99,6 +105,67 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   const [autoRefineMaxIterations] = useState(10);
   const [autoRefineLog, setAutoRefineLog] = useState<string[]>([]);
   const autoRefineAbortRef = useRef(false);
+
+  // Visual context settings for auto-refine (persisted to localStorage)
+  const [includeScreenshot, setIncludeScreenshot] = useState(() => {
+    const saved = localStorage.getItem("qontinui-autorefine-include-screenshot");
+    return saved !== null ? saved === "true" : true; // Default: true
+  });
+  const [includeTraceData, setIncludeTraceData] = useState(() => {
+    const saved = localStorage.getItem("qontinui-autorefine-include-trace");
+    return saved !== null ? saved === "true" : true; // Default: true
+  });
+  // Video iteration threshold - initially from localStorage if set, otherwise will load from AI settings
+  const [includeVideoAfterIterations, setIncludeVideoAfterIterations] = useState(() => {
+    const saved = localStorage.getItem("qontinui-autorefine-video-after-iterations");
+    return saved !== null ? parseInt(saved, 10) : 3; // Temporary default, will be updated from AI settings
+  });
+  const [videoSettingsLoaded, setVideoSettingsLoaded] = useState(false);
+
+  // Load default video threshold from AI settings on mount (only if no localStorage override)
+  useEffect(() => {
+    const loadAiSettingsDefault = async () => {
+      // Only load from AI settings if localStorage doesn't have a value
+      const localStorageValue = localStorage.getItem("qontinui-autorefine-video-after-iterations");
+      if (localStorageValue !== null) {
+        setVideoSettingsLoaded(true);
+        return;
+      }
+
+      try {
+        const result = await invoke<{
+          success: boolean;
+          data?: { auto_refine_video_after_iterations?: number };
+        }>("get_ai_settings");
+        if (result?.success && result.data?.auto_refine_video_after_iterations !== undefined) {
+          setIncludeVideoAfterIterations(result.data.auto_refine_video_after_iterations);
+        }
+      } catch (error) {
+        console.error("Failed to load AI settings for video threshold:", error);
+        // Keep the default value
+      }
+      setVideoSettingsLoaded(true);
+    };
+
+    loadAiSettingsDefault();
+  }, []);
+
+  // Persist visual context settings
+  useEffect(() => {
+    localStorage.setItem("qontinui-autorefine-include-screenshot", String(includeScreenshot));
+  }, [includeScreenshot]);
+  useEffect(() => {
+    localStorage.setItem("qontinui-autorefine-include-trace", String(includeTraceData));
+  }, [includeTraceData]);
+  // Only persist video threshold after settings have been loaded (to avoid overwriting with default)
+  useEffect(() => {
+    if (videoSettingsLoaded) {
+      localStorage.setItem(
+        "qontinui-autorefine-video-after-iterations",
+        String(includeVideoAfterIterations),
+      );
+    }
+  }, [includeVideoAfterIterations, videoSettingsLoaded]);
 
   // Description regeneration state
   const [isRegeneratingDescription, setIsRegeneratingDescription] = useState(false);
@@ -269,6 +336,9 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
           browser: formBrowser,
+          workflow_objective: formWorkflowObjective || undefined,
+          success_criteria: formSuccessCriteria.length > 0 ? formSuccessCriteria : undefined,
+          is_workflow_automation: formIsWorkflowAutomation,
         }),
       });
       const result = await response.json();
@@ -751,6 +821,80 @@ import { test, expect } from '@playwright/test';
     );
   };
 
+  // Verify workflow objective using AI analysis
+  const verifyWorkflowObjective = async (
+    testResult: PlaywrightResult,
+    objective: string,
+    successCriteria: string[]
+  ): Promise<{ verified: boolean; notes: string }> => {
+    const prompt = `You are verifying whether a workflow automation objective was achieved.
+
+IMPORTANT: The Playwright script has PASSED. This is expected - it just means the automation steps ran.
+Now you must verify whether the ACTUAL OBJECTIVE was achieved.
+
+## Workflow Objective
+${objective}
+
+## Success Criteria to Verify
+${successCriteria.length > 0 ? successCriteria.map((c, i) => `${i + 1}. ${c}`).join('\n') : 'No specific criteria - verify the objective was met based on available evidence.'}
+
+## Available Evidence
+
+### Page Snapshot (Current DOM State)
+\`\`\`yaml
+${testResult.structured_output?.page_snapshot || 'Not available'}
+\`\`\`
+
+### Console Output
+${testResult.structured_output?.console_output?.join('\n') || 'None'}
+
+### Screenshots Available
+${testResult.screenshots?.length || 0} screenshot(s) captured
+
+## Your Task
+Analyze the page snapshot and any available evidence to determine:
+1. Was the workflow objective achieved?
+2. If there are success criteria, were they all met?
+
+You MUST make a determination. If evidence is insufficient, lean towards false (not verified).
+
+## Response Format
+Respond with ONLY a JSON object (no markdown, no explanation):
+{"verified": true, "notes": "Objective achieved because..."}
+OR
+{"verified": false, "notes": "Objective NOT achieved because..."}`;
+
+    try {
+      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          display_prompt: `Verifying: ${objective.substring(0, 50)}...`,
+          timeout_seconds: 60,
+          wait_for_completion: true,
+          image_paths: testResult.screenshots || [],
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success && result.data?.output) {
+        // Parse JSON from AI response
+        const jsonMatch = result.data.output.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          return {
+            verified: parsed.verified === true, // Explicit true check
+            notes: parsed.notes || "No notes provided",
+          };
+        }
+      }
+      return { verified: false, notes: "Failed to parse AI verification response" };
+    } catch (error) {
+      return { verified: false, notes: `Verification error: ${error}` };
+    }
+  };
+
   // Auto-refinement loop: runs test, refines on failure, repeats until success
   const runAutoRefinementLoop = async () => {
     if (!editingScript) {
@@ -814,6 +958,30 @@ import { test, expect } from '@playwright/test';
         }
 
         if (testResult.passed) {
+          // Check if this is workflow automation requiring objective verification
+          const isWorkflowAutomation = editingScript?.is_workflow_automation || !!editingScript?.workflow_objective;
+
+          if (isWorkflowAutomation && editingScript?.workflow_objective) {
+            log(`Script execution passed (expected). Verifying workflow objective...`);
+
+            const verification = await verifyWorkflowObjective(
+              testResult,
+              editingScript.workflow_objective,
+              editingScript.success_criteria || []
+            );
+
+            if (verification.verified) {
+              log(`WORKFLOW SUCCESS! Objective verified: ${verification.notes}`);
+              onLog("success", `Workflow completed successfully after ${iteration} iteration(s)!`);
+              break;
+            } else {
+              log(`Script passed but objective NOT verified: ${verification.notes}`);
+              onLog("error", `Workflow objective not achieved: ${verification.notes}`);
+              break;
+            }
+          }
+
+          // Traditional test mode - script pass = success
           log(`SUCCESS! Test passed on iteration ${iteration}`);
           onLog("success", `Auto-refinement succeeded after ${iteration} iteration(s)!`);
           break;
@@ -906,6 +1074,32 @@ import { test, expect } from '@playwright/test';
 // Your corrected code here
 \`\`\``;
 
+        // Collect visual context (screenshots, trace, video)
+        const imagePaths: string[] = [];
+        const videoPaths: string[] = [];
+        let tracePath: string | undefined;
+
+        // Include final screenshot if enabled and available
+        if (includeScreenshot && testResult.screenshots && testResult.screenshots.length > 0) {
+          const lastScreenshot = testResult.screenshots[testResult.screenshots.length - 1];
+          imagePaths.push(lastScreenshot);
+          log(`Including screenshot: ${lastScreenshot.split(/[\\/]/).pop()}`);
+        }
+
+        // Include trace if enabled and available
+        if (includeTraceData && testResult.trace_path) {
+          tracePath = testResult.trace_path;
+          log(`Including trace data from: ${tracePath.split(/[\\/]/).pop()}`);
+        }
+
+        // Include video after N iterations (if enabled and available)
+        const shouldIncludeVideo =
+          includeVideoAfterIterations > 0 && iteration >= includeVideoAfterIterations;
+        if (shouldIncludeVideo && testResult.video_paths && testResult.video_paths.length > 0) {
+          videoPaths.push(...testResult.video_paths);
+          log(`Iteration ${iteration}: Including video for additional context`);
+        }
+
         // Call AI to refine
         setIsGenerating(true);
         const aiResponse = await fetch(`${API_BASE}/trigger-ai-analysis`, {
@@ -916,6 +1110,11 @@ import { test, expect } from '@playwright/test';
             display_prompt: `Auto-refine iteration ${iteration}: ${formName || "script"}`,
             timeout_seconds: 120,
             wait_for_completion: true,
+            image_paths: imagePaths,
+            video_paths: videoPaths,
+            trace_path: tracePath,
+            max_video_frames: 3,
+            max_trace_screenshots: 5,
           }),
         });
         setIsGenerating(false);
@@ -1053,6 +1252,9 @@ import { test, expect } from '@playwright/test';
           timeout_seconds: formTimeoutSeconds,
           display_mode: formDisplayMode,
           browser: formBrowser,
+          workflow_objective: formWorkflowObjective || undefined,
+          success_criteria: formSuccessCriteria.length > 0 ? formSuccessCriteria : undefined,
+          is_workflow_automation: formIsWorkflowAutomation,
         }),
       });
       const saveResult = await saveResponse.json();
@@ -1178,6 +1380,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     setFormTimeoutSeconds(60);
     setFormDisplayMode("headless");
     setFormBrowser("chromium");
+    setFormWorkflowObjective("");
+    setFormSuccessCriteria([]);
+    setFormIsWorkflowAutomation(false);
     setViewMode("natural_language");
   };
 
@@ -1196,6 +1401,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     setFormTimeoutSeconds(script.timeout_seconds);
     setFormDisplayMode(script.display_mode);
     setFormBrowser(script.browser);
+    setFormWorkflowObjective(script.workflow_objective || "");
+    setFormSuccessCriteria(script.success_criteria || []);
+    setFormIsWorkflowAutomation(script.is_workflow_automation || false);
     setIsCreating(false);
   };
 
@@ -1403,6 +1611,62 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                   Use this to give the AI additional context without changing the test description.
                 </p>
               </div>
+
+              {/* Workflow Automation (optional - collapsible) */}
+              <details className="mt-4 border border-blue-500/30 rounded-lg p-3 bg-blue-500/5">
+                <summary className="cursor-pointer text-sm font-medium flex items-center gap-2 text-blue-600 dark:text-blue-400">
+                  <CheckSquare className="w-4 h-4" />
+                  Workflow Automation Settings (Optional)
+                </summary>
+                <div className="mt-3 space-y-3">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      id="is-workflow-automation"
+                      checked={formIsWorkflowAutomation}
+                      onChange={(e) => setFormIsWorkflowAutomation(e.target.checked)}
+                      className="w-4 h-4 rounded border-blue-500/50 text-blue-600 focus:ring-blue-500"
+                    />
+                    <label htmlFor="is-workflow-automation" className="text-sm">
+                      This is workflow automation (script success is expected, verify objective instead)
+                    </label>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Workflow Objective</label>
+                    <textarea
+                      value={formWorkflowObjective}
+                      onChange={(e) => setFormWorkflowObjective(e.target.value)}
+                      placeholder="What should this workflow achieve?&#10;&#10;Example: Create a new state called 'test-state' and verify it appears in the state list"
+                      rows={2}
+                      className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Success Criteria (one per line)</label>
+                    <textarea
+                      value={formSuccessCriteria.join("\n")}
+                      onChange={(e) =>
+                        setFormSuccessCriteria(
+                          e.target.value
+                            .split("\n")
+                            .map((s) => s.trim())
+                            .filter(Boolean)
+                        )
+                      }
+                      placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
+                      rows={3}
+                      className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                    />
+                  </div>
+
+                  <p className="text-xs text-muted-foreground">
+                    When enabled, script execution success is expected. After the script passes,
+                    AI will verify whether the workflow objective was actually achieved.
+                  </p>
+                </div>
+              </details>
             </div>
           ) : (
             <div>
@@ -2358,6 +2622,53 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         </button>
                       )}
                     </div>
+
+                    {/* Visual Context Settings for Auto-Refine */}
+                    <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
+                      <div className="flex items-center gap-2">
+                        <ImageIcon className="w-4 h-4" />
+                        <span>Visual Context:</span>
+                      </div>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={includeScreenshot}
+                          onChange={(e) => setIncludeScreenshot(e.target.checked)}
+                          className="rounded border-border"
+                        />
+                        <span>Screenshot</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={includeTraceData}
+                          onChange={(e) => setIncludeTraceData(e.target.checked)}
+                          className="rounded border-border"
+                        />
+                        <span>Trace</span>
+                      </label>
+                      <label
+                        className="flex items-center gap-1.5 cursor-pointer"
+                        title="Video uses significantly more tokens. Only recommended for complex failures."
+                      >
+                        <span>Video after</span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={10}
+                          value={includeVideoAfterIterations}
+                          onChange={(e) =>
+                            setIncludeVideoAfterIterations(parseInt(e.target.value) || 0)
+                          }
+                          className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
+                        />
+                        <span>iterations</span>
+                        <span title="Video uses significantly more tokens. Set to 0 to disable.">
+                          <Info className="w-3.5 h-3.5 text-muted-foreground" />
+                        </span>
+                      </label>
+                    </div>
+
                     {/* Regenerate description from code button */}
                     <button
                       onClick={regenerateDescriptionFromCode}

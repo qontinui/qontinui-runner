@@ -7,7 +7,7 @@
 //! - Monitor detection
 //! - System operations (updates, folder opening)
 
-use crate::config::ScreenshotCaptureSettings;
+use crate::config::{ConfigLoader, ScreenshotCaptureSettings};
 use crate::error::UserFacingError;
 use crate::executor::PythonBridge;
 use crate::settings;
@@ -42,11 +42,79 @@ pub fn start_python_executor(
     let mut bridge_lock = state.python_bridge.lock().unwrap();
 
     // Check if already running
-    if let Some(ref bridge) = *bridge_lock {
+    if let Some(ref mut bridge) = *bridge_lock {
         if bridge.is_running() {
-            warn!("Attempt to start Python executor but it's already running");
+            info!("Python executor already running, checking if config needs to be reloaded");
+
+            // When app restarts but Python is still running, we need to reload the config
+            // because the Rust state was cleared but Python might have stale or no config
+            if let Some(config_path) = settings::get_last_config_path() {
+                info!(
+                    "Reloading configuration to Python executor: {}",
+                    config_path
+                );
+
+                // Load and validate the configuration file
+                match ConfigLoader::load_from_file(&config_path) {
+                    Ok(config) => {
+                        // Create config data for event emission
+                        let config_data = serde_json::json!({
+                            "metadata": config.metadata.clone(),
+                            "workflows": config.workflows.clone(),
+                            "states": config.states.clone(),
+                            "transitions": config.transitions.clone(),
+                            "images": config.images.clone()
+                        });
+
+                        // Store in app state
+                        *state.current_config.lock().unwrap() = Some(config);
+                        info!("Configuration stored in app state");
+
+                        // Send debug settings first
+                        let debug_settings = settings::get_debug_settings();
+                        if let Err(e) = bridge.set_debug_settings(
+                            debug_settings.enable_image_debug,
+                            debug_settings.top_matches_count,
+                        ) {
+                            warn!("Failed to send debug settings: {}", e);
+                        }
+
+                        // Send configuration to Python
+                        if let Err(e) = bridge.load_configuration(&config_path) {
+                            warn!("Failed to reload configuration to Python executor: {}", e);
+                        } else {
+                            info!("Configuration reloaded to Python executor successfully");
+                        }
+
+                        // Get saved workflow and monitor for event
+                        let workflow_id = settings::get_last_workflow_id();
+                        let monitor_index = settings::get_last_monitor_index();
+
+                        // Emit event to notify frontend of config load
+                        let event_payload = serde_json::json!({
+                            "event": "config_loaded",
+                            "data": {
+                                "path": config_path,
+                                "config": config_data,
+                                "workflow_id": workflow_id,
+                                "monitor_index": monitor_index
+                            }
+                        });
+
+                        if let Err(e) = app_handle.emit("executor-event", &event_payload) {
+                            warn!("Failed to emit config_loaded event: {}", e);
+                        } else {
+                            info!("Emitted config_loaded event to frontend");
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to load configuration file {}: {}", config_path, e);
+                    }
+                }
+            }
+
             return Ok(CommandResponse {
-                success: false,
+                success: true, // Changed to success since executor is running
                 message: Some("Python executor already running".to_string()),
                 data: None,
             });
@@ -711,184 +779,123 @@ pub fn get_workflow_required_screens(
     // Collect monitor associations from states
     let mut screens = std::collections::HashSet::new();
 
-    // Build state -> monitors mapping by examining stateImages.monitors
-    let mut state_monitors_map: std::collections::HashMap<String, Vec<i32>> =
+    // Build stateimage_id -> monitors mapping (more precise than per-state)
+    let mut stateimage_monitors_map: std::collections::HashMap<String, Vec<i32>> =
         std::collections::HashMap::new();
-    for state in &config.states {
-        if let Some(state_id) = state.get("id").and_then(|id| id.as_str()) {
-            let mut state_monitors = Vec::new();
+    // Also build region/location/string -> monitors mapping
+    let mut element_monitors_map: std::collections::HashMap<String, Vec<i32>> =
+        std::collections::HashMap::new();
 
-            // Check stateImages for monitors field
-            if let Some(state_images) = state.get("stateImages").and_then(|si| si.as_array()) {
-                for state_image in state_images {
+    for state in &config.states {
+        // Check stateImages for monitors field
+        if let Some(state_images) = state.get("stateImages").and_then(|si| si.as_array()) {
+            for state_image in state_images {
+                if let Some(state_image_id) = state_image.get("id").and_then(|id| id.as_str()) {
                     if let Some(monitors) = state_image.get("monitors").and_then(|m| m.as_array()) {
+                        let mut image_monitors = Vec::new();
                         for monitor in monitors {
                             if let Some(monitor_idx) = monitor.as_i64() {
-                                state_monitors.push(monitor_idx as i32);
+                                image_monitors.push(monitor_idx as i32);
                             }
+                        }
+                        if !image_monitors.is_empty() {
+                            image_monitors.sort();
+                            image_monitors.dedup();
+                            stateimage_monitors_map
+                                .insert(state_image_id.to_string(), image_monitors);
                         }
                     }
                 }
             }
+        }
 
-            // Also check regions, locations, and strings for monitors
-            for field_name in &["regions", "locations", "strings"] {
-                if let Some(items) = state.get(*field_name).and_then(|f| f.as_array()) {
-                    for item in items {
+        // Also check regions, locations, and strings for monitors
+        for field_name in &["regions", "locations", "strings"] {
+            if let Some(items) = state.get(*field_name).and_then(|f| f.as_array()) {
+                for item in items {
+                    if let Some(item_id) = item.get("id").and_then(|id| id.as_str()) {
                         if let Some(monitors) = item.get("monitors").and_then(|m| m.as_array()) {
+                            let mut item_monitors = Vec::new();
                             for monitor in monitors {
                                 if let Some(monitor_idx) = monitor.as_i64() {
-                                    state_monitors.push(monitor_idx as i32);
+                                    item_monitors.push(monitor_idx as i32);
                                 }
+                            }
+                            if !item_monitors.is_empty() {
+                                item_monitors.sort();
+                                item_monitors.dedup();
+                                element_monitors_map.insert(item_id.to_string(), item_monitors);
                             }
                         }
                     }
                 }
             }
-
-            if !state_monitors.is_empty() {
-                // Deduplicate
-                state_monitors.sort();
-                state_monitors.dedup();
-                state_monitors_map.insert(state_id.to_string(), state_monitors);
-            }
         }
     }
 
-    // Check initial states
-    if let Some(initial_states) = workflow
-        .get("initialStateIds")
-        .and_then(|ids| ids.as_array())
-    {
-        for state_id in initial_states {
-            if let Some(state_id_str) = state_id.as_str() {
-                if let Some(state_monitors) = state_monitors_map.get(state_id_str) {
-                    for &monitor in state_monitors {
-                        screens.insert(monitor);
-                    }
-                }
+    // Helper closure to add monitors from a stateimage ID
+    let add_stateimage_monitors = |screens: &mut std::collections::HashSet<i32>, id: &str| {
+        if let Some(monitors) = stateimage_monitors_map.get(id) {
+            for &monitor in monitors {
+                screens.insert(monitor);
             }
         }
-    }
+    };
 
-    // Analyze actions
+    // Helper closure to add monitors from an element ID (region/location/string)
+    let add_element_monitors = |screens: &mut std::collections::HashSet<i32>, id: &str| {
+        if let Some(monitors) = element_monitors_map.get(id) {
+            for &monitor in monitors {
+                screens.insert(monitor);
+            }
+        }
+    };
+
+    // NOTE: We intentionally skip initialStateIds and GO_TO_STATE for monitor calculation.
+    // These represent navigation targets, not the actual elements being interacted with.
+    // The monitors should be determined by the specific images/elements used in actions.
+
+    // Analyze actions - collect monitors from specific image/element references
     if let Some(actions) = workflow.get("actions").and_then(|a| a.as_array()) {
         for action in actions {
-            if let Some(action_type) = action.get("type").and_then(|t| t.as_str()) {
-                // GO_TO_STATE actions - check stateIds field (can be array)
-                if action_type == "GO_TO_STATE" {
-                    // Check stateIds array (preferred)
-                    if let Some(state_ids) = action
-                        .get("config")
-                        .and_then(|c| c.get("stateIds"))
-                        .and_then(|ids| ids.as_array())
-                    {
-                        for state_id in state_ids {
-                            if let Some(state_id_str) = state_id.as_str() {
-                                if let Some(state_monitors) = state_monitors_map.get(state_id_str) {
-                                    for &monitor in state_monitors {
-                                        screens.insert(monitor);
-                                    }
-                                }
+            if let Some(action_config) = action.get("config") {
+                // Check target for imageIds array (handles CLICK, FIND with type "image" or "stateImage")
+                if let Some(target) = action_config.get("target") {
+                    // Check imageIds array (most common pattern)
+                    if let Some(image_ids) = target.get("imageIds").and_then(|ids| ids.as_array()) {
+                        for image_id in image_ids {
+                            if let Some(id_str) = image_id.as_str() {
+                                add_stateimage_monitors(&mut screens, id_str);
                             }
                         }
                     }
-                    // Legacy: check targetState string
-                    else if let Some(target_state) = action
-                        .get("config")
-                        .and_then(|c| c.get("targetState"))
-                        .and_then(|ts| ts.as_str())
-                    {
-                        if let Some(state_monitors) = state_monitors_map.get(target_state) {
-                            for &monitor in state_monitors {
-                                screens.insert(monitor);
-                            }
-                        }
+                    // Check single imageId field (alternative format)
+                    else if let Some(image_id) = target.get("imageId").and_then(|id| id.as_str()) {
+                        add_stateimage_monitors(&mut screens, image_id);
                     }
-                }
+                    // Check stateImageId field (used in some FIND actions)
+                    else if let Some(state_image_id) =
+                        target.get("stateImageId").and_then(|id| id.as_str())
+                    {
+                        add_stateimage_monitors(&mut screens, state_image_id);
+                    }
 
-                // FIND actions may have target with stateImage that specifies monitors
-                if action_type == "FIND" || action_type == "RAG_FIND" {
-                    if let Some(action_config) = action.get("config") {
-                        // Check if target references a stateImage with monitors
-                        if let Some(target) = action_config.get("target") {
-                            if let Some(target_type) = target.get("type").and_then(|t| t.as_str()) {
-                                if target_type == "stateImage" {
-                                    // The stateImage may have monitors defined
-                                    // Search through states to find the stateImage
-                                    if let Some(state_image_id) =
-                                        target.get("stateImageId").and_then(|id| id.as_str())
-                                    {
-                                        // Search all states in the main config for this stateImage
-                                        for state in &config.states {
-                                            if let Some(state_images) = state
-                                                .get("stateImages")
-                                                .and_then(|si| si.as_array())
-                                            {
-                                                for state_image in state_images {
-                                                    if state_image
-                                                        .get("id")
-                                                        .and_then(|id| id.as_str())
-                                                        == Some(state_image_id)
-                                                    {
-                                                        if let Some(monitors) = state_image
-                                                            .get("monitors")
-                                                            .and_then(|m| m.as_array())
-                                                        {
-                                                            for monitor in monitors {
-                                                                if let Some(monitor_idx) =
-                                                                    monitor.as_i64()
-                                                                {
-                                                                    screens
-                                                                        .insert(monitor_idx as i32);
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Check regionId for region-based actions
+                    if let Some(region_id) = target.get("regionId").and_then(|id| id.as_str()) {
+                        add_element_monitors(&mut screens, region_id);
+                    }
+
+                    // Check locationId for location-based actions
+                    if let Some(location_id) = target.get("locationId").and_then(|id| id.as_str()) {
+                        add_element_monitors(&mut screens, location_id);
                     }
                 }
             }
         }
     }
 
-    // Also check transitions in the config
-    for transition in &config.transitions {
-        // Check fromState
-        if let Some(from_state) = transition.get("fromState").and_then(|s| s.as_str()) {
-            if let Some(state_monitors) = state_monitors_map.get(from_state) {
-                for &monitor in state_monitors {
-                    screens.insert(monitor);
-                }
-            }
-        }
-        // Check toState
-        if let Some(to_state) = transition.get("toState").and_then(|s| s.as_str()) {
-            if let Some(state_monitors) = state_monitors_map.get(to_state) {
-                for &monitor in state_monitors {
-                    screens.insert(monitor);
-                }
-            }
-        }
-        // Check activateStates array
-        if let Some(activate_states) = transition.get("activateStates").and_then(|a| a.as_array()) {
-            for activate_state in activate_states {
-                if let Some(state_id) = activate_state.as_str() {
-                    if let Some(state_monitors) = state_monitors_map.get(state_id) {
-                        for &monitor in state_monitors {
-                            screens.insert(monitor);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // NOTE: We intentionally skip transitions for monitor calculation.
+    // Transitions are about state navigation, not element interaction.
 
     // Convert to sorted vec
     let mut screen_list: Vec<i32> = screens.into_iter().collect();
@@ -900,12 +907,13 @@ pub fn get_workflow_required_screens(
     }
 
     info!(
-        "Workflow '{}' requires screens: {:?} (found {} states with monitor info)",
+        "Workflow '{}' requires screens: {:?} (found {} stateImages with monitor info)",
         workflow_id,
         screen_list,
-        state_monitors_map.len()
+        stateimage_monitors_map.len()
     );
-    debug!("State -> monitors mapping: {:?}", state_monitors_map);
+    debug!("StateImage -> monitors mapping: {:?}", stateimage_monitors_map);
+    debug!("Element -> monitors mapping: {:?}", element_monitors_map);
 
     Ok(CommandResponse {
         success: true,

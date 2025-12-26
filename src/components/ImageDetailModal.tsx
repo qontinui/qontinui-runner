@@ -204,7 +204,7 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                       <div className="flex items-center gap-2">
                         <Monitor className="w-4 h-4 text-muted-foreground" />
                         {entry.monitorIndex !== undefined && entry.monitorIndex !== null
-                          ? `Monitor ${entry.monitorIndex + 1}`
+                          ? `Monitor ${entry.monitorIndex}`
                           : "All monitors"}
                       </div>
                     </div>

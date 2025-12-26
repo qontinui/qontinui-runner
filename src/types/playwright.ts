@@ -19,6 +19,43 @@ export type SyncStatus = "local_only" | "synced" | "local_modified" | "cloud_mod
 export type DisplayMode = "headless" | "headed" | "connect_existing";
 
 /**
+ * Result of verifying a single success criterion
+ */
+export interface CriteriaResult {
+  /** The criterion text */
+  criterion: string;
+  /** Whether it was verified as met */
+  verified: boolean;
+  /** Evidence supporting the verification */
+  evidence?: string;
+}
+
+/**
+ * Workflow verification status - tracks whether the workflow objective was achieved
+ * (separate from whether the script executed successfully)
+ */
+export interface WorkflowStatus {
+  /** The workflow objective (copied from script for reference) */
+  objective?: string;
+  /** Did the script execute without errors? (For automation, expected to be true) */
+  script_passed: boolean;
+  /** Explanatory note about script_passed for AI consumption */
+  script_passed_note?: string;
+  /** Was the workflow objective verified as successful? null = pending */
+  objective_verified?: boolean | null;
+  /** How was the objective verified? "automatic" | "ai_analysis" | "manual" | "pending" */
+  verification_method?: string;
+  /** Notes from verification */
+  verification_notes?: string;
+  /** Success criteria from the script */
+  success_criteria: string[];
+  /** Which criteria were confirmed (if verification was performed) */
+  criteria_results: CriteriaResult[];
+  /** Hints for manual/AI verification */
+  verification_hints: string[];
+}
+
+/**
  * A single test spec result
  */
 export interface TestSpec {
@@ -80,12 +117,16 @@ export interface PlaywrightResult {
   report_path?: string;
   /** Paths to screenshots taken */
   screenshots: string[];
+  /** Paths to video recordings */
+  video_paths: string[];
   /** Path to trace file (if enabled) */
   trace_path?: string;
   /** ISO 8601 timestamp of execution */
   executed_at: string;
   /** Structured output for AI analysis */
   structured_output?: StructuredTestOutput;
+  /** Workflow verification status (for AI workflows) */
+  workflow_status?: WorkflowStatus;
 }
 
 /**
@@ -116,6 +157,12 @@ export interface PlaywrightScript {
   display_mode: DisplayMode;
   /** Browser to use: chromium, firefox, webkit */
   browser: "chromium" | "firefox" | "webkit";
+  /** Workflow objective - what this script aims to accomplish */
+  workflow_objective?: string;
+  /** Success criteria - specific things to verify after script passes */
+  success_criteria?: string[];
+  /** Whether this is workflow automation (not traditional testing) */
+  is_workflow_automation?: boolean;
   /** Sync status for cloud backup */
   sync_status: SyncStatus;
   /** Cloud version (for conflict detection) */
@@ -144,6 +191,9 @@ export interface CreatePlaywrightScriptRequest {
   timeout_seconds?: number;
   display_mode?: DisplayMode;
   browser?: "chromium" | "firefox" | "webkit";
+  workflow_objective?: string;
+  success_criteria?: string[];
+  is_workflow_automation?: boolean;
 }
 
 /**
@@ -160,6 +210,9 @@ export interface UpdatePlaywrightScriptRequest {
   timeout_seconds?: number;
   display_mode?: DisplayMode;
   browser?: "chromium" | "firefox" | "webkit";
+  workflow_objective?: string;
+  success_criteria?: string[];
+  is_workflow_automation?: boolean;
 }
 
 /**
@@ -203,6 +256,9 @@ export interface ScriptBuilderFormState {
   timeout_seconds: number;
   display_mode: DisplayMode;
   browser: "chromium" | "firefox" | "webkit";
+  workflow_objective: string;
+  success_criteria: string[];
+  is_workflow_automation: boolean;
 }
 
 /**
@@ -228,6 +284,9 @@ test('example test', async ({ page }) => {
   timeout_seconds: 60,
   display_mode: "headless",
   browser: "chromium",
+  workflow_objective: "",
+  success_criteria: [],
+  is_workflow_automation: false,
 };
 
 /**

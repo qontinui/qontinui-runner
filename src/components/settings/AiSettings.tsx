@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, Check, X, Play, Eye, EyeOff, Zap, Terminal } from "lucide-react";
+import { Bot, Check, X, Play, Eye, EyeOff, Zap, Terminal, Video } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type {
   AiSettings as AiSettingsType,
@@ -34,6 +34,7 @@ const DEFAULT_AI_SETTINGS: AiSettingsType = {
     model: "claude-sonnet-4-20250514",
     max_tokens: 4096,
   },
+  auto_refine_video_after_iterations: 3,
 };
 
 const PROVIDER_OPTIONS: { value: AiProvider; label: string; description: string }[] = [
@@ -125,6 +126,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             max_tokens:
               result.data.claude_api?.max_tokens || DEFAULT_AI_SETTINGS.claude_api.max_tokens,
           },
+          auto_refine_video_after_iterations:
+            result.data.auto_refine_video_after_iterations ??
+            DEFAULT_AI_SETTINGS.auto_refine_video_after_iterations,
         });
         onLog("debug", "AI settings loaded");
       }
@@ -163,6 +167,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         timeoutSeconds: settings.claude_cli.timeout_seconds,
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
+        autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
       });
 
       if (result && result.success) {
@@ -534,6 +539,47 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           </div>
         </div>
       )}
+
+      {/* Auto-Refine Defaults */}
+      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+        <h4 className="font-semibold text-lg flex items-center gap-2">
+          <Video className="w-5 h-5 text-primary" />
+          Auto-Refine Defaults
+        </h4>
+
+        <div className="space-y-4">
+          <div className="space-y-2">
+            <label className="block font-medium">Include Video After Iterations</label>
+            <input
+              type="number"
+              min="0"
+              max="20"
+              value={settings.auto_refine_video_after_iterations}
+              onChange={(e) =>
+                setSettings((prev) => ({
+                  ...prev,
+                  auto_refine_video_after_iterations: Math.max(
+                    0,
+                    Math.min(20, parseInt(e.target.value) || 0),
+                  ),
+                }))
+              }
+              className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+            />
+            <p className="text-sm text-muted-foreground">
+              Default number of failed iterations before including video frames in AI analysis.
+              Set to 0 to never include video. This value is used as the default for new scripts.
+            </p>
+          </div>
+
+          <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+            <div className="text-sm text-yellow-400">
+              <strong>Note:</strong> Video frames use significantly more tokens than screenshots.
+              Only recommended for complex failures where screenshots alone aren't sufficient.
+            </div>
+          </div>
+        </div>
+      </div>
 
       {/* Test Connection */}
       <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">

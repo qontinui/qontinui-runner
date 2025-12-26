@@ -14,3 +14,5 @@ export { actionLogManager } from "./ActionLogManager";
 export { eventRouter } from "./EventRouter";
 
 export { setupEventHandlers } from "./EventHandlers";
+
+export { configManager } from "./ConfigManager";

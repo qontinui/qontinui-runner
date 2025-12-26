@@ -5,8 +5,8 @@
 
 use crate::auth::AuthManager;
 use crate::rag::{
-    EmbeddingGenerator, EmbeddingStatus, ImportResult, QontinuiConfig, RAGConfig, RAGStorage,
-    ScreenshotData, SearchFilters, SearchResult, SemanticSearch,
+    EmbeddingGenerator, EmbeddingStatus, ImportResult, QontinuiConfig, RAGStorage, SearchFilters,
+    SearchResult, SemanticSearch,
 };
 use base64::Engine as _;
 use serde_json::Value;
@@ -31,15 +31,13 @@ fn get_api_base_url() -> String {
 ///
 /// This function reads the embeddings.json file and sends the results
 /// to the web backend for storage.
-async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
-    // Get the embeddings file path
+pub async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
+    // Get the project directory
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-    let embeddings_path = home
-        .join(".qontinui")
-        .join("rag")
-        .join(project_id)
-        .join("embeddings")
-        .join("embeddings.json");
+    let project_dir = home.join(".qontinui").join("rag").join(project_id);
+
+    let embeddings_path = project_dir.join("embeddings").join("embeddings.json");
+    let config_path = project_dir.join("config.json");
 
     if !embeddings_path.exists() {
         return Err(format!(
@@ -55,6 +53,44 @@ async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
     let embeddings_data: Value = serde_json::from_str(&embeddings_content)
         .map_err(|e| format!("Failed to parse embeddings JSON: {}", e))?;
 
+    // Read config file to get pattern -> stateImage mapping
+    let config_content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read config file: {}", e))?;
+
+    let config_data: Value = serde_json::from_str(&config_content)
+        .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
+
+    // Build pattern_id -> state_image_id mapping from config
+    let mut pattern_to_state_image: HashMap<String, String> = HashMap::new();
+
+    if let Some(states) = config_data.get("states").and_then(|s| s.as_array()) {
+        for state in states {
+            if let Some(state_images) = state.get("stateImages").and_then(|si| si.as_array()) {
+                for state_image in state_images {
+                    let state_image_id = state_image
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+
+                    if let Some(patterns) = state_image.get("patterns").and_then(|p| p.as_array())
+                    {
+                        for pattern in patterns {
+                            if let Some(pattern_id) = pattern.get("id").and_then(|v| v.as_str()) {
+                                pattern_to_state_image
+                                    .insert(pattern_id.to_string(), state_image_id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!(
+        "Built pattern to stateImage mapping: {} patterns",
+        pattern_to_state_image.len()
+    );
+
     // Extract elements and group by state_image_id
     let elements = embeddings_data
         .get("elements")
@@ -65,12 +101,20 @@ async fn send_embeddings_to_web(project_id: &str) -> Result<(), String> {
     let mut state_image_embeddings: HashMap<String, Value> = HashMap::new();
 
     for element in elements {
-        let state_image_id = element
-            .get("state_image_id")
-            .and_then(|v| v.as_str())
+        // The element id is the pattern id (e.g., "pattern_123")
+        let pattern_id = element.get("id").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Look up the state_image_id from the mapping
+        let state_image_id = pattern_to_state_image
+            .get(pattern_id)
+            .map(|s| s.as_str())
             .unwrap_or("");
 
         if state_image_id.is_empty() {
+            warn!(
+                "No stateImage mapping found for pattern: {}",
+                pattern_id
+            );
             continue;
         }
 
@@ -186,17 +230,17 @@ impl RAGState {
     }
 }
 
-/// Import a RAG configuration with screenshots
+/// Import a QontinuiConfig for RAG processing
 ///
 /// This command:
-/// 1. Validates the RAG configuration
+/// 1. Validates the configuration
 /// 2. Saves the config to ~/.qontinui/rag/{project_id}/
-/// 3. Saves screenshots to ~/.qontinui/rag/{project_id}/screenshots/
+/// 3. Extracts and saves images from config.images[]
 /// 4. Triggers embedding generation (background)
 ///
 /// # Arguments
-/// * `config` - RAG configuration metadata
-/// * `screenshots` - Screenshot data (base64-encoded PNG images)
+/// * `project_id` - Project ID for storage
+/// * `config` - QontinuiConfig with images and states
 /// * `state` - RAG state containing storage and embedding generator
 ///
 /// # Returns
@@ -204,54 +248,39 @@ impl RAGState {
 /// * `Err(String)` - Error message if import fails
 #[tauri::command]
 pub async fn import_rag_config(
-    config: RAGConfig,
-    screenshots: Vec<ScreenshotData>,
+    project_id: String,
+    config: QontinuiConfig,
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Importing RAG config: project_id={}, screenshots={}",
-        config.project_id,
-        screenshots.len()
+        "Importing RAG config: project_id={}, images={}, states={}",
+        project_id,
+        config.images.len(),
+        config.states.len()
     );
 
     // Validate configuration
-    if config.project_id.is_empty() {
+    if project_id.is_empty() {
         return Err("Project ID cannot be empty".to_string());
     }
 
-    if config.screenshots.len() != screenshots.len() {
-        return Err(format!(
-            "Screenshot count mismatch: config has {}, data has {}",
-            config.screenshots.len(),
-            screenshots.len()
-        ));
-    }
-
-    let project_id = config.project_id.clone();
-    let screenshot_count = screenshots.len();
-    let element_count = config.total_element_count();
+    let image_count = config.images.len();
+    let pattern_count = config.pattern_count();
 
     // Save configuration
     let storage = state.storage.lock().await;
-    #[allow(deprecated)]
     let storage_path = storage
-        .save_config(&config)
+        .save_qontinui_config(&project_id, &config)
         .map_err(|e| format!("Failed to save config: {}", e))?;
 
-    // Save screenshots
+    // Save images from config
+    let referenced_ids = config.referenced_image_ids();
     let saved_count = storage
-        .save_screenshots(&project_id, &screenshots)
-        .map_err(|e| format!("Failed to save screenshots: {}", e))?;
+        .save_images_from_config(&project_id, &config.images, &referenced_ids)
+        .map_err(|e| format!("Failed to save images: {}", e))?;
 
     let storage_path_str = storage_path.to_string_lossy().to_string();
     drop(storage); // Release lock before starting async task
-
-    if saved_count != screenshot_count {
-        warn!(
-            "Screenshot count mismatch: expected {}, saved {}",
-            screenshot_count, saved_count
-        );
-    }
 
     // Trigger embedding generation in background
     info!(
@@ -269,11 +298,11 @@ pub async fn import_rag_config(
         success: true,
         project_id: project_id.clone(),
         message: format!(
-            "Successfully imported RAG config with {} screenshots and {} elements. Embedding generation started.",
-            saved_count, element_count
+            "Successfully imported RAG config with {} images ({} saved) and {} patterns. Embedding generation started.",
+            image_count, saved_count, pattern_count
         ),
         screenshot_count: saved_count,
-        element_count,
+        element_count: pattern_count,
         storage_path: storage_path_str,
     };
 
@@ -372,9 +401,9 @@ pub async fn get_rag_embedding_status(
     })
 }
 
-/// Search RAG elements by query (legacy label-based search)
+/// Search RAG elements by query (name-based search in patterns)
 ///
-/// NOTE: This is a legacy implementation using simple label matching.
+/// NOTE: This is a simple name-matching implementation.
 /// For semantic search with embeddings, use `search_rag_elements_semantic` instead.
 ///
 /// # Arguments
@@ -394,7 +423,7 @@ pub async fn search_rag_elements(
     state: State<'_, Arc<RAGState>>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Searching RAG elements (label-based): project_id={}, query={}",
+        "Searching RAG elements (name-based): project_id={}, query={}",
         project_id, query
     );
 
@@ -402,43 +431,59 @@ pub async fn search_rag_elements(
 
     // Load config
     let config = storage
-        .load_config(&project_id)
+        .load_qontinui_config(&project_id)
         .map_err(|e| format!("Failed to load config: {}", e))?;
 
-    // Simple label-based search
+    // Simple name-based search through states and patterns
     let mut results = Vec::new();
     let query_lower = query.to_lowercase();
 
-    for (screenshot_id, elements) in &config.elements {
-        for element in elements {
-            // Apply filters
-            if let Some(ref f) = filters {
-                if let Some(ref element_type) = f.element_type {
-                    if element.element_type.as_ref() != Some(element_type) {
-                        continue;
-                    }
-                }
-
-                if let Some(ref state_id) = f.state_id {
-                    let screenshot = config.screenshots.iter().find(|s| s.id == *screenshot_id);
-                    if let Some(ss) = screenshot {
-                        if ss.state_id.as_ref() != Some(state_id) {
-                            continue;
-                        }
-                    }
+    for state_obj in &config.states {
+        // Apply state filter
+        if let Some(ref f) = filters {
+            if let Some(ref filter_state_id) = f.state_id {
+                if &state_obj.id != filter_state_id {
+                    continue;
                 }
             }
+        }
 
-            // Simple label matching
-            if element.label.to_lowercase().contains(&query_lower) {
+        for state_image in &state_obj.state_images {
+            // Search in stateImage name
+            if state_image.name.to_lowercase().contains(&query_lower) {
                 results.push(SearchResult {
-                    element_id: element.id.clone(),
-                    label: element.label.clone(),
-                    screenshot_id: screenshot_id.clone(),
-                    bbox: element.bbox.clone(),
-                    similarity: 1.0, // Placeholder - would be actual similarity score with embeddings
-                    metadata: element.metadata.clone(),
+                    element_id: state_image.id.clone(),
+                    label: state_image.name.clone(),
+                    screenshot_id: state_obj.id.clone(),
+                    bbox: crate::rag::BoundingBox {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                    similarity: 1.0,
+                    metadata: None,
                 });
+            }
+
+            // Search in pattern names
+            for pattern in &state_image.patterns {
+                let pattern_name = pattern.name.as_deref().unwrap_or(&pattern.id);
+                if pattern_name.to_lowercase().contains(&query_lower) {
+                    results.push(SearchResult {
+                        element_id: pattern.id.clone(),
+                        label: pattern_name.to_string(),
+                        screenshot_id: pattern.image_id.clone(),
+                        bbox: crate::rag::BoundingBox {
+                            x: 0,
+                            y: 0,
+                            width: 0,
+                            height: 0,
+                        },
+                        similarity: 1.0,
+                        metadata: None,
+                    });
+                }
             }
         }
     }
@@ -608,7 +653,7 @@ pub async fn get_rag_config(
 
     let storage = state.storage.lock().await;
     let config = storage
-        .load_config(&project_id)
+        .load_qontinui_config(&project_id)
         .map_err(|e| format!("Failed to load config: {}", e))?;
 
     Ok(CommandResponse {

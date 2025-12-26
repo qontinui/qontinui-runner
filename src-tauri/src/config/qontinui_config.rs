@@ -73,6 +73,9 @@ pub struct ConfigMetadata {
     pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "targetApplication")]
     pub target_application: Option<String>,
+    /// Project ID from qontinui-web for test run reporting
+    #[serde(skip_serializing_if = "Option::is_none", rename = "projectId")]
+    pub project_id: Option<String>,
 }
 
 /// Image asset with base64 data

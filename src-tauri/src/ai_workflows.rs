@@ -88,6 +88,7 @@ fn default_max_iterations() -> u32 {
 
 impl AiWorkflow {
     /// Create a new workflow with auto-generated ID and timestamps
+    #[allow(dead_code)]
     pub fn new(name: String, goal: String, steps: Vec<ExecutionStep>) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
@@ -333,7 +334,9 @@ pub fn search_workflows(query: &str) -> Vec<AiWorkflow> {
             w.name.to_lowercase().contains(&query_lower)
                 || w.description.to_lowercase().contains(&query_lower)
                 || w.goal.to_lowercase().contains(&query_lower)
-                || w.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
+                || w.tags
+                    .iter()
+                    .any(|t| t.to_lowercase().contains(&query_lower))
         })
         .collect()
 }
@@ -355,10 +358,7 @@ pub fn get_categories() -> Vec<String> {
 /// Get all unique tags from saved workflows
 pub fn get_tags() -> Vec<String> {
     let workflows = load_workflows();
-    let mut tags: Vec<String> = workflows
-        .iter()
-        .flat_map(|w| w.tags.clone())
-        .collect();
+    let mut tags: Vec<String> = workflows.iter().flat_map(|w| w.tags.clone()).collect();
 
     tags.sort();
     tags.dedup();

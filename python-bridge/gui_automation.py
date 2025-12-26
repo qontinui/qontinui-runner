@@ -221,6 +221,17 @@ class GUIAutomation:
                 # Normal action delegation to library
                 success = self.action_executor.execute_action(action)
 
+            # Capture error message for failed GO_TO_STATE actions
+            if action_type == "GO_TO_STATE" and not success and not error_message:
+                state_names = config.get("stateNames", [])
+                state_ids = config.get("stateIds", [])
+                target_state = (
+                    state_names[0]
+                    if state_names
+                    else (state_ids[0] if state_ids else "unknown")
+                )
+                error_message = f"Navigation to state '{target_state}' failed - no path found or transition execution failed"
+
             # Sync last_find_location from library if available
             if (
                 hasattr(self.action_executor, "last_find_location")
@@ -234,7 +245,14 @@ class GUIAutomation:
 
             # Handle GO_TO_STATE actions - record transition data
             if action_type == "GO_TO_STATE" and self.unified_data_collector:
-                target_state = config.get("targetState", "unknown")
+                # Get target state from stateNames (display names) or stateIds (fallback)
+                state_names = config.get("stateNames", [])
+                state_ids = config.get("stateIds", [])
+                target_state = (
+                    state_names[0]
+                    if state_names
+                    else (state_ids[0] if state_ids else "unknown")
+                )
                 from_state = self.state_executor.current_state if self.state_executor else None
 
                 transition_data = {

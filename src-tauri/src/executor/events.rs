@@ -5,14 +5,29 @@ use crate::commands::AppState;
 use crate::display::RawEvent;
 use crate::safe_eprintln;
 use serde_json::json;
+use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
-/// Handles event forwarding from Python executor to Tauri frontend
+/// Handles event forwarding from Python executor to Tauri frontend and WebSocket clients
 pub struct EventForwarder;
 
 impl EventForwarder {
-    /// Emits a message to the Tauri frontend and feeds events to DisplayProcessor
+    /// Broadcasts an event to all connected WebSocket clients
+    fn broadcast_to_websocket(app_handle: &tauri::AppHandle, event: &serde_json::Value) {
+        if let Some(app_state) = app_handle.try_state::<Arc<AppState>>() {
+            // Send to broadcast channel - ignore errors (no receivers is ok)
+            if let Err(e) = app_state.event_broadcast.send(event.clone()) {
+                // Only warn if there are supposed to be receivers
+                // receiver_count() > 0 but send failed means something is wrong
+                if app_state.event_broadcast.receiver_count() > 0 {
+                    warn!("Failed to broadcast event to WebSocket clients: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Emits a message to the Tauri frontend, WebSocket clients, and feeds events to DisplayProcessor
     pub async fn emit_message_to_frontend(app_handle: &tauri::AppHandle, message: ExecutorMessage) {
         // Feed tree events to DisplayProcessor
         if let ExecutorMessage::TreeEvent {
@@ -101,6 +116,10 @@ impl EventForwarder {
                     "timestamp": timestamp,
                     "sequence": sequence,
                 });
+
+                // Broadcast to WebSocket clients for live perception
+                Self::broadcast_to_websocket(app_handle, &tree_event);
+
                 if let Err(e) = app_handle.emit("executor-event", &tree_event) {
                     error!("Failed to emit tree event: {}", e);
                 }
@@ -146,6 +165,11 @@ impl EventForwarder {
                     "event": "image_recognition",
                     "data": data,
                 });
+
+                // Broadcast to WebSocket clients for live perception
+                // This includes found coordinates for displaying StateImages at runtime positions
+                Self::broadcast_to_websocket(app_handle, &image_recognition_event);
+
                 if let Err(e) = app_handle.emit("executor-event", &image_recognition_event) {
                     error!("Failed to emit image recognition event: {}", e);
                 }

@@ -335,6 +335,7 @@ impl PythonBridge {
         project_id: Option<String>,
         runner_name: Option<String>,
     ) -> Result<(), String> {
+        // Configure WebSocket
         self.send_command(
             "ws_configure",
             Some(json!({
@@ -343,6 +344,40 @@ impl PythonBridge {
                 "jwt_token": token,
                 "project_id": project_id,
                 "runner_name": runner_name,
+            })),
+        )?;
+
+        // Also configure test results with the same credentials
+        // Test results use HTTP API on the same backend
+        if let Some(ref project) = project_id {
+            self.send_command(
+                "test_results_configure",
+                Some(json!({
+                    "enabled": enabled,
+                    "api_url": url,
+                    "access_token": token,
+                    "project_id": project,
+                })),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn configure_test_results(
+        &mut self,
+        enabled: bool,
+        api_url: String,
+        access_token: String,
+        project_id: Option<String>,
+    ) -> Result<(), String> {
+        self.send_command(
+            "test_results_configure",
+            Some(json!({
+                "enabled": enabled,
+                "api_url": api_url,
+                "access_token": access_token,
+                "project_id": project_id,
             })),
         )
     }

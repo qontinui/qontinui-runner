@@ -246,102 +246,6 @@ impl QontinuiConfig {
     }
 }
 
-// ============================================================================
-// Legacy RAGConfig format - kept for backward compatibility during transition
-// TODO: Remove once all clients migrate to QontinuiConfig
-// ============================================================================
-
-/// Legacy RAG configuration metadata (deprecated - use QontinuiConfig)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RAGConfig {
-    /// Unique project identifier
-    pub project_id: String,
-
-    /// Project name
-    pub project_name: String,
-
-    /// Configuration format version
-    pub version: String,
-
-    /// When this config was exported
-    pub exported_at: String,
-
-    /// Screenshot metadata
-    pub screenshots: Vec<ScreenshotMetadata>,
-
-    /// Element annotations per screenshot
-    pub elements: HashMap<String, Vec<ElementAnnotation>>,
-
-    /// Optional: State structure information
-    pub states: Option<Vec<StateInfo>>,
-}
-
-/// Screenshot metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenshotMetadata {
-    /// Unique screenshot identifier
-    pub id: String,
-
-    /// Original filename
-    pub filename: String,
-
-    /// When it was captured
-    pub captured_at: String,
-
-    /// Screenshot dimensions
-    pub width: u32,
-    pub height: u32,
-
-    /// Optional: Associated state ID
-    pub state_id: Option<String>,
-}
-
-/// Element annotation (bounding box + label)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ElementAnnotation {
-    /// Element ID
-    pub id: String,
-
-    /// Element label/name
-    pub label: String,
-
-    /// Bounding box (x, y, width, height)
-    pub bbox: BoundingBox,
-
-    /// Element type (button, input, etc.)
-    pub element_type: Option<String>,
-
-    /// Additional metadata
-    pub metadata: Option<HashMap<String, serde_json::Value>>,
-}
-
-/// Bounding box coordinates
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BoundingBox {
-    pub x: u32,
-    pub y: u32,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// State information (optional)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StateInfo {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-}
-
-/// Screenshot data for import (binary image data)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenshotData {
-    /// Screenshot ID (matches ScreenshotMetadata.id)
-    pub id: String,
-
-    /// Base64-encoded PNG image data
-    pub data: String,
-}
-
 /// RAG configuration summary (for listing)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RAGConfigSummary {
@@ -364,6 +268,15 @@ pub struct ImportResult {
     pub screenshot_count: usize,
     pub element_count: usize,
     pub storage_path: String,
+}
+
+/// Bounding box coordinates for search results
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundingBox {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Search filters for RAG search
@@ -391,25 +304,4 @@ pub struct SearchResult {
     pub bbox: BoundingBox,
     pub similarity: f32,
     pub metadata: Option<HashMap<String, serde_json::Value>>,
-}
-
-impl RAGConfig {
-    /// Get total number of elements across all screenshots
-    pub fn total_element_count(&self) -> usize {
-        self.elements.values().map(|v| v.len()).sum()
-    }
-
-    /// Get summary of this configuration
-    pub fn summary(&self) -> RAGConfigSummary {
-        RAGConfigSummary {
-            project_id: self.project_id.clone(),
-            project_name: self.project_name.clone(),
-            version: self.version.clone(),
-            exported_at: self.exported_at.clone(),
-            screenshot_count: self.screenshots.len(),
-            element_count: self.total_element_count(),
-            has_embeddings: false, // Will be updated by storage
-            embedding_status: None,
-        }
-    }
 }

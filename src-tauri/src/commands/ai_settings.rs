@@ -111,6 +111,7 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
 /// * `timeout_seconds` - CLI timeout in seconds
 /// * `model` - Claude API model name
 /// * `max_tokens` - Maximum tokens for API calls
+/// * `auto_refine_video_after_iterations` - Default iteration threshold for video in auto-refine
 ///
 /// # Returns
 /// * `Ok(CommandResponse)` - Success
@@ -123,10 +124,11 @@ pub fn save_ai_settings(
     timeout_seconds: u64,
     model: String,
     max_tokens: u32,
+    auto_refine_video_after_iterations: Option<u32>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s",
-        provider, execution_mode, timeout_seconds
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, video_after_iterations={:?}",
+        provider, execution_mode, timeout_seconds, auto_refine_video_after_iterations
     );
 
     let ai_provider = match provider.as_str() {
@@ -151,6 +153,7 @@ pub fn save_ai_settings(
             timeout_seconds,
         },
         claude_api: ClaudeApiSettings { model, max_tokens },
+        auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
     };
 
     settings::save_ai_settings(ai_settings)

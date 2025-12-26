@@ -17,7 +17,7 @@
 //!   └── ...
 //! ```
 
-use super::{ImageAsset, QontinuiConfig, RAGConfig, RAGConfigSummary, ScreenshotData};
+use super::{ImageAsset, QontinuiConfig, RAGConfigSummary};
 use base64::{engine::general_purpose, Engine};
 use std::fs;
 use std::io::Write;
@@ -100,27 +100,7 @@ impl RAGStorage {
         self.get_config_path(project_id).exists()
     }
 
-    /// Save a RAG configuration to disk (legacy format)
-    #[deprecated(note = "Use save_qontinui_config instead")]
-    pub fn save_config(&self, config: &RAGConfig) -> Result<PathBuf, RAGStorageError> {
-        let project_path = self.get_project_path(&config.project_id);
-        fs::create_dir_all(&project_path)?;
-
-        let config_path = self.get_config_path(&config.project_id);
-        let config_json = serde_json::to_string_pretty(config)?;
-
-        let mut file = fs::File::create(&config_path)?;
-        file.write_all(config_json.as_bytes())?;
-
-        info!(
-            "RAG config saved: project_id={}, path={:?}",
-            config.project_id, config_path
-        );
-
-        Ok(config_path)
-    }
-
-    /// Save a QontinuiConfig to disk (new unified format)
+    /// Save a QontinuiConfig to disk
     pub fn save_qontinui_config(
         &self,
         project_id: &str,
@@ -220,55 +200,7 @@ impl RAGStorage {
         Ok(saved_count)
     }
 
-    /// Load a RAG configuration from disk (legacy format)
-    pub fn load_config(&self, project_id: &str) -> Result<RAGConfig, RAGStorageError> {
-        let config_path = self.get_config_path(project_id);
-
-        if !config_path.exists() {
-            return Err(RAGStorageError::ProjectNotFound(project_id.to_string()));
-        }
-
-        let config_json = fs::read_to_string(&config_path)?;
-        let config: RAGConfig = serde_json::from_str(&config_json)?;
-
-        info!("RAG config loaded: project_id={}", project_id);
-
-        Ok(config)
-    }
-
-    /// Save screenshots to disk
-    pub fn save_screenshots(
-        &self,
-        project_id: &str,
-        screenshots: &[ScreenshotData],
-    ) -> Result<usize, RAGStorageError> {
-        let screenshots_path = self.get_images_path(project_id);
-        fs::create_dir_all(&screenshots_path)?;
-
-        let mut saved_count = 0;
-
-        for screenshot in screenshots {
-            let image_path = screenshots_path.join(format!("{}.png", screenshot.id));
-
-            // Decode base64 image data
-            let image_bytes = general_purpose::STANDARD.decode(&screenshot.data)?;
-
-            // Write to file
-            let mut file = fs::File::create(&image_path)?;
-            file.write_all(&image_bytes)?;
-
-            saved_count += 1;
-        }
-
-        info!(
-            "Saved {} screenshots for project_id={}",
-            saved_count, project_id
-        );
-
-        Ok(saved_count)
-    }
-
-    /// List all RAG configurations (supports both new QontinuiConfig and legacy RAGConfig)
+    /// List all RAG configurations
     pub fn list_configs(&self) -> Result<Vec<RAGConfigSummary>, RAGStorageError> {
         let mut summaries = Vec::new();
 
@@ -298,7 +230,7 @@ impl RAGStorage {
                 let has_embeddings =
                     embeddings_path.exists() && embeddings_path.join("embeddings.json").exists();
 
-                // Try loading as QontinuiConfig first, then fall back to legacy RAGConfig
+                // Load QontinuiConfig
                 if let Ok(config) = self.load_qontinui_config(&project_id) {
                     // Count images in the images directory
                     let images_path = self.get_images_path(&project_id);
@@ -320,11 +252,6 @@ impl RAGStorage {
                         has_embeddings,
                         embedding_status: None,
                     });
-                } else if let Ok(config) = self.load_config(&project_id) {
-                    // Fall back to legacy format
-                    let mut summary = config.summary();
-                    summary.has_embeddings = has_embeddings;
-                    summaries.push(summary);
                 } else {
                     warn!("Failed to load config for project_id={}", project_id);
                 }
@@ -379,24 +306,10 @@ impl RAGStorage {
             usage.total_bytes += usage.config_bytes;
         }
 
-        // Images directory size (new format)
+        // Images directory size
         let images_path = self.get_images_path(project_id);
         if images_path.exists() {
             for entry in fs::read_dir(&images_path)? {
-                let entry = entry?;
-                if entry.path().is_file() {
-                    let size = fs::metadata(entry.path())?.len();
-                    usage.image_bytes += size;
-                    usage.image_count += 1;
-                }
-            }
-        }
-
-        // Also check legacy screenshots directory
-        #[allow(deprecated)]
-        let screenshots_path = self.get_images_path(project_id);
-        if screenshots_path.exists() {
-            for entry in fs::read_dir(&screenshots_path)? {
                 let entry = entry?;
                 if entry.path().is_file() {
                     let size = fs::metadata(entry.path())?.len();
@@ -465,62 +378,64 @@ impl StorageUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rag::{BoundingBox, ElementAnnotation, ScreenshotMetadata};
-    use std::collections::HashMap;
+    use crate::rag::{ConfigMetadata, Position, State};
     use tempfile::TempDir;
 
-    fn create_test_config() -> RAGConfig {
-        let mut elements = HashMap::new();
-        elements.insert(
-            "screenshot1".to_string(),
-            vec![ElementAnnotation {
-                id: "element1".to_string(),
-                label: "Test Button".to_string(),
-                bbox: BoundingBox {
-                    x: 100,
-                    y: 200,
-                    width: 150,
-                    height: 50,
-                },
-                element_type: Some("button".to_string()),
-                metadata: None,
+    fn create_test_config() -> QontinuiConfig {
+        QontinuiConfig {
+            version: "2.9.0".to_string(),
+            metadata: ConfigMetadata {
+                name: "Test Project".to_string(),
+                description: Some("A test project".to_string()),
+                author: None,
+                created: "2025-01-01T00:00:00Z".to_string(),
+                modified: "2025-01-01T00:00:00Z".to_string(),
+                tags: None,
+                target_application: None,
+                compatible_versions: None,
+            },
+            images: vec![],
+            workflows: vec![],
+            states: vec![State {
+                id: "state1".to_string(),
+                name: "Test State".to_string(),
+                description: Some("A test state".to_string()),
+                state_images: vec![],
+                regions: None,
+                locations: None,
+                strings: None,
+                position: Position { x: 0, y: 0 },
+                entry_actions: None,
+                exit_actions: None,
+                timeout: None,
+                is_initial: Some(true),
+                is_final: None,
             }],
-        );
-
-        RAGConfig {
-            project_id: "test-project".to_string(),
-            project_name: "Test Project".to_string(),
-            version: "1.0.0".to_string(),
-            exported_at: "2025-01-01T00:00:00Z".to_string(),
-            screenshots: vec![ScreenshotMetadata {
-                id: "screenshot1".to_string(),
-                filename: "test.png".to_string(),
-                captured_at: "2025-01-01T00:00:00Z".to_string(),
-                width: 1920,
-                height: 1080,
-                state_id: None,
-            }],
-            elements,
-            states: None,
+            transitions: vec![],
+            categories: vec![],
+            settings: None,
+            schedules: None,
+            execution_records: None,
         }
     }
 
     #[test]
-    fn test_save_and_load_config() {
+    fn test_save_and_load_qontinui_config() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RAGStorage::with_path(temp_dir.path().to_path_buf()).unwrap();
 
         let config = create_test_config();
 
         // Save config
-        let saved_path = storage.save_config(&config).unwrap();
+        let saved_path = storage
+            .save_qontinui_config("test-project", &config)
+            .unwrap();
         assert!(saved_path.exists());
 
         // Load config
-        let loaded_config = storage.load_config("test-project").unwrap();
-        assert_eq!(loaded_config.project_id, config.project_id);
-        assert_eq!(loaded_config.project_name, config.project_name);
-        assert_eq!(loaded_config.screenshots.len(), 1);
+        let loaded_config = storage.load_qontinui_config("test-project").unwrap();
+        assert_eq!(loaded_config.metadata.name, config.metadata.name);
+        assert_eq!(loaded_config.states.len(), 1);
     }
 
     #[test]
@@ -529,11 +444,15 @@ mod tests {
         let storage = RAGStorage::with_path(temp_dir.path().to_path_buf()).unwrap();
 
         let config1 = create_test_config();
-        storage.save_config(&config1).unwrap();
+        storage
+            .save_qontinui_config("test-project-1", &config1)
+            .unwrap();
 
         let mut config2 = create_test_config();
-        config2.project_id = "test-project-2".to_string();
-        storage.save_config(&config2).unwrap();
+        config2.metadata.name = "Test Project 2".to_string();
+        storage
+            .save_qontinui_config("test-project-2", &config2)
+            .unwrap();
 
         let summaries = storage.list_configs().unwrap();
         assert_eq!(summaries.len(), 2);
@@ -545,7 +464,9 @@ mod tests {
         let storage = RAGStorage::with_path(temp_dir.path().to_path_buf()).unwrap();
 
         let config = create_test_config();
-        storage.save_config(&config).unwrap();
+        storage
+            .save_qontinui_config("test-project", &config)
+            .unwrap();
 
         assert!(storage.project_exists("test-project"));
 

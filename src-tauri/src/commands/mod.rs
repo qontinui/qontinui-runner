@@ -29,6 +29,7 @@ use crate::storage::LocalStorage;
 use crate::video_recorder::VideoRecordingService;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
@@ -38,9 +39,12 @@ pub mod config;
 pub mod dataset;
 pub mod debug;
 pub mod execution;
+pub mod execution_reporting;
 pub mod extraction;
+pub mod issues;
 pub mod logging;
 pub mod project_logs;
+pub mod testing;
 pub mod rag;
 pub mod screenshot;
 pub mod state_machine;
@@ -59,12 +63,16 @@ pub mod websocket;
 /// - Display processor for UI views
 /// - Local storage service
 /// - Video recording service
+/// - Event broadcast channel for WebSocket clients
 pub struct AppState {
     pub python_bridge: Mutex<Option<PythonBridge>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
     pub display_processor: Arc<TokioMutex<DisplayProcessor>>,
     pub local_storage: Arc<Mutex<LocalStorage>>,
     pub video_recorder: Arc<Mutex<VideoRecordingService>>,
+    /// Broadcast channel for streaming execution events to WebSocket clients.
+    /// Events include image recognition results, tree events, and state changes.
+    pub event_broadcast: broadcast::Sender<serde_json::Value>,
 }
 
 /// Standard response structure for command handlers.

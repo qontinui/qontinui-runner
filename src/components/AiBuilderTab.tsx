@@ -41,6 +41,8 @@ import {
   TestTube,
   BookOpen,
   X,
+  FilePlus2,
+  AlertTriangle,
 } from "lucide-react";
 import { useExecution } from "../contexts";
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
@@ -461,13 +463,21 @@ if ($state.stop_requested) {
 }
 \`\`\`
 
-**If all issues fixed and automation passes:** Update state to complete and exit:
+**If all issues fixed and automation passes:** Output the goal completion marker and update state:
+\`\`\`
+[GOAL_COMPLETE]
+\`\`\`
+
+Then update state file:
 \`\`\`powershell
 $state = Get-Content "{{STATE_FILE}}" -Raw | ConvertFrom-Json
 $state.status = "complete"
+$state.goal_achieved = $true
 $state.completed_at = (Get-Date -Format "o")
 $state | ConvertTo-Json -Depth 10 | Set-Content "{{STATE_FILE}}"
 \`\`\`
+
+**IMPORTANT:** The \`[GOAL_COMPLETE]\` marker is detected by the runner and will stop further iterations.
 
 **If more work needed:** Spawn fresh session and exit:
 \`\`\`powershell
@@ -497,6 +507,7 @@ python {{SPAWN_SCRIPT_ESCAPED}} --file "{{DEV_LOGS_ESCAPED}}\\ai-developer-conti
 - You are INDEPENDENT - you CAN restart any service including the runner
 - STOP when iteration reaches {{MAX_ITERATIONS}}
 - Work AUTONOMOUSLY - never ask the user
+- **IMPORTANT:** When the goal is achieved, output \`[GOAL_COMPLETE]\` to stop the workflow early
 
 ## Issue Tracking
 
@@ -509,6 +520,15 @@ When you fix an issue:
 \`\`\`
 [ISSUE:RESOLVED] {"title":"Brief title","resolution":"How you fixed it"}
 \`\`\`
+
+## Goal Completion
+
+When the goal is achieved and all tests pass, output this marker to stop the workflow:
+\`\`\`
+[GOAL_COMPLETE]
+\`\`\`
+
+This marker is detected by the runner and will immediately stop further iterations, even if max_iterations hasn't been reached.
 `;
 
 interface WorkspacePaths {
@@ -695,6 +715,16 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
   const [saveName, setSaveName] = useState("");
   const [saveDescription, setSaveDescription] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+
+  // New workflow confirmation dialog (for unsaved changes warning)
+  const [showNewConfirmDialog, setShowNewConfirmDialog] = useState(false);
+
+  // Track the currently loaded workflow (null = new unsaved workflow)
+  const [currentWorkflowId, setCurrentWorkflowId] = useState<string | null>(null);
+  const [currentWorkflowName, setCurrentWorkflowName] = useState<string>("");
+
+  // Simple dirty flag for unsaved changes detection
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
 
   // Saved AI Workflows from the AI Workflows library
   const [savedAiWorkflows, setSavedAiWorkflows] = useState<SavedAiWorkflow[]>([]);
@@ -1022,11 +1052,13 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     };
     setExecutionSteps((prev) => [...prev, newStep]);
     setShowAddDropdown(false);
+    setHasUnsavedChanges(true);
   };
 
   // Remove a step
   const removeStep = (stepId: string) => {
     setExecutionSteps((prev) => prev.filter((s) => s.id !== stepId));
+    setHasUnsavedChanges(true);
   };
 
   // Toggle screenshot for a step
@@ -1034,6 +1066,7 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     setExecutionSteps((prev) =>
       prev.map((s) => (s.id === stepId ? { ...s, takeScreenshot: !s.takeScreenshot } : s)),
     );
+    setHasUnsavedChanges(true);
   };
 
   // Move step up
@@ -1044,6 +1077,7 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
       [newSteps[index - 1], newSteps[index]] = [newSteps[index], newSteps[index - 1]];
       return newSteps;
     });
+    setHasUnsavedChanges(true);
   };
 
   // Move step down
@@ -1054,6 +1088,7 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
       [newSteps[index], newSteps[index + 1]] = [newSteps[index + 1], newSteps[index]];
       return newSteps;
     });
+    setHasUnsavedChanges(true);
   };
 
   // Generate common prompt parts
@@ -1279,7 +1314,37 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     setPersistentSession(workflow.persistent_session);
     setCaptureInputValidation(workflow.capture_input_validation);
     setShowWorkflowsPanel(false);
+    // Track the loaded workflow for "Save" vs "Save As" behavior
+    setCurrentWorkflowId(workflow.id);
+    setCurrentWorkflowName(workflow.name);
+    setHasUnsavedChanges(false);
     setLastResult({ success: true, message: `Loaded workflow "${workflow.name}"` });
+    setTimeout(() => setLastResult(null), 3000);
+  };
+
+  // Create a new workflow (reset to blank state)
+  const handleNewWorkflow = () => {
+    // Check for unsaved changes first
+    if (hasUnsavedChanges) {
+      setShowNewConfirmDialog(true);
+      return;
+    }
+    // No unsaved changes, proceed directly
+    resetToNewWorkflow();
+  };
+
+  // Actually reset to a new blank workflow
+  const resetToNewWorkflow = () => {
+    setExecutionSteps([]);
+    setGoal("");
+    setMaxIterations(5);
+    setPersistentSession(false);
+    setCaptureInputValidation(false);
+    setCurrentWorkflowId(null);
+    setCurrentWorkflowName("");
+    setHasUnsavedChanges(false);
+    setShowNewConfirmDialog(false);
+    setLastResult({ success: true, message: "Created new workflow" });
     setTimeout(() => setLastResult(null), 3000);
   };
 
@@ -1305,8 +1370,61 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     }
   };
 
-  // Save workflow to AI Workflows Library
-  const saveWorkflow = async () => {
+  // Save current workflow (update existing or prompt for new)
+  const handleSaveWorkflow = async () => {
+    if (currentWorkflowId) {
+      // Update existing workflow
+      await updateCurrentWorkflow();
+    } else {
+      // Show dialog for new workflow
+      setSaveName(goal.trim() || "AI Builder Workflow");
+      setShowSaveDialog(true);
+    }
+  };
+
+  // Update the currently loaded workflow
+  const updateCurrentWorkflow = async () => {
+    if (!currentWorkflowId) return;
+
+    setIsSaving(true);
+    try {
+      const response = await fetch(`http://localhost:9876/ai-workflows/${currentWorkflowId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: currentWorkflowName,
+          description: "",
+          steps: executionSteps,
+          goal: goal.trim(),
+          max_iterations: maxIterations,
+          persistent_session: persistentSession,
+          capture_input_validation: captureInputValidation,
+          category: "",
+          tags: [],
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success) {
+        setLastResult({ success: true, message: `Workflow "${currentWorkflowName}" saved!` });
+        setHasUnsavedChanges(false);
+        await fetchSavedAiWorkflows();
+      } else {
+        throw new Error(result.error || "Failed to save workflow");
+      }
+    } catch (error) {
+      setLastResult({
+        success: false,
+        message: `Error saving: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setIsSaving(false);
+    }
+    setTimeout(() => setLastResult(null), 3000);
+  };
+
+  // Save as new workflow (from dialog)
+  const saveAsNewWorkflow = async () => {
     if (!saveName.trim()) {
       setLastResult({ success: false, message: "Please enter a name for the workflow" });
       return;
@@ -1334,10 +1452,14 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       if (result.success) {
         setLastResult({ success: true, message: `Workflow "${saveName}" saved!` });
         setShowSaveDialog(false);
+        // Track the new workflow as current
+        if (result.data?.id) {
+          setCurrentWorkflowId(result.data.id);
+          setCurrentWorkflowName(saveName.trim());
+        }
+        setHasUnsavedChanges(false);
         setSaveName("");
         setSaveDescription("");
-
-        // Refresh the saved workflows list
         await fetchSavedAiWorkflows();
       } else {
         throw new Error(result.error || "Failed to save workflow");
@@ -1847,7 +1969,10 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
             <textarea
               value={goal}
-              onChange={(e) => setGoal(e.target.value)}
+              onChange={(e) => {
+                setGoal(e.target.value);
+                setHasUnsavedChanges(true);
+              }}
               placeholder="Describe what you want to verify or achieve..."
               className="w-full h-24 px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary"
             />
@@ -1918,7 +2043,10 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                   </div>
                 </div>
                 <button
-                  onClick={() => setPersistentSession(!persistentSession)}
+                  onClick={() => {
+                    setPersistentSession(!persistentSession);
+                    setHasUnsavedChanges(true);
+                  }}
                   className={`flex items-center transition-colors ${persistentSession ? "text-orange-500" : "text-muted-foreground"}`}
                   title={persistentSession ? "Persistent Session enabled" : "Inline Session"}
                 >
@@ -1953,11 +2081,12 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                         min={1}
                         max={50}
                         value={maxIterations}
-                        onChange={(e) =>
+                        onChange={(e) => {
                           setMaxIterations(
                             Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
-                          )
-                        }
+                          );
+                          setHasUnsavedChanges(true);
+                        }}
                         className="w-16 px-2 py-1 bg-background border border-border rounded text-sm"
                       />
                     </label>
@@ -1992,7 +2121,10 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                   </div>
                 </div>
                 <button
-                  onClick={() => setCaptureInputValidation(!captureInputValidation)}
+                  onClick={() => {
+                    setCaptureInputValidation(!captureInputValidation);
+                    setHasUnsavedChanges(true);
+                  }}
                   className={`flex items-center transition-colors ${captureInputValidation ? "text-purple-500" : "text-muted-foreground"}`}
                   title={
                     captureInputValidation ? "Input capture enabled" : "Input capture disabled"
@@ -2077,6 +2209,14 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             )}
 
             <button
+              onClick={handleNewWorkflow}
+              className="flex items-center gap-2 px-4 py-3 bg-blue-500/10 text-blue-600 rounded-md font-medium hover:bg-blue-500/20 transition-colors"
+              title="Create new workflow"
+            >
+              <FilePlus2 className="w-4 h-4" />
+            </button>
+
+            <button
               onClick={copyPrompt}
               className="flex items-center gap-2 px-4 py-3 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
               title="Copy prompt to clipboard"
@@ -2085,14 +2225,12 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             </button>
 
             <button
-              onClick={() => {
-                setSaveName(goal.trim() || "AI Builder Workflow");
-                setShowSaveDialog(true);
-              }}
-              className="flex items-center gap-2 px-4 py-3 bg-green-500/10 text-green-600 rounded-md font-medium hover:bg-green-500/20 transition-colors"
-              title="Save workflow to Prompt Library"
+              onClick={handleSaveWorkflow}
+              disabled={isSaving}
+              className="flex items-center gap-2 px-4 py-3 bg-green-500/10 text-green-600 rounded-md font-medium hover:bg-green-500/20 disabled:opacity-50 transition-colors"
+              title={currentWorkflowId ? `Save "${currentWorkflowName}"` : "Save workflow"}
             >
-              <Save className="w-4 h-4" />
+              {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
             </button>
           </div>
 
@@ -2333,7 +2471,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                 Cancel
               </button>
               <button
-                onClick={saveWorkflow}
+                onClick={saveAsNewWorkflow}
                 disabled={isSaving || !saveName.trim()}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-500 text-white rounded-md font-medium hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
               >
@@ -2348,6 +2486,61 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                     Save to Library
                   </>
                 )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Workflow Confirmation Dialog (Unsaved Changes Warning) */}
+      {showNewConfirmDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          {/* Backdrop */}
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setShowNewConfirmDialog(false)}
+          />
+
+          {/* Dialog */}
+          <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-5 h-5 text-yellow-500" />
+                <h3 className="text-lg font-semibold">Unsaved Changes</h3>
+              </div>
+              <button
+                onClick={() => setShowNewConfirmDialog(false)}
+                className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-muted-foreground">
+              You have unsaved changes to your current workflow. Creating a new workflow will discard these changes.
+            </p>
+
+            <div className="text-xs text-muted-foreground bg-yellow-500/10 border border-yellow-500/20 p-3 rounded">
+              <p><strong>Current workflow includes:</strong></p>
+              <ul className="list-disc list-inside mt-1 space-y-0.5">
+                <li>{executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}</li>
+                {goal.trim() && <li>Goal: {goal.trim().slice(0, 50)}{goal.trim().length > 50 ? "..." : ""}</li>}
+              </ul>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={() => setShowNewConfirmDialog(false)}
+                className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={resetToNewWorkflow}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+                Discard & Create New
               </button>
             </div>
           </div>

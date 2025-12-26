@@ -12,7 +12,9 @@ pillow = "^11"
 qontinui = {path = "../../qontinui", develop = true}
 qontinui-schemas = {path = "../../qontinui-schemas", develop = true}
 websockets = "^15.0.1"
-croniter = "^5.0"
+requests = "^2.31"
+pynput = "^1.7"
+httpx = "^0.27"
 
 
 [tool.poetry.group.dev.dependencies]

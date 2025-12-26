@@ -80,6 +80,7 @@ pub struct WorkflowEvent {
 
 impl WorkflowRun {
     /// Create a new workflow run
+    #[allow(dead_code)]
     pub fn new(prompt: &SavedPrompt) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -247,6 +248,7 @@ pub struct RestartPermission {
 ///   }
 /// }
 /// ```
+#[allow(dead_code)]
 pub fn read_restart_permission(checkpoint_path: &str) -> Option<RestartPermission> {
     let path = Path::new(checkpoint_path);
     if !path.exists() {
@@ -297,6 +299,7 @@ pub fn read_restart_permission(checkpoint_path: &str) -> Option<RestartPermissio
 ///
 /// Call this after successfully resuming a workflow to prevent
 /// the permission from being reused on subsequent restarts.
+#[allow(dead_code)]
 pub fn clear_restart_permission(checkpoint_path: &str) -> Result<(), String> {
     let path = Path::new(checkpoint_path);
     if !path.exists() {
@@ -331,6 +334,7 @@ pub fn clear_restart_permission(checkpoint_path: &str) -> Result<(), String> {
 ///
 /// Agents should call this before triggering a runner restart
 /// to allow the workflow to auto-continue after restart.
+#[allow(dead_code)]
 pub fn write_restart_permission(checkpoint_path: &str, reason: &str) -> Result<(), String> {
     let path = Path::new(checkpoint_path);
 
@@ -380,6 +384,7 @@ pub fn write_restart_permission(checkpoint_path: &str, reason: &str) -> Result<(
 // ============================================================================
 
 /// Manages active workflow runs
+#[allow(dead_code)]
 pub struct WorkflowManager {
     /// Active workflow runs, keyed by workflow run ID
     runs: Arc<RwLock<HashMap<String, WorkflowRun>>>,
@@ -388,6 +393,7 @@ pub struct WorkflowManager {
     pub configs: Arc<RwLock<HashMap<String, WorkflowConfig>>>,
 }
 
+#[allow(dead_code)]
 impl WorkflowManager {
     pub fn new() -> Self {
         Self {
@@ -596,6 +602,7 @@ pub struct PersistedWorkflowState {
     pub persisted_at: u64,
 }
 
+#[allow(dead_code)]
 impl WorkflowManager {
     /// Get the path to the workflow state file
     fn get_state_file_path() -> Result<std::path::PathBuf, String> {

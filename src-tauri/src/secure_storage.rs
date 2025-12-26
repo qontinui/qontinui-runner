@@ -227,6 +227,7 @@ impl SecureStorage {
     }
 
     /// Deletes the storage file entirely.
+    #[allow(dead_code)]
     pub fn delete_storage(&self) -> Result<()> {
         if self.storage_path.exists() {
             fs::remove_file(&self.storage_path).context("Failed to delete storage file")?;

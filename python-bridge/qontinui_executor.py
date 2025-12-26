@@ -87,6 +87,7 @@ from services.input_monitor_service import InputMonitorService  # noqa: E402
 from services.screenshot_service import ScreenshotService  # noqa: E402
 from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
 from services.web_extraction_service import WebExtractionService  # noqa: E402
+from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
 
@@ -157,6 +158,9 @@ class QontinuiExecutor:
         self.websocket_handler = WebSocketHandler(
             emit_log_fn=self.event_manager.emit_log, on_command_fn=self._handle_websocket_command
         )
+
+        # Initialize TestResultsHandler for QA dashboard submission
+        self.test_results_handler = TestResultsHandler(emit_log_fn=self.event_manager.emit_log)
 
         # Initialize CaptureManager
         self.capture_manager = CaptureManager(
@@ -375,13 +379,58 @@ class QontinuiExecutor:
             # Initialize TrainingExportService
             self.training_export.initialize(run_dir)
 
-            # Initialize UnifiedDataCollector
-            record_callback = self.training_export.get_record_callback()
+            # Initialize UnifiedDataCollector with combined callback
+            training_callback = self.training_export.get_record_callback()
+
+            def combined_record_callback(record):
+                """Callback that reports to training export and test results handler."""
+                # Call training export callback
+                if training_callback:
+                    training_callback(record)
+
+                # Report action data for historical indexing (Config Testing)
+                if self.test_results_handler and self.test_results_handler.is_enabled():
+                    try:
+                        # Extract match info from record
+                        match_summary = record.match_summary or {}
+
+                        self.test_results_handler.report_action(
+                            action_id=record.action_id,
+                            action_type=record.action_type,
+                            success=record.success,
+                            pattern_id=match_summary.get("image_id"),
+                            pattern_name=match_summary.get("image_id"),  # Using image_id as name
+                            active_states=list(record.active_states_before),
+                            match_count=1 if match_summary.get("found") else 0,
+                            best_match_score=match_summary.get("confidence"),
+                            match_x=(
+                                match_summary.get("location", {}).get("x")
+                                if match_summary.get("location")
+                                else None
+                            ),
+                            match_y=(
+                                match_summary.get("location", {}).get("y")
+                                if match_summary.get("location")
+                                else None
+                            ),
+                            match_width=None,  # Not available in current record
+                            match_height=None,
+                            duration_ms=int(record.duration_ms) if record.duration_ms else None,
+                            result_data={
+                                "config": record.config,
+                                "clicked_location": record.clicked_location,
+                                "transition_data": record.transition_data,
+                            },
+                        )
+                    except Exception as e:
+                        self.event_manager.emit_log(
+                            "debug", f"Failed to report action for historical indexing: {e}"
+                        )
 
             self.unified_data_collector = UnifiedDataCollector(
                 state_memory=state_memory_adapter,
                 screenshot_service=self.screenshot_service,
-                record_created_callback=record_callback,
+                record_created_callback=combined_record_callback,
             )
             self.event_manager.emit_log("info", "UnifiedDataCollector initialized")
 
@@ -683,6 +732,9 @@ class QontinuiExecutor:
 
     def _run_workflow(self, workflow_id: str):
         """Run workflow in background thread."""
+        execution_start_time = time.time()
+        test_run_id = None
+
         try:
             self.event_manager.emit_log("info", f"Starting workflow execution: {workflow_id}")
 
@@ -690,9 +742,24 @@ class QontinuiExecutor:
             if self.gui_automation:
                 self.gui_automation.reset_navigation_state()
 
+            # Get workflow config for test results
+            workflow = self.executor_core.workflows.get(workflow_id) if self.executor_core else None
+            workflow_name = workflow_id
+            if workflow:
+                if isinstance(workflow, dict):
+                    workflow_name = workflow.get("name", workflow_id)
+                elif hasattr(workflow, "name"):
+                    workflow_name = workflow.name
+
+            # Start test run for QA dashboard
+            if self.test_results_handler.is_enabled():
+                test_run_id = self.test_results_handler.start_test_run(
+                    workflow_name=workflow_name,
+                    workflow_config=self.config or {},
+                )
+
             # Initialize state executor with workflow's initial states (if any)
             if self.executor_core and self.executor_core.state_executor:
-                workflow = self.executor_core.workflows.get(workflow_id)
                 if workflow:
                     # Get initialStateIds from workflow (handles both dict and object)
                     initial_state_ids = None
@@ -727,6 +794,14 @@ class QontinuiExecutor:
             if self.websocket_handler.is_enabled():
                 self.websocket_handler.end_session(status="completed" if success else "failed")
 
+            # Complete test run for QA dashboard
+            if test_run_id and self.test_results_handler.is_enabled():
+                execution_duration = time.time() - execution_start_time
+                self.test_results_handler.complete_test_run(
+                    success=success,
+                    summary=f"Workflow '{workflow_name}' {'completed successfully' if success else 'failed'} in {execution_duration:.1f}s",
+                )
+
         except Exception as e:
             self.event_manager.emit_log("error", f"Workflow execution error: {e}")
             self.event_manager.emit_log("debug", f"Traceback: {traceback.format_exc()}")
@@ -743,6 +818,13 @@ class QontinuiExecutor:
             # End WebSocket session with error
             if self.websocket_handler.is_enabled():
                 self.websocket_handler.end_session(status="failed", error=str(e))
+
+            # Complete test run with failure
+            if test_run_id and self.test_results_handler.is_enabled():
+                self.test_results_handler.complete_test_run(
+                    success=False,
+                    summary=f"Workflow failed with error: {e}",
+                )
 
         finally:
             # Stop input capture for coordinate validation
@@ -1102,6 +1184,27 @@ class QontinuiExecutor:
                 "success": True,
                 "enabled": self.websocket_handler.is_enabled(),
                 "connected": self.websocket_handler.is_connected,
+            }
+
+        # Test Results Handler commands (for QA Dashboard)
+        elif cmd_type == "test_results_configure":
+            enabled = params.get("enabled", False)
+            api_url = params.get("api_url", "")
+            access_token = params.get("access_token", "")
+            project_id = params.get("project_id")
+            self.event_manager.emit_log(
+                "info",
+                f"[TEST_RESULTS_CONFIGURE] enabled={enabled}, api_url={api_url}, project_id={project_id}",
+            )
+            success = self.test_results_handler.configure(
+                enabled, api_url, access_token, project_id
+            )
+            return {"success": success}
+
+        elif cmd_type == "test_results_status":
+            return {
+                "success": True,
+                **self.test_results_handler.get_status(),
             }
 
         elif cmd_type == "ping":

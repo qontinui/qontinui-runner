@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, warn};
 
+use crate::playwright::WorkflowStatus;
+
 /// Counter for generating unique screenshot filenames
 static SCREENSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -131,6 +133,9 @@ pub struct PlaywrightLogEntry {
     /// Page snapshot (YAML showing elements on page at failure)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_snapshot: Option<String>,
+    /// Workflow verification status (if this is workflow automation)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_status: Option<WorkflowStatus>,
 }
 
 /// Individual test spec result for logging
@@ -247,6 +252,27 @@ impl FileLogger {
             })
         });
 
+        // Extract node from hierarchy.workflow_name, hierarchy.parent_id, or fallback
+        let node = data
+            .get("hierarchy")
+            .and_then(|h| {
+                h.get("workflow_name")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| h.get("parent_id").and_then(|v| v.as_str()))
+            })
+            .or_else(|| data.get("node").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Extract template from template_name, image_path, or fallback
+        let template = data
+            .get("template_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| data.get("image_path").and_then(|v| v.as_str()))
+            .or_else(|| data.get("template").and_then(|v| v.as_str()))
+            .unwrap_or("unknown")
+            .to_string();
+
         let entry = ImageRecognitionFileEntry {
             id: format!("img-{}", uuid::Uuid::new_v4()),
             timestamp: format_timestamp_now(),
@@ -254,16 +280,8 @@ impl FileLogger {
                 .get("screenshot_timestamp")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            node: data
-                .get("node")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
-            template: data
-                .get("template")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
+            node,
+            template,
             confidence: data
                 .get("confidence")
                 .and_then(|v| v.as_f64())
@@ -313,6 +331,7 @@ impl FileLogger {
         console_output: &[String],
         specs: &[(String, String, u64, Option<String>)], // (title, status, duration_ms, error)
         page_snapshot: Option<&str>,
+        workflow_status: Option<WorkflowStatus>,
     ) {
         if let Err(e) = ensure_dirs() {
             error!("Failed to ensure log directories: {}", e);
@@ -370,6 +389,7 @@ impl FileLogger {
             console_output: console_output.to_vec(),
             specs: spec_entries,
             page_snapshot: page_snapshot.map(String::from),
+            workflow_status,
         };
 
         Self::append_to_jsonl("runner-playwright.jsonl", &entry);

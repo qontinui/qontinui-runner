@@ -8,7 +8,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { eventRouter } from "../managers";
+import { eventRouter, configManager } from "../managers";
 import type { CommandResponse } from "../types/displayProfile";
 
 export interface ConfigImage {
@@ -44,6 +44,8 @@ export interface Config {
   images?: ConfigImage[];
   states?: ConfigState[];
   path: string;
+  /** Project ID from qontinui-web for test run reporting */
+  projectId?: string;
 }
 
 export interface Workflow {
@@ -55,6 +57,11 @@ export interface Workflow {
 }
 
 interface LoadConfigurationData {
+  metadata?: {
+    name?: string;
+    projectId?: string;
+    [key: string]: unknown;
+  };
   states?: ConfigState[];
   workflows?: Workflow[];
   images?: ConfigImage[];
@@ -70,6 +77,11 @@ interface ConfigLoadedEventPayload {
   data?: {
     path?: string;
     config?: {
+      metadata?: {
+        projectId?: string;
+        name?: string;
+        [key: string]: unknown;
+      };
       states?: ConfigState[];
       workflows?: Workflow[];
       images?: ConfigImage[];
@@ -130,8 +142,19 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
           const fullFilename = pathParts[pathParts.length - 1] || "config.json";
           const nameWithoutExtension = fullFilename.replace(/\.[^/.]+$/, "");
 
-          const loadedConfig = {
-            name: nameWithoutExtension,
+          // Extract projectId from metadata for test run reporting
+          const projectId = result.data?.metadata?.projectId;
+          if (projectId) {
+            console.log("[CONFIG] Config includes projectId:", projectId);
+            // Store in configManager for EventHandlers to access
+            configManager.setProjectId(projectId);
+          } else {
+            // Clear stored projectId if config doesn't have one
+            configManager.setProjectId(null);
+          }
+
+          const loadedConfig: Config = {
+            name: result.data?.metadata?.name || nameWithoutExtension,
             version: "1.0.0",
             statesCount: result.data?.states?.length || 0,
             workflowsCount: result.data?.workflows?.length || 0,
@@ -139,6 +162,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
             images: result.data?.images || [],
             states: result.data?.states || [],
             path: configPath,
+            projectId, // Include projectId from metadata
           };
 
           console.log("Config loaded with images:", loadedConfig.images?.length || 0, "images");
@@ -367,8 +391,19 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
       const fullFilename = pathParts[pathParts.length - 1] || "config.json";
       const nameWithoutExtension = fullFilename.replace(/\.[^/.]+$/, "");
 
+      // Extract projectId from metadata for test run reporting
+      const projectId = configData.metadata?.projectId;
+      if (projectId) {
+        console.log("[CONFIG] Config includes projectId:", projectId);
+        // Store in configManager for EventHandlers to access
+        configManager.setProjectId(projectId);
+      } else {
+        // Clear stored projectId if config doesn't have one
+        configManager.setProjectId(null);
+      }
+
       const loadedConfig: Config = {
-        name: nameWithoutExtension,
+        name: configData.metadata?.name || nameWithoutExtension,
         version: "1.0.0",
         statesCount: configData.states?.length || 0,
         workflowsCount: configData.workflows?.length || 0,
@@ -376,6 +411,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
         images: configData.images || [],
         states: configData.states || [],
         path: configPath,
+        projectId, // Include projectId from metadata
       };
 
       console.log(

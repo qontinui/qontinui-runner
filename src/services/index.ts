@@ -37,6 +37,15 @@ export { StateDetectionService } from "./StateDetectionService";
 export { IssueTracker, issueTracker } from "./IssueTracker";
 export type { IssueTrackerEventType, IssueTrackerEvent } from "./IssueTracker";
 
+// Issue Sync Services (runner → web backend)
+export {
+  syncIssuesToBackend,
+  syncSessionIssues,
+  syncSpecificIssues,
+  issueSyncService,
+} from "./IssueSyncService";
+export type { SyncIssuesResponse } from "./IssueSyncService";
+
 // Verification Services (AI self-healing)
 export { verificationService } from "./VerificationService";
 export type {
@@ -46,3 +55,34 @@ export type {
   VerificationFailedMarker,
   RunnerRestartMarker,
 } from "./VerificationService";
+
+// Unified Execution Reporting Services (new unified schema)
+export {
+  executionReportingService,
+  startRun,
+  reportAction,
+  reportActions,
+  reportScreenshot,
+  reportIssues,
+  completeRun,
+  getNextActionSequenceNumber,
+} from "./ExecutionReportingService";
+export type {
+  RunnerMetadata,
+  WorkflowMetadata,
+  ExecutionStats,
+  CoverageData,
+  ActionExecutionCreate,
+  ExecutionScreenshotCreate,
+  ExecutionIssueCreate,
+} from "./ExecutionReportingService";
+
+// Legacy Test Run Reporting Services (deprecated - use ExecutionReportingService)
+// @deprecated Use ExecutionReportingService instead
+export {
+  testRunReportingService,
+  startTestRun,
+  reportTransition,
+  completeTestRun,
+} from "./TestRunReportingService";
+export type { TransitionData } from "./TestRunReportingService";

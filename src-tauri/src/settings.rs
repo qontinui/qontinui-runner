@@ -67,11 +67,29 @@ impl Default for ClaudeApiSettings {
 }
 
 /// Complete AI settings
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettings {
     pub provider: AiProvider,
     pub claude_cli: ClaudeCliSettings,
     pub claude_api: ClaudeApiSettings,
+    /// Default iteration threshold for including video in auto-refine (0 = never)
+    #[serde(default = "default_auto_refine_video_after_iterations")]
+    pub auto_refine_video_after_iterations: u32,
+}
+
+fn default_auto_refine_video_after_iterations() -> u32 {
+    3 // Include video after 3 failed iterations by default
+}
+
+impl Default for AiSettings {
+    fn default() -> Self {
+        Self {
+            provider: AiProvider::default(),
+            claude_cli: ClaudeCliSettings::default(),
+            claude_api: ClaudeApiSettings::default(),
+            auto_refine_video_after_iterations: default_auto_refine_video_after_iterations(),
+        }
+    }
 }
 
 // ============================================================================
@@ -117,7 +135,7 @@ pub struct Settings {
 }
 
 fn default_auto_load_last_config() -> bool {
-    false
+    true
 }
 
 /// Get the settings file path in the app data directory

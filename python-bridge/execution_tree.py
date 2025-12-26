@@ -44,6 +44,7 @@ class ExecutionNode:
     metadata: dict[str, Any] = field(default_factory=dict)
     status: str = "pending"  # "pending" | "running" | "success" | "failed"
     error: str | None = None
+    _timestamp_synced: bool = False  # Whether timestamp was synced with first child
 
     @property
     def duration(self) -> float | None:
@@ -59,6 +60,12 @@ class ExecutionNode:
     def add_child(self, child: "ExecutionNode") -> "ExecutionNode":
         """Add a child node and set its parent reference.
 
+        When the first child is added to an action node, the parent's timestamp
+        is synchronized to match the child's timestamp. This ensures that parent
+        actions (like GO_TO_STATE) have timestamps that reflect when their
+        children (like Outgoing Transition) actually execute, not when the
+        parent was initially created.
+
         Args:
             child: The child node to add
 
@@ -67,6 +74,13 @@ class ExecutionNode:
         """
         child.parent = self
         self.children.append(child)
+
+        # Sync parent timestamp with first child for action nodes
+        # This ensures GO_TO_STATE has the same timestamp as its transitions
+        if not self._timestamp_synced and self.node_type == "action":
+            self.timestamp = child.timestamp
+            self._timestamp_synced = True
+
         return child
 
     def to_dict(self, include_children: bool = True) -> dict[str, Any]:

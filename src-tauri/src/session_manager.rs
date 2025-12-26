@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 // ============================================================================
 // Session Types
@@ -138,7 +138,10 @@ impl Checkpoint {
 
         // Check status strings
         let status_upper = self.status.to_uppercase();
-        if matches!(status_upper.as_str(), "COMPLETE" | "COMPLETED" | "DONE" | "FINISHED") {
+        if matches!(
+            status_upper.as_str(),
+            "COMPLETE" | "COMPLETED" | "DONE" | "FINISHED"
+        ) {
             return true;
         }
 
@@ -178,6 +181,7 @@ impl Checkpoint {
     }
 
     /// Advance to next phase
+    #[allow(dead_code)]
     pub fn advance_phase(&mut self) {
         self.current_phase += 1;
         self.sessions_spawned += 1;
@@ -194,29 +198,28 @@ impl Checkpoint {
         let path = Self::file_path(dev_logs_dir, &self.session_id);
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize checkpoint: {}", e))?;
-        fs::write(&path, json)
-            .map_err(|e| format!("Failed to write checkpoint: {}", e))?;
+        fs::write(&path, json).map_err(|e| format!("Failed to write checkpoint: {}", e))?;
         Ok(())
     }
 
     /// Load checkpoint from file
+    #[allow(dead_code)]
     pub fn load(dev_logs_dir: &Path, session_id: &str) -> Result<Self, String> {
         let path = Self::file_path(dev_logs_dir, session_id);
         if !path.exists() {
             return Err("Checkpoint file does not exist".to_string());
         }
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read checkpoint: {}", e))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse checkpoint: {}", e))
+        let content =
+            fs::read_to_string(&path).map_err(|e| format!("Failed to read checkpoint: {}", e))?;
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse checkpoint: {}", e))
     }
 
     /// Delete checkpoint file
+    #[allow(dead_code)]
     pub fn delete(dev_logs_dir: &Path, session_id: &str) -> Result<(), String> {
         let path = Self::file_path(dev_logs_dir, session_id);
         if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|e| format!("Failed to delete checkpoint: {}", e))?;
+            fs::remove_file(&path).map_err(|e| format!("Failed to delete checkpoint: {}", e))?;
         }
         Ok(())
     }
@@ -269,7 +272,7 @@ impl Default for SessionConfig {
             continuation_prompt: None,
             total_phases: 1,
             uses_gui: false,
-            timeout_seconds: 1800, // 30 minutes
+            timeout_seconds: 1800,        // 30 minutes
             stall_threshold_seconds: 300, // 5 minutes
             name: "Unnamed Session".to_string(),
             description: String::new(),
@@ -315,11 +318,7 @@ pub struct SessionEvent {
 impl Session {
     /// Create a new session
     pub fn new(id: &str, config: SessionConfig) -> Self {
-        let checkpoint = Checkpoint::new(
-            id,
-            config.session_type.clone(),
-            config.total_phases,
-        );
+        let checkpoint = Checkpoint::new(id, config.session_type.clone(), config.total_phases);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -362,14 +361,22 @@ impl Session {
     }
 
     /// Check if session is complete
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
-        matches!(self.status, SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Stopped)
-            || self.checkpoint.is_complete()
+        matches!(
+            self.status,
+            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Stopped
+        ) || self.checkpoint.is_complete()
     }
 
     /// Check if session is running
     pub fn is_running(&self) -> bool {
-        matches!(self.status, SessionStatus::Running | SessionStatus::Starting | SessionStatus::WaitingForContinuation)
+        matches!(
+            self.status,
+            SessionStatus::Running
+                | SessionStatus::Starting
+                | SessionStatus::WaitingForContinuation
+        )
     }
 }
 
@@ -423,7 +430,10 @@ impl SessionManager {
             sessions.insert(session_id.clone(), session.clone());
         }
 
-        info!("Started session {} ({:?})", session_id, session.config.session_type);
+        info!(
+            "Started session {} ({:?})",
+            session_id, session.config.session_type
+        );
         Ok(session)
     }
 
@@ -466,6 +476,7 @@ impl SessionManager {
     }
 
     /// Mark a session as completed
+    #[allow(dead_code)]
     pub async fn complete_session(&self, session_id: &str) -> Option<Session> {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
@@ -483,6 +494,7 @@ impl SessionManager {
     }
 
     /// Mark a session as failed
+    #[allow(dead_code)]
     pub async fn fail_session(&self, session_id: &str, error: &str) -> Option<Session> {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(session_id) {
@@ -519,18 +531,22 @@ impl SessionManager {
     }
 
     /// Get all running sessions
+    #[allow(dead_code)]
     pub async fn list_running_sessions(&self) -> Vec<Session> {
         let sessions = self.sessions.read().await;
-        sessions.values()
+        sessions
+            .values()
             .filter(|s| s.is_running())
             .cloned()
             .collect()
     }
 
     /// Get sessions by type
+    #[allow(dead_code)]
     pub async fn list_sessions_by_type(&self, session_type: SessionType) -> Vec<Session> {
         let sessions = self.sessions.read().await;
-        sessions.values()
+        sessions
+            .values()
             .filter(|s| s.config.session_type == session_type)
             .cloned()
             .collect()
@@ -569,11 +585,13 @@ impl SessionManager {
     }
 
     /// Get current GUI lock holder
+    #[allow(dead_code)]
     pub async fn gui_lock_holder(&self) -> Option<String> {
         self.gui_lock_holder.read().await.clone()
     }
 
     /// Check if GUI is available for a session
+    #[allow(dead_code)]
     pub async fn can_use_gui(&self, session_id: &str) -> bool {
         let lock = self.gui_lock_holder.read().await;
         match &*lock {
@@ -594,9 +612,8 @@ impl SessionManager {
     /// Persist current state for recovery after restart
     pub async fn persist_state(&self) -> Result<(), String> {
         let sessions = self.sessions.read().await;
-        let running_sessions: Vec<&Session> = sessions.values()
-            .filter(|s| s.is_running())
-            .collect();
+        let running_sessions: Vec<&Session> =
+            sessions.values().filter(|s| s.is_running()).collect();
 
         if running_sessions.is_empty() {
             // Remove state file if no running sessions
@@ -629,18 +646,23 @@ impl SessionManager {
             return Ok(vec![]);
         }
 
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read state file: {}", e))?;
+        let content =
+            fs::read_to_string(&path).map_err(|e| format!("Failed to read state file: {}", e))?;
 
         let state: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse state file: {}", e))?;
 
         let sessions: Vec<Session> = serde_json::from_value(
-            state.get("sessions").cloned().unwrap_or(serde_json::json!([]))
-        ).unwrap_or_default();
+            state
+                .get("sessions")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .unwrap_or_default();
 
         // Filter to only sessions that have restart_permitted
-        let resumable: Vec<Session> = sessions.into_iter()
+        let resumable: Vec<Session> = sessions
+            .into_iter()
             .filter(|s| s.checkpoint.restart_permitted && s.is_running())
             .collect();
 
@@ -660,11 +682,11 @@ impl SessionManager {
     }
 
     /// Clear persisted state
+    #[allow(dead_code)]
     pub fn clear_persisted_state(&self) -> Result<(), String> {
         let path = self.state_file_path();
         if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|e| format!("Failed to remove state file: {}", e))?;
+            fs::remove_file(&path).map_err(|e| format!("Failed to remove state file: {}", e))?;
         }
         Ok(())
     }
@@ -676,6 +698,7 @@ impl SessionManager {
 
 /// Result of a single Claude session execution
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct SessionExecutionResult {
     /// Whether the session completed successfully
     pub success: bool,
@@ -686,11 +709,13 @@ pub struct SessionExecutionResult {
 }
 
 /// Callback type for session output events
+#[allow(dead_code)]
 pub type OutputCallback = Box<dyn Fn(&str, &str) + Send + Sync>;
 
 /// Session executor handles running Claude sessions with checkpoint-based continuation.
 ///
 /// This is the unified execution engine used by both Prompt Library and AI Builder.
+#[allow(dead_code)]
 pub struct SessionExecutor {
     /// Session manager for state updates
     manager: Arc<SessionManager>,
@@ -700,6 +725,7 @@ pub struct SessionExecutor {
     output_callback: Option<Arc<OutputCallback>>,
 }
 
+#[allow(dead_code)]
 impl SessionExecutor {
     /// Create a new session executor
     pub fn new(manager: Arc<SessionManager>, workspace_root: String) -> Self {
@@ -711,7 +737,10 @@ impl SessionExecutor {
     }
 
     /// Set output callback for streaming results
-    pub fn with_output_callback(mut self, callback: impl Fn(&str, &str) + Send + Sync + 'static) -> Self {
+    pub fn with_output_callback(
+        mut self,
+        callback: impl Fn(&str, &str) + Send + Sync + 'static,
+    ) -> Self {
         self.output_callback = Some(Arc::new(Box::new(callback)));
         self
     }
@@ -735,7 +764,10 @@ impl SessionExecutor {
         session_id: &str,
         run_claude_fn: impl Fn(&str, &str, &str, u64) -> Result<(bool, String), String> + Send + Sync,
     ) -> Result<Session, String> {
-        let session = self.manager.get_session(session_id).await
+        let session = self
+            .manager
+            .get_session(session_id)
+            .await
             .ok_or_else(|| format!("Session {} not found", session_id))?;
 
         let config = session.config.clone();
@@ -743,7 +775,10 @@ impl SessionExecutor {
         let mut current_prompt = config.prompt.clone();
         let continuation_prompt = config.continuation_prompt.clone();
 
-        info!("Starting session execution loop for {} ({:?})", session_id, config.session_type);
+        info!(
+            "Starting session execution loop for {} ({:?})",
+            session_id, config.session_type
+        );
         self.emit(&format!("Starting session {}...", session_id), "status");
 
         let mut phase = 0u32;
@@ -766,10 +801,21 @@ impl SessionExecutor {
                 let _ = self.manager.update_session(s).await;
             }
 
-            self.emit(&format!("🚀 Running phase {} (session {})...", phase, phase_session_id), "status");
+            self.emit(
+                &format!(
+                    "🚀 Running phase {} (session {})...",
+                    phase, phase_session_id
+                ),
+                "status",
+            );
 
             // Run Claude session
-            let result = run_claude_fn(&self.workspace_root, &current_prompt, &phase_session_id, timeout);
+            let result = run_claude_fn(
+                &self.workspace_root,
+                &current_prompt,
+                &phase_session_id,
+                timeout,
+            );
 
             match result {
                 Ok((success, output)) => {
@@ -780,7 +826,9 @@ impl SessionExecutor {
                     // Check checkpoint for completion
                     if let Some(mut s) = self.manager.get_session(session_id).await {
                         // Reload checkpoint from file to get latest state
-                        if let Ok(checkpoint) = Checkpoint::load(&self.manager.dev_logs_path, session_id) {
+                        if let Ok(checkpoint) =
+                            Checkpoint::load(&self.manager.dev_logs_path, session_id)
+                        {
                             s.checkpoint = checkpoint;
                         }
 
@@ -789,7 +837,10 @@ impl SessionExecutor {
                             s.checkpoint.mark_completed();
                             let _ = self.manager.update_session(s.clone()).await;
 
-                            self.emit(&format!("✅ Session {} completed successfully", session_id), "status");
+                            self.emit(
+                                &format!("✅ Session {} completed successfully", session_id),
+                                "status",
+                            );
                             info!("Session {} completed after {} phases", session_id, phase);
 
                             return Ok(s);
@@ -802,18 +853,28 @@ impl SessionExecutor {
                             s.checkpoint.status = "completed".to_string();
                             let _ = self.manager.update_session(s.clone()).await;
 
-                            self.emit(&format!("✅ Session {} completed (max phases reached)", session_id), "status");
+                            self.emit(
+                                &format!(
+                                    "✅ Session {} completed (max phases reached)",
+                                    session_id
+                                ),
+                                "status",
+                            );
                             return Ok(s);
                         }
 
                         // Prepare continuation prompt
                         if let Some(ref cont_prompt) = continuation_prompt {
-                            current_prompt = cont_prompt.replace("{phase}", &phase.to_string())
+                            current_prompt = cont_prompt
+                                .replace("{phase}", &phase.to_string())
                                 .replace("{output}", &output);
                         }
 
                         s.status = SessionStatus::WaitingForContinuation;
-                        s.log_event("phase_completed", &format!("Phase {} completed, continuing...", phase));
+                        s.log_event(
+                            "phase_completed",
+                            &format!("Phase {} completed, continuing...", phase),
+                        );
                         let _ = self.manager.update_session(s).await;
                     }
                 }

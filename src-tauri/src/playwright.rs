@@ -92,6 +92,62 @@ pub struct NetworkRequest {
     pub duration_ms: u64,
 }
 
+/// Result of verifying a single success criterion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriteriaResult {
+    /// The criterion text
+    pub criterion: String,
+    /// Whether it was verified as met
+    pub verified: bool,
+    /// Evidence supporting the verification
+    #[serde(default)]
+    pub evidence: Option<String>,
+}
+
+/// Workflow verification status - tracks whether the workflow objective was achieved
+/// (separate from whether the script executed successfully)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowStatus {
+    /// The workflow objective (copied from script for reference)
+    #[serde(default)]
+    pub objective: Option<String>,
+
+    /// Did the script execute without errors? (For automation, expected to be true)
+    #[serde(default)]
+    pub script_passed: bool,
+
+    /// Explanatory note about script_passed for AI consumption
+    #[serde(default)]
+    pub script_passed_note: Option<String>,
+
+    /// Was the workflow objective verified as successful?
+    /// - None = not yet verified (pending)
+    /// - Some(true) = objective confirmed achieved
+    /// - Some(false) = objective confirmed NOT achieved
+    #[serde(default)]
+    pub objective_verified: Option<bool>,
+
+    /// How was the objective verified?
+    #[serde(default)]
+    pub verification_method: Option<String>, // "automatic", "ai_analysis", "manual", "pending"
+
+    /// Notes from verification
+    #[serde(default)]
+    pub verification_notes: Option<String>,
+
+    /// Success criteria from the script
+    #[serde(default)]
+    pub success_criteria: Vec<String>,
+
+    /// Which criteria were confirmed (if verification was performed)
+    #[serde(default)]
+    pub criteria_results: Vec<CriteriaResult>,
+
+    /// Hints for manual/AI verification
+    #[serde(default)]
+    pub verification_hints: Vec<String>,
+}
+
 /// Result of a Playwright test execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaywrightResult {
@@ -115,6 +171,9 @@ pub struct PlaywrightResult {
     /// Paths to screenshots taken
     #[serde(default)]
     pub screenshots: Vec<String>,
+    /// Paths to video recordings
+    #[serde(default)]
+    pub video_paths: Vec<String>,
     /// Path to trace file (if enabled)
     #[serde(default)]
     pub trace_path: Option<String>,
@@ -123,6 +182,10 @@ pub struct PlaywrightResult {
     /// Structured output for AI analysis
     #[serde(default)]
     pub structured_output: Option<StructuredTestOutput>,
+    /// Workflow verification status (for AI workflows)
+    /// Separates "script passed" from "workflow objective achieved"
+    #[serde(default)]
+    pub workflow_status: Option<WorkflowStatus>,
 }
 
 /// A saved Playwright script
@@ -177,6 +240,17 @@ pub struct PlaywrightScript {
     /// Last execution result (cached)
     #[serde(default)]
     pub last_result: Option<PlaywrightResult>,
+    /// Workflow objective - what this script aims to accomplish
+    /// Used for AI to verify success beyond just "test passed"
+    #[serde(default)]
+    pub workflow_objective: Option<String>,
+    /// Success criteria - specific things to verify after script passes
+    #[serde(default)]
+    pub success_criteria: Vec<String>,
+    /// Whether this script is used as workflow automation (not traditional testing)
+    /// Automation scripts are expected to pass; verification is what matters
+    #[serde(default)]
+    pub is_workflow_automation: bool,
 }
 
 fn default_timeout_seconds() -> u32 {
@@ -211,6 +285,9 @@ impl PlaywrightScript {
             created_at: now.clone(),
             modified_at: now,
             last_result: None,
+            workflow_objective: None,
+            success_criteria: Vec::new(),
+            is_workflow_automation: false,
         }
     }
 
@@ -248,6 +325,9 @@ impl PlaywrightScript {
             created_at: now.clone(),
             modified_at: now,
             last_result: None,
+            workflow_objective: None,
+            success_criteria: Vec::new(),
+            is_workflow_automation: false,
         }
     }
 }
@@ -913,6 +993,31 @@ pub fn run_script(
         page_snapshot,
     };
 
+    // Populate workflow_status if this is workflow automation
+    let workflow_status = if script.is_workflow_automation || script.workflow_objective.is_some() {
+        Some(WorkflowStatus {
+            objective: script.workflow_objective.clone(),
+            script_passed: passed,
+            script_passed_note: Some(
+                "Script execution succeeded. This is EXPECTED for workflow automation. \
+                 Script success does NOT mean workflow success."
+                    .to_string(),
+            ),
+            objective_verified: None, // Pending verification
+            verification_method: Some("pending".to_string()),
+            verification_notes: None,
+            success_criteria: script.success_criteria.clone(),
+            criteria_results: vec![],
+            verification_hints: vec![
+                "Check the final screenshot to verify the objective was achieved".to_string(),
+                "Look at the page snapshot YAML for expected elements".to_string(),
+                "Verify there are no error messages or toasts".to_string(),
+            ],
+        })
+    } else {
+        None
+    };
+
     let result = PlaywrightResult {
         passed,
         tests_passed,
@@ -922,9 +1027,11 @@ pub fn run_script(
         error,
         report_path: Some(output_dir.to_str().unwrap().to_string()),
         screenshots,
+        video_paths: find_video_files(&output_dir),
         trace_path: find_trace_file(&output_dir),
         executed_at,
         structured_output: Some(structured_output),
+        workflow_status,
     };
 
     // Save result to script's last_result
@@ -995,6 +1102,7 @@ pub fn run_script(
         &console_output,
         &spec_tuples,
         page_snapshot,
+        result.workflow_status.clone(),
     );
 
     Ok(result)
@@ -1190,6 +1298,33 @@ fn find_trace_file(output_dir: &PathBuf) -> Option<String> {
     }
 
     find_in_dir(output_dir)
+}
+
+/// Find video files in output directory (recursively checks subdirs)
+fn find_video_files(output_dir: &PathBuf) -> Vec<String> {
+    let mut videos = Vec::new();
+
+    fn find_in_dir(dir: &PathBuf, videos: &mut Vec<String>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Recursively check subdirectories
+                    find_in_dir(&path, videos);
+                } else if let Some(ext) = path.extension() {
+                    // Playwright records videos as .webm files
+                    if ext == "webm" || ext == "mp4" {
+                        if let Some(path_str) = path.to_str() {
+                            videos.push(path_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    find_in_dir(output_dir, &mut videos);
+    videos
 }
 
 #[cfg(test)]

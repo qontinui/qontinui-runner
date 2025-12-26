@@ -445,6 +445,15 @@ class EventTranslator:
                 frontend_data["debug"] = data.get("debug")
                 print("[EventTranslator] Including debug data", file=sys.stderr)
 
+            # Pass through monitor_index from library (which monitor was captured)
+            # This comes from the StateImage's monitors config via the qontinui library
+            if "monitor_index" in data:
+                frontend_data["monitor_index"] = data.get("monitor_index")
+                print(
+                    f"[EventTranslator] Including monitor_index={data.get('monitor_index')}",
+                    file=sys.stderr,
+                )
+
             # Debug logging
             print(
                 f"[EventTranslator] Emitting IMAGE_RECOGNITION: found={frontend_data['found']}, confidence={frontend_data['confidence']}, screenshot_path={screenshot_path is not None}, screenshot_base64={data.get('screenshot_base64') is not None}, visual_debug={data.get('visual_debug_image') is not None}",

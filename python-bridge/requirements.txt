@@ -3,6 +3,7 @@ Pillow>=9.0.0  # For screenshot handling
 websockets>=12.0  # For WebSocket client communication with qontinui-web
 requests>=2.31.0  # For HTTP authentication
 pynput>=1.7.6  # For cross-platform input monitoring
+httpx>=0.27.0  # For async HTTP requests (test results submission)
 
 # Note: The actual Qontinui library should be installed from the parent directory
 # pip install -e ../../qontinui
