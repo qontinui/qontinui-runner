@@ -14,7 +14,7 @@ export interface ActionLogEntry {
   duration?: number | null;
   status: string;
   error?: string | null;
-  metadata?: any;
+  metadata?: Record<string, unknown> | null;
 }
 
 export interface AiOutputLine {

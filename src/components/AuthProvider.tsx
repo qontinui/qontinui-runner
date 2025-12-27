@@ -206,6 +206,16 @@ export function AuthProvider({ children }: AuthProviderProps) {
       return;
     }
 
+    // Skip auto-login if credentials are not configured
+    if (!DEV_AUTO_LOGIN.email || !DEV_AUTO_LOGIN.password) {
+      console.log("[AUTH] Dev mode: No dev credentials configured, skipping auto-login");
+      console.log(
+        "[AUTH] Dev mode: Set VITE_DEV_EMAIL and VITE_DEV_PASSWORD in .env to enable auto-login",
+      );
+      setDevAutoLoginPending(false);
+      return;
+    }
+
     // Auto-login in development
     console.log("[AUTH] Dev mode: Not authenticated, attempting auto-login...");
     hasAttemptedDevLogin.current = true;

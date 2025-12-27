@@ -273,20 +273,6 @@ pub fn get_categories() -> Vec<String> {
     categories
 }
 
-/// Get all unique tags
-pub fn get_all_tags() -> Vec<String> {
-    let library = load_scriptlet_library();
-    let mut tags: Vec<String> = library
-        .scriptlets
-        .iter()
-        .flat_map(|s| s.tags.clone())
-        .collect();
-
-    tags.sort();
-    tags.dedup();
-    tags
-}
-
 /// Search scriptlets by query (searches name, content, category, and tags)
 pub fn search_scriptlets(query: &str) -> Vec<Scriptlet> {
     let query_lower = query.to_lowercase();
