@@ -94,3 +94,7 @@ src-tauri/binaries/*.exe
 playwright-user-scripts/
 test-results/
 test.spec.ts
+
+# Debug/test screenshots
+web-extraction*.png
+*.screenshot.png

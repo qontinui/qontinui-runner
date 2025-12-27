@@ -99,7 +99,7 @@ class ExecutionReportingServiceImpl {
     runName: string,
     runnerMetadata: RunnerMetadata,
     workflowMetadata?: WorkflowMetadata,
-    configuration?: Record<string, unknown>
+    configuration?: Record<string, unknown>,
   ): Promise<string | null> {
     if (!projectId) {
       console.warn("[ExecutionReporting] No project ID provided, skipping run creation");
@@ -179,7 +179,7 @@ class ExecutionReportingServiceImpl {
    */
   async reportScreenshot(
     screenshot: ExecutionScreenshotCreate,
-    imageData: Uint8Array
+    imageData: Uint8Array,
   ): Promise<ExecutionScreenshotResponse | null> {
     if (!this.activeRunId) {
       console.warn("[ExecutionReporting] No active run for screenshot upload");
@@ -188,7 +188,7 @@ class ExecutionReportingServiceImpl {
 
     try {
       console.log(
-        `[ExecutionReporting] Uploading screenshot ${screenshot.screenshot_id} for run ${this.activeRunId}`
+        `[ExecutionReporting] Uploading screenshot ${screenshot.screenshot_id} for run ${this.activeRunId}`,
       );
 
       const response = await invoke<ExecutionScreenshotResponse>("upload_execution_screenshot", {
@@ -217,7 +217,7 @@ class ExecutionReportingServiceImpl {
 
     try {
       console.log(
-        `[ExecutionReporting] Reporting ${issues.length} issues for run ${this.activeRunId}`
+        `[ExecutionReporting] Reporting ${issues.length} issues for run ${this.activeRunId}`,
       );
 
       const response = await invoke<ExecutionIssueResponse>("report_execution_issues", {
@@ -243,7 +243,7 @@ class ExecutionReportingServiceImpl {
     status: RunStatus,
     stats?: ExecutionStats,
     coverage?: CoverageData,
-    errorMessage?: string
+    errorMessage?: string,
   ): Promise<void> {
     if (!this.activeRunId) {
       console.warn("[ExecutionReporting] No active run to complete");
@@ -254,9 +254,7 @@ class ExecutionReportingServiceImpl {
       // Flush any remaining actions
       await this.flushActions();
 
-      console.log(
-        `[ExecutionReporting] Completing run ${this.activeRunId} with status: ${status}`
-      );
+      console.log(`[ExecutionReporting] Completing run ${this.activeRunId} with status: ${status}`);
 
       const finalStats = stats || this.buildExecutionStats();
       const finalCoverage = coverage || this.buildCoverageData();
@@ -275,7 +273,7 @@ class ExecutionReportingServiceImpl {
       });
 
       console.log(
-        `[ExecutionReporting] Run completed: ${response.status}, duration: ${response.duration_seconds}s`
+        `[ExecutionReporting] Run completed: ${response.status}, duration: ${response.duration_seconds}s`,
       );
 
       // Reset state
@@ -472,7 +470,7 @@ class ExecutionReportingServiceImpl {
 
     try {
       console.log(
-        `[ExecutionReporting] Reporting ${actions.length} actions for run ${this.activeRunId}`
+        `[ExecutionReporting] Reporting ${actions.length} actions for run ${this.activeRunId}`,
       );
 
       const response = await invoke<ActionExecutionResponse>("report_action_executions", {
@@ -498,9 +496,12 @@ export const executionReportingService = new ExecutionReportingServiceImpl();
 
 // Export helper functions for direct use
 export const startRun = executionReportingService.startRun.bind(executionReportingService);
-export const reportActions = executionReportingService.reportActions.bind(executionReportingService);
+export const reportActions =
+  executionReportingService.reportActions.bind(executionReportingService);
 export const reportAction = executionReportingService.reportAction.bind(executionReportingService);
-export const reportScreenshot = executionReportingService.reportScreenshot.bind(executionReportingService);
+export const reportScreenshot =
+  executionReportingService.reportScreenshot.bind(executionReportingService);
 export const reportIssues = executionReportingService.reportIssues.bind(executionReportingService);
 export const completeRun = executionReportingService.completeRun.bind(executionReportingService);
-export const getNextActionSequenceNumber = executionReportingService.getNextActionSequenceNumber.bind(executionReportingService);
+export const getNextActionSequenceNumber =
+  executionReportingService.getNextActionSequenceNumber.bind(executionReportingService);

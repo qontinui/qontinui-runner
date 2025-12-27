@@ -77,8 +77,4 @@ export type {
 export { DEFAULT_SCRIPT_VALUES } from "./playwright";
 
 // Scriptlet types
-export type {
-  Scriptlet,
-  CreateScriptletRequest,
-  UpdateScriptletRequest,
-} from "./scriptlet";
+export type { Scriptlet, CreateScriptletRequest, UpdateScriptletRequest } from "./scriptlet";

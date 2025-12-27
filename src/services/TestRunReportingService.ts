@@ -143,7 +143,9 @@ class TestRunReportingServiceImpl {
   private activeProjectId: string | null = null;
   private activeWorkflowId: number | null = null;
   private pendingTransitions: TransitionData[] = [];
-  private pendingRecognitions: Array<ImageRecognitionData & { action_id: string; sequence_number: number }> = [];
+  private pendingRecognitions: Array<
+    ImageRecognitionData & { action_id: string; sequence_number: number }
+  > = [];
   private transitionSequenceNumber = 0;
   private recognitionSequenceNumber = 0;
   private flushTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -173,7 +175,7 @@ class TestRunReportingServiceImpl {
       totalStates?: number;
       totalTransitions?: number;
       description?: string;
-    }
+    },
   ): Promise<string | null> {
     if (!projectId) {
       console.warn("[TestRunReporting] No project ID provided, skipping test run creation");
@@ -300,7 +302,7 @@ class TestRunReportingServiceImpl {
       await this.flushRecognitions();
 
       console.log(
-        `[TestRunReporting] Completing test run ${this.activeRunId} with status: ${success ? "completed" : "failed"}`
+        `[TestRunReporting] Completing test run ${this.activeRunId} with status: ${success ? "completed" : "failed"}`,
       );
 
       const input: CompleteTestRunInput = {
@@ -322,7 +324,7 @@ class TestRunReportingServiceImpl {
       const response = await invoke<CompleteTestRunResponse>("complete_test_run", { input });
 
       console.log(
-        `[TestRunReporting] Test run completed: ${response.status}, duration: ${response.duration_seconds}s`
+        `[TestRunReporting] Test run completed: ${response.status}, duration: ${response.duration_seconds}s`,
       );
 
       // Reset state
@@ -435,7 +437,7 @@ class TestRunReportingServiceImpl {
 
     try {
       console.log(
-        `[TestRunReporting] Reporting ${transitions.length} transitions for run ${this.activeRunId}`
+        `[TestRunReporting] Reporting ${transitions.length} transitions for run ${this.activeRunId}`,
       );
 
       const response = await invoke<ReportTransitionsResponse>("report_test_transitions", {
@@ -479,7 +481,7 @@ class TestRunReportingServiceImpl {
 
     try {
       console.log(
-        `[TestRunReporting] Reporting ${recognitions.length} recognitions for run ${this.activeRunId}`
+        `[TestRunReporting] Reporting ${recognitions.length} recognitions for run ${this.activeRunId}`,
       );
 
       const input: ReportRecognitionsInput = {
@@ -511,10 +513,14 @@ export const testRunReportingService = new TestRunReportingServiceImpl();
 /** @deprecated Use startRun from ExecutionReportingService instead */
 export const startTestRun = testRunReportingService.startTestRun.bind(testRunReportingService);
 /** @deprecated Use reportAction/reportActions from ExecutionReportingService instead */
-export const reportTransition = testRunReportingService.reportTransition.bind(testRunReportingService);
+export const reportTransition =
+  testRunReportingService.reportTransition.bind(testRunReportingService);
 /** @deprecated Use reportAction/reportActions from ExecutionReportingService instead */
-export const reportImageRecognition = testRunReportingService.reportImageRecognition.bind(testRunReportingService);
+export const reportImageRecognition =
+  testRunReportingService.reportImageRecognition.bind(testRunReportingService);
 /** @deprecated Use getNextActionSequenceNumber from ExecutionReportingService instead */
-export const getNextTransitionSequenceNumber = testRunReportingService.getNextTransitionSequenceNumber.bind(testRunReportingService);
+export const getNextTransitionSequenceNumber =
+  testRunReportingService.getNextTransitionSequenceNumber.bind(testRunReportingService);
 /** @deprecated Use completeRun from ExecutionReportingService instead */
-export const completeTestRun = testRunReportingService.completeTestRun.bind(testRunReportingService);
+export const completeTestRun =
+  testRunReportingService.completeTestRun.bind(testRunReportingService);

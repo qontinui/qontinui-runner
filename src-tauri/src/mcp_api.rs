@@ -1299,11 +1299,11 @@ pub struct ExtractionStatusResponse {
     pub stats: Option<ExtractionStats>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ExtractionStats {
     pub states_found: u32,
     pub transitions_found: u32,
-    pub pages_extracted: u32,
+    pub warnings: u32,
     pub errors: u32,
 }
 
