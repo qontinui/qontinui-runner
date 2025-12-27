@@ -8,7 +8,7 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Puzzle, Search, ChevronDown, X, FolderOpen } from "lucide-react";
+import { Puzzle, Search, ChevronDown, X } from "lucide-react";
 import type { Scriptlet } from "../types";
 
 const API_BASE = "http://localhost:9876";
@@ -203,7 +203,7 @@ export function ScriptletSelector({
             <div className="px-3 py-1.5 text-xs font-medium text-muted-foreground bg-muted/30 sticky top-0">
               {category}
             </div>
-            {items.map((scriptlet, idx) => {
+            {items.map((scriptlet) => {
               const globalIndex = filteredScriptlets.indexOf(scriptlet);
               return (
                 <button

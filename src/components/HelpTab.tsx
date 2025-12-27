@@ -8,7 +8,7 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Keyboard, HelpCircle, Command } from "lucide-react";
+import { Keyboard, HelpCircle } from "lucide-react";
 
 type HelpSubPage = "shortcuts";
 

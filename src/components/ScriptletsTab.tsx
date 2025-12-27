@@ -13,7 +13,6 @@ import {
   Edit3,
   Save,
   X,
-  ChevronDown,
   ChevronUp,
   Sparkles,
   Tag,
@@ -211,7 +210,7 @@ export function ScriptletsTab({ onLog, aiOutputLines = [] }: ScriptletsTabProps)
       await navigator.clipboard.writeText(content);
       setCopiedId(id);
       setTimeout(() => setCopiedId(null), 2000);
-    } catch (error) {
+    } catch {
       onLog("error", "Failed to copy to clipboard");
     }
   };

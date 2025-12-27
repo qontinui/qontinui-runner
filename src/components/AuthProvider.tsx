@@ -35,10 +35,10 @@ interface AuthProviderProps {
 
 const TOKEN_REFRESH_INTERVAL = 14 * 60 * 1000; // 14 minutes (tokens expire in 15 minutes)
 
-// Development auto-login credentials
+// Development auto-login credentials (loaded from environment variables)
 const DEV_AUTO_LOGIN = {
-  email: "josh@qontinui.io",
-  password: "admin123",
+  email: import.meta.env.VITE_DEV_EMAIL || "",
+  password: import.meta.env.VITE_DEV_PASSWORD || "",
 };
 
 export function AuthProvider({ children }: AuthProviderProps) {
