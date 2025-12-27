@@ -878,13 +878,22 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
       try {
         const response = await fetch("http://localhost:9876/workflow/resumable");
         const result = await response.json();
-        if (result.success && result.data?.has_resumable) {
-          setResumableWorkflow({
-            name: result.data.name || "Unknown Workflow",
-            currentPhase: result.data.current_phase || 0,
-            totalPhases: result.data.total_phases || 0,
-            status: result.data.status || "unknown",
-          });
+        if (result.success) {
+          // Update isRunning from the API (more reliable than local state)
+          if (result.data?.is_running !== undefined) {
+            setIsRunning(result.data.is_running);
+          }
+          // Only show Continue if there's a resumable workflow AND nothing is running
+          if (result.data?.has_resumable && !result.data?.is_running) {
+            setResumableWorkflow({
+              name: result.data.name || "Unknown Workflow",
+              currentPhase: result.data.current_phase || 0,
+              totalPhases: result.data.total_phases || 0,
+              status: result.data.status || "unknown",
+            });
+          } else {
+            setResumableWorkflow(null);
+          }
         } else {
           setResumableWorkflow(null);
         }
@@ -897,8 +906,8 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     // Check on mount
     checkResumableWorkflow();
 
-    // Check periodically (every 30 seconds)
-    const interval = setInterval(checkResumableWorkflow, 30000);
+    // Check periodically (every 5 seconds for better responsiveness)
+    const interval = setInterval(checkResumableWorkflow, 5000);
 
     return () => clearInterval(interval);
   }, []);

@@ -39,6 +39,14 @@ pub struct WorkflowConfig {
     /// Prompt to use when spawning continuation sessions
     #[serde(default)]
     pub continuation_prompt: String,
+    /// Auto-continue workflow on runner restart (default: true for prompts)
+    /// Can be toggled during workflow execution via API
+    #[serde(default = "default_auto_continue")]
+    pub auto_continue: bool,
+}
+
+fn default_auto_continue() -> bool {
+    true // Prompts default to auto-continue enabled
 }
 
 fn default_phase_field() -> String {

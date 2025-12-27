@@ -34,6 +34,7 @@ interface WorkflowConfig {
   completion_value: number;
   stall_threshold_secs: number;
   continuation_prompt: string;
+  auto_continue: boolean; // Default: true - auto-continue on runner restart
 }
 
 // Types for the prompt library

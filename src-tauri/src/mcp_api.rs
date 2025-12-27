@@ -5013,6 +5013,7 @@ async fn start_session(
                     completion_value,
                     started_at: chrono::Utc::now().to_rfc3339(),
                     cross_session_count: 0,
+                    auto_continue: true, // Default to true for prompts
                 };
                 if let Err(e) = save_active_workflow_config(&active_config) {
                     warn!("Failed to save active workflow config: {}", e);
@@ -5268,6 +5269,13 @@ struct ActiveWorkflowConfig {
     started_at: String,
     /// Number of cross-session continuations so far
     cross_session_count: u32,
+    /// Auto-continue on runner restart (default: true for prompts)
+    #[serde(default = "default_auto_continue")]
+    auto_continue: bool,
+}
+
+fn default_auto_continue() -> bool {
+    true
 }
 
 /// Get the path to the active workflow config file
@@ -5342,6 +5350,8 @@ fn update_active_workflow_cross_session_count(count: u32) {
 struct ResumableWorkflowInfo {
     /// Whether a resumable workflow exists
     has_resumable: bool,
+    /// Whether an AI workflow is currently running (prevents Continue button)
+    is_running: bool,
     /// Workflow name (if resumable)
     name: Option<String>,
     /// Session type
@@ -5360,14 +5370,20 @@ struct ResumableWorkflowInfo {
 
 /// Get information about any resumable workflow
 async fn get_resumable_workflow(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<ResumableWorkflowInfo>> {
+    // Check if AI is currently running
+    let is_running = state
+        .ai_analysis_running
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     // Load the active workflow config
     let config = match load_active_workflow_config() {
         Some(c) => c,
         None => {
             return Json(ApiResponse::success(ResumableWorkflowInfo {
                 has_resumable: false,
+                is_running,
                 name: None,
                 session_type: None,
                 current_phase: None,
@@ -5384,6 +5400,7 @@ async fn get_resumable_workflow(
     if !check_workflow_restart_permitted(&checkpoint_path) {
         return Json(ApiResponse::success(ResumableWorkflowInfo {
             has_resumable: false,
+            is_running,
             name: None,
             session_type: None,
             current_phase: None,
@@ -5405,6 +5422,7 @@ async fn get_resumable_workflow(
             delete_active_workflow_config();
             return Json(ApiResponse::success(ResumableWorkflowInfo {
                 has_resumable: false,
+                is_running,
                 name: None,
                 session_type: None,
                 current_phase: None,
@@ -5427,6 +5445,7 @@ async fn get_resumable_workflow(
 
         return Json(ApiResponse::success(ResumableWorkflowInfo {
             has_resumable: true,
+            is_running,
             name: Some(config.name),
             session_type: Some(config.session_type),
             current_phase: Some(current_phase),
@@ -5440,6 +5459,7 @@ async fn get_resumable_workflow(
     // No valid checkpoint
     Json(ApiResponse::success(ResumableWorkflowInfo {
         has_resumable: false,
+        is_running,
         name: None,
         session_type: None,
         current_phase: None,
@@ -5574,8 +5594,74 @@ async fn set_auto_continue_setting(
     }
 }
 
+/// Response for per-workflow auto-continue setting
+#[derive(Debug, Serialize)]
+struct WorkflowAutoContinueResponse {
+    enabled: bool,
+    workflow_name: Option<String>,
+}
+
+/// Get the auto-continue setting for the active workflow
+async fn get_workflow_auto_continue() -> Json<ApiResponse<WorkflowAutoContinueResponse>> {
+    match load_active_workflow_config() {
+        Some(config) => Json(ApiResponse::success(WorkflowAutoContinueResponse {
+            enabled: config.auto_continue,
+            workflow_name: Some(config.name),
+        })),
+        None => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some("No active workflow found".to_string()),
+        }),
+    }
+}
+
+/// Set the auto-continue setting for the active workflow
+/// This can be called during workflow execution to toggle auto-continue on/off
+async fn set_workflow_auto_continue(
+    Json(body): Json<SetAutoContinueRequest>,
+) -> Json<ApiResponse<WorkflowAutoContinueResponse>> {
+    let config = match load_active_workflow_config() {
+        Some(c) => c,
+        None => {
+            return Json(ApiResponse {
+                success: false,
+                data: None,
+                error: Some("No active workflow found".to_string()),
+            });
+        }
+    };
+
+    // Update the auto_continue field
+    let updated_config = ActiveWorkflowConfig {
+        auto_continue: body.enabled,
+        ..config
+    };
+
+    // Save the updated config
+    match save_active_workflow_config(&updated_config) {
+        Ok(_) => {
+            info!(
+                "Workflow '{}' auto-continue updated to: {}",
+                updated_config.name, body.enabled
+            );
+            Json(ApiResponse::success(WorkflowAutoContinueResponse {
+                enabled: body.enabled,
+                workflow_name: Some(updated_config.name),
+            }))
+        }
+        Err(e) => Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some(format!("Failed to update workflow auto-continue: {}", e)),
+        }),
+    }
+}
+
 /// Check the active workflow checkpoint for restart_permitted flag
-/// Returns true if restart is permitted (or if the flag is absent)
+/// Returns (should_resume, restart_permitted_value)
+/// - Always resumes incomplete workflows (completed=false) regardless of restart_permitted
+/// - restart_permitted is now informational only (legacy behavior was too strict)
 fn check_workflow_restart_permitted(checkpoint_path: &std::path::Path) -> bool {
     if !checkpoint_path.exists() {
         return false;
@@ -5583,11 +5669,33 @@ fn check_workflow_restart_permitted(checkpoint_path: &std::path::Path) -> bool {
     match std::fs::read_to_string(checkpoint_path) {
         Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
             Ok(json) => {
-                // If restart_permitted is explicitly false, don't resume
-                // If absent or true, resume
-                json.get("restart_permitted")
+                // Check if workflow is complete - if so, don't resume
+                let is_complete = json
+                    .get("completed")
                     .and_then(|v| v.as_bool())
-                    .unwrap_or(true)
+                    .unwrap_or(false);
+
+                if is_complete {
+                    info!("Workflow is marked as complete, not resuming");
+                    return false;
+                }
+
+                // Check restart_permitted flag (informational)
+                let restart_permitted = json
+                    .get("restart_permitted")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+
+                if !restart_permitted {
+                    // Log warning but still resume - incomplete workflows should always resume
+                    warn!(
+                        "restart_permitted=false but workflow is incomplete (completed=false). \
+                         Resuming anyway - set completed=true to stop a workflow."
+                    );
+                }
+
+                // Always resume incomplete workflows
+                true
             }
             Err(_) => false,
         },
@@ -6159,13 +6267,29 @@ pub fn create_router(
 
         // Check for active workflows to resume after runner restart
         // This runs after session restore, with a small additional delay
-        // Only auto-resume if the setting is enabled
+        // Auto-resume if:
+        // 1. Global auto-continue setting is enabled, AND
+        // 2. The specific workflow has auto_continue=true (default for prompts)
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         if settings::get_auto_continue_ai_workflow() {
-            info!("Auto-continue is enabled, checking for workflows to resume...");
-            resume_active_workflow_on_startup(state_for_restore).await;
+            // Check if the active workflow has auto_continue enabled
+            if let Some(config) = load_active_workflow_config() {
+                if config.auto_continue {
+                    info!(
+                        "Auto-continue is enabled (global + workflow), checking for workflows to resume..."
+                    );
+                    resume_active_workflow_on_startup(state_for_restore).await;
+                } else {
+                    info!(
+                        "Workflow '{}' has auto_continue=false, skipping automatic resume",
+                        config.name
+                    );
+                }
+            } else {
+                info!("No active workflow config found, nothing to resume");
+            }
         } else {
-            info!("Auto-continue is disabled, skipping automatic workflow resume");
+            info!("Global auto-continue is disabled, skipping automatic workflow resume");
         }
     });
 
@@ -6267,9 +6391,18 @@ pub fn create_router(
         // Workflow resume routes
         .route("/workflow/resumable", get(get_resumable_workflow))
         .route("/workflow/resume", post(resume_workflow))
-        // Auto-continue setting routes
+        // Auto-continue setting routes (global)
         .route("/workflow/auto-continue", get(get_auto_continue_setting))
         .route("/workflow/auto-continue", post(set_auto_continue_setting))
+        // Per-workflow auto-continue setting routes
+        .route(
+            "/workflow/active/auto-continue",
+            get(get_workflow_auto_continue),
+        )
+        .route(
+            "/workflow/active/auto-continue",
+            post(set_workflow_auto_continue),
+        )
         // Backup and Restore routes
         .route("/backup", get(create_backup_handler))
         .route("/backup/info", post(get_backup_info_handler))
