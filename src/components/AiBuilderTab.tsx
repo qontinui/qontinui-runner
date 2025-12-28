@@ -45,7 +45,7 @@ import {
   AlertTriangle,
   RotateCcw,
 } from "lucide-react";
-import { useExecution } from "../contexts";
+import { useExecution, useAutoContinue } from "../contexts";
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
 import CollapsiblePanel from "./CollapsiblePanel";
 
@@ -106,6 +106,7 @@ interface ExecutionStep {
   type: "workflow" | "state" | "playwright" | "prompt";
   name: string;
   takeScreenshot: boolean;
+  screenshotDelay?: number; // Delay in seconds before taking screenshot (default 0)
   playwrightScriptId?: string;
   playwrightScriptContent?: string;
   playwrightTargetUrl?: string;
@@ -708,8 +709,13 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     status: string;
   } | null>(null);
   const [isResuming, setIsResuming] = useState(false);
-  const [autoContinueEnabled, setAutoContinueEnabled] = useState(false);
-  const [autoContinueLoading, setAutoContinueLoading] = useState(false);
+
+  // Auto-continue settings (from context - syncs across all components)
+  const {
+    enabled: autoContinueEnabled,
+    loading: autoContinueLoading,
+    toggle: toggleAutoContinue,
+  } = useAutoContinue();
 
   // Claude output log (real-time visibility)
   // Note: These values are polled but not displayed in UI yet
@@ -883,6 +889,7 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
           if (result.data?.is_running !== undefined) {
             setIsRunning(result.data.is_running);
           }
+          // Note: auto_continue_enabled is now managed by AutoContinueContext
           // Only show Continue if there's a resumable workflow AND nothing is running
           if (result.data?.has_resumable && !result.data?.is_running) {
             setResumableWorkflow({
@@ -943,42 +950,6 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
       });
     } finally {
       setIsResuming(false);
-    }
-  };
-
-  // Fetch auto-continue setting on mount
-  useEffect(() => {
-    const fetchAutoContinueSetting = async () => {
-      try {
-        const response = await fetch("http://localhost:9876/workflow/auto-continue");
-        const result = await response.json();
-        if (result.success && result.data) {
-          setAutoContinueEnabled(result.data.enabled);
-        }
-      } catch (error) {
-        console.error("Failed to fetch auto-continue setting:", error);
-      }
-    };
-    fetchAutoContinueSetting();
-  }, []);
-
-  // Handler to toggle auto-continue setting
-  const handleToggleAutoContinue = async () => {
-    setAutoContinueLoading(true);
-    try {
-      const response = await fetch("http://localhost:9876/workflow/auto-continue", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ enabled: !autoContinueEnabled }),
-      });
-      const result = await response.json();
-      if (result.success && result.data) {
-        setAutoContinueEnabled(result.data.enabled);
-      }
-    } catch (error) {
-      console.error("Failed to toggle auto-continue setting:", error);
-    } finally {
-      setAutoContinueLoading(false);
     }
   };
 
@@ -1125,6 +1096,7 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
       type,
       name,
       takeScreenshot: type !== "prompt", // Screenshots don't apply to prompts
+      screenshotDelay: 0, // Default delay in seconds
       playwrightScriptId: scriptId,
       playwrightScriptContent: scriptContent,
       playwrightTargetUrl: scriptTargetUrl,
@@ -1146,6 +1118,14 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
   const toggleStepScreenshot = (stepId: string) => {
     setExecutionSteps((prev) =>
       prev.map((s) => (s.id === stepId ? { ...s, takeScreenshot: !s.takeScreenshot } : s)),
+    );
+    setHasUnsavedChanges(true);
+  };
+
+  // Update screenshot delay for a step
+  const updateScreenshotDelay = (stepId: string, delay: number) => {
+    setExecutionSteps((prev) =>
+      prev.map((s) => (s.id === stepId ? { ...s, screenshotDelay: Math.max(0, delay) } : s)),
     );
     setHasUnsavedChanges(true);
   };
@@ -1188,9 +1168,13 @@ Execute the workflow using the MCP tool:
 mcp__qontinui__run_workflow with workflow_name="${step.name}", timeout_seconds=300
 \`\`\``;
           if (step.takeScreenshot) {
+            const delayText =
+              step.screenshotDelay && step.screenshotDelay > 0
+                ? ` Wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before taking the screenshot to allow the UI to settle.`
+                : "";
             instruction += `
 
-After the workflow completes, take a screenshot to capture the result.`;
+After the workflow completes, take a screenshot to capture the result.${delayText}`;
           }
           return instruction;
         } else if (step.type === "playwright") {
@@ -1230,9 +1214,13 @@ $body = @{ script_content = @"
 Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}" -Method PUT -ContentType "application/json" -Body $body
 \`\`\``;
           if (step.takeScreenshot) {
+            const delayText =
+              step.screenshotDelay && step.screenshotDelay > 0
+                ? ` Wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before taking the screenshot to allow the UI to settle.`
+                : "";
             instruction += `
 
-After the test completes, take an additional screenshot to capture the current application state.`;
+After the test completes, take an additional screenshot to capture the current application state.${delayText}`;
           }
           return instruction;
         } else if (step.type === "prompt") {
@@ -1921,17 +1909,39 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
                     {/* Screenshot toggle (not applicable to prompts) */}
                     {step.type !== "prompt" && (
-                      <button
-                        onClick={() => toggleStepScreenshot(step.id)}
-                        className={`p-1 rounded transition-colors ${
-                          step.takeScreenshot
-                            ? "text-green-500 hover:text-green-400"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                        title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
-                      >
-                        <Camera className="w-4 h-4" />
-                      </button>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => toggleStepScreenshot(step.id)}
+                          className={`p-1 rounded transition-colors ${
+                            step.takeScreenshot
+                              ? "text-green-500 hover:text-green-400"
+                              : "text-muted-foreground hover:text-foreground"
+                          }`}
+                          title={step.takeScreenshot ? "Screenshot enabled" : "Screenshot disabled"}
+                        >
+                          <Camera className="w-4 h-4" />
+                        </button>
+                        {step.takeScreenshot && (
+                          <div
+                            className="flex items-center gap-0.5"
+                            title="Screenshot delay (seconds)"
+                          >
+                            <input
+                              type="number"
+                              min={0}
+                              max={30}
+                              step={0.5}
+                              value={step.screenshotDelay ?? 0}
+                              onChange={(e) =>
+                                updateScreenshotDelay(step.id, parseFloat(e.target.value) || 0)
+                              }
+                              className="w-12 px-1 py-0.5 text-xs text-center bg-background border border-border rounded"
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                            <span className="text-xs text-muted-foreground">s</span>
+                          </div>
+                        )}
+                      </div>
                     )}
 
                     {/* Move up */}
@@ -2108,7 +2118,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                 </div>
               </div>
               <button
-                onClick={handleToggleAutoContinue}
+                onClick={toggleAutoContinue}
                 disabled={autoContinueLoading}
                 className={`flex items-center transition-colors ${autoContinueEnabled ? "text-orange-500" : "text-muted-foreground"} ${autoContinueLoading ? "opacity-50" : ""}`}
                 title={autoContinueEnabled ? "Auto-continue enabled" : "Auto-continue disabled"}
@@ -2215,7 +2225,31 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                 <div className="flex items-center gap-2">
                   <MousePointer2 className="w-4 h-4 text-purple-500" />
                   <div>
-                    <span className="text-sm font-medium">Capture Input for Validation</span>
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-sm font-medium">Capture Input for Validation</span>
+                      <div className="relative group">
+                        <Info className="w-3.5 h-3.5 text-muted-foreground hover:text-foreground cursor-help" />
+                        <div className="absolute left-0 bottom-full mb-2 w-72 p-3 bg-popover border border-border rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                          <p className="text-xs font-medium text-foreground mb-2">
+                            Debugging/Validation Feature
+                          </p>
+                          <div className="space-y-2 text-xs text-muted-foreground">
+                            <p>
+                              <strong>When Disabled:</strong> Only reported positions from the
+                              automation engine are logged (where clicks <em>should</em> happen).
+                            </p>
+                            <p>
+                              <strong>When Enabled:</strong> Captures actual mouse/keyboard events
+                              during execution and compares them to reported positions.
+                            </p>
+                            <p className="pt-1 border-t border-border mt-2">
+                              <strong>Use Case:</strong> Debug clicks missing targets due to
+                              multi-monitor offsets, DPI scaling, or coordinate calculation bugs.
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
                     <p className="text-xs text-muted-foreground">
                       {captureInputValidation
                         ? "Records actual mouse/keyboard to compare with reported positions"

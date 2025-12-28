@@ -262,32 +262,49 @@ export function setupEventHandlers(
 
   // Handler for "tree_event" event
   unsubscribers.push(
-    eventRouter.subscribe("tree_event", (payload: { data?: TreeEventData }) => {
+    eventRouter.subscribe("tree_event", (payload) => {
       console.log("[EVENT_HANDLER] tree_event received, triggering action log refresh");
       actionLogManager.triggerRefresh();
 
       // Report completed actions to both new and legacy services
-      if (payload?.data) {
-        const eventData = payload.data;
+      const treeEventData = payload?.data as unknown as TreeEventData | undefined;
+      if (treeEventData) {
+        const eventData = treeEventData;
         const eventType = eventData.event_type;
 
         // Report on action completion (success or failure)
         if ((eventType === "action_completed" || eventType === "action_failed") && eventData.node) {
           const node = eventData.node;
-          const metadata = node.metadata || {};
-          const stateContext = metadata.state_context;
+          const metadata = (node.metadata || {}) as Record<string, unknown>;
+          const stateContext = metadata.state_context as
+            | { active_before?: string[]; active_after?: string[] }
+            | undefined;
 
           // Calculate timestamps
           const durationMs = node.duration ? Math.round(node.duration * 1000) : 0;
           const completedAt = new Date(node.timestamp * 1000);
           const startedAt = new Date(completedAt.getTime() - durationMs);
 
+          // Extract confidence from runtime (typed) or metadata (unknown)
+          // Moved outside conditional blocks so both services can use it
+          const runtime = metadata.runtime as Record<string, unknown> | undefined;
+          const confidenceFromRuntime = runtime?.confidence;
+          const confidenceFromMeta = metadata.confidence;
+          const confidenceScore =
+            typeof confidenceFromRuntime === "number"
+              ? confidenceFromRuntime
+              : typeof confidenceFromMeta === "number"
+                ? confidenceFromMeta
+                : undefined;
+
           // Report to new unified execution service
           if (executionReportingService.isActive) {
             // Map node type to ActionType (using node_type and action_type from metadata)
             let actionType: ActionType = ActionType.CUSTOM;
             const nodeTypeStr = (node.node_type || "").toLowerCase();
-            const actionTypeStr = (metadata.action_type || "").toLowerCase();
+            const actionTypeFromMeta = metadata.action_type as string | undefined;
+            const actionTypeStr =
+              typeof actionTypeFromMeta === "string" ? actionTypeFromMeta.toLowerCase() : "";
 
             // First check action_type from metadata, then fall back to node_type
             const typeToCheck = actionTypeStr || nodeTypeStr;
@@ -302,7 +319,6 @@ export function setupEventHandlers(
             const actionStatus: ActionStatus =
               node.status === "success" ? ActionStatus.SUCCESS : ActionStatus.FAILED;
 
-            // Build action execution data
             const actionExecution: ActionExecutionCreate = {
               sequence_number: executionReportingService.getNextActionSequenceNumber(),
               action_type: actionType,
@@ -314,10 +330,10 @@ export function setupEventHandlers(
               from_state: stateContext?.active_before?.[0],
               to_state: stateContext?.active_after?.[0],
               active_states: stateContext?.active_after,
-              confidence_score: metadata.confidence,
+              confidence_score: confidenceScore,
               error_message: node.error,
               error_type: node.error ? ErrorType.OTHER : undefined,
-              screenshot_id: metadata.screenshot_reference,
+              screenshot_id: metadata.screenshot_reference as string | undefined,
               metadata: {
                 node_id: node.id,
                 node_type: node.node_type,
@@ -344,11 +360,11 @@ export function setupEventHandlers(
               duration_ms: durationMs,
               error_message: node.error,
               error_type: node.error ? "other" : undefined, // Backend allows: element_not_found, timeout, assertion_failed, crash, other
-              screenshot_id: metadata.screenshot_reference,
+              screenshot_id: metadata.screenshot_reference as string | undefined,
               metadata: {
                 node_id: node.id,
                 actions_executed: 1,
-                confidence_score: metadata.confidence,
+                confidence_score: confidenceScore,
               },
             };
 

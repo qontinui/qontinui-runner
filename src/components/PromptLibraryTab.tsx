@@ -167,27 +167,81 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
-  const [_allTags, _setAllTags] = useState<string[]>([]);
+
+  // Storage key for persisting create form state
+  const CREATE_FORM_STORAGE_KEY = "qontinui-prompt-create-form";
+
+  // Load persisted create form state
+  const loadPersistedCreateForm = useCallback(() => {
+    try {
+      const saved = localStorage.getItem(CREATE_FORM_STORAGE_KEY);
+      if (saved) {
+        return JSON.parse(saved);
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    return null;
+  }, []);
 
   // Edit modal state
   const [editingPrompt, setEditingPrompt] = useState<SavedPrompt | null>(null);
-  const [isCreating, setIsCreating] = useState(false);
+  const [isCreating, setIsCreating] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.isCreating ?? false;
+  });
 
-  // Form state for create/edit
-  const [formName, setFormName] = useState("");
-  const [formDescription, setFormDescription] = useState("");
-  const [formContent, setFormContent] = useState("");
-  const [formCategory, setFormCategory] = useState("");
-  const [formTags, setFormTags] = useState("");
-  const [formMaxIterations, setFormMaxIterations] = useState(10);
+  // Form state for create/edit - restore from localStorage if available
+  const [formName, setFormName] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formName ?? "";
+  });
+  const [formDescription, setFormDescription] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formDescription ?? "";
+  });
+  const [formContent, setFormContent] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formContent ?? "";
+  });
+  const [formCategory, setFormCategory] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formCategory ?? "";
+  });
+  const [formTags, setFormTags] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formTags ?? "";
+  });
+  const [formMaxIterations, setFormMaxIterations] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formMaxIterations ?? 10;
+  });
 
   // Workflow form state
-  const [formWorkflowEnabled, setFormWorkflowEnabled] = useState(false);
-  const [formCheckpointPath, setFormCheckpointPath] = useState("");
-  const [formPhaseField, setFormPhaseField] = useState("current_phase");
-  const [formCompletionValue, setFormCompletionValue] = useState(12);
-  const [formStallThreshold, setFormStallThreshold] = useState(300);
-  const [formContinuationPrompt, setFormContinuationPrompt] = useState("");
+  const [formWorkflowEnabled, setFormWorkflowEnabled] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formWorkflowEnabled ?? false;
+  });
+  const [formCheckpointPath, setFormCheckpointPath] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formCheckpointPath ?? "";
+  });
+  const [formPhaseField, setFormPhaseField] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formPhaseField ?? "current_phase";
+  });
+  const [formCompletionValue, setFormCompletionValue] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formCompletionValue ?? 12;
+  });
+  const [formStallThreshold, setFormStallThreshold] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formStallThreshold ?? 300;
+  });
+  const [formContinuationPrompt, setFormContinuationPrompt] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formContinuationPrompt ?? "";
+  });
 
   // Running state
   const [runningPromptId, setRunningPromptId] = useState<string | null>(null);
@@ -200,7 +254,6 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   useEffect(() => {
     loadPrompts();
     loadCategories();
-    loadTags();
     loadWorkflowRuns();
   }, []);
 
@@ -211,6 +264,45 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       return () => clearInterval(interval);
     }
   }, [showWorkflowRuns]);
+
+  // Persist create form state when in creating mode
+  useEffect(() => {
+    if (isCreating) {
+      const formState = {
+        isCreating,
+        formName,
+        formDescription,
+        formContent,
+        formCategory,
+        formTags,
+        formMaxIterations,
+        formWorkflowEnabled,
+        formCheckpointPath,
+        formPhaseField,
+        formCompletionValue,
+        formStallThreshold,
+        formContinuationPrompt,
+      };
+      localStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(formState));
+    } else {
+      // Clear persisted state when not creating
+      localStorage.removeItem(CREATE_FORM_STORAGE_KEY);
+    }
+  }, [
+    isCreating,
+    formName,
+    formDescription,
+    formContent,
+    formCategory,
+    formTags,
+    formMaxIterations,
+    formWorkflowEnabled,
+    formCheckpointPath,
+    formPhaseField,
+    formCompletionValue,
+    formStallThreshold,
+    formContinuationPrompt,
+  ]);
 
   const loadPrompts = useCallback(async () => {
     setLoading(true);
@@ -238,18 +330,6 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       }
     } catch (error) {
       console.error("Failed to load categories:", error);
-    }
-  };
-
-  const loadTags = async () => {
-    try {
-      const response = await fetch(`${API_BASE}/prompts/tags`);
-      const result = await response.json();
-      if (result.success) {
-        _setAllTags(result.data || []);
-      }
-    } catch (error) {
-      console.error("Failed to load tags:", error);
     }
   };
 
@@ -306,7 +386,6 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
         setIsCreating(false);
         loadPrompts();
         loadCategories();
-        loadTags();
       } else {
         onLog("error", `Failed to create prompt: ${result.error}`);
       }
@@ -350,7 +429,6 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
         setEditingPrompt(null);
         loadPrompts();
         loadCategories();
-        loadTags();
       } else {
         onLog("error", `Failed to update prompt: ${result.error}`);
       }
@@ -585,7 +663,6 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
           onLog("success", `Imported ${result.data.length} prompts`);
           loadPrompts();
           loadCategories();
-          loadTags();
         } else {
           onLog("error", `Failed to import prompts: ${result.error}`);
         }

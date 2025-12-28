@@ -65,29 +65,90 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
 
+  // Storage key for persisting create form state
+  const CREATE_FORM_STORAGE_KEY = "qontinui-script-create-form";
+
+  // Load persisted create form state
+  const loadPersistedCreateForm = useCallback(() => {
+    try {
+      const saved = localStorage.getItem(CREATE_FORM_STORAGE_KEY);
+      if (saved) {
+        return JSON.parse(saved);
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    return null;
+  }, []);
+
   // Edit modal state
   const [editingScript, setEditingScript] = useState<PlaywrightScript | null>(null);
-  const [isCreating, setIsCreating] = useState(false);
+  const [isCreating, setIsCreating] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.isCreating ?? false;
+  });
 
   // View mode toggle
-  const [viewMode, setViewMode] = useState<ScriptViewMode>("natural_language");
+  const [viewMode, setViewMode] = useState<ScriptViewMode>(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.viewMode ?? "natural_language";
+  });
 
-  // Form state
-  const [formName, setFormName] = useState("");
-  const [formDescription, setFormDescription] = useState("");
-  const [formAiInstructions, setFormAiInstructions] = useState("");
-  const [formTargetUrl, setFormTargetUrl] = useState("");
-  const [formScriptContent, setFormScriptContent] = useState(DEFAULT_SCRIPT_CONTENT);
-  const [formCategory, setFormCategory] = useState("");
-  const [formTags, setFormTags] = useState("");
-  const [formTimeoutSeconds, setFormTimeoutSeconds] = useState(60);
-  const [formDisplayMode, setFormDisplayMode] = useState<DisplayMode>("headless");
-  const [formBrowser, setFormBrowser] = useState<"chromium" | "firefox" | "webkit">("chromium");
+  // Form state - restore from localStorage if available
+  const [formName, setFormName] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formName ?? "";
+  });
+  const [formDescription, setFormDescription] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formDescription ?? "";
+  });
+  const [formAiInstructions, setFormAiInstructions] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formAiInstructions ?? "";
+  });
+  const [formTargetUrl, setFormTargetUrl] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formTargetUrl ?? "";
+  });
+  const [formScriptContent, setFormScriptContent] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formScriptContent ?? DEFAULT_SCRIPT_CONTENT;
+  });
+  const [formCategory, setFormCategory] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formCategory ?? "";
+  });
+  const [formTags, setFormTags] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formTags ?? "";
+  });
+  const [formTimeoutSeconds, setFormTimeoutSeconds] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formTimeoutSeconds ?? 60;
+  });
+  const [formDisplayMode, setFormDisplayMode] = useState<DisplayMode>(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formDisplayMode ?? "headless";
+  });
+  const [formBrowser, setFormBrowser] = useState<"chromium" | "firefox" | "webkit">(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formBrowser ?? "chromium";
+  });
 
   // Workflow automation fields
-  const [formWorkflowObjective, setFormWorkflowObjective] = useState("");
-  const [formSuccessCriteria, setFormSuccessCriteria] = useState<string[]>([]);
-  const [formIsWorkflowAutomation, setFormIsWorkflowAutomation] = useState(false);
+  const [formWorkflowObjective, setFormWorkflowObjective] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formWorkflowObjective ?? "";
+  });
+  const [formSuccessCriteria, setFormSuccessCriteria] = useState<string[]>(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formSuccessCriteria ?? [];
+  });
+  const [formIsWorkflowAutomation, setFormIsWorkflowAutomation] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formIsWorkflowAutomation ?? false;
+  });
 
   // Execution state
   const [_executingScriptId, setExecutingScriptId] = useState<string | null>(null);
@@ -103,7 +164,10 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   // Auto-refinement loop state
   const [isAutoRefining, setIsAutoRefining] = useState(false);
   const [autoRefineIteration, setAutoRefineIteration] = useState(0);
-  const [autoRefineMaxIterations] = useState(10);
+  const [autoRefineMaxIterations, setAutoRefineMaxIterations] = useState(() => {
+    const saved = localStorage.getItem("qontinui-autorefine-max-iterations");
+    return saved !== null ? parseInt(saved, 10) : 10;
+  });
   const [autoRefineLog, setAutoRefineLog] = useState<string[]>([]);
   const autoRefineAbortRef = useRef(false);
 
@@ -118,6 +182,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
 
   // User hint for auto-refine - gets included in next AI call
   const [autoRefineUserHint, setAutoRefineUserHint] = useState("");
+  const [hintQueued, setHintQueued] = useState(false);
 
   // Visual context settings for auto-refine (persisted to localStorage)
   const [includeScreenshot, setIncludeScreenshot] = useState(() => {
@@ -128,7 +193,11 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
     const saved = localStorage.getItem("qontinui-autorefine-include-trace");
     return saved !== null ? saved === "true" : true; // Default: true
   });
-  // Video iteration threshold - initially from localStorage if set, otherwise will load from AI settings
+  // Video settings - checkbox to enable + iteration threshold
+  const [includeVideo, setIncludeVideo] = useState(() => {
+    const saved = localStorage.getItem("qontinui-autorefine-include-video");
+    return saved !== null ? saved === "true" : true; // Default: enabled
+  });
   const [includeVideoAfterIterations, setIncludeVideoAfterIterations] = useState(() => {
     const saved = localStorage.getItem("qontinui-autorefine-video-after-iterations");
     return saved !== null ? parseInt(saved, 10) : 3; // Temporary default, will be updated from AI settings
@@ -170,6 +239,12 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   useEffect(() => {
     localStorage.setItem("qontinui-autorefine-include-trace", String(includeTraceData));
   }, [includeTraceData]);
+  useEffect(() => {
+    localStorage.setItem("qontinui-autorefine-include-video", String(includeVideo));
+  }, [includeVideo]);
+  useEffect(() => {
+    localStorage.setItem("qontinui-autorefine-max-iterations", String(autoRefineMaxIterations));
+  }, [autoRefineMaxIterations]);
   // Only persist video threshold after settings have been loaded (to avoid overwriting with default)
   useEffect(() => {
     if (videoSettingsLoaded) {
@@ -179,6 +254,49 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
       );
     }
   }, [includeVideoAfterIterations, videoSettingsLoaded]);
+
+  // Persist create form state when in creating mode
+  useEffect(() => {
+    if (isCreating) {
+      const formState = {
+        isCreating,
+        viewMode,
+        formName,
+        formDescription,
+        formAiInstructions,
+        formTargetUrl,
+        formScriptContent,
+        formCategory,
+        formTags,
+        formTimeoutSeconds,
+        formDisplayMode,
+        formBrowser,
+        formWorkflowObjective,
+        formSuccessCriteria,
+        formIsWorkflowAutomation,
+      };
+      localStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(formState));
+    } else {
+      // Clear persisted state when not creating
+      localStorage.removeItem(CREATE_FORM_STORAGE_KEY);
+    }
+  }, [
+    isCreating,
+    viewMode,
+    formName,
+    formDescription,
+    formAiInstructions,
+    formTargetUrl,
+    formScriptContent,
+    formCategory,
+    formTags,
+    formTimeoutSeconds,
+    formDisplayMode,
+    formBrowser,
+    formWorkflowObjective,
+    formSuccessCriteria,
+    formIsWorkflowAutomation,
+  ]);
 
   // Description regeneration state
   const [isRegeneratingDescription, setIsRegeneratingDescription] = useState(false);
@@ -408,8 +526,36 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
     }
   };
 
+  // Check if script content is still the default (needs generation)
+  const isDefaultScriptContent = useCallback(() => {
+    return formScriptContent.trim() === DEFAULT_SCRIPT_CONTENT.trim();
+  }, [formScriptContent]);
+
   // CRUD operations
-  const createScript = async () => {
+  const createScript = async (options?: {
+    runTest?: boolean;
+    autoRefine?: boolean;
+    generatedContent?: string;
+  }) => {
+    // If auto-refine or run test is requested and script is still default, generate first
+    if (
+      (options?.runTest || options?.autoRefine) &&
+      !options?.generatedContent &&
+      isDefaultScriptContent()
+    ) {
+      if (!formDescription.trim()) {
+        onLog("warning", "Please enter a description to generate the script");
+        return;
+      }
+      onLog("info", "Generating script before saving...");
+      // Generate script first, then this function will be called again via generateAndCreate
+      await generateScriptThenCreate(options);
+      return;
+    }
+
+    // Use generated content if provided, otherwise use form state
+    const scriptContent = options?.generatedContent || formScriptContent;
+
     try {
       const response = await fetch(`${API_BASE}/playwright/scripts`, {
         method: "POST",
@@ -419,7 +565,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
           description: formDescription,
           ai_instructions: formAiInstructions || undefined,
           target_url: formTargetUrl,
-          script_content: formScriptContent,
+          script_content: scriptContent,
           category: formCategory,
           tags: formTags
             .split(",")
@@ -436,15 +582,123 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
       const result = await response.json();
       if (result.success) {
         onLog("success", `Created script: ${formName}`);
-        loadScripts();
+        await loadScripts();
         loadCategories();
-        resetForm();
-        setIsCreating(false);
+
+        // If we need to run test or auto-refine, switch to edit mode with the new script
+        // but keep the form visible (don't minimize)
+        if ((options?.runTest || options?.autoRefine) && result.data) {
+          const createdScript = result.data as PlaywrightScript;
+          // Switch from create mode to edit mode - this keeps the form open
+          setIsCreating(false);
+          setEditingScript(createdScript);
+          setExpandedScriptId(createdScript.id); // Must set this for edit form to show
+          // Form state is already set, no need to reset
+
+          // Small delay to ensure state is updated
+          await new Promise((resolve) => setTimeout(resolve, 100));
+
+          if (options.autoRefine) {
+            // Start auto-refinement loop
+            runAutoRefinementLoop();
+          } else if (options.runTest) {
+            // Just run the test once
+            saveAndRunScript(createdScript.id);
+          }
+        } else {
+          // Only reset and close if not running/refining
+          resetForm();
+          setIsCreating(false);
+        }
       } else {
         onLog("error", `Failed to create script: ${result.error}`);
       }
     } catch (error) {
       onLog("error", `Failed to create script: ${error}`);
+    }
+  };
+
+  // Generate script and then create with options
+  const generateScriptThenCreate = async (options: { runTest?: boolean; autoRefine?: boolean }) => {
+    if (!formDescription.trim()) {
+      onLog("warning", "Please enter a description first");
+      return;
+    }
+
+    setIsGenerating(true);
+    onLog("info", "Generating Playwright script from description...");
+
+    // Build the prompt with optional AI instructions
+    const aiInstructionsSection = formAiInstructions.trim()
+      ? `\n## AI Instructions (Important - Follow These)\n${formAiInstructions}\n`
+      : "";
+
+    const prompt = `Generate a Playwright test script based on the following requirements.
+
+## Test Name
+${formName || "Untitled Test"}
+
+## Target URL
+${formTargetUrl || "http://localhost:3000"}
+
+## Test Description
+${formDescription}
+${aiInstructionsSection}
+## Requirements
+1. Generate a complete, working Playwright test script in TypeScript
+2. Use modern Playwright best practices (locators, web-first assertions)
+3. Include proper error handling and meaningful test assertions
+4. Add comments explaining what each section does
+5. Use page.goto() with the full target URL
+6. Include appropriate waits for elements
+
+## Output Format
+Return ONLY the Playwright script code, wrapped in a code block. Do not include any other text or explanation.
+
+\`\`\`typescript
+import { test, expect } from '@playwright/test';
+
+test('${formName || "test"}', async ({ page }) => {
+  // Your generated test code here
+});
+\`\`\``;
+
+    try {
+      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt,
+          display_prompt: `Generate Playwright: ${formName || formDescription.substring(0, 50)}`,
+          timeout_seconds: 300,
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success && result.output) {
+        // Extract code from the AI response
+        const codeMatch = result.output.match(/```(?:typescript|ts)?\s*([\s\S]*?)```/);
+        if (codeMatch) {
+          const generatedCode = codeMatch[1].trim();
+          setFormScriptContent(generatedCode);
+          setLastGeneratedFromDescription(formDescription);
+          onLog("success", "Script generated successfully");
+
+          // Now create the script with the generated content
+          setIsGenerating(false);
+          // Call createScript again - pass the generated content directly to avoid state timing issues
+          await createScript({ ...options, generatedContent: generatedCode });
+        } else {
+          onLog("error", "Failed to extract code from AI response");
+          setIsGenerating(false);
+        }
+      } else {
+        onLog("error", `Failed to generate script: ${result.error || "Unknown error"}`);
+        setIsGenerating(false);
+      }
+    } catch (error) {
+      onLog("error", `Failed to generate script: ${error}`);
+      setIsGenerating(false);
     }
   };
 
@@ -1278,8 +1532,7 @@ import { test, expect } from '@playwright/test';
         }
 
         // Include video after N iterations (if enabled and available)
-        const shouldIncludeVideo =
-          includeVideoAfterIterations > 0 && iteration >= includeVideoAfterIterations;
+        const shouldIncludeVideo = includeVideo && iteration >= includeVideoAfterIterations;
         if (shouldIncludeVideo && testResult.video_paths && testResult.video_paths.length > 0) {
           videoPaths.push(...testResult.video_paths);
           log(`Iteration ${iteration}: Including video for additional context`);
@@ -1306,8 +1559,9 @@ import { test, expect } from '@playwright/test';
 
         // Clear user hint after it's been sent to AI
         if (autoRefineUserHint.trim()) {
-          log(`User hint included: "${autoRefineUserHint.trim().substring(0, 50)}..."`);
+          log(`[HINT SENT TO AI] "${autoRefineUserHint.trim()}"`);
           setAutoRefineUserHint("");
+          setHintQueued(false);
         }
 
         const aiResult = await aiResponse.json();
@@ -1797,31 +2051,49 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             <div>
               <div className="flex items-center justify-between mb-1">
                 <label className="block text-sm font-medium">Description (Natural Language)</label>
-                <button
-                  onClick={generateScript}
-                  disabled={isGenerating || !formDescription.trim()}
-                  className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                >
-                  {isGenerating ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Generating...
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-4 h-4" />
-                      Generate Script
-                    </>
-                  )}
-                </button>
+                <div className="flex items-center gap-2">
+                  <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
+                  <button
+                    onClick={generateScript}
+                    disabled={isGenerating || !formDescription.trim()}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                  >
+                    {isGenerating ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4" />
+                        Generate Script
+                      </>
+                    )}
+                  </button>
+                </div>
               </div>
-              <textarea
-                value={formDescription}
-                onChange={(e) => setFormDescription(e.target.value)}
-                placeholder="Describe what this test should do in plain English...&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
-                rows={6}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-              />
+              <div className="relative">
+                <textarea
+                  ref={descriptionTextareaRef}
+                  value={formDescription}
+                  onChange={(e) => setFormDescription(e.target.value)}
+                  onKeyDown={scriptletMention.handleKeyDown}
+                  onInput={scriptletMention.handleInput}
+                  placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
+                  rows={6}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                />
+                {/* @-mention popup for scriptlet insertion */}
+                {scriptletMention.isActive && (
+                  <ScriptletSelector
+                    mode="popup"
+                    onSelect={scriptletMention.handleSelect}
+                    onClose={scriptletMention.handleClose}
+                    searchQuery={scriptletMention.searchQuery}
+                    position={scriptletMention.position}
+                  />
+                )}
+              </div>
               <p className="text-xs text-muted-foreground mt-1">
                 Describe what you want to test, then click "Generate Script" to create the
                 Playwright code.
@@ -2114,7 +2386,77 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             </div>
           </div>
 
-          <div className="flex justify-end gap-2 pt-4">
+          {/* Visual Context Settings for Auto-Refine (applies when using Save & Auto-Refine) */}
+          <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground py-3 border-t border-border">
+            <div className="flex items-center gap-2">
+              <ImageIcon className="w-4 h-4" />
+              <span>Auto-Refine Visual Context:</span>
+            </div>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeScreenshot}
+                onChange={(e) => setIncludeScreenshot(e.target.checked)}
+                className="rounded border-border"
+              />
+              <span>Screenshot</span>
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeTraceData}
+                onChange={(e) => setIncludeTraceData(e.target.checked)}
+                className="rounded border-border"
+              />
+              <span>Trace</span>
+            </label>
+            <label
+              className="flex items-center gap-1.5 cursor-pointer"
+              title="Video uses significantly more tokens. Only recommended for complex failures."
+            >
+              <input
+                type="checkbox"
+                checked={includeVideo}
+                onChange={(e) => setIncludeVideo(e.target.checked)}
+                className="rounded border-border"
+              />
+              <span>Video after</span>
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={includeVideoAfterIterations}
+                onChange={(e) =>
+                  setIncludeVideoAfterIterations(Math.max(1, parseInt(e.target.value) || 3))
+                }
+                disabled={!includeVideo}
+                className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
+              />
+              <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
+              <span title="Video uses significantly more tokens. Enables after N failed iterations.">
+                <Info className="w-3.5 h-3.5 text-muted-foreground" />
+              </span>
+            </label>
+            <div className="border-l border-border pl-4 ml-2">
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <span>Max iterations:</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={autoRefineMaxIterations}
+                  onChange={(e) =>
+                    setAutoRefineMaxIterations(
+                      Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
+                    )
+                  }
+                  className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div className="flex justify-between items-center gap-2 pt-4 border-t border-border">
             <button
               onClick={() => {
                 setIsCreating(false);
@@ -2124,14 +2466,34 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             >
               Cancel
             </button>
-            <button
-              onClick={createScript}
-              disabled={!formName || !formScriptContent}
-              className="btn-primary px-4 py-2 flex items-center gap-2"
-            >
-              <Save className="w-4 h-4" />
-              Create Script
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => createScript()}
+                disabled={!formName || !formScriptContent}
+                className="btn-secondary px-4 py-2 flex items-center gap-2"
+              >
+                <Save className="w-4 h-4" />
+                Save Only
+              </button>
+              <button
+                onClick={() => createScript({ runTest: true })}
+                disabled={!formName || !formScriptContent}
+                className="btn-primary px-4 py-2 flex items-center gap-2"
+                title="Save and run the test once"
+              >
+                <Play className="w-4 h-4" />
+                Save & Run
+              </button>
+              <button
+                onClick={() => createScript({ autoRefine: true })}
+                disabled={!formName || !formScriptContent}
+                className="flex items-center gap-2 px-4 py-2 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                title="Save, run test, and refine with AI until it passes"
+              >
+                <Sparkles className="w-4 h-4" />
+                Save & Auto-Refine
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -2593,24 +2955,55 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                       {/* User hint input for guiding AI during auto-refine */}
                       <div className="mt-3">
                         <label className="text-xs text-muted-foreground block mb-1">
-                          Add hint for next AI iteration (optional)
+                          Add hint for next AI iteration (optional) - Press Enter to queue
                         </label>
                         <div className="flex gap-2">
                           <input
                             type="text"
                             value={autoRefineUserHint}
-                            onChange={(e) => setAutoRefineUserHint(e.target.value)}
+                            onChange={(e) => {
+                              setAutoRefineUserHint(e.target.value);
+                              setHintQueued(false);
+                            }}
                             placeholder="e.g., The button is actually called 'Submit' not 'Send'"
-                            className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                            className={`flex-1 px-3 py-2 bg-background border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 ${
+                              hintQueued ? "border-green-500" : "border-border"
+                            }`}
                             onKeyDown={(e) => {
-                              if (e.key === "Enter") {
+                              if (e.key === "Enter" && autoRefineUserHint.trim()) {
                                 e.preventDefault();
+                                setHintQueued(true);
+                                setAutoRefineLog((prev) => [
+                                  ...prev,
+                                  `[HINT QUEUED] ${autoRefineUserHint.trim()}`,
+                                ]);
                               }
                             }}
                           />
-                          {autoRefineUserHint.trim() && (
+                          <button
+                            onClick={() => {
+                              if (autoRefineUserHint.trim()) {
+                                setHintQueued(true);
+                                setAutoRefineLog((prev) => [
+                                  ...prev,
+                                  `[HINT QUEUED] ${autoRefineUserHint.trim()}`,
+                                ]);
+                              }
+                            }}
+                            disabled={!autoRefineUserHint.trim()}
+                            className="px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-muted disabled:text-muted-foreground text-white rounded-lg text-sm"
+                          >
+                            Queue
+                          </button>
+                          {hintQueued && (
+                            <span className="text-xs text-green-400 self-center whitespace-nowrap flex items-center gap-1">
+                              <CheckCircle className="w-3 h-3" />
+                              Queued for next iteration
+                            </span>
+                          )}
+                          {!hintQueued && autoRefineUserHint.trim() && (
                             <span className="text-xs text-purple-400 self-center whitespace-nowrap">
-                              Will be sent with next iteration
+                              Press Enter or Queue
                             </span>
                           )}
                         </div>
@@ -2969,21 +3362,45 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
                         className="flex items-center gap-1.5 cursor-pointer"
                         title="Video uses significantly more tokens. Only recommended for complex failures."
                       >
+                        <input
+                          type="checkbox"
+                          checked={includeVideo}
+                          onChange={(e) => setIncludeVideo(e.target.checked)}
+                          className="rounded border-border"
+                        />
                         <span>Video after</span>
                         <input
                           type="number"
-                          min={0}
+                          min={1}
                           max={10}
                           value={includeVideoAfterIterations}
                           onChange={(e) =>
-                            setIncludeVideoAfterIterations(parseInt(e.target.value) || 0)
+                            setIncludeVideoAfterIterations(
+                              Math.max(1, parseInt(e.target.value) || 3),
+                            )
+                          }
+                          disabled={!includeVideo}
+                          className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
+                        />
+                        <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
+                        <span title="Video uses significantly more tokens. Enables after N failed iterations.">
+                          <Info className="w-3.5 h-3.5 text-muted-foreground" />
+                        </span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <span>Max iterations:</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={50}
+                          value={autoRefineMaxIterations}
+                          onChange={(e) =>
+                            setAutoRefineMaxIterations(
+                              Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
+                            )
                           }
                           className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
                         />
-                        <span>iterations</span>
-                        <span title="Video uses significantly more tokens. Set to 0 to disable.">
-                          <Info className="w-3.5 h-3.5 text-muted-foreground" />
-                        </span>
                       </label>
                     </div>
 

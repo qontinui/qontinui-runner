@@ -149,6 +149,22 @@ fn run_claude_session_inline(
         std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
 
     // Spawn Claude CLI with stream-json output
+    //
+    // SECURITY NOTE: bypassPermissions mode rationale
+    // ------------------------------------------------
+    // We use --permission-mode bypassPermissions because:
+    // 1. The qontinui-runner is an AUTOMATION tool that programmatically invokes Claude
+    // 2. Interactive permission prompts would block automation (no user to click "Allow")
+    // 3. The user has already consented to automation by configuring and running workflows
+    // 4. The runner itself provides the security boundary - it controls what prompts are sent
+    //
+    // Security implications:
+    // - Claude can execute any action without per-action confirmation
+    // - The runner's workflow configuration is the trust boundary
+    // - Users should only run trusted workflow configurations
+    //
+    // Alternative considered: Using "acceptEdits" mode would still require user interaction
+    // for bash commands, which breaks automation. Full bypass is necessary for autonomous operation.
     let mut child = std::process::Command::new("cmd.exe")
         .args([
             "/c",
@@ -3815,7 +3831,23 @@ fn execute_windows_native(
 
     // Spawn the process - use stream-json for real-time streaming output
     // Note: stream-json requires --verbose flag
+    //
+    // SECURITY NOTE: bypassPermissions mode rationale
+    // ------------------------------------------------
+    // We use --permission-mode bypassPermissions because:
+    // 1. The qontinui-runner is an AUTOMATION tool that programmatically invokes Claude
+    // 2. Interactive permission prompts would block automation (no user to click "Allow")
+    // 3. The user has already consented to automation by configuring and running workflows
+    // 4. The runner itself provides the security boundary - it controls what prompts are sent
+    //
+    // Security implications:
+    // - Claude can execute any action without per-action confirmation
+    // - The runner's workflow configuration is the trust boundary
+    // - Users should only run trusted workflow configurations
     write_ai_debug_log("execute_windows_native: Spawning cmd.exe process with stream-json...");
+    tracing::warn!(
+        "Spawning Claude CLI with bypassPermissions mode - ensure workflow configuration is trusted"
+    );
     let spawn_result = std::panic::catch_unwind(|| {
         std::process::Command::new("cmd.exe")
             .args([
@@ -4926,6 +4958,27 @@ async fn start_session(
     let workflow_phase_field = request.phase_field.clone();
     let workflow_completion_value = request.completion_value;
 
+    // Debug: Log the workflow config values received
+    info!(
+        "Session workflow config: checkpoint_path={:?}, phase_field={:?}, completion_value={:?}",
+        workflow_checkpoint_path, workflow_phase_field, workflow_completion_value
+    );
+
+    // Clear existing checkpoint file for fresh workflow start
+    // This ensures new workflow runs don't resume from old checkpoints
+    if let Some(ref cp_path) = workflow_checkpoint_path {
+        let checkpoint_path = std::path::PathBuf::from(cp_path);
+        if checkpoint_path.exists() {
+            info!(
+                "Clearing existing checkpoint file for fresh workflow start: {:?}",
+                checkpoint_path
+            );
+            if let Err(e) = std::fs::remove_file(&checkpoint_path) {
+                warn!("Failed to remove old checkpoint file: {}", e);
+            }
+        }
+    }
+
     let config = SessionConfig {
         session_type,
         prompt: request.prompt,
@@ -4990,6 +5043,9 @@ async fn start_session(
                 }
 
                 // Multi-session workflow enabled
+                info!(
+                    "Multi-session workflow ENABLED. Entering continuation loop with checkpoint_path and completion_value."
+                );
                 let checkpoint_path_str = workflow_checkpoint_path.unwrap();
                 let checkpoint_path = std::path::PathBuf::from(&checkpoint_path_str);
                 let phase_field = workflow_phase_field;
@@ -5034,12 +5090,53 @@ async fn start_session(
                     )
                     .await;
 
+                    info!(
+                        "Session loop completed for session {}. Checking checkpoint for continuation...",
+                        current_session_id
+                    );
+
+                    // Debug: Write to file-based log for tracing
+                    let debug_log_path = std::path::PathBuf::from("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log");
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&debug_log_path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(
+                            file,
+                            "[{}] Session {} completed. Checking checkpoint at {:?} for phase_field={}, completion_value={}",
+                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                            current_session_id,
+                            checkpoint_path,
+                            phase_field,
+                            completion_value
+                        );
+                    }
+
                     // After session ends, check if we should spawn a continuation
-                    if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
+                    let checkpoint_result = check_external_checkpoint_status(
                         &checkpoint_path,
                         &phase_field,
                         completion_value,
-                    ) {
+                    );
+
+                    // Debug: Log the checkpoint check result
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(
+                            file,
+                            "[{}] Checkpoint check result: {:?}",
+                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                            checkpoint_result
+                        );
+                    }
+
+                    if let Some((is_complete, current_phase)) = checkpoint_result {
                         if is_complete {
                             info!(
                                 "Workflow complete: {}={} >= completion_value={}. Finished after {} sessions.",
@@ -5146,6 +5243,24 @@ async fn start_session(
                         }
                     } else {
                         // Checkpoint file not found or unreadable
+                        // Debug: Log this case
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
+                        {
+                            use std::io::Write;
+                            let checkpoint_exists = checkpoint_path.exists();
+                            let checkpoint_contents = std::fs::read_to_string(&checkpoint_path).ok();
+                            let _ = writeln!(
+                                file,
+                                "[{}] STOPPING: Checkpoint not found or unreadable. exists={}, contents={:?}",
+                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                                checkpoint_exists,
+                                checkpoint_contents
+                            );
+                        }
+
                         warn!(
                             "Checkpoint not found or unreadable at {:?}. Stopping workflow.",
                             checkpoint_path
@@ -5352,6 +5467,8 @@ struct ResumableWorkflowInfo {
     has_resumable: bool,
     /// Whether an AI workflow is currently running (prevents Continue button)
     is_running: bool,
+    /// Whether auto-continue on restart is enabled (global setting)
+    auto_continue_enabled: bool,
     /// Workflow name (if resumable)
     name: Option<String>,
     /// Session type
@@ -5373,9 +5490,26 @@ async fn get_resumable_workflow(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<ResumableWorkflowInfo>> {
     // Check if AI is currently running
-    let is_running = state
+    // We check both the ai_analysis_running flag (for standard mode)
+    // AND the session manager (for persistent session mode)
+    let ai_analysis_running = state
         .ai_analysis_running
         .load(std::sync::atomic::Ordering::Relaxed);
+
+    // Also check session manager for running sessions
+    let sessions = state.session_manager.list_sessions().await;
+    let has_running_session = sessions.iter().any(|s| {
+        matches!(
+            s.status,
+            crate::session_manager::SessionStatus::Running
+                | crate::session_manager::SessionStatus::WaitingForContinuation
+        )
+    });
+
+    let is_running = ai_analysis_running || has_running_session;
+
+    // Get the global auto-continue setting (included in every response for UI sync)
+    let auto_continue_enabled = settings::get_auto_continue_ai_workflow();
 
     // Load the active workflow config
     let config = match load_active_workflow_config() {
@@ -5384,6 +5518,7 @@ async fn get_resumable_workflow(
             return Json(ApiResponse::success(ResumableWorkflowInfo {
                 has_resumable: false,
                 is_running,
+                auto_continue_enabled,
                 name: None,
                 session_type: None,
                 current_phase: None,
@@ -5401,6 +5536,7 @@ async fn get_resumable_workflow(
         return Json(ApiResponse::success(ResumableWorkflowInfo {
             has_resumable: false,
             is_running,
+            auto_continue_enabled,
             name: None,
             session_type: None,
             current_phase: None,
@@ -5423,6 +5559,7 @@ async fn get_resumable_workflow(
             return Json(ApiResponse::success(ResumableWorkflowInfo {
                 has_resumable: false,
                 is_running,
+                auto_continue_enabled,
                 name: None,
                 session_type: None,
                 current_phase: None,
@@ -5446,6 +5583,7 @@ async fn get_resumable_workflow(
         return Json(ApiResponse::success(ResumableWorkflowInfo {
             has_resumable: true,
             is_running,
+            auto_continue_enabled,
             name: Some(config.name),
             session_type: Some(config.session_type),
             current_phase: Some(current_phase),
@@ -5460,6 +5598,7 @@ async fn get_resumable_workflow(
     Json(ApiResponse::success(ResumableWorkflowInfo {
         has_resumable: false,
         is_running,
+        auto_continue_enabled,
         name: None,
         session_type: None,
         current_phase: None,
@@ -5726,6 +5865,37 @@ async fn resume_active_workflow_on_startup(state: Arc<ApiState>) {
     if !check_workflow_restart_permitted(&checkpoint_path) {
         info!("Workflow restart not permitted (restart_permitted=false). Not resuming.");
         return;
+    }
+
+    // Check if a NEW workflow run was started after the active-workflow.json was created
+    // This happens when a workflow completes and spawns a new session that resets the checkpoint
+    // We detect this by comparing the checkpoint's started_at with the active-workflow's started_at
+    if let Ok(checkpoint_contents) = std::fs::read_to_string(&checkpoint_path) {
+        if let Ok(checkpoint_json) = serde_json::from_str::<serde_json::Value>(&checkpoint_contents)
+        {
+            if let Some(checkpoint_started) =
+                checkpoint_json.get("started_at").and_then(|v| v.as_str())
+            {
+                // Parse both timestamps
+                if let (Ok(checkpoint_time), Ok(config_time)) = (
+                    chrono::DateTime::parse_from_rfc3339(checkpoint_started),
+                    chrono::DateTime::parse_from_rfc3339(&config.started_at),
+                ) {
+                    // If the checkpoint was created AFTER the active-workflow config, this is a NEW run
+                    // Don't auto-resume new runs - only resume interrupted workflows
+                    if checkpoint_time > config_time {
+                        info!(
+                            "Checkpoint started_at ({}) is newer than active-workflow started_at ({}). \
+                             This is a NEW workflow run, not an interrupted one. Not auto-resuming.",
+                            checkpoint_started, config.started_at
+                        );
+                        // Clean up the stale active-workflow.json
+                        delete_active_workflow_config();
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     // Check if the workflow is already complete
@@ -6391,17 +6561,15 @@ pub fn create_router(
         // Workflow resume routes
         .route("/workflow/resumable", get(get_resumable_workflow))
         .route("/workflow/resume", post(resume_workflow))
-        // Auto-continue setting routes (global)
-        .route("/workflow/auto-continue", get(get_auto_continue_setting))
-        .route("/workflow/auto-continue", post(set_auto_continue_setting))
-        // Per-workflow auto-continue setting routes
+        // Auto-continue setting routes (global) - combined GET and POST on same route
         .route(
-            "/workflow/active/auto-continue",
-            get(get_workflow_auto_continue),
+            "/workflow/auto-continue",
+            get(get_auto_continue_setting).post(set_auto_continue_setting),
         )
+        // Per-workflow auto-continue setting routes - combined GET and POST on same route
         .route(
             "/workflow/active/auto-continue",
-            post(set_workflow_auto_continue),
+            get(get_workflow_auto_continue).post(set_workflow_auto_continue),
         )
         // Backup and Restore routes
         .route("/backup", get(create_backup_handler))
@@ -6413,6 +6581,22 @@ pub fn create_router(
         .with_state(api_state)
 }
 
+/// Try to bind to a port with SO_REUSEADDR
+fn try_bind_port(port: u16) -> Result<std::net::TcpListener, std::io::Error> {
+    // Create socket with SO_REUSEADDR to allow binding even if there are zombie connections
+    // This is necessary on Windows where TIME_WAIT/CLOSE_WAIT sockets can block port binding
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], port)).into())?;
+    socket.listen(1024)?;
+    Ok(socket.into())
+}
+
 /// Start the MCP API server
 pub async fn start_server(
     app_state: Arc<AppState>,
@@ -6422,10 +6606,34 @@ pub async fn start_server(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let router = create_router(app_state, rag_state, app_handle);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    info!("MCP API server listening on port {}", port);
+    // Try the requested port first, then fallback ports if zombie connections are blocking
+    // This can happen on Windows when previous process crashes leave orphaned sockets
+    let ports_to_try = [port, port + 1, port + 2];
+    let mut last_error = None;
 
-    axum::serve(listener, router).await?;
+    for try_port in ports_to_try {
+        match try_bind_port(try_port) {
+            Ok(std_listener) => {
+                let listener = tokio::net::TcpListener::from_std(std_listener)?;
+                if try_port != port {
+                    warn!(
+                        "Primary port {} was blocked, using fallback port {}. \
+                         Restart the app after zombie connections clear.",
+                        port, try_port
+                    );
+                }
+                info!("MCP API server listening on port {}", try_port);
+                axum::serve(listener, router).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Failed to bind to port {}: {}", try_port, e);
+                last_error = Some(e);
+            }
+        }
+    }
 
-    Ok(())
+    Err(Box::new(last_error.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Other, "All ports failed")
+    })))
 }

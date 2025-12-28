@@ -12,13 +12,8 @@
  * @module ExecutionTreeManager
  */
 
-import {
-  TreeEventData,
-  DisplayNode,
-  NodeType,
-  NodeStatus,
-  NodeMetadata,
-} from "../types/treeEvents";
+import { TreeEventData, DisplayNode, NodeType, NodeStatus } from "../types/treeEvents";
+import type { ExtendedNodeMetadata, NodeMetadata } from "../types/treeEvents";
 
 /**
  * Manages the execution tree structure for the frontend.
@@ -133,22 +128,28 @@ export class ExecutionTreeManager {
     end_timestamp?: number;
     duration?: number;
     status: NodeStatus;
-    metadata: NodeMetadata;
+    metadata?: ExtendedNodeMetadata | NodeMetadata | Record<string, unknown>;
     error?: string;
   }): DisplayNode {
     // Flatten execution_record metadata into top-level metadata
     // Backend sends: metadata.execution_record.metadata.runtime
     // Frontend expects: metadata.runtime
-    const flattenedMetadata = { ...nodeData.metadata };
-    if (flattenedMetadata.execution_record?.metadata) {
+    const flattenedMetadata: ExtendedNodeMetadata = { ...(nodeData.metadata || {}) };
+    const executionRecord = flattenedMetadata.execution_record;
+    if (
+      executionRecord &&
+      typeof executionRecord === "object" &&
+      "metadata" in executionRecord &&
+      executionRecord.metadata
+    ) {
       // Merge execution_record.metadata fields into top level
-      const recordMetadata = flattenedMetadata.execution_record.metadata;
+      const recordMetadata = executionRecord.metadata as Record<string, unknown>;
       Object.assign(flattenedMetadata, recordMetadata);
     }
 
     return {
       id: nodeData.id,
-      type: nodeData.node_type,
+      node_type: nodeData.node_type,
       name: nodeData.name,
       timestamp: nodeData.timestamp,
       end_timestamp: nodeData.end_timestamp,
@@ -233,7 +234,7 @@ export class ExecutionTreeManager {
       end_timestamp?: number;
       duration?: number;
       error?: string;
-      metadata?: NodeMetadata;
+      metadata?: ExtendedNodeMetadata | NodeMetadata | Record<string, unknown>;
     },
   ): void {
     node.status = nodeData.status;
@@ -244,9 +245,15 @@ export class ExecutionTreeManager {
     // Deep merge metadata to preserve new fields from action_completed events
     if (nodeData.metadata) {
       // Flatten execution_record metadata before merging
-      const flattenedMetadata = { ...nodeData.metadata };
-      if (flattenedMetadata.execution_record?.metadata) {
-        const recordMetadata = flattenedMetadata.execution_record.metadata;
+      const flattenedMetadata: ExtendedNodeMetadata = { ...nodeData.metadata };
+      const executionRecord = flattenedMetadata.execution_record;
+      if (
+        executionRecord &&
+        typeof executionRecord === "object" &&
+        "metadata" in executionRecord &&
+        executionRecord.metadata
+      ) {
+        const recordMetadata = executionRecord.metadata as Record<string, unknown>;
         Object.assign(flattenedMetadata, recordMetadata);
       }
 
@@ -267,8 +274,11 @@ export class ExecutionTreeManager {
    * @param incoming - New metadata from update event
    * @returns Merged metadata object
    */
-  private deepMergeMetadata(existing: NodeMetadata, incoming: NodeMetadata): NodeMetadata {
-    const merged = { ...existing };
+  private deepMergeMetadata(
+    existing: ExtendedNodeMetadata,
+    incoming: ExtendedNodeMetadata,
+  ): ExtendedNodeMetadata {
+    const merged: ExtendedNodeMetadata = { ...existing };
 
     // Merge each field from incoming metadata
     for (const [key, value] of Object.entries(incoming)) {
@@ -380,7 +390,7 @@ export class ExecutionTreeManager {
 
     // Recursive traversal function
     const traverse = (node: DisplayNode, level: number) => {
-      if (node.type === "action") {
+      if (node.node_type === "action") {
         // Set the level property directly on the node
         // This preserves the original node with all its references intact
         node.level = level;

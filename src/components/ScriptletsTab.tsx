@@ -34,6 +34,22 @@ interface ScriptletsTabProps {
 }
 
 export function ScriptletsTab({ onLog, aiOutputLines = [] }: ScriptletsTabProps) {
+  // Storage key for persisting create form state
+  const CREATE_FORM_STORAGE_KEY = "qontinui-scriptlet-create-form";
+
+  // Load persisted create form state
+  const loadPersistedCreateForm = useCallback(() => {
+    try {
+      const saved = localStorage.getItem(CREATE_FORM_STORAGE_KEY);
+      if (saved) {
+        return JSON.parse(saved);
+      }
+    } catch {
+      // Ignore parse errors
+    }
+    return null;
+  }, []);
+
   // Scriptlet library state
   const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
   const [loading, setLoading] = useState(true);
@@ -43,24 +59,60 @@ export function ScriptletsTab({ onLog, aiOutputLines = [] }: ScriptletsTabProps)
 
   // Editing state
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  const [isCreating, setIsCreating] = useState(false);
+  const [isCreating, setIsCreating] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.isCreating ?? false;
+  });
 
-  // Form state
-  const [formName, setFormName] = useState("");
-  const [formContent, setFormContent] = useState("");
-  const [formCategory, setFormCategory] = useState("");
-  const [formTags, setFormTags] = useState("");
+  // Form state - restore from localStorage if available
+  const [formName, setFormName] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formName ?? "";
+  });
+  const [formContent, setFormContent] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formContent ?? "";
+  });
+  const [formCategory, setFormCategory] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formCategory ?? "";
+  });
+  const [formTags, setFormTags] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formTags ?? "";
+  });
   const [newCategoryInput, setNewCategoryInput] = useState("");
   const [showNewCategoryInput, setShowNewCategoryInput] = useState(false);
 
   // AI generation state
   const [showLogSelector, setShowLogSelector] = useState(false);
   const [selectedLogIds, setSelectedLogIds] = useState<Set<string>>(new Set());
-  const [generationPrompt, setGenerationPrompt] = useState("");
+  const [generationPrompt, setGenerationPrompt] = useState(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.generationPrompt ?? "";
+  });
   const [isGenerating, setIsGenerating] = useState(false);
 
   // Copy feedback
   const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  // Persist create form state when in creating mode
+  useEffect(() => {
+    if (isCreating) {
+      const formState = {
+        isCreating,
+        formName,
+        formContent,
+        formCategory,
+        formTags,
+        generationPrompt,
+      };
+      localStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(formState));
+    } else {
+      // Clear persisted state when not creating
+      localStorage.removeItem(CREATE_FORM_STORAGE_KEY);
+    }
+  }, [isCreating, formName, formContent, formCategory, formTags, generationPrompt]);
 
   // Load scriptlets on mount
   useEffect(() => {

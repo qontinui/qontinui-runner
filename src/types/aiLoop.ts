@@ -27,6 +27,10 @@ export interface AiLoop {
   issueCount: number;
   /** Whether this loop is currently active (AI is still responding) */
   isActive: boolean;
+  /** Session/workflow ID this loop belongs to (if known) */
+  sessionId?: string;
+  /** Session/workflow name for display */
+  sessionName?: string;
 }
 
 /**
@@ -83,6 +87,8 @@ export function groupEntriesIntoLoops(entries: AiOutputLine[]): AiLoop[] {
         promptPreview,
         issueCount: 0,
         isActive: false,
+        sessionId: entry.sessionId,
+        sessionName: entry.sessionName,
       };
       currentActionId = entry.actionId;
     } else if (currentLoop) {
@@ -102,6 +108,20 @@ export function groupEntriesIntoLoops(entries: AiOutputLine[]): AiLoop[] {
     currentLoop.endTime =
       currentLoop.entries[currentLoop.entries.length - 1]?.timestamp || currentLoop.startTime;
     loops.push(currentLoop);
+  }
+
+  // Post-process: fix any loops that still have "AI Response" as promptPreview
+  // by scanning their entries for actual prompts
+  for (const loop of loops) {
+    if (loop.promptPreview === "AI Response") {
+      // Look through all entries to find a prompt
+      for (const entry of loop.entries) {
+        if (entry.source === "prompt" && entry.line.trim()) {
+          loop.promptPreview = truncateText(entry.line, PROMPT_PREVIEW_MAX_LENGTH);
+          break;
+        }
+      }
+    }
   }
 
   return loops;

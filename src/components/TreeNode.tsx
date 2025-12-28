@@ -18,6 +18,48 @@ import {
 } from "lucide-react";
 import { DisplayNode } from "../types/treeEvents";
 
+/**
+ * Type for action config target with optional properties
+ */
+interface ActionTarget {
+  type?: string;
+  imageId?: string;
+  imageName?: string;
+  imageIds?: string[];
+}
+
+/**
+ * Type for text source configuration
+ */
+interface TextSource {
+  text?: string;
+  stateId?: string;
+}
+
+/**
+ * Type for action configuration with known properties
+ * Allows additional unknown properties via index signature
+ */
+interface ActionConfig {
+  text?: string;
+  textToType?: string;
+  textSource?: TextSource;
+  target?: ActionTarget;
+  x?: number;
+  y?: number;
+  imageNames?: string[];
+  imageName?: string;
+  imageId?: string;
+  imageIds?: string[];
+  image?: string;
+  condition?: string;
+  duration?: number;
+  workflowId?: string;
+  stateNames?: string[];
+  stateIds?: string[];
+  [key: string]: unknown;
+}
+
 interface TreeNodeProps {
   /**
    * The tree node to render
@@ -50,7 +92,7 @@ interface TreeNodeProps {
  */
 function formatActionDetails(node: DisplayNode): string {
   const details: string[] = [];
-  const config = node.metadata.config || {};
+  const config = (node.metadata.config || {}) as ActionConfig;
 
   // Handle different action types
   switch (node.name) {
@@ -205,9 +247,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
   const nestingLevel = level !== undefined ? level : calculateNestingLevel(node);
   // Each level adds 20px of indentation
   const indentation = nestingLevel * 20;
-  const isExpandable = node.metadata.is_expandable || node.children.length > 0;
-  const isWorkflow = node.type === "workflow";
-  const isTransition = node.type === "transition";
+  const isExpandable = node.metadata?.is_expandable || node.children.length > 0;
+  const isWorkflow = node.node_type === "workflow";
+  const isTransition = node.node_type === "transition";
 
   /**
    * Renders the toggle button for expandable nodes
@@ -317,7 +359,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
 
     // For actions, create descriptive labels
     const details = formatActionDetails(node);
-    const config = node.metadata.config || {};
+    const config = (node.metadata.config || {}) as ActionConfig;
 
     // Override default labels for clarity
     switch (node.name) {
@@ -334,9 +376,9 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         const target = config.target;
         if (config.imageName) {
           return `FIND "${config.imageName}"`;
-        } else if (typeof target === "object" && target !== null && target.imageName) {
+        } else if (target?.imageName) {
           return `FIND "${target.imageName}"`;
-        } else if (typeof target === "object" && target !== null && target.imageId) {
+        } else if (target?.imageId) {
           return `FIND "${target.imageId}"`;
         } else if (config.imageId) {
           return `FIND "${config.imageId}"`;
@@ -403,7 +445,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         <div>
           {node.children.flatMap((child) => {
             // Transitions should always be rendered (they're the structural containers)
-            if (child.type === "transition") {
+            if (child.node_type === "transition") {
               return [
                 <TreeNode
                   key={child.id}
@@ -417,7 +459,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
             }
 
             // Filter out inline workflow wrappers recursively
-            if (child.type === "workflow" && child.children.length > 0) {
+            if (child.node_type === "workflow" && child.children.length > 0) {
               const isInline = child.metadata.is_inline === true;
               const isUserWorkflow = child.metadata.is_expandable === true;
 

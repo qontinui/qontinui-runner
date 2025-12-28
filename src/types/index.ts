@@ -5,15 +5,32 @@
  */
 
 // Tree event types for hierarchical action logging
+// Re-exported from qontinui-schemas with runner-specific extensions
 export type {
   TreeEventData,
   DisplayNode,
   TreeNode,
   NodeMetadata,
+  PathElement,
+  TreeEvent,
+  TreeEventCreate,
+  TreeEventResponse,
+  TreeEventListResponse,
+  ExecutionTreeResponse,
+  RuntimeData,
+  StateContext,
+  TimingInfo,
+  Outcome,
+  MatchLocation,
+  TopMatch,
+} from "./treeEvents";
+
+export {
   NodeType,
   NodeStatus,
   TreeEventType,
-  PathElement,
+  ActionType as TreeActionType,
+  createDisplayNode,
 } from "./treeEvents";
 
 // State machine types and functions
@@ -78,3 +95,24 @@ export { DEFAULT_SCRIPT_VALUES } from "./playwright";
 
 // Scriptlet types
 export type { Scriptlet, CreateScriptletRequest, UpdateScriptletRequest } from "./scriptlet";
+
+// Findings types (categorized findings system)
+export type {
+  BuiltInCategoryId,
+  ActionType,
+  FindingStatus,
+  FindingSeverity,
+  UserInputType,
+  FindingCategory,
+  UserInputOption,
+  UserInputRequest,
+  CodeContext,
+  Finding,
+  CategorySummary,
+  ReportSummary,
+  PhaseInfo,
+  ReportStatus,
+  ExecutionReport,
+  ParsedFinding,
+  CategoryStore,
+} from "./findings";

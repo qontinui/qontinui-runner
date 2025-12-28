@@ -56,6 +56,26 @@ export type {
   RunnerRestartMarker,
 } from "./VerificationService";
 
+// Findings Tracking Services (categorized findings system)
+export { FindingsTracker, findingsTracker } from "./FindingsTracker";
+export type { FindingsTrackerEventType, FindingsTrackerEvent } from "./FindingsTracker";
+
+// Finding Categories Service
+export {
+  BUILT_IN_CATEGORIES,
+  getAllCategories,
+  getVisibleCategories,
+  getCategoryById,
+  isBuiltInCategory,
+  addCustomCategory,
+  updateCustomCategory,
+  deleteCustomCategory,
+  setCategoryVisibility,
+  setCategoryOrder,
+  resetCategories,
+  getCategoryColorClasses,
+} from "./FindingCategories";
+
 // Unified Execution Reporting Services (new unified schema)
 export {
   executionReportingService,

@@ -18,7 +18,7 @@ export interface StorageUsage {
 export interface CommandResponse {
   success: boolean;
   message?: string;
-  data?: any;
+  data?: Record<string, unknown>;
 }
 
 export class LocalStorageService {
@@ -58,7 +58,7 @@ export class LocalStorageService {
         throw new Error(result.message || "Failed to save screenshot");
       }
 
-      return result.data?.path || "";
+      return (result.data?.path as string) || "";
     } catch (error) {
       console.error("Failed to save screenshot:", error);
       throw error;
@@ -82,7 +82,7 @@ export class LocalStorageService {
         throw new Error(result.message || "Failed to save video");
       }
 
-      return result.data?.path || "";
+      return (result.data?.path as string) || "";
     } catch (error) {
       console.error("Failed to save video:", error);
       throw error;
@@ -102,10 +102,10 @@ export class LocalStorageService {
       }
 
       return {
-        screenshots: result.data?.screenshots_mb || 0,
-        videos: result.data?.videos_mb || 0,
-        screenshotCount: result.data?.screenshot_count || 0,
-        videoCount: result.data?.video_count || 0,
+        screenshots: (result.data?.screenshots_mb as number) || 0,
+        videos: (result.data?.videos_mb as number) || 0,
+        screenshotCount: (result.data?.screenshot_count as number) || 0,
+        videoCount: (result.data?.video_count as number) || 0,
       };
     } catch (error) {
       console.error("Failed to get storage usage:", error);

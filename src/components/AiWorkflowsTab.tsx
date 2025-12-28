@@ -1,64 +1,40 @@
 /**
  * AiWorkflowsTab.tsx
  *
- * Consolidated AI Workflows tab with sub-pages:
- * - Workflow Builder: Build and run AI automation workflows
- * - Workflow Library: Manage saved AI workflows
- * - Prompts: Prompt library management
- * - Scripts: Playwright script management
- * - AI Output: View AI conversation output
- * - Issues: AI-detected issues from workflow execution
- * - Learnings: Analyze AI loops to extract patterns and insights
- * - Log Locations: Configure external log sources for AI analysis
+ * Redesigned AI Workflows tab with streamlined navigation (4 tabs):
+ * - Session: Active workflow view with AI Output (Continue button here)
+ * - Library: Combined prompts, workflows, and scripts
+ * - Monitor: Issues and learnings analysis
+ * - Configure: Workflow builder, log sources, scriptlets
+ *
+ * This redesign addresses UX confusion where users would start prompts
+ * in one tab but need to go to another for Continue/Output viewing.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import {
-  Sparkles,
-  BookOpen,
-  FileText,
-  TestTube,
-  MessageSquare,
-  AlertTriangle,
-  FolderOpen,
-  Lightbulb,
-  Puzzle,
-} from "lucide-react";
+import { Activity, BookOpen, Eye, Settings, AlertTriangle } from "lucide-react";
 
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
 import type { AiOutputLine } from "./AiOutputTab";
 import { issueTracker } from "../services";
 
-// Sub-tab components
-import { WorkflowBuilderSubTab } from "./ai-workflows/WorkflowBuilderSubTab";
-import { WorkflowLibrarySubTab } from "./ai-workflows/WorkflowLibrarySubTab";
-import { PromptsSubTab } from "./ai-workflows/PromptsSubTab";
-import { ScriptsSubTab } from "./ai-workflows/ScriptsSubTab";
-import { AiOutputSubTab } from "./ai-workflows/AiOutputSubTab";
-import { LearningsSubTab } from "./ai-workflows/LearningsSubTab";
-import { ScriptletsSubTab } from "./ai-workflows/ScriptletsSubTab";
-import { IssuesPanel } from "./IssuesPanel";
-import { ExternalLogsTab } from "./ExternalLogsTab";
+// New consolidated sub-tab components
+import { SessionSubTab } from "./ai-workflows/SessionSubTab";
+import { LibrarySubTab } from "./ai-workflows/LibrarySubTab";
+import { MonitorSubTab } from "./ai-workflows/MonitorSubTab";
+import { ConfigureSubTab } from "./ai-workflows/ConfigureSubTab";
 
-type AiWorkflowSubTab =
-  | "builder"
-  | "library"
-  | "prompts"
-  | "scripts"
-  | "output"
-  | "issues"
-  | "learnings"
-  | "scriptlets"
-  | "log-locations";
+type AiWorkflowSubTab = "session" | "library" | "monitor" | "configure";
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
-const SUB_TAB_STORAGE_KEY = "qontinui-ai-workflows-sub-tab";
+const SUB_TAB_STORAGE_KEY = "qontinui-ai-workflows-sub-tab-v2";
 
 interface AiWorkflowsTabProps {
   projectLogs: UseProjectLogsReturn;
   aiOutputLines: AiOutputLine[];
   onClearAiOutput: () => void;
+  onAddAiOutputLine?: (line: Omit<AiOutputLine, "id">) => void;
   onLog: (level: LogLevel, message: string) => void;
   onConfigureLogLocations: () => void;
 }
@@ -67,32 +43,24 @@ export function AiWorkflowsTab({
   projectLogs,
   aiOutputLines,
   onClearAiOutput,
+  onAddAiOutputLine,
   onLog,
   onConfigureLogLocations,
 }: AiWorkflowsTabProps) {
   const [activeSubTab, setActiveSubTab] = useState<AiWorkflowSubTab>(() => {
     const stored = localStorage.getItem(SUB_TAB_STORAGE_KEY);
-    if (
-      stored &&
-      [
-        "builder",
-        "library",
-        "prompts",
-        "scripts",
-        "output",
-        "issues",
-        "learnings",
-        "scriptlets",
-        "log-locations",
-      ].includes(stored)
-    ) {
+    // Map old tab names to new ones for backward compatibility
+    if (stored === "builder" || stored === "output") return "session";
+    if (stored === "prompts" || stored === "library" || stored === "scripts") return "library";
+    if (stored === "issues" || stored === "learnings") return "monitor";
+    if (stored === "scriptlets" || stored === "log-locations") return "configure";
+    if (stored && ["session", "library", "monitor", "configure"].includes(stored)) {
       return stored as AiWorkflowSubTab;
     }
-    return "builder";
+    return "session";
   });
 
-  // Track issue count from IssueTracker (using session-filtered counts to match IssuesPanel)
-  const [issueCount, setIssueCount] = useState(() => issueTracker.getSessionIssues().length);
+  // Track issue count for badge
   const [unresolvedCount, setUnresolvedCount] = useState(
     () =>
       issueTracker
@@ -103,12 +71,10 @@ export function AiWorkflowsTab({
   useEffect(() => {
     const updateCounts = () => {
       const sessionIssues = issueTracker.getSessionIssues();
-      setIssueCount(sessionIssues.length);
       setUnresolvedCount(
         sessionIssues.filter((i) => i.status === "detected" || i.status === "in_progress").length,
       );
     };
-    // Initial update
     updateCounts();
     const unsubscribe = issueTracker.subscribe(updateCounts);
     return unsubscribe;
@@ -119,22 +85,43 @@ export function AiWorkflowsTab({
     localStorage.setItem(SUB_TAB_STORAGE_KEY, activeSubTab);
   }, [activeSubTab]);
 
+  // Navigation callback for Library -> Session
+  const handleNavigateToSession = useCallback(() => {
+    setActiveSubTab("session");
+  }, []);
+
+  // Navigation callback for Session -> Library
+  const handleNavigateToLibrary = useCallback(() => {
+    setActiveSubTab("library");
+  }, []);
+
   const subTabs = [
-    { id: "builder" as const, label: "Builder", icon: Sparkles },
-    { id: "library" as const, label: "Workflows", icon: BookOpen },
-    { id: "prompts" as const, label: "Prompts", icon: FileText },
-    { id: "scripts" as const, label: "Scripts", icon: TestTube },
-    { id: "output" as const, label: "AI Output", icon: MessageSquare },
     {
-      id: "issues" as const,
-      label: "Issues",
-      icon: AlertTriangle,
-      count: issueCount,
+      id: "session" as const,
+      label: "Session",
+      icon: Activity,
+      description: "Active AI session & output",
+    },
+    {
+      id: "library" as const,
+      label: "Library",
+      icon: BookOpen,
+      description: "Prompts, workflows, scripts",
+    },
+    {
+      id: "monitor" as const,
+      label: "Monitor",
+      icon: Eye,
+      description: "Issues & learnings",
+      count: unresolvedCount > 0 ? unresolvedCount : undefined,
       highlight: unresolvedCount > 0,
     },
-    { id: "learnings" as const, label: "Learnings", icon: Lightbulb },
-    { id: "scriptlets" as const, label: "Scriptlets", icon: Puzzle },
-    { id: "log-locations" as const, label: "Log Locations", icon: FolderOpen },
+    {
+      id: "configure" as const,
+      label: "Configure",
+      icon: Settings,
+      description: "Builder, logs, scriptlets",
+    },
   ];
 
   return (
@@ -144,27 +131,28 @@ export function AiWorkflowsTab({
         onValueChange={(value) => setActiveSubTab(value as AiWorkflowSubTab)}
         className="flex-1 flex flex-col min-h-0"
       >
-        {/* Sub-Tab Navigation - Fixed */}
+        {/* Sub-Tab Navigation */}
         <Tabs.List className="flex border-b border-border bg-card/50 px-4 flex-shrink-0">
           {subTabs.map((tab) => {
             const Icon = tab.icon;
-            const hasCount = "count" in tab && typeof tab.count === "number";
-            const hasHighlight = "highlight" in tab && tab.highlight;
+            const hasCount = tab.count !== undefined;
+            const hasHighlight = tab.highlight;
             return (
               <Tabs.Trigger
                 key={tab.id}
                 value={tab.id}
                 className={`
-                  flex items-center gap-2 px-4 py-3 text-sm font-medium
+                  flex items-center gap-2 px-6 py-3 text-sm font-medium
                   border-b-2 transition-colors
                   data-[state=active]:border-primary data-[state=active]:text-primary
                   data-[state=inactive]:border-transparent data-[state=inactive]:text-muted-foreground
                   data-[state=inactive]:hover:text-foreground data-[state=inactive]:hover:bg-muted/30
                 `}
+                title={tab.description}
               >
                 <Icon className={`w-4 h-4 ${hasHighlight ? "text-red-500" : ""}`} />
                 {tab.label}
-                {hasCount && tab.count > 0 && (
+                {hasCount && (
                   <span
                     className={`ml-1 px-1.5 py-0.5 text-xs rounded-full ${
                       hasHighlight ? "bg-red-500/20 text-red-400" : "bg-muted"
@@ -180,92 +168,46 @@ export function AiWorkflowsTab({
 
         {/* Sub-Tab Content */}
         <div className="flex-1 min-h-0 overflow-hidden">
-          {/* Workflow Builder */}
+          {/* Session Tab - Active workflow & AI Output */}
           <Tabs.Content
-            value="builder"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
+            value="session"
+            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
-            <WorkflowBuilderSubTab
-              projectLogs={projectLogs}
-              onNavigateToLogLocations={() => setActiveSubTab("log-locations")}
+            <SessionSubTab
+              aiOutputLines={aiOutputLines}
+              onClearAiOutput={onClearAiOutput}
+              onAddAiOutputLine={onAddAiOutputLine}
+              onNavigateToLibrary={handleNavigateToLibrary}
             />
           </Tabs.Content>
 
-          {/* Workflow Library */}
+          {/* Library Tab - Prompts, Workflows, Scripts */}
           <Tabs.Content
             value="library"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <WorkflowLibrarySubTab onLog={onLog} />
-          </Tabs.Content>
-
-          {/* Prompts */}
-          <Tabs.Content
-            value="prompts"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <PromptsSubTab onLog={onLog} />
-          </Tabs.Content>
-
-          {/* Scripts */}
-          <Tabs.Content
-            value="scripts"
-            forceMount
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <ScriptsSubTab onLog={onLog} />
-          </Tabs.Content>
-
-          {/* AI Output */}
-          <Tabs.Content
-            value="output"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <AiOutputSubTab aiOutputLines={aiOutputLines} onClearAiOutput={onClearAiOutput} />
-          </Tabs.Content>
-
-          {/* Issues */}
-          <Tabs.Content
-            value="issues"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <div className="h-full p-4">
-              <IssuesPanel />
-            </div>
-          </Tabs.Content>
-
-          {/* Learnings */}
-          <Tabs.Content
-            value="learnings"
             className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
-            <LearningsSubTab aiOutputLines={aiOutputLines} />
+            <LibrarySubTab onLog={onLog} onNavigateToSession={handleNavigateToSession} />
           </Tabs.Content>
 
-          {/* Scriptlets */}
+          {/* Monitor Tab - Issues & Learnings */}
           <Tabs.Content
-            value="scriptlets"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
+            value="monitor"
+            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
-            <ScriptletsSubTab onLog={onLog} aiOutputLines={aiOutputLines} />
+            <MonitorSubTab aiOutputLines={aiOutputLines} />
           </Tabs.Content>
 
-          {/* Log Locations */}
+          {/* Configure Tab - Builder, Log Sources, Scriptlets */}
           <Tabs.Content
-            value="log-locations"
-            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
+            value="configure"
+            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
-            <div className="h-full p-4">
-              <ExternalLogsTab
-                config={projectLogs.config}
-                sources={projectLogs.logsState.sources}
-                loading={projectLogs.logsState.loading}
-                error={projectLogs.logsState.error}
-                lastRefresh={projectLogs.logsState.lastRefresh}
-                onRefresh={projectLogs.refreshLogs}
-                onConfigureSources={onConfigureLogLocations}
-              />
-            </div>
+            <ConfigureSubTab
+              projectLogs={projectLogs}
+              aiOutputLines={aiOutputLines}
+              onLog={onLog}
+              onConfigureLogLocations={onConfigureLogLocations}
+            />
           </Tabs.Content>
         </div>
       </Tabs.Root>

@@ -6,7 +6,6 @@
  * Features:
  * - AI Loop selector to navigate between different conversation sessions
  * - Truncation of long responses with expand/collapse toggle
- * - Error summary showing detected issues
  * - Fixed header that doesn't scroll
  */
 
@@ -21,27 +20,31 @@ import {
   Send,
   ChevronDown,
   ChevronUp,
-  AlertTriangle,
-  CheckCircle,
-  Clock,
   ChevronRight,
   Square,
+  Copy,
+  Check,
 } from "lucide-react";
-import { issueTracker } from "../services";
+import { issueTracker, findingsTracker } from "../services";
 import { groupEntriesIntoLoops, DEFAULT_MAX_LINES /* type AiLoop */ } from "../types/aiLoop";
-import type { DetectedIssue } from "../types/issues";
 
 export interface AiOutputLine {
   id: string;
   timestamp: number;
   line: string;
-  source: string; // "prompt" for user prompt, "claude" for AI response
+  source: string; // "prompt" for user prompt, "claude" for AI response, "user_hint" for user hints
   actionId?: string;
+  /** Session/workflow ID for grouping loops by workflow */
+  sessionId?: string;
+  /** Human-readable session/workflow name */
+  sessionName?: string;
 }
 
 interface AiOutputTabProps {
   lines: AiOutputLine[];
   onClear: () => void;
+  /** Callback to add a line to the output (for hints) */
+  onAddLine?: (line: Omit<AiOutputLine, "id">) => void;
 }
 
 // Time threshold (ms) to consider AI as "recently active"
@@ -49,7 +52,7 @@ const AI_ACTIVITY_THRESHOLD_MS = 5000;
 // Polling interval for executor status
 const STATUS_POLL_INTERVAL_MS = 1000;
 
-export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
+export function AiOutputTab({ lines = [], onClear, onAddLine }: AiOutputTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [isAiWorking, setIsAiWorking] = useState(false);
@@ -58,12 +61,11 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
   const [selectedLoopId, setSelectedLoopId] = useState<string | null>(null);
   const [expandedResponses, setExpandedResponses] = useState<Set<string>>(new Set());
   const [showLoopSelector, setShowLoopSelector] = useState(false);
-  const [showErrorSummary, setShowErrorSummary] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const [hintQueued, setHintQueued] = useState(false);
+  const [queuedHint, setQueuedHint] = useState("");
   const lastLineTimestampRef = useRef<number>(0);
   const processedLinesRef = useRef<Set<string>>(new Set());
-
-  // Track issues for the current session
-  const [sessionIssues, setSessionIssues] = useState<DetectedIssue[]>([]);
 
   // Group lines into AI loops
   const loops = useMemo(() => groupEntriesIntoLoops(lines), [lines]);
@@ -88,7 +90,7 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
     }
   }, [loops, selectedLoopId]);
 
-  // Process new lines through IssueTracker for issue detection
+  // Process new lines through IssueTracker and FindingsTracker for detection
   useEffect(() => {
     for (const line of lines) {
       // Skip already processed lines
@@ -96,23 +98,16 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
 
       // Only process AI responses (claude source), not user prompts
       if (line.source === "claude") {
+        // Legacy issue detection
         issueTracker.processLine(line.line);
+        // New categorized findings detection
+        findingsTracker.processLine(line.line);
       }
 
       // Mark as processed
       processedLinesRef.current.add(line.id);
     }
   }, [lines]);
-
-  // Subscribe to issue tracker updates
-  useEffect(() => {
-    const updateIssues = () => {
-      setSessionIssues(issueTracker.getSessionIssues());
-    };
-    updateIssues();
-    const unsubscribe = issueTracker.subscribe(updateIssues);
-    return unsubscribe;
-  }, []);
 
   // Build conversation history from lines
   const buildConversationHistory = useCallback(() => {
@@ -170,6 +165,28 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
     return history;
   }, [lines]);
 
+  // Queue a hint to be included in the next AI call (when AI is working)
+  const handleQueueHint = useCallback(() => {
+    const trimmedHint = promptInput.trim();
+    if (!trimmedHint) return;
+
+    // Add hint to the output as a user comment
+    if (onAddLine) {
+      onAddLine({
+        timestamp: Date.now(),
+        line: trimmedHint,
+        source: "user_hint",
+        sessionId: currentLoop?.sessionId,
+        sessionName: currentLoop?.sessionName,
+      });
+    }
+
+    // Queue the hint for the next AI call
+    setQueuedHint(trimmedHint);
+    setHintQueued(true);
+    setPromptInput("");
+  }, [promptInput, onAddLine, currentLoop]);
+
   // Send a prompt to continue the conversation
   const handleSendPrompt = useCallback(async () => {
     const trimmedPrompt = promptInput.trim();
@@ -179,7 +196,17 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
     try {
       // Include conversation history for context (sent to AI but not displayed)
       const history = buildConversationHistory();
-      const fullPrompt = history + trimmedPrompt;
+
+      // Include queued hint if any
+      let hintSection = "";
+      if (queuedHint) {
+        hintSection = `\n## User Hint (IMPORTANT - From the user watching this session)\n${queuedHint}\n\n`;
+        // Clear the queued hint after including it
+        setQueuedHint("");
+        setHintQueued(false);
+      }
+
+      const fullPrompt = history + hintSection + trimmedPrompt;
 
       const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
         method: "POST",
@@ -202,17 +229,22 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
     } finally {
       setIsSending(false);
     }
-  }, [promptInput, isSending, buildConversationHistory]);
+  }, [promptInput, isSending, buildConversationHistory, queuedHint]);
 
   // Handle keyboard shortcuts
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
-        handleSendPrompt();
+        // When AI is working, queue as hint; otherwise send as prompt
+        if (isAiWorking) {
+          handleQueueHint();
+        } else {
+          handleSendPrompt();
+        }
       }
     },
-    [handleSendPrompt],
+    [handleSendPrompt, handleQueueHint, isAiWorking],
   );
 
   // Stop the current AI analysis
@@ -304,25 +336,25 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
     setShowLoopSelector(false);
   }, []);
 
-  // Get issue counts by status
-  const issueSummary = useMemo(() => {
-    const summary = {
-      total: sessionIssues.length,
-      detected: 0,
-      inProgress: 0,
-      resolved: 0,
-      critical: 0,
-      high: 0,
-    };
-    for (const issue of sessionIssues) {
-      if (issue.status === "detected") summary.detected++;
-      if (issue.status === "in_progress") summary.inProgress++;
-      if (issue.status === "resolved") summary.resolved++;
-      if (issue.severity === "critical") summary.critical++;
-      if (issue.severity === "high") summary.high++;
+  // Copy all text in current loop
+  const handleCopyLoop = useCallback(async () => {
+    if (!currentLoop) return;
+
+    const allText = currentLoop.entries
+      .map((entry) => {
+        const prefix = entry.source === "prompt" ? "[Prompt]\n" : "";
+        return prefix + entry.line;
+      })
+      .join("\n\n");
+
+    try {
+      await navigator.clipboard.writeText(allText);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error("Failed to copy:", err);
     }
-    return summary;
-  }, [sessionIssues]);
+  }, [currentLoop]);
 
   // Empty state
   if (!lines || lines.length === 0) {
@@ -458,115 +490,24 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
               {currentLoop?.entries.length || 0} messages
             </span>
             <button
-              onClick={onClear}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-              title="Clear all AI output"
+              onClick={handleCopyLoop}
+              disabled={!currentLoop}
+              className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+              title="Copy all text in this loop"
             >
-              <Trash2 className="w-3 h-3" />
-              Clear All
+              {copied ? (
+                <>
+                  <Check className="w-3 h-3 text-green-500" />
+                  <span className="text-green-500">Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3" />
+                  Copy
+                </>
+              )}
             </button>
           </div>
-        </div>
-
-        {/* Error Summary (always visible, collapsible) */}
-        <div className="bg-muted/50 rounded-lg border border-border">
-          <button
-            onClick={() => setShowErrorSummary(!showErrorSummary)}
-            className="w-full flex items-center justify-between px-3 py-2 text-sm font-medium hover:bg-muted/80 transition-colors rounded-lg"
-          >
-            <div className="flex items-center gap-2">
-              {issueSummary.total > 0 ? (
-                <AlertTriangle
-                  className={`w-4 h-4 ${issueSummary.critical > 0 ? "text-red-500" : issueSummary.high > 0 ? "text-orange-500" : "text-yellow-500"}`}
-                />
-              ) : (
-                <CheckCircle className="w-4 h-4 text-green-500" />
-              )}
-              <span>
-                {issueSummary.total > 0
-                  ? `Issues Detected: ${issueSummary.total}`
-                  : "No Issues Detected"}
-              </span>
-            </div>
-            <div className="flex items-center gap-3">
-              {issueSummary.detected > 0 && (
-                <span className="text-xs px-2 py-0.5 bg-red-500/20 text-red-400 rounded">
-                  {issueSummary.detected} open
-                </span>
-              )}
-              {issueSummary.inProgress > 0 && (
-                <span className="text-xs px-2 py-0.5 bg-blue-500/20 text-blue-400 rounded">
-                  {issueSummary.inProgress} in progress
-                </span>
-              )}
-              {issueSummary.resolved > 0 && (
-                <span className="text-xs px-2 py-0.5 bg-green-500/20 text-green-400 rounded">
-                  {issueSummary.resolved} resolved
-                </span>
-              )}
-              {showErrorSummary ? (
-                <ChevronUp className="w-4 h-4" />
-              ) : (
-                <ChevronDown className="w-4 h-4" />
-              )}
-            </div>
-          </button>
-
-          {showErrorSummary && issueSummary.total > 0 && (
-            <div className="px-3 pb-2 space-y-1 max-h-32 overflow-y-auto">
-              {sessionIssues.slice(0, 5).map((issue) => (
-                <div
-                  key={issue.id}
-                  className="flex items-center gap-2 text-xs py-1 border-t border-border/50"
-                >
-                  {issue.status === "resolved" ? (
-                    <CheckCircle className="w-3 h-3 text-green-500 flex-shrink-0" />
-                  ) : issue.status === "in_progress" ? (
-                    <Clock className="w-3 h-3 text-blue-500 flex-shrink-0" />
-                  ) : (
-                    <AlertTriangle
-                      className={`w-3 h-3 flex-shrink-0 ${
-                        issue.severity === "critical"
-                          ? "text-red-500"
-                          : issue.severity === "high"
-                            ? "text-orange-500"
-                            : "text-yellow-500"
-                      }`}
-                    />
-                  )}
-                  <span
-                    className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium ${
-                      issue.severity === "critical"
-                        ? "bg-red-500/20 text-red-400"
-                        : issue.severity === "high"
-                          ? "bg-orange-500/20 text-orange-400"
-                          : issue.severity === "medium"
-                            ? "bg-yellow-500/20 text-yellow-400"
-                            : "bg-gray-500/20 text-gray-400"
-                    }`}
-                  >
-                    {issue.severity}
-                  </span>
-                  <span className="truncate flex-1" title={issue.title}>
-                    {issue.title}
-                  </span>
-                  {issue.file && (
-                    <span
-                      className="text-muted-foreground truncate max-w-[120px]"
-                      title={issue.file}
-                    >
-                      {issue.file.split("/").pop()}
-                    </span>
-                  )}
-                </div>
-              ))}
-              {sessionIssues.length > 5 && (
-                <div className="text-xs text-muted-foreground pt-1 border-t border-border/50">
-                  +{sessionIssues.length - 5} more issues (see Issues tab)
-                </div>
-              )}
-            </div>
-          )}
         </div>
       </div>
 
@@ -577,16 +518,38 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
       >
         {currentLoop?.entries.map((entry, index) => {
           const isPrompt = entry.source === "prompt";
+          const isUserHint = entry.source === "user_hint";
           const prevEntry = index > 0 ? currentLoop.entries[index - 1] : null;
-          const isFirstResponse = !isPrompt && prevEntry?.source === "prompt";
+          const isFirstResponse = !isPrompt && !isUserHint && prevEntry?.source === "prompt";
 
-          // Group consecutive response lines together
-          if (!isPrompt) {
+          // User hint styling (purple like the script auto-refine hints)
+          if (isUserHint) {
+            return (
+              <div
+                key={entry.id}
+                className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 mb-3"
+              >
+                <div className="flex items-center gap-2 text-purple-400 text-xs font-semibold mb-2">
+                  <MessageSquare className="w-4 h-4" />
+                  <span>USER HINT</span>
+                  <span className="text-muted-foreground font-normal ml-auto">
+                    {new Date(entry.timestamp).toLocaleTimeString()}
+                  </span>
+                </div>
+                <div className="text-foreground whitespace-pre-wrap break-words">{entry.line}</div>
+              </div>
+            );
+          }
+
+          // Group consecutive response lines together (claude responses only)
+          if (!isPrompt && !isUserHint) {
             // Find all consecutive response lines starting from this entry
             let responseLines: string[] = [];
             let _endIndex = index;
             for (let i = index; i < currentLoop.entries.length; i++) {
-              if (currentLoop.entries[i].source !== "prompt") {
+              const src = currentLoop.entries[i].source;
+              // Only group claude responses, not prompts or hints
+              if (src !== "prompt" && src !== "user_hint") {
                 responseLines.push(currentLoop.entries[i].line);
                 _endIndex = i;
               } else {
@@ -595,7 +558,7 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
             }
 
             // Only render the grouped response at the first response line
-            if (index > 0 && prevEntry?.source !== "prompt") {
+            if (index > 0 && prevEntry?.source !== "prompt" && prevEntry?.source !== "user_hint") {
               return null; // Skip - will be rendered as part of the group
             }
 
@@ -663,26 +626,56 @@ export function AiOutputTab({ lines = [], onClear }: AiOutputTabProps) {
         })}
       </div>
 
-      {/* Prompt input for continuing the conversation */}
+      {/* Prompt/Hint input */}
       <div className="flex-shrink-0 mt-3 flex gap-2">
         <textarea
           ref={textareaRef}
           value={promptInput}
-          onChange={(e) => setPromptInput(e.target.value)}
+          onChange={(e) => {
+            setPromptInput(e.target.value);
+            if (hintQueued) setHintQueued(false);
+          }}
           onKeyDown={handleKeyDown}
-          placeholder="Continue the conversation... (Enter to send, Shift+Enter for newline)"
-          disabled={isSending || isAiWorking}
-          className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50 disabled:cursor-not-allowed"
+          placeholder={
+            isAiWorking
+              ? "Send a hint to the AI... (Enter to queue)"
+              : "Continue the conversation... (Enter to send, Shift+Enter for newline)"
+          }
+          disabled={isSending}
+          className={`flex-1 px-3 py-2 bg-background border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-none focus:ring-2 disabled:opacity-50 disabled:cursor-not-allowed ${
+            isAiWorking
+              ? "border-purple-500/50 focus:ring-purple-500"
+              : "border-border focus:ring-primary"
+          } ${hintQueued ? "border-green-500" : ""}`}
           rows={1}
         />
-        <button
-          onClick={handleSendPrompt}
-          disabled={!promptInput.trim() || isSending || isAiWorking}
-          className="px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
-          title="Send prompt (Enter)"
-        >
-          {isSending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
-        </button>
+        {isAiWorking ? (
+          <button
+            onClick={handleQueueHint}
+            disabled={!promptInput.trim()}
+            className="px-4 py-2 bg-purple-600 text-white rounded-lg font-medium hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+            title="Queue hint for AI (Enter)"
+          >
+            <MessageSquare className="w-4 h-4" />
+            <span>Hint</span>
+          </button>
+        ) : (
+          <button
+            onClick={handleSendPrompt}
+            disabled={!promptInput.trim() || isSending}
+            className="px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+            title="Send prompt (Enter)"
+          >
+            {isSending ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Send className="w-4 h-4" />
+            )}
+          </button>
+        )}
+        {hintQueued && (
+          <span className="text-xs text-green-400 self-center whitespace-nowrap">Hint queued</span>
+        )}
       </div>
     </div>
   );

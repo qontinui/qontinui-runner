@@ -9,6 +9,8 @@ export type { Config, Workflow } from "./ExecutionContext";
 
 export { EventManagerProvider, useEventManager } from "./EventManagerContext";
 
+export { AutoContinueProvider, useAutoContinue } from "./AutoContinueContext";
+
 // Re-export execution-related hooks for convenience
 export {
   usePythonExecutor,

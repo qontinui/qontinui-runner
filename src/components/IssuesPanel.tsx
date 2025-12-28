@@ -33,10 +33,8 @@ import {
 } from "../types/issues";
 import { issueTracker, IssueTrackerEvent } from "../services/IssueTracker";
 
-interface IssuesPanelProps {
-  /** Callback when an issue is clicked for details */
-  onIssueClick?: (issue: DetectedIssue) => void;
-}
+// Component is self-contained with expand/collapse functionality
+type IssuesPanelProps = Record<string, never>;
 
 /** Icon for source types */
 const SOURCE_ICONS: Record<IssueSourceType, React.ReactNode> = {
@@ -62,35 +60,77 @@ function buildAnalyzePrompt(issuesJson: string): string {
 
 ## Your Task
 
-1. **Analyze** each issue to determine if it's a real problem that needs fixing
-2. **Fix** issues that you can fix by making code changes
-3. **Report** on what you fixed
-4. **Remove** issues that are no longer valid (false positives, already fixed, or duplicates)
+1. **Analyze** each issue to determine what type of finding it is
+2. **Fix** code bugs, security issues, test issues, and documentation problems automatically
+3. **Categorize** all findings appropriately using the structured output format
+4. **Report** your findings in a categorized, structured format
 
 ## Current Issues
 
 ${issuesJson}
 
+## Output Format
+
+For EACH issue, output a structured finding using this format:
+
+\`\`\`
+[FINDING:category_id:severity]
+Title: Brief title
+Description: What was found and what was done (if fixed)
+File: path/to/file (if applicable)
+Line: line number (if applicable)
+Resolution: What you fixed (if you fixed it)
+[/FINDING]
+\`\`\`
+
+## Categories to Use
+
+**Auto-fixable (fix these automatically):**
+- \`code_bug\` - Actual code bugs → FIX IT, then report with Resolution field
+- \`security\` - Security vulnerabilities → FIX IT, then report with Resolution field
+- \`test_issue\` - Test code problems → FIX IT, then report with Resolution field
+- \`documentation\` - Doc issues → FIX IT, then report with Resolution field
+
+**Not code bugs (categorize appropriately):**
+- \`already_fixed\` - Was fixed in a previous session
+- \`expected_behavior\` - This is intentional/by design, not a bug
+- \`config_issue\` - Configuration or environment problem (user must handle)
+- \`runtime_issue\` - Operational issue, not a code bug
+- \`data_migration\` - Requires database admin intervention
+- \`enhancement\` - Improvement suggestion (use :needs_input if user decision required)
+- \`todo\` - TODO item that needs user decision (use :needs_input)
+- \`performance\` - Performance issue (use :needs_input for trade-off decisions)
+- \`warning\` - Something to be aware of, no action needed
+
+**When user input is needed:**
+Add \`:needs_input\` to the marker and include Question/Options fields:
+\`\`\`
+[FINDING:enhancement:medium:needs_input]
+Title: Feature suggestion
+Description: Explanation
+Question: What should we do?
+Options: Option A | Option B | Option C
+[/FINDING]
+\`\`\`
+
+## Severity Levels
+- \`critical\` - System-breaking, security vulnerabilities, data loss
+- \`high\` - Major functionality broken
+- \`medium\` - Should be addressed soon
+- \`low\` - Minor issues
+- \`info\` - Informational only
+
 ## Instructions
 
-For each issue:
-- If it's a REAL problem: Fix it in the code, then output:
-  [ISSUE:RESOLVED] {"id": "<issue_id>", "resolution": "<what you fixed>"}
+1. Read the relevant files to understand each issue
+2. For auto-fixable categories: Make the fix in the code, then output the finding with a Resolution field
+3. For non-actionable items: Categorize them appropriately so users understand why no action is needed
+4. For items needing user input: Use the :needs_input modifier with a clear question
 
-- If it's NOT a real problem (false positive, already fixed, duplicate): Output:
-  [ISSUE:REMOVED] {"id": "<issue_id>", "reason": "<why it's not a real issue>"}
-
-- If you need more context, read the relevant files first.
-
-After processing all issues, provide a summary of:
-- How many issues were fixed
-- How many issues were removed (false positives)
-- Any issues that couldn't be fixed and why
-
-Work autonomously. Fix what you can, remove what's invalid, and explain your reasoning.`;
+Work autonomously. Fix what you can, categorize everything appropriately.`;
 }
 
-export function IssuesPanel({ onIssueClick: _onIssueClick }: IssuesPanelProps) {
+export function IssuesPanel(_props: IssuesPanelProps) {
   const [issues, setIssues] = useState<DetectedIssue[]>([]);
   const [summary, setSummary] = useState<IssueSessionSummary | null>(null);
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());

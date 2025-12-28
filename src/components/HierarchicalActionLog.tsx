@@ -18,7 +18,7 @@ function renderNodeTree(
   skipRootWorkflows: boolean = false,
 ): React.ReactNode[] {
   // Skip workflow nodes that are just wrappers
-  if (node.type === "workflow") {
+  if (node.node_type === "workflow") {
     console.log(`[HierarchicalActionLog] Checking workflow node: ${node.name}`, {
       isRoot: node.parent === null,
       skipRootWorkflows,

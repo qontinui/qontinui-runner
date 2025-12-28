@@ -34,6 +34,9 @@ pub struct ExecutionStep {
     /// Whether to capture a screenshot after this step
     #[serde(default, rename = "takeScreenshot")]
     pub take_screenshot: bool,
+    /// Delay in seconds before taking screenshot (default 0)
+    #[serde(default, rename = "screenshotDelay")]
+    pub screenshot_delay: Option<f64>,
     /// For playwright steps: the script ID
     #[serde(default, rename = "playwrightScriptId")]
     pub playwright_script_id: Option<String>,

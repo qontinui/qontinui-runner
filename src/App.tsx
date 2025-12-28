@@ -23,7 +23,12 @@ import {
 } from "lucide-react";
 
 // Contexts
-import { ExecutionProvider, useExecution, EventManagerProvider } from "./contexts";
+import {
+  ExecutionProvider,
+  useExecution,
+  EventManagerProvider,
+  AutoContinueProvider,
+} from "./contexts";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 
 // Managers
@@ -115,6 +120,7 @@ function AppContent() {
     imageLogs,
     aiOutputLogs,
     addLog,
+    addAiOutputLog,
     clearGeneralLogs,
     clearImageLogs,
     clearAiOutputLogs,
@@ -498,6 +504,7 @@ function AppContent() {
               projectLogs={projectLogs}
               aiOutputLines={aiOutputLogs}
               onClearAiOutput={clearAiOutputLogs}
+              onAddAiOutputLine={(line) => addAiOutputLog(line.line, line.source, line.actionId)}
               onLog={addLog}
               onConfigureLogLocations={() => setShowLogSourceManager(true)}
             />
@@ -592,7 +599,9 @@ export default function App() {
             // Could be handled here if needed for other side effects
           }}
         >
-          <AppContent />
+          <AutoContinueProvider>
+            <AppContent />
+          </AutoContinueProvider>
         </ExecutionProvider>
       </EventManagerProvider>
     </AuthProvider>
