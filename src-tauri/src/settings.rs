@@ -4,8 +4,6 @@ use std::path::PathBuf;
 use tracing::{error, info};
 
 const SETTINGS_FILE: &str = "settings.json";
-#[allow(dead_code)]
-const LAST_CONFIG_KEY: &str = "last_config_path";
 
 // ============================================================================
 // AI Settings

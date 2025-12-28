@@ -186,7 +186,10 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
           phase_field: isWorkflow ? prompt.workflow.phase_field : "current_phase",
           completion_value: isWorkflow ? prompt.workflow.completion_value : null,
         };
-        console.log("[LibrarySubTab] Running prompt with config:", JSON.stringify(requestBody, null, 2));
+        console.log(
+          "[LibrarySubTab] Running prompt with config:",
+          JSON.stringify(requestBody, null, 2),
+        );
         const response = await fetch("http://localhost:9876/sessions/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },

@@ -210,17 +210,3 @@ impl From<AppError> for String {
         error.to_string()
     }
 }
-
-#[allow(dead_code)]
-pub type AppResult<T> = Result<T, AppError>;
-
-#[allow(dead_code)]
-pub fn handle_error_with_context<T>(
-    result: Result<T, AppError>,
-    context: &str,
-) -> Result<T, AppError> {
-    result.map_err(|e| {
-        tracing::error!("Error in {}: {:?}", context, e);
-        e
-    })
-}

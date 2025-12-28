@@ -138,10 +138,6 @@ pub struct ExecutorLifecycle {
     /// Pending command responses - maps command ID to oneshot sender
     pending_commands:
         Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<CommandResponseResult>>>>,
-
-    /// Whether lifecycle has been started
-    #[allow(dead_code)]
-    started: Arc<RwLock<bool>>,
 }
 
 impl ExecutorLifecycle {
@@ -155,7 +151,6 @@ impl ExecutorLifecycle {
             ready_tx: None,
             execution_complete_tx: Arc::new(RwLock::new(None)),
             pending_commands: Arc::new(RwLock::new(HashMap::new())),
-            started: Arc::new(RwLock::new(false)),
         }
     }
 

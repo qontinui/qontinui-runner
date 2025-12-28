@@ -2753,11 +2753,10 @@ async fn run_prompt(
             "activity_log": []
         });
 
-        std::fs::write(
-            &state_file,
-            serde_json::to_string_pretty(&initial_state).unwrap(),
-        )
-        .map_err(|e| format!("Failed to write state file: {}", e))?;
+        let state_json = serde_json::to_string_pretty(&initial_state)
+            .map_err(|e| format!("Failed to serialize state: {}", e))?;
+        std::fs::write(&state_file, state_json)
+            .map_err(|e| format!("Failed to write state file: {}", e))?;
 
         // Write prompt content to file
         std::fs::write(&prompt_file, &prompt.content)
@@ -5037,6 +5036,7 @@ async fn start_session(
                         state_clone.clone(),
                         session_id.clone(),
                         workspace_root.clone(),
+                        None, // No external checkpoint for single session
                     )
                     .await;
                     return;
@@ -5046,10 +5046,13 @@ async fn start_session(
                 info!(
                     "Multi-session workflow ENABLED. Entering continuation loop with checkpoint_path and completion_value."
                 );
-                let checkpoint_path_str = workflow_checkpoint_path.unwrap();
+                // Safe to use expect here as has_workflow_config guarantees these are Some
+                let checkpoint_path_str = workflow_checkpoint_path
+                    .expect("workflow_checkpoint_path verified as Some above");
                 let checkpoint_path = std::path::PathBuf::from(&checkpoint_path_str);
                 let phase_field = workflow_phase_field;
-                let completion_value = workflow_completion_value.unwrap();
+                let completion_value = workflow_completion_value
+                    .expect("workflow_completion_value verified as Some above");
 
                 const MAX_CROSS_SESSION_ITERATIONS: u32 = 20; // Safety limit
                 let mut cross_session_count = 0u32;
@@ -5082,11 +5085,29 @@ async fn start_session(
                         cross_session_count, current_session_id
                     );
 
+                    // Read the current external checkpoint phase before starting the session
+                    // This allows the internal loop to detect when the phase advances
+                    let initial_ext_phase: u32 = if checkpoint_path.exists() {
+                        std::fs::read_to_string(&checkpoint_path)
+                            .ok()
+                            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                            .and_then(|j| j.get(&phase_field).and_then(|v| v.as_u64()))
+                            .unwrap_or(0) as u32
+                    } else {
+                        0
+                    };
+
                     // Run the session loop (handles phases within this session)
+                    // Pass external checkpoint info so the loop can exit when the phase advances
                     run_unified_session_loop(
                         state_clone.clone(),
                         current_session_id.clone(),
                         workspace_root.clone(),
+                        Some((
+                            checkpoint_path.clone(),
+                            phase_field.clone(),
+                            initial_ext_phase,
+                        )),
                     )
                     .await;
 
@@ -5995,11 +6016,27 @@ async fn resume_active_workflow_on_startup(state: Arc<ApiState>) {
                             cross_session_count, current_session_id
                         );
 
-                        // Run the session loop
+                        // Read the current external checkpoint phase before starting the session
+                        let initial_ext_phase: u32 = if checkpoint_path.exists() {
+                            std::fs::read_to_string(&checkpoint_path)
+                                .ok()
+                                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+                                .and_then(|j| j.get(&phase_field).and_then(|v| v.as_u64()))
+                                .unwrap_or(0) as u32
+                        } else {
+                            0
+                        };
+
+                        // Run the session loop with external checkpoint monitoring
                         run_unified_session_loop(
                             state_clone.clone(),
                             current_session_id.clone(),
                             workspace_root.clone(),
+                            Some((
+                                checkpoint_path.clone(),
+                                phase_field.clone(),
+                                initial_ext_phase,
+                            )),
                         )
                         .await;
 
@@ -6196,10 +6233,14 @@ fn check_external_checkpoint_status(
 }
 
 /// Run the unified session execution loop
+///
+/// For multi-session workflows, pass the external checkpoint info so the loop
+/// can exit when the external checkpoint advances, allowing cross-session continuation.
 async fn run_unified_session_loop(
     state: Arc<ApiState>,
     session_id: String,
     workspace_root: String,
+    external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
 ) {
     let session = match state.session_manager.get_session(&session_id).await {
         Some(s) => s,
@@ -6341,6 +6382,46 @@ async fn run_unified_session_loop(
                             Some(&session_id),
                         );
                         return;
+                    }
+
+                    // Check if external checkpoint has advanced (for multi-session workflows)
+                    // This allows the cross-session continuation loop to take over
+                    if let Some((ref ext_path, ref ext_field, initial_phase)) = external_checkpoint
+                    {
+                        if ext_path.exists() {
+                            if let Ok(contents) = std::fs::read_to_string(ext_path) {
+                                if let Ok(json) =
+                                    serde_json::from_str::<serde_json::Value>(&contents)
+                                {
+                                    let current_ext_phase =
+                                        json.get(ext_field).and_then(|v| v.as_u64()).unwrap_or(0)
+                                            as u32;
+
+                                    if current_ext_phase > initial_phase {
+                                        info!(
+                                            "External checkpoint advanced: {} {} -> {}. Exiting internal loop for cross-session continuation.",
+                                            ext_field, initial_phase, current_ext_phase
+                                        );
+                                        s.status = SessionStatus::Completed;
+                                        s.checkpoint.completed = true;
+                                        s.checkpoint.status = "phase_advanced".to_string();
+                                        let _ =
+                                            state.session_manager.update_session(s.clone()).await;
+
+                                        emit_ai_output(
+                                            &app_handle,
+                                            &format!(
+                                                "📤 Session {} completed phase {} -> {}. Ready for cross-session continuation.",
+                                                session_id, initial_phase, current_ext_phase
+                                            ),
+                                            "status",
+                                            Some(&session_id),
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Prepare continuation prompt
@@ -6634,6 +6715,6 @@ pub async fn start_server(
     }
 
     Err(Box::new(last_error.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, "All ports failed")
+        std::io::Error::other("All ports failed")
     })))
 }

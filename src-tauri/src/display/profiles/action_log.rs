@@ -14,10 +14,6 @@ pub struct ActionLogConfig {
 
     /// Whether to exclude inline workflows (helper workflows)
     pub exclude_inline_workflows: bool,
-
-    /// Whether to flatten the hierarchy
-    #[allow(dead_code)]
-    pub flatten_hierarchy: bool,
 }
 
 impl Default for ActionLogConfig {
@@ -34,7 +30,6 @@ impl Default for ActionLogConfig {
             include_actions,
             exclude_actions,
             exclude_inline_workflows: false, // Include helper workflows
-            flatten_hierarchy: true,
         }
     }
 }

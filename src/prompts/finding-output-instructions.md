@@ -28,41 +28,43 @@ Line: 42 (optional)
 
 ## Available Categories
 
-| Category ID | Name | Description | Default Action |
-|-------------|------|-------------|----------------|
-| `code_bug` | Code Bug | Actual code issues that can be auto-fixed | Auto-fix |
-| `todo` | TODO | Tasks that may require user decisions | Needs input |
-| `security` | Security | Security vulnerabilities or concerns | Auto-fix |
-| `config_issue` | Configuration Issue | Configuration or environment problems | Manual |
-| `already_fixed` | Already Fixed | Issues resolved in previous sessions | Informational |
-| `expected_behavior` | Expected Behavior | Intentional design, not a bug | Informational |
-| `data_migration` | Data Migration | Requires admin or manual intervention | Manual |
-| `runtime_issue` | Runtime Issue | Operational issues, not code bugs | Manual |
-| `test_issue` | Test Issue | Problems with test code or test setup | Auto-fix |
-| `enhancement` | Enhancement | Improvement suggestions | Needs input |
-| `documentation` | Documentation | Documentation issues or improvements | Auto-fix |
-| `performance` | Performance | Performance issues or optimization opportunities | Needs input |
-| `warning` | Warning | Things to be aware of | Informational |
+| Category ID         | Name                | Description                                      | Default Action |
+| ------------------- | ------------------- | ------------------------------------------------ | -------------- |
+| `code_bug`          | Code Bug            | Actual code issues that can be auto-fixed        | Auto-fix       |
+| `todo`              | TODO                | Tasks that may require user decisions            | Needs input    |
+| `security`          | Security            | Security vulnerabilities or concerns             | Auto-fix       |
+| `config_issue`      | Configuration Issue | Configuration or environment problems            | Manual         |
+| `already_fixed`     | Already Fixed       | Issues resolved in previous sessions             | Informational  |
+| `expected_behavior` | Expected Behavior   | Intentional design, not a bug                    | Informational  |
+| `data_migration`    | Data Migration      | Requires admin or manual intervention            | Manual         |
+| `runtime_issue`     | Runtime Issue       | Operational issues, not code bugs                | Manual         |
+| `test_issue`        | Test Issue          | Problems with test code or test setup            | Auto-fix       |
+| `enhancement`       | Enhancement         | Improvement suggestions                          | Needs input    |
+| `documentation`     | Documentation       | Documentation issues or improvements             | Auto-fix       |
+| `performance`       | Performance         | Performance issues or optimization opportunities | Needs input    |
+| `warning`           | Warning             | Things to be aware of                            | Informational  |
 
 ## Severity Levels
 
-| Severity | Use Case |
-|----------|----------|
+| Severity   | Use Case                                                          |
+| ---------- | ----------------------------------------------------------------- |
 | `critical` | System-breaking issues, security vulnerabilities, data loss risks |
-| `high` | Major functionality broken, significant bugs |
-| `medium` | Notable issues that should be addressed soon |
-| `low` | Minor issues, cosmetic problems |
-| `info` | Informational notes, suggestions |
+| `high`     | Major functionality broken, significant bugs                      |
+| `medium`   | Notable issues that should be addressed soon                      |
+| `low`      | Minor issues, cosmetic problems                                   |
+| `info`     | Informational notes, suggestions                                  |
 
 ## When to Use `:needs_input`
 
 Add `:needs_input` to the marker when:
+
 - Multiple valid solutions exist and user preference matters
 - The fix involves a design decision
 - Trade-offs need to be discussed
 - You need clarification before proceeding
 
 When using `:needs_input`, always include:
+
 - `Question:` field with a clear question for the user
 - `Options:` field with pipe-separated options (if applicable)
 

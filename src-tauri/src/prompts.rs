@@ -96,24 +96,6 @@ fn default_max_iterations() -> u32 {
 }
 
 impl SavedPrompt {
-    /// Create a new prompt with auto-generated ID and timestamps
-    #[allow(dead_code)]
-    pub fn new(name: String, content: String) -> Self {
-        let now = chrono::Utc::now().to_rfc3339();
-        Self {
-            id: Uuid::new_v4().to_string(),
-            name,
-            description: String::new(),
-            content,
-            category: String::new(),
-            tags: Vec::new(),
-            max_iterations: default_max_iterations(),
-            workflow: WorkflowConfig::default(),
-            created_at: now.clone(),
-            modified_at: now,
-        }
-    }
-
     /// Create a new prompt with all fields specified
     pub fn with_details(
         name: String,

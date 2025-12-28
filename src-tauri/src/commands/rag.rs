@@ -303,7 +303,7 @@ pub async fn import_rag_config(
     Ok(CommandResponse {
         success: true,
         message: Some(result.message.clone()),
-        data: Some(serde_json::to_value(result).unwrap()),
+        data: serde_json::to_value(result).ok(),
     })
 }
 
@@ -494,7 +494,7 @@ pub async fn search_rag_elements(
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} matching elements", results.len())),
-        data: Some(serde_json::to_value(results).unwrap()),
+        data: serde_json::to_value(results).ok(),
     })
 }
 
@@ -572,7 +572,7 @@ pub async fn search_rag_elements_semantic(
             "Found {} semantically similar results",
             results_for_response.len()
         )),
-        data: Some(serde_json::to_value(results_for_response).unwrap()),
+        data: serde_json::to_value(results_for_response).ok(),
     })
 }
 
@@ -598,7 +598,7 @@ pub async fn list_rag_configs(state: State<'_, Arc<RAGState>>) -> Result<Command
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Found {} configurations", summaries.len())),
-        data: Some(serde_json::to_value(summaries).unwrap()),
+        data: serde_json::to_value(summaries).ok(),
     })
 }
 
@@ -656,7 +656,7 @@ pub async fn get_rag_config(
     Ok(CommandResponse {
         success: true,
         message: Some(format!("Successfully loaded config for {}", project_id)),
-        data: Some(serde_json::to_value(config).unwrap()),
+        data: serde_json::to_value(config).ok(),
     })
 }
 

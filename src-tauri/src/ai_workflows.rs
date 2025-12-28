@@ -90,26 +90,6 @@ fn default_max_iterations() -> u32 {
 }
 
 impl AiWorkflow {
-    /// Create a new workflow with auto-generated ID and timestamps
-    #[allow(dead_code)]
-    pub fn new(name: String, goal: String, steps: Vec<ExecutionStep>) -> Self {
-        let now = chrono::Utc::now().to_rfc3339();
-        Self {
-            id: Uuid::new_v4().to_string(),
-            name,
-            description: String::new(),
-            steps,
-            goal,
-            max_iterations: default_max_iterations(),
-            persistent_session: false,
-            capture_input_validation: false,
-            category: String::new(),
-            tags: Vec::new(),
-            created_at: now.clone(),
-            modified_at: now,
-        }
-    }
-
     /// Create a new workflow with all fields specified
     #[allow(clippy::too_many_arguments)]
     pub fn with_details(

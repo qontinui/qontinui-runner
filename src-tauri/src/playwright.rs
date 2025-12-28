@@ -262,35 +262,6 @@ fn default_browser() -> String {
 }
 
 impl PlaywrightScript {
-    /// Create a new script with auto-generated ID and timestamps
-    #[allow(dead_code)]
-    pub fn new(name: String, script_content: String) -> Self {
-        let now = chrono::Utc::now().to_rfc3339();
-        Self {
-            id: Uuid::new_v4().to_string(),
-            cloud_id: None,
-            name,
-            description: String::new(),
-            ai_instructions: None,
-            target_url: String::new(),
-            script_content,
-            category: String::new(),
-            tags: Vec::new(),
-            timeout_seconds: default_timeout_seconds(),
-            display_mode: DisplayMode::default(),
-            browser: default_browser(),
-            sync_status: SyncStatus::default(),
-            cloud_version: None,
-            last_synced_at: None,
-            created_at: now.clone(),
-            modified_at: now,
-            last_result: None,
-            workflow_objective: None,
-            success_criteria: Vec::new(),
-            is_workflow_automation: false,
-        }
-    }
-
     /// Create a new script with all fields specified
     #[allow(clippy::too_many_arguments)]
     pub fn with_details(
@@ -1025,7 +996,7 @@ pub fn run_script(
         tests_skipped,
         duration_ms,
         error,
-        report_path: Some(output_dir.to_str().unwrap().to_string()),
+        report_path: output_dir.to_str().map(|s| s.to_string()),
         screenshots,
         video_paths: find_video_files(&output_dir),
         trace_path: find_trace_file(&output_dir),
@@ -1113,8 +1084,11 @@ pub fn run_script(
 fn strip_ansi_codes(s: &str) -> String {
     // ANSI escape codes follow the pattern: ESC [ ... m
     // ESC is \x1b (27) or \033
-    let re = regex::Regex::new(r"\x1b\[[0-9;]*m").unwrap();
-    re.replace_all(s, "").to_string()
+    // Safe: regex pattern is a compile-time constant
+    match regex::Regex::new(r"\x1b\[[0-9;]*m") {
+        Ok(re) => re.replace_all(s, "").to_string(),
+        Err(_) => s.to_string(), // Fallback: return original string if regex fails
+    }
 }
 
 /// Parse Playwright JSON reporter output

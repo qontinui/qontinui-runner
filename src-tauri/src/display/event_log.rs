@@ -98,51 +98,11 @@ impl EventLog {
         &self.events
     }
 
-    /// Get events by type
-    #[allow(dead_code)]
-    pub fn events_by_type(&self, event_type: &str) -> Vec<&RawEvent> {
-        self.type_index
-            .get(event_type)
-            .map(|indices| {
-                indices
-                    .iter()
-                    .filter_map(|&idx| self.events.get(idx))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Get events for a specific node
-    #[allow(dead_code)]
-    pub fn events_for_node(&self, node_id: &str) -> Vec<&RawEvent> {
-        self.node_index
-            .get(node_id)
-            .map(|indices| {
-                indices
-                    .iter()
-                    .filter_map(|&idx| self.events.get(idx))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Clear all events
     pub fn clear(&mut self) {
         self.events.clear();
         self.type_index.clear();
         self.node_index.clear();
-    }
-
-    /// Get event count
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.events.len()
-    }
-
-    /// Check if log is empty
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
     }
 }
 

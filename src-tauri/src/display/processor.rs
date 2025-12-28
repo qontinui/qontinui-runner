@@ -67,12 +67,6 @@ impl DisplayProcessor {
         &mut self.event_log
     }
 
-    /// Get the event log (immutable)
-    #[allow(dead_code)]
-    pub fn event_log(&self) -> &EventLog {
-        &self.event_log
-    }
-
     /// Get view data for a specific profile
     pub fn get_view(&self, profile_name: &str) -> Result<serde_json::Value, String> {
         let profile = self
@@ -83,29 +77,6 @@ impl DisplayProcessor {
         let output = profile.process(self.event_log.events());
 
         serde_json::to_value(&output).map_err(|e| format!("Failed to serialize view data: {}", e))
-    }
-
-    /// Get view data by view type
-    #[allow(dead_code)]
-    pub fn get_view_by_type(&self, view_type: ViewType) -> Result<serde_json::Value, String> {
-        let profile = self
-            .profiles
-            .values()
-            .find(|p| p.view_type() == view_type)
-            .ok_or_else(|| format!("No profile found for view type: {:?}", view_type))?;
-
-        let output = profile.process(self.event_log.events());
-
-        serde_json::to_value(&output).map_err(|e| format!("Failed to serialize view data: {}", e))
-    }
-
-    /// List all registered profiles
-    #[allow(dead_code)]
-    pub fn list_profiles(&self) -> Vec<(String, ViewType)> {
-        self.profiles
-            .iter()
-            .map(|(name, profile)| (name.clone(), profile.view_type()))
-            .collect()
     }
 
     /// Clear the event log

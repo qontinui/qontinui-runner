@@ -84,7 +84,7 @@ impl WorkflowRun {
     pub fn new(prompt: &SavedPrompt) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         Self {
@@ -114,7 +114,7 @@ impl WorkflowRun {
     pub fn log_event(&mut self, event_type: &str, message: &str) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         self.event_log.push(WorkflowEvent {
             timestamp: now,
@@ -542,7 +542,7 @@ impl WorkflowManager {
         // Determine workflow status
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let last_activity = run.last_checkpoint_update.unwrap_or(run.last_activity);
@@ -653,7 +653,7 @@ impl WorkflowManager {
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
 
         let state = PersistedWorkflowState {
