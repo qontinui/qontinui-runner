@@ -13,11 +13,10 @@ import logging
 import os
 import platform
 import socket
-import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import httpx
 

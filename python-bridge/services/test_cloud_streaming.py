@@ -15,6 +15,7 @@ import asyncio
 import gzip
 import json
 import time
+from io import BytesIO
 from pathlib import Path
 
 try:
@@ -94,8 +95,6 @@ def create_test_image(width: int = 1920, height: int = 1080) -> bytes:
     for y in range(height):
         for x in range(width):
             pixels[x, y] = (int(255 * x / width), int(255 * y / height), 128)  # type: ignore[index]
-
-    from io import BytesIO
 
     buffer = BytesIO()
     img.save(buffer, format="PNG")
@@ -378,8 +377,6 @@ async def test_thumbnail_streaming():
     # Generate thumbnail (simulated)
     img = Image.open(BytesIO(full_size_image))
     img.thumbnail((320, 180), Image.LANCZOS)
-
-    from io import BytesIO
 
     buffer = BytesIO()
     img.convert("RGB").save(buffer, format="JPEG", quality=85, optimize=True)

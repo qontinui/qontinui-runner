@@ -35,7 +35,7 @@ def check_dependencies():
         try:
             if module == "dataclasses":
                 # Built-in for Python 3.7+
-                import dataclasses
+                import dataclasses  # noqa: F401
 
                 print(f"  ✓ {package}")
             elif module == "numpy":
@@ -61,7 +61,7 @@ def check_models():
     print("\nChecking models module...")
 
     try:
-        from models import DetectedState, Frame, InputEvent, StateImage
+        from models import DetectedState, Frame, InputEvent, StateImage  # noqa: F401
 
         print("  ✓ models.DetectedState")
         print("  ✓ models.Frame")
@@ -78,7 +78,7 @@ def check_analysis_module():
     print("\nChecking analysis module...")
 
     try:
-        from analysis import (
+        from analysis import (  # noqa: F401
             ImageExtractionConfig,
             StateImageExtractor,
             load_state_image,

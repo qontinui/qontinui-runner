@@ -83,9 +83,9 @@ class ExtractedFrame:
             self.image = Image.open(self.path)
             return self.image
         except FileNotFoundError:
-            raise FileNotFoundError(f"Image file not found: {self.path}")
+            raise FileNotFoundError(f"Image file not found: {self.path}") from None
         except Exception as e:
-            raise OSError(f"Failed to load image from {self.path}: {e}")
+            raise OSError(f"Failed to load image from {self.path}: {e}") from e
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.
@@ -128,7 +128,7 @@ class ExtractedFrame:
             metadata=data.get("metadata", {}),
         )
 
-    def save_image(self, path: str, format: str | None = None) -> None:
+    def save_image(self, path: str, image_format: str | None = None) -> None:
         """Save the frame image to disk.
 
         Args:
@@ -143,10 +143,10 @@ class ExtractedFrame:
             raise ValueError("Cannot save image: no image data loaded")
 
         try:
-            self.image.save(path, format=format)
+            self.image.save(path, format=image_format)
             self.path = path
         except Exception as e:
-            raise OSError(f"Failed to save image to {path}: {e}")
+            raise OSError(f"Failed to save image to {path}: {e}") from e
 
     def __repr__(self) -> str:
         """String representation for debugging."""

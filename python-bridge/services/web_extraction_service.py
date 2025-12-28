@@ -393,9 +393,7 @@ class WebExtractionService:
 
                 # Update backend session to completed with stats
                 pages_extracted = (
-                    result.runtime_extraction.pages_visited
-                    if result.runtime_extraction
-                    else 1
+                    result.runtime_extraction.pages_visited if result.runtime_extraction else 1
                 )
                 await self._update_backend_session(
                     status="completed",
@@ -823,7 +821,7 @@ class WebExtractionService:
     def export_training_data(
         self,
         extraction_id: str,
-        format: str,
+        export_format: str,
         output_path: str,
         annotations: dict[str, Any] | None = None,
         include_states: bool = True,
@@ -833,7 +831,7 @@ class WebExtractionService:
 
         Args:
             extraction_id: ID of the extraction
-            format: Export format ("coco", "yolo", "jsonl")
+            export_format: Export format ("coco", "yolo", "jsonl")
             output_path: Path to save output
             annotations: Optional updated annotations from web backend
             include_states: Whether to include state annotations
@@ -869,7 +867,7 @@ class WebExtractionService:
             output_file = Path(output_path)
             output_file.parent.mkdir(parents=True, exist_ok=True)
 
-            if format == "jsonl":
+            if export_format == "jsonl":
                 # Export as JSON Lines format
                 with open(output_file, "w") as f:
                     for state in result.states:
@@ -887,16 +885,16 @@ class WebExtractionService:
                     "format": "jsonl",
                 }
 
-            elif format in ("coco", "yolo"):
+            elif export_format in ("coco", "yolo"):
                 # For COCO/YOLO formats, we'd need element bounding boxes from runtime extraction
                 # This is a placeholder for future implementation
                 return {
                     "success": False,
-                    "error": f"{format.upper()} export not yet implemented in new architecture",
+                    "error": f"{export_format.upper()} export not yet implemented in new architecture",
                 }
 
             else:
-                return {"success": False, "error": f"Unknown format: {format}"}
+                return {"success": False, "error": f"Unknown format: {export_format}"}
 
         except Exception as e:
             logger.error(f"Failed to export training data: {e}", exc_info=True)

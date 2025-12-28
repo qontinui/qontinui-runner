@@ -82,7 +82,7 @@ class StateImage:
             self.image = Image.open(BytesIO(self.image_data))
             return self.image
         except Exception as e:
-            raise OSError(f"Failed to load image from bytes: {e}")
+            raise OSError(f"Failed to load image from bytes: {e}") from e
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization.

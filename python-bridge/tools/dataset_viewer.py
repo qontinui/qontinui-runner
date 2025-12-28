@@ -14,7 +14,9 @@ warnings.warn(
 )
 
 try:
-    from qontinui_train.export.dataset_viewer import *
+    from qontinui_train.export.dataset_viewer import *  # noqa: F403
 except ImportError:
     # Re-raise ImportError so calling code can catch it gracefully
-    raise ImportError("qontinui-train is not installed. Dataset viewer functionality unavailable.")
+    raise ImportError(
+        "qontinui-train is not installed. Dataset viewer functionality unavailable."
+    ) from None

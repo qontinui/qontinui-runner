@@ -243,13 +243,16 @@ class FrameExtractorService:
 
         except FileNotFoundError:
             logger.error("FFmpeg not found. Please install FFmpeg and ensure it's in PATH")
-            raise RuntimeError("FFmpeg not available")
+            raise RuntimeError("FFmpeg not available") from None
         except Exception as e:
             logger.error(f"Failed to extract frame: {type(e).__name__}: {e}")
             return None
 
     def extract_at_events(
-        self, video_path: str, events: list[InputMonitorEvent], filter: EventFilter | None = None
+        self,
+        video_path: str,
+        events: list[InputMonitorEvent],
+        event_filter: EventFilter | None = None,
     ) -> list[ExtractedFrame]:
         """Extract frames at filtered input events.
 
@@ -273,17 +276,20 @@ class FrameExtractorService:
             return []
 
         # Use default filter if none provided
-        if filter is None:
-            filter = EventFilter()
+        if event_filter is None:
+            event_filter = EventFilter()
 
         # Filter events
         filtered_events = []
         for event in events:
-            if filter.matches_event(event):
+            if event_filter.matches_event(event):
                 filtered_events.append(event)
 
             # Check max count
-            if filter.max_count is not None and len(filtered_events) >= filter.max_count:
+            if (
+                event_filter.max_count is not None
+                and len(filtered_events) >= event_filter.max_count
+            ):
                 break
 
         if not filtered_events:
@@ -293,7 +299,7 @@ class FrameExtractorService:
         logger.info(f"Extracting {len(filtered_events)} frames from {len(events)} events")
 
         # Extract timestamps with delay applied
-        timestamps = [filter.apply_delay(event.timestamp) for event in filtered_events]
+        timestamps = [event_filter.apply_delay(event.timestamp) for event in filtered_events]
 
         # Use batch extraction for efficiency
         frames = self.extract_batch(video_path, timestamps)
@@ -415,7 +421,7 @@ class FrameExtractorService:
 
         except FileNotFoundError:
             logger.error("FFmpeg not found. Please install FFmpeg and ensure it's in PATH")
-            raise RuntimeError("FFmpeg not available")
+            raise RuntimeError("FFmpeg not available") from None
         except Exception as e:
             logger.error(f"Batch extraction failed: {type(e).__name__}: {e}")
             return []
@@ -515,7 +521,7 @@ class FrameExtractorService:
 
         except FileNotFoundError:
             logger.error("FFmpeg not found. Please install FFmpeg and ensure it's in PATH")
-            raise RuntimeError("FFmpeg not available")
+            raise RuntimeError("FFmpeg not available") from None
         except Exception as e:
             logger.error(f"Keyframe extraction failed: {type(e).__name__}: {e}")
             return []
@@ -573,7 +579,9 @@ class FrameExtractorService:
         # Use batch extraction
         return self.extract_batch(video_path, timestamps)
 
-    def save_frame(self, frame: ExtractedFrame, output_path: str, format: str = "png") -> str:
+    def save_frame(
+        self, frame: ExtractedFrame, output_path: str, output_format: str = "png"
+    ) -> str:
         """Save extracted frame to disk.
 
         Args:
@@ -599,19 +607,19 @@ class FrameExtractorService:
         output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            frame.save_image(str(output_path_obj), format=format.upper())
+            frame.save_image(str(output_path_obj), format=output_format.upper())
             logger.debug(f"Saved frame to {output_path_obj}")
             return str(output_path_obj.absolute())
         except Exception as e:
             logger.error(f"Failed to save frame: {e}")
-            raise OSError(f"Failed to save frame to {output_path}: {e}")
+            raise OSError(f"Failed to save frame to {output_path}: {e}") from e
 
     def save_frames_batch(
         self,
         frames: list[ExtractedFrame],
         output_dir: str,
         filename_pattern: str = "frame_{frame_number:04d}",
-        format: str = "png",
+        output_format: str = "png",
     ) -> list[str]:
         """Save multiple frames to disk efficiently.
 
@@ -646,11 +654,11 @@ class FrameExtractorService:
             filename = filename_pattern.format(
                 frame_number=frame.frame_number, timestamp=frame.timestamp
             )
-            filename = f"{filename}.{format.lower()}"
+            filename = f"{filename}.{output_format.lower()}"
             output_path = output_dir_obj / filename
 
             try:
-                frame.save_image(str(output_path), format=format.upper())
+                frame.save_image(str(output_path), format=output_format.upper())
                 saved_paths.append(str(output_path.absolute()))
             except Exception as e:
                 logger.error(f"Failed to save frame {frame.frame_number}: {e}")

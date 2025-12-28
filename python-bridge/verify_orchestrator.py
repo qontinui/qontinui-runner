@@ -101,7 +101,7 @@ def verify_command_bindings():
         from qontinui_executor import get_orchestrator  # noqa: F401
         from qontinui_executor import initialize_orchestrator  # noqa: F401
         from qontinui_executor import navigate_to_multiple_states  # noqa: F401
-        from qontinui_executor import navigate_to_state  # noqa: F401; noqa: F401
+        from qontinui_executor import navigate_to_state  # noqa: F401
 
         print("✓ All command binding functions exist")
         return True

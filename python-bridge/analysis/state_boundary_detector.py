@@ -610,7 +610,7 @@ class StateBoundaryDetector:
 
         for label in unique_labels:
             # Get all frames in this cluster
-            cluster_indices = [i for i, l in enumerate(labels) if l == label]
+            cluster_indices = [i for i, lbl in enumerate(labels) if lbl == label]
 
             if len(cluster_indices) < self.config.min_frames_per_state:
                 continue

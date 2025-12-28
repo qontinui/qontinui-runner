@@ -206,36 +206,36 @@ def numpy_to_pil(
 
 def pil_to_bytes(
     image: Image.Image,
-    format: str = "PNG",
+    image_format: str = "PNG",
 ) -> bytes:
     """Convert a PIL Image to bytes.
 
     Args:
         image: PIL Image object
-        format: Image format (PNG, JPEG, etc.)
+        image_format: Image format (PNG, JPEG, etc.)
 
     Returns:
         Image data as bytes
     """
     buffer = io.BytesIO()
-    image.save(buffer, format=format)
+    image.save(buffer, format=image_format)
     return buffer.getvalue()
 
 
 def numpy_to_bytes(
     array: np.ndarray,
     is_bgr: bool = True,
-    format: str = "PNG",
+    image_format: str = "PNG",
 ) -> bytes:
     """Convert a numpy array directly to image bytes.
 
     Args:
         array: Numpy array (OpenCV BGR or RGB format)
         is_bgr: If True, convert from BGR to RGB
-        format: Image format (PNG, JPEG, etc.)
+        image_format: Image format (PNG, JPEG, etc.)
 
     Returns:
         Image data as bytes
     """
     pil_image = numpy_to_pil(array, is_bgr)
-    return pil_to_bytes(pil_image, format)
+    return pil_to_bytes(pil_image, image_format)

@@ -991,7 +991,6 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            import traceback
 
             print(
                 f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
@@ -1331,7 +1330,6 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            import traceback
 
             print(
                 f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
@@ -1501,7 +1499,6 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            import traceback
 
             print(
                 f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
@@ -1609,7 +1606,6 @@ class QontinuiExecutor:
             print(
                 f"[error   ] EXECUTOR: Failed to start extraction: {e}", file=sys.stderr, flush=True
             )
-            import traceback
 
             print(
                 f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
@@ -1815,7 +1811,6 @@ class QontinuiExecutor:
                 file=sys.stderr,
                 flush=True,
             )
-            import traceback
 
             print(
                 f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
