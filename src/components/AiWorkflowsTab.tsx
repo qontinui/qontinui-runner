@@ -13,7 +13,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Activity, BookOpen, Eye, Settings, AlertTriangle } from "lucide-react";
+import { Activity, BookOpen, Eye, Settings } from "lucide-react";
 
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
 import type { AiOutputLine } from "./AiOutputTab";

@@ -62,7 +62,7 @@ const LINE_PATTERN = /^Line:\s*(\d+)$/m;
 const QUESTION_PATTERN = /^Question:\s*(.+)$/m;
 const OPTIONS_PATTERN = /^Options:\s*(.+)$/m;
 const RESOLUTION_PATTERN = /^Resolution:\s*(.+)$/m;
-const CONTEXT_PATTERN =
+const _CONTEXT_PATTERN =
   /^Context:\s*([\s\S]*?)(?=^(?:Title|File|Line|Question|Options|Resolution|Description):|\[\/FINDING\]|$)/m;
 
 /**

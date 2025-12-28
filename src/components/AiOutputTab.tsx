@@ -13,7 +13,6 @@ import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Brain,
-  Trash2,
   MessageSquare,
   Bot,
   Loader2,
@@ -52,7 +51,7 @@ const AI_ACTIVITY_THRESHOLD_MS = 5000;
 // Polling interval for executor status
 const STATUS_POLL_INTERVAL_MS = 1000;
 
-export function AiOutputTab({ lines = [], onClear, onAddLine }: AiOutputTabProps) {
+export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutputTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [isAiWorking, setIsAiWorking] = useState(false);

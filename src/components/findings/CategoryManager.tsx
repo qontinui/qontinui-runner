@@ -46,7 +46,6 @@ import {
   setCategoryOrder,
   resetCategories,
   getCategoryColorClasses,
-  isBuiltInCategory,
 } from "../../services/FindingCategories";
 
 // Map icon names to Lucide components

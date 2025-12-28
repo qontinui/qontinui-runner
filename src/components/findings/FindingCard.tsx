@@ -30,7 +30,7 @@ import {
   Loader2,
   ExternalLink,
 } from "lucide-react";
-import type { Finding, FindingCategory } from "../../types/findings";
+import type { Finding } from "../../types/findings";
 import { getCategoryById, getCategoryColorClasses } from "../../services/FindingCategories";
 
 // Map icon names to Lucide components
@@ -79,7 +79,7 @@ const statusBadges: Record<string, { label: string; color: string }> = {
 export function FindingCard({
   finding,
   onAnalyze,
-  onResolve,
+  onResolve: _onResolve,
   onProvideInput,
   onDismiss,
   isProcessing = false,

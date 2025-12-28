@@ -33,7 +33,7 @@ import type {
   NodeType as SchemaNodeType,
   NodeStatus as SchemaNodeStatus,
   NodeMetadata as SchemaNodeMetadata,
-  RuntimeData as SchemaRuntimeData,
+  RuntimeData as _SchemaRuntimeData,
 } from "@qontinui/schemas/tree_events";
 
 /**
