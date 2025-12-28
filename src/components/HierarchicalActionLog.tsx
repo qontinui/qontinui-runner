@@ -5,7 +5,6 @@ import { DisplayNode } from "../types/treeEvents";
 interface HierarchicalActionLogProps {
   treeRoots: DisplayNode[];
   autoScroll: boolean;
-  onClear: () => void;
 }
 
 /**

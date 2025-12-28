@@ -3,7 +3,6 @@ name = "qontinui-runner-bridge"
 version = "0.1.0"
 description = "Python bridge for Qontinui Runner"
 authors = ["Joshua Spinak <jspinak@hotmail.com>"]
-readme = "README.md"
 package-mode = false
 
 [tool.poetry.dependencies]

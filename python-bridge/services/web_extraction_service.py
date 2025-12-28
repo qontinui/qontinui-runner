@@ -392,10 +392,15 @@ class WebExtractionService:
                 await self._save_annotations_to_backend(serialized_states, serialized_transitions)
 
                 # Update backend session to completed with stats
+                pages_extracted = (
+                    result.runtime_extraction.pages_visited
+                    if result.runtime_extraction
+                    else 1
+                )
                 await self._update_backend_session(
                     status="completed",
                     stats={
-                        "pages_extracted": 1,  # TODO: track actual pages
+                        "pages_extracted": pages_extracted,
                         "states_found": len(result.states),
                         "elements_found": (
                             len(result.runtime_extraction.elements)
