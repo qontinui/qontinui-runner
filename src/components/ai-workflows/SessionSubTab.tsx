@@ -99,6 +99,7 @@ export function SessionSubTab({
   // Resumable workflow state
   const [resumableWorkflow, setResumableWorkflow] = useState<ResumableWorkflow | null>(null);
   const [isResuming, setIsResuming] = useState(false);
+  const [isForceContinuing, setIsForceContinuing] = useState(false);
 
   // Auto-continue settings (from context - syncs across all components)
   const {
@@ -138,11 +139,10 @@ export function SessionSubTab({
   const loops = useMemo(() => groupEntriesIntoLoops(aiOutputLines), [aiOutputLines]);
 
   // Extract workflow sessions from loops
-  // Sessions are inferred from gaps between loops (> 5 minutes = new session)
-  // or from explicit sessionName/sessionId in the entries
+  // Sessions are grouped ONLY by explicit sessionId from the backend
+  // No time-based grouping - each session is identified by its unique sessionId
   const workflowSessions = useMemo(() => {
     const sessions: WorkflowSession[] = [];
-    const SESSION_GAP_MS = 5 * 60 * 1000; // 5 minutes
 
     // Helper to find the best name from a loop's entries
     const findBestLoopName = (loop: AiLoop): string | null => {
@@ -166,49 +166,38 @@ export function SessionSubTab({
       return null;
     };
 
-    // First pass: group loops into sessions based on time gaps
+    // Group loops by sessionId
     interface TempSession {
       id: string;
       loops: AiLoop[];
       startTime: number;
       endTime: number;
     }
-    const tempSessions: TempSession[] = [];
-    let currentTemp: TempSession | null = null;
-    let lastLoopEndTime = 0;
+    const sessionMap = new Map<string, TempSession>();
 
     for (const loop of loops) {
-      const sessionId = loop.sessionId || `session-${loop.startTime}`;
-      const timeSinceLast = loop.startTime - lastLoopEndTime;
-      const shouldStartNewSession =
-        !currentTemp ||
-        timeSinceLast > SESSION_GAP_MS ||
-        (loop.sessionId && loop.sessionId !== currentTemp.id);
+      // Use explicit sessionId, or fall back to loop id for legacy data without sessionId
+      const sessionId = loop.sessionId || loop.id;
 
-      if (shouldStartNewSession) {
-        if (currentTemp) {
-          tempSessions.push(currentTemp);
-        }
-        currentTemp = {
+      if (sessionMap.has(sessionId)) {
+        // Add loop to existing session
+        const session = sessionMap.get(sessionId)!;
+        session.loops.push(loop);
+        session.endTime = Math.max(session.endTime, loop.endTime);
+        session.startTime = Math.min(session.startTime, loop.startTime);
+      } else {
+        // Start new session
+        sessionMap.set(sessionId, {
           id: sessionId,
           loops: [loop],
           startTime: loop.startTime,
           endTime: loop.endTime,
-        };
-      } else if (currentTemp) {
-        currentTemp.loops.push(loop);
-        currentTemp.endTime = loop.endTime;
+        });
       }
-
-      lastLoopEndTime = loop.endTime;
     }
 
-    if (currentTemp) {
-      tempSessions.push(currentTemp);
-    }
-
-    // Second pass: find the best name for each session by looking through all its loops
-    for (const temp of tempSessions) {
+    // Convert map to array and find best names
+    for (const temp of sessionMap.values()) {
       let bestName: string | null = null;
 
       // Look through loops in order to find first meaningful name
@@ -226,18 +215,19 @@ export function SessionSubTab({
         bestName = `Session at ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
       }
 
-      const now = Date.now();
       sessions.push({
         id: temp.id,
         name: bestName,
         startTime: temp.startTime,
         endTime: temp.endTime,
         loopCount: temp.loops.length,
-        isActive: isRunning && now - temp.endTime < SESSION_GAP_MS,
+        // Session is active if runner is running and this session has the most recent activity
+        isActive: isRunning,
       });
     }
 
-    return sessions.reverse(); // Most recent first
+    // Sort by most recent first
+    return sessions.sort((a, b) => b.endTime - a.endTime);
   }, [loops, isRunning]);
 
   // Get the selected session or default to the most recent
@@ -414,6 +404,42 @@ export function SessionSubTab({
     }
   }, [resumableWorkflow, isResuming]);
 
+  // Handler to force continue a stopped session
+  const handleForceContinue = useCallback(async () => {
+    if (isForceContinuing) return;
+
+    setIsForceContinuing(true);
+    try {
+      const response = await fetch("http://localhost:9876/workflow/force-continue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const result = await response.json();
+
+      if (result.success) {
+        setIsRunning(true);
+        setLastResult({
+          success: true,
+          message: "Force continue session started. AI will resume with context from last output.",
+        });
+      } else {
+        setLastResult({
+          success: false,
+          message: result.error || "Failed to force continue",
+        });
+      }
+    } catch (error) {
+      console.error("Failed to force continue:", error);
+      setLastResult({
+        success: false,
+        message: `Failed to force continue: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    } finally {
+      setIsForceContinuing(false);
+    }
+  }, [isForceContinuing]);
+
   // Handler to stop AI
   const handleStopAi = useCallback(async () => {
     setIsStopping(true);
@@ -564,19 +590,21 @@ export function SessionSubTab({
     if (isRunning) {
       // Show count of active sessions if multiple
       const sessionCount = activeSessions.length;
-      const subtitle = sessionCount > 1
-        ? `${sessionCount} sessions running concurrently`
-        : activeWorkflow
-          ? `${activeWorkflow.type} - Phase ${activeWorkflow.iteration || "?"} of ${activeWorkflow.maxIterations || "?"}`
-          : "Processing...";
+      const subtitle =
+        sessionCount > 1
+          ? `${sessionCount} sessions running concurrently`
+          : activeWorkflow
+            ? `${activeWorkflow.type} - Phase ${activeWorkflow.iteration || "?"} of ${activeWorkflow.maxIterations || "?"}`
+            : "Processing...";
 
       return {
         status: "running" as const,
         color: "emerald",
         icon: Loader2,
-        title: sessionCount > 1
-          ? `${sessionCount} Sessions Running`
-          : activeWorkflow?.name || "AI Running",
+        title:
+          sessionCount > 1
+            ? `${sessionCount} Sessions Running`
+            : activeWorkflow?.name || "AI Running",
         subtitle,
         sessionCount,
       };
@@ -658,7 +686,9 @@ export function SessionSubTab({
                     }`}
                     title={`${session.session_type} - ${session.uses_gui ? "GUI" : "Non-GUI"}`}
                   >
-                    {session.name.length > 20 ? session.name.substring(0, 17) + "..." : session.name}
+                    {session.name.length > 20
+                      ? session.name.substring(0, 17) + "..."
+                      : session.name}
                   </span>
                 ))}
               </div>
@@ -680,6 +710,28 @@ export function SessionSubTab({
                   <>
                     <Play className="w-4 h-4" />
                     Continue Workflow
+                  </>
+                )}
+              </button>
+            )}
+
+            {/* Force Continue Button - When stopped unexpectedly (has output but not running/resumable) */}
+            {!isRunning && !resumableWorkflow && aiOutputLines.length > 0 && (
+              <button
+                onClick={handleForceContinue}
+                disabled={isForceContinuing}
+                className="flex items-center gap-2 px-4 py-2 bg-amber-600 text-white rounded-lg font-medium hover:bg-amber-700 disabled:opacity-50 transition-colors"
+                title="Force continue a session that stopped unexpectedly. Uses recent output as context."
+              >
+                {isForceContinuing ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Starting...
+                  </>
+                ) : (
+                  <>
+                    <RotateCcw className="w-4 h-4" />
+                    Force Continue
                   </>
                 )}
               </button>

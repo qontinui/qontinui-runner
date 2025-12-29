@@ -6,6 +6,7 @@ mod auth;
 mod backup;
 mod commands;
 mod config;
+mod database;
 mod debug_lifecycle;
 mod display;
 mod error;
@@ -26,6 +27,7 @@ mod video_recorder;
 mod workflow_monitor;
 
 use commands::AppState;
+use database::CheckpointDb;
 use display::profiles::ActionLogProfile;
 use display::DisplayProcessor;
 use logging::{init_logging, setup_panic_handler, LoggingConfig};
@@ -33,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
 use tauri::Manager;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use video_recorder::VideoRecordingService;
 
 fn main() {
@@ -98,6 +100,37 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize VideoRecordingService
     let video_recorder = Arc::new(Mutex::new(VideoRecordingService::new()));
 
+    // Initialize Checkpoint Database
+    let checkpoint_db =
+        Arc::new(CheckpointDb::new().expect("Failed to initialize checkpoint database"));
+    info!(
+        "Checkpoint database initialized at {:?}",
+        checkpoint_db.path()
+    );
+
+    // Run one-time migration from JSON files (if any exist)
+    match checkpoint_db.migrate_from_json_files() {
+        Ok(result) => {
+            if result.total_migrated() > 0 {
+                info!(
+                    "Migrated {} items from JSON files to database (settings: {}, prompts: {}, scheduler: {})",
+                    result.total_migrated(),
+                    result.settings_migrated,
+                    result.prompts_migrated,
+                    result.scheduler_tasks_migrated
+                );
+            }
+            if !result.errors.is_empty() {
+                for err in &result.errors {
+                    warn!("Migration warning: {}", err);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("JSON migration failed (non-fatal): {}", e);
+        }
+    }
+
     // Initialize RAGState
     let rag_state =
         Arc::new(commands::rag::RAGState::new().expect("Failed to initialize RAG state"));
@@ -114,6 +147,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         local_storage,
         video_recorder,
         event_broadcast,
+        checkpoint_db,
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -265,6 +299,18 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::execution_reporting::upload_execution_screenshot,
             commands::execution_reporting::report_execution_issues,
             commands::execution_reporting::complete_execution_run,
+            // Checkpoint/session commands (SQLite database)
+            commands::checkpoints::checkpoint_get,
+            commands::checkpoints::checkpoint_save,
+            commands::checkpoints::checkpoint_delete,
+            commands::checkpoints::checkpoint_list_active,
+            commands::checkpoints::checkpoint_status,
+            commands::checkpoints::checkpoint_history,
+            commands::checkpoints::session_create,
+            commands::checkpoints::session_update_status,
+            commands::checkpoints::setting_get,
+            commands::checkpoints::setting_set,
+            commands::checkpoints::settings_get_all,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

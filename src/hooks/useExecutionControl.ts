@@ -54,8 +54,7 @@ export function useExecutionControl(
       initialStateIds?: string[] | null;
     }) => {
       console.log("[EXECUTION_CONTROL] startExecution called");
-      const { selectedWorkflow, selectedMonitors, workflows, initialStateIds } =
-        params;
+      const { selectedWorkflow, selectedMonitors, workflows, initialStateIds } = params;
 
       try {
         if (!selectedWorkflow) {

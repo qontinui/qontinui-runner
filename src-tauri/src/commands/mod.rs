@@ -23,6 +23,7 @@
 //! Common types and state used across all command modules are defined here.
 
 use crate::config::QontinuiConfig;
+use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
 use crate::executor::PythonBridge;
 use crate::storage::LocalStorage;
@@ -35,6 +36,7 @@ use tokio::sync::Mutex as TokioMutex;
 // Command modules organized by domain
 pub mod ai_settings;
 pub mod auth;
+pub mod checkpoints;
 pub mod config;
 pub mod dataset;
 pub mod debug;
@@ -65,6 +67,7 @@ pub mod websocket;
 /// - Local storage service
 /// - Video recording service
 /// - Event broadcast channel for WebSocket clients
+/// - Checkpoint database for persistent storage
 pub struct AppState {
     pub python_bridge: Mutex<Option<PythonBridge>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
@@ -74,6 +77,8 @@ pub struct AppState {
     /// Broadcast channel for streaming execution events to WebSocket clients.
     /// Events include image recognition results, tree events, and state changes.
     pub event_broadcast: broadcast::Sender<serde_json::Value>,
+    /// SQLite database for checkpoints, sessions, settings, and scheduler state.
+    pub checkpoint_db: Arc<CheckpointDb>,
 }
 
 /// Standard response structure for command handlers.

@@ -37,7 +37,8 @@ fn get_qontinui_api_url() -> String {
     })
 }
 
-/// Monitor information from qontinui-api
+/// Monitor information from qontinui-api.
+/// Matches the Monitor type from qontinui-schemas/geometry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorInfo {
     pub index: i32,
@@ -45,8 +46,17 @@ pub struct MonitorInfo {
     pub y: i32,
     pub width: i32,
     pub height: i32,
-    pub scale: f64,
-    pub is_primary: bool,
+    /// Spatial position: "left", "center", or "right"
+    pub position: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_primary: Option<bool>,
+    /// DPI scale factor (1.0 = 100%, 1.5 = 150%, 2.0 = 200%)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f64>,
+    /// Legacy scale field for backward compatibility
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
 

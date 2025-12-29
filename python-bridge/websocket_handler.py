@@ -473,27 +473,50 @@ class WebSocketHandler:
         Returns:
             True if session started successfully, False otherwise
         """
+        self.emit_log(
+            "debug",
+            f"[WS_START_SESSION] Entry: ws_enabled={self.ws_enabled}, "
+            f"ws_client={self.ws_client is not None}, ws_loop={self.ws_loop is not None}, "
+            f"ws_config={self.ws_config is not None}",
+        )
+
         # Check if we need to reconnect
-        if self.ws_enabled and not self._is_loop_running():
+        loop_running = self._is_loop_running()
+        self.emit_log("debug", f"[WS_START_SESSION] _is_loop_running={loop_running}")
+        if self.ws_enabled and not loop_running:
+            self.emit_log("debug", "[WS_START_SESSION] Marking disconnected (loop closed)")
             self._mark_disconnected("event loop closed")
 
         # If not connected but we have config, try to reconnect
+        self.emit_log(
+            "debug",
+            f"[WS_START_SESSION] After check - ws_enabled={self.ws_enabled}, "
+            f"ws_config.enabled={self.ws_config.enabled if self.ws_config else None}",
+        )
         if not self.ws_enabled and self.ws_config and self.ws_config.enabled:
-            print(
-                "[info    ] WS_HANDLER: Connection dead, attempting auto-reconnect before session start",
-                file=sys.stderr,
-                flush=True,
-            )
-            if not self._try_reconnect():
+            self.emit_log("info", "[WS_START_SESSION] Connection dead, attempting auto-reconnect")
+            reconnect_result = self._try_reconnect()
+            self.emit_log("debug", f"[WS_START_SESSION] _try_reconnect returned {reconnect_result}")
+            if not reconnect_result:
                 self.emit_log("warning", "Cannot start WebSocket session: reconnection failed")
                 return False
 
+        self.emit_log(
+            "debug",
+            f"[WS_START_SESSION] Final check - ws_enabled={self.ws_enabled}, "
+            f"ws_client={self.ws_client is not None}, ws_loop={self.ws_loop is not None}",
+        )
         if not self.ws_enabled or not self.ws_client or not self.ws_loop:
             self.emit_log("warning", "Cannot start WebSocket session: not connected")
             return False
 
         try:
             self.emit_log("info", "Starting WebSocket session...")
+            self.emit_log(
+                "debug",
+                f"[WS_START_SESSION] ws_client.is_connected={self.ws_client.is_connected}, "
+                f"ws_client.ws={self.ws_client.ws is not None}",
+            )
 
             future = asyncio.run_coroutine_threadsafe(
                 self.ws_client.start_session(config_snapshot), self.ws_loop
@@ -505,6 +528,10 @@ class WebSocketHandler:
                 return True
             else:
                 self.emit_log("error", "Failed to start WebSocket session")
+                self.emit_log(
+                    "debug",
+                    f"[WS_START_SESSION] After failure: ws_client.is_connected={self.ws_client.is_connected}",
+                )
                 return False
 
         except RuntimeError as e:
@@ -636,8 +663,9 @@ class WebSocketHandler:
         Check if WebSocket is enabled and the connection is healthy.
 
         This method verifies both that WebSocket was enabled AND that the
-        underlying event loop is still running. If the event loop died,
-        this will detect it and mark the connection as disconnected.
+        underlying event loop is still running AND that the actual WebSocket
+        client is connected. If any of these conditions fail, this will
+        detect it and mark the connection as disconnected.
 
         Returns:
             True if WebSocket is enabled and healthy, False otherwise
@@ -648,6 +676,11 @@ class WebSocketHandler:
         # Check if event loop is still alive
         if not self._is_loop_running():
             self._mark_disconnected("event loop closed")
+            return False
+
+        # Check if the actual WebSocket client is still connected
+        if self.ws_client and not self.ws_client.is_connected:
+            self._mark_disconnected("websocket client disconnected")
             return False
 
         return True

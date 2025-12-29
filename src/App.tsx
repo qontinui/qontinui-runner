@@ -45,6 +45,7 @@ import {
   useProjectSelection,
   useProjectLogs,
   useRagProcessing,
+  useWebSocketAutoConnect,
 } from "./hooks";
 
 // Components
@@ -168,6 +169,13 @@ function AppContent() {
 
   // RAG processing state
   const ragProcessing = useRagProcessing();
+
+  // WebSocket auto-connect (runs at App level to ensure it's always active)
+  const webSocket = useWebSocketAutoConnect({
+    isAuthenticated: auth.authStatus?.authenticated ?? false,
+    selectedProjectId: projectSelection.selectedProjectId,
+    onLog: addLog,
+  });
 
   // Log source manager modal state
   const [showLogSourceManager, setShowLogSourceManager] = useState(false);
@@ -551,6 +559,7 @@ function AppContent() {
                 selectedProjectId={projectSelection.selectedProjectId}
                 onProjectSelect={projectSelection.setSelectedProject}
                 onLoadProjects={projectSelection.loadProjects}
+                webSocketState={webSocket}
               />
             </div>
           </Tabs.Content>

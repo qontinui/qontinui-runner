@@ -13,12 +13,37 @@ import base64
 import contextlib
 import json
 import logging
+import os
 import platform
 import socket
+import sys
 from collections.abc import Callable
-from datetime import UTC, datetime
 from io import BytesIO
 from typing import Any
+
+from qontinui_schemas.common import utc_now
+
+# Debug log file path - hardcoded to ensure it works
+_WS_CLIENT_DEBUG_LOG = (
+    r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\ws-client-debug.log"
+)
+
+
+def _debug_log(message: str) -> None:
+    """Write debug message to log file."""
+    try:
+        import datetime as dt
+
+        with open(_WS_CLIENT_DEBUG_LOG, "a") as f:
+            f.write(f"[{dt.datetime.now().isoformat()}] {message}\n")
+            f.flush()
+    except Exception as e:
+        # Write exception to stderr as fallback
+        print(f"[ERROR] _debug_log failed: {e}", file=sys.stderr, flush=True)
+
+
+# Write initial log to verify file creation works
+_debug_log("websocket_client module loaded")
 
 try:
     import websockets
@@ -113,6 +138,15 @@ class RunnerWebSocketClient:
         self.reconnect_task: asyncio.Task | None = None
         self.listener_task: asyncio.Task | None = None
 
+        # Response queue for request-response pattern - keyed by expected response type
+        self._pending_responses: dict[str, asyncio.Queue] = {}
+        self._response_lock = asyncio.Lock()
+        # Mapping of request types to expected response types
+        self._request_response_map = {
+            "session_start": "session_started",
+            "session_end": "session_ended",
+        }
+
         # System info
         self.runner_os = self._get_os_info()
         self.runner_hostname = socket.gethostname()
@@ -131,7 +165,7 @@ class RunnerWebSocketClient:
 
     def _get_timestamp(self) -> str:
         """Get current UTC timestamp in ISO format."""
-        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        return utc_now().isoformat().replace("+00:00", "Z")
 
     async def connect(self) -> bool:
         """
@@ -141,7 +175,6 @@ class RunnerWebSocketClient:
             True if connection successful, False otherwise
         """
         # DEBUG: Write to file for visibility regardless of how runner is started
-        import os
         from datetime import datetime
 
         # Path: websocket_client.py -> python-bridge -> qontinui-runner -> qontinui_parent_directory
@@ -292,44 +325,75 @@ class RunnerWebSocketClient:
         Returns:
             Response dictionary if successful, None otherwise
         """
+        _debug_log(f"_send_message: is_connected={self.is_connected}, ws={self.ws is not None}")
         if not self.is_connected or not self.ws:
+            _debug_log("Cannot send message: Not connected")
             logger.error("Cannot send message: Not connected")
             return None
 
         try:
-            # Send message
-            await self.ws.send(json.dumps(message))  # type: ignore[attr-defined]
+            # Determine expected response type based on request type
+            request_type = message.get("type")
+            expected_response_type = self._request_response_map.get(request_type)
 
-            # Wait for response (with timeout)
-            response_raw = await asyncio.wait_for(self.ws.recv(), timeout=10.0)  # type: ignore[attr-defined]
-            response = json.loads(response_raw)
+            # Create a response queue keyed by expected response type
+            response_queue: asyncio.Queue = asyncio.Queue()
+            if expected_response_type:
+                async with self._response_lock:
+                    self._pending_responses[expected_response_type] = response_queue
 
-            # Check for error response
-            if response.get("type") == "error":
-                error_msg = response.get("error", "Unknown error")
-                details = response.get("details", {})
-                logger.error(f"Server error: {error_msg} - {details}")
+            try:
+                # Send message
+                _debug_log(
+                    f"_send_message: sending type={request_type}, expecting={expected_response_type}"
+                )
+                await self.ws.send(json.dumps(message))  # type: ignore[attr-defined]
 
-                if self.on_error:
-                    try:
-                        self.on_error(f"{error_msg}: {details}")
-                    except Exception as e:
-                        logger.error(f"Error in on_error callback: {e}")
+                if not expected_response_type:
+                    # No response expected
+                    return {"success": True}
 
-                return None
+                # Wait for response from the message listener (with timeout)
+                _debug_log("_send_message: waiting for response via queue...")
+                response = await asyncio.wait_for(response_queue.get(), timeout=10.0)
+                _debug_log(
+                    f"_send_message: received response type={response.get('type')}, success={response.get('success')}"
+                )
 
-            return response  # type: ignore[no-any-return]
+                # Check for error response
+                if response.get("type") == "error":
+                    error_msg = response.get("error", "Unknown error")
+                    details = response.get("details", {})
+                    logger.error(f"Server error: {error_msg} - {details}")
+
+                    if self.on_error:
+                        try:
+                            self.on_error(f"{error_msg}: {details}")
+                        except Exception as e:
+                            logger.error(f"Error in on_error callback: {e}")
+
+                    return None
+
+                return response  # type: ignore[no-any-return]
+            finally:
+                # Clean up the pending response entry
+                if expected_response_type:
+                    async with self._response_lock:
+                        self._pending_responses.pop(expected_response_type, None)
 
         except TimeoutError:
+            _debug_log("_send_message: TIMEOUT waiting for server response")
             logger.error("Timeout waiting for server response")
             return None
-        except ConnectionClosed:
+        except ConnectionClosed as e:
+            _debug_log(f"_send_message: ConnectionClosed error: {e}")
             logger.error("Connection closed while sending message")
             self.is_connected = False
             if self.auto_reconnect:
                 asyncio.create_task(self._reconnect())
             return None
         except Exception as e:
+            _debug_log(f"_send_message: Exception: {type(e).__name__}: {e}")
             logger.error(f"Error sending message: {e}")
             return None
 
@@ -408,9 +472,15 @@ class RunnerWebSocketClient:
         Returns:
             True if session started successfully, False otherwise
         """
+        # Generate a session_id for this automation run
+        import uuid as uuid_module
+
+        generated_session_id = str(uuid_module.uuid4())
+
         message = {
             "type": "session_start",
             "project_id": self.project_id,
+            "session_id": generated_session_id,  # Provide session_id for backend to track
             "runner_version": self.runner_version,
             "runner_os": self.runner_os,
             "runner_hostname": self.runner_hostname,
@@ -420,12 +490,20 @@ class RunnerWebSocketClient:
         }
 
         logger.info(f"Starting session for project: {self.project_id}")
+        _debug_log(f"start_session: is_connected={self.is_connected}, ws={self.ws is not None}")
         response = await self._send_message(message)
+        _debug_log(f"start_session: _send_message returned: {response}")
 
-        if response and response.get("success"):
-            self.session_id = response.get("data", {}).get("session_id")
+        # Check for success: either explicit success=True or type="session_started"
+        if response and (response.get("success") or response.get("type") == "session_started"):
+            # Use session_id from response, or fall back to generated one
+            response_session_id = response.get("data", {}).get("session_id")
+            self.session_id = response_session_id or generated_session_id
             self.log_sequence = 0
             logger.info(f"Session started successfully: {self.session_id}")
+            _debug_log(
+                f"start_session: SUCCESS session_id={self.session_id} (from response={response_session_id})"
+            )
 
             # Start heartbeat task
             if self.heartbeat_task is None or self.heartbeat_task.done():
@@ -433,7 +511,8 @@ class RunnerWebSocketClient:
 
             return True
         else:
-            logger.error("Failed to start session")
+            _debug_log(f"start_session: FAILED response={response}")
+            logger.error(f"Failed to start session: response={response}")
             return False
 
     async def end_session(
@@ -449,8 +528,11 @@ class RunnerWebSocketClient:
         Returns:
             True if session ended successfully, False otherwise
         """
+        _debug_log(f"end_session: called with status={status}, session_id={self.session_id}")
+
         if not self.session_id:
             logger.warning("Cannot end session: No active session")
+            _debug_log("end_session: No active session")
             return False
 
         message = {
@@ -462,6 +544,7 @@ class RunnerWebSocketClient:
         }
 
         logger.info(f"Ending session: {self.session_id} with status: {status}")
+        _debug_log("end_session: sending session_end message")
         response = await self._send_message(message)
 
         # Cancel heartbeat task
@@ -470,12 +553,15 @@ class RunnerWebSocketClient:
             with contextlib.suppress(asyncio.CancelledError):
                 await self.heartbeat_task
 
-        success = response and response.get("success", False)
+        # Check for success: either explicit success=True or type="session_ended"
+        success = response and (response.get("success") or response.get("type") == "session_ended")
 
         if success:
             logger.info("Session ended successfully")
+            _debug_log("end_session: SUCCESS")
         else:
-            logger.error("Failed to end session")
+            logger.error(f"Failed to end session: response={response}")
+            _debug_log(f"end_session: FAILED response={response}")
 
         self.session_id = None
         self.log_sequence = 0
@@ -661,6 +747,10 @@ class RunnerWebSocketClient:
                     message = json.loads(message_raw)
 
                     message_type = message.get("type")
+                    request_id = message.get("request_id")
+                    _debug_log(
+                        f"_message_listener: received type={message_type}, request_id={request_id}"
+                    )
                     logger.debug(f"Received message: type={message_type}")
 
                     if message_type == "command":
@@ -704,18 +794,36 @@ class RunnerWebSocketClient:
                         "pong",
                         "runner_info_ack",
                     ]:
-                        # These are responses to messages we sent - ignore in listener
-                        # They are handled by _send_message
-                        pass
+                        # Check if there's a pending request waiting for this response type
+                        if message_type in self._pending_responses:
+                            _debug_log(
+                                f"_message_listener: dispatching {message_type} to waiting caller"
+                            )
+                            await self._pending_responses[message_type].put(message)
+                        else:
+                            # Unsolicited response - log it but don't process
+                            logger.debug(f"Received unsolicited response type={message_type}")
 
                     elif message_type == "error":
-                        error_msg = message.get("message", "Unknown error")
-                        logger.error(f"Server error: {error_msg}")
-                        if self.on_error:
-                            try:
-                                self.on_error(error_msg)
-                            except Exception as e:
-                                logger.error(f"Error in on_error callback: {e}")
+                        # Check if there's any pending request that might be waiting
+                        # For errors, we dispatch to any pending response queue since we don't know
+                        # which request triggered the error
+                        dispatched = False
+                        for response_type, queue in list(self._pending_responses.items()):
+                            _debug_log(
+                                f"_message_listener: dispatching error to pending {response_type}"
+                            )
+                            await queue.put(message)
+                            dispatched = True
+                            break  # Only dispatch to one waiter
+                        if not dispatched:
+                            error_msg = message.get("message", "Unknown error")
+                            logger.error(f"Server error: {error_msg}")
+                            if self.on_error:
+                                try:
+                                    self.on_error(error_msg)
+                                except Exception as e:
+                                    logger.error(f"Error in on_error callback: {e}")
 
                     else:
                         logger.debug(f"Unhandled message type: {message_type}")

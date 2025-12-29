@@ -33,10 +33,11 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+
+from qontinui_schemas.common import utc_now
 
 try:
     import websockets
@@ -270,7 +271,7 @@ class CloudStreamingService:
         Returns:
             ISO 8601 formatted timestamp string
         """
-        return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+        return utc_now().isoformat().replace("+00:00", "Z")
 
     async def connect(self, jwt_token: str) -> bool:
         """Establish WebSocket connection to cloud.

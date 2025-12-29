@@ -7,9 +7,10 @@ Results are saved to a standardized location for analysis by Claude Code.
 import json
 import logging
 import shutil
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from qontinui_schemas.common import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +133,7 @@ def save_automation_results(
                 logger.warning(f"Failed to copy AI output log: {e}")
 
     # Build execution results JSON
-    timestamp = datetime.now().isoformat()
+    timestamp = utc_now().isoformat()
 
     execution_result: dict[str, Any] = {
         "execution_id": execution_id,

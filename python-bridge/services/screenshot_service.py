@@ -16,9 +16,10 @@ The service is designed to be:
 
 import json
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from qontinui_schemas.common import utc_now
 
 
 class ScreenshotService:
@@ -139,7 +140,7 @@ class ScreenshotService:
             "screenshot_number": next_num,
             "action_id": action_id,
             "active_states": active_states,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now().isoformat(),
             "filename": screenshot_filename,
         }
 
@@ -221,7 +222,7 @@ class ScreenshotService:
         full_metadata = {
             "debug_number": next_num,
             "action_id": action_id,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": utc_now().isoformat(),
             "filename": debug_filename,
             "match_info": match_info,
         }

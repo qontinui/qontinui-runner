@@ -25,7 +25,16 @@ import { UpdateSettings } from "./UpdateSettings";
 import { AiSettings } from "./AiSettings";
 import { BackupSettings } from "./BackupSettings";
 import { PlaywrightSettings } from "./PlaywrightSettings";
-import type { Project } from "../../types/auth";
+import type { Project, ConnectionInfo } from "../../types/auth";
+
+interface WebSocketState {
+  connected: boolean;
+  connecting: boolean;
+  error: string | null;
+  connectionInfo: ConnectionInfo | null;
+  connect: () => Promise<void>;
+  disconnect: () => Promise<void>;
+}
 
 interface SettingsProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -34,6 +43,7 @@ interface SettingsProps {
   selectedProjectId: string | null;
   onProjectSelect: (projectId: string | null) => void;
   onLoadProjects: () => Promise<void>;
+  webSocketState: WebSocketState;
 }
 
 type SettingsTab =
@@ -55,6 +65,7 @@ export function Settings({
   selectedProjectId,
   onProjectSelect,
   onLoadProjects,
+  webSocketState,
 }: SettingsProps) {
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // Load persisted tab on mount
@@ -146,6 +157,7 @@ export function Settings({
             projects={projects}
             selectedProjectId={selectedProjectId}
             onProjectSelect={onProjectSelect}
+            webSocketState={webSocketState}
             onLoadProjects={onLoadProjects}
           />
         </Tabs.Content>

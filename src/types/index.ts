@@ -145,3 +145,9 @@ export {
   hasCompletedSuccessfully,
   getTimeUntilNextRun,
 } from "./scheduler";
+
+// Geometry types (monitor, coordinates, regions)
+// Re-exported from qontinui-schemas
+export type { Coordinates, Region, Monitor, VirtualDesktop, MonitorInfo } from "./geometry";
+
+export { CoordinateSystem } from "./geometry";

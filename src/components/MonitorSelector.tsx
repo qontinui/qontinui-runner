@@ -8,17 +8,16 @@
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Monitor, Check, Info } from "lucide-react";
+import { Monitor as MonitorIcon, Check, Info } from "lucide-react";
+import type { Monitor } from "../types/geometry";
 
-export interface MonitorInfo {
-  index: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  scale: number;
-  is_primary: boolean;
-  name?: string;
+/**
+ * Extended monitor info from the Rust backend.
+ * Adds scale field that may be present in backend responses.
+ */
+interface BackendMonitor extends Monitor {
+  /** Legacy scale field (use scale_factor from Monitor) */
+  scale?: number;
 }
 
 interface MonitorSelectorProps {
@@ -39,7 +38,7 @@ interface MonitorSelectorProps {
 /**
  * Get position label based on monitor X coordinate relative to others
  */
-function getPositionLabel(monitor: MonitorInfo, allMonitors: MonitorInfo[]): string {
+function getPositionLabel(monitor: BackendMonitor, allMonitors: BackendMonitor[]): string {
   if (allMonitors.length === 1) return "";
 
   const sorted = [...allMonitors].sort((a, b) => a.x - b.x);
@@ -62,7 +61,7 @@ export function MonitorSelector({
   className = "",
   readOnly = false,
 }: MonitorSelectorProps) {
-  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
+  const [monitors, setMonitors] = useState<BackendMonitor[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -72,7 +71,7 @@ export function MonitorSelector({
   const loadMonitors = async () => {
     try {
       setLoading(true);
-      const result = await invoke<{ success: boolean; data?: { monitors: MonitorInfo[] } }>(
+      const result = await invoke<{ success: boolean; data?: { monitors: BackendMonitor[] } }>(
         "get_monitors",
       );
       if (result?.success && result.data?.monitors) {
@@ -153,7 +152,7 @@ export function MonitorSelector({
               } ${readOnly ? "cursor-default opacity-80" : "cursor-pointer"}`}
             >
               <div className="flex items-center gap-1.5">
-                <Monitor className={iconSize} />
+                <MonitorIcon className={iconSize} />
                 <span className="font-medium">#{displayNumber}</span>
                 {multiSelect && isSelected && <Check className={`${iconSize} text-primary`} />}
               </div>
@@ -179,7 +178,7 @@ export function MonitorSelector({
             }`}
           >
             <div className="flex items-center gap-1.5">
-              <Monitor className={iconSize} />
+              <MonitorIcon className={iconSize} />
               <span className="font-medium">All</span>
               {selectedMonitors.length === monitors.length && (
                 <Check className={`${iconSize} text-primary`} />

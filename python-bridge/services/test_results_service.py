@@ -14,11 +14,12 @@ import os
 import platform
 import socket
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
 import httpx
+from qontinui_schemas.common import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -381,7 +382,7 @@ class TestResultsService:
 
         payload = {
             "status": status,
-            "ended_at": datetime.now(UTC).isoformat(),
+            "ended_at": utc_now().isoformat(),
             "final_metrics": final_metrics,
             "summary": summary,
         }

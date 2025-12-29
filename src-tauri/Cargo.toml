@@ -51,6 +51,7 @@ aes-gcm = "0.10"
 hex = "0.4"
 scopeguard = "1.2"
 regex = "1.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
 socket2 = "0.5"
 cron = "0.12"
 once_cell = "1.19"

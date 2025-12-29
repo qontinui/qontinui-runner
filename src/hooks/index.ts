@@ -50,3 +50,9 @@ export { useInitialStatesOverride } from "./useInitialStatesOverride";
 export type { UseInitialStatesOverrideReturn } from "./useInitialStatesOverride";
 
 export { useScheduler } from "./useScheduler";
+
+export { useWebSocketAutoConnect } from "./useWebSocketAutoConnect";
+export type {
+  UseWebSocketAutoConnectOptions,
+  UseWebSocketAutoConnectReturn,
+} from "./useWebSocketAutoConnect";

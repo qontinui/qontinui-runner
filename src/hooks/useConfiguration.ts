@@ -139,17 +139,12 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
    */
   const loadConfigFromPath = useCallback(
     async (configPath: string, workflowIdToSelect?: string) => {
-      console.log("[CONFIG] Loading configuration from:", configPath);
-      if (workflowIdToSelect) {
-        console.log("[CONFIG] Will select workflow after load:", workflowIdToSelect);
-      }
       onLog?.("info", `Loading configuration: ${configPath}`);
 
       try {
         const result = await invoke<LoadConfigurationResponse>("load_configuration", {
           path: configPath,
         });
-        console.log("[CONFIG] load_configuration result:", result);
 
         if (result.success) {
           // Extract filename without extension
@@ -159,14 +154,8 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
           // Extract projectId from metadata for test run reporting
           const projectId = deriveProjectId(result.data?.metadata);
-          if (projectId) {
-            console.log("[CONFIG] Config includes projectId:", projectId);
-            // Store in configManager for EventHandlers to access
-            configManager.setProjectId(projectId);
-          } else {
-            // Clear stored projectId if config doesn't have one
-            configManager.setProjectId(null);
-          }
+          // Store in configManager for EventHandlers to access
+          configManager.setProjectId(projectId ?? null);
 
           const loadedConfig: Config = {
             name: result.data?.metadata?.name || nameWithoutExtension,
@@ -180,20 +169,10 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
             projectId, // Include projectId from metadata
           };
 
-          console.log("Config loaded with images:", loadedConfig.images?.length || 0, "images");
-          console.log("Config loaded with states:", loadedConfig.states?.length || 0, "states");
-
           setConfig(loadedConfig);
 
           // Filter workflows to only show those in the "main" category
           const allWorkflows = result.data?.workflows || [];
-
-          console.log("All workflows loaded:", allWorkflows.length);
-          allWorkflows.forEach((w) => {
-            console.log(
-              `Workflow: ${w.name} (ID: ${w.id}), Category: "${w.category}", Visibility: "${w.visibility || "public"}"`,
-            );
-          });
 
           // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
           const mainWorkflows = allWorkflows.filter(
@@ -203,20 +182,13 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
               (!w.visibility || w.visibility !== "internal"),
           );
 
-          console.log("Filtered main workflows:", mainWorkflows.length);
-          mainWorkflows.forEach((w) => {
-            console.log(`Main workflow: ${w.name} (ID: ${w.id})`);
-          });
-
           setWorkflows(mainWorkflows);
-          console.log("Workflows state updated with:", mainWorkflows);
 
           setConfigLoaded(true);
           onLog?.("success", `Configuration loaded: ${configPath}`);
 
           // Auto-start Python executor after config is loaded
           if (onPythonStart) {
-            console.log("[CONFIG] Auto-starting Python executor after config load...");
             await onPythonStart();
           }
 
@@ -290,7 +262,6 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
         "get_auto_load_last_config",
       );
       if (!autoLoadResult.success || !autoLoadResult.data?.enabled) {
-        console.log("[CONFIG] Auto-load last config is disabled");
         return;
       }
 

@@ -1,5 +1,8 @@
 // Shared types for settings components
 
+// Re-export Monitor from shared geometry types
+export type { Monitor } from "../../types/geometry";
+
 export interface DebugSettings {
   enable_image_debug: boolean;
   top_matches_count: number;
@@ -56,15 +59,6 @@ export interface ScreenshotCaptureSettings {
   baseImageName: string;
   screens: ScreenSelectionType;
   captureTimings: number[];
-}
-
-export interface Monitor {
-  index: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  is_primary: boolean;
 }
 
 export interface StorageUsage {

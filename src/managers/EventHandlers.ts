@@ -18,6 +18,7 @@ import type {
 import type { TreeEventData } from "../types/treeEvents";
 import { syncIssuesToBackend } from "../services/IssueSyncService";
 import { issueTracker } from "../services/IssueTracker";
+import { findingsTracker } from "../services/FindingsTracker";
 // Legacy service - deprecated, use ExecutionReportingService instead
 import {
   testRunReportingService,
@@ -51,6 +52,9 @@ export function setupEventHandlers(
 
   // Collect unsubscribe functions
   const unsubscribers: Array<() => void> = [];
+
+  // Track current AI session to detect new sessions
+  let currentAiActionId: string | null = null;
 
   // Handler for "ready" event
   unsubscribers.push(
@@ -207,6 +211,13 @@ export function setupEventHandlers(
             // Don't show error to user - sync is best-effort
           });
       }
+
+      // Archive findings from the session to disk for persistence
+      const findingsCount = findingsTracker.count;
+      if (findingsCount > 0) {
+        console.log(`[EVENT_HANDLER] Archiving ${findingsCount} findings from session`);
+        findingsTracker.archiveCurrentSession("completed");
+      }
     }),
   );
 
@@ -236,6 +247,13 @@ export function setupEventHandlers(
           await testRunReportingService.completeTestRun(false).catch((error) => {
             console.error("[EVENT_HANDLER] Failed to complete legacy test run:", error);
           });
+        }
+
+        // Archive findings from the session (even on failure)
+        const findingsCount = findingsTracker.count;
+        if (findingsCount > 0) {
+          console.log(`[EVENT_HANDLER] Archiving ${findingsCount} findings from failed session`);
+          findingsTracker.archiveCurrentSession("failed");
         }
       },
     ),
@@ -275,7 +293,9 @@ export function setupEventHandlers(
       actionLogManager.triggerRefresh();
 
       // Report completed actions to both new and legacy services
-      const treeEventData = payload?.data as unknown as TreeEventData | undefined;
+      // NOTE: Tree event data is at the top level of the payload, not nested under "data"
+      // The Rust backend sends: { type: "tree_event", event_type: "...", node: {...}, ... }
+      const treeEventData = payload as unknown as TreeEventData | undefined;
       if (treeEventData) {
         const eventData = treeEventData;
         const eventType = eventData.event_type;
@@ -486,6 +506,26 @@ export function setupEventHandlers(
       const line = data.line || "";
       const source = data.source || "ai";
       const actionId = data.action_id;
+
+      // Detect new AI session by checking if action_id changed
+      if (actionId && actionId !== currentAiActionId) {
+        console.log(
+          `[EVENT_HANDLER] New AI session detected: ${actionId} (previous: ${currentAiActionId})`,
+        );
+
+        // Archive previous session if one exists
+        if (currentAiActionId && findingsTracker.getCurrentReport()) {
+          console.log("[EVENT_HANDLER] Archiving previous AI session");
+          findingsTracker.archiveCurrentSession("completed");
+        }
+
+        // Start new session and report
+        currentAiActionId = actionId;
+        findingsTracker.startNewSession(actionId);
+        findingsTracker.startReport("AI Analysis", actionId);
+        console.log(`[EVENT_HANDLER] Started findings report for session: ${actionId}`);
+      }
+
       logManager.addAiOutputLog(line, source, actionId);
     }),
   );

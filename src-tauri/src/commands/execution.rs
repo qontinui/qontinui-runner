@@ -70,7 +70,10 @@ pub fn start_python_executor(
                         });
 
                         // Store in app state
-                        *state.current_config.lock().unwrap() = Some(config);
+                        match state.current_config.lock() {
+                            Ok(mut guard) => *guard = Some(config),
+                            Err(e) => warn!("Failed to store config (mutex poisoned): {}", e),
+                        }
                         info!("Configuration stored in app state");
 
                         // Send debug settings first
@@ -439,30 +442,52 @@ pub fn get_monitors(app_handle: AppHandle) -> Result<CommandResponse, String> {
 
     let monitor_count = monitors.len();
 
-    // Build detailed monitor info
+    // Build detailed monitor info with all x positions for position calculation
+    let x_positions: Vec<i32> = monitors.iter().map(|m| m.position().x).collect();
+
     let monitor_details: Vec<serde_json::Value> = monitors
         .iter()
         .enumerate()
         .map(|(idx, monitor)| {
-            let position = monitor.position();
+            let mon_position = monitor.position();
             let size = monitor.size();
+            let scale_factor = monitor.scale_factor();
+            let name = monitor.name().map(|n| n.to_string());
             let is_primary = if let Some(ref current) = current_monitor {
                 // Check if this is the primary monitor by comparing position and size
-                position.x == current.position().x
-                    && position.y == current.position().y
+                mon_position.x == current.position().x
+                    && mon_position.y == current.position().y
                     && size.width == current.size().width
                     && size.height == current.size().height
             } else {
                 idx == 0 // fallback to first monitor
             };
 
+            // Determine spatial position based on X coordinate relative to other monitors
+            let position_label = if monitors.len() == 1 {
+                "center"
+            } else {
+                let min_x = x_positions.iter().min().copied().unwrap_or(0);
+                let max_x = x_positions.iter().max().copied().unwrap_or(0);
+                if mon_position.x == min_x {
+                    "left"
+                } else if mon_position.x == max_x {
+                    "right"
+                } else {
+                    "center"
+                }
+            };
+
             serde_json::json!({
                 "index": idx,
-                "x": position.x,
-                "y": position.y,
+                "x": mon_position.x,
+                "y": mon_position.y,
                 "width": size.width,
                 "height": size.height,
+                "position": position_label,
                 "is_primary": is_primary,
+                "scale_factor": scale_factor,
+                "name": name,
             })
         })
         .collect();

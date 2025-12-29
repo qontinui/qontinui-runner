@@ -720,9 +720,25 @@ class QontinuiExecutor:
             capture_session_id = f"exec-{workflow_id}-{int(time.time())}"
             self._start_input_capture_for_execution(capture_session_id)
 
-        # Start WebSocket session if enabled
-        if self.websocket_handler.is_enabled():
-            self.websocket_handler.start_session(config_snapshot=self.config)
+        # Start WebSocket session if enabled or if it was configured (for auto-reconnect)
+        # Call start_session even if currently disconnected - it will attempt to reconnect
+        ws_is_enabled = self.websocket_handler.is_enabled()
+        ws_config_exists = self.websocket_handler.ws_config is not None
+        ws_config_enabled = self.websocket_handler.ws_config.enabled if ws_config_exists else False
+        self.event_manager.emit_log(
+            "debug",
+            f"[WS_SESSION_CHECK] is_enabled={ws_is_enabled}, ws_config_exists={ws_config_exists}, ws_config.enabled={ws_config_enabled}, ws_enabled={self.websocket_handler.ws_enabled}",
+        )
+        if ws_is_enabled or (ws_config_exists and ws_config_enabled):
+            self.event_manager.emit_log("info", "[WS_SESSION_CHECK] Starting WebSocket session...")
+            result = self.websocket_handler.start_session(config_snapshot=self.config)
+            self.event_manager.emit_log(
+                "info", f"[WS_SESSION_CHECK] start_session result: {result}"
+            )
+        else:
+            self.event_manager.emit_log(
+                "warning", "[WS_SESSION_CHECK] WebSocket session NOT started - conditions not met"
+            )
 
         # Start execution in background thread
         thread = threading.Thread(target=self._run_workflow, args=(workflow_id,), daemon=True)

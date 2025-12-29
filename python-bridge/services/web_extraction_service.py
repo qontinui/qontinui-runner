@@ -10,9 +10,10 @@ import base64
 import json
 import logging
 import uuid
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from qontinui_schemas.common import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -273,7 +274,7 @@ class WebExtractionService:
             self._composite_results[composite_id] = {
                 "composite_id": composite_id,
                 "extraction_ids": extraction_ids,
-                "created_at": datetime.now().isoformat(),
+                "created_at": utc_now().isoformat(),
             }
 
             return {
@@ -512,7 +513,7 @@ class WebExtractionService:
             message = {
                 "type": event_type,
                 "data": data,
-                "timestamp": datetime.now().isoformat(),
+                "timestamp": utc_now().isoformat(),
             }
             self.websocket_handler.send_message(json.dumps(message))
         except Exception as e:

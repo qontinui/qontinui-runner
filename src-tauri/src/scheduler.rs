@@ -97,7 +97,6 @@ pub enum ScheduledTaskStatus {
     Cancelled,
 }
 
-
 // ============================================================================
 // Execution Record
 // ============================================================================
@@ -545,10 +544,7 @@ pub fn record_execution(task_id: &str, record: TaskExecutionRecord) -> Result<()
     }
 
     // Add to history
-    let history = state
-        .history
-        .entry(task_id.to_string())
-        .or_default();
+    let history = state.history.entry(task_id.to_string()).or_default();
     history.push(record);
 
     // Trim history if needed

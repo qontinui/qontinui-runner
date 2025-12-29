@@ -42,6 +42,9 @@ pub struct ConfigMetadata {
     pub tags: Vec<String>,
     #[serde(rename = "targetApplication")]
     pub target_application: Option<String>,
+    /// Project ID for qontinui-web execution run reporting
+    #[serde(rename = "projectId")]
+    pub project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
