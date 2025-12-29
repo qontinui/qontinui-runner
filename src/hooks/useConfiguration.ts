@@ -105,7 +105,7 @@ interface UseConfigurationReturn {
   setWorkflows: (workflows: Workflow[]) => void;
   loadConfiguration: () => Promise<void>;
   loadLastConfiguration: () => Promise<void>;
-  loadConfigFromPath: (configPath: string, workflowIdToSelect?: string) => Promise<void>;
+  loadConfigFromPath: (configPath: string, _workflowIdToSelect?: string) => Promise<void>;
 }
 
 /**
@@ -138,7 +138,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
    * Load configuration from a specific path
    */
   const loadConfigFromPath = useCallback(
-    async (configPath: string, workflowIdToSelect?: string) => {
+    async (configPath: string, _workflowIdToSelect?: string) => {
       onLog?.("info", `Loading configuration: ${configPath}`);
 
       try {
