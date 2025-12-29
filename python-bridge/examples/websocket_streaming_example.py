@@ -15,6 +15,7 @@ Usage:
 """
 
 import base64
+import os
 import sys
 import time
 from io import BytesIO
@@ -45,13 +46,26 @@ async def main():
     """Main demonstration function."""
 
     # Configuration
-    # IMPORTANT: Change these values to match your setup
-    API_URL = "http://localhost:8000"  # HTTP for auth, WS for WebSocket
-    WS_URL = "ws://localhost:8000"  # WebSocket URL
-    EMAIL = "admin@qontinui.com"  # Your email
-    PASSWORD = "admin123"  # Your password
-    PROJECT_ID = "your-project-uuid-here"  # Replace with actual project UUID
-    RUNNER_NAME = "Demo Runner"  # Custom runner name
+    # Set these via environment variables or change the defaults
+    API_URL = os.environ.get("QONTINUI_API_URL", "http://localhost:8000")
+    WS_URL = os.environ.get("QONTINUI_WS_URL", "ws://localhost:8000")
+    EMAIL = os.environ.get("QONTINUI_EMAIL", "")
+    PASSWORD = os.environ.get("QONTINUI_PASSWORD", "")
+    PROJECT_ID = os.environ.get("QONTINUI_PROJECT_ID", "")
+    RUNNER_NAME = os.environ.get("QONTINUI_RUNNER_NAME", "Demo Runner")
+
+    if not EMAIL or not PASSWORD:
+        print("Error: Please set QONTINUI_EMAIL and QONTINUI_PASSWORD environment variables")
+        print("Example:")
+        print("  export QONTINUI_EMAIL=your-email@example.com")
+        print("  export QONTINUI_PASSWORD=your-password")
+        return
+
+    if not PROJECT_ID:
+        print("Error: Please set QONTINUI_PROJECT_ID environment variable")
+        print("Example:")
+        print("  export QONTINUI_PROJECT_ID=your-project-uuid-here")
+        return
 
     print("=" * 60)
     print("WebSocket Streaming Demo")
