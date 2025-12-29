@@ -9,6 +9,7 @@
 //! - Optional cloud sync with qontinui-web
 
 use crate::executor::file_logger::{FileLogger, PlaywrightLogParams};
+use crate::settings;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -876,6 +877,15 @@ pub fn run_script(
         }
     }
 
+    // Load Playwright settings to pass as environment variables
+    let playwright_settings = settings::get_playwright_settings();
+    info!("Playwright settings loaded: skip_web_server={}, has_username={}, has_password={}, has_base_url={}",
+        playwright_settings.skip_web_server,
+        playwright_settings.test_username.is_some(),
+        playwright_settings.test_password.is_some(),
+        playwright_settings.base_url.is_some()
+    );
+
     let output = if system == "windows" {
         // On Windows, use cmd.exe to ensure npx is found via PATH
         let npx_args = std::iter::once("npx".to_string())
@@ -889,10 +899,24 @@ pub fn run_script(
             npx_args
         );
 
-        Command::new("cmd.exe")
-            .args(["/c", &npx_args])
-            .current_dir(&runner_dir)
-            .output()
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/c", &npx_args]).current_dir(&runner_dir);
+
+        // Set Playwright environment variables from settings
+        if let Some(username) = &playwright_settings.test_username {
+            cmd.env("PLAYWRIGHT_TEST_USERNAME", username);
+        }
+        if let Some(password) = &playwright_settings.test_password {
+            cmd.env("PLAYWRIGHT_TEST_PASSWORD", password);
+        }
+        if let Some(base_url) = &playwright_settings.base_url {
+            cmd.env("PLAYWRIGHT_BASE_URL", base_url);
+        }
+        if playwright_settings.skip_web_server {
+            cmd.env("SKIP_WEB_SERVER", "1");
+        }
+
+        cmd.output()
             .map_err(|e| format!("Failed to execute playwright via cmd.exe: {}", e))?
     } else {
         info!(
@@ -900,10 +924,25 @@ pub fn run_script(
             runner_dir.display(),
             args.join(" ")
         );
-        Command::new("npx")
-            .args(&args)
-            .current_dir(&runner_dir)
-            .output()
+
+        let mut cmd = Command::new("npx");
+        cmd.args(&args).current_dir(&runner_dir);
+
+        // Set Playwright environment variables from settings
+        if let Some(username) = &playwright_settings.test_username {
+            cmd.env("PLAYWRIGHT_TEST_USERNAME", username);
+        }
+        if let Some(password) = &playwright_settings.test_password {
+            cmd.env("PLAYWRIGHT_TEST_PASSWORD", password);
+        }
+        if let Some(base_url) = &playwright_settings.base_url {
+            cmd.env("PLAYWRIGHT_BASE_URL", base_url);
+        }
+        if playwright_settings.skip_web_server {
+            cmd.env("SKIP_WEB_SERVER", "1");
+        }
+
+        cmd.output()
             .map_err(|e| format!("Failed to execute playwright: {}", e))?
     };
 

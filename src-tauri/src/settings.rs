@@ -91,6 +91,43 @@ impl Default for AiSettings {
 }
 
 // ============================================================================
+// Playwright Settings
+// ============================================================================
+
+/// Settings for Playwright test execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaywrightSettings {
+    /// Username or email for test authentication
+    /// Passed as PLAYWRIGHT_TEST_USERNAME environment variable
+    pub test_username: Option<String>,
+    /// Password for test authentication
+    /// Passed as PLAYWRIGHT_TEST_PASSWORD environment variable
+    pub test_password: Option<String>,
+    /// Base URL for tests (e.g., http://localhost:3001)
+    /// Passed as PLAYWRIGHT_BASE_URL environment variable
+    pub base_url: Option<String>,
+    /// Skip web server startup (assume it's already running)
+    /// Passed as SKIP_WEB_SERVER=1 environment variable
+    #[serde(default = "default_skip_web_server")]
+    pub skip_web_server: bool,
+}
+
+fn default_skip_web_server() -> bool {
+    true // Default to true since runner users typically have servers running
+}
+
+impl Default for PlaywrightSettings {
+    fn default() -> Self {
+        Self {
+            test_username: None,
+            test_password: None,
+            base_url: None,
+            skip_web_server: default_skip_web_server(),
+        }
+    }
+}
+
+// ============================================================================
 // Debug Settings
 // ============================================================================
 
@@ -129,10 +166,15 @@ pub struct Settings {
     /// Auto-continue AI Developer workflows after runner restart (default: false)
     #[serde(default)]
     pub auto_continue_ai_workflow: bool,
+    /// Auto-fix issues on session failure (triggers auto-fix when workflow/prompt fails)
+    #[serde(default)]
+    pub session_auto_fix_on_failure: bool,
     #[serde(default)]
     pub debug: DebugSettings,
     #[serde(default)]
     pub ai: AiSettings,
+    #[serde(default)]
+    pub playwright: PlaywrightSettings,
 }
 
 fn default_auto_load_last_config() -> bool {
@@ -318,6 +360,36 @@ pub fn save_auto_continue_ai_workflow(enabled: bool) -> Result<(), String> {
     info!("Saving auto-continue AI workflow setting: {}", enabled);
     let mut settings = load_settings();
     settings.auto_continue_ai_workflow = enabled;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the current Playwright settings
+pub fn get_playwright_settings() -> PlaywrightSettings {
+    let settings = load_settings();
+    settings.playwright
+}
+
+/// Save Playwright settings
+pub fn save_playwright_settings(playwright_settings: PlaywrightSettings) -> Result<(), String> {
+    info!("Saving Playwright settings");
+    let mut settings = load_settings();
+    settings.playwright = playwright_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the session auto-fix on failure setting
+pub fn get_session_auto_fix_on_failure() -> bool {
+    let settings = load_settings();
+    settings.session_auto_fix_on_failure
+}
+
+/// Save the session auto-fix on failure setting
+pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
+    info!("Saving session auto-fix on failure setting: {}", enabled);
+    let mut settings = load_settings();
+    settings.session_auto_fix_on_failure = enabled;
     save_settings(&settings)?;
     Ok(())
 }

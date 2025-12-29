@@ -43,6 +43,7 @@ pub mod execution_reporting;
 pub mod extraction;
 pub mod issues;
 pub mod logging;
+pub mod playwright_settings;
 pub mod project_logs;
 pub mod rag;
 pub mod screenshot;

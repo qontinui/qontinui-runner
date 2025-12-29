@@ -182,8 +182,31 @@ export class FindingsTracker {
   /**
    * Process an AI output line for finding markers
    * Handles both new structured format and legacy issue markers
+   *
+   * NOTE: The input may contain multiple lines separated by \n (when streaming
+   * from Claude, entire paragraphs may arrive as a single "line" with embedded newlines).
+   * This method splits by newlines and processes each sub-line individually.
    */
-  processLine(line: string): Finding | null {
+  processLine(text: string): Finding | null {
+    // Split by newlines to handle multi-line input
+    // (Claude often sends entire paragraphs with embedded \n characters)
+    const lines = text.split("\n");
+    let lastFinding: Finding | null = null;
+
+    for (const line of lines) {
+      const finding = this.processSingleLine(line);
+      if (finding) {
+        lastFinding = finding;
+      }
+    }
+
+    return lastFinding;
+  }
+
+  /**
+   * Process a single line of AI output for finding markers
+   */
+  private processSingleLine(line: string): Finding | null {
     // Check if we're currently parsing a multi-line finding block
     if (this.currentFindingMeta) {
       // Check for end marker
@@ -774,6 +797,169 @@ export class FindingsTracker {
     return this.getAllFindings().filter((f) => f.status !== "resolved" && f.status !== "wont_fix")
       .length;
   }
+
+  // ==================== Persistence ====================
+
+  /**
+   * Get session history from the store
+   * Returns completed sessions with their findings summaries
+   */
+  getSessionHistory(): SessionHistoryEntry[] {
+    return this.sessionHistory;
+  }
+
+  /**
+   * Archive the current session to history
+   * Called when a session ends (completes, fails, or times out)
+   */
+  archiveCurrentSession(
+    status: "completed" | "failed" | "timeout" | "context_limit" = "completed",
+  ): void {
+    const currentReport = this.getCurrentReport();
+    if (!currentReport) {
+      console.log("[FindingsTracker] No current report to archive");
+      return;
+    }
+
+    const sessionFindings = this.getSessionFindings();
+    const entry: SessionHistoryEntry = {
+      id: currentReport.id,
+      sessionId: this.currentSessionId,
+      promptName: currentReport.promptName,
+      startedAt: currentReport.startedAt,
+      completedAt: Date.now(),
+      duration: Date.now() - currentReport.startedAt,
+      status,
+      phases: currentReport.phases.length,
+      findings: sessionFindings,
+      summary: {
+        total: sessionFindings.length,
+        resolved: sessionFindings.filter((f) => f.status === "resolved").length,
+        pending: sessionFindings.filter(
+          (f) => f.status === "detected" || f.status === "in_progress",
+        ).length,
+        bySeverity: {
+          critical: sessionFindings.filter((f) => f.severity === "critical").length,
+          high: sessionFindings.filter((f) => f.severity === "high").length,
+          medium: sessionFindings.filter((f) => f.severity === "medium").length,
+          low: sessionFindings.filter((f) => f.severity === "low").length,
+          info: sessionFindings.filter((f) => f.severity === "info").length,
+        },
+        byCategory: sessionFindings.reduce(
+          (acc, f) => {
+            acc[f.categoryId] = (acc[f.categoryId] || 0) + 1;
+            return acc;
+          },
+          {} as Record<string, number>,
+        ),
+      },
+    };
+
+    // Add to history (keep last 50 sessions)
+    this.sessionHistory.unshift(entry);
+    if (this.sessionHistory.length > 50) {
+      this.sessionHistory = this.sessionHistory.slice(0, 50);
+    }
+
+    // Persist to disk
+    this.persistToDisk();
+
+    console.log(
+      `[FindingsTracker] Session archived: ${currentReport.promptName} (${entry.id}) - ${status}`,
+    );
+  }
+
+  /**
+   * Persist findings and session history to disk
+   */
+  private async persistToDisk(): Promise<void> {
+    try {
+      const data: PersistedFindingsData = {
+        version: 1,
+        savedAt: Date.now(),
+        currentSessionId: this.currentSessionId,
+        findings: this.getAllFindings(),
+        reports: this.getAllReports(),
+        sessionHistory: this.sessionHistory,
+      };
+
+      // Use Tauri's invoke to save to .dev-logs
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("save_findings_data", { data: JSON.stringify(data, null, 2) });
+      console.log("[FindingsTracker] Persisted to disk");
+    } catch (error) {
+      console.error("[FindingsTracker] Failed to persist to disk:", error);
+    }
+  }
+
+  /**
+   * Load findings and session history from disk
+   */
+  async loadFromDisk(): Promise<void> {
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const jsonStr = await invoke<string>("load_findings_data");
+
+      if (!jsonStr) {
+        console.log("[FindingsTracker] No persisted data found");
+        return;
+      }
+
+      const data: PersistedFindingsData = JSON.parse(jsonStr);
+
+      // Restore session history
+      this.sessionHistory = data.sessionHistory || [];
+
+      // Optionally restore findings from last session
+      // (commented out - usually we want a fresh start)
+      // for (const finding of data.findings) {
+      //   this.findings.set(finding.id, finding);
+      // }
+
+      console.log(
+        `[FindingsTracker] Loaded from disk: ${this.sessionHistory.length} sessions in history`,
+      );
+    } catch (error) {
+      console.error("[FindingsTracker] Failed to load from disk:", error);
+    }
+  }
+
+  // Session history storage
+  private sessionHistory: SessionHistoryEntry[] = [];
+}
+
+/**
+ * Session history entry - a completed session with its findings
+ */
+export interface SessionHistoryEntry {
+  id: string;
+  sessionId: string;
+  promptName: string;
+  startedAt: number;
+  completedAt: number;
+  duration: number;
+  status: "completed" | "failed" | "timeout" | "context_limit";
+  phases: number;
+  findings: Finding[];
+  summary: {
+    total: number;
+    resolved: number;
+    pending: number;
+    bySeverity: Record<string, number>;
+    byCategory: Record<string, number>;
+  };
+}
+
+/**
+ * Data structure for persisted findings
+ */
+interface PersistedFindingsData {
+  version: number;
+  savedAt: number;
+  currentSessionId: string;
+  findings: Finding[];
+  reports: ExecutionReport[];
+  sessionHistory: SessionHistoryEntry[];
 }
 
 // Export singleton instance

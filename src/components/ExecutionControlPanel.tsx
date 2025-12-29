@@ -15,9 +15,6 @@ import type { Workflow, ConfigState } from "../contexts/ExecutionContext";
 import type { ResolvedInitialStates } from "../types/state-machine";
 
 export interface ExecutionControlPanelProps {
-  collapsed: boolean;
-  onToggle: (collapsed: boolean) => void;
-
   // Workflow selection
   workflows: Workflow[];
   selectedWorkflow: string;
@@ -47,8 +44,6 @@ export interface ExecutionControlPanelProps {
 }
 
 export function ExecutionControlPanel({
-  collapsed,
-  onToggle,
   workflows,
   selectedWorkflow,
   configLoaded,
@@ -137,8 +132,7 @@ export function ExecutionControlPanel({
     <CollapsiblePanel
       title="Execution Control"
       icon={<Cpu className="w-4 h-4" />}
-      collapsed={collapsed}
-      onToggle={onToggle}
+      collapsible={false}
     >
       <div className="space-y-4">
         {/* Workflow Selector */}
@@ -235,17 +229,15 @@ export function ExecutionControlPanel({
         )}
 
         {/* Auto-minimize Toggle */}
-        {selectedMonitors.length === 1 && (
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={autoMinimize}
-              onChange={(e) => onAutoMinimizeChange(e.target.checked)}
-              className="rounded"
-            />
-            <span>Auto-minimize window on start</span>
-          </label>
-        )}
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={autoMinimize}
+            onChange={(e) => onAutoMinimizeChange(e.target.checked)}
+            className="rounded"
+          />
+          <span>Auto-minimize window on start</span>
+        </label>
 
         {/* Start/Stop Buttons */}
         <div className="flex gap-2">

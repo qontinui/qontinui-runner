@@ -355,8 +355,9 @@ Always end with a summary before exiting:
 - **Don't spawn sessions yourself** - runner handles this deterministically
 `;
 
-// Developer Mode Prompt Template - Runner handles continuation deterministically
-const DEVELOPER_PROMPT_TEMPLATE = `# AI Developer Loop
+// Default Developer Mode Prompt Template - Runner handles continuation deterministically
+// This is the hardcoded default that can be restored if users modify the template
+const DEFAULT_DEVELOPER_PROMPT_TEMPLATE = `# AI Developer Loop
 
 Execute automation steps, analyze results, fix issues. The runner handles session continuation.
 
@@ -379,6 +380,48 @@ Your job: Do the work, update checkpoint when done.
 
 **Execution Steps:** {{STEP_COUNT}} steps
 **Goal:** {{GOAL}}
+
+## Debugging Resources
+
+### Quick Error Check (Use First)
+
+Query the runner's debugging API for structured error summaries:
+
+\`\`\`powershell
+# Get all recent errors across services (backend, frontend, api, runner)
+(Invoke-WebRequest -Uri "http://localhost:9876/debug/app/errors?limit=50" -UseBasicParsing).Content | ConvertFrom-Json | Select-Object -ExpandProperty data
+
+# Filter by service
+(Invoke-WebRequest -Uri "http://localhost:9876/debug/app/errors?service=backend&level=error" -UseBasicParsing).Content | ConvertFrom-Json | Select-Object -ExpandProperty data
+
+# Check previous session findings
+(Invoke-WebRequest -Uri "http://localhost:9876/findings/summary" -UseBasicParsing).Content | ConvertFrom-Json | Select-Object -ExpandProperty data
+\`\`\`
+
+### When to Use Which Resource
+
+| Scenario | Use |
+|----------|-----|
+| "Are there any errors?" | MCP endpoint \`/debug/app/errors\` |
+| "What errors occurred in the last run?" | MCP endpoint \`/debug/app/errors\` |
+| "What issues were found previously?" | MCP endpoint \`/findings/summary\` |
+| "What's the full stack trace?" | Log files directly |
+| "Search for a specific error message" | Log files with Select-String |
+| "Understand the sequence of events" | Log files directly |
+
+### Detailed Investigation (Log Files)
+
+For full context, stack traces, or searching specific patterns:
+
+\`\`\`powershell
+# Application logs
+{{LOG_CHECK_COMMANDS}}
+
+# Runner event logs
+Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-actions.jsonl" -Tail 50 | Select-String -Pattern '"error"|"failed"'
+Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-image-recognition.jsonl" -Tail 30 | Select-String -Pattern '"found":\\s*false'
+\`\`\`
+
 {{LOG_MONITORING_SECTION}}
 
 ## Step 1: Execute Automation Steps
@@ -387,20 +430,37 @@ Your job: Do the work, update checkpoint when done.
 
 ## Step 2: Analyze Results
 
-### Check Logs for Errors
+### 2.1 Quick Error Check (MCP API)
+
+First, query the debugging API for a structured summary:
 
 \`\`\`powershell
-# Runner event logs
-Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-actions.jsonl" -Tail 50 | Select-String -Pattern '"error"|"failed"'
-Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-image-recognition.jsonl" -Tail 30 | Select-String -Pattern '"found":\\s*false'
-
-# Application logs (if configured)
-{{LOG_CHECK_COMMANDS}}
+$errors = (Invoke-WebRequest -Uri "http://localhost:9876/debug/app/errors?limit=30" -UseBasicParsing).Content | ConvertFrom-Json
+if ($errors.data.summary.total -gt 0) {
+    Write-Host "Found $($errors.data.summary.total) errors/warnings:"
+    Write-Host "  By service: $($errors.data.summary.by_service | ConvertTo-Json -Compress)"
+    Write-Host "  By level: $($errors.data.summary.by_level | ConvertTo-Json -Compress)"
+    $errors.data.errors | Select-Object timestamp, service, level, message | Format-Table -AutoSize
+}
 \`\`\`
 
-### View Screenshots
+### 2.2 Check Previous Findings
+
+See what issues were already detected in previous sessions:
+
+\`\`\`powershell
+$findings = (Invoke-WebRequest -Uri "http://localhost:9876/findings/summary" -UseBasicParsing).Content | ConvertFrom-Json
+if ($findings.data.total_findings -gt 0) {
+    Write-Host "Previous sessions found $($findings.data.total_findings) issues:"
+    Write-Host "  Code-related: $($findings.data.code_related_findings)"
+    Write-Host "  By severity: $($findings.data.by_severity | ConvertTo-Json -Compress)"
+}
+\`\`\`
+
+### 2.3 View Screenshots
 
 Check for annotated screenshots from image recognition:
+
 \`\`\`powershell
 Get-ChildItem "{{DEV_LOGS_ESCAPED}}\\screenshots" -Filter "*.png" | Sort-Object LastWriteTime -Descending | Select-Object -First 5
 \`\`\`
@@ -410,7 +470,7 @@ Use the Read tool to view the most recent screenshots.
 ## Step 3: Fix Issues
 
 If any errors were found:
-1. Identify the root cause from logs and screenshots
+1. Identify the root cause from the API response or logs
 2. Read the relevant source code
 3. Make the fix
 4. Restart affected services as needed:
@@ -462,7 +522,8 @@ $checkpoint | ConvertTo-Json -Depth 10 | Out-File -Encoding UTF8 $checkpointPath
 ## Rules
 
 - Execute steps IN THE EXACT ORDER specified
-- ALWAYS analyze logs and screenshots after execution
+- **USE MCP ENDPOINTS FIRST** for quick error discovery
+- Use log files for detailed investigation when needed
 - You are INDEPENDENT - you CAN restart any service including the runner
 - Work AUTONOMOUSLY - never ask the user
 - **UPDATE CHECKPOINT** when done - runner reads it to decide continuation
@@ -481,6 +542,42 @@ When you fix an issue:
 [ISSUE:RESOLVED] {"title":"Brief title","resolution":"How you fixed it"}
 \`\`\`
 `;
+
+// Storage key for custom prompt template
+const CUSTOM_PROMPT_TEMPLATE_KEY = "qontinui-custom-developer-prompt-template";
+
+// Get the current developer prompt template (custom or default)
+const getDeveloperPromptTemplate = (): string => {
+  if (typeof window !== "undefined") {
+    const customTemplate = localStorage.getItem(CUSTOM_PROMPT_TEMPLATE_KEY);
+    if (customTemplate) {
+      return customTemplate;
+    }
+  }
+  return DEFAULT_DEVELOPER_PROMPT_TEMPLATE;
+};
+
+// Save a custom prompt template
+const saveCustomPromptTemplate = (template: string): void => {
+  if (typeof window !== "undefined") {
+    localStorage.setItem(CUSTOM_PROMPT_TEMPLATE_KEY, template);
+  }
+};
+
+// Reset to default prompt template
+const resetPromptTemplateToDefault = (): void => {
+  if (typeof window !== "undefined") {
+    localStorage.removeItem(CUSTOM_PROMPT_TEMPLATE_KEY);
+  }
+};
+
+// Check if using custom template
+const isUsingCustomTemplate = (): boolean => {
+  if (typeof window !== "undefined") {
+    return localStorage.getItem(CUSTOM_PROMPT_TEMPLATE_KEY) !== null;
+  }
+  return false;
+};
 
 interface WorkspacePaths {
   workspace_root: string;
@@ -671,6 +768,11 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
   const [saveName, setSaveName] = useState("");
   const [saveDescription, setSaveDescription] = useState("");
   const [isSaving, setIsSaving] = useState(false);
+
+  // Prompt template editing state
+  const [isEditingPromptTemplate, setIsEditingPromptTemplate] = useState(false);
+  const [editedPromptTemplate, setEditedPromptTemplate] = useState("");
+  const [usingCustomTemplate, setUsingCustomTemplate] = useState(() => isUsingCustomTemplate());
 
   // New workflow confirmation dialog (for unsaved changes warning)
   const [showNewConfirmDialog, setShowNewConfirmDialog] = useState(false);
@@ -1168,33 +1270,42 @@ Execute the workflow using the MCP tool:
 mcp__qontinui__run_workflow with workflow_name="${step.name}", timeout_seconds=300
 \`\`\``;
           if (step.takeScreenshot) {
-            const delayText =
+            const delayParam =
               step.screenshotDelay && step.screenshotDelay > 0
-                ? ` Wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before taking the screenshot to allow the UI to settle.`
+                ? `&delay_seconds=${step.screenshotDelay}`
                 : "";
             instruction += `
 
-After the workflow completes, take a screenshot to capture the result.${delayText}`;
+After the workflow completes, capture a screenshot using the qontinui-api:
+\`\`\`powershell
+Invoke-WebRequest -Uri "http://localhost:8001/api/capture/screenshot/current?quality=95${delayParam}" -OutFile "screenshot.png"
+\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(The API will wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before capturing to allow the UI to settle.)` : ""}`;
           }
           return instruction;
         } else if (step.type === "playwright") {
           let instruction = `### Step ${stepNum}: Run Playwright Test "${step.name}"
 
-**Script ID:** ${step.playwrightScriptId}
+**⚡ ACTION: RUN THIS TEST IMMEDIATELY** - The script already exists on the server.
+
+**Script ID:** \`${step.playwrightScriptId}\`
 **Target URL:** ${step.playwrightTargetUrl || "(not specified)"}
 
-**Current Script Content:**
-\`\`\`typescript
-${step.playwrightScriptContent || "// Script content not available"}
-\`\`\`
-
-Execute the Playwright test script via the runner API:
+**EXECUTE NOW** - Run this Playwright test via the runner API:
 \`\`\`powershell
-$response = Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}/run" -Method POST -ContentType "application/json" -Body '{}' | ConvertFrom-Json
-$response | ConvertTo-Json -Depth 10
+$response = Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}/run" -Method POST -ContentType "application/json" -Body '{}' -UseBasicParsing
+$response.Content | ConvertFrom-Json | ConvertTo-Json -Depth 10
 \`\`\`
 
-Analyze the structured output:
+${
+  step.playwrightScriptContent
+    ? `**Script Content (for reference):**
+\`\`\`typescript
+${step.playwrightScriptContent}
+\`\`\``
+    : `*(Script content not cached - run the test anyway, it exists on the server)*`
+}
+
+After running, analyze the structured output:
 - Check \`success\` field for overall result
 - Check \`data.passed\` for test pass status
 - Check \`data.tests_passed\` and \`data.tests_failed\` counts
@@ -1214,13 +1325,16 @@ $body = @{ script_content = @"
 Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}" -Method PUT -ContentType "application/json" -Body $body
 \`\`\``;
           if (step.takeScreenshot) {
-            const delayText =
+            const delayParam =
               step.screenshotDelay && step.screenshotDelay > 0
-                ? ` Wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before taking the screenshot to allow the UI to settle.`
+                ? `&delay_seconds=${step.screenshotDelay}`
                 : "";
             instruction += `
 
-After the test completes, take an additional screenshot to capture the current application state.${delayText}`;
+After the test completes, capture an additional screenshot using the qontinui-api:
+\`\`\`powershell
+Invoke-WebRequest -Uri "http://localhost:8001/api/capture/screenshot/current?quality=95${delayParam}" -OutFile "screenshot.png"
+\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(The API will wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before capturing to allow the UI to settle.)` : ""}`;
           }
           return instruction;
         } else if (step.type === "prompt") {
@@ -1339,7 +1453,8 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
         "**Log Monitoring:** Disabled (only runner logs will be checked)\nConfigure log sources in the Logs tab to enable application log monitoring.";
     }
 
-    return DEVELOPER_PROMPT_TEMPLATE.replace("{{SESSION_ID}}", sessionId)
+    return getDeveloperPromptTemplate()
+      .replace("{{SESSION_ID}}", sessionId)
       .replace(/\{\{SESSION_ID\}\}/g, sessionId)
       .replace("{{ITERATION}}", "1")
       .replace(/\{\{ITERATION\}\}/g, "1")
@@ -2519,10 +2634,87 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             icon={<Sparkles className="w-4 h-4" />}
             defaultCollapsed={currentSessionId !== null}
             storageKey="ai-builder-preview"
+            headerExtra={
+              <div className="flex items-center gap-2">
+                {usingCustomTemplate && (
+                  <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded">
+                    Custom
+                  </span>
+                )}
+                {!isEditingPromptTemplate ? (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setEditedPromptTemplate(getDeveloperPromptTemplate());
+                      setIsEditingPromptTemplate(true);
+                    }}
+                    className="text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded hover:bg-muted/50"
+                    title="Edit prompt template"
+                  >
+                    Edit Template
+                  </button>
+                ) : null}
+              </div>
+            }
           >
-            <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-64 whitespace-pre-wrap">
-              {generatePrompt("preview-session")}
-            </pre>
+            {isEditingPromptTemplate ? (
+              <div className="space-y-3">
+                <div className="text-xs text-muted-foreground mb-2">
+                  Edit the developer prompt template. Use placeholders like{" "}
+                  <code className="bg-muted px-1 rounded">{"{{GOAL}}"}</code>,{" "}
+                  <code className="bg-muted px-1 rounded">{"{{EXECUTION_STEPS}}"}</code>,{" "}
+                  <code className="bg-muted px-1 rounded">{"{{DEV_LOGS_ESCAPED}}"}</code>, etc.
+                </div>
+                <textarea
+                  value={editedPromptTemplate}
+                  onChange={(e) => setEditedPromptTemplate(e.target.value)}
+                  className="w-full h-96 text-xs font-mono bg-background border border-border rounded-md p-3 resize-y"
+                  placeholder="Enter custom prompt template..."
+                />
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        saveCustomPromptTemplate(editedPromptTemplate);
+                        setUsingCustomTemplate(true);
+                        setIsEditingPromptTemplate(false);
+                        setLastResult({ success: true, message: "Custom template saved!" });
+                        setTimeout(() => setLastResult(null), 3000);
+                      }}
+                      className="px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90"
+                    >
+                      Save Template
+                    </button>
+                    <button
+                      onClick={() => {
+                        setIsEditingPromptTemplate(false);
+                        setEditedPromptTemplate("");
+                      }}
+                      className="px-3 py-1.5 text-xs bg-muted text-muted-foreground rounded hover:bg-muted/80"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => {
+                      resetPromptTemplateToDefault();
+                      setUsingCustomTemplate(false);
+                      setEditedPromptTemplate(DEFAULT_DEVELOPER_PROMPT_TEMPLATE);
+                      setLastResult({ success: true, message: "Reset to default template" });
+                      setTimeout(() => setLastResult(null), 3000);
+                    }}
+                    className="px-3 py-1.5 text-xs text-orange-400 hover:text-orange-300 hover:bg-orange-500/10 rounded"
+                    title="Reset to the hardcoded default template"
+                  >
+                    Reset to Default
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <pre className="text-xs bg-background p-3 rounded-md overflow-auto max-h-64 whitespace-pre-wrap">
+                {generatePrompt("preview-session")}
+              </pre>
+            )}
           </CollapsiblePanel>
 
           {/* History */}

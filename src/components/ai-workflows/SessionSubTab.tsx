@@ -35,6 +35,7 @@ import {
   Calendar,
   CheckSquare,
   X,
+  Wrench,
 } from "lucide-react";
 import { AiOutputTab } from "../AiOutputTab";
 import type { AiOutputLine } from "../AiOutputTab";
@@ -95,6 +96,10 @@ export function SessionSubTab({
     loading: autoContinueLoading,
     toggle: toggleAutoContinue,
   } = useAutoContinue();
+
+  // Auto-fix on failure state
+  const [autoFixEnabled, setAutoFixEnabled] = useState(false);
+  const [autoFixLoading, setAutoFixLoading] = useState(false);
 
   // Active workflow info (when running)
   const [activeWorkflow, setActiveWorkflow] = useState<ActiveWorkflowInfo | null>(null);
@@ -267,6 +272,44 @@ export function SessionSubTab({
     const unsubscribe = issueTracker.subscribe(updateIssues);
     return unsubscribe;
   }, []);
+
+  // Load auto-fix setting on mount
+  useEffect(() => {
+    const loadAutoFixSetting = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/session/auto-fix");
+        const result = await response.json();
+        if (result.success) {
+          setAutoFixEnabled(result.data?.enabled ?? false);
+        }
+      } catch (error) {
+        console.error("Failed to load auto-fix setting:", error);
+      }
+    };
+    loadAutoFixSetting();
+  }, []);
+
+  // Toggle auto-fix setting
+  const toggleAutoFix = useCallback(async () => {
+    if (autoFixLoading) return;
+
+    setAutoFixLoading(true);
+    try {
+      const response = await fetch("http://localhost:9876/session/auto-fix", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !autoFixEnabled }),
+      });
+      const result = await response.json();
+      if (result.success) {
+        setAutoFixEnabled(result.data?.enabled ?? !autoFixEnabled);
+      }
+    } catch (error) {
+      console.error("Failed to toggle auto-fix setting:", error);
+    } finally {
+      setAutoFixLoading(false);
+    }
+  }, [autoFixEnabled, autoFixLoading]);
 
   // Check for resumable workflows and running state periodically
   useEffect(() => {
@@ -870,6 +913,35 @@ export function SessionSubTab({
                 {autoContinueLoading ? (
                   <Loader2 className="w-6 h-6 animate-spin" />
                 ) : autoContinueEnabled ? (
+                  <ToggleRight className="w-6 h-6" />
+                ) : (
+                  <ToggleLeft className="w-6 h-6" />
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Auto-Fix on Failure Toggle */}
+          <div className="card p-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Wrench className="w-4 h-4 text-blue-500" />
+                <div>
+                  <span className="text-sm font-medium">Auto-Fix</span>
+                  <p className="text-xs text-muted-foreground">
+                    {autoFixEnabled ? "Fix issues on failure" : "Manual fix"}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={toggleAutoFix}
+                disabled={autoFixLoading}
+                className={`flex items-center transition-colors ${autoFixEnabled ? "text-blue-500" : "text-muted-foreground"} ${autoFixLoading ? "opacity-50" : ""}`}
+                title={autoFixEnabled ? "Auto-fix enabled" : "Auto-fix disabled"}
+              >
+                {autoFixLoading ? (
+                  <Loader2 className="w-6 h-6 animate-spin" />
+                ) : autoFixEnabled ? (
                   <ToggleRight className="w-6 h-6" />
                 ) : (
                   <ToggleLeft className="w-6 h-6" />

@@ -288,3 +288,72 @@ pub fn read_image_as_base64(path: String) -> Result<String, String> {
 
     Ok(format!("data:{};base64,{}", mime_type, base64_data))
 }
+
+/// Get the findings data file path.
+pub fn get_findings_data_path() -> std::path::PathBuf {
+    // Store in .dev-logs directory (parent of runner)
+    let dev_logs_dir = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .parent()
+        .map(|p| p.join(".dev-logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".dev-logs"));
+
+    // Create directory if it doesn't exist
+    if !dev_logs_dir.exists() {
+        let _ = fs::create_dir_all(&dev_logs_dir);
+    }
+
+    dev_logs_dir.join("findings-history.json")
+}
+
+/// Save findings data to disk.
+///
+/// Persists the findings tracker data (findings, reports, session history) to a JSON file.
+/// This allows session history to survive runner restarts and context resets.
+///
+/// # Arguments
+/// * `data` - JSON string containing the findings data
+///
+/// # Returns
+/// * `Ok(())` - Success
+/// * `Err(String)` - Error if save fails
+#[tauri::command]
+pub fn save_findings_data(data: String) -> Result<(), String> {
+    let path = get_findings_data_path();
+    info!("Saving findings data to: {:?}", path);
+
+    fs::write(&path, &data).map_err(|e| {
+        error!("Failed to save findings data: {}", e);
+        format!("Failed to save findings data: {}", e)
+    })?;
+
+    info!("Findings data saved successfully ({} bytes)", data.len());
+    Ok(())
+}
+
+/// Load findings data from disk.
+///
+/// Loads previously persisted findings tracker data from the JSON file.
+///
+/// # Returns
+/// * `Ok(String)` - JSON string containing the findings data
+/// * `Ok("")` - Empty string if file doesn't exist (not an error)
+/// * `Err(String)` - Error if read fails
+#[tauri::command]
+pub fn load_findings_data() -> Result<String, String> {
+    let path = get_findings_data_path();
+    info!("Loading findings data from: {:?}", path);
+
+    if !path.exists() {
+        info!("Findings data file does not exist");
+        return Ok(String::new());
+    }
+
+    let data = fs::read_to_string(&path).map_err(|e| {
+        error!("Failed to load findings data: {}", e);
+        format!("Failed to load findings data: {}", e)
+    })?;
+
+    info!("Findings data loaded successfully ({} bytes)", data.len());
+    Ok(data)
+}

@@ -604,6 +604,7 @@ class QontinuiExecutor:
         monitor: int | None = None,
         monitor_offset_x: int | None = None,
         monitor_offset_y: int | None = None,
+        initial_state_ids: list[str] | None = None,
     ) -> bool:
         """Start workflow execution in background thread.
 
@@ -612,7 +613,10 @@ class QontinuiExecutor:
             monitor: Monitor index to use for screen capture and actions (None = default)
             monitor_offset_x: DEPRECATED - X offset (ignored, library looks up internally)
             monitor_offset_y: DEPRECATED - Y offset (ignored, library looks up internally)
+            initial_state_ids: Resolved initial active states from runner (overrides workflow config)
         """
+        # Store initial_state_ids for use in _run_workflow and event emission
+        self._initial_state_ids = initial_state_ids
         self.event_manager.emit_log(
             "info",
             f"[PYTHON_EXECUTOR] start_execution called: workflow_id={workflow_id}, monitor={monitor}",
@@ -725,7 +729,12 @@ class QontinuiExecutor:
         thread.start()
 
         self.event_manager.emit_event(
-            EventType.EXECUTION_STARTED, {"workflow_id": workflow_id, "timestamp": time.time()}
+            EventType.EXECUTION_STARTED,
+            {
+                "workflow_id": workflow_id,
+                "timestamp": time.time(),
+                "initial_state_ids": self._initial_state_ids or [],
+            },
         )
 
         return True
@@ -758,24 +767,24 @@ class QontinuiExecutor:
                     workflow_config=self.config or {},
                 )
 
-            # Initialize state executor with workflow's initial states (if any)
+            # Initialize state executor with initial states
+            # Priority: resolved from runner (self._initial_state_ids) > workflow config
             if self.executor_core and self.executor_core.state_executor:
-                if workflow:
-                    # Get initialStateIds from workflow (handles both dict and object)
-                    initial_state_ids = None
+                # Use runner-resolved initial states if available
+                initial_state_ids = self._initial_state_ids
+                if not initial_state_ids and workflow:
+                    # Fall back to extracting from workflow config
                     if isinstance(workflow, dict):
                         initial_state_ids = workflow.get("initialStateIds")
                     elif hasattr(workflow, "initial_state_ids"):
                         initial_state_ids = workflow.initial_state_ids
 
-                    if initial_state_ids:
-                        self.event_manager.emit_log(
-                            "info",
-                            f"Initializing with workflow initial states: {initial_state_ids}",
-                        )
-                        self.executor_core.state_executor.initialize(initial_state_ids)
-                    else:
-                        self.executor_core.state_executor.initialize()
+                if initial_state_ids:
+                    self.event_manager.emit_log(
+                        "info",
+                        f"Initializing with initial states: {initial_state_ids}",
+                    )
+                    self.executor_core.state_executor.initialize(initial_state_ids)
                 else:
                     self.executor_core.state_executor.initialize()
 
@@ -1040,6 +1049,8 @@ class QontinuiExecutor:
             # Get monitor offset from Rust (if provided)
             monitor_offset_x = params.get("monitor_offset_x")
             monitor_offset_y = params.get("monitor_offset_y")
+            # Get resolved initial_state_ids from Rust (if provided)
+            initial_state_ids = params.get("initial_state_ids")
             self.event_manager.emit_log(
                 "info",
                 f"[PYTHON_EXECUTOR] start command: workflow_id={workflow_id}, params={params}, resolved monitor={monitor}",
@@ -1062,6 +1073,7 @@ class QontinuiExecutor:
                 monitor=monitor,
                 monitor_offset_x=monitor_offset_x,
                 monitor_offset_y=monitor_offset_y,
+                initial_state_ids=initial_state_ids,
             )
             return {"success": success}
 

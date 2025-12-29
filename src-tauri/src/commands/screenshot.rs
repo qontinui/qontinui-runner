@@ -140,16 +140,36 @@ pub async fn get_screenshot_monitors() -> Result<CommandResponse, String> {
 ///
 /// # Arguments
 /// * `monitor` - Monitor index (0-based), None for all monitors combined
+/// * `delay_seconds` - Optional delay in seconds before capturing (0-30).
+///   Useful for waiting for UI animations to settle.
 #[tauri::command]
-pub async fn capture_screenshot(monitor: Option<i32>) -> Result<ScreenshotCaptureResult, String> {
-    info!("Capturing screenshot from monitor: {:?}", monitor);
+pub async fn capture_screenshot(
+    monitor: Option<i32>,
+    delay_seconds: Option<f64>,
+) -> Result<ScreenshotCaptureResult, String> {
+    info!(
+        "Capturing screenshot from monitor: {:?}, delay: {:?}s",
+        monitor, delay_seconds
+    );
 
     let client = reqwest::Client::new();
     let api_url = get_qontinui_api_url();
 
+    // Build URL with query parameters
     let mut url = format!("{}/api/capture/screenshot/current", api_url);
+    let mut params = Vec::new();
     if let Some(mon) = monitor {
-        url = format!("{}?monitor={}", url, mon);
+        params.push(format!("monitor={}", mon));
+    }
+    if let Some(delay) = delay_seconds {
+        if delay > 0.0 {
+            // Clamp delay to valid range (0-30 seconds)
+            let clamped_delay = delay.min(30.0).max(0.0);
+            params.push(format!("delay_seconds={}", clamped_delay));
+        }
+    }
+    if !params.is_empty() {
+        url = format!("{}?{}", url, params.join("&"));
     }
 
     let response = client.get(&url).send().await.map_err(|e| {
@@ -229,8 +249,8 @@ pub async fn capture_and_upload_screenshot(
         config.project_id
     );
 
-    // 1. Capture the screenshot via qontinui-api
-    let capture_result = capture_screenshot(config.monitor).await?;
+    // 1. Capture the screenshot via qontinui-api (no delay for upload workflow)
+    let capture_result = capture_screenshot(config.monitor, None).await?;
 
     if !capture_result.success || capture_result.screenshot_base64.is_none() {
         return Ok(ScreenshotUploadResult {

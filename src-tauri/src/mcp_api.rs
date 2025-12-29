@@ -5059,7 +5059,9 @@ async fn start_session(
                 let mut current_session_id = session_id.clone();
 
                 // Save active workflow config for resume-on-startup
+                let workflow_run_id = uuid::Uuid::new_v4().to_string();
                 let active_config = ActiveWorkflowConfig {
+                    run_id: workflow_run_id.clone(),
                     session_type: session_type_str.clone(),
                     name: session_name.clone(),
                     prompt: original_prompt.clone(),
@@ -5209,14 +5211,15 @@ async fn start_session(
                                 _ => SessionType::OneShot,
                             },
                             prompt: format!(
-                                "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n",
+                                "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n\nIMPORTANT: When updating the checkpoint, include run_id: \"{}\"\n",
                                 original_prompt,
                                 cross_session_count + 1,
                                 phase_field,
                                 current_phase,
                                 checkpoint_path.display(),
                                 phase_field,
-                                completion_value
+                                completion_value,
+                                workflow_run_id
                             ),
                             continuation_prompt: continuation_prompt_template.clone(),
                             total_phases,
@@ -5381,6 +5384,8 @@ fn check_goal_completion_markers(output: &str) -> bool {
 /// This is persisted to `.dev-logs/active-workflow.json` when a multi-session workflow starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveWorkflowConfig {
+    /// Unique identifier for this workflow run (used for resume matching instead of timestamps)
+    run_id: String,
     /// Session type ("prompt_workflow", "ai_builder", "one_shot")
     session_type: String,
     /// Display name for the workflow
@@ -5888,33 +5893,34 @@ async fn resume_active_workflow_on_startup(state: Arc<ApiState>) {
         return;
     }
 
-    // Check if a NEW workflow run was started after the active-workflow.json was created
-    // This happens when a workflow completes and spawns a new session that resets the checkpoint
-    // We detect this by comparing the checkpoint's started_at with the active-workflow's started_at
+    // Check if this is the same workflow run by comparing run_id
+    // This avoids timezone issues - we use a unique identifier instead of timestamps
     if let Ok(checkpoint_contents) = std::fs::read_to_string(&checkpoint_path) {
         if let Ok(checkpoint_json) = serde_json::from_str::<serde_json::Value>(&checkpoint_contents)
         {
-            if let Some(checkpoint_started) =
-                checkpoint_json.get("started_at").and_then(|v| v.as_str())
-            {
-                // Parse both timestamps
-                if let (Ok(checkpoint_time), Ok(config_time)) = (
-                    chrono::DateTime::parse_from_rfc3339(checkpoint_started),
-                    chrono::DateTime::parse_from_rfc3339(&config.started_at),
-                ) {
-                    // If the checkpoint was created AFTER the active-workflow config, this is a NEW run
-                    // Don't auto-resume new runs - only resume interrupted workflows
-                    if checkpoint_time > config_time {
-                        info!(
-                            "Checkpoint started_at ({}) is newer than active-workflow started_at ({}). \
-                             This is a NEW workflow run, not an interrupted one. Not auto-resuming.",
-                            checkpoint_started, config.started_at
-                        );
-                        // Clean up the stale active-workflow.json
-                        delete_active_workflow_config();
-                        return;
-                    }
+            if let Some(checkpoint_run_id) = checkpoint_json.get("run_id").and_then(|v| v.as_str()) {
+                // Log the run_id check to debug file
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                    .open(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log") {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] RUN_ID_CHECK: checkpoint={}, config={}",
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                        checkpoint_run_id, config.run_id);
                 }
+
+                if checkpoint_run_id != config.run_id {
+                    info!(
+                        "Checkpoint run_id ({}) differs from active-workflow run_id ({}). \
+                         This is a NEW workflow run. Not auto-resuming.",
+                        checkpoint_run_id, config.run_id
+                    );
+                    delete_active_workflow_config();
+                    return;
+                }
+                info!("Run IDs match ({}) - same workflow run, proceeding with resume", checkpoint_run_id);
+            } else {
+                // No run_id in checkpoint - legacy checkpoint, allow resume
+                info!("No run_id in checkpoint - legacy format, allowing resume");
             }
         }
     }
@@ -6091,14 +6097,15 @@ async fn resume_active_workflow_on_startup(state: Arc<ApiState>) {
                                     _ => SessionType::OneShot,
                                 },
                                 prompt: format!(
-                                    "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n",
+                                    "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n\nIMPORTANT: When updating the checkpoint, include run_id: \"{}\"\n",
                                     original_prompt,
                                     cross_session_count + 1,
                                     phase_field,
                                     current_phase,
                                     checkpoint_path.display(),
                                     phase_field,
-                                    completion_value
+                                    completion_value,
+                                    config.run_id
                                 ),
                                 continuation_prompt: continuation_prompt_template.clone(),
                                 total_phases,

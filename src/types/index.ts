@@ -116,3 +116,32 @@ export type {
   ParsedFinding,
   CategoryStore,
 } from "./findings";
+
+// Scheduler types (CI/CD scheduling system)
+export type {
+  ScheduleExpression,
+  ScheduleOnce,
+  ScheduleCron,
+  ScheduleInterval,
+  ScheduledTaskType,
+  WorkflowTask,
+  PromptTask,
+  AutoFixTask,
+  ScheduledTaskStatus,
+  TaskExecutionRecord,
+  ScheduledTask,
+  SchedulerSettings,
+  SchedulerStatus,
+  NextTaskInfo,
+  CreateScheduledTaskRequest,
+  UpdateScheduledTaskRequest,
+} from "./scheduler";
+
+export {
+  describeSchedule,
+  describeTaskType,
+  getStatusColor,
+  isTaskRunning,
+  hasCompletedSuccessfully,
+  getTimeUntilNextRun,
+} from "./scheduler";

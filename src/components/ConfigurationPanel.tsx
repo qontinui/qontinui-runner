@@ -14,8 +14,6 @@ import type { Config } from "../contexts/ExecutionContext";
 
 export interface ConfigurationPanelProps {
   config: Config | null;
-  collapsed: boolean;
-  onToggle: (collapsed: boolean) => void;
   onLoadConfiguration: () => void;
   onLoadLastConfiguration: () => void;
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
@@ -23,8 +21,6 @@ export interface ConfigurationPanelProps {
 
 export function ConfigurationPanel({
   config,
-  collapsed,
-  onToggle,
   onLoadConfiguration,
   onLoadLastConfiguration,
   onLog,
@@ -36,8 +32,7 @@ export function ConfigurationPanel({
       <CollapsiblePanel
         title="Configuration"
         icon={<FileText className="w-4 h-4" />}
-        collapsed={collapsed}
-        onToggle={onToggle}
+        collapsible={false}
       >
         <div className="space-y-4">
           {/* Configuration Load Menu */}

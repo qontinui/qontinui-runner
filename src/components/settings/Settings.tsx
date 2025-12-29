@@ -15,6 +15,7 @@ import {
   Download,
   Bot,
   Archive,
+  FlaskConical,
 } from "lucide-react";
 import { AuthConnectionSettings } from "./AuthConnectionSettings";
 import { GeneralSettings } from "./GeneralSettings";
@@ -23,6 +24,7 @@ import { AdvancedSettings } from "./AdvancedSettings";
 import { UpdateSettings } from "./UpdateSettings";
 import { AiSettings } from "./AiSettings";
 import { BackupSettings } from "./BackupSettings";
+import { PlaywrightSettings } from "./PlaywrightSettings";
 import type { Project } from "../../types/auth";
 
 interface SettingsProps {
@@ -34,7 +36,15 @@ interface SettingsProps {
   onLoadProjects: () => Promise<void>;
 }
 
-type SettingsTab = "connection" | "ai" | "general" | "storage" | "backup" | "advanced" | "updates";
+type SettingsTab =
+  | "connection"
+  | "ai"
+  | "playwright"
+  | "general"
+  | "storage"
+  | "backup"
+  | "advanced"
+  | "updates";
 
 const STORAGE_KEY = "qontinui-settings-active-tab";
 
@@ -51,7 +61,16 @@ export function Settings({
     const stored = localStorage.getItem(STORAGE_KEY);
     if (
       stored &&
-      ["connection", "ai", "general", "storage", "backup", "advanced", "updates"].includes(stored)
+      [
+        "connection",
+        "ai",
+        "playwright",
+        "general",
+        "storage",
+        "backup",
+        "advanced",
+        "updates",
+      ].includes(stored)
     ) {
       return stored as SettingsTab;
     }
@@ -66,6 +85,7 @@ export function Settings({
   const tabs = [
     { id: "connection" as const, label: "Connection", icon: Wifi },
     { id: "ai" as const, label: "AI", icon: Bot },
+    { id: "playwright" as const, label: "Playwright", icon: FlaskConical },
     { id: "general" as const, label: "Preferences", icon: SettingsIcon },
     { id: "storage" as const, label: "Storage", icon: HardDrive },
     { id: "backup" as const, label: "Backup", icon: Archive },
@@ -132,6 +152,10 @@ export function Settings({
 
         <Tabs.Content value="ai" className="outline-none">
           <AiSettings onLog={onLog} />
+        </Tabs.Content>
+
+        <Tabs.Content value="playwright" className="outline-none">
+          <PlaywrightSettings onLog={onLog} />
         </Tabs.Content>
 
         <Tabs.Content value="general" className="outline-none">

@@ -39,7 +39,10 @@ pub fn start_python_executor(
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Starting Python executor");
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock = state
+        .python_bridge
+        .lock()
+        .map_err(|e| format!("Python bridge mutex poisoned: {}", e))?;
 
     // Check if already running
     if let Some(ref mut bridge) = *bridge_lock {
@@ -1062,7 +1065,7 @@ pub fn get_input_validation_status(state: State<Arc<AppState>>) -> Result<Comman
 ///
 /// # Returns
 /// Vector of state IDs to use as initial states (may be empty)
-fn resolve_initial_states(
+pub fn resolve_initial_states(
     config: Option<&crate::config::QontinuiConfig>,
     workflow_id: &str,
     override_ids: Option<Vec<String>>,

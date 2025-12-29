@@ -162,6 +162,9 @@ pub struct WorkflowMetadata {
     pub tags: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Initial active states when workflow starts (resolved from config)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_state_ids: Option<Vec<String>>,
 }
 
 /// Execution statistics
@@ -228,6 +231,8 @@ pub struct ExecutionRunCreateRequest {
 /// Response from creating an execution run
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExecutionRunResponse {
+    /// The backend returns 'id' but we expose it as 'run_id' for clarity
+    #[serde(alias = "id")]
     pub run_id: String,
     pub project_id: String,
     pub run_type: RunType,
@@ -238,6 +243,13 @@ pub struct ExecutionRunResponse {
     pub ended_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<f64>,
+    /// Additional fields from backend (ignored during deserialization)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runner_metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_metadata: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// Match location for vision actions
@@ -461,6 +473,18 @@ pub async fn create_execution_run(
         input.project_id
     );
 
+    // Debug: log workflow metadata including initial_state_ids
+    if let Some(ref wm) = input.workflow_metadata {
+        info!(
+            "[CREATE_EXECUTION_RUN] workflow_metadata: workflow_id={}, workflow_name={}, initial_state_ids={:?}",
+            wm.workflow_id,
+            wm.workflow_name,
+            wm.initial_state_ids
+        );
+    } else {
+        info!("[CREATE_EXECUTION_RUN] No workflow_metadata provided");
+    }
+
     let auth_manager = AuthManager::new();
 
     // Check authentication
@@ -484,6 +508,11 @@ pub async fn create_execution_run(
         workflow_metadata: input.workflow_metadata,
         configuration: input.configuration,
     };
+
+    // Debug: log the serialized request JSON
+    if let Ok(json_str) = serde_json::to_string_pretty(&request) {
+        info!("[CREATE_EXECUTION_RUN] Request JSON: {}", json_str);
+    }
 
     // Send to backend
     let client = reqwest::Client::new();

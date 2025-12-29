@@ -133,6 +133,8 @@ export interface WorkflowMetadata {
   total_transitions?: number;
   tags?: string[];
   description?: string;
+  /** Initial active states when workflow starts (resolved from config) */
+  initial_state_ids?: string[];
 }
 
 /** Execution statistics */

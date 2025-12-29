@@ -15,6 +15,7 @@ import {
   type RagCompletionEvent as SharedRagCompletionEvent,
   type EmbeddingResultItem,
 } from "@qontinui/schemas/rag";
+import type { Config } from "./useConfiguration";
 
 // Extend the shared type to include state_image_name for UI display
 interface EmbeddingResultWithName extends EmbeddingResultItem {
@@ -39,13 +40,10 @@ const initialState: RagProcessingState = {
   logs: [],
 };
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ConfigType = any; // Config type from useConfiguration
-
 export function useRagProcessing() {
   const [state, setState] = useState<RagProcessingState>(initialState);
   const [configHasRagImages, setConfigHasRagImages] = useState(false);
-  const [currentConfig, setCurrentConfig] = useState<ConfigType | null>(null);
+  const [currentConfig, setCurrentConfig] = useState<Config | null>(null);
 
   // Add a log entry
   const addLog = useCallback(

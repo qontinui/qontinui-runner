@@ -2,7 +2,8 @@
  * MonitorSubTab.tsx
  *
  * Monitoring view that combines:
- * - Findings panel (categorized findings from AI execution)
+ * - Summary panel (code-focused execution summary)
+ * - Findings panel (all categorized findings from AI execution)
  * - Issues panel (legacy detected issues during AI execution)
  * - Learnings panel (AI pattern analysis from sessions)
  *
@@ -11,9 +12,10 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { AlertTriangle, Lightbulb, FileText } from "lucide-react";
+import { AlertTriangle, Lightbulb, FileText, ClipboardList } from "lucide-react";
 import { IssuesPanel } from "../IssuesPanel";
 import { LearningsSubTab } from "./LearningsSubTab";
+import { ExecutionSummaryTab } from "./ExecutionSummaryTab";
 import { ExecutionReport } from "../findings";
 import type { AiOutputLine } from "../AiOutputTab";
 
@@ -21,10 +23,10 @@ interface MonitorSubTabProps {
   aiOutputLines: AiOutputLine[];
 }
 
-type MonitorTab = "findings" | "issues" | "learnings";
+type MonitorTab = "summary" | "findings" | "issues" | "learnings";
 
 export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
-  const [activeTab, setActiveTab] = useState<MonitorTab>("findings");
+  const [activeTab, setActiveTab] = useState<MonitorTab>("summary");
 
   const tabTriggerClass = `
     flex items-center gap-2 px-4 py-3 text-sm font-medium
@@ -43,9 +45,13 @@ export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
       >
         {/* Tab Navigation */}
         <Tabs.List className="flex border-b border-border bg-muted/30 px-4 flex-shrink-0">
+          <Tabs.Trigger value="summary" className={tabTriggerClass}>
+            <ClipboardList className="w-4 h-4" />
+            Execution Report
+          </Tabs.Trigger>
           <Tabs.Trigger value="findings" className={tabTriggerClass}>
             <FileText className="w-4 h-4" />
-            Findings
+            All Findings
           </Tabs.Trigger>
           <Tabs.Trigger value="issues" className={tabTriggerClass}>
             <AlertTriangle className="w-4 h-4" />
@@ -59,6 +65,13 @@ export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
 
         {/* Tab Content */}
         <div className="flex-1 min-h-0 overflow-hidden">
+          <Tabs.Content
+            value="summary"
+            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
+          >
+            <ExecutionSummaryTab />
+          </Tabs.Content>
+
           <Tabs.Content
             value="findings"
             className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"

@@ -75,9 +75,15 @@ export function setupEventHandlers(
     eventRouter.subscribe(
       "execution_started",
       async (payload: {
-        data?: { workflow_id?: string; workflow_name?: string; run_type?: string };
+        data?: {
+          workflow_id?: string;
+          workflow_name?: string;
+          run_type?: string;
+          initial_state_ids?: string[];
+        };
       }) => {
         console.log("[EVENT_HANDLER] execution_started event received");
+        console.log("[EVENT_HANDLER] Full payload:", JSON.stringify(payload, null, 2));
         setExecutionActive(true);
 
         // Start execution run reporting using the new unified service
@@ -86,6 +92,7 @@ export function setupEventHandlers(
           const workflowId = payload?.data?.workflow_id || `workflow-${Date.now()}`;
           const workflowName = payload?.data?.workflow_name || "Workflow Execution";
           const runTypeStr = payload?.data?.run_type || "live_automation";
+          const initialStateIds = payload?.data?.initial_state_ids || [];
 
           // Map run type string to enum
           let runType: RunType;
@@ -113,14 +120,15 @@ export function setupEventHandlers(
             hostname: "qontinui-runner",
           };
 
-          // Get workflow metadata
+          // Get workflow metadata including initial states
           const workflowMetadata = {
             workflow_id: workflowId,
             workflow_name: workflowName,
+            initial_state_ids: initialStateIds.length > 0 ? initialStateIds : undefined,
           };
 
           console.log(
-            `[EVENT_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}`,
+            `[EVENT_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}, initial states: ${JSON.stringify(initialStateIds)}`,
           );
 
           // Start using new unified service

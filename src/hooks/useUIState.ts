@@ -30,12 +30,6 @@ export interface UseUIStateResult {
   showMonitorDropdown: boolean;
   setShowMonitorDropdown: (show: boolean) => void;
 
-  // Panel collapse states
-  configPanelCollapsed: boolean;
-  setConfigPanelCollapsed: (collapsed: boolean) => void;
-  executionPanelCollapsed: boolean;
-  setExecutionPanelCollapsed: (collapsed: boolean) => void;
-
   // Copy success state
   copySuccess: boolean;
   setCopySuccess: (success: boolean) => void;
@@ -51,8 +45,6 @@ export function useUIState(): UseUIStateResult {
   const [showLogFilter, setShowLogFilter] = useState(false);
   const [showMonitorDropdown, setShowMonitorDropdown] = useState(false);
   const [copySuccess, setCopySuccess] = useState(false);
-  const [configPanelCollapsed, setConfigPanelCollapsed] = useState(false);
-  const [executionPanelCollapsed, setExecutionPanelCollapsed] = useState(false);
 
   const showCopySuccessFeedback = () => {
     setCopySuccess(true);
@@ -68,10 +60,6 @@ export function useUIState(): UseUIStateResult {
     setShowLogFilter,
     showMonitorDropdown,
     setShowMonitorDropdown,
-    configPanelCollapsed,
-    setConfigPanelCollapsed,
-    executionPanelCollapsed,
-    setExecutionPanelCollapsed,
     copySuccess,
     setCopySuccess,
     showCopySuccessFeedback,

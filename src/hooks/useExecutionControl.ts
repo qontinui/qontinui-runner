@@ -13,8 +13,6 @@ import type { CommandResponse } from "../types/displayProfile";
 
 interface UseExecutionControlOptions {
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
-  onConfigurationPanelCollapse?: (collapsed: boolean) => void;
-  onExecutionPanelCollapse?: (collapsed: boolean) => void;
 }
 
 interface UseExecutionControlReturn {
@@ -39,7 +37,7 @@ interface UseExecutionControlReturn {
 export function useExecutionControl(
   options: UseExecutionControlOptions = {},
 ): UseExecutionControlReturn {
-  const { onLog, onConfigurationPanelCollapse, onExecutionPanelCollapse } = options;
+  const { onLog } = options;
 
   const [executionActive, setExecutionActive] = useState(false);
   const [autoMinimize, setAutoMinimize] = useState(true);
@@ -56,7 +54,7 @@ export function useExecutionControl(
       initialStateIds?: string[] | null;
     }) => {
       console.log("[EXECUTION_CONTROL] startExecution called");
-      const { selectedWorkflow, selectedMonitors, workflows, availableMonitors, initialStateIds } =
+      const { selectedWorkflow, selectedMonitors, workflows, initialStateIds } =
         params;
 
       try {
@@ -68,10 +66,6 @@ export function useExecutionControl(
 
         console.log("[EXECUTION_CONTROL] Selected workflow:", selectedWorkflow);
         console.log("[EXECUTION_CONTROL] Selected monitors:", selectedMonitors);
-
-        // Auto-collapse panels when starting
-        if (onConfigurationPanelCollapse) onConfigurationPanelCollapse(true);
-        if (onExecutionPanelCollapse) onExecutionPanelCollapse(true);
 
         // Build invoke params, including initial states if override is active
         const invokeParams: {
@@ -92,23 +86,16 @@ export function useExecutionControl(
         const workflowName = workflows.find((w) => w.id === selectedWorkflow)?.name;
         console.log("Starting execution with workflow:", selectedWorkflow, workflowName);
 
-        // Minimize window if auto-minimize is enabled and only one monitor selected
-        console.log(
-          "[EXECUTION_CONTROL] Auto-minimize check: autoMinimize=",
-          autoMinimize,
-          "selectedMonitors=",
-          selectedMonitors.length,
-          "availableMonitors=",
-          availableMonitors.length,
-        );
-        if (autoMinimize && selectedMonitors.length === 1 && availableMonitors.length === 1) {
+        // Minimize window if auto-minimize is enabled
+        console.log("[EXECUTION_CONTROL] Auto-minimize check: autoMinimize=", autoMinimize);
+        if (autoMinimize) {
           console.log("[EXECUTION_CONTROL] Minimizing window...");
           await windowManager.minimize();
           onLog?.("info", "Window minimized - waiting 1 second before starting automation");
           // Wait 1 second to allow window minimization and user to refocus previous window
           await new Promise((resolve) => setTimeout(resolve, 1000));
         } else {
-          console.log("[EXECUTION_CONTROL] Skipping auto-minimize (multi-monitor or disabled)");
+          console.log("[EXECUTION_CONTROL] Skipping auto-minimize (disabled)");
         }
 
         console.log("Invoking start_execution with params:", invokeParams);
@@ -137,7 +124,7 @@ export function useExecutionControl(
         onLog?.("error", `Failed to start execution: ${error}`);
       }
     },
-    [autoMinimize, onLog, onConfigurationPanelCollapse, onExecutionPanelCollapse],
+    [autoMinimize, onLog],
   );
 
   /**

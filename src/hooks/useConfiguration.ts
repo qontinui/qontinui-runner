@@ -109,6 +109,21 @@ interface UseConfigurationReturn {
 }
 
 /**
+ * Derive projectId from metadata name if not explicitly set.
+ * This matches the Rust project_id() method behavior.
+ */
+function deriveProjectId(metadata?: { name?: string; projectId?: string }): string | undefined {
+  if (metadata?.projectId) {
+    return metadata.projectId;
+  }
+  if (metadata?.name) {
+    // Sanitize name for use as projectId (same as Rust's project_id() method)
+    return metadata.name.replace(/[^a-zA-Z0-9_-]/g, "_").toLowerCase();
+  }
+  return undefined;
+}
+
+/**
  * Hook to manage configuration loading and state
  */
 export function useConfiguration(options: UseConfigurationOptions = {}): UseConfigurationReturn {
@@ -143,7 +158,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
           const nameWithoutExtension = fullFilename.replace(/\.[^/.]+$/, "");
 
           // Extract projectId from metadata for test run reporting
-          const projectId = result.data?.metadata?.projectId;
+          const projectId = deriveProjectId(result.data?.metadata);
           if (projectId) {
             console.log("[CONFIG] Config includes projectId:", projectId);
             // Store in configManager for EventHandlers to access
@@ -392,7 +407,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
       const nameWithoutExtension = fullFilename.replace(/\.[^/.]+$/, "");
 
       // Extract projectId from metadata for test run reporting
-      const projectId = configData.metadata?.projectId;
+      const projectId = deriveProjectId(configData.metadata);
       if (projectId) {
         console.log("[CONFIG] Config includes projectId:", projectId);
         // Store in configManager for EventHandlers to access

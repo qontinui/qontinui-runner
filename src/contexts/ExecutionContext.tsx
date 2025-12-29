@@ -104,19 +104,12 @@ const ExecutionContext: React.Context<ExecutionContextValue | null> =
 interface ExecutionProviderProps {
   children: ReactNode;
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
-  onConfigurationPanelCollapse?: (collapsed: boolean) => void;
-  onExecutionPanelCollapse?: (collapsed: boolean) => void;
 }
 
 /**
  * ExecutionProvider - Composes specialized hooks into a unified context
  */
-export function ExecutionProvider({
-  children,
-  onLog,
-  onConfigurationPanelCollapse,
-  onExecutionPanelCollapse,
-}: ExecutionProviderProps) {
+export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
   // Python Executor Hook
   const { pythonStatus, setPythonStatus, startPython } = usePythonExecutor();
 
@@ -314,8 +307,6 @@ export function ExecutionProvider({
     stopExecution: stopExecutionHook,
   } = useExecutionControl({
     onLog,
-    onConfigurationPanelCollapse,
-    onExecutionPanelCollapse,
   });
 
   /**

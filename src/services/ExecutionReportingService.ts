@@ -108,6 +108,9 @@ class ExecutionReportingServiceImpl {
 
     try {
       console.log(`[ExecutionReporting] Starting ${runType} run: ${runName}`);
+      console.log(
+        `[ExecutionReporting] workflowMetadata: ${JSON.stringify(workflowMetadata, null, 2)}`,
+      );
 
       const input: ExecutionRunCreate = {
         project_id: projectId,
@@ -117,6 +120,8 @@ class ExecutionReportingServiceImpl {
         workflow_metadata: workflowMetadata,
         configuration,
       };
+
+      console.log(`[ExecutionReporting] Full input: ${JSON.stringify(input, null, 2)}`);
 
       const response = await invoke<ExecutionRunResponse>("create_execution_run", { input });
 

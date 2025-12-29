@@ -48,3 +48,5 @@ export { useRagProcessing } from "./useRagProcessing";
 
 export { useInitialStatesOverride } from "./useInitialStatesOverride";
 export type { UseInitialStatesOverrideReturn } from "./useInitialStatesOverride";
+
+export { useScheduler } from "./useScheduler";

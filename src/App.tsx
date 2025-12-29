@@ -20,6 +20,7 @@ import {
   Package,
   Sparkles,
   HelpCircle,
+  Calendar,
 } from "lucide-react";
 
 // Contexts
@@ -61,6 +62,7 @@ import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
 import { AiWorkflowsTab } from "./components/AiWorkflowsTab";
 import { HelpTab } from "./components/HelpTab";
+import { SchedulerTab } from "./components/scheduler";
 
 // Styles
 import "./index.css";
@@ -72,6 +74,7 @@ type MainTab =
   | "extract"
   | "dataset"
   | "ai-workflows"
+  | "scheduler"
   | "settings"
   | "help";
 type LogSubTab = "general" | "image" | "actions" | "rag";
@@ -97,9 +100,17 @@ function AppContent() {
     }
     if (
       stored &&
-      ["run", "logs", "capture", "extract", "dataset", "ai-workflows", "settings", "help"].includes(
-        stored,
-      )
+      [
+        "run",
+        "logs",
+        "capture",
+        "extract",
+        "dataset",
+        "ai-workflows",
+        "scheduler",
+        "settings",
+        "help",
+      ].includes(stored)
     ) {
       return stored as MainTab;
     }
@@ -332,6 +343,7 @@ function AppContent() {
     { id: "extract" as const, label: "Extract", icon: Globe },
     { id: "dataset" as const, label: "Dataset", icon: Package },
     { id: "ai-workflows" as const, label: "AI Workflows", icon: Sparkles },
+    { id: "scheduler" as const, label: "Scheduler", icon: Calendar },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
     { id: "help" as const, label: "Help", icon: HelpCircle },
   ];
@@ -387,8 +399,6 @@ function AppContent() {
                 {/* Configuration Panel */}
                 <ConfigurationPanel
                   config={execution.config}
-                  collapsed={uiState.configPanelCollapsed}
-                  onToggle={uiState.setConfigPanelCollapsed}
                   onLoadConfiguration={execution.loadConfiguration}
                   onLoadLastConfiguration={execution.loadLastConfiguration}
                   onLog={addLog}
@@ -396,8 +406,6 @@ function AppContent() {
 
                 {/* Execution Control Panel */}
                 <ExecutionControlPanel
-                  collapsed={uiState.executionPanelCollapsed}
-                  onToggle={uiState.setExecutionPanelCollapsed}
                   workflows={execution.workflows}
                   selectedWorkflow={execution.selectedWorkflow}
                   configLoaded={execution.configLoaded}
@@ -510,6 +518,14 @@ function AppContent() {
             />
           </Tabs.Content>
 
+          {/* Scheduler Tab */}
+          <Tabs.Content
+            value="scheduler"
+            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
+          >
+            <SchedulerTab />
+          </Tabs.Content>
+
           {/* Settings Tab */}
           <Tabs.Content
             value="settings"
@@ -591,12 +607,6 @@ export default function App() {
           onLog={(level, message) => {
             // Logs are now handled by LogManager through event handlers
             console.log(`[LOG] ${level}: ${message}`);
-          }}
-          onConfigurationPanelCollapse={() => {
-            // Could be handled here if needed for other side effects
-          }}
-          onExecutionPanelCollapse={() => {
-            // Could be handled here if needed for other side effects
           }}
         >
           <AutoContinueProvider>

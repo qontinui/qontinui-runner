@@ -15,6 +15,8 @@ mod mcp_api;
 mod playwright;
 mod prompts;
 mod rag;
+mod scheduler;
+mod scheduler_service;
 mod scriptlets;
 mod secure_storage;
 mod session_manager;
@@ -190,6 +192,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::storage::clear_all_storage,
             commands::storage::get_storage_paths,
             commands::storage::read_image_as_base64,
+            commands::storage::save_findings_data,
+            commands::storage::load_findings_data,
             // Web extraction commands
             commands::extraction::start_web_extraction,
             commands::extraction::stop_web_extraction,
@@ -245,6 +249,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_settings::delete_ai_api_key_command,
             commands::ai_settings::has_ai_api_key,
             commands::ai_settings::test_ai_connection,
+            // Playwright settings commands
+            commands::playwright_settings::get_playwright_settings,
+            commands::playwright_settings::save_playwright_settings,
             // Issues sync commands
             commands::issues::sync_issues_to_backend,
             // Test run reporting commands (deprecated - use execution_reporting)
@@ -358,6 +365,14 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(_) => info!("MCP API server stopped normally"),
                     Err(e) => error!("MCP API server error: {}", e),
                 }
+            });
+
+            // Start scheduler service in background
+            info!("Starting scheduler service");
+            tauri::async_runtime::spawn(async move {
+                // Wait for MCP API server to be ready
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                scheduler_service::start_scheduler_service().await;
             });
 
             info!("Tauri application setup complete");
