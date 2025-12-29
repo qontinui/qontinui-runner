@@ -85,7 +85,9 @@ impl Default for ScheduledTaskType {
 /// Status of a scheduled task execution
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ScheduledTaskStatus {
+    #[default]
     Pending,
     Running,
     Completed,
@@ -95,11 +97,6 @@ pub enum ScheduledTaskStatus {
     Cancelled,
 }
 
-impl Default for ScheduledTaskStatus {
-    fn default() -> Self {
-        ScheduledTaskStatus::Pending
-    }
-}
 
 // ============================================================================
 // Execution Record
@@ -551,7 +548,7 @@ pub fn record_execution(task_id: &str, record: TaskExecutionRecord) -> Result<()
     let history = state
         .history
         .entry(task_id.to_string())
-        .or_insert_with(Vec::new);
+        .or_default();
     history.push(record);
 
     // Trim history if needed

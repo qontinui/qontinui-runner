@@ -5486,6 +5486,23 @@ fn update_active_workflow_cross_session_count(count: u32) {
     }
 }
 
+/// Information about a single active session
+#[derive(Debug, Clone, Serialize)]
+struct ActiveSessionInfo {
+    /// Unique session ID
+    id: String,
+    /// Display name
+    name: String,
+    /// Session type (prompt_workflow, ai_builder, one_shot)
+    session_type: String,
+    /// Current status (running, waiting_for_continuation, etc.)
+    status: String,
+    /// When the session started
+    started_at: String,
+    /// Whether this session uses GUI automation (blocks other GUI sessions)
+    uses_gui: bool,
+}
+
 /// Response for resumable workflow check
 #[derive(Debug, Serialize)]
 struct ResumableWorkflowInfo {
@@ -5509,6 +5526,9 @@ struct ResumableWorkflowInfo {
     cross_session_count: Option<u32>,
     /// Status from checkpoint
     status: Option<String>,
+    /// All currently active sessions (for concurrent session display)
+    #[serde(default)]
+    active_sessions: Vec<ActiveSessionInfo>,
 }
 
 /// Get information about any resumable workflow
@@ -5534,6 +5554,27 @@ async fn get_resumable_workflow(
 
     let is_running = ai_analysis_running || has_running_session;
 
+    // Collect info about all active sessions for the UI
+    let active_sessions: Vec<ActiveSessionInfo> = sessions
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                crate::session_manager::SessionStatus::Running
+                    | crate::session_manager::SessionStatus::Starting
+                    | crate::session_manager::SessionStatus::WaitingForContinuation
+            )
+        })
+        .map(|s| ActiveSessionInfo {
+            id: s.id.clone(),
+            name: s.config.name.clone(),
+            session_type: format!("{:?}", s.config.session_type),
+            status: format!("{:?}", s.status),
+            started_at: s.checkpoint.started_at.clone(),
+            uses_gui: s.config.uses_gui,
+        })
+        .collect();
+
     // Get the global auto-continue setting (included in every response for UI sync)
     let auto_continue_enabled = settings::get_auto_continue_ai_workflow();
 
@@ -5552,6 +5593,7 @@ async fn get_resumable_workflow(
                 started_at: None,
                 cross_session_count: None,
                 status: None,
+                active_sessions: active_sessions.clone(),
             }));
         }
     };
@@ -5570,6 +5612,7 @@ async fn get_resumable_workflow(
             started_at: None,
             cross_session_count: None,
             status: None,
+            active_sessions: active_sessions.clone(),
         }));
     }
 
@@ -5593,6 +5636,7 @@ async fn get_resumable_workflow(
                 started_at: None,
                 cross_session_count: None,
                 status: None,
+                active_sessions: active_sessions.clone(),
             }));
         }
 
@@ -5617,6 +5661,7 @@ async fn get_resumable_workflow(
             started_at: Some(config.started_at),
             cross_session_count: Some(config.cross_session_count),
             status,
+            active_sessions: active_sessions.clone(),
         }));
     }
 
@@ -5632,6 +5677,7 @@ async fn get_resumable_workflow(
         started_at: None,
         cross_session_count: None,
         status: None,
+        active_sessions,
     }))
 }
 

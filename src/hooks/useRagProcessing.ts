@@ -137,7 +137,7 @@ export function useRagProcessing() {
       projectId: string | null,
       projectName: string | null,
       hasRagImages: boolean,
-      config?: ConfigType,
+      config?: Config,
     ) => {
       setState((prev) => ({
         ...prev,

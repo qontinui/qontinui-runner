@@ -58,6 +58,16 @@ interface ResumableWorkflow {
   status: string;
 }
 
+/** Information about a single active session from the backend */
+interface ActiveSessionInfo {
+  id: string;
+  name: string;
+  session_type: string;
+  status: string;
+  started_at: string;
+  uses_gui: boolean;
+}
+
 interface ActiveWorkflowInfo {
   name: string;
   type: "prompt" | "workflow" | "builder";
@@ -103,6 +113,9 @@ export function SessionSubTab({
 
   // Active workflow info (when running)
   const [activeWorkflow, setActiveWorkflow] = useState<ActiveWorkflowInfo | null>(null);
+
+  // All currently active sessions (for concurrent session display)
+  const [activeSessions, setActiveSessions] = useState<ActiveSessionInfo[]>([]);
 
   // Session/workflow filter
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -346,6 +359,13 @@ export function SessionSubTab({
           } else if (!result.data?.is_running) {
             setActiveWorkflow(null);
           }
+
+          // Update all active sessions (for concurrent session display)
+          if (result.data?.active_sessions) {
+            setActiveSessions(result.data.active_sessions);
+          } else {
+            setActiveSessions([]);
+          }
         }
       } catch (error) {
         console.error("Failed to check workflow status:", error);
@@ -542,14 +562,23 @@ export function SessionSubTab({
   // Determine the status for the banner
   const statusInfo = useMemo(() => {
     if (isRunning) {
+      // Show count of active sessions if multiple
+      const sessionCount = activeSessions.length;
+      const subtitle = sessionCount > 1
+        ? `${sessionCount} sessions running concurrently`
+        : activeWorkflow
+          ? `${activeWorkflow.type} - Phase ${activeWorkflow.iteration || "?"} of ${activeWorkflow.maxIterations || "?"}`
+          : "Processing...";
+
       return {
         status: "running" as const,
         color: "emerald",
         icon: Loader2,
-        title: activeWorkflow?.name || "AI Running",
-        subtitle: activeWorkflow
-          ? `${activeWorkflow.type} - Phase ${activeWorkflow.iteration || "?"} of ${activeWorkflow.maxIterations || "?"}`
-          : "Processing...",
+        title: sessionCount > 1
+          ? `${sessionCount} Sessions Running`
+          : activeWorkflow?.name || "AI Running",
+        subtitle,
+        sessionCount,
       };
     }
     if (resumableWorkflow) {
@@ -568,7 +597,7 @@ export function SessionSubTab({
       title: "No Active Session",
       subtitle: "Start a prompt or workflow from the Library",
     };
-  }, [isRunning, resumableWorkflow, activeWorkflow]);
+  }, [isRunning, resumableWorkflow, activeWorkflow, activeSessions]);
 
   // Format time for display
   const formatTime = (timestamp: number) => {
@@ -616,6 +645,25 @@ export function SessionSubTab({
 
           {/* Action Buttons */}
           <div className="flex items-center gap-3">
+            {/* Active Sessions List - Show when multiple sessions */}
+            {activeSessions.length > 1 && (
+              <div className="flex items-center gap-2 text-xs">
+                {activeSessions.map((session) => (
+                  <span
+                    key={session.id}
+                    className={`px-2 py-1 rounded-full ${
+                      session.uses_gui
+                        ? "bg-purple-500/20 text-purple-400"
+                        : "bg-blue-500/20 text-blue-400"
+                    }`}
+                    title={`${session.session_type} - ${session.uses_gui ? "GUI" : "Non-GUI"}`}
+                  >
+                    {session.name.length > 20 ? session.name.substring(0, 17) + "..." : session.name}
+                  </span>
+                ))}
+              </div>
+            )}
+
             {/* Continue Button - Prominent when resumable */}
             {resumableWorkflow && !isRunning && (
               <button

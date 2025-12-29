@@ -164,7 +164,7 @@ pub async fn capture_screenshot(
     if let Some(delay) = delay_seconds {
         if delay > 0.0 {
             // Clamp delay to valid range (0-30 seconds)
-            let clamped_delay = delay.min(30.0).max(0.0);
+            let clamped_delay = delay.clamp(0.0, 30.0);
             params.push(format!("delay_seconds={}", clamped_delay));
         }
     }

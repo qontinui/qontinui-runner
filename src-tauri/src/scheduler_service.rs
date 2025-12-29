@@ -205,10 +205,8 @@ impl SchedulerService {
                         "Scheduler: Triggering auto-fix for failed task '{}'",
                         task_name
                     );
-                    if let Ok((_, auto_fix_session_id)) = self.execute_auto_fix(true, false).await {
-                        if let Some(session_id) = auto_fix_session_id {
-                            record.mark_auto_fix_triggered(session_id);
-                        }
+                    if let Ok((_, Some(session_id))) = self.execute_auto_fix(true, false).await {
+                        record.mark_auto_fix_triggered(session_id);
                     }
                 }
             }
@@ -280,7 +278,7 @@ impl SchedulerService {
         // Load config if specified
         if let Some(path) = config_path {
             let load_response = client
-                .post(&format!("{}/load-config", base_url))
+                .post(format!("{}/load-config", base_url))
                 .json(&serde_json::json!({
                     "path": path
                 }))
@@ -304,7 +302,7 @@ impl SchedulerService {
         }
 
         let run_response = client
-            .post(&format!("{}/run-workflow", base_url))
+            .post(format!("{}/run-workflow", base_url))
             .json(&request_body)
             .send()
             .await
@@ -361,7 +359,7 @@ impl SchedulerService {
         }
 
         let response = client
-            .post(&format!("{}/prompts/{}/run", base_url, prompt_id))
+            .post(format!("{}/prompts/{}/run", base_url, prompt_id))
             .json(&request_body)
             .send()
             .await
@@ -436,7 +434,7 @@ After making fixes, run tests if applicable to verify the fixes work."#
         });
 
         let response = client
-            .post(&format!("{}/trigger-ai-analysis", base_url))
+            .post(format!("{}/trigger-ai-analysis", base_url))
             .json(&request_body)
             .send()
             .await
