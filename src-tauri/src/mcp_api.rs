@@ -5232,13 +5232,11 @@ fn check_supervisor_available() -> bool {
     use std::time::Duration;
 
     // Try to connect to supervisor health endpoint
-    match TcpStream::connect_timeout(
+    TcpStream::connect_timeout(
         &"127.0.0.1:9875".parse().unwrap(),
         Duration::from_millis(500),
-    ) {
-        Ok(_) => true,
-        Err(_) => false,
-    }
+    )
+    .is_ok()
 }
 
 /// Resume ALL running tasks from the database on startup.

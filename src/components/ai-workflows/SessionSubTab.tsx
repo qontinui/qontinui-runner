@@ -283,14 +283,7 @@ export function SessionSubTab({
   // Filter loops by selected session
   const filteredLoops = useMemo(() => {
     if (!currentSession) return loops;
-
-    // Find loops that belong to this session's time range (with some buffer)
-    const BUFFER_MS = 1000; // 1 second buffer
-    return loops.filter(
-      (loop) =>
-        loop.startTime >= currentSession.startTime - BUFFER_MS &&
-        loop.endTime <= currentSession.endTime + BUFFER_MS,
-    );
+    return loops.filter((loop) => loop.sessionId === currentSession.id);
   }, [loops, currentSession]);
 
   // Get filtered AI output lines based on selected session
