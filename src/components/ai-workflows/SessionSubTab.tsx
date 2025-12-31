@@ -263,14 +263,14 @@ export function SessionSubTab({
         startTime: temp.startTime,
         endTime: temp.endTime,
         loopCount: temp.loops.length,
-        // Session is active if runner is running and this session has the most recent activity
-        isActive: isRunning,
+        // Session is active if it's in the active sessions list from the backend
+        isActive: activeSessions.some((s) => s.id === temp.id),
       });
     }
 
     // Sort by most recent first
     return sessions.sort((a, b) => b.endTime - a.endTime);
-  }, [loops, isRunning]);
+  }, [loops, activeSessions]);
 
   // Get the selected session or default to the most recent
   const currentSession = useMemo(() => {
