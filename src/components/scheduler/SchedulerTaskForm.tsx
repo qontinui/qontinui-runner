@@ -110,9 +110,9 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
   const [promptId, setPromptId] = useState(
     task?.task.task_type === "Prompt" ? task.task.prompt_id : "",
   );
-  const [maxIterations, setMaxIterations] = useState<string>(
-    task?.task.task_type === "Prompt" && task.task.max_iterations !== undefined
-      ? String(task.task.max_iterations)
+  const [maxSessions, setMaxSessions] = useState<string>(
+    task?.task.task_type === "Prompt" && task.task.max_sessions !== undefined
+      ? String(task.task.max_sessions)
       : "",
   );
   const [checkFindings, setCheckFindings] = useState(
@@ -207,7 +207,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return {
           task_type: "Prompt",
           prompt_id: promptId,
-          max_iterations: maxIterations ? parseInt(maxIterations, 10) : undefined,
+          max_sessions: maxSessions ? parseInt(maxSessions, 10) : undefined,
         };
       case "autofix":
         return {
@@ -521,16 +521,18 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
               )}
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1">Max Iterations</label>
+              <label className="block text-sm font-medium mb-1">Max Sessions (optional)</label>
               <input
                 type="number"
-                value={maxIterations}
-                onChange={(e) => setMaxIterations(e.target.value)}
-                placeholder="Default: 10"
+                value={maxSessions}
+                onChange={(e) => setMaxSessions(e.target.value)}
+                placeholder="No limit"
                 min={1}
-                max={100}
                 className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
               />
+              <p className="text-xs text-muted-foreground mt-1">
+                Leave empty for no limit (runs until [TASK_COMPLETE])
+              </p>
             </div>
           </div>
         )}

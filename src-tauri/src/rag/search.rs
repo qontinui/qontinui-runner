@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::process::Command;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Errors that can occur during search
 #[derive(Debug, Error)]
@@ -87,6 +87,22 @@ impl SemanticSearch {
             python_path,
             script_path,
         })
+    }
+
+    /// Create a degraded SemanticSearch that will return errors on use
+    ///
+    /// This is used when RAG initialization fails but we want the runner to continue.
+    pub fn new_degraded() -> Self {
+        warn!("Creating degraded SemanticSearch - semantic search features will be disabled");
+        Self {
+            python_path: PathBuf::new(),
+            script_path: PathBuf::new(),
+        }
+    }
+
+    /// Check if this is a degraded instance
+    pub fn is_degraded(&self) -> bool {
+        self.script_path.as_os_str().is_empty()
     }
 
     /// Find the search_rag.py script in the python-bridge directory

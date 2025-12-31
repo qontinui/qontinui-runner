@@ -9,6 +9,7 @@ import { createContext, useContext, useEffect, useState, ReactNode } from "react
 import { Event } from "@tauri-apps/api/event";
 import { eventRouter, logManager } from "../managers";
 import { verificationService } from "../services";
+import { executeAiTask } from "../hooks";
 
 interface EventManagerContextValue {
   isConnected: boolean;
@@ -70,22 +71,18 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
 
           console.log("[EVENT_MGR] Sending verification prompt to AI...");
 
-          // Send to AI analysis endpoint
-          const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              prompt: fullPrompt,
+          // Use async task execution with polling
+          try {
+            const task = await executeAiTask({
+              name: "ai-analysis",
+              content: fullPrompt,
+              max_sessions: 1,
               display_prompt: "Verification: Checking if the fix worked...",
               timeout_seconds: 600,
-            }),
-          });
-
-          const result = await response.json();
-          if (result.success) {
-            console.log("[EVENT_MGR] Verification prompt sent successfully");
-          } else {
-            console.error("[EVENT_MGR] Verification prompt failed:", result.error);
+            });
+            console.log("[EVENT_MGR] Verification prompt completed, task status:", task.status);
+          } catch (error) {
+            console.error("[EVENT_MGR] Verification prompt failed:", error);
           }
         } else if (pending) {
           console.log("[EVENT_MGR] Pending verification exists but status is:", pending.status);
@@ -121,7 +118,15 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
         // Listen for AI output events
         const unlistenAiOutputFn = await listen(
           "ai-output",
-          (event: Event<{ line?: string; source?: string; actionId?: string }>) => {
+          (
+            event: Event<{
+              line?: string;
+              source?: string;
+              actionId?: string;
+              sessionId?: string;
+              sessionName?: string;
+            }>,
+          ) => {
             if (!isMounted) {
               return;
             }
@@ -131,7 +136,13 @@ export function EventManagerProvider({ children }: EventManagerProviderProps) {
 
             // Route AI output to LogManager
             if (data.line !== undefined && data.source !== undefined) {
-              logManager.addAiOutputLog(data.line, data.source, data.actionId);
+              logManager.addAiOutputLog(
+                data.line,
+                data.source,
+                data.actionId,
+                data.sessionId,
+                data.sessionName,
+              );
             }
           },
         );

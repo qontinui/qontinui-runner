@@ -130,21 +130,25 @@ pub fn stop_heartbeat() {
 }
 
 /// Log when a thread starts
+#[allow(dead_code)]
 pub fn log_thread_start(thread_name: &str) {
     log_lifecycle("THREAD", &format!("Started: {}", thread_name));
 }
 
 /// Log when a thread ends
+#[allow(dead_code)]
 pub fn log_thread_end(thread_name: &str, reason: &str) {
     log_lifecycle("THREAD", &format!("Ended: {} - {}", thread_name, reason));
 }
 
 /// Log an AI session event
+#[allow(dead_code)]
 pub fn log_ai_session(event: &str, details: &str) {
     log_lifecycle("AI_SESSION", &format!("{}: {}", event, details));
 }
 
 /// Log a Claude CLI event
+#[allow(dead_code)]
 pub fn log_claude_cli(event: &str, details: &str) {
     log_lifecycle("CLAUDE_CLI", &format!("{}: {}", event, details));
 }

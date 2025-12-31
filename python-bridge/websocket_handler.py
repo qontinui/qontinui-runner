@@ -607,7 +607,19 @@ class WebSocketHandler:
             message: Log message
             log_data: Optional structured log data
         """
+        import sys
+
+        print(
+            f"[WS_SEND_LOG] Called: level={level}, msg={message[:50] if message else 'None'}..., ws_enabled={self.ws_enabled}, ws_client={self.ws_client is not None}, ws_loop={self.ws_loop is not None}",
+            file=sys.stderr,
+            flush=True,
+        )
         if not self.ws_enabled or not self.ws_client or not self.ws_loop:
+            print(
+                f"[WS_SEND_LOG] Early return: ws_enabled={self.ws_enabled}, ws_client={self.ws_client is not None}, ws_loop={self.ws_loop is not None}",
+                file=sys.stderr,
+                flush=True,
+            )
             return
 
         # Check event loop health

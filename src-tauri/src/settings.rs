@@ -163,8 +163,8 @@ pub struct Settings {
     last_monitor_indices: Option<Vec<i32>>,
     #[serde(default = "default_auto_load_last_config")]
     pub auto_load_last_config: bool,
-    /// Auto-continue AI Developer workflows after runner restart (default: false)
-    #[serde(default)]
+    /// Auto-continue AI Developer workflows after runner restart (default: true)
+    #[serde(default = "default_auto_continue_ai_workflow")]
     pub auto_continue_ai_workflow: bool,
     /// Auto-fix issues on session failure (triggers auto-fix when workflow/prompt fails)
     #[serde(default)]
@@ -178,6 +178,10 @@ pub struct Settings {
 }
 
 fn default_auto_load_last_config() -> bool {
+    true
+}
+
+fn default_auto_continue_ai_workflow() -> bool {
     true
 }
 

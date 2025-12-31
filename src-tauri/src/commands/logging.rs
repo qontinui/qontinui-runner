@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 use super::CommandResponse;
 
 /// AI output entry structure (matches TypeScript AiOutputEntry)
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AiOutputEntry {
     pub id: String,
     pub timestamp: i64,
@@ -20,6 +20,21 @@ pub struct AiOutputEntry {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_id: Option<String>,
+    /// Session/workflow ID for grouping loops by workflow
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Human-readable session/workflow name (the task title)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// Path to screenshot file (relative to .dev-logs/)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
+    /// Screenshot width in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_width: Option<i32>,
+    /// Screenshot height in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_height: Option<i32>,
 }
 
 /// Get the path to the AI output log file
@@ -193,5 +208,222 @@ pub fn load_ai_output_log() -> CommandResponse {
         data: Some(serde_json::json!({
             "entries": entries
         })),
+    }
+}
+
+/// Get the base directory for dev logs
+fn get_dev_logs_dir() -> PathBuf {
+    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+}
+
+/// List all session checkpoint files
+/// Returns session IDs that have checkpoint files
+#[tauri::command]
+pub fn list_session_checkpoints() -> CommandResponse {
+    let dev_logs_dir = get_dev_logs_dir();
+
+    if !dev_logs_dir.exists() {
+        return CommandResponse {
+            success: true,
+            message: Some("No dev-logs directory".to_string()),
+            data: Some(serde_json::json!({
+                "session_ids": []
+            })),
+        };
+    }
+
+    let mut session_ids: Vec<String> = Vec::new();
+
+    match fs::read_dir(&dev_logs_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                let name = file_name.to_string_lossy();
+                // Match pattern: session-{id}-checkpoint.json
+                if name.starts_with("session-") && name.ends_with("-checkpoint.json") {
+                    // Extract session ID
+                    let id = name
+                        .strip_prefix("session-")
+                        .and_then(|s| s.strip_suffix("-checkpoint.json"))
+                        .map(|s| s.to_string());
+                    if let Some(id) = id {
+                        session_ids.push(id);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to read dev-logs directory: {}", e);
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to read directory: {}", e)),
+                data: None,
+            };
+        }
+    }
+
+    info!("Found {} session checkpoint files", session_ids.len());
+
+    CommandResponse {
+        success: true,
+        message: Some(format!("Found {} checkpoints", session_ids.len())),
+        data: Some(serde_json::json!({
+            "session_ids": session_ids
+        })),
+    }
+}
+
+/// Delete session checkpoint files by session IDs
+/// Also cleans up session manager state file if all sessions are deleted
+#[tauri::command]
+pub fn delete_session_checkpoints(session_ids: Vec<String>) -> CommandResponse {
+    let dev_logs_dir = get_dev_logs_dir();
+
+    if !dev_logs_dir.exists() {
+        return CommandResponse {
+            success: true,
+            message: Some("No dev-logs directory".to_string()),
+            data: Some(serde_json::json!({
+                "deleted_count": 0
+            })),
+        };
+    }
+
+    let mut deleted_count = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    for session_id in &session_ids {
+        let checkpoint_path = dev_logs_dir.join(format!("session-{}-checkpoint.json", session_id));
+
+        if checkpoint_path.exists() {
+            match fs::remove_file(&checkpoint_path) {
+                Ok(_) => {
+                    info!("Deleted checkpoint for session {}", session_id);
+                    deleted_count += 1;
+                }
+                Err(e) => {
+                    let err_msg = format!("Failed to delete checkpoint {}: {}", session_id, e);
+                    error!("{}", err_msg);
+                    errors.push(err_msg);
+                }
+            }
+        }
+    }
+
+    // Also clean up session-manager-state.json if it exists and all sessions deleted
+    let state_file_path = dev_logs_dir.join("session-manager-state.json");
+    if state_file_path.exists() {
+        // Try to remove it - it will be recreated if there are active sessions
+        if let Err(e) = fs::remove_file(&state_file_path) {
+            warn!("Failed to remove session manager state file: {}", e);
+        } else {
+            info!("Cleaned up session manager state file");
+        }
+    }
+
+    if errors.is_empty() {
+        CommandResponse {
+            success: true,
+            message: Some(format!("Deleted {} checkpoint(s)", deleted_count)),
+            data: Some(serde_json::json!({
+                "deleted_count": deleted_count
+            })),
+        }
+    } else {
+        CommandResponse {
+            success: false,
+            message: Some(format!(
+                "Deleted {} checkpoint(s) with {} error(s): {}",
+                deleted_count,
+                errors.len(),
+                errors.join("; ")
+            )),
+            data: Some(serde_json::json!({
+                "deleted_count": deleted_count,
+                "errors": errors
+            })),
+        }
+    }
+}
+
+/// Delete all session checkpoints and AI output log
+/// Complete cleanup of run history
+#[tauri::command]
+pub fn clear_all_run_history() -> CommandResponse {
+    let dev_logs_dir = get_dev_logs_dir();
+
+    let mut deleted_checkpoints = 0;
+    let mut errors: Vec<String> = Vec::new();
+
+    // Delete all session checkpoint files
+    if dev_logs_dir.exists() {
+        match fs::read_dir(&dev_logs_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let name = file_name.to_string_lossy();
+                    // Match checkpoint files and state files
+                    if (name.starts_with("session-") && name.ends_with("-checkpoint.json"))
+                        || name == "session-manager-state.json"
+                    {
+                        if let Err(e) = fs::remove_file(entry.path()) {
+                            errors.push(format!("Failed to delete {}: {}", name, e));
+                        } else {
+                            deleted_checkpoints += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                errors.push(format!("Failed to read dev-logs directory: {}", e));
+            }
+        }
+    }
+
+    // Clear AI output log
+    let log_path = get_ai_output_log_path();
+    let log_deleted = if log_path.exists() {
+        match fs::remove_file(&log_path) {
+            Ok(_) => true,
+            Err(e) => {
+                errors.push(format!("Failed to delete AI output log: {}", e));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    info!(
+        "Cleared run history: {} checkpoints, log deleted: {}",
+        deleted_checkpoints, log_deleted
+    );
+
+    if errors.is_empty() {
+        CommandResponse {
+            success: true,
+            message: Some(format!(
+                "Cleared {} checkpoint(s) and AI output log",
+                deleted_checkpoints
+            )),
+            data: Some(serde_json::json!({
+                "deleted_checkpoints": deleted_checkpoints,
+                "log_deleted": log_deleted
+            })),
+        }
+    } else {
+        CommandResponse {
+            success: false,
+            message: Some(format!(
+                "Partial cleanup: {} checkpoint(s), errors: {}",
+                deleted_checkpoints,
+                errors.join("; ")
+            )),
+            data: Some(serde_json::json!({
+                "deleted_checkpoints": deleted_checkpoints,
+                "log_deleted": log_deleted,
+                "errors": errors
+            })),
+        }
     }
 }

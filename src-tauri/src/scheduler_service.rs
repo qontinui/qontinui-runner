@@ -181,8 +181,8 @@ impl SchedulerService {
             }
             ScheduledTaskType::Prompt {
                 prompt_id,
-                max_iterations,
-            } => self.execute_prompt(prompt_id, *max_iterations).await,
+                max_sessions,
+            } => self.execute_prompt(prompt_id, *max_sessions).await,
             ScheduledTaskType::AutoFix {
                 check_findings,
                 force_run,
@@ -339,11 +339,11 @@ impl SchedulerService {
     async fn execute_prompt(
         &self,
         prompt_id: &str,
-        max_iterations: Option<u32>,
+        max_sessions: Option<u32>,
     ) -> Result<(bool, Option<String>), String> {
         info!(
-            "Executing prompt '{}' (max_iterations: {:?})",
-            prompt_id, max_iterations
+            "Executing prompt '{}' (max_sessions: {:?})",
+            prompt_id, max_sessions
         );
 
         // Run prompt via HTTP API
@@ -354,8 +354,8 @@ impl SchedulerService {
             "prompt_id": prompt_id
         });
 
-        if let Some(max_iter) = max_iterations {
-            request_body["max_iterations"] = serde_json::json!(max_iter);
+        if let Some(max_sess) = max_sessions {
+            request_body["max_sessions"] = serde_json::json!(max_sess);
         }
 
         let response = client
@@ -428,13 +428,15 @@ After making fixes, run tests if applicable to verify the fixes work."#
         };
 
         let request_body = serde_json::json!({
-            "prompt": prompt,
+            "name": "scheduled-auto-fix",
+            "content": prompt,
             "display_prompt": "Scheduler: Auto-Fix",
-            "timeout_seconds": 600
+            "timeout_seconds": 600,
+            "max_sessions": 1
         });
 
         let response = client
-            .post(format!("{}/trigger-ai-analysis", base_url))
+            .post(format!("{}/prompts/run", base_url))
             .json(&request_body)
             .send()
             .await

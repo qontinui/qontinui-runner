@@ -42,7 +42,13 @@ export interface UseLogManagerResult {
   addImageLog: (entry: ImageRecognitionEntry) => void;
 
   /** Add an AI output log entry */
-  addAiOutputLog: (line: string, source: string, actionId?: string) => void;
+  addAiOutputLog: (
+    line: string,
+    source: string,
+    actionId?: string,
+    sessionId?: string,
+    sessionName?: string,
+  ) => void;
 
   /** Get filtered logs by level */
   getFilteredLogs: (level: string) => LogEntry[];
@@ -113,9 +119,12 @@ export function useLogManager(): UseLogManagerResult {
     logManager.addImageLog(entry);
   }, []);
 
-  const addAiOutputLog = useCallback((line: string, source: string, actionId?: string) => {
-    logManager.addAiOutputLog(line, source, actionId);
-  }, []);
+  const addAiOutputLog = useCallback(
+    (line: string, source: string, actionId?: string, sessionId?: string, sessionName?: string) => {
+      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName);
+    },
+    [],
+  );
 
   const getFilteredLogs = useCallback((level: string) => {
     return logManager.getFilteredLogs(level);

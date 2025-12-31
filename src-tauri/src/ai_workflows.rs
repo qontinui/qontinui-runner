@@ -6,7 +6,6 @@
 //! AI Workflows are distinct from Prompts - they contain:
 //! - Execution steps (GUI automation, Playwright tests, prompts, state visits)
 //! - Screenshot capture settings
-//! - Session configuration (persistent vs standard mode)
 //! - Goal description
 
 use serde::{Deserialize, Serialize};
@@ -67,9 +66,6 @@ pub struct AiWorkflow {
     /// Maximum iterations for the AI loop
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
-    /// Whether to use persistent session mode (spawns independent Claude sessions)
-    #[serde(default)]
-    pub persistent_session: bool,
     /// Whether to capture input for coordinate validation
     #[serde(default)]
     pub capture_input_validation: bool,
@@ -98,7 +94,6 @@ impl AiWorkflow {
         steps: Vec<ExecutionStep>,
         goal: String,
         max_iterations: u32,
-        persistent_session: bool,
         capture_input_validation: bool,
         category: String,
         tags: Vec<String>,
@@ -111,7 +106,6 @@ impl AiWorkflow {
             steps,
             goal,
             max_iterations,
-            persistent_session,
             capture_input_validation,
             category,
             tags,
@@ -190,7 +184,6 @@ pub fn create_workflow(
     steps: Vec<ExecutionStep>,
     goal: String,
     max_iterations: u32,
-    persistent_session: bool,
     capture_input_validation: bool,
     category: String,
     tags: Vec<String>,
@@ -203,7 +196,6 @@ pub fn create_workflow(
         steps,
         goal,
         max_iterations,
-        persistent_session,
         capture_input_validation,
         category,
         tags,
@@ -231,7 +223,6 @@ pub fn update_workflow(
     steps: Option<Vec<ExecutionStep>>,
     goal: Option<String>,
     max_iterations: Option<u32>,
-    persistent_session: Option<bool>,
     capture_input_validation: Option<bool>,
     category: Option<String>,
     tags: Option<Vec<String>>,
@@ -257,9 +248,6 @@ pub fn update_workflow(
     }
     if let Some(m) = max_iterations {
         workflow.max_iterations = m;
-    }
-    if let Some(p) = persistent_session {
-        workflow.persistent_session = p;
     }
     if let Some(c) = capture_input_validation {
         workflow.capture_input_validation = c;

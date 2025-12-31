@@ -355,7 +355,11 @@ pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, St
 #[tauri::command]
 pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     debug!("[GET_EXECUTOR_STATUS] Called - checking bridge lock...");
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    // Use unwrap_or_else to recover from poisoned mutex (after a panic in another thread)
+    let mut bridge_lock = state.python_bridge.lock().unwrap_or_else(|poisoned| {
+        warn!("[GET_EXECUTOR_STATUS] python_bridge mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
     debug!("[GET_EXECUTOR_STATUS] Got bridge lock");
 
     if let Some(ref mut bridge) = *bridge_lock {
@@ -375,7 +379,14 @@ pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandRespons
             debug!("[GET_EXECUTOR_STATUS] get_status() completed");
         }
 
-        let config_loaded = state.current_config.lock().unwrap().is_some();
+        let config_loaded = state
+            .current_config
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!("[GET_EXECUTOR_STATUS] current_config mutex was poisoned, recovering");
+                poisoned.into_inner()
+            })
+            .is_some();
         debug!("[GET_EXECUTOR_STATUS] config_loaded = {}", config_loaded);
         info!(
             "[GET_EXECUTOR_STATUS] Returning: python_running={}, state={}, config_loaded={}",

@@ -1,8 +1,11 @@
 -- SQLite Schema for qontinui-runner
--- Version: 1
+-- Version: 3
 --
--- This schema provides persistent storage for sessions, checkpoints,
--- settings, prompts, workflows, and scheduler state.
+-- This schema provides persistent storage for task runs, settings,
+-- prompts, and scheduler state.
+--
+-- Key concept: Every task runs until completion (marked by [TASK_COMPLETE]).
+-- Sessions are internal implementation details - users only see task runs.
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -137,7 +140,7 @@ CREATE TABLE IF NOT EXISTS prompts (
 
 CREATE INDEX IF NOT EXISTS idx_prompts_category ON prompts(category);
 
--- AI Workflows
+-- AI Workflows (legacy - kept for backward compatibility)
 CREATE TABLE IF NOT EXISTS ai_workflows (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -146,6 +149,27 @@ CREATE TABLE IF NOT EXISTS ai_workflows (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Task Runs (simplified task execution model)
+-- Every task runs until [TASK_COMPLETE] marker is found in output.
+-- Sessions are internal - output is accumulated in output_log with session markers.
+CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY,
+    task_name TEXT NOT NULL,
+    prompt TEXT NOT NULL,  -- The task description/instructions
+    status TEXT NOT NULL DEFAULT 'running',  -- 'running', 'complete', 'failed', 'stopped'
+    sessions_count INTEGER NOT NULL DEFAULT 0,  -- How many Claude sessions spawned
+    max_sessions INTEGER,  -- NULL = unlimited, otherwise max before giving up
+    output_log TEXT DEFAULT '',  -- Accumulated output with [SESSION_START:N] markers
+    error_message TEXT,
+    auto_continue BOOLEAN NOT NULL DEFAULT 1,  -- Per-run auto-continue setting (1=true, 0=false)
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
 
 -- Execution history (automation runs)
 CREATE TABLE IF NOT EXISTS executions (
@@ -166,4 +190,4 @@ CREATE INDEX IF NOT EXISTS idx_executions_workflow_name ON executions(workflow_n
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (1, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (3, datetime('now'));

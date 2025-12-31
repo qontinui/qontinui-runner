@@ -171,18 +171,37 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
           setConfig(loadedConfig);
 
-          // Filter workflows to only show those in the "main" category
+          // Filter workflows to show those in automation-enabled categories
           const allWorkflows = result.data?.workflows || [];
+          const categories = (result.data as Record<string, unknown>)?.categories;
 
-          // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
-          const mainWorkflows = allWorkflows.filter(
+          // Get list of automation-enabled category names
+          let automationEnabledCategories: string[] = ["main"]; // Default if no categories defined
+
+          if (Array.isArray(categories)) {
+            // Check if categories are objects (new format) or strings (legacy format)
+            if (categories.length > 0 && typeof categories[0] === "object") {
+              // New format: Category[] with automationEnabled flag
+              automationEnabledCategories = (
+                categories as Array<{ name: string; automationEnabled: boolean }>
+              )
+                .filter((c) => c.automationEnabled)
+                .map((c) => c.name.toLowerCase());
+            } else {
+              // Legacy format: string[] - default to only "main" enabled
+              automationEnabledCategories = ["main"];
+            }
+          }
+
+          // Show only workflows in automation-enabled categories and exclude internal workflows
+          const automationWorkflows = allWorkflows.filter(
             (w) =>
               w.category &&
-              w.category.toLowerCase() === "main" &&
+              automationEnabledCategories.includes(w.category.toLowerCase()) &&
               (!w.visibility || w.visibility !== "internal"),
           );
 
-          setWorkflows(mainWorkflows);
+          setWorkflows(automationWorkflows);
 
           setConfigLoaded(true);
           onLog?.("success", `Configuration loaded: ${configPath}`);
@@ -213,26 +232,25 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
             onLog?.("debug", `Workflow categories: ${categoryInfo}`);
             onLog?.("debug", `Workflow visibility: ${visibilityInfo}`);
+            onLog?.(
+              "debug",
+              `Automation-enabled categories: ${automationEnabledCategories.join(", ")}`,
+            );
 
-            const internalCount = allWorkflows.length - mainWorkflows.length;
-            if (internalCount > 0) {
+            const hiddenCount = allWorkflows.length - automationWorkflows.length;
+            if (hiddenCount > 0) {
               onLog?.(
                 "info",
-                `Loaded ${mainWorkflows.length} public workflows (${internalCount} internal workflows hidden)`,
-              );
-            } else if (mainWorkflows.length !== allWorkflows.length) {
-              onLog?.(
-                "info",
-                `Loaded ${mainWorkflows.length} workflows from "Main" category (${allWorkflows.length} total)`,
+                `Loaded ${automationWorkflows.length} workflows for automation (${hiddenCount} hidden)`,
               );
             } else {
-              onLog?.("info", `Loaded ${mainWorkflows.length} workflows`);
+              onLog?.("info", `Loaded ${automationWorkflows.length} workflows`);
             }
 
-            if (mainWorkflows.length === 0) {
+            if (automationWorkflows.length === 0) {
               onLog?.(
                 "warning",
-                "No workflows found with 'Main' category. Check your config categories.",
+                "No workflows found in automation-enabled categories. Enable automation for categories in qontinui-web.",
               );
             }
           }
@@ -319,8 +337,8 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
   /**
    * Manually load last configuration (for button)
    */
-  const loadLastConfiguration = useCallback(async () => {
-    console.log("[CONFIG] loadLastConfiguration called");
+  const loadLastConfiguration = useCallback(async (): Promise<void> => {
+    onLog?.("info", "Loading last configuration...");
     try {
       const result = await invoke<
         CommandResponse<{
@@ -332,16 +350,20 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
       if (result.success && result.data?.path) {
         const workflowId = result.data?.workflow_id || null;
         const monitorIndex = result.data?.monitor_index ?? null;
-        onLog?.("info", `Loading last config: ${result.data.path}`);
+        console.log("[CONFIG] Found last config:", result.data.path, "workflow:", workflowId);
         await loadConfigFromPath(result.data.path, workflowId);
-        // Notify caller of last workflow and monitor selection
+        console.log("[CONFIG] loadConfigFromPath completed");
         onLastConfigLoaded?.(workflowId, monitorIndex);
+        onLog?.("success", "Configuration loaded successfully");
       } else {
-        onLog?.("warning", "No previous configuration found");
+        const message = result.message || "No previous configuration found";
+        console.log("[CONFIG] No previous configuration found:", message);
+        onLog?.("warning", message);
       }
     } catch (error) {
       console.error("[CONFIG] Error loading last config:", error);
-      onLog?.("error", `Failed to load last configuration: ${error}`);
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      onLog?.("error", `Failed to load last configuration: ${errorMsg}`);
     }
   }, [onLog, loadConfigFromPath, onLastConfigLoaded]);
 
@@ -413,22 +435,42 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
 
       setConfig(loadedConfig);
 
-      // Filter workflows to only show those in the "main" category
+      // Filter workflows to show those in automation-enabled categories
       const allWorkflows = configData.workflows || [];
+      const categories = (configData as Record<string, unknown>)?.categories;
 
       console.log("[CONFIG] MCP API - All workflows loaded:", allWorkflows.length);
 
-      // Show only workflows with "Main" category (case-insensitive) and exclude internal workflows
-      const mainWorkflows = allWorkflows.filter(
+      // Get list of automation-enabled category names
+      let automationEnabledCategories: string[] = ["main"]; // Default if no categories defined
+
+      if (Array.isArray(categories)) {
+        // Check if categories are objects (new format) or strings (legacy format)
+        if (categories.length > 0 && typeof categories[0] === "object") {
+          // New format: Category[] with automationEnabled flag
+          automationEnabledCategories = (
+            categories as Array<{ name: string; automationEnabled: boolean }>
+          )
+            .filter((c) => c.automationEnabled)
+            .map((c) => c.name.toLowerCase());
+        } else {
+          // Legacy format: string[] - default to only "main" enabled
+          automationEnabledCategories = ["main"];
+        }
+      }
+
+      // Show only workflows in automation-enabled categories and exclude internal workflows
+      const automationWorkflows = allWorkflows.filter(
         (w) =>
           w.category &&
-          w.category.toLowerCase() === "main" &&
+          automationEnabledCategories.includes(w.category.toLowerCase()) &&
           (!w.visibility || w.visibility !== "internal"),
       );
 
-      console.log("[CONFIG] MCP API - Filtered main workflows:", mainWorkflows.length);
+      console.log("[CONFIG] MCP API - Filtered automation workflows:", automationWorkflows.length);
+      console.log("[CONFIG] MCP API - Automation-enabled categories:", automationEnabledCategories);
 
-      setWorkflows(mainWorkflows);
+      setWorkflows(automationWorkflows);
       setConfigLoaded(true);
       onLog?.("success", `Configuration loaded via MCP API: ${configPath}`);
     };

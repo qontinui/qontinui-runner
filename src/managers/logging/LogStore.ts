@@ -48,6 +48,10 @@ export interface AiOutputEntry {
   line: string;
   source: string;
   actionId?: string;
+  /** Session/workflow ID for grouping loops by workflow */
+  sessionId?: string;
+  /** Human-readable session/workflow name (the task title) */
+  sessionName?: string;
 }
 
 type StoreListener = () => void;

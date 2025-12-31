@@ -52,7 +52,6 @@
 //! The fix: Always calculate the virtual desktop origin (min X, min Y across all monitors)
 //! regardless of which monitor is specified, because FIND always captures the full virtual desktop.
 
-use crate::debug_lifecycle;
 use crate::safe_eprintln;
 use axum::{
     extract::{
@@ -66,7 +65,6 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -83,6 +81,7 @@ use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
 use crate::session_manager::SessionManager;
 use crate::settings;
+use crate::task_monitor::TaskMonitor;
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
 use tauri::{Emitter, Manager};
@@ -114,6 +113,59 @@ fn spawn_python_with_console(
     }
 
     cmd.spawn()
+}
+
+/// Extract text from Claude CLI stream-json output line
+fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
+    // Parse the JSON line
+    let parsed: serde_json::Value = serde_json::from_str(json_line).ok()?;
+
+    // Handle different message types
+    match parsed.get("type")?.as_str()? {
+        "assistant" => {
+            // Extract text from assistant message content
+            let content = parsed.get("message")?.get("content")?.as_array()?;
+            let mut text_parts = Vec::new();
+            for item in content {
+                if item.get("type")?.as_str()? == "text" {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        text_parts.push(text.to_string());
+                    }
+                }
+            }
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join(""))
+            }
+        }
+        "content_block_delta" => {
+            // Handle streaming deltas (partial text)
+            parsed
+                .get("delta")?
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string())
+        }
+        "result" => {
+            // Final result - extract text from content blocks
+            let content = parsed.get("result")?.get("content")?.as_array()?;
+            let mut text_parts = Vec::new();
+            for item in content {
+                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                        text_parts.push(text.to_string());
+                    }
+                }
+            }
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join(""))
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Run a Claude CLI session inline (as a child process) and wait for completion.
@@ -377,12 +429,10 @@ pub struct ApiState {
     pub app_state: Arc<AppState>,
     pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
-    /// Tracks whether an AI analysis is currently in progress
-    pub ai_analysis_running: AtomicBool,
-    /// Flag to request stopping the current AI analysis
-    pub ai_analysis_stop_requested: AtomicBool,
     /// Unified session manager for all AI sessions (Prompt Library + AI Builder)
     pub session_manager: Arc<SessionManager>,
+    /// Task monitor for watching Claude session output
+    pub task_monitor: Arc<TaskMonitor>,
 }
 
 /// Response for API endpoints
@@ -446,11 +496,80 @@ fn default_timeout() -> u64 {
     300 // 5 minutes default timeout
 }
 
+fn default_action_timeout() -> u64 {
+    30 // 30 seconds default timeout for single action
+}
+
+/// Execute single action request
+#[derive(Debug, Deserialize)]
+pub struct ExecuteActionRequest {
+    /// Action type: "click", "double_click", "right_click", etc.
+    pub action_type: String,
+    /// Image ID from the loaded config
+    pub image_id: String,
+    /// Optional monitor index
+    #[serde(default)]
+    pub monitor_index: Option<i32>,
+    /// Timeout in seconds for action completion (default: 30)
+    #[serde(default = "default_action_timeout")]
+    pub timeout_seconds: u64,
+}
+
+/// Execute action result
+#[derive(Debug, Serialize)]
+pub struct ExecuteActionResult {
+    pub success: bool,
+    pub action_type: String,
+    pub image_id: String,
+    pub error: Option<String>,
+}
+
 /// Execution result
 #[derive(Debug, Serialize)]
 pub struct ExecutionResult {
     pub success: bool,
     pub workflow_name: String,
+    pub error: Option<String>,
+}
+
+/// Capture screenshot request for AI Automation Builder
+#[derive(Debug, Deserialize)]
+pub struct CaptureScreenshotRequest {
+    /// Monitor index (0-based), None for all monitors combined
+    #[serde(default)]
+    pub monitor: Option<i32>,
+    /// Delay in seconds before capture (0-30)
+    #[serde(default)]
+    pub delay_seconds: Option<f64>,
+    /// Task/run identifier for filename (e.g., "ai-task-abc123")
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Step index for filename ordering
+    #[serde(default)]
+    pub step_index: Option<u32>,
+}
+
+/// Capture screenshot response
+#[derive(Debug, Serialize)]
+pub struct CaptureScreenshotResponse {
+    pub success: bool,
+    /// Relative path to screenshot in .dev-logs/screenshots/
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
+    /// Absolute path to screenshot
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub absolute_path: Option<String>,
+    /// Screenshot width in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    /// Screenshot height in pixels
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
+    /// Monitor that was captured (None = all monitors)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<i32>,
+    /// Error message if capture failed
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -788,8 +907,82 @@ async fn get_status(
         executor_state: result.1,
         config_loaded: result.2,
         config_path: result.3,
-        ai_analysis_running: state.ai_analysis_running.load(Ordering::SeqCst),
+        ai_analysis_running: has_running_ai_tasks(),
     })))
+}
+
+/// Internal helper to load a configuration file synchronously.
+/// Used by resume_active_workflow_on_startup to load config before resuming.
+///
+/// This performs the core config loading logic:
+/// 1. Loads and validates the configuration file
+/// 2. Stores it in the app state (current_config)
+/// 3. Sends debug settings to the Python executor
+/// 4. Sends the configuration to the Python executor
+fn load_config_internal(
+    app_state: &Arc<crate::AppState>,
+    config_path: &str,
+) -> Result<String, String> {
+    // Step 1: Load and validate the configuration file
+    let config = ConfigLoader::load_from_file(config_path).map_err(|e| {
+        error!(
+            "load_config_internal: Failed to load configuration from {}: {}",
+            config_path, e
+        );
+        format!("Failed to load configuration: {}", e)
+    })?;
+
+    let summary = config.summary();
+    info!("load_config_internal: Configuration validated: {}", summary);
+
+    // Step 2: Store the configuration in app state
+    *app_state.current_config.lock().unwrap_or_else(|poisoned| {
+        warn!("load_config_internal: current_config mutex was poisoned, recovering");
+        poisoned.into_inner()
+    }) = Some(config);
+    info!("load_config_internal: Configuration stored in app state");
+
+    // Step 3: Send debug settings and configuration to Python bridge
+    let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+        warn!("load_config_internal: python_bridge mutex was poisoned, recovering");
+        poisoned.into_inner()
+    });
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            warn!("load_config_internal: Python executor not running, config stored but not sent to executor");
+            return Ok(summary);
+        }
+
+        // Send debug settings first (before config execution)
+        let debug_settings = settings::get_debug_settings();
+        if let Err(e) = bridge.set_debug_settings(
+            debug_settings.enable_image_debug,
+            debug_settings.top_matches_count,
+        ) {
+            warn!("load_config_internal: Failed to send debug settings: {}", e);
+        } else {
+            info!(
+                "load_config_internal: Debug settings sent: enable={}, top_matches={}",
+                debug_settings.enable_image_debug, debug_settings.top_matches_count
+            );
+        }
+
+        // Send configuration to Python
+        bridge.load_configuration(config_path).map_err(|e| {
+            error!(
+                "load_config_internal: Failed to send configuration to Python: {}",
+                e
+            );
+            format!("Failed to send configuration to Python: {}", e)
+        })?;
+
+        info!("load_config_internal: Configuration sent to Python executor");
+    } else {
+        warn!("load_config_internal: Python executor not initialized, config stored but not sent");
+    }
+
+    Ok(summary)
 }
 
 /// Load a configuration file
@@ -1294,6 +1487,376 @@ async fn stop_execution(
     }
 }
 
+/// Execute a single action (e.g., click on an image)
+///
+/// This endpoint allows executing individual GUI actions without running a full workflow.
+/// It sends the action to the Python executor and waits for completion.
+async fn execute_action(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ExecuteActionRequest>,
+) -> Result<Json<ApiResponse<ExecuteActionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Executing action: {} on image {} (timeout: {}s)",
+        request.action_type, request.image_id, request.timeout_seconds
+    );
+
+    let app_state = state.app_state.clone();
+    let action_type = request.action_type.clone();
+    let image_id = request.image_id.clone();
+    let monitor_index = request.monitor_index;
+    let timeout_duration = Duration::from_secs(request.timeout_seconds);
+
+    // Build action parameters
+    let action_params = serde_json::json!({
+        "action_type": action_type.to_uppercase(),
+        "image_id": image_id,
+        "monitor_index": monitor_index.unwrap_or(0)
+    });
+
+    // Send command and wait for response using spawn_blocking
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            // Use send_command_and_wait to get synchronous response
+            match bridge.send_command_and_wait(
+                "execute_action",
+                Some(action_params),
+                timeout_duration,
+            ) {
+                Ok(response) => {
+                    if response.success {
+                        Ok(ExecuteActionResult {
+                            success: true,
+                            action_type: request.action_type,
+                            image_id: request.image_id,
+                            error: None,
+                        })
+                    } else {
+                        Ok(ExecuteActionResult {
+                            success: false,
+                            action_type: request.action_type,
+                            image_id: request.image_id,
+                            error: response.error,
+                        })
+                    }
+                }
+                Err(e) => Err(format!("Failed to execute action: {}", e)),
+            }
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(action_result) => {
+            if action_result.success {
+                info!(
+                    "MCP API: Action {} on image {} succeeded",
+                    action_result.action_type, action_result.image_id
+                );
+            } else {
+                warn!(
+                    "MCP API: Action {} on image {} failed: {:?}",
+                    action_result.action_type, action_result.image_id, action_result.error
+                );
+            }
+            Ok(Json(ApiResponse::success(action_result)))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to execute action: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Screenshot Capture API Endpoint
+// ============================================================================
+
+/// Capture a screenshot and save it to .dev-logs/screenshots/ with task-identifiable naming.
+/// Also logs the screenshot to ai-output.jsonl for AI analysis.
+///
+/// This endpoint is used by both:
+/// 1. Dedicated screenshot actions in the AI Automation Builder
+/// 2. Post-step screenshots (takeScreenshot toggle on other step types)
+async fn capture_screenshot_step(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<CaptureScreenshotRequest>,
+) -> Result<Json<ApiResponse<CaptureScreenshotResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use base64::Engine;
+    use std::fs;
+    use std::io::Write;
+
+    info!(
+        "MCP API: Capturing screenshot (monitor: {:?}, delay: {:?}s, task: {:?}, step: {:?})",
+        request.monitor, request.delay_seconds, request.task_id, request.step_index
+    );
+
+    // Apply delay if specified (clamped to 0-30 seconds)
+    if let Some(delay) = request.delay_seconds {
+        if delay > 0.0 {
+            let clamped_delay = delay.clamp(0.0, 30.0);
+            info!(
+                "MCP API: Waiting {}s before screenshot capture",
+                clamped_delay
+            );
+            tokio::time::sleep(tokio::time::Duration::from_secs_f64(clamped_delay)).await;
+        }
+    }
+
+    // Get qontinui-api URL
+    let api_url = std::env::var("QONTINUI_API_URL_VISION")
+        .unwrap_or_else(|_| "http://localhost:8001".to_string());
+
+    // Build URL with query parameters
+    let mut url = format!("{}/api/capture/screenshot/current", api_url);
+    let mut params = Vec::new();
+    if let Some(mon) = request.monitor {
+        params.push(format!("monitor={}", mon));
+    }
+    // Always request high quality for AI analysis
+    params.push("quality=95".to_string());
+    if !params.is_empty() {
+        url = format!("{}?{}", url, params.join("&"));
+    }
+
+    // Capture screenshot via qontinui-api
+    let client = reqwest::Client::new();
+    let response = match client.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!("MCP API: Failed to capture screenshot: {}", e);
+            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+                success: false,
+                screenshot_path: None,
+                absolute_path: None,
+                width: None,
+                height: None,
+                monitor: request.monitor,
+                error: Some(format!("Network error: {}", e)),
+            })));
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+        error!(
+            "MCP API: Screenshot capture failed with status {}: {}",
+            status, error_text
+        );
+        return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+            success: false,
+            screenshot_path: None,
+            absolute_path: None,
+            width: None,
+            height: None,
+            monitor: request.monitor,
+            error: Some(format!("Capture failed: {}", error_text)),
+        })));
+    }
+
+    // Parse response
+    let capture_response: serde_json::Value = match response.json().await {
+        Ok(j) => j,
+        Err(e) => {
+            error!("MCP API: Failed to parse screenshot response: {}", e);
+            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+                success: false,
+                screenshot_path: None,
+                absolute_path: None,
+                width: None,
+                height: None,
+                monitor: request.monitor,
+                error: Some(format!("Invalid API response: {}", e)),
+            })));
+        }
+    };
+
+    let screenshot_base64 = match capture_response
+        .get("screenshot_base64")
+        .and_then(|s| s.as_str())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            error!("MCP API: No screenshot_base64 in response");
+            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+                success: false,
+                screenshot_path: None,
+                absolute_path: None,
+                width: None,
+                height: None,
+                monitor: request.monitor,
+                error: Some("No screenshot data in response".to_string()),
+            })));
+        }
+    };
+
+    let width = capture_response
+        .get("width")
+        .and_then(|w| w.as_i64())
+        .map(|w| w as i32);
+    let height = capture_response
+        .get("height")
+        .and_then(|h| h.as_i64())
+        .map(|h| h as i32);
+
+    // Decode base64 to bytes
+    let image_bytes = match base64::engine::general_purpose::STANDARD.decode(&screenshot_base64) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("MCP API: Failed to decode screenshot base64: {}", e);
+            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+                success: false,
+                screenshot_path: None,
+                absolute_path: None,
+                width: None,
+                height: None,
+                monitor: request.monitor,
+                error: Some(format!("Failed to decode screenshot: {}", e)),
+            })));
+        }
+    };
+
+    // Generate filename with task/run identification
+    let timestamp = chrono::Utc::now().timestamp_millis();
+    let task_id = request.task_id.as_deref().unwrap_or("manual");
+    let step_part = request
+        .step_index
+        .map(|i| format!("step{:02}", i))
+        .unwrap_or_else(|| "step00".to_string());
+    let monitor_part = request
+        .monitor
+        .map(|m| format!("m{}", m))
+        .unwrap_or_else(|| "all".to_string());
+    let filename = format!(
+        "screenshot-{}-{}-{}-{}.png",
+        task_id, step_part, timestamp, monitor_part
+    );
+
+    // Save to .dev-logs/screenshots/
+    let dev_logs_path =
+        std::path::PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
+    let screenshots_dir = dev_logs_path.join("screenshots");
+    if let Err(e) = fs::create_dir_all(&screenshots_dir) {
+        error!("MCP API: Failed to create screenshots directory: {}", e);
+        return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+            success: false,
+            screenshot_path: None,
+            absolute_path: None,
+            width: None,
+            height: None,
+            monitor: request.monitor,
+            error: Some(format!("Failed to create directory: {}", e)),
+        })));
+    }
+
+    let screenshot_path = screenshots_dir.join(&filename);
+    let mut file = match fs::File::create(&screenshot_path) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("MCP API: Failed to create screenshot file: {}", e);
+            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+                success: false,
+                screenshot_path: None,
+                absolute_path: None,
+                width: None,
+                height: None,
+                monitor: request.monitor,
+                error: Some(format!("Failed to create file: {}", e)),
+            })));
+        }
+    };
+
+    if let Err(e) = file.write_all(&image_bytes) {
+        error!("MCP API: Failed to write screenshot file: {}", e);
+        return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+            success: false,
+            screenshot_path: None,
+            absolute_path: None,
+            width: None,
+            height: None,
+            monitor: request.monitor,
+            error: Some(format!("Failed to write file: {}", e)),
+        })));
+    }
+
+    let relative_path = format!("screenshots/{}", filename);
+    let absolute_path_str = screenshot_path.to_string_lossy().to_string();
+
+    info!(
+        "MCP API: Screenshot saved: {} ({}x{})",
+        relative_path,
+        width.unwrap_or(0),
+        height.unwrap_or(0)
+    );
+
+    // Log to ai-output.jsonl
+    let ai_output_entry = crate::commands::logging::AiOutputEntry {
+        id: format!("ss-{}-{}", timestamp, rand::random::<u32>()),
+        timestamp,
+        line: format!(
+            "[SCREENSHOT] {} ({}x{})",
+            filename,
+            width.unwrap_or(0),
+            height.unwrap_or(0)
+        ),
+        source: "runner".to_string(),
+        action_id: Some(format!("screenshot-{}", step_part)),
+        session_id: None,
+        session_name: None,
+        screenshot_path: Some(relative_path.clone()),
+        screenshot_width: width,
+        screenshot_height: height,
+    };
+
+    // Append to ai-output.jsonl
+    let _ = crate::commands::logging::append_ai_output_log(ai_output_entry);
+
+    // Also emit to frontend for real-time display
+    emit_ai_output(
+        &state.app_handle,
+        &format!(
+            "[SCREENSHOT] Captured: {} ({}x{})",
+            filename,
+            width.unwrap_or(0),
+            height.unwrap_or(0)
+        ),
+        "runner",
+        Some(&format!("screenshot-{}", step_part)),
+        None,
+    );
+
+    Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+        success: true,
+        screenshot_path: Some(relative_path),
+        absolute_path: Some(absolute_path_str),
+        width,
+        height,
+        monitor: request.monitor,
+        error: None,
+    })))
+}
+
 // ============================================================================
 // Web Extraction API Endpoints
 // ============================================================================
@@ -1501,6 +2064,65 @@ async fn get_extraction_status(
         Err(e) => {
             error!("MCP API: Failed to get extraction status: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get extraction screenshot
+///
+/// Serves a screenshot image from a web extraction session.
+/// The screenshot is stored locally on the runner machine.
+async fn get_extraction_screenshot(
+    axum::extract::Path((extraction_id, screenshot_id)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    use axum::body::Body;
+    use axum::http::header;
+
+    // Build path to screenshot file
+    let home_dir = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let screenshot_path = home_dir
+        .join(".qontinui")
+        .join("extraction")
+        .join(&extraction_id)
+        .join("screenshots")
+        .join(format!("{}.png", screenshot_id));
+
+    info!(
+        "MCP API: Serving extraction screenshot: {} from {:?}",
+        screenshot_id, screenshot_path
+    );
+
+    // Check if file exists and read it
+    match tokio::fs::read(&screenshot_path).await {
+        Ok(data) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/png"),
+                (header::CACHE_CONTROL, "public, max-age=3600"),
+            ],
+            Body::from(data),
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            warn!("Screenshot not found: {:?}", screenshot_path);
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(r#"{"error": "Screenshot not found"}"#),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("Failed to read screenshot file: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from(format!(
+                    r#"{{"error": "Failed to read screenshot: {}"}}"#,
+                    e
+                )),
+            )
+                .into_response()
         }
     }
 }
@@ -1978,53 +2600,6 @@ async fn segment_screenshot(
         }
     }
 }
-// ============================================================================
-// AI Analysis Trigger Endpoint
-// ============================================================================
-
-use crate::commands::ai_settings;
-use crate::settings::{AiProvider, CliExecutionMode};
-
-/// Request to trigger AI analysis
-#[derive(Debug, Deserialize)]
-pub struct TriggerAiAnalysisRequest {
-    /// The prompt to send to Claude (may include conversation history)
-    pub prompt: String,
-    /// The prompt to display in the UI (just the new message, no history)
-    /// If not provided, falls back to the full prompt
-    #[serde(default)]
-    pub display_prompt: Option<String>,
-    /// Timeout in seconds (optional - uses settings if not provided)
-    #[serde(default)]
-    pub timeout_seconds: Option<u64>,
-    /// Image paths to include (screenshots, etc.) - for multimodal analysis
-    #[serde(default)]
-    pub image_paths: Vec<String>,
-    /// Video paths to extract frames from
-    #[serde(default)]
-    pub video_paths: Vec<String>,
-    /// Path to Playwright trace ZIP file (will extract timeline and screenshots)
-    #[serde(default)]
-    pub trace_path: Option<String>,
-    /// Maximum number of frames to extract from each video (default: 3)
-    #[serde(default)]
-    pub max_video_frames: Option<u32>,
-    /// Maximum number of screenshots to extract from trace (default: 5)
-    #[serde(default)]
-    pub max_trace_screenshots: Option<u32>,
-}
-
-/// Response from AI analysis trigger
-#[derive(Debug, Serialize)]
-pub struct TriggerAiAnalysisResponse {
-    pub success: bool,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// The full output from Claude (if captured synchronously)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<String>,
-}
 
 /// Request to restart the runner (for AI self-healing workflow)
 #[derive(Debug, Deserialize)]
@@ -2051,14 +2626,9 @@ pub struct CreatePromptRequest {
     pub category: String,
     #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default = "default_prompt_max_iterations")]
-    pub max_iterations: u32,
+    /// Maximum number of sessions (null = unlimited)
     #[serde(default)]
-    pub workflow: Option<prompts::WorkflowConfig>,
-}
-
-fn default_prompt_max_iterations() -> u32 {
-    10
+    pub max_sessions: Option<u32>,
 }
 
 /// Request to update an existing prompt
@@ -2074,27 +2644,60 @@ pub struct UpdatePromptRequest {
     pub category: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Maximum number of sessions (null = unlimited)
     #[serde(default)]
-    pub max_iterations: Option<u32>,
-    #[serde(default)]
-    pub workflow: Option<prompts::WorkflowConfig>,
+    pub max_sessions: Option<Option<u32>>,
 }
 
 /// Request to run a prompt
 #[derive(Debug, Deserialize)]
 pub struct RunPromptRequest {
+    // Mode 1: Lookup prompt from database
+    /// Prompt ID to lookup from database (mutually exclusive with name+content)
+    #[serde(default)]
+    pub prompt_id: Option<String>,
+
+    // Mode 2: Ad-hoc prompt (used by qontinui-web)
+    /// Task name for display (required for ad-hoc mode)
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Prompt content (required for ad-hoc mode)
+    #[serde(default)]
+    pub content: Option<String>,
+
+    // Common options
     /// Optional session_id override (auto-generated if not provided)
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Optional max_iterations override (uses prompt's setting if not provided)
+    /// Optional max_sessions override (uses prompt's setting if not provided)
     #[serde(default)]
-    pub max_iterations: Option<u32>,
+    pub max_sessions: Option<u32>,
+
+    // Image analysis options (for multimodal analysis)
+    /// Image paths to include (screenshots, etc.) - for multimodal analysis
+    #[serde(default)]
+    pub image_paths: Option<Vec<String>>,
+    /// Video paths to extract frames from
+    #[serde(default)]
+    pub video_paths: Option<Vec<String>>,
+    /// Path to Playwright trace ZIP file (will extract timeline and screenshots)
+    #[serde(default)]
+    pub trace_path: Option<String>,
+    /// Maximum number of frames to extract from each video (default: 3)
+    #[serde(default)]
+    pub max_video_frames: Option<usize>,
+    /// Maximum number of screenshots to extract from trace (default: 5)
+    #[serde(default)]
+    pub max_trace_screenshots: Option<usize>,
 }
 
 /// Response from running a prompt
 #[derive(Debug, Serialize)]
 pub struct RunPromptResponse {
+    pub task_run_id: String,
     pub session_id: String,
+    /// Backward compatibility alias for task_run_id
+    pub action_id: String,
     pub state_file: String,
     pub log_file: String,
     pub pid: Option<u32>,
@@ -2134,8 +2737,6 @@ pub struct CreateAiWorkflowRequest {
     #[serde(default = "default_ai_workflow_max_iterations")]
     pub max_iterations: u32,
     #[serde(default)]
-    pub persistent_session: bool,
-    #[serde(default)]
     pub capture_input_validation: bool,
     #[serde(default)]
     pub category: String,
@@ -2160,8 +2761,6 @@ pub struct UpdateAiWorkflowRequest {
     pub goal: Option<String>,
     #[serde(default)]
     pub max_iterations: Option<u32>,
-    #[serde(default)]
-    pub persistent_session: Option<bool>,
     #[serde(default)]
     pub capture_input_validation: Option<bool>,
     #[serde(default)]
@@ -2367,235 +2966,74 @@ fn write_ai_debug_log(message: &str) {
     }
 }
 
-/// Trigger AI analysis via configured provider
-///
-/// This endpoint triggers AI analysis using the configured provider:
-/// - Claude CLI: Invokes Claude Code CLI (subscription-based)
-/// - Claude API: Direct HTTP calls to Anthropic API (per-token billing)
-///
-/// Returns an error if an AI analysis is already in progress.
-async fn trigger_ai_analysis(
-    State(state): State<Arc<ApiState>>,
-    Json(request): Json<TriggerAiAnalysisRequest>,
-) -> Result<Json<ApiResponse<TriggerAiAnalysisResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    write_ai_debug_log("=== AI ANALYSIS TRIGGERED ===");
-
-    // Check if AI analysis is already running (atomic compare-and-swap)
-    // This prevents multiple concurrent AI analyses
-    if state
-        .ai_analysis_running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        write_ai_debug_log("AI analysis already in progress - rejecting request");
-        warn!("MCP API: AI analysis already in progress, rejecting new request");
-        return Err((
-            StatusCode::CONFLICT,
-            Json(api_error("AI analysis already in progress. Wait for it to complete before triggering another.")),
-        ));
-    }
-
-    // Ensure we clear the flag when we're done (even on error)
-    // Clone the Arc so the guard owns it and can access it when dropped
-    let state_for_guard = state.clone();
-    let _guard = scopeguard::guard((), move |_| {
-        state_for_guard
-            .ai_analysis_running
-            .store(false, Ordering::SeqCst);
-        write_ai_debug_log("AI analysis flag cleared");
-    });
-
-    // Clear any previous stop request
-    state
-        .ai_analysis_stop_requested
-        .store(false, Ordering::SeqCst);
-
-    // Generate a unique action_id for this AI analysis session
-    // This groups all output from this analysis into one "AI Loop"
-    let action_id = format!(
-        "ai-loop-{}-{}",
-        chrono::Utc::now().timestamp_millis(),
-        rand::random::<u32>()
-    );
-    write_ai_debug_log(&format!("Generated action_id: {}", action_id));
-
-    // Load AI settings
-    let ai_settings = settings::get_ai_settings();
-    let timeout_secs = request
-        .timeout_seconds
-        .unwrap_or(ai_settings.claude_cli.timeout_seconds);
-
-    write_ai_debug_log(&format!(
-        "Provider: {:?}, Timeout: {}s, Prompt length: {} chars",
-        ai_settings.provider,
-        timeout_secs,
-        request.prompt.len()
-    ));
-
-    info!(
-        "MCP API: Triggering AI analysis (provider: {:?}, timeout: {}s, prompt length: {}, action_id: {})",
-        ai_settings.provider,
-        timeout_secs,
-        request.prompt.len(),
-        action_id
-    );
-
-    // Emit prompt to frontend (use display_prompt if provided, else full prompt)
-    // display_prompt shows only the new message, not the conversation history
-    let ui_prompt = request.display_prompt.as_deref().unwrap_or(&request.prompt);
-    write_ai_debug_log("Emitting prompt to frontend...");
-    emit_ai_output(
-        &state.app_handle,
-        ui_prompt,
-        "prompt",
-        Some(&action_id),
-        None,
-    );
-    write_ai_debug_log("Prompt emitted successfully");
-
-    // Emit hourglass indicator to show AI is processing
-    emit_ai_output(
-        &state.app_handle,
-        "⏳ AI is processing...",
-        "status",
-        Some(&action_id),
-        None,
-    );
-
-    let app_handle = state.app_handle.clone();
-    write_ai_debug_log("Starting AI execution...");
-
-    // Collect all images for analysis (screenshots, trace screenshots, video frames)
-    let max_video_frames = request.max_video_frames.unwrap_or(3);
-    let max_trace_screenshots = request.max_trace_screenshots.unwrap_or(5);
-
-    let (all_images, trace_timeline) = collect_images_for_analysis(
-        &request.image_paths,
-        &request.video_paths,
-        request.trace_path.as_deref(),
-        max_video_frames,
-        max_trace_screenshots,
-    );
-
-    write_ai_debug_log(&format!(
-        "Collected {} images for analysis (trace timeline: {})",
-        all_images.len(),
-        trace_timeline.is_some()
-    ));
-
-    // Build enhanced prompt with trace timeline if available
-    let enhanced_prompt = if let Some(timeline) = &trace_timeline {
-        format!("{}\n\n{}", request.prompt, timeline)
-    } else {
-        request.prompt.clone()
-    };
-
-    let result = match ai_settings.provider {
-        AiProvider::ClaudeCli => {
-            write_ai_debug_log("Using Claude CLI provider");
-            execute_claude_cli(
-                &ai_settings.claude_cli,
-                &enhanced_prompt,
-                &all_images,
-                &app_handle,
-                &action_id,
-            )
-            .await
-        }
-        AiProvider::ClaudeApi => {
-            write_ai_debug_log("Using Claude API provider");
-            execute_claude_api(
-                &ai_settings.claude_api,
-                &enhanced_prompt,
-                &all_images,
-                &app_handle,
-                &action_id,
-            )
-            .await
-        }
-    };
-
-    match result {
-        Ok(response) => {
-            if response.success {
-                write_ai_debug_log("AI analysis completed successfully");
-                info!("MCP API: AI analysis completed successfully");
-                // Emit completion indicator
-                emit_ai_output(
-                    &state.app_handle,
-                    "✅ AI analysis complete",
-                    "status",
-                    Some(&action_id),
-                    None,
-                );
-            } else {
-                write_ai_debug_log(&format!("AI analysis failed: {:?}", response.error));
-                warn!("MCP API: AI analysis failed: {:?}", response.error);
-                // Emit failure indicator
-                emit_ai_output(
-                    &state.app_handle,
-                    "❌ AI analysis failed",
-                    "status",
-                    Some(&action_id),
-                    None,
-                );
-            }
-            write_ai_debug_log("=== AI ANALYSIS COMPLETE ===\n");
-            Ok(Json(ApiResponse::success(response)))
-        }
-        Err(e) => {
-            write_ai_debug_log(&format!("AI analysis error: {}", e));
-            error!("MCP API: Failed to trigger AI analysis: {}", e);
-            // Emit error to frontend
-            emit_ai_output(
-                &state.app_handle,
-                "❌ AI analysis error",
-                "status",
-                Some(&action_id),
-                None,
-            );
-            emit_ai_output(
-                &state.app_handle,
-                &format!("Error: {}", e),
-                "claude",
-                Some(&action_id),
-                None,
-            );
-            write_ai_debug_log("=== AI ANALYSIS FAILED ===\n");
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
-}
-
 /// Stop the currently running AI analysis
 ///
-/// This endpoint sets a flag that the AI analysis process checks
-/// to gracefully terminate the Claude CLI subprocess.
+/// This endpoint stops all running tasks by:
+/// 1. Getting running task runs from the database
+/// 2. Stopping monitoring for each task
+/// 3. Marking tasks as stopped in the database
 async fn stop_ai_analysis(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("MCP API: Stop AI analysis requested");
 
-    // Check if AI analysis is running
-    if !state.ai_analysis_running.load(Ordering::SeqCst) {
+    // Get running tasks from the database
+    let db = match CheckpointDb::new() {
+        Ok(db) => db,
+        Err(e) => {
+            error!("MCP API: Failed to open database: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to open database: {}", e))),
+            ));
+        }
+    };
+
+    let running_tasks = match db.get_running_task_runs() {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            error!("MCP API: Failed to get running tasks: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get running tasks: {}", e))),
+            ));
+        }
+    };
+
+    if running_tasks.is_empty() {
+        info!("MCP API: No running tasks to stop");
         return Ok(Json(ApiResponse::success(())));
     }
 
-    // Set the stop flag
-    state
-        .ai_analysis_stop_requested
-        .store(true, Ordering::SeqCst);
+    // Stop each running task
+    let task_monitor = &state.task_monitor;
+    for task in &running_tasks {
+        // Stop monitoring
+        if let Err(e) = task_monitor.stop_monitoring(&task.id).await {
+            warn!("MCP API: Failed to stop monitoring for {}: {}", task.id, e);
+        }
+
+        // Mark as stopped in database
+        if let Err(e) = db.stop_task_run(&task.id) {
+            warn!("MCP API: Failed to stop task run {}: {}", task.id, e);
+        }
+
+        info!("MCP API: Stopped task run: {}", task.id);
+    }
 
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
-        "🛑 Stop requested - AI analysis will terminate",
+        &format!("Stopped {} running task(s)", running_tasks.len()),
         "status",
         None,
         None,
     );
 
-    info!("MCP API: AI analysis stop flag set");
+    info!(
+        "MCP API: Stopped {} AI analysis task(s)",
+        running_tasks.len()
+    );
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -2641,6 +3079,24 @@ async fn restart_runner(
 // ============================================================================
 // AI Developer (Persistent Mode) HTTP Endpoints
 // ============================================================================
+
+/// Check if any AI analysis tasks are currently running.
+/// Uses the database to check for running task runs instead of an atomic flag.
+fn has_running_ai_tasks() -> bool {
+    match CheckpointDb::new() {
+        Ok(db) => match db.get_running_task_runs() {
+            Ok(tasks) => !tasks.is_empty(),
+            Err(e) => {
+                warn!("Failed to check running tasks: {}", e);
+                false
+            }
+        },
+        Err(e) => {
+            warn!("Failed to open database to check running tasks: {}", e);
+            false
+        }
+    }
+}
 
 /// Helper function to get workspace paths (reused from config.rs pattern)
 fn get_workspace_paths_internal(
@@ -2716,8 +3172,7 @@ async fn create_prompt(
         request.content,
         request.category,
         request.tags,
-        request.max_iterations,
-        request.workflow,
+        request.max_sessions,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -2737,8 +3192,7 @@ async fn update_prompt(
         request.content,
         request.category,
         request.tags,
-        request.max_iterations,
-        request.workflow,
+        request.max_sessions,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
@@ -2757,18 +3211,45 @@ async fn delete_prompt(
 }
 
 /// Run a prompt by spawning a Claude session
+///
+/// Supports two modes:
+/// 1. Lookup prompt from database: provide `prompt_id`
+/// 2. Ad-hoc prompt: provide `name` and `content`
+///
+/// Optional image analysis: provide `image_paths`, `video_paths`, or `trace_path`
+/// to enhance the prompt with visual analysis data.
 async fn run_prompt(
-    State(_state): State<Arc<ApiState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
+    State(state): State<Arc<ApiState>>,
     Json(request): Json<RunPromptRequest>,
 ) -> Result<Json<ApiResponse<RunPromptResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Get the prompt
-    let prompt = prompts::get_prompt(&id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("Prompt not found: {}", id))),
-        )
-    })?;
+    // Determine mode and get prompt name + content
+    let (prompt_name, prompt_content, prompt_id, prompt_max_sessions) =
+        if let Some(ref id) = request.prompt_id {
+            // Mode 1: Lookup from database
+            let prompt = prompts::get_prompt(id).ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!("Prompt not found: {}", id))),
+                )
+            })?;
+            (
+                prompt.name.clone(),
+                prompt.content.clone(),
+                Some(prompt.id.clone()),
+                prompt.max_sessions,
+            )
+        } else if let (Some(name), Some(content)) = (&request.name, &request.content) {
+            // Mode 2: Ad-hoc prompt
+            (name.clone(), content.clone(), None, None)
+        } else {
+            // Invalid: neither mode satisfied
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "Must provide either prompt_id OR (name AND content)",
+                )),
+            ));
+        };
 
     // Generate session_id if not provided
     let session_id = request.session_id.unwrap_or_else(|| {
@@ -2779,14 +3260,231 @@ async fn run_prompt(
         )
     });
 
-    // Use override or prompt's setting
-    let max_iterations = request.max_iterations.unwrap_or(prompt.max_iterations);
+    // Use override or prompt's setting (None = unlimited sessions)
+    let max_sessions = request.max_sessions.or(prompt_max_sessions);
 
-    info!(
-        "MCP API: Running prompt '{}' (session: {}, max_iterations: {})",
-        prompt.name, session_id, max_iterations
+    // Use session_id as task_run_id (they are the same)
+    let task_run_id = session_id.clone();
+
+    // Auto-load last config if not already loaded and auto_load_last_config is enabled
+    // This ensures GUI automation tasks have access to workflows
+    let config_was_loaded = {
+        let config_lock = state.app_state.current_config.lock().unwrap();
+        config_lock.is_some()
+    };
+
+    let mut config_info: Option<(String, Option<String>, Option<i32>)> = None;
+    if !config_was_loaded && settings::get_auto_load_last_config() {
+        if let Some(config_path) = settings::get_last_config_path() {
+            if std::path::Path::new(&config_path).exists() {
+                info!(
+                    "MCP API: Auto-loading last config for prompt execution: {}",
+                    config_path
+                );
+
+                // Load the config
+                match crate::config::ConfigLoader::load_from_file(&config_path) {
+                    Ok(config) => {
+                        // Store the config
+                        let mut config_lock = state.app_state.current_config.lock().unwrap();
+                        *config_lock = Some(config);
+
+                        let workflow_id = settings::get_last_workflow_id();
+                        let monitor_index = settings::get_last_monitor_index();
+                        config_info = Some((config_path.clone(), workflow_id, monitor_index));
+
+                        info!(
+                            "MCP API: Auto-loaded config: {:?}, workflow: {:?}, monitor: {:?}",
+                            config_path,
+                            config_info.as_ref().map(|c| &c.1),
+                            config_info.as_ref().map(|c| &c.2)
+                        );
+                    }
+                    Err(e) => {
+                        warn!("MCP API: Failed to auto-load config: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect images for analysis if provided
+    let image_paths = request.image_paths.unwrap_or_default();
+    let video_paths = request.video_paths.unwrap_or_default();
+    let max_video_frames = request.max_video_frames.unwrap_or(3) as u32;
+    let max_trace_screenshots = request.max_trace_screenshots.unwrap_or(5) as u32;
+
+    let (all_images, trace_timeline) = collect_images_for_analysis(
+        &image_paths,
+        &video_paths,
+        request.trace_path.as_deref(),
+        max_video_frames,
+        max_trace_screenshots,
     );
 
+    // Build enhanced prompt with trace timeline and image references if available
+    let mut enhanced_prompt = prompt_content.clone();
+
+    // Prepend runner-triggered context and supervisor instructions
+    // This tells the AI session how to safely restart the runner if needed
+    let supervisor_available = check_supervisor_available();
+    let runner_context = if supervisor_available {
+        r#"## IMPORTANT: Runner-Triggered Session Context
+
+You are being run BY the qontinui-runner. You are a child process of the runner.
+
+**CRITICAL RULES:**
+1. Do NOT restart the qontinui-runner directly - it will kill your session
+2. You CAN restart backend, frontend, and qontinui-api without issues
+3. If the runner needs to be restarted, USE THE SUPERVISOR API
+
+**Restarting Runner via Supervisor (SAFE):**
+```powershell
+# Simple restart (no rebuild)
+Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"trigger_auto_continue": true}'
+
+# Restart with REBUILD (use after modifying runner Rust code)
+Invoke-RestMethod -Uri "http://localhost:9875/runner/restart" -Method Post -ContentType "application/json" -Body '{"rebuild": true, "trigger_auto_continue": true}'
+```
+
+**Supervisor API (port 9875):**
+- GET /health - Check if supervisor is running
+- POST /runner/stop - Stop the runner
+- POST /runner/restart - Restart runner (options: rebuild, trigger_auto_continue, wait_timeout_seconds)
+
+**IMPORTANT:** If you modified qontinui-runner Rust code, use `"rebuild": true` to recompile before restart.
+
+---
+
+"#
+    } else {
+        r#"## IMPORTANT: Runner-Triggered Session Context
+
+You are being run BY the qontinui-runner. You are a child process of the runner.
+
+**CRITICAL RULES:**
+1. Do NOT restart the qontinui-runner directly - it will kill your session
+2. You CAN restart backend, frontend, and qontinui-api without issues
+3. The supervisor is NOT currently running - if runner restart is needed, inform the user
+
+**If runner restart is needed:**
+Tell the user: "The qontinui-runner needs to be restarted manually to apply changes."
+
+---
+
+"#
+    };
+
+    enhanced_prompt = format!("{}{}", runner_context, enhanced_prompt);
+
+    // Add GUI automation context if config was auto-loaded
+    if let Some((config_path, workflow_id, monitor_index)) = &config_info {
+        let workflow_info = workflow_id
+            .as_ref()
+            .map(|w| format!("- Last workflow: {}", w))
+            .unwrap_or_else(|| "- No last workflow saved".to_string());
+        let monitor_info = monitor_index
+            .map(|m| format!("- Last monitor index: {}", m))
+            .unwrap_or_else(|| "- No last monitor index saved".to_string());
+
+        let gui_context = format!(
+            r#"
+## GUI Automation Available
+
+A workflow configuration has been auto-loaded:
+- Config path: {}
+{}
+{}
+
+**Runner MCP API (port 9876):**
+- GET /status - Check runner and config status
+- POST /run-workflow - Run a workflow by name
+  Example: `Invoke-RestMethod -Uri "http://localhost:9876/run-workflow" -Method Post -ContentType "application/json" -Body '{{"workflow_id": "workflow-name", "monitor_index": 0}}'`
+- GET /monitors - List available monitors
+
+If your task requires running visual automation, use the Runner API to execute workflows.
+
+---
+
+"#,
+            config_path, workflow_info, monitor_info
+        );
+
+        enhanced_prompt = format!("{}{}", gui_context, enhanced_prompt);
+    }
+
+    if let Some(timeline) = &trace_timeline {
+        enhanced_prompt = format!("{}\n\n{}", enhanced_prompt, timeline);
+    }
+
+    // Add image paths to prompt if there are any
+    if !all_images.is_empty() {
+        enhanced_prompt = format!(
+            "{}\n\n## Images for Analysis\n\nThe following images are available for analysis. Use the Read tool to view them:\n{}",
+            enhanced_prompt,
+            all_images.iter().map(|p| format!("- {}", p)).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    info!(
+        "MCP API: Running prompt '{}' (session: {}, max_sessions: {:?}, images: {})",
+        prompt_name,
+        session_id,
+        max_sessions,
+        all_images.len()
+    );
+
+    // Create TaskRun record in database
+    let db = CheckpointDb::new().map_err(|e| {
+        error!("MCP API: Failed to open database: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to open database: {}", e))),
+        )
+    })?;
+
+    db.create_task_run(
+        &task_run_id,
+        &prompt_name,
+        &enhanced_prompt,
+        max_sessions,
+        None,
+    )
+    .map_err(|e| {
+        error!("MCP API: Failed to create task run: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to create task run: {}", e))),
+        )
+    })?;
+
+    info!("MCP API: Created task run with ID: {}", task_run_id);
+
+    // Create session context for AI output events so frontend can display the task name
+    let session_ctx = AiOutputSessionContext {
+        session_id: Some(task_run_id.clone()),
+        session_name: Some(prompt_name.clone()),
+    };
+
+    // Emit prompt to frontend (use original prompt content for display)
+    emit_ai_output(
+        &state.app_handle,
+        &prompt_content,
+        "prompt",
+        Some(&task_run_id),
+        Some(&session_ctx),
+    );
+
+    // Emit status indicator
+    emit_ai_output(
+        &state.app_handle,
+        "AI session spawned - check task runs for status",
+        "status",
+        Some(&task_run_id),
+        Some(&session_ctx),
+    );
+
+    let prompt_name_for_state = prompt_name.clone();
     let result = tokio::task::spawn_blocking(move || {
         let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
         let spawn_script = scripts_path.join("spawn-independent-claude.py");
@@ -2801,10 +3499,11 @@ async fn run_prompt(
         // Create initial state file
         let initial_state = serde_json::json!({
             "session_id": session_id,
-            "prompt_id": prompt.id,
-            "prompt_name": prompt.name,
-            "iteration": 1,
-            "max_iterations": max_iterations,
+            "task_run_id": session_id,
+            "prompt_id": prompt_id,
+            "prompt_name": prompt_name_for_state,
+            "session_count": 1,
+            "max_sessions": max_sessions,
             "status": "starting",
             "started_at": chrono::Utc::now().to_rfc3339(),
             "stop_requested": false,
@@ -2819,8 +3518,8 @@ async fn run_prompt(
         std::fs::write(&state_file, state_json)
             .map_err(|e| format!("Failed to write state file: {}", e))?;
 
-        // Write prompt content to file
-        std::fs::write(&prompt_file, &prompt.content)
+        // Write enhanced prompt content to file
+        std::fs::write(&prompt_file, &enhanced_prompt)
             .map_err(|e| format!("Failed to write prompt file: {}", e))?;
 
         info!("MCP API: State file created: {:?}", state_file);
@@ -2845,14 +3544,20 @@ async fn run_prompt(
                 info!(
                     "MCP API: AI Developer spawned with PID: {} for prompt '{}'",
                     child.id(),
-                    prompt.name
+                    prompt_name_for_state
                 );
-                Ok(RunPromptResponse {
-                    session_id,
-                    state_file: state_file.to_string_lossy().to_string(),
-                    log_file: log_file.to_string_lossy().to_string(),
-                    pid: Some(child.id()),
-                })
+                Ok((
+                    RunPromptResponse {
+                        task_run_id: session_id.clone(),
+                        action_id: session_id.clone(), // Backward compatibility
+                        session_id,
+                        state_file: state_file.to_string_lossy().to_string(),
+                        log_file: log_file.to_string_lossy().to_string(),
+                        pid: Some(child.id()),
+                    },
+                    log_file,
+                    dev_logs_path,
+                ))
             }
             Err(e) => {
                 error!("MCP API: Failed to spawn AI Developer: {}", e);
@@ -2870,7 +3575,25 @@ async fn run_prompt(
     })?;
 
     match result {
-        Ok(response) => Ok(Json(ApiResponse::success(response))),
+        Ok((response, log_file, dev_logs_path)) => {
+            // Start monitoring the task for [TASK_COMPLETE] marker
+            let task_monitor = state.task_monitor.clone();
+            let task_run_id = response.task_run_id.clone();
+
+            // Spawn monitoring in background
+            tokio::spawn(async move {
+                if let Err(e) = task_monitor
+                    .start_monitoring(&task_run_id, log_file, dev_logs_path)
+                    .await
+                {
+                    error!("Failed to start task monitoring for {}: {}", task_run_id, e);
+                } else {
+                    info!("Started task monitoring for {}", task_run_id);
+                }
+            });
+
+            Ok(Json(ApiResponse::success(response)))
+        }
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
@@ -2973,7 +3696,6 @@ async fn create_ai_workflow(
         request.steps,
         request.goal,
         request.max_iterations,
-        request.persistent_session,
         request.capture_input_validation,
         request.category,
         request.tags,
@@ -2996,7 +3718,6 @@ async fn update_ai_workflow(
         request.steps,
         request.goal,
         request.max_iterations,
-        request.persistent_session,
         request.capture_input_validation,
         request.category,
         request.tags,
@@ -3635,1304 +4356,19 @@ fn collect_images_for_analysis(
     (all_images, trace_timeline)
 }
 
-// ============================================================================
-// Claude CLI Execution
-// ============================================================================
-
-/// Execute AI analysis via Claude CLI
-async fn execute_claude_cli(
-    cli_settings: &settings::ClaudeCliSettings,
-    prompt: &str,
-    image_paths: &[String],
-    app_handle: &tauri::AppHandle,
-    action_id: &str,
-) -> Result<TriggerAiAnalysisResponse, String> {
-    write_ai_debug_log("execute_claude_cli: Starting");
-
-    let system = std::env::consts::OS;
-    write_ai_debug_log(&format!("execute_claude_cli: OS = {}", system));
-
-    // Get the working directory (qontinui_parent_directory)
-    let exe_path = std::env::current_exe().map_err(|e| {
-        let err = format!("Failed to get exe path: {}", e);
-        write_ai_debug_log(&format!("execute_claude_cli ERROR: {}", err));
-        err
-    })?;
-    write_ai_debug_log(&format!("execute_claude_cli: exe_path = {:?}", exe_path));
-
-    // Navigate from exe to qontinui_parent_directory
-    let working_dir = exe_path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .unwrap_or_else(|| std::path::Path::new("."));
-
-    let working_dir_str = working_dir.to_string_lossy().to_string();
-    write_ai_debug_log(&format!(
-        "execute_claude_cli: working_dir = {}",
-        working_dir_str
-    ));
-
-    // Build prompt with image paths if provided
-    // Claude CLI (Claude Code) can read images from file paths
-    let prompt_with_images = if image_paths.is_empty() {
-        prompt.to_string()
-    } else {
-        let mut enhanced_prompt = prompt.to_string();
-        enhanced_prompt.push_str("\n\n## Visual Context\n\n");
-        enhanced_prompt.push_str("The following images are available for your analysis. Please examine them to understand the visual state:\n\n");
-        for (i, path) in image_paths.iter().enumerate() {
-            enhanced_prompt.push_str(&format!("{}. Image: {}\n", i + 1, path));
-        }
-        enhanced_prompt.push_str(
-            "\nPlease read and analyze these images to understand the current state of the page.\n",
-        );
-        enhanced_prompt
-    };
-
-    let prompt_owned = prompt_with_images;
-    let prompt_len = prompt_owned.len();
-    let custom_path = cli_settings.custom_path.clone();
-    let execution_mode = cli_settings.execution_mode;
-    let timeout_seconds = cli_settings.timeout_seconds;
-    let app_handle = app_handle.clone();
-    let action_id_owned = action_id.to_string();
-
-    write_ai_debug_log(&format!(
-        "execute_claude_cli: execution_mode = {:?}, custom_path = {:?}, prompt_len = {}, timeout = {}s",
-        execution_mode, custom_path, prompt_len, timeout_seconds
-    ));
-
-    write_ai_debug_log("execute_claude_cli: Spawning blocking task...");
-
-    // Spawn a blocking task to run the command
-    let result = tokio::task::spawn_blocking(move || {
-        write_ai_debug_log("execute_claude_cli: Inside spawn_blocking");
-
-        // Determine execution mode
-        let effective_mode = match execution_mode {
-            CliExecutionMode::Auto => {
-                if system == "windows" {
-                    write_ai_debug_log("execute_claude_cli: Auto -> WindowsNative (Windows OS)");
-                    CliExecutionMode::WindowsNative
-                } else {
-                    write_ai_debug_log("execute_claude_cli: Auto -> Native (non-Windows OS)");
-                    CliExecutionMode::Native
-                }
-            }
-            mode => {
-                write_ai_debug_log(&format!(
-                    "execute_claude_cli: Using specified mode: {:?}",
-                    mode
-                ));
-                mode
-            }
-        };
-
-        let result = match effective_mode {
-            CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
-                write_ai_debug_log("execute_claude_cli: Calling execute_windows_native");
-                execute_windows_native(
-                    &working_dir_str,
-                    &prompt_owned,
-                    custom_path.as_deref(),
-                    &app_handle,
-                    &action_id_owned,
-                    timeout_seconds,
-                )
-            }
-            CliExecutionMode::Wsl => {
-                write_ai_debug_log("execute_claude_cli: Calling execute_via_wsl");
-                execute_via_wsl(
-                    &working_dir_str,
-                    &prompt_owned,
-                    custom_path.as_deref(),
-                    &app_handle,
-                    &action_id_owned,
-                )
-            }
-            CliExecutionMode::Native => {
-                write_ai_debug_log("execute_claude_cli: Calling execute_native");
-                execute_native(
-                    &working_dir_str,
-                    &prompt_owned,
-                    custom_path.as_deref(),
-                    &app_handle,
-                    &action_id_owned,
-                )
-            }
-        };
-
-        write_ai_debug_log(&format!(
-            "execute_claude_cli: Execution result: {:?}",
-            result.as_ref().map(|r| &r.success)
-        ));
-        result
-    })
-    .await;
-
-    match result {
-        Ok(inner_result) => {
-            write_ai_debug_log("execute_claude_cli: spawn_blocking completed successfully");
-            inner_result
-        }
-        Err(e) => {
-            let err = format!("spawn_blocking error: {}", e);
-            write_ai_debug_log(&format!("execute_claude_cli ERROR: {}", err));
-            Err(err)
-        }
-    }
-}
-
-/// Extract text content from Claude CLI stream-json format
-fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
-    // Parse the JSON line
-    let parsed: serde_json::Value = serde_json::from_str(json_line).ok()?;
-
-    // Handle different message types
-    match parsed.get("type")?.as_str()? {
-        "assistant" => {
-            // Extract text from assistant message content
-            let content = parsed.get("message")?.get("content")?.as_array()?;
-            let mut text_parts = Vec::new();
-            for item in content {
-                if item.get("type")?.as_str()? == "text" {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        text_parts.push(text.to_string());
-                    }
-                }
-            }
-            if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join(""))
-            }
-        }
-        "content_block_delta" => {
-            // Handle streaming deltas (partial text)
-            parsed
-                .get("delta")?
-                .get("text")
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-        }
-        "result" => {
-            // Final result - extract text from content blocks
-            let content = parsed.get("result")?.get("content")?.as_array()?;
-            let mut text_parts = Vec::new();
-            for item in content {
-                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        text_parts.push(text.to_string());
-                    }
-                }
-            }
-            if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join(""))
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Execute Claude CLI on Windows natively with real-time streaming output
-fn execute_windows_native(
-    working_dir: &str,
-    prompt: &str,
-    custom_path: Option<&str>,
-    app_handle: &tauri::AppHandle,
-    action_id: &str,
-    timeout_seconds: u64,
-) -> Result<TriggerAiAnalysisResponse, String> {
-    use std::io::{BufRead, BufReader, Read};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    write_ai_debug_log("execute_windows_native: Starting (streaming mode)");
-    write_ai_debug_log(&format!(
-        "execute_windows_native: working_dir = {}, custom_path = {:?}, inactivity_timeout = {}s",
-        working_dir, custom_path, timeout_seconds
-    ));
-
-    // Clone action_id for threads
-    let action_id_owned = action_id.to_string();
-
-    // Write prompt to a temp file to avoid shell escaping issues
-    let temp_dir = std::env::temp_dir();
-    let prompt_file = temp_dir.join("qontinui_ai_prompt.txt");
-
-    std::fs::write(&prompt_file, prompt).map_err(|e| {
-        let err = format!("Failed to write prompt file: {}", e);
-        write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
-        err
-    })?;
-
-    let program = custom_path.unwrap_or("claude");
-    write_ai_debug_log(&format!(
-        "execute_windows_native: Using program = {}, prompt {} bytes",
-        program,
-        prompt.len()
-    ));
-    info!(
-        "Running Claude Code on Windows via cmd.exe: {} with prompt from {:?}",
-        program, prompt_file
-    );
-
-    // Read the prompt file
-    let prompt_content =
-        std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
-
-    // Spawn the process - use stream-json for real-time streaming output
-    // Note: stream-json requires --verbose flag
-    //
-    // SECURITY NOTE: bypassPermissions mode rationale
-    // ------------------------------------------------
-    // We use --permission-mode bypassPermissions because:
-    // 1. The qontinui-runner is an AUTOMATION tool that programmatically invokes Claude
-    // 2. Interactive permission prompts would block automation (no user to click "Allow")
-    // 3. The user has already consented to automation by configuring and running workflows
-    // 4. The runner itself provides the security boundary - it controls what prompts are sent
-    //
-    // Security implications:
-    // - Claude can execute any action without per-action confirmation
-    // - The runner's workflow configuration is the trust boundary
-    // - Users should only run trusted workflow configurations
-    write_ai_debug_log("execute_windows_native: Spawning cmd.exe process with stream-json...");
-    tracing::warn!(
-        "Spawning Claude CLI with bypassPermissions mode - ensure workflow configuration is trusted"
-    );
-    let spawn_result = std::panic::catch_unwind(|| {
-        std::process::Command::new("cmd.exe")
-            .args([
-                "/c",
-                program,
-                "--output-format",
-                "stream-json",
-                "--verbose",
-                "--permission-mode",
-                "bypassPermissions",
-            ])
-            .current_dir(working_dir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-    });
-
-    let mut child = match spawn_result {
-        Ok(Ok(child)) => {
-            write_ai_debug_log("execute_windows_native: Process spawned successfully");
-            child
-        }
-        Ok(Err(e)) => {
-            let err = format!(
-                "Failed to spawn {}: {}. Is Claude Code installed and in PATH?",
-                program, e
-            );
-            write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
-            return Err(err);
-        }
-        Err(panic) => {
-            let err = format!("PANIC during spawn: {:?}", panic);
-            write_ai_debug_log(&format!("execute_windows_native PANIC: {}", err));
-            return Err(err);
-        }
-    };
-
-    // Write prompt to stdin
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if let Err(e) = stdin.write_all(&prompt_content) {
-            let err = format!("Failed to write to claude stdin: {}", e);
-            write_ai_debug_log(&format!("execute_windows_native ERROR: {}", err));
-            return Err(err);
-        }
-        write_ai_debug_log("execute_windows_native: Stdin written and closed");
-    }
-
-    // Track whether we've received any output (to control heartbeat)
-    let has_output = Arc::new(AtomicBool::new(false));
-    let has_output_heartbeat = has_output.clone();
-
-    // Track the last time we received output (for inactivity timeout)
-    // Store as epoch seconds (u64)
-    use std::sync::atomic::AtomicU64;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let last_activity = Arc::new(AtomicU64::new(now_secs));
-    let last_activity_stdout = last_activity.clone();
-
-    // Start a heartbeat thread to show progress while waiting
-    let app_handle_heartbeat = app_handle.clone();
-    let action_id_heartbeat = action_id_owned.clone();
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let start_time = Instant::now();
-
-    debug_lifecycle::log_claude_cli("spawn", "starting heartbeat thread");
-    let heartbeat_handle = thread::spawn(move || {
-        debug_lifecycle::log_thread_start("claude_cli_heartbeat");
-        let mut last_update = 0u64;
-        loop {
-            // Check if we should stop every 100ms
-            if stop_rx.try_recv().is_ok() {
-                debug_lifecycle::log_thread_end("claude_cli_heartbeat", "stop signal received");
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-
-            // Only show heartbeat if we haven't received output yet
-            if has_output_heartbeat.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            let elapsed_secs = start_time.elapsed().as_secs();
-            // Update every 30 seconds
-            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
-                last_update = elapsed_secs;
-                let mins = elapsed_secs / 60;
-                let secs = elapsed_secs % 60;
-                let msg = if mins > 0 {
-                    format!("⏳ AI processing... ({}m {}s elapsed)", mins, secs)
-                } else {
-                    format!("⏳ AI processing... ({}s elapsed)", secs)
-                };
-                debug_lifecycle::log_ai_session("heartbeat", &msg);
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(
-                        &app_handle_heartbeat,
-                        &msg,
-                        "status",
-                        Some(&action_id_heartbeat),
-                        None,
-                    );
-                }));
-            }
-        }
-    });
-
-    // Read stdout in a separate thread - streaming JSON line by line
-    let stdout = child.stdout.take();
-    let app_handle_stdout = app_handle.clone();
-    let action_id_stdout = action_id_owned.clone();
-    let has_output_stdout = has_output.clone();
-
-    debug_lifecycle::log_claude_cli("spawn", "starting stdout reader thread");
-    let stdout_handle = thread::spawn(move || {
-        debug_lifecycle::log_thread_start("claude_cli_stdout_reader");
-        let mut all_text = String::new();
-        let mut line_count = 0;
-        let mut last_log_count = 0;
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            for line_result in reader.lines() {
-                match line_result {
-                    Ok(line) => {
-                        line_count += 1;
-
-                        // Update last activity time - we're receiving output
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs();
-                        last_activity_stdout.store(now, Ordering::Relaxed);
-
-                        // Log progress every 50 lines
-                        if line_count - last_log_count >= 50 {
-                            debug_lifecycle::log_claude_cli(
-                                "stdout_progress",
-                                &format!(
-                                    "{} lines processed, {} chars",
-                                    line_count,
-                                    all_text.len()
-                                ),
-                            );
-                            last_log_count = line_count;
-                        }
-
-                        // Try to extract text from the JSON line
-                        if let Some(text) = extract_text_from_stream_json(&line) {
-                            // Mark that we've received output
-                            has_output_stdout.store(true, Ordering::Relaxed);
-
-                            if !text.is_empty() {
-                                // Emit the extracted text immediately
-                                let _ =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        emit_ai_output(
-                                            &app_handle_stdout,
-                                            &text,
-                                            "claude",
-                                            Some(&action_id_stdout),
-                                            None,
-                                        );
-                                    }));
-                                all_text.push_str(&text);
-                                write_ai_debug_log(&format!(
-                                    "execute_windows_native: stream line {} ({} chars)",
-                                    line_count,
-                                    all_text.len()
-                                ));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug_lifecycle::log_claude_cli(
-                            "stdout_error",
-                            &format!("Error reading line: {}", e),
-                        );
-                        write_ai_debug_log(&format!(
-                            "execute_windows_native: Error reading stdout line: {}",
-                            e
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-        debug_lifecycle::log_thread_end(
-            "claude_cli_stdout_reader",
-            &format!("{} lines, {} chars", line_count, all_text.len()),
-        );
-        write_ai_debug_log(&format!(
-            "execute_windows_native: stdout complete - {} JSON lines, {} chars extracted",
-            line_count,
-            all_text.len()
-        ));
-        all_text
-    });
-
-    // Read stderr in a separate thread (collect all at once, usually small)
-    let stderr = child.stderr.take();
-
-    debug_lifecycle::log_claude_cli("spawn", "starting stderr reader thread");
-    let stderr_handle = thread::spawn(move || {
-        debug_lifecycle::log_thread_start("claude_cli_stderr_reader");
-        let mut output = String::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_string(&mut output);
-        }
-        debug_lifecycle::log_thread_end(
-            "claude_cli_stderr_reader",
-            &format!("{} chars", output.len()),
-        );
-        output
-    });
-
-    // Wait for process to complete with inactivity timeout
-    // The process will only be killed if it stops producing output for timeout_seconds
-    debug_lifecycle::log_claude_cli(
-        "wait",
-        &format!(
-            "waiting for Claude CLI process to complete (inactivity timeout: {}s)",
-            timeout_seconds
-        ),
-    );
-
-    let status = loop {
-        // Check for inactivity - only timeout if no output received for timeout_seconds
-        let now_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let last_activity_secs = last_activity.load(Ordering::Relaxed);
-        let inactive_secs = now_secs.saturating_sub(last_activity_secs);
-
-        if inactive_secs > timeout_seconds {
-            debug_lifecycle::log_claude_cli(
-                "timeout",
-                &format!(
-                    "Process inactive for {}s (> {}s threshold), killing...",
-                    inactive_secs, timeout_seconds
-                ),
-            );
-            write_ai_debug_log(&format!(
-                "execute_windows_native: INACTIVITY TIMEOUT - no output for {}s (threshold: {}s), killing process",
-                inactive_secs, timeout_seconds
-            ));
-
-            // Kill the process
-            if let Err(e) = child.kill() {
-                debug_lifecycle::log_claude_cli("error", &format!("Failed to kill process: {}", e));
-            }
-
-            // Wait a bit for the process to terminate
-            thread::sleep(Duration::from_millis(500));
-
-            // Try to reap the process
-            let _ = child.try_wait();
-
-            // Stop heartbeat
-            let _ = stop_tx.send(());
-            let _ = heartbeat_handle.join();
-
-            // Emit timeout message to UI
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(
-                    app_handle,
-                    &format!(
-                        "⏰ AI analysis stopped - no response for {} seconds",
-                        inactive_secs
-                    ),
-                    "status",
-                    Some(&action_id_owned),
-                    None,
-                );
-            }));
-
-            // Cleanup temp file
-            let _ = std::fs::remove_file(&prompt_file);
-
-            return Ok(TriggerAiAnalysisResponse {
-                success: false,
-                message: "AI analysis stopped due to inactivity".to_string(),
-                error: Some(format!(
-                    "Claude CLI process was unresponsive for {} seconds and was killed",
-                    inactive_secs
-                )),
-                output: None,
-            });
-        }
-
-        // Try to check if process has exited (non-blocking)
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                debug_lifecycle::log_claude_cli(
-                    "wait",
-                    &format!("process exited with status: {:?}", status),
-                );
-                break status;
-            }
-            Ok(None) => {
-                // Process still running, wait a bit and check again
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => {
-                debug_lifecycle::log_claude_cli("error", &format!("try_wait failed: {}", e));
-                let _ = stop_tx.send(());
-                let _ = heartbeat_handle.join();
-                let _ = std::fs::remove_file(&prompt_file);
-                return Err(format!("Failed to wait for claude: {}", e));
-            }
-        }
-    };
-
-    // Stop heartbeat
-    debug_lifecycle::log_claude_cli("cleanup", "stopping heartbeat thread");
-    let _ = stop_tx.send(());
-    let _ = heartbeat_handle.join();
-    debug_lifecycle::log_claude_cli("cleanup", "heartbeat thread joined");
-
-    // Get output from threads
-    debug_lifecycle::log_claude_cli("cleanup", "joining stdout thread");
-    let all_output = stdout_handle.join().unwrap_or_default();
-    debug_lifecycle::log_claude_cli("cleanup", "stdout thread joined");
-
-    debug_lifecycle::log_claude_cli("cleanup", "joining stderr thread");
-    let stderr_output = stderr_handle.join().unwrap_or_default();
-    debug_lifecycle::log_claude_cli("cleanup", "stderr thread joined");
-
-    let elapsed = start_time.elapsed();
-    debug_lifecycle::log_claude_cli(
-        "complete",
-        &format!(
-            "finished in {:.1}s, {} chars output",
-            elapsed.as_secs_f64(),
-            all_output.len()
-        ),
-    );
-    write_ai_debug_log(&format!(
-        "execute_windows_native: Process completed in {:.1}s, output {} chars, stderr {} chars",
-        elapsed.as_secs_f64(),
-        all_output.len(),
-        stderr_output.len()
-    ));
-
-    // Emit stderr if any (this is usually error messages, so emit at end)
-    if !stderr_output.is_empty() {
-        for line in stderr_output.lines() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(
-                    app_handle,
-                    &format!("[stderr] {}", line),
-                    "claude",
-                    Some(&action_id_owned),
-                    None,
-                );
-            }));
-        }
-    }
-
-    // Cleanup
-    let _ = std::fs::remove_file(&prompt_file);
-
-    if status.success() {
-        write_ai_debug_log("execute_windows_native: SUCCESS");
-        Ok(TriggerAiAnalysisResponse {
-            success: true,
-            message: "AI analysis completed successfully".to_string(),
-            error: None,
-            output: Some(all_output),
-        })
-    } else {
-        write_ai_debug_log(&format!(
-            "execute_windows_native: FAILED with code {:?}",
-            status.code()
-        ));
-        Ok(TriggerAiAnalysisResponse {
-            success: false,
-            message: "AI analysis failed".to_string(),
-            error: Some(if stderr_output.is_empty() {
-                format!("Claude Code exited with code {:?}", status.code())
-            } else {
-                stderr_output
-            }),
-            output: Some(all_output),
-        })
-    }
-}
-
-/// Execute Claude CLI via WSL with real-time streaming output
-fn execute_via_wsl(
-    working_dir: &str,
-    prompt: &str,
-    custom_path: Option<&str>,
-    app_handle: &tauri::AppHandle,
-    action_id: &str,
-) -> Result<TriggerAiAnalysisResponse, String> {
-    use std::io::{BufRead, BufReader, Read};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let action_id_owned = action_id.to_string();
-    write_ai_debug_log("execute_via_wsl: Starting");
-
-    // Convert Windows path to WSL path
-    let wsl_working_dir = working_dir.replace('\\', "/").replace("C:", "/mnt/c");
-    let program = custom_path.unwrap_or("claude");
-
-    write_ai_debug_log(&format!(
-        "execute_via_wsl: wsl_working_dir = {}, program = {}",
-        wsl_working_dir, program
-    ));
-
-    info!(
-        "Running Claude Code via WSL: {} in {}",
-        program, wsl_working_dir
-    );
-
-    // Write prompt to a temp file
-    let temp_dir = std::env::temp_dir();
-    let prompt_file = temp_dir.join("qontinui_ai_prompt.txt");
-    std::fs::write(&prompt_file, prompt)
-        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
-
-    // Convert temp file path to WSL path
-    let wsl_prompt_file = prompt_file
-        .to_string_lossy()
-        .replace('\\', "/")
-        .replace("C:", "/mnt/c");
-
-    // Use bash to read the file and pipe to claude with stream-json for real-time output
-    // Note: stream-json requires --verbose flag
-    let bash_command = format!(
-        "cd '{}' && cat '{}' | {} --output-format stream-json --verbose --permission-mode bypassPermissions",
-        wsl_working_dir, wsl_prompt_file, program
-    );
-
-    write_ai_debug_log("execute_via_wsl: Spawning WSL process...");
-    let mut child = std::process::Command::new("wsl")
-        .args(["bash", "-c", &bash_command])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to run WSL: {}. Is WSL installed?", e))?;
-
-    // Track whether we've received any output (to control heartbeat)
-    let has_output = Arc::new(AtomicBool::new(false));
-    let has_output_heartbeat = has_output.clone();
-
-    // Start a heartbeat thread to show progress while waiting
-    let app_handle_heartbeat = app_handle.clone();
-    let action_id_heartbeat = action_id_owned.clone();
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let start_time = Instant::now();
-
-    let heartbeat_handle = thread::spawn(move || {
-        let mut last_update = 0u64;
-        loop {
-            // Check if we should stop every 100ms
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-
-            // Only show heartbeat if we haven't received output yet
-            if has_output_heartbeat.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            let elapsed_secs = start_time.elapsed().as_secs();
-            // Update every 30 seconds
-            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
-                last_update = elapsed_secs;
-                let mins = elapsed_secs / 60;
-                let secs = elapsed_secs % 60;
-                let msg = if mins > 0 {
-                    format!("⏳ AI processing... ({}m {}s elapsed)", mins, secs)
-                } else {
-                    format!("⏳ AI processing... ({}s elapsed)", secs)
-                };
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(
-                        &app_handle_heartbeat,
-                        &msg,
-                        "status",
-                        Some(&action_id_heartbeat),
-                        None,
-                    );
-                }));
-            }
-        }
-    });
-
-    // Read stdout in a separate thread - streaming line by line
-    let stdout = child.stdout.take();
-    let app_handle_stdout = app_handle.clone();
-    let action_id_stdout = action_id_owned.clone();
-    let has_output_stdout = has_output.clone();
-
-    let stdout_handle = thread::spawn(move || {
-        let mut all_text = String::new();
-        let mut line_count = 0;
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            for line_result in reader.lines() {
-                match line_result {
-                    Ok(line) => {
-                        line_count += 1;
-
-                        // Try to extract text from the JSON line
-                        if let Some(text) = extract_text_from_stream_json(&line) {
-                            // Mark that we've received output
-                            has_output_stdout.store(true, Ordering::Relaxed);
-
-                            if !text.is_empty() {
-                                // Emit the extracted text immediately
-                                let _ =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        emit_ai_output(
-                                            &app_handle_stdout,
-                                            &text,
-                                            "claude",
-                                            Some(&action_id_stdout),
-                                            None,
-                                        );
-                                    }));
-                                all_text.push_str(&text);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        write_ai_debug_log(&format!(
-                            "execute_via_wsl: Error reading stdout line: {}",
-                            e
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-        write_ai_debug_log(&format!(
-            "execute_via_wsl: stdout complete - {} JSON lines, {} chars extracted",
-            line_count,
-            all_text.len()
-        ));
-        all_text
-    });
-
-    // Read stderr in a separate thread (collect all at once, usually small)
-    let stderr = child.stderr.take();
-
-    let stderr_handle = thread::spawn(move || {
-        let mut output = String::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_string(&mut output);
-        }
-        output
-    });
-
-    // Wait for process to complete
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = stop_tx.send(());
-            let _ = heartbeat_handle.join();
-            return Err(format!("Failed to wait for WSL: {}", e));
-        }
-    };
-
-    // Stop heartbeat
-    let _ = stop_tx.send(());
-    let _ = heartbeat_handle.join();
-
-    // Get output from threads
-    let all_output = stdout_handle.join().unwrap_or_default();
-    let stderr_output = stderr_handle.join().unwrap_or_default();
-
-    let elapsed = start_time.elapsed();
-    write_ai_debug_log(&format!(
-        "execute_via_wsl: Process completed in {:.1}s, output {} chars, stderr {} chars",
-        elapsed.as_secs_f64(),
-        all_output.len(),
-        stderr_output.len()
-    ));
-
-    // Emit stderr if any (this is usually error messages, so emit at end)
-    if !stderr_output.is_empty() {
-        for line in stderr_output.lines() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(
-                    app_handle,
-                    &format!("[stderr] {}", line),
-                    "claude",
-                    Some(&action_id_owned),
-                    None,
-                );
-            }));
-        }
-    }
-
-    // Cleanup
-    let _ = std::fs::remove_file(&prompt_file);
-
-    if status.success() {
-        write_ai_debug_log("execute_via_wsl: SUCCESS");
-        Ok(TriggerAiAnalysisResponse {
-            success: true,
-            message: "AI analysis completed successfully".to_string(),
-            error: None,
-            output: Some(all_output),
-        })
-    } else {
-        write_ai_debug_log(&format!(
-            "execute_via_wsl: FAILED with code {:?}",
-            status.code()
-        ));
-        Ok(TriggerAiAnalysisResponse {
-            success: false,
-            message: "AI analysis failed".to_string(),
-            error: Some(if stderr_output.is_empty() {
-                format!("Claude Code exited with code {:?}", status.code())
-            } else {
-                stderr_output
-            }),
-            output: Some(all_output),
-        })
-    }
-}
-
-/// Execute Claude CLI natively (Unix/macOS/Linux) with real-time streaming output
-fn execute_native(
-    working_dir: &str,
-    prompt: &str,
-    custom_path: Option<&str>,
-    app_handle: &tauri::AppHandle,
-    action_id: &str,
-) -> Result<TriggerAiAnalysisResponse, String> {
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::mpsc;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::{Duration, Instant};
-
-    let action_id_owned = action_id.to_string();
-    write_ai_debug_log("execute_native: Starting");
-
-    let program = custom_path.unwrap_or("claude");
-    info!("Running Claude Code natively: {}", program);
-
-    // Write prompt to a temp file
-    let temp_dir = std::env::temp_dir();
-    let prompt_file = temp_dir.join("qontinui_ai_prompt.txt");
-    std::fs::write(&prompt_file, prompt)
-        .map_err(|e| format!("Failed to write prompt file: {}", e))?;
-
-    let prompt_content =
-        std::fs::read(&prompt_file).map_err(|e| format!("Failed to read prompt file: {}", e))?;
-
-    // Note: stream-json requires --verbose flag
-    write_ai_debug_log("execute_native: Spawning process with stream-json...");
-    let mut child = std::process::Command::new(program)
-        .args([
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--permission-mode",
-            "bypassPermissions",
-        ])
-        .current_dir(working_dir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "Failed to spawn {}: {}. Is Claude Code installed and in PATH?",
-                program, e
-            )
-        })?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&prompt_content)
-            .map_err(|e| format!("Failed to write to claude stdin: {}", e))?;
-    }
-
-    // Track whether we've received any output (to control heartbeat)
-    let has_output = Arc::new(AtomicBool::new(false));
-    let has_output_heartbeat = has_output.clone();
-
-    // Start a heartbeat thread to show progress while waiting
-    let app_handle_heartbeat = app_handle.clone();
-    let action_id_heartbeat = action_id_owned.clone();
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let start_time = Instant::now();
-
-    let heartbeat_handle = thread::spawn(move || {
-        let mut last_update = 0u64;
-        loop {
-            // Check if we should stop every 100ms
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-
-            // Only show heartbeat if we haven't received output yet
-            if has_output_heartbeat.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            let elapsed_secs = start_time.elapsed().as_secs();
-            // Update every 30 seconds
-            if elapsed_secs > 0 && elapsed_secs % 30 == 0 && elapsed_secs != last_update {
-                last_update = elapsed_secs;
-                let mins = elapsed_secs / 60;
-                let secs = elapsed_secs % 60;
-                let msg = if mins > 0 {
-                    format!("⏳ AI processing... ({}m {}s elapsed)", mins, secs)
-                } else {
-                    format!("⏳ AI processing... ({}s elapsed)", secs)
-                };
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    emit_ai_output(
-                        &app_handle_heartbeat,
-                        &msg,
-                        "status",
-                        Some(&action_id_heartbeat),
-                        None,
-                    );
-                }));
-            }
-        }
-    });
-
-    // Read stdout in a separate thread - streaming line by line
-    let stdout = child.stdout.take();
-    let app_handle_stdout = app_handle.clone();
-    let action_id_stdout = action_id_owned.clone();
-    let has_output_stdout = has_output.clone();
-
-    let stdout_handle = thread::spawn(move || {
-        let mut all_text = String::new();
-        let mut line_count = 0;
-        if let Some(stdout) = stdout {
-            let reader = BufReader::new(stdout);
-            for line_result in reader.lines() {
-                match line_result {
-                    Ok(line) => {
-                        line_count += 1;
-
-                        // Try to extract text from the JSON line
-                        if let Some(text) = extract_text_from_stream_json(&line) {
-                            // Mark that we've received output
-                            has_output_stdout.store(true, Ordering::Relaxed);
-
-                            if !text.is_empty() {
-                                // Emit the extracted text immediately
-                                let _ =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        emit_ai_output(
-                                            &app_handle_stdout,
-                                            &text,
-                                            "claude",
-                                            Some(&action_id_stdout),
-                                            None,
-                                        );
-                                    }));
-                                all_text.push_str(&text);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        write_ai_debug_log(&format!(
-                            "execute_native: Error reading stdout line: {}",
-                            e
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-        write_ai_debug_log(&format!(
-            "execute_native: stdout complete - {} JSON lines, {} chars extracted",
-            line_count,
-            all_text.len()
-        ));
-        all_text
-    });
-
-    // Read stderr in a separate thread (collect all at once, usually small)
-    let stderr = child.stderr.take();
-
-    let stderr_handle = thread::spawn(move || {
-        let mut output = String::new();
-        if let Some(mut stderr) = stderr {
-            let _ = stderr.read_to_string(&mut output);
-        }
-        output
-    });
-
-    // Wait for process to complete
-    let status = match child.wait() {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = stop_tx.send(());
-            let _ = heartbeat_handle.join();
-            return Err(format!("Failed to wait for {}: {}", program, e));
-        }
-    };
-
-    // Stop heartbeat
-    let _ = stop_tx.send(());
-    let _ = heartbeat_handle.join();
-
-    // Get output from threads
-    let all_output = stdout_handle.join().unwrap_or_default();
-    let stderr_output = stderr_handle.join().unwrap_or_default();
-
-    let elapsed = start_time.elapsed();
-    write_ai_debug_log(&format!(
-        "execute_native: Process completed in {:.1}s, output {} chars, stderr {} chars",
-        elapsed.as_secs_f64(),
-        all_output.len(),
-        stderr_output.len()
-    ));
-
-    // Emit stderr if any (this is usually error messages, so emit at end)
-    if !stderr_output.is_empty() {
-        for line in stderr_output.lines() {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                emit_ai_output(
-                    app_handle,
-                    &format!("[stderr] {}", line),
-                    "claude",
-                    Some(&action_id_owned),
-                    None,
-                );
-            }));
-        }
-    }
-
-    // Cleanup
-    let _ = std::fs::remove_file(&prompt_file);
-
-    if status.success() {
-        write_ai_debug_log("execute_native: SUCCESS");
-        Ok(TriggerAiAnalysisResponse {
-            success: true,
-            message: "AI analysis completed successfully".to_string(),
-            error: None,
-            output: Some(all_output),
-        })
-    } else {
-        write_ai_debug_log(&format!(
-            "execute_native: FAILED with code {:?}",
-            status.code()
-        ));
-        Ok(TriggerAiAnalysisResponse {
-            success: false,
-            message: "AI analysis failed".to_string(),
-            error: Some(if stderr_output.is_empty() {
-                format!("Claude Code exited with code {:?}", status.code())
-            } else {
-                stderr_output
-            }),
-            output: Some(all_output),
-        })
-    }
-}
-
-/// Execute AI analysis via Claude API (direct HTTP calls)
-async fn execute_claude_api(
-    api_settings: &settings::ClaudeApiSettings,
-    prompt: &str,
-    image_paths: &[String],
-    app_handle: &tauri::AppHandle,
-    action_id: &str,
-) -> Result<TriggerAiAnalysisResponse, String> {
-    use base64::Engine;
-
-    // Get API key from keychain
-    let api_key = ai_settings::get_provider_api_key("claude_api")?.ok_or_else(|| {
-        "No API key configured. Please configure your Claude API key in Settings > AI.".to_string()
-    })?;
-
-    info!(
-        "Calling Claude API with model: {}, images: {}",
-        api_settings.model,
-        image_paths.len()
-    );
-
-    // Build content array (multimodal if images provided)
-    let content = if image_paths.is_empty() {
-        // Text-only: simple string content
-        serde_json::json!(prompt)
-    } else {
-        // Multimodal: array of content blocks
-        let mut content_parts: Vec<serde_json::Value> = Vec::new();
-
-        // Add text first
-        content_parts.push(serde_json::json!({
-            "type": "text",
-            "text": prompt
-        }));
-
-        // Add images (base64 encoded)
-        for image_path in image_paths {
-            if let Ok(image_data) = std::fs::read(image_path) {
-                let base64_data = base64::engine::general_purpose::STANDARD.encode(&image_data);
-                let media_type = if image_path.ends_with(".png") {
-                    "image/png"
-                } else if image_path.ends_with(".jpg") || image_path.ends_with(".jpeg") {
-                    "image/jpeg"
-                } else if image_path.ends_with(".webp") {
-                    "image/webp"
-                } else if image_path.ends_with(".gif") {
-                    "image/gif"
-                } else {
-                    info!("Skipping unsupported image format: {}", image_path);
-                    continue;
-                };
-
-                content_parts.push(serde_json::json!({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": base64_data
-                    }
-                }));
-            } else {
-                warn!("Failed to read image file: {}", image_path);
-            }
-        }
-
-        serde_json::json!(content_parts)
-    };
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", &api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&serde_json::json!({
-            "model": api_settings.model,
-            "max_tokens": api_settings.max_tokens,
-            "messages": [{"role": "user", "content": content}]
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Network error: {}", e))?;
-
-    if response.status().is_success() {
-        let response_body: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse API response: {}", e))?;
-
-        // Extract the text content from the response
-        let content = response_body["content"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|c| c["text"].as_str())
-            .unwrap_or("No content in response");
-
-        // Emit response to frontend (emit line by line for consistency)
-        for line in content.lines() {
-            emit_ai_output(app_handle, line, "claude", Some(action_id), None);
-        }
-
-        Ok(TriggerAiAnalysisResponse {
-            success: true,
-            message: "AI analysis completed successfully".to_string(),
-            error: None,
-            output: Some(content.to_string()),
-        })
-    } else {
-        let status = response.status();
-        let error_body = response.text().await.unwrap_or_default();
-
-        let error_message = if status.as_u16() == 401 {
-            "Invalid API key. Please check your API key in Settings > AI.".to_string()
-        } else if status.as_u16() == 429 {
-            "Rate limited. Please wait and try again.".to_string()
-        } else {
-            format!("API error ({}): {}", status, error_body)
-        };
-
-        // Emit error to frontend
-        emit_ai_output(
-            app_handle,
-            &format!("Error: {}", error_message),
-            "claude",
-            Some(action_id),
-            None,
-        );
-
-        Ok(TriggerAiAnalysisResponse {
-            success: false,
-            message: "API call failed".to_string(),
-            error: Some(error_message),
-            output: None,
-        })
-    }
-}
+// NOTE: execute_claude_cli, execute_windows_native, execute_via_wsl, execute_native,
+// and execute_claude_api functions were removed. They implemented synchronous execution
+// which has been replaced by the TaskRun model using spawn-independent-claude.py.
 
 // ============================================================================
 // Unified Session API Handlers
 // ============================================================================
 
-use crate::session_manager::{Session, SessionConfig, SessionStatus, SessionType};
+use crate::session_manager::{Session, SessionConfig, SessionStatus};
 
 /// Request to start a new unified session
 #[derive(Debug, Deserialize)]
 struct StartSessionRequest {
-    /// Session type
-    session_type: String, // "prompt_workflow", "ai_builder", "one_shot"
     /// Session name (for display)
     name: String,
     /// Initial prompt content
@@ -5002,27 +4438,9 @@ async fn start_session(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<StartSessionRequest>,
 ) -> Result<Json<ApiResponse<StartSessionResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Parse session type
-    let session_type = match request.session_type.as_str() {
-        "prompt_workflow" => SessionType::PromptWorkflow,
-        "ai_builder" => SessionType::AiBuilder,
-        "one_shot" => SessionType::OneShot,
-        other => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(format!("Invalid session type: {}", other))),
-            ))
-        }
-    };
-
-    // Clone values BEFORE moving them into config (for potential continuation sessions)
-    let original_prompt = request.prompt.clone();
-    let continuation_prompt_template = request.continuation_prompt.clone();
-    let session_type_str = request.session_type.clone();
-    let total_phases = request.total_phases;
-    let uses_gui = request.uses_gui;
-    let timeout_seconds = request.timeout_seconds;
+    // Clone values BEFORE moving them into config
     let session_name = request.name.clone();
+    let prompt_for_task_run = request.prompt.clone();
 
     // Multi-session workflow config
     let workflow_checkpoint_path = request.checkpoint_path.clone();
@@ -5051,7 +4469,6 @@ async fn start_session(
     }
 
     let config = SessionConfig {
-        session_type,
         prompt: request.prompt,
         continuation_prompt: request.continuation_prompt,
         total_phases: request.total_phases,
@@ -5066,6 +4483,25 @@ async fn start_session(
     match state.session_manager.start_session(config).await {
         Ok(session) => {
             info!("Started unified session: {}", session.id);
+
+            // Create task_run record for auto-continue tracking
+            // This is critical - without this, auto-continue won't work
+            let task_run_id = session.id.clone();
+            if let Err(e) = state.app_state.checkpoint_db.create_task_run(
+                &task_run_id,
+                &session_name,
+                &prompt_for_task_run,
+                None, // max_sessions - None means unlimited
+                None, // auto_continue - defaults to true
+            ) {
+                warn!(
+                    "Failed to create task_run for session {}: {}",
+                    task_run_id, e
+                );
+                // Continue anyway - session will still run, just without auto-continue tracking
+            } else {
+                info!("Created task_run {} for session tracking", task_run_id);
+            }
 
             // Spawn the execution loop
             let session_id = session.id.clone();
@@ -5097,367 +4533,39 @@ async fn start_session(
                 // Max sessions is a safety limit to prevent infinite loops.
                 // =====================================================================
 
-                // Check if multi-session workflow is enabled
-                let has_workflow_config =
-                    workflow_checkpoint_path.is_some() && workflow_completion_value.is_some();
+                // Simple session execution - task_runs table handles state tracking
+                // The TaskMonitor captures output to task_runs.output_log
+                // [TASK_COMPLETE] in output signals completion
+                // Startup resume handles continuation after restart
 
-                if !has_workflow_config {
-                    // No workflow config - run single session and exit
-                    info!("No multi-session workflow config. Running single session.");
-                    run_unified_session_loop(
-                        state_clone.clone(),
-                        session_id.clone(),
-                        workspace_root.clone(),
-                        None, // No external checkpoint for single session
-                    )
-                    .await;
-                    return;
+                info!("Starting session '{}' (id: {})", session_name, session_id);
+
+                // Log session start
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                    .open(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log") {
+                    use std::io::Write;
+                    let _ = writeln!(f, "[{}] START_SESSION: name={}, id={}",
+                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                        session_name, session_id);
                 }
 
-                // Multi-session workflow enabled
-                info!(
-                    "Multi-session workflow ENABLED. Entering continuation loop with checkpoint_path and completion_value."
-                );
-                // Safe to use expect here as has_workflow_config guarantees these are Some
-                let checkpoint_path_str = workflow_checkpoint_path
-                    .expect("workflow_checkpoint_path verified as Some above");
-                let checkpoint_path = std::path::PathBuf::from(&checkpoint_path_str);
-                let phase_field = workflow_phase_field;
-                let completion_value = workflow_completion_value
-                    .expect("workflow_completion_value verified as Some above");
-
-                const MAX_CROSS_SESSION_ITERATIONS: u32 = 20; // Safety limit
-                let mut cross_session_count = 0u32;
-                let mut current_session_id = session_id.clone();
-
-                // Save active workflow config for resume-on-startup
-                let workflow_run_id = uuid::Uuid::new_v4().to_string();
-                let active_config = ActiveWorkflowConfig {
-                    run_id: workflow_run_id.clone(),
-                    session_type: session_type_str.clone(),
-                    name: session_name.clone(),
-                    prompt: original_prompt.clone(),
-                    continuation_prompt: continuation_prompt_template.clone(),
-                    total_phases,
-                    uses_gui,
-                    timeout_seconds,
-                    checkpoint_path: checkpoint_path_str.clone(),
-                    phase_field: phase_field.clone(),
-                    completion_value,
-                    started_at: chrono::Utc::now().to_rfc3339(),
-                    cross_session_count: 0,
-                    auto_continue: true, // Default to true for prompts
-                };
-                if let Err(e) = save_active_workflow_config(&active_config) {
-                    warn!("Failed to save active workflow config: {}", e);
-                }
-
-                // Create session context for AI output events
-                // Use workflow_run_id to group all continuations together
+                // Create session context for grouping output
                 let session_ctx = AiOutputSessionContext {
-                    session_id: Some(workflow_run_id.clone()),
+                    session_id: Some(session_id.clone()),
                     session_name: Some(session_name.clone()),
                 };
 
-                loop {
-                    cross_session_count += 1;
-                    info!(
-                        "Starting cross-session iteration {} (session: {})",
-                        cross_session_count, current_session_id
-                    );
+                // Run the session
+                run_unified_session_loop(
+                    state_clone.clone(),
+                    session_id.clone(),
+                    workspace_root.clone(),
+                    None, // No external checkpoint - database tracks state
+                    Some(session_ctx),
+                )
+                .await;
 
-                    // Read the current external checkpoint phase before starting the session
-                    // This allows the internal loop to detect when the phase advances
-                    let initial_ext_phase: u32 = if checkpoint_path.exists() {
-                        std::fs::read_to_string(&checkpoint_path)
-                            .ok()
-                            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                            .and_then(|j| j.get(&phase_field).and_then(|v| v.as_u64()))
-                            .unwrap_or(0) as u32
-                    } else {
-                        0
-                    };
-
-                    // Run the session loop (handles phases within this session)
-                    // Pass external checkpoint info so the loop can exit when the phase advances
-                    run_unified_session_loop(
-                        state_clone.clone(),
-                        current_session_id.clone(),
-                        workspace_root.clone(),
-                        Some((
-                            checkpoint_path.clone(),
-                            phase_field.clone(),
-                            initial_ext_phase,
-                        )),
-                    )
-                    .await;
-
-                    info!(
-                        "Session loop completed for session {}. Checking checkpoint for continuation...",
-                        current_session_id
-                    );
-
-                    // Debug: Write to file-based log for tracing
-                    let debug_log_path = std::path::PathBuf::from("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log");
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&debug_log_path)
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            file,
-                            "[{}] Session {} completed. Checking checkpoint at {:?} for phase_field={}, completion_value={}",
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                            current_session_id,
-                            checkpoint_path,
-                            phase_field,
-                            completion_value
-                        );
-                    }
-
-                    // After session ends, check if we should spawn a continuation
-                    let checkpoint_result = check_external_checkpoint_status(
-                        &checkpoint_path,
-                        &phase_field,
-                        completion_value,
-                    );
-
-                    // Debug: Log the checkpoint check result
-                    if let Ok(mut file) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
-                    {
-                        use std::io::Write;
-                        let _ = writeln!(
-                            file,
-                            "[{}] Checkpoint check result: {:?}",
-                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                            checkpoint_result
-                        );
-                    }
-
-                    if let Some((is_complete, current_phase)) = checkpoint_result {
-                        // Debug: Log the branch we're taking
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "[{}] Checkpoint result: is_complete={}, current_phase={}, completion_value={}, cross_session_count={}/{}",
-                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                is_complete, current_phase, completion_value, cross_session_count, MAX_CROSS_SESSION_ITERATIONS
-                            );
-                        }
-
-                        if is_complete {
-                            info!(
-                                "Workflow complete: {}={} >= completion_value={}. Finished after {} sessions.",
-                                phase_field, current_phase, completion_value, cross_session_count
-                            );
-                            emit_ai_output(
-                                &state_clone.app_handle,
-                                &format!(
-                                    "✅ Workflow completed after {} sessions (phase {} >= {})",
-                                    cross_session_count, current_phase, completion_value
-                                ),
-                                "status",
-                                Some(&current_session_id),
-                                Some(&session_ctx),
-                            );
-                            // Delete the active workflow config since workflow is complete
-                            delete_active_workflow_config();
-                            // Also delete the checkpoint file now that workflow is truly complete
-                            // (Previously this was done by Claude during the session, but that caused
-                            // issues when the unified session loop ran another phase after deletion)
-                            if let Err(e) = std::fs::remove_file(&checkpoint_path) {
-                                warn!(
-                                    "Failed to delete checkpoint file {:?}: {}",
-                                    checkpoint_path, e
-                                );
-                            } else {
-                                info!("Deleted checkpoint file: {:?}", checkpoint_path);
-                            }
-                            break;
-                        }
-
-                        // Not complete - check if we should continue
-                        if cross_session_count >= MAX_CROSS_SESSION_ITERATIONS {
-                            warn!(
-                                "Reached max cross-session iterations ({}). Stopping to prevent infinite loop.",
-                                MAX_CROSS_SESSION_ITERATIONS
-                            );
-                            emit_ai_output(
-                                &state_clone.app_handle,
-                                &format!(
-                                    "⚠️ Reached max sessions ({}). Phase {} of {}.",
-                                    MAX_CROSS_SESSION_ITERATIONS, current_phase, completion_value
-                                ),
-                                "warning",
-                                Some(&current_session_id),
-                                Some(&session_ctx),
-                            );
-                            break;
-                        }
-
-                        // Spawn a continuation session
-                        info!(
-                            "Workflow not complete (phase {} < {}). Spawning continuation session ({}/{})",
-                            current_phase, completion_value, cross_session_count + 1, MAX_CROSS_SESSION_ITERATIONS
-                        );
-
-                        // Debug: Log continuation spawn attempt
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                file,
-                                "[{}] SPAWNING_CONTINUATION: phase {} < {}, session {}/{}",
-                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                current_phase, completion_value, cross_session_count + 1, MAX_CROSS_SESSION_ITERATIONS
-                            );
-                        }
-
-                        // Create continuation config with modified prompt
-                        let continuation_config = SessionConfig {
-                            session_type: match session_type_str.as_str() {
-                                "prompt_workflow" => SessionType::PromptWorkflow,
-                                "ai_builder" => SessionType::AiBuilder,
-                                _ => SessionType::OneShot,
-                            },
-                            prompt: format!(
-                                "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n\nIMPORTANT: When updating the checkpoint, include run_id: \"{}\"\n",
-                                original_prompt,
-                                cross_session_count + 1,
-                                phase_field,
-                                current_phase,
-                                checkpoint_path.display(),
-                                phase_field,
-                                completion_value,
-                                workflow_run_id
-                            ),
-                            continuation_prompt: continuation_prompt_template.clone(),
-                            total_phases,
-                            uses_gui,
-                            timeout_seconds,
-                            stall_threshold_seconds: 300,
-                            name: format!("{}-cont-{}", session_name, cross_session_count + 1),
-                            description: format!("Continuation session {} of workflow (phase {}/{})", cross_session_count + 1, current_phase, completion_value),
-                            custom_config: serde_json::json!({}),
-                        };
-
-                        match state_clone
-                            .session_manager
-                            .start_session(continuation_config)
-                            .await
-                        {
-                            Ok(new_session) => {
-                                current_session_id = new_session.id.clone();
-
-                                // Debug: Log continuation success
-                                if let Ok(mut file) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
-                                {
-                                    use std::io::Write;
-                                    let _ = writeln!(
-                                        file,
-                                        "[{}] CONTINUATION_STARTED: session_id={}, will run run_unified_session_loop next",
-                                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                        current_session_id
-                                    );
-                                }
-
-                                emit_ai_output(
-                                    &state_clone.app_handle,
-                                    &format!(
-                                        "🔄 Continuation session {} (phase {}/{}, id: {})",
-                                        cross_session_count + 1,
-                                        current_phase,
-                                        completion_value,
-                                        current_session_id
-                                    ),
-                                    "status",
-                                    Some(&current_session_id),
-                                    Some(&session_ctx),
-                                );
-                                // Update the cross_session_count in the active workflow config
-                                update_active_workflow_cross_session_count(cross_session_count + 1);
-                                // Continue the loop - this will run run_unified_session_loop again
-                            }
-                            Err(e) => {
-                                error!("Failed to create continuation session: {}", e);
-
-                                // Debug: Log continuation failure
-                                if let Ok(mut file) = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
-                                {
-                                    use std::io::Write;
-                                    let _ = writeln!(
-                                        file,
-                                        "[{}] CONTINUATION_FAILED: error={}",
-                                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                        e
-                                    );
-                                }
-
-                                emit_ai_output(
-                                    &state_clone.app_handle,
-                                    &format!("❌ Failed to spawn continuation: {}", e),
-                                    "error",
-                                    Some(&current_session_id),
-                                    Some(&session_ctx),
-                                );
-                                break;
-                            }
-                        }
-                    } else {
-                        // Checkpoint file not found or unreadable
-                        // Debug: Log this case
-                        if let Ok(mut file) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/workflow-debug.log")
-                        {
-                            use std::io::Write;
-                            let checkpoint_exists = checkpoint_path.exists();
-                            let checkpoint_contents = std::fs::read_to_string(&checkpoint_path).ok();
-                            let _ = writeln!(
-                                file,
-                                "[{}] STOPPING: Checkpoint not found or unreadable. exists={}, contents={:?}",
-                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                checkpoint_exists,
-                                checkpoint_contents
-                            );
-                        }
-
-                        warn!(
-                            "Checkpoint not found or unreadable at {:?}. Stopping workflow.",
-                            checkpoint_path
-                        );
-                        emit_ai_output(
-                            &state_clone.app_handle,
-                            &format!(
-                                "⚠️ Checkpoint not found: {}. Session complete.",
-                                checkpoint_path.display()
-                            ),
-                            "warning",
-                            Some(&current_session_id),
-                            Some(&session_ctx),
-                        );
-                        break;
-                    }
-                }
+                info!("Session '{}' completed", session_name);
             });
 
             Ok(Json(ApiResponse::success(StartSessionResponse { session })))
@@ -5533,116 +4641,6 @@ fn check_goal_completion_markers(output: &str) -> bool {
     false
 }
 
-// ============================================================================
-// Active Workflow Persistence (for Resume-on-Startup)
-// ============================================================================
-
-/// Configuration for an active multi-session workflow that should be resumed on startup.
-/// This is persisted to `.dev-logs/active-workflow.json` when a multi-session workflow starts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ActiveWorkflowConfig {
-    /// Unique identifier for this workflow run (used for resume matching instead of timestamps)
-    run_id: String,
-    /// Session type ("prompt_workflow", "ai_builder", "one_shot")
-    session_type: String,
-    /// Display name for the workflow
-    name: String,
-    /// Original prompt content
-    prompt: String,
-    /// Continuation prompt template (if any)
-    continuation_prompt: Option<String>,
-    /// Total phases/iterations per session (0 = unlimited)
-    total_phases: u32,
-    /// Whether this workflow uses GUI automation
-    uses_gui: bool,
-    /// Timeout per phase in seconds
-    timeout_seconds: u64,
-    /// Path to the checkpoint JSON file
-    checkpoint_path: String,
-    /// JSON field name in checkpoint that tracks current phase
-    phase_field: String,
-    /// Workflow is complete when phase_field >= this value
-    completion_value: u32,
-    /// When the workflow was started
-    started_at: String,
-    /// Number of cross-session continuations so far
-    cross_session_count: u32,
-    /// Auto-continue on runner restart (default: true for prompts)
-    #[serde(default = "default_auto_continue")]
-    auto_continue: bool,
-}
-
-fn default_auto_continue() -> bool {
-    true
-}
-
-/// Get the path to the active workflow config file
-fn get_active_workflow_config_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(
-        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\active-workflow.json",
-    )
-}
-
-/// Save an active workflow config (called when starting a multi-session workflow)
-fn save_active_workflow_config(config: &ActiveWorkflowConfig) -> Result<(), String> {
-    let path = get_active_workflow_config_path();
-    let json = serde_json::to_string_pretty(config)
-        .map_err(|e| format!("Failed to serialize workflow config: {}", e))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Failed to write workflow config to {:?}: {}", path, e))?;
-    info!("Saved active workflow config to {:?}", path);
-    Ok(())
-}
-
-/// Load an active workflow config (called on startup to check for resumption)
-fn load_active_workflow_config() -> Option<ActiveWorkflowConfig> {
-    let path = get_active_workflow_config_path();
-    if !path.exists() {
-        return None;
-    }
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => match serde_json::from_str::<ActiveWorkflowConfig>(&contents) {
-            Ok(config) => {
-                info!(
-                    "Loaded active workflow config: {} (phase_field={}, completion_value={})",
-                    config.name, config.phase_field, config.completion_value
-                );
-                Some(config)
-            }
-            Err(e) => {
-                warn!("Failed to parse active workflow config: {}", e);
-                None
-            }
-        },
-        Err(e) => {
-            warn!("Failed to read active workflow config: {}", e);
-            None
-        }
-    }
-}
-
-/// Delete the active workflow config (called when workflow completes or is stopped)
-fn delete_active_workflow_config() {
-    let path = get_active_workflow_config_path();
-    if path.exists() {
-        if let Err(e) = std::fs::remove_file(&path) {
-            warn!("Failed to delete active workflow config: {}", e);
-        } else {
-            info!("Deleted active workflow config (workflow complete)");
-        }
-    }
-}
-
-/// Update the cross_session_count in the active workflow config
-fn update_active_workflow_cross_session_count(count: u32) {
-    if let Some(mut config) = load_active_workflow_config() {
-        config.cross_session_count = count;
-        if let Err(e) = save_active_workflow_config(&config) {
-            warn!("Failed to update cross_session_count: {}", e);
-        }
-    }
-}
-
 /// Information about a single active session
 #[derive(Debug, Clone, Serialize)]
 struct ActiveSessionInfo {
@@ -5650,8 +4648,6 @@ struct ActiveSessionInfo {
     id: String,
     /// Display name
     name: String,
-    /// Session type (prompt_workflow, ai_builder, one_shot)
-    session_type: String,
     /// Current status (running, waiting_for_continuation, etc.)
     status: String,
     /// When the session started
@@ -5671,8 +4667,6 @@ struct ResumableWorkflowInfo {
     auto_continue_enabled: bool,
     /// Workflow name (if resumable)
     name: Option<String>,
-    /// Session type
-    session_type: Option<String>,
     /// Current phase/iteration
     current_phase: Option<u32>,
     /// Total phases (0 = unlimited)
@@ -5689,15 +4683,12 @@ struct ResumableWorkflowInfo {
 }
 
 /// Get information about any resumable workflow
+/// Uses task_runs table from database - no more external checkpoint files
 async fn get_resumable_workflow(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<ResumableWorkflowInfo>> {
     // Check if AI is currently running
-    // We check both the ai_analysis_running flag (for standard mode)
-    // AND the session manager (for persistent session mode)
-    let ai_analysis_running = state
-        .ai_analysis_running
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let has_running_tasks = has_running_ai_tasks();
 
     // Also check session manager for running sessions
     let sessions = state.session_manager.list_sessions().await;
@@ -5709,7 +4700,7 @@ async fn get_resumable_workflow(
         )
     });
 
-    let is_running = ai_analysis_running || has_running_session;
+    let is_running = has_running_tasks || has_running_session;
 
     // Collect info about all active sessions for the UI
     let active_sessions: Vec<ActiveSessionInfo> = sessions
@@ -5725,115 +4716,63 @@ async fn get_resumable_workflow(
         .map(|s| ActiveSessionInfo {
             id: s.id.clone(),
             name: s.config.name.clone(),
-            session_type: format!("{:?}", s.config.session_type),
             status: format!("{:?}", s.status),
             started_at: s.checkpoint.started_at.clone(),
             uses_gui: s.config.uses_gui,
         })
         .collect();
 
-    // Get the global auto-continue setting (included in every response for UI sync)
+    // Get the global auto-continue setting
     let auto_continue_enabled = settings::get_auto_continue_ai_workflow();
 
-    // Load the active workflow config
-    let config = match load_active_workflow_config() {
-        Some(c) => c,
-        None => {
+    // Get running tasks from database
+    let db = match CheckpointDb::new() {
+        Ok(db) => db,
+        Err(_) => {
             return Json(ApiResponse::success(ResumableWorkflowInfo {
                 has_resumable: false,
                 is_running,
                 auto_continue_enabled,
                 name: None,
-                session_type: None,
                 current_phase: None,
                 total_phases: None,
                 started_at: None,
                 cross_session_count: None,
                 status: None,
-                active_sessions: active_sessions.clone(),
+                active_sessions,
             }));
         }
     };
 
-    // Check if restart is permitted
-    let checkpoint_path = std::path::PathBuf::from(&config.checkpoint_path);
-    if !check_workflow_restart_permitted(&checkpoint_path) {
+    let running_tasks = db.get_running_task_runs().unwrap_or_default();
+
+    if running_tasks.is_empty() {
         return Json(ApiResponse::success(ResumableWorkflowInfo {
             has_resumable: false,
             is_running,
             auto_continue_enabled,
             name: None,
-            session_type: None,
             current_phase: None,
             total_phases: None,
             started_at: None,
             cross_session_count: None,
             status: None,
-            active_sessions: active_sessions.clone(),
+            active_sessions,
         }));
     }
 
-    // Check if the workflow is already complete
-    if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
-        &checkpoint_path,
-        &config.phase_field,
-        config.completion_value,
-    ) {
-        if is_complete {
-            // Workflow is complete, clean up
-            delete_active_workflow_config();
-            return Json(ApiResponse::success(ResumableWorkflowInfo {
-                has_resumable: false,
-                is_running,
-                auto_continue_enabled,
-                name: None,
-                session_type: None,
-                current_phase: None,
-                total_phases: None,
-                started_at: None,
-                cross_session_count: None,
-                status: None,
-                active_sessions: active_sessions.clone(),
-            }));
-        }
-
-        // Get status from checkpoint
-        let status = std::fs::read_to_string(&checkpoint_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| {
-                v.get("status")
-                    .and_then(|s| s.as_str())
-                    .map(|s| s.to_string())
-            });
-
-        return Json(ApiResponse::success(ResumableWorkflowInfo {
-            has_resumable: true,
-            is_running,
-            auto_continue_enabled,
-            name: Some(config.name),
-            session_type: Some(config.session_type),
-            current_phase: Some(current_phase),
-            total_phases: Some(config.total_phases),
-            started_at: Some(config.started_at),
-            cross_session_count: Some(config.cross_session_count),
-            status,
-            active_sessions: active_sessions.clone(),
-        }));
-    }
-
-    // No valid checkpoint
+    // Return info about the most recent running task
+    let task = &running_tasks[0];
     Json(ApiResponse::success(ResumableWorkflowInfo {
-        has_resumable: false,
+        has_resumable: true,
         is_running,
         auto_continue_enabled,
-        name: None,
-        session_type: None,
-        current_phase: None,
-        total_phases: None,
-        started_at: None,
-        cross_session_count: None,
-        status: None,
+        name: Some(task.task_name.clone()),
+        current_phase: Some(task.sessions_count),
+        total_phases: task.max_sessions,
+        started_at: Some(task.created_at.clone()),
+        cross_session_count: Some(task.sessions_count),
+        status: Some(task.status.clone()),
         active_sessions,
     }))
 }
@@ -5845,84 +4784,73 @@ struct ResumeWorkflowResponse {
     name: String,
 }
 
-/// Manually resume an active workflow
+/// Manually resume running tasks from database
 async fn resume_workflow(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<ResumeWorkflowResponse>> {
     // Check if AI analysis is already running
-    if state
-        .ai_analysis_running
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if has_running_ai_tasks() {
         return Json(ApiResponse {
             success: false,
             data: None,
             error: Some(
-                "AI analysis is already running. Stop it first before resuming a workflow."
-                    .to_string(),
+                "AI analysis is already running. Stop it first before resuming.".to_string(),
             ),
         });
     }
 
-    // Load the active workflow config
-    let config = match load_active_workflow_config() {
-        Some(c) => c,
-        None => {
+    // Get running tasks from database
+    let db = match CheckpointDb::new() {
+        Ok(db) => db,
+        Err(e) => {
             return Json(ApiResponse {
                 success: false,
                 data: None,
-                error: Some("No active workflow to resume".to_string()),
+                error: Some(format!("Failed to open database: {}", e)),
             });
         }
     };
 
-    // Check if restart is permitted
-    let checkpoint_path = std::path::PathBuf::from(&config.checkpoint_path);
-    if !check_workflow_restart_permitted(&checkpoint_path) {
-        return Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some(
-                "Workflow restart not permitted (restart_permitted=false in checkpoint)"
-                    .to_string(),
-            ),
-        });
-    }
-
-    // Check if the workflow is already complete
-    if let Some((is_complete, _)) = check_external_checkpoint_status(
-        &checkpoint_path,
-        &config.phase_field,
-        config.completion_value,
-    ) {
-        if is_complete {
-            delete_active_workflow_config();
+    let running_tasks = match db.get_running_task_runs() {
+        Ok(tasks) => tasks,
+        Err(e) => {
             return Json(ApiResponse {
                 success: false,
                 data: None,
-                error: Some("Workflow is already complete".to_string()),
+                error: Some(format!("Failed to get running tasks: {}", e)),
             });
         }
+    };
+
+    if running_tasks.is_empty() {
+        return Json(ApiResponse {
+            success: false,
+            data: None,
+            error: Some("No running tasks to resume".to_string()),
+        });
     }
 
-    info!("Manually resuming workflow: {}", config.name);
-    let workflow_name = config.name.clone();
+    let task_name = running_tasks[0].task_name.clone();
+    info!("Manually resuming {} running task(s)", running_tasks.len());
 
-    // Call the resume function (spawn it so we don't block)
+    // Resume all running tasks
     let state_clone = state.clone();
     tokio::spawn(async move {
-        resume_active_workflow_on_startup(state_clone).await;
+        resume_all_running_tasks_on_startup(state_clone).await;
     });
 
     Json(ApiResponse::success(ResumeWorkflowResponse {
-        message: format!("Resuming workflow: {}", workflow_name),
-        name: workflow_name,
+        message: format!("Resuming {} task(s)", running_tasks.len()),
+        name: task_name,
     }))
 }
 
 /// Request body for force continue
 #[derive(Debug, Deserialize)]
 struct ForceContinueRequest {
+    /// Optional task run ID to continue (if not provided, continues most recent running task)
+    #[serde(default)]
+    task_run_id: Option<String>,
     /// Optional custom continuation prompt (if not provided, uses a default)
     #[serde(default)]
     prompt: Option<String>,
@@ -5942,11 +4870,8 @@ async fn force_continue_session(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ForceContinueRequest>,
 ) -> Json<ApiResponse<ForceContinueResponse>> {
-    // Check if AI analysis is already running
-    if state
-        .ai_analysis_running
-        .load(std::sync::atomic::Ordering::Relaxed)
-    {
+    // Check if AI analysis is already running (using database)
+    if has_running_ai_tasks() {
         return Json(ApiResponse {
             success: false,
             data: None,
@@ -5971,88 +4896,95 @@ async fn force_continue_session(
         });
     }
 
-    // Check if there's an active workflow config - if so, use it for proper cross-session continuation
-    if let Some(active_config) = load_active_workflow_config() {
-        info!(
-            "Force continue: Found active workflow '{}', using checkpoint at {:?}",
-            active_config.name, active_config.checkpoint_path
-        );
+    // Check for running tasks in the database - use output_log for context
+    let db = match CheckpointDb::new() {
+        Ok(d) => d,
+        Err(e) => {
+            warn!("Could not open database: {}", e);
+            // Fall through to simple continuation
+            return force_continue_simple(state, request).await;
+        }
+    };
 
-        // Sync auto-continue setting from active workflow to global setting
-        // This ensures the UI checkbox reflects the workflow's auto-continue state
-        if active_config.auto_continue {
-            if let Err(e) = settings::save_auto_continue_ai_workflow(true) {
-                warn!("Failed to sync auto-continue setting: {}", e);
-            } else {
-                info!("Synced auto-continue setting to enabled (from active workflow)");
+    // If a specific task_run_id is provided, look up that task
+    // Otherwise, fall back to the most recent running task
+    let task = if let Some(ref task_run_id) = request.task_run_id {
+        match db.get_task_run(task_run_id) {
+            Ok(Some(t)) => Some(t),
+            Ok(None) => {
+                warn!("Task run with id '{}' not found", task_run_id);
+                None
+            }
+            Err(e) => {
+                warn!("Failed to get task run '{}': {}", task_run_id, e);
+                None
             }
         }
+    } else {
+        // Fall back to most recent running task
+        db.get_running_task_runs()
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+    };
 
-        let checkpoint_path = std::path::PathBuf::from(&active_config.checkpoint_path);
-        let phase_field = active_config.phase_field.clone();
-        let completion_value = active_config.completion_value;
+    if let Some(task) = task {
+        info!(
+            "Force continue: Using task '{}' (id: {}), using output_log for context",
+            task.task_name, task.id
+        );
+
         let workspace_root = get_workspace_paths_internal()
             .map(|(root, _, _)| root.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
-        // Read the current checkpoint to get context, or create a minimal one if missing
-        let checkpoint_info = if checkpoint_path.exists() {
-            std::fs::read_to_string(&checkpoint_path)
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+        // Get context from output_log (last 4000 chars)
+        let output_context = if task.output_log.len() > 4000 {
+            format!(
+                "[... {} chars omitted ...]\n\n{}",
+                task.output_log.len() - 4000,
+                &task.output_log[task.output_log.len() - 4000..]
+            )
         } else {
-            // Checkpoint file doesn't exist - create a minimal one to allow continuation
-            info!("Force continue: Checkpoint file doesn't exist, creating minimal checkpoint");
-            let minimal_checkpoint = serde_json::json!({
-                phase_field.clone(): 0,
-                "run_id": active_config.run_id,
-                "started_at": chrono::Utc::now().to_rfc3339(),
-                "restart_permitted": true,
-                "created_by": "force_continue"
-            });
-            if let Err(e) = std::fs::write(
-                &checkpoint_path,
-                serde_json::to_string_pretty(&minimal_checkpoint).unwrap_or_default(),
-            ) {
-                warn!("Failed to create minimal checkpoint: {}", e);
-                None
-            } else {
-                info!("Created minimal checkpoint at {:?}", checkpoint_path);
-                Some(minimal_checkpoint)
-            }
+            task.output_log.clone()
         };
 
-        let current_phase = checkpoint_info
-            .as_ref()
-            .and_then(|j| j.get(&phase_field).and_then(|v| v.as_u64()))
-            .unwrap_or(0) as u32;
-
-        // Create continuation prompt with checkpoint context
+        // Create continuation prompt using task's prompt and output context
         let continuation_prompt = request.prompt.unwrap_or_else(|| {
             format!(
-                "Continue the '{}' workflow from phase {}. Check your checkpoint file and resume from where you left off.",
-                active_config.name, current_phase
+                "{}\n\n## Force Continue (Session #{})\n\n\
+                The previous session was interrupted. Here's the output from the previous session:\n\n\
+                ### Previous Session Output\n```\n{}\n```\n\n\
+                Continue the task from where you left off. When complete, print [TASK_COMPLETE].",
+                task.prompt,
+                task.sessions_count + 1,
+                output_context
             )
         });
 
-        // Create a prompt workflow session that uses the checkpoint
-        let session_name = format!("{} (Force Continue)", active_config.name);
+        // Create session name
+        let session_name = format!(
+            "{} (Force Continue #{})",
+            task.task_name,
+            task.sessions_count + 1
+        );
+
         let config = crate::session_manager::SessionConfig {
-            session_type: crate::session_manager::SessionType::PromptWorkflow,
-            prompt: continuation_prompt.clone(),
-            continuation_prompt: Some(continuation_prompt),
-            total_phases: active_config.total_phases,
-            uses_gui: active_config.uses_gui,
-            timeout_seconds: active_config.timeout_seconds,
+            prompt: continuation_prompt,
+            continuation_prompt: None,
+            total_phases: 1,
+            uses_gui: false,
+            timeout_seconds: 1800,
             stall_threshold_seconds: 300,
             name: session_name.clone(),
-            description: "Force continued session".to_string(),
-            custom_config: serde_json::json!({
-                "checkpoint_path": active_config.checkpoint_path,
-                "phase_field": phase_field,
-                "completion_value": completion_value,
-            }),
+            description: format!("Force continued session #{}", task.sessions_count + 1),
+            custom_config: serde_json::json!({}),
         };
+
+        // Get task_id for context grouping
+        let task_id = task.id.clone();
+
+        // Note: sessions_count will be incremented when output is appended via append_task_output
 
         match state.session_manager.start_session(config).await {
             Ok(session) => {
@@ -6060,61 +4992,20 @@ async fn force_continue_session(
                 let state_clone = state.clone();
                 let sid = session_id.clone();
 
-                // Increment cross_session_count
-                update_active_workflow_cross_session_count(active_config.cross_session_count + 1);
+                // Create session context for grouping output
+                let run_ctx = AiOutputSessionContext {
+                    session_id: Some(task_id),
+                    session_name: Some(session_name),
+                };
 
-                // Spawn the cross-session continuation loop
+                // Spawn the execution
                 tokio::spawn(async move {
-                    // Run with external checkpoint monitoring for proper continuation
-                    let initial_ext_phase = current_phase;
-
-                    loop {
-                        run_unified_session_loop(
-                            state_clone.clone(),
-                            sid.clone(),
-                            workspace_root.clone(),
-                            Some((
-                                checkpoint_path.clone(),
-                                phase_field.clone(),
-                                initial_ext_phase,
-                            )),
-                        )
+                    run_unified_session_loop(state_clone, sid, workspace_root, None, Some(run_ctx))
                         .await;
-
-                        // Check checkpoint status after session ends
-                        let checkpoint_result = check_external_checkpoint_status(
-                            &checkpoint_path,
-                            &phase_field,
-                            completion_value,
-                        );
-
-                        match checkpoint_result {
-                            Some((true, phase)) => {
-                                info!("Workflow completed at phase {}. Cleaning up.", phase);
-                                // Delete the checkpoint and active workflow config
-                                let _ = std::fs::remove_file(&checkpoint_path);
-                                delete_active_workflow_config();
-                                break;
-                            }
-                            Some((false, phase)) => {
-                                info!("Checkpoint at phase {}, not complete. Spawning continuation...", phase);
-                                // Continue the loop to spawn another session
-                                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                            }
-                            None => {
-                                info!("No checkpoint found. Ending workflow.");
-                                delete_active_workflow_config();
-                                break;
-                            }
-                        }
-                    }
                 });
 
                 return Json(ApiResponse::success(ForceContinueResponse {
-                    message: format!(
-                        "Force continue with workflow checkpoint (phase {})",
-                        current_phase
-                    ),
+                    message: "Force continue from running task".to_string(),
                     session_id,
                 }));
             }
@@ -6128,7 +5019,16 @@ async fn force_continue_session(
         }
     }
 
-    // Fallback: No active workflow config - use simple one-shot continuation
+    // No running tasks - use simple one-shot continuation
+    force_continue_simple(state, request).await
+}
+
+/// Simple force continue without task context - reads ai-output.jsonl for context
+async fn force_continue_simple(
+    state: Arc<ApiState>,
+    request: ForceContinueRequest,
+) -> Json<ApiResponse<ForceContinueResponse>> {
+    // Fallback: No running task - use simple one-shot continuation
     info!("Force continue: No active workflow config found. Using simple one-shot continuation.");
 
     // Read the last AI output to provide context
@@ -6183,9 +5083,8 @@ async fn force_continue_session(
         continuation_prompt.len()
     );
 
-    // Create a one-shot session to continue
+    // Create a session to continue
     let config = crate::session_manager::SessionConfig {
-        session_type: crate::session_manager::SessionType::OneShot,
         prompt: continuation_prompt,
         continuation_prompt: None,
         total_phases: 1,
@@ -6209,7 +5108,7 @@ async fn force_continue_session(
                 .unwrap_or_else(|_| ".".to_string());
 
             tokio::spawn(async move {
-                run_unified_session_loop(state_clone, sid, workspace_root, None).await;
+                run_unified_session_loop(state_clone, sid, workspace_root, None, None).await;
             });
 
             Json(ApiResponse::success(ForceContinueResponse {
@@ -6275,494 +5174,281 @@ struct WorkflowAutoContinueResponse {
 }
 
 /// Get the auto-continue setting for the active workflow
+/// Now uses global setting and checks for running tasks in database
 async fn get_workflow_auto_continue() -> Json<ApiResponse<WorkflowAutoContinueResponse>> {
-    match load_active_workflow_config() {
-        Some(config) => Json(ApiResponse::success(WorkflowAutoContinueResponse {
-            enabled: config.auto_continue,
-            workflow_name: Some(config.name),
-        })),
-        None => Json(ApiResponse {
-            success: false,
-            data: None,
-            error: Some("No active workflow found".to_string()),
-        }),
-    }
+    let enabled = settings::get_auto_continue_ai_workflow();
+
+    // Check if there are any running tasks
+    let workflow_name = if let Ok(db) = CheckpointDb::new() {
+        db.get_running_task_runs()
+            .ok()
+            .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
+    } else {
+        None
+    };
+
+    Json(ApiResponse::success(WorkflowAutoContinueResponse {
+        enabled,
+        workflow_name,
+    }))
 }
 
 /// Set the auto-continue setting for the active workflow
-/// This can be called during workflow execution to toggle auto-continue on/off
+/// Now just updates the global setting
 async fn set_workflow_auto_continue(
     Json(body): Json<SetAutoContinueRequest>,
 ) -> Json<ApiResponse<WorkflowAutoContinueResponse>> {
-    let config = match load_active_workflow_config() {
-        Some(c) => c,
-        None => {
-            return Json(ApiResponse {
-                success: false,
-                data: None,
-                error: Some("No active workflow found".to_string()),
-            });
-        }
-    };
-
-    // Update the auto_continue field
-    let updated_config = ActiveWorkflowConfig {
-        auto_continue: body.enabled,
-        ..config
-    };
-
-    // Save the updated config
-    match save_active_workflow_config(&updated_config) {
+    // Update the global setting
+    match settings::save_auto_continue_ai_workflow(body.enabled) {
         Ok(_) => {
-            info!(
-                "Workflow '{}' auto-continue updated to: {}",
-                updated_config.name, body.enabled
-            );
+            info!("Auto-continue setting updated to: {}", body.enabled);
+
+            // Get the active workflow name if any
+            let workflow_name = if let Ok(db) = CheckpointDb::new() {
+                db.get_running_task_runs()
+                    .ok()
+                    .and_then(|tasks| tasks.first().map(|t| t.task_name.clone()))
+            } else {
+                None
+            };
+
             Json(ApiResponse::success(WorkflowAutoContinueResponse {
                 enabled: body.enabled,
-                workflow_name: Some(updated_config.name),
+                workflow_name,
             }))
         }
         Err(e) => Json(ApiResponse {
             success: false,
             data: None,
-            error: Some(format!("Failed to update workflow auto-continue: {}", e)),
+            error: Some(format!("Failed to update auto-continue setting: {}", e)),
         }),
     }
 }
 
-/// Check the active workflow checkpoint for restart_permitted flag
-/// Returns (should_resume, restart_permitted_value)
-/// - Always resumes incomplete workflows (completed=false) regardless of restart_permitted
-/// - restart_permitted is now informational only (legacy behavior was too strict)
-fn check_workflow_restart_permitted(checkpoint_path: &std::path::Path) -> bool {
-    if !checkpoint_path.exists() {
-        return false;
-    }
-    match std::fs::read_to_string(checkpoint_path) {
-        Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
-            Ok(json) => {
-                // Check if workflow is complete - if so, don't resume
-                let is_complete = json
-                    .get("completed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
+/// Check if the supervisor is available on port 9875.
+/// Used to determine what restart instructions to give AI sessions.
+fn check_supervisor_available() -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
 
-                if is_complete {
-                    info!("Workflow is marked as complete, not resuming");
-                    return false;
-                }
-
-                // Check restart_permitted flag (informational)
-                let restart_permitted = json
-                    .get("restart_permitted")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-
-                if !restart_permitted {
-                    // Log warning but still resume - incomplete workflows should always resume
-                    warn!(
-                        "restart_permitted=false but workflow is incomplete (completed=false). \
-                         Resuming anyway - set completed=true to stop a workflow."
-                    );
-                }
-
-                // Always resume incomplete workflows
-                true
-            }
-            Err(_) => false,
-        },
+    // Try to connect to supervisor health endpoint
+    match TcpStream::connect_timeout(
+        &"127.0.0.1:9875".parse().unwrap(),
+        Duration::from_millis(500),
+    ) {
+        Ok(_) => true,
         Err(_) => false,
     }
 }
 
-/// Resume an active workflow on startup if one exists and should be resumed.
-/// This is called during server startup to check for workflows that were interrupted
-/// (e.g., by runner restart during code changes).
-async fn resume_active_workflow_on_startup(state: Arc<ApiState>) {
-    // Load the active workflow config
-    let config = match load_active_workflow_config() {
-        Some(c) => c,
-        None => {
-            info!("No active workflow to resume on startup");
-            return;
+/// Resume ALL running tasks from the database on startup.
+///
+/// This is the single, clean system for auto-continue:
+/// 1. Query task_runs WHERE status = 'running'
+/// 2. For EACH running task, spawn a continuation session
+/// 3. The AI reads output_log to understand context and continue
+///
+/// Returns the number of tasks resumed.
+async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize {
+    // Open the database
+    let db = match CheckpointDb::new() {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("Failed to open database for task resume: {}", e);
+            return 0;
         }
     };
 
-    // Sync auto-continue setting from active workflow to global setting
-    // This ensures the UI checkbox reflects the workflow's auto-continue state after restart
-    if config.auto_continue {
-        if let Err(e) = settings::save_auto_continue_ai_workflow(true) {
-            warn!("Failed to sync auto-continue setting on startup: {}", e);
-        } else {
-            info!("Synced auto-continue setting to enabled (from active workflow on startup)");
+    // Get all running task runs
+    let running_tasks = match db.get_running_task_runs() {
+        Ok(tasks) => tasks,
+        Err(e) => {
+            warn!("Failed to get running task runs: {}", e);
+            return 0;
         }
+    };
+
+    if running_tasks.is_empty() {
+        info!("No running tasks found in database to resume");
+        return 0;
     }
 
-    info!(
-        "Found active workflow '{}' to potentially resume (checkpoint: {}, phase_field: {}, completion_value: {})",
-        config.name, config.checkpoint_path, config.phase_field, config.completion_value
-    );
-
-    // Check if restart is permitted
-    let checkpoint_path = std::path::PathBuf::from(&config.checkpoint_path);
-    if !check_workflow_restart_permitted(&checkpoint_path) {
-        info!("Workflow restart not permitted (restart_permitted=false). Not resuming.");
-        return;
+    // Log to debug file
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(
+            f,
+            "[{}] STARTUP_RESUME: Found {} running task(s) in database",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+            running_tasks.len()
+        );
     }
 
-    // Check if this is the same workflow run by comparing run_id
-    // This avoids timezone issues - we use a unique identifier instead of timestamps
-    if let Ok(checkpoint_contents) = std::fs::read_to_string(&checkpoint_path) {
-        if let Ok(checkpoint_json) = serde_json::from_str::<serde_json::Value>(&checkpoint_contents)
-        {
-            if let Some(checkpoint_run_id) = checkpoint_json.get("run_id").and_then(|v| v.as_str())
-            {
-                // Log the run_id check to debug file
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                    .open(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log") {
-                    use std::io::Write;
-                    let _ = writeln!(f, "[{}] RUN_ID_CHECK: checkpoint={}, config={}",
-                        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                        checkpoint_run_id, config.run_id);
-                }
+    info!("Found {} running task(s) to resume", running_tasks.len());
 
-                if checkpoint_run_id != config.run_id {
-                    info!(
-                        "Checkpoint run_id ({}) differs from active-workflow run_id ({}). \
-                         This is a NEW workflow run. Not auto-resuming.",
-                        checkpoint_run_id, config.run_id
-                    );
-                    delete_active_workflow_config();
-                    return;
-                }
-                info!(
-                    "Run IDs match ({}) - same workflow run, proceeding with resume",
-                    checkpoint_run_id
+    // Load the last configuration before resuming (for visual automation)
+    // Must use spawn_blocking because load_config_internal accesses python_bridge
+    // which uses block_on internally - cannot call block_on from async context
+    if let Some(config_path) = settings::get_last_config_path() {
+        info!("Loading last config before resume: {}", config_path);
+        let app_state_clone = state.app_state.clone();
+        let config_path_clone = config_path.clone();
+        let load_result = tokio::task::spawn_blocking(move || {
+            load_config_internal(&app_state_clone, &config_path_clone)
+        })
+        .await;
+
+        match load_result {
+            Ok(Ok(_)) => {
+                info!("Successfully loaded config for resume");
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Failed to load last config: {}. Visual automation may fail.",
+                    e
                 );
-            } else {
-                // No run_id in checkpoint - legacy checkpoint, allow resume
-                info!("No run_id in checkpoint - legacy format, allowing resume");
+            }
+            Err(e) => {
+                warn!(
+                    "spawn_blocking failed for config load: {}. Visual automation may fail.",
+                    e
+                );
             }
         }
     }
 
-    // Check if the workflow is already complete
-    if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
-        &checkpoint_path,
-        &config.phase_field,
-        config.completion_value,
-    ) {
-        if is_complete {
-            info!(
-                "Workflow already complete ({}={} >= {}). Cleaning up.",
-                config.phase_field, current_phase, config.completion_value
-            );
-            delete_active_workflow_config();
-            return;
-        }
+    let mut resumed_count = 0;
 
-        // Workflow is not complete - resume it
+    // Resume EACH running task
+    for task in &running_tasks {
         info!(
-            "Resuming workflow '{}' from phase {} (target: {})",
-            config.name, current_phase, config.completion_value
+            "Resuming task '{}' (id: {}, session #{})",
+            task.task_name,
+            task.id,
+            task.sessions_count + 1
         );
 
-        emit_ai_output(
-            &state.app_handle,
-            &format!(
-                "🔄 Resuming workflow '{}' from phase {} (interrupted by restart)",
-                config.name, current_phase
-            ),
-            "status",
-            None,
-            None,
+        // Build continuation prompt with output context
+        // The AI reads this to understand where to continue from
+        let output_context = if task.output_log.len() > 4000 {
+            // For long outputs, include markers showing we truncated
+            format!(
+                "[... {} chars of earlier output omitted ...]\n\n{}",
+                task.output_log.len() - 4000,
+                &task.output_log[task.output_log.len() - 4000..]
+            )
+        } else {
+            task.output_log.clone()
+        };
+
+        let continuation_prompt = format!(
+            "{}\n\n\
+            ## Resume After Runner Restart (Session #{})\n\n\
+            This session is resuming after a runner restart. \
+            Read the previous output below to understand context and continue from where the last session left off.\n\n\
+            ### Previous Session Output\n\
+            ```\n{}\n```\n\n\
+            Continue the task. When complete, print [TASK_COMPLETE].\n",
+            task.prompt,
+            task.sessions_count + 1,
+            output_context
         );
 
-        // Create a continuation session config
-        let continuation_config = SessionConfig {
-            session_type: match config.session_type.as_str() {
-                "prompt_workflow" => SessionType::PromptWorkflow,
-                "ai_builder" => SessionType::AiBuilder,
-                _ => SessionType::OneShot,
-            },
-            prompt: format!(
-                "{}\n\n## Resume After Runner Restart\n\nThis session is resuming after a runner restart. Read the checkpoint file and continue from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n",
-                config.prompt,
-                config.phase_field,
-                current_phase,
-                config.checkpoint_path,
-                config.phase_field,
-                config.completion_value
-            ),
-            continuation_prompt: config.continuation_prompt.clone(),
-            total_phases: config.total_phases,
-            uses_gui: config.uses_gui,
-            timeout_seconds: config.timeout_seconds,
+        // Create session config
+        let session_config = SessionConfig {
+            prompt: continuation_prompt,
+            continuation_prompt: None,
+            total_phases: 1,
+            uses_gui: false,
+            timeout_seconds: 600,
             stall_threshold_seconds: 300,
-            name: format!("{}-resume", config.name),
-            description: format!("Resumed after runner restart (phase {}/{})", current_phase, config.completion_value),
+            name: format!("{} (resumed)", task.task_name),
+            description: format!(
+                "Resumed after restart - session #{}",
+                task.sessions_count + 1
+            ),
             custom_config: serde_json::json!({}),
         };
 
-        // Start the continuation session
-        match state
-            .session_manager
-            .start_session(continuation_config)
-            .await
-        {
+        // Create session context for AI output events so frontend can display the task name
+        let session_ctx = AiOutputSessionContext {
+            session_id: Some(task.id.clone()),
+            session_name: Some(task.task_name.clone()),
+        };
+
+        // Start the session
+        match state.session_manager.start_session(session_config).await {
             Ok(session) => {
-                info!("Started resume session: {}", session.id);
+                info!(
+                    "Started resume session {} for task '{}'",
+                    session.id, task.task_name
+                );
+
+                emit_ai_output(
+                    &state.app_handle,
+                    &format!(
+                        "🔄 Resuming '{}' (session #{})",
+                        task.task_name,
+                        task.sessions_count + 1
+                    ),
+                    "status",
+                    None,
+                    Some(&session_ctx),
+                );
+
+                // Increment session count
+                if let Err(e) = db.append_task_output(&task.id, "", true) {
+                    warn!(
+                        "Failed to increment session count for task {}: {}",
+                        task.id, e
+                    );
+                }
+
+                // Run the session loop in background
                 let session_id = session.id.clone();
                 let workspace_root = get_workspace_paths_internal()
                     .map(|(root, _, _)| root.to_string_lossy().to_string())
                     .unwrap_or_else(|_| ".".to_string());
 
-                // Spawn the cross-session continuation loop
                 let state_clone = state.clone();
-                let original_prompt = config.prompt.clone();
-                let continuation_prompt_template = config.continuation_prompt.clone();
-                let session_type_str = config.session_type.clone();
-                let session_name = config.name.clone();
-                let total_phases = config.total_phases;
-                let uses_gui = config.uses_gui;
-                let timeout_seconds = config.timeout_seconds;
-                let checkpoint_path_str = config.checkpoint_path.clone();
-                let phase_field = config.phase_field.clone();
-                let completion_value = config.completion_value;
-                let initial_cross_session_count = config.cross_session_count;
+                let task_name = task.task_name.clone();
+                let run_ctx = session_ctx.clone();
 
                 tokio::spawn(async move {
-                    const MAX_CROSS_SESSION_ITERATIONS: u32 = 20;
-                    let mut cross_session_count = initial_cross_session_count;
-                    let mut current_session_id = session_id.clone();
-                    let checkpoint_path = std::path::PathBuf::from(&checkpoint_path_str);
-
-                    loop {
-                        cross_session_count += 1;
-                        info!(
-                            "Resume: Starting cross-session iteration {} (session: {})",
-                            cross_session_count, current_session_id
-                        );
-
-                        // Read the current external checkpoint phase before starting the session
-                        let initial_ext_phase: u32 = if checkpoint_path.exists() {
-                            std::fs::read_to_string(&checkpoint_path)
-                                .ok()
-                                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                                .and_then(|j| j.get(&phase_field).and_then(|v| v.as_u64()))
-                                .unwrap_or(0) as u32
-                        } else {
-                            0
-                        };
-
-                        // Run the session loop with external checkpoint monitoring
-                        run_unified_session_loop(
-                            state_clone.clone(),
-                            current_session_id.clone(),
-                            workspace_root.clone(),
-                            Some((
-                                checkpoint_path.clone(),
-                                phase_field.clone(),
-                                initial_ext_phase,
-                            )),
-                        )
-                        .await;
-
-                        // Check if we should spawn a continuation
-                        if let Some((is_complete, current_phase)) = check_external_checkpoint_status(
-                            &checkpoint_path,
-                            &phase_field,
-                            completion_value,
-                        ) {
-                            if is_complete {
-                                info!(
-                                    "Resume workflow complete: {}={} >= {}. Finished after {} sessions.",
-                                    phase_field, current_phase, completion_value, cross_session_count
-                                );
-                                emit_ai_output(
-                                    &state_clone.app_handle,
-                                    &format!(
-                                        "✅ Resumed workflow completed after {} sessions (phase {} >= {})",
-                                        cross_session_count, current_phase, completion_value
-                                    ),
-                                    "status",
-                                    Some(&current_session_id), None,
-                                );
-                                delete_active_workflow_config();
-                                break;
-                            }
-
-                            if cross_session_count >= MAX_CROSS_SESSION_ITERATIONS {
-                                warn!(
-                                    "Resume: Reached max cross-session iterations ({}). Stopping.",
-                                    MAX_CROSS_SESSION_ITERATIONS
-                                );
-                                emit_ai_output(
-                                    &state_clone.app_handle,
-                                    &format!(
-                                        "⚠️ Reached max sessions ({}). Phase {} of {}.",
-                                        MAX_CROSS_SESSION_ITERATIONS,
-                                        current_phase,
-                                        completion_value
-                                    ),
-                                    "warning",
-                                    Some(&current_session_id),
-                                    None,
-                                );
-                                break;
-                            }
-
-                            // Spawn a continuation session
-                            let continuation_config = SessionConfig {
-                                session_type: match session_type_str.as_str() {
-                                    "prompt_workflow" => SessionType::PromptWorkflow,
-                                    "ai_builder" => SessionType::AiBuilder,
-                                    _ => SessionType::OneShot,
-                                },
-                                prompt: format!(
-                                    "{}\n\n## Continuation Session {}\n\nThis is an automatic continuation. Read the checkpoint file and resume from {}={}.\nCheckpoint: {}\nTarget: {} >= {}\n\nIMPORTANT: When updating the checkpoint, include run_id: \"{}\"\n",
-                                    original_prompt,
-                                    cross_session_count + 1,
-                                    phase_field,
-                                    current_phase,
-                                    checkpoint_path.display(),
-                                    phase_field,
-                                    completion_value,
-                                    config.run_id
-                                ),
-                                continuation_prompt: continuation_prompt_template.clone(),
-                                total_phases,
-                                uses_gui,
-                                timeout_seconds,
-                                stall_threshold_seconds: 300,
-                                name: format!("{}-cont-{}", session_name, cross_session_count + 1),
-                                description: format!("Continuation session {} (phase {}/{})", cross_session_count + 1, current_phase, completion_value),
-                                custom_config: serde_json::json!({}),
-                            };
-
-                            match state_clone
-                                .session_manager
-                                .start_session(continuation_config)
-                                .await
-                            {
-                                Ok(new_session) => {
-                                    current_session_id = new_session.id.clone();
-                                    emit_ai_output(
-                                        &state_clone.app_handle,
-                                        &format!(
-                                            "🔄 Continuation session {} (phase {}/{}, id: {})",
-                                            cross_session_count + 1,
-                                            current_phase,
-                                            completion_value,
-                                            current_session_id
-                                        ),
-                                        "status",
-                                        Some(&current_session_id),
-                                        None,
-                                    );
-                                    update_active_workflow_cross_session_count(
-                                        cross_session_count + 1,
-                                    );
-                                }
-                                Err(e) => {
-                                    error!("Resume: Failed to create continuation session: {}", e);
-                                    break;
-                                }
-                            }
-                        } else {
-                            warn!("Resume: Checkpoint not found or unreadable. Stopping.");
-                            break;
-                        }
-                    }
+                    run_unified_session_loop(
+                        state_clone,
+                        session_id.clone(),
+                        workspace_root,
+                        None,
+                        Some(run_ctx),
+                    )
+                    .await;
+                    info!(
+                        "Resumed session {} completed for '{}'",
+                        session_id, task_name
+                    );
                 });
+
+                resumed_count += 1;
             }
             Err(e) => {
-                error!("Failed to start resume session: {}", e);
+                error!("Failed to resume task '{}': {}", task.task_name, e);
                 emit_ai_output(
                     &state.app_handle,
-                    &format!("❌ Failed to resume workflow: {}", e),
+                    &format!("❌ Failed to resume '{}': {}", task.task_name, e),
                     "error",
                     None,
-                    None,
+                    Some(&session_ctx),
                 );
             }
         }
-    } else {
-        warn!("Could not read checkpoint for resumption. Not resuming.");
-    }
-}
-
-/// Check external checkpoint file for workflow completion status.
-///
-/// # Why This Is Deterministic (Not AI-Managed)
-///
-/// We check the external checkpoint file from the RUNNER, not from the AI, because:
-///
-/// 1. **Reliability**: The AI might forget to spawn a continuation, timeout before
-///    doing so, or exit without saving state. The runner ALWAYS runs after each
-///    Claude session ends, so it can reliably check and continue.
-///
-/// 2. **Edge Case Handling**: If the AI crashes, times out, or hits context limits,
-///    the runner can still read the checkpoint and spawn a continuation. The AI
-///    cannot handle its own failure.
-///
-/// 3. **Iteration Limits**: The runner enforces max_iterations to prevent infinite
-///    loops. The AI might not track this correctly across sessions.
-///
-/// 4. **Single Source of Truth**: The checkpoint file is the authoritative state.
-///    The runner reads it deterministically; the AI just writes to it.
-///
-/// 5. **User Experience**: The user starts improve-all once and walks away.
-///    Multiple sessions may run, but the user is never asked to intervene.
-///
-/// # Arguments
-/// * `checkpoint_path` - Path to the checkpoint JSON file
-/// * `phase_field` - JSON field name that contains the current phase (e.g., "current_phase")
-/// * `completion_value` - Workflow is complete when phase_field >= this value
-///
-/// # Returns
-/// * `Some((true, phase))` - Checkpoint exists and workflow is complete (phase >= completion_value)
-/// * `Some((false, phase))` - Checkpoint exists and workflow is NOT complete (continue)
-/// * `None` - Checkpoint doesn't exist or couldn't be read
-fn check_external_checkpoint_status(
-    checkpoint_path: &std::path::Path,
-    phase_field: &str,
-    completion_value: u32,
-) -> Option<(bool, u32)> {
-    if !checkpoint_path.exists() {
-        return None;
     }
 
-    match std::fs::read_to_string(checkpoint_path) {
-        Ok(contents) => {
-            match serde_json::from_str::<serde_json::Value>(&contents) {
-                Ok(json) => {
-                    // Get current phase from the configured field
-                    let current_phase =
-                        json.get(phase_field).and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
-                    // Workflow is complete when current_phase >= completion_value
-                    let is_complete = current_phase >= completion_value;
-
-                    info!(
-                        "External checkpoint status: {}={}, completion_value={}, is_complete={}",
-                        phase_field, current_phase, completion_value, is_complete
-                    );
-
-                    Some((is_complete, current_phase))
-                }
-                Err(e) => {
-                    warn!("Failed to parse external checkpoint: {}", e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to read external checkpoint: {}", e);
-            None
-        }
-    }
+    resumed_count
 }
 
 /// Run the unified session execution loop
@@ -6774,6 +5460,7 @@ async fn run_unified_session_loop(
     session_id: String,
     workspace_root: String,
     external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
+    run_ctx: Option<AiOutputSessionContext>, // Context for grouping output into a single Run
 ) {
     let session = match state.session_manager.get_session(&session_id).await {
         Some(s) => s,
@@ -6789,16 +5476,17 @@ async fn run_unified_session_loop(
     let continuation_prompt = config.continuation_prompt.clone();
     let app_handle = state.app_handle.clone();
 
-    // Create session context for AI output events - this ensures all output
-    // from this session is grouped together, even across continuation phases
-    let session_ctx = AiOutputSessionContext {
+    // Use provided run context for grouping output, or create a default one for single sessions
+    // For multi-session workflows, run_ctx should have the workflow_run_id
+    // For single sessions, we use the session_id as the run identifier
+    let session_ctx = run_ctx.unwrap_or_else(|| AiOutputSessionContext {
         session_id: Some(session_id.clone()),
         session_name: Some(config.name.clone()),
-    };
+    });
 
     info!(
-        "Starting unified session loop for {} ({:?})",
-        session_id, config.session_type
+        "Starting unified session loop for {}, run_id: {:?}",
+        session_id, session_ctx.session_id
     );
 
     let mut phase = 0u32;
@@ -7021,7 +5709,7 @@ async fn run_unified_session_loop(
 // Checkpoint HTTP API Handlers
 // ============================================================================
 
-use crate::database::{CheckpointData, SessionEvent};
+use crate::database::{CheckpointData, CheckpointDb, SessionEvent, TaskRun};
 
 /// List all active (non-completed) checkpoints.
 async fn list_checkpoints(
@@ -7188,6 +5876,229 @@ async fn get_checkpoint_history(
 // End Checkpoint HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// Task Run HTTP API Handlers
+// ============================================================================
+
+/// Query params for listing task runs.
+#[derive(Debug, Deserialize)]
+struct ListTaskRunsQuery {
+    /// Maximum number of task runs to return (default: 50)
+    limit: Option<u32>,
+}
+
+/// List recent task runs.
+async fn list_task_runs(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<ListTaskRunsQuery>,
+) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
+    let limit = query.limit.unwrap_or(50);
+    state
+        .app_state
+        .checkpoint_db
+        .get_recent_task_runs(limit)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// List only running task runs.
+async fn list_running_task_runs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
+    state
+        .app_state
+        .checkpoint_db
+        .get_running_task_runs()
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Request body for creating a task run.
+#[derive(Debug, Deserialize)]
+struct CreateTaskRunRequest {
+    /// Name/identifier for this task
+    task_name: String,
+    /// The prompt to run
+    prompt: String,
+    /// Maximum number of sessions before giving up (optional)
+    #[serde(default)]
+    max_sessions: Option<u32>,
+    /// Per-run auto-continue setting (defaults to true if not specified)
+    #[serde(default)]
+    auto_continue: Option<bool>,
+}
+
+/// Create a new task run.
+async fn create_task_run(
+    State(state): State<Arc<ApiState>>,
+    Json(req): Json<CreateTaskRunRequest>,
+) -> Result<Json<TaskRun>, (StatusCode, String)> {
+    let id = uuid::Uuid::new_v4().to_string();
+    state
+        .app_state
+        .checkpoint_db
+        .create_task_run(
+            &id,
+            &req.task_name,
+            &req.prompt,
+            req.max_sessions,
+            req.auto_continue,
+        )
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Get a task run by ID.
+async fn get_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Option<TaskRun>>, (StatusCode, String)> {
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Query params for getting task output.
+#[derive(Debug, Deserialize)]
+struct TaskOutputQuery {
+    /// Number of characters from end of output to return (optional)
+    tail_chars: Option<usize>,
+}
+
+/// Get task output (optionally just the tail).
+async fn get_task_output(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<TaskOutputQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // First verify task exists
+    let task_run = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    let output = if let Some(tail_chars) = query.tail_chars {
+        state
+            .app_state
+            .checkpoint_db
+            .get_task_output_tail(&id, tail_chars)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+    } else {
+        task_run.output_log
+    };
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "output": output,
+        "status": task_run.status,
+        "sessions_count": task_run.sessions_count
+    })))
+}
+
+/// Stop a running task run.
+async fn stop_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists first
+    let task_run = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    if task_run.status != "running" {
+        return Ok(Json(serde_json::json!({
+            "success": false,
+            "message": format!("Task is not running (status: {})", task_run.status)
+        })));
+    }
+
+    state
+        .app_state
+        .checkpoint_db
+        .stop_task_run(&id)
+        .map(|_| {
+            Json(serde_json::json!({
+                "success": true,
+                "message": "Task run stopped"
+            }))
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Delete a task run.
+async fn delete_task_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .app_state
+        .checkpoint_db
+        .delete_task_run(&id)
+        .map(|deleted| {
+            Json(serde_json::json!({
+                "success": deleted,
+                "message": if deleted { "Task run deleted" } else { "Task run not found" }
+            }))
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Get the auto-continue setting for a specific task run.
+async fn get_task_auto_continue(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_auto_continue(&id)
+        .map(|auto_continue| {
+            Json(serde_json::json!({
+                "id": id,
+                "auto_continue": auto_continue
+            }))
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Request body for setting auto-continue on a task run.
+#[derive(Debug, Deserialize)]
+struct SetTaskAutoContinueRequest {
+    auto_continue: bool,
+}
+
+/// Set the auto-continue setting for a specific task run.
+async fn set_task_auto_continue(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(req): Json<SetTaskAutoContinueRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .app_state
+        .checkpoint_db
+        .set_task_auto_continue(&id, req.auto_continue)
+        .map(|_| {
+            Json(serde_json::json!({
+                "success": true,
+                "id": id,
+                "auto_continue": req.auto_continue
+            }))
+        })
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+// ============================================================================
+// End Task Run HTTP API Handlers
+// ============================================================================
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -7202,13 +6113,18 @@ pub fn create_router(
     // Ensure dev_logs directory exists
     let _ = std::fs::create_dir_all(&dev_logs_path);
 
+    // Create database and task monitor
+    let db = Arc::new(
+        CheckpointDb::new().expect("Failed to initialize checkpoint database for task monitoring"),
+    );
+    let task_monitor = Arc::new(TaskMonitor::new(db));
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
         app_handle: app_handle.clone(),
-        ai_analysis_running: AtomicBool::new(false),
-        ai_analysis_stop_requested: AtomicBool::new(false),
         session_manager: Arc::new(SessionManager::new(dev_logs_path)),
+        task_monitor,
     });
 
     // Restore persisted session state on startup
@@ -7241,31 +6157,32 @@ pub fn create_router(
             }
         }
 
-        // Check for active workflows to resume after runner restart
-        // This runs after session restore, with a small additional delay
-        // Auto-resume if:
-        // 1. Global auto-continue setting is enabled, AND
-        // 2. The specific workflow has auto_continue=true (default for prompts)
+        // Resume running tasks from database after runner restart
+        // Simple, clean system: query task_runs WHERE status = 'running'
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        if settings::get_auto_continue_ai_workflow() {
-            // Check if the active workflow has auto_continue enabled
-            if let Some(config) = load_active_workflow_config() {
-                if config.auto_continue {
-                    info!(
-                        "Auto-continue is enabled (global + workflow), checking for workflows to resume..."
-                    );
-                    resume_active_workflow_on_startup(state_for_restore).await;
-                } else {
-                    info!(
-                        "Workflow '{}' has auto_continue=false, skipping automatic resume",
-                        config.name
-                    );
-                }
-            } else {
-                info!("No active workflow config found, nothing to resume");
+
+        let global_auto_continue = settings::get_auto_continue_ai_workflow();
+
+        // Log to debug file
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(
+            r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log",
+        ) {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[{}] STARTUP_RESUME_CHECK: global_auto_continue={}",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                global_auto_continue
+            );
+        }
+
+        if global_auto_continue {
+            let resumed = resume_all_running_tasks_on_startup(state_for_restore).await;
+            if resumed > 0 {
+                info!("Resumed {} running task(s) from database", resumed);
             }
         } else {
-            info!("Global auto-continue is disabled, skipping automatic workflow resume");
+            info!("Global auto-continue is disabled, skipping task resume");
         }
     });
 
@@ -7286,10 +6203,16 @@ pub fn create_router(
         .route("/load-last-config", post(load_last_config))
         .route("/run-workflow", post(run_workflow))
         .route("/stop-execution", post(stop_execution))
+        .route("/execute-action", post(execute_action))
+        .route("/capture-screenshot", post(capture_screenshot_step))
         // Web extraction routes
         .route("/extraction/start", post(start_web_extraction))
         .route("/extraction/stop", post(stop_web_extraction))
         .route("/extraction/status", get(get_extraction_status))
+        .route(
+            "/extraction/:extraction_id/screenshot/:screenshot_id",
+            get(get_extraction_screenshot),
+        )
         // RAG routes
         .route("/rag/import", post(import_rag))
         .route("/rag/list", get(list_rag_configs))
@@ -7298,8 +6221,7 @@ pub fn create_router(
         .route("/rag/:project_id/status", get(get_rag_status))
         .route("/rag/:project_id/load", post(load_rag_project))
         .route("/rag/:project_id", delete(delete_rag_config))
-        // AI Analysis routes (standard/inline mode)
-        .route("/trigger-ai-analysis", post(trigger_ai_analysis))
+        // AI Analysis routes
         .route("/stop-ai-analysis", post(stop_ai_analysis))
         // Runner restart route (for AI self-healing)
         .route("/restart-runner", post(restart_runner))
@@ -7307,6 +6229,7 @@ pub fn create_router(
         // Prompt Library routes
         .route("/prompts", get(list_prompts))
         .route("/prompts", post(create_prompt))
+        .route("/prompts/run", post(run_prompt))
         .route("/prompts/search", get(search_prompts))
         .route("/prompts/categories", get(get_prompt_categories))
         .route("/prompts/tags", get(get_prompt_tags))
@@ -7315,7 +6238,6 @@ pub fn create_router(
         .route("/prompts/:id", get(get_prompt))
         .route("/prompts/:id", put(update_prompt))
         .route("/prompts/:id", delete(delete_prompt))
-        .route("/prompts/:id/run", post(run_prompt))
         .route("/prompts/:id/duplicate", post(duplicate_prompt))
         // AI Workflow Library routes
         .route("/ai-workflows", get(list_ai_workflows))
@@ -7390,6 +6312,16 @@ pub fn create_router(
         )
         .route("/checkpoints/:name/status", get(get_checkpoint_status))
         .route("/checkpoints/history", get(get_checkpoint_history))
+        // Task Run routes (simplified task execution model)
+        .route("/task-runs", get(list_task_runs).post(create_task_run))
+        .route("/task-runs/running", get(list_running_task_runs))
+        .route("/task-runs/:id", get(get_task_run).delete(delete_task_run))
+        .route("/task-runs/:id/output", get(get_task_output))
+        .route("/task-runs/:id/stop", post(stop_task_run))
+        .route(
+            "/task-runs/:id/auto-continue",
+            get(get_task_auto_continue).put(set_task_auto_continue),
+        )
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

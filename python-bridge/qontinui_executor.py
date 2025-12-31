@@ -233,6 +233,9 @@ class QontinuiExecutor:
 
     def _forward_to_websocket(self, event_type: str, data: dict[str, Any]):
         """Forward events to WebSocket backend."""
+        import sys
+
+        print(f"[FWD_TO_WS] Called: event_type={event_type}", file=sys.stderr, flush=True)
         # Handle image recognition events
         if event_type == "image_recognition":
             screenshot_base64 = data.get("screenshot_base64")
@@ -1096,6 +1099,66 @@ class QontinuiExecutor:
         elif cmd_type == "stop":
             self.stop_execution()
             return {"success": True}
+
+        elif cmd_type == "execute_action":
+            # Execute a single GUI action (e.g., click on an image)
+            action_type = params.get("action_type", "CLICK")
+            image_id = params.get("image_id")
+            monitor_index = params.get("monitor_index", 0)
+
+            if not image_id:
+                return {"success": False, "error": "image_id is required"}
+
+            if not self.gui_automation:
+                return {"success": False, "error": "GUI automation not initialized"}
+
+            self.event_manager.emit_log(
+                "info",
+                f"[EXECUTE_ACTION] Executing {action_type} on image: {image_id}",
+            )
+
+            # Build action data for gui_automation.execute_action()
+            action_data = {
+                "id": f"action-{action_type.lower()}-{time.time()}",
+                "type": action_type.upper(),
+                "config": {
+                    "target": {
+                        "type": "image",
+                        "imageIds": [image_id],
+                    }
+                },
+            }
+
+            try:
+                # Set monitor if provided
+                if self.executor_core.state_executor and monitor_index is not None:
+                    self.executor_core.state_executor.set_monitor(monitor_index)
+
+                # Execute the action
+                success = self.gui_automation.execute_action(action_data)
+
+                self.event_manager.emit_log(
+                    "info" if success else "warning",
+                    f"[EXECUTE_ACTION] {action_type} on {image_id}: {'success' if success else 'failed'}",
+                )
+
+                return {
+                    "success": success,
+                    "action_type": action_type,
+                    "image_id": image_id,
+                }
+            except Exception as e:
+                error_msg = str(e)
+                self.event_manager.emit_log(
+                    "error",
+                    f"[EXECUTE_ACTION] Error executing {action_type} on {image_id}: {error_msg}",
+                )
+                return {
+                    "success": False,
+                    "action_type": action_type,
+                    "image_id": image_id,
+                    "error": error_msg,
+                }
 
         elif cmd_type == "status":
             return {

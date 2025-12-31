@@ -15,7 +15,7 @@ import type { Config } from "../contexts/ExecutionContext";
 export interface ConfigurationPanelProps {
   config: Config | null;
   onLoadConfiguration: () => void;
-  onLoadLastConfiguration: () => void;
+  onLoadLastConfiguration: () => Promise<void>;
   onLog?: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
 }
 
@@ -26,6 +26,23 @@ export function ConfigurationPanel({
   onLog,
 }: ConfigurationPanelProps) {
   const [showRAGModal, setShowRAGModal] = useState(false);
+  const [isLoadingLastConfig, setIsLoadingLastConfig] = useState(false);
+
+  const handleLoadLastConfig = async () => {
+    if (isLoadingLastConfig) {
+      return;
+    }
+
+    setIsLoadingLastConfig(true);
+
+    try {
+      await onLoadLastConfiguration();
+    } catch (error: unknown) {
+      console.error("[ConfigurationPanel] Load failed:", error);
+    } finally {
+      setIsLoadingLastConfig(false);
+    }
+  };
 
   return (
     <>
@@ -42,11 +59,14 @@ export function ConfigurationPanel({
           />
 
           <button
-            onClick={onLoadLastConfiguration}
-            className="w-full btn-secondary flex items-center justify-center gap-2"
+            key="load-last-config-btn"
+            onClick={handleLoadLastConfig}
+            disabled={isLoadingLastConfig}
+            type="button"
+            className="w-full btn-secondary flex items-center justify-center gap-2 disabled:opacity-50"
           >
             <FileText className="w-4 h-4" />
-            Load Last Config
+            {isLoadingLastConfig ? "Loading..." : "Load Last Config"}
           </button>
 
           {config && (

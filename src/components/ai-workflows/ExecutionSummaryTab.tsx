@@ -1,11 +1,11 @@
 /**
  * ExecutionSummaryTab.tsx
  *
- * Shows a comprehensive summary of AI execution sessions.
+ * Shows a comprehensive summary of AI execution runs.
  * Focuses on code-related findings (bugs, security, performance)
  * and excludes automation/test infrastructure issues.
  *
- * Shows per-session summaries with session history.
+ * Shows per-run summaries with run history.
  */
 
 import { useState, useMemo, useEffect } from "react";
@@ -230,7 +230,7 @@ export function ExecutionSummaryTab() {
             </div>
             <div>
               <h2 className="font-semibold text-foreground">
-                {selectedSession ? selectedSession.promptName : "Current Session"}
+                {selectedSession ? selectedSession.promptName : "Current Run"}
               </h2>
               {selectedSession ? (
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -238,7 +238,7 @@ export function ExecutionSummaryTab() {
                   {new Date(selectedSession.startedAt).toLocaleString()}
                   <span>({formatDuration(selectedSession.duration)})</span>
                   <span className="px-1.5 py-0.5 bg-muted rounded">
-                    {selectedSession.phases} phase{selectedSession.phases !== 1 ? "s" : ""}
+                    {selectedSession.phases} step{selectedSession.phases !== 1 ? "s" : ""}
                   </span>
                 </div>
               ) : isRunning ? (
@@ -250,13 +250,13 @@ export function ExecutionSummaryTab() {
                 <div className="text-xs text-muted-foreground">
                   {findings.length > 0
                     ? `${displayFindings.length} code findings`
-                    : "No active session"}
+                    : "No active run"}
                 </div>
               )}
             </div>
           </div>
 
-          {/* Session Controls */}
+          {/* Run Controls */}
           <div className="flex items-center gap-2">
             {selectedSession && (
               <button
@@ -280,7 +280,7 @@ export function ExecutionSummaryTab() {
           </div>
         </div>
 
-        {/* Session Status Badge */}
+        {/* Run Status Badge */}
         {selectedSession && (
           <div className="flex items-center gap-2">
             {(() => {
@@ -331,7 +331,7 @@ export function ExecutionSummaryTab() {
         </div>
       </div>
 
-      {/* Session History Panel (collapsible) */}
+      {/* Run History Panel (collapsible) */}
       {showHistory && sessionHistory.length > 0 && (
         <div className="flex-shrink-0 border-b border-border bg-muted/20 p-3 max-h-48 overflow-y-auto">
           <div className="space-y-2">
@@ -387,7 +387,7 @@ export function ExecutionSummaryTab() {
       <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
         {categoriesWithFindings.length === 0 ? (
           <div className="text-center text-muted-foreground py-8">
-            <p>No code-related findings in this session.</p>
+            <p>No code-related findings in this run.</p>
             <p className="text-sm mt-1">
               This view filters out automation/test infrastructure issues.
             </p>

@@ -151,3 +151,13 @@ export {
 export type { Coordinates, Region, Monitor, VirtualDesktop, MonitorInfo } from "./geometry";
 
 export { CoordinateSystem } from "./geometry";
+
+// Task run types (async AI task system)
+export type { TaskRun, TaskRunStatus, RunPromptRequest, RunPromptResponse } from "./taskRun";
+
+export {
+  isTaskRunning as isAiTaskRunning,
+  isTaskComplete,
+  isTaskFailed,
+  isTaskFinished,
+} from "./taskRun";

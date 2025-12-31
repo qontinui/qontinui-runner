@@ -123,6 +123,10 @@ export interface AiOutputStreamEventData {
   line?: string;
   source?: string;
   action_id?: string;
+  /** Session/workflow ID for grouping loops by workflow */
+  session_id?: string;
+  /** Human-readable session/workflow name (the task title) */
+  session_name?: string;
   [key: string]: unknown;
 }
 

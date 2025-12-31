@@ -56,3 +56,6 @@ export type {
   UseWebSocketAutoConnectOptions,
   UseWebSocketAutoConnectReturn,
 } from "./useWebSocketAutoConnect";
+
+export { useAiTaskPolling, executeAiTask } from "./useAiTaskPolling";
+export type { UseAiTaskPollingOptions, UseAiTaskPollingResult } from "./useAiTaskPolling";

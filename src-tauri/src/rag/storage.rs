@@ -67,6 +67,21 @@ impl RAGStorage {
         Ok(Self { base_path })
     }
 
+    /// Create a degraded RAGStorage that will return errors on use
+    ///
+    /// This is used when RAG initialization fails but we want the runner to continue.
+    pub fn new_degraded() -> Self {
+        warn!("Creating degraded RAGStorage - RAG features will be disabled");
+        Self {
+            base_path: PathBuf::new(),
+        }
+    }
+
+    /// Check if this is a degraded instance
+    pub fn is_degraded(&self) -> bool {
+        self.base_path.as_os_str().is_empty()
+    }
+
     /// Create a new RAGStorage with custom base path
     #[allow(dead_code)]
     pub fn with_path(base_path: PathBuf) -> Result<Self, RAGStorageError> {

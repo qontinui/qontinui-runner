@@ -2,12 +2,12 @@
  * LibrarySubTab.tsx
  *
  * Unified Library view that combines:
- * - Prompts (from PromptLibraryTab)
- * - AI Workflows (from WorkflowLibrarySubTab)
- * - Playwright Scripts (from ScriptsSubTab)
+ * - Tasks (single-step AI tasks)
+ * - Multi-Step Tasks (multi-step AI workflows)
+ * - Playwright Scripts (test automation)
  *
  * Each section can be expanded/collapsed. Items can be run directly,
- * which navigates to the Session tab.
+ * which navigates to the Run tab.
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -24,7 +24,6 @@ import {
   Loader2,
   Tag,
   FolderOpen,
-  Workflow,
   Settings,
   Target,
   List,
@@ -39,7 +38,7 @@ interface LibrarySubTabProps {
   onNavigateToSession: () => void;
 }
 
-// Prompt types
+// Task types (simplified model: runs until [TASK_COMPLETE])
 interface SavedPrompt {
   id: string;
   name: string;
@@ -47,16 +46,7 @@ interface SavedPrompt {
   content: string;
   category: string;
   tags: string[];
-  max_iterations: number;
-  workflow: {
-    enabled: boolean;
-    checkpoint_path: string;
-    phase_field: string;
-    completion_value: number;
-    stall_threshold_secs: number;
-    continuation_prompt: string;
-    auto_continue: boolean;
-  };
+  max_sessions: number | null; // Optional limit on sessions
   created_at: string;
   modified_at: string;
 }
@@ -161,28 +151,20 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
     setExpandedItemId((prev) => (prev === id ? null : id));
   };
 
-  // Run a prompt using the unified sessions API
+  // Run a task using the unified sessions API
   const runPrompt = useCallback(
-    async (prompt: SavedPrompt) => {
-      setRunningId(prompt.id);
+    async (task: SavedPrompt) => {
+      setRunningId(task.id);
       try {
-        // Use sessions API to run inline (not spawn external Claude window)
-        const isWorkflow = prompt.workflow?.enabled;
+        // All tasks run until [TASK_COMPLETE] is found
         const requestBody = {
-          session_type: isWorkflow ? "prompt_workflow" : "one_shot",
-          name: prompt.name,
-          prompt: prompt.content,
-          continuation_prompt: isWorkflow ? prompt.workflow.continuation_prompt : null,
-          total_phases: isWorkflow ? prompt.workflow.completion_value : prompt.max_iterations,
+          name: task.name,
+          prompt: task.content,
           uses_gui: false,
           timeout_seconds: 1800,
-          // Multi-session workflow config (runner handles continuation)
-          checkpoint_path: isWorkflow ? prompt.workflow.checkpoint_path : null,
-          phase_field: isWorkflow ? prompt.workflow.phase_field : "current_phase",
-          completion_value: isWorkflow ? prompt.workflow.completion_value : null,
         };
         console.log(
-          "[LibrarySubTab] Running prompt with config:",
+          "[LibrarySubTab] Running task with config:",
           JSON.stringify(requestBody, null, 2),
         );
         const response = await fetch("http://localhost:9876/sessions/start", {
@@ -193,13 +175,13 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
 
         const result = await response.json();
         if (result.success) {
-          onLog("success", `Started prompt: ${prompt.name}`);
+          onLog("success", `Started task: ${task.name}`);
           onNavigateToSession();
         } else {
-          throw new Error(result.error || "Failed to run prompt");
+          throw new Error(result.error || "Failed to run task");
         }
       } catch (error) {
-        onLog("error", `Failed to run prompt: ${error}`);
+        onLog("error", `Failed to run task: ${error}`);
       } finally {
         setRunningId(null);
       }
@@ -219,7 +201,6 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            session_type: workflow.persistent_session ? "ai_builder" : "one_shot",
             name: workflow.name,
             prompt: prompt,
             total_phases: workflow.max_iterations,
@@ -391,12 +372,12 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
           type="text"
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Search prompts, workflows, and scripts..."
+          placeholder="Search tasks and scripts..."
           className="w-full pl-9 pr-4 py-2 bg-background border border-border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary"
         />
       </div>
 
-      {/* Prompts Section */}
+      {/* Tasks Section */}
       <div className="card overflow-hidden">
         <button
           onClick={() => toggleSection("prompts")}
@@ -405,9 +386,9 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
           <div className="flex items-center gap-3">
             <FileText className="w-5 h-5 text-amber-500" />
             <div className="text-left">
-              <h3 className="font-semibold">Prompts</h3>
+              <h3 className="font-semibold">Tasks</h3>
               <p className="text-xs text-muted-foreground">
-                {filteredPrompts.length} prompt{filteredPrompts.length !== 1 ? "s" : ""}
+                {filteredPrompts.length} task{filteredPrompts.length !== 1 ? "s" : ""}
               </p>
             </div>
           </div>
@@ -421,7 +402,7 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
         {expandedSections.has("prompts") && (
           <div className="border-t border-border">
             {filteredPrompts.length === 0 ? (
-              <div className="p-4 text-center text-muted-foreground text-sm">No prompts found</div>
+              <div className="p-4 text-center text-muted-foreground text-sm">No tasks found</div>
             ) : (
               <div className="divide-y divide-border">
                 {filteredPrompts.map((prompt) => {
@@ -443,10 +424,9 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="font-medium truncate">{prompt.name}</span>
-                              {prompt.workflow.enabled && (
-                                <span className="text-xs bg-orange-500/20 text-orange-600 px-1.5 py-0.5 rounded">
-                                  <Workflow className="w-3 h-3 inline mr-1" />
-                                  Workflow
+                              {prompt.max_sessions && (
+                                <span className="text-xs bg-blue-500/20 text-blue-600 px-1.5 py-0.5 rounded">
+                                  Max {prompt.max_sessions} sessions
                                 </span>
                               )}
                               {prompt.category && (
@@ -507,48 +487,23 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
                           {/* Settings */}
                           <div className="flex items-start gap-2">
                             <Settings className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-0.5" />
-                            <div className="text-xs text-muted-foreground space-y-1">
-                              <div>Max iterations: {prompt.max_iterations}</div>
-                              {prompt.workflow.enabled && (
-                                <>
-                                  <div>
-                                    Auto-continue: {prompt.workflow.auto_continue ? "Yes" : "No"}
-                                  </div>
-                                  <div>
-                                    Stall threshold: {prompt.workflow.stall_threshold_secs}s
-                                  </div>
-                                </>
-                              )}
+                            <div className="text-xs text-muted-foreground">
+                              Max sessions: {prompt.max_sessions ?? "unlimited"}
                             </div>
                           </div>
 
-                          {/* Prompt Content */}
+                          {/* Task Content */}
                           <div className="flex items-start gap-2">
                             <Code className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-0.5" />
                             <div className="flex-1 min-w-0">
                               <div className="text-xs font-medium text-muted-foreground mb-1">
-                                Prompt Content:
+                                Task Content:
                               </div>
                               <pre className="text-xs bg-background border border-border rounded p-2 overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap break-words">
                                 {prompt.content}
                               </pre>
                             </div>
                           </div>
-
-                          {/* Workflow continuation prompt */}
-                          {prompt.workflow.enabled && prompt.workflow.continuation_prompt && (
-                            <div className="flex items-start gap-2">
-                              <Workflow className="w-4 h-4 text-muted-foreground flex-shrink-0 mt-0.5" />
-                              <div className="flex-1 min-w-0">
-                                <div className="text-xs font-medium text-muted-foreground mb-1">
-                                  Continuation Prompt:
-                                </div>
-                                <pre className="text-xs bg-background border border-border rounded p-2 overflow-x-auto max-h-24 overflow-y-auto whitespace-pre-wrap break-words">
-                                  {prompt.workflow.continuation_prompt}
-                                </pre>
-                              </div>
-                            </div>
-                          )}
 
                           {/* Timestamps */}
                           <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t border-border/50">
@@ -566,7 +521,7 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
         )}
       </div>
 
-      {/* AI Workflows Section */}
+      {/* Multi-Step Tasks Section */}
       <div className="card overflow-hidden">
         <button
           onClick={() => toggleSection("workflows")}
@@ -575,9 +530,10 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
           <div className="flex items-center gap-3">
             <Sparkles className="w-5 h-5 text-green-500" />
             <div className="text-left">
-              <h3 className="font-semibold">AI Workflows</h3>
+              <h3 className="font-semibold">Multi-Step Tasks</h3>
               <p className="text-xs text-muted-foreground">
-                {filteredWorkflows.length} workflow{filteredWorkflows.length !== 1 ? "s" : ""}
+                {filteredWorkflows.length} multi-step task
+                {filteredWorkflows.length !== 1 ? "s" : ""}
               </p>
             </div>
           </div>
@@ -592,7 +548,7 @@ export function LibrarySubTab({ onLog, onNavigateToSession }: LibrarySubTabProps
           <div className="border-t border-border">
             {filteredWorkflows.length === 0 ? (
               <div className="p-4 text-center text-muted-foreground text-sm">
-                No workflows found
+                No multi-step tasks found
               </div>
             ) : (
               <div className="divide-y divide-border">

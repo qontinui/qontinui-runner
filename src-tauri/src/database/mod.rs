@@ -76,6 +76,41 @@ pub struct SessionEvent {
     pub data: Option<serde_json::Value>,
 }
 
+/// Task run data structure for the simplified task model.
+/// Every task runs until [TASK_COMPLETE] is found in output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRun {
+    pub id: String,
+    pub task_name: String,
+    pub prompt: String,
+    pub status: String, // 'running', 'complete', 'failed', 'stopped'
+    pub sessions_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u32>,
+    pub output_log: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Per-run auto-continue setting (defaults to true)
+    #[serde(default = "default_auto_continue")]
+    pub auto_continue: bool,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+fn default_auto_continue() -> bool {
+    true
+}
+
+/// Completion marker that AI uses to signal task is done
+pub const TASK_COMPLETE_MARKER: &str = "[TASK_COMPLETE]";
+
+/// Session start marker format
+pub fn session_start_marker(session_num: u32) -> String {
+    format!("[SESSION_START:{}]", session_num)
+}
+
 impl CheckpointDb {
     /// Create a new database connection at the default location.
     ///
@@ -135,13 +170,53 @@ impl CheckpointDb {
 
         if current_version == 0 {
             // Fresh database - create schema
-            info!("Creating database schema (version 1)");
+            info!("Creating database schema (version 3)");
             conn.execute_batch(include_str!("schema.sql"))
                 .map_err(|e| format!("Failed to create schema: {}", e))?;
         }
 
-        // Future migrations would go here:
-        // if current_version < 2 { ... }
+        // Migration to version 2: Add task_runs table
+        if current_version == 1 {
+            info!("Migrating database to version 2 (adding task_runs table)");
+            conn.execute_batch(
+                r#"
+                -- Task Runs (simplified task execution model)
+                CREATE TABLE IF NOT EXISTS task_runs (
+                    id TEXT PRIMARY KEY,
+                    task_name TEXT NOT NULL,
+                    prompt TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    sessions_count INTEGER NOT NULL DEFAULT 0,
+                    max_sessions INTEGER,
+                    output_log TEXT DEFAULT '',
+                    error_message TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
+                CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (2, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 2: {}", e))?;
+        }
+
+        // Migration to version 3: Add auto_continue column to task_runs
+        if current_version == 1 || current_version == 2 {
+            info!("Migrating database to version 3 (adding auto_continue to task_runs)");
+            conn.execute_batch(
+                r#"
+                -- Add auto_continue column to task_runs (default true)
+                ALTER TABLE task_runs ADD COLUMN auto_continue BOOLEAN NOT NULL DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (3, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 3: {}", e))?;
+        }
 
         Ok(())
     }
@@ -529,6 +604,345 @@ impl CheckpointDb {
     }
 
     // ========================================================================
+    // Task Run Operations (Simplified Task Model)
+    // ========================================================================
+
+    /// Create a new task run.
+    /// If `auto_continue` is None, defaults to true.
+    pub fn create_task_run(
+        &self,
+        id: &str,
+        task_name: &str,
+        prompt: &str,
+        max_sessions: Option<u32>,
+        auto_continue: Option<bool>,
+    ) -> Result<TaskRun, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+        let auto_continue_val = auto_continue.unwrap_or(true);
+
+        conn.execute(
+            r#"
+            INSERT INTO task_runs (id, task_name, prompt, status, sessions_count, max_sessions, output_log, auto_continue, created_at, updated_at)
+            VALUES (?1, ?2, ?3, 'running', 0, ?4, '', ?5, ?6, ?6)
+            "#,
+            params![id, task_name, prompt, max_sessions.map(|v| v as i64), auto_continue_val as i32, now],
+        )
+        .map_err(|e| format!("Failed to create task run: {}", e))?;
+
+        Ok(TaskRun {
+            id: id.to_string(),
+            task_name: task_name.to_string(),
+            prompt: prompt.to_string(),
+            status: "running".to_string(),
+            sessions_count: 0,
+            max_sessions,
+            output_log: String::new(),
+            error_message: None,
+            auto_continue: auto_continue_val,
+            created_at: now.clone(),
+            updated_at: now,
+            completed_at: None,
+        })
+    }
+
+    /// Get a task run by ID.
+    pub fn get_task_run(&self, id: &str) -> Result<Option<TaskRun>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+
+        let result: SqliteResult<TaskRun> = conn.query_row(
+            r#"
+            SELECT id, task_name, prompt, status, sessions_count, max_sessions, output_log, error_message, auto_continue, created_at, updated_at, completed_at
+            FROM task_runs
+            WHERE id = ?1
+            "#,
+            params![id],
+            |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    status: row.get(3)?,
+                    sessions_count: row.get::<_, i64>(4)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    output_log: row.get(6)?,
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    completed_at: row.get(11)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(task_run) => Ok(Some(task_run)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get task run: {}", e)),
+        }
+    }
+
+    /// Append output to a task run and increment session count.
+    /// Returns true if [TASK_COMPLETE] marker was found in the appended text.
+    pub fn append_task_output(
+        &self,
+        id: &str,
+        output: &str,
+        increment_session: bool,
+    ) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let session_increment = if increment_session { 1 } else { 0 };
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                output_log = output_log || ?1,
+                sessions_count = sessions_count + ?2,
+                updated_at = ?3
+            WHERE id = ?4
+            "#,
+            params![output, session_increment, now, id],
+        )
+        .map_err(|e| format!("Failed to append task output: {}", e))?;
+
+        // Check if task is complete
+        let is_complete = output.contains(TASK_COMPLETE_MARKER);
+        if is_complete {
+            self.complete_task_run(id)?;
+        }
+
+        Ok(is_complete)
+    }
+
+    /// Mark a task run as complete.
+    pub fn complete_task_run(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'complete',
+                updated_at = ?1,
+                completed_at = ?1
+            WHERE id = ?2
+            "#,
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to complete task run: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Mark a task run as failed.
+    pub fn fail_task_run(&self, id: &str, error_message: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'failed',
+                error_message = ?1,
+                updated_at = ?2,
+                completed_at = ?2
+            WHERE id = ?3
+            "#,
+            params![error_message, now, id],
+        )
+        .map_err(|e| format!("Failed to fail task run: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Stop a task run.
+    pub fn stop_task_run(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'stopped',
+                updated_at = ?1,
+                completed_at = ?1
+            WHERE id = ?2
+            "#,
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to stop task run: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get all running (incomplete) task runs.
+    pub fn get_running_task_runs(&self) -> Result<Vec<TaskRun>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, output_log, error_message, auto_continue, created_at, updated_at, completed_at
+                FROM task_runs
+                WHERE status = 'running'
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let task_runs = stmt
+            .query_map([], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    status: row.get(3)?,
+                    sessions_count: row.get::<_, i64>(4)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    output_log: row.get(6)?,
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    completed_at: row.get(11)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
+    }
+
+    /// Get recent task runs (for display in UI).
+    pub fn get_recent_task_runs(&self, limit: u32) -> Result<Vec<TaskRun>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, output_log, error_message, auto_continue, created_at, updated_at, completed_at
+                FROM task_runs
+                ORDER BY updated_at DESC
+                LIMIT ?1
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let task_runs = stmt
+            .query_map(params![limit], |row| {
+                Ok(TaskRun {
+                    id: row.get(0)?,
+                    task_name: row.get(1)?,
+                    prompt: row.get(2)?,
+                    status: row.get(3)?,
+                    sessions_count: row.get::<_, i64>(4)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    output_log: row.get(6)?,
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    completed_at: row.get(11)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(task_runs)
+    }
+
+    /// Get the last N characters of output for continuation context.
+    pub fn get_task_output_tail(&self, id: &str, chars: usize) -> Result<String, String> {
+        let task_run = self
+            .get_task_run(id)?
+            .ok_or_else(|| format!("Task run not found: {}", id))?;
+
+        let output = &task_run.output_log;
+        if output.len() <= chars {
+            Ok(output.clone())
+        } else {
+            Ok(output[output.len() - chars..].to_string())
+        }
+    }
+
+    /// Check if a task run should continue (not complete, not stopped, not at max sessions).
+    pub fn should_continue_task(&self, id: &str) -> Result<bool, String> {
+        let task_run = self
+            .get_task_run(id)?
+            .ok_or_else(|| format!("Task run not found: {}", id))?;
+
+        // Already complete or stopped
+        if task_run.status != "running" {
+            return Ok(false);
+        }
+
+        // Check max sessions limit
+        if let Some(max) = task_run.max_sessions {
+            if task_run.sessions_count >= max {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Delete a task run by ID.
+    pub fn delete_task_run(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+
+        let rows = conn
+            .execute("DELETE FROM task_runs WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete task run: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Get the auto-continue setting for a specific task run.
+    pub fn get_task_auto_continue(&self, id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+
+        let result: SqliteResult<i32> = conn.query_row(
+            "SELECT auto_continue FROM task_runs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(value) => Ok(value != 0),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(format!("Task run not found: {}", id)),
+            Err(e) => Err(format!("Failed to get task auto_continue: {}", e)),
+        }
+    }
+
+    /// Set the auto-continue setting for a specific task run.
+    pub fn set_task_auto_continue(&self, id: &str, auto_continue: bool) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let rows = conn
+            .execute(
+                r#"
+                UPDATE task_runs SET
+                    auto_continue = ?1,
+                    updated_at = ?2
+                WHERE id = ?3
+                "#,
+                params![auto_continue as i32, now, id],
+            )
+            .map_err(|e| format!("Failed to set task auto_continue: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Task run not found: {}", id));
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
     // Settings Operations
     // ========================================================================
 
@@ -686,11 +1100,10 @@ impl CheckpointDb {
             count += 1;
         }
 
-        // Rename original file to .bak
-        let backup_path = path.with_extension("json.bak");
-        if let Err(e) = std::fs::rename(path, &backup_path) {
-            warn!("Failed to rename {:?} to backup: {}", path, e);
-        }
+        // NOTE: Do NOT rename settings.json to .bak here!
+        // settings.rs still reads from settings.json directly.
+        // The database is used for settings that aren't in settings.rs yet.
+        // Once settings.rs is fully migrated to database, we can rename.
 
         Ok(count)
     }
@@ -856,6 +1269,7 @@ pub struct MigrationResult {
 }
 
 impl MigrationResult {
+    #[allow(dead_code)]
     pub fn is_success(&self) -> bool {
         self.errors.is_empty()
     }
@@ -984,5 +1398,44 @@ mod tests {
 
         let all = db.get_all_settings().unwrap();
         assert!(all.get("ai_config").is_some());
+    }
+
+    #[test]
+    fn test_task_run_auto_continue() {
+        let (db, _temp) = create_test_db();
+
+        // Create task run with default auto_continue (true)
+        let task_run = db
+            .create_task_run("test-task-1", "Test Task", "Do something", None, None)
+            .unwrap();
+        assert_eq!(task_run.auto_continue, true);
+
+        // Create task run with explicit auto_continue = false
+        let task_run_disabled = db
+            .create_task_run(
+                "test-task-2",
+                "Test Task 2",
+                "Do something else",
+                None,
+                Some(false),
+            )
+            .unwrap();
+        assert_eq!(task_run_disabled.auto_continue, false);
+
+        // Get auto_continue setting
+        let auto_continue = db.get_task_auto_continue("test-task-1").unwrap();
+        assert_eq!(auto_continue, true);
+
+        let auto_continue_disabled = db.get_task_auto_continue("test-task-2").unwrap();
+        assert_eq!(auto_continue_disabled, false);
+
+        // Set auto_continue setting
+        db.set_task_auto_continue("test-task-1", false).unwrap();
+        let updated = db.get_task_auto_continue("test-task-1").unwrap();
+        assert_eq!(updated, false);
+
+        // Verify via get_task_run
+        let loaded = db.get_task_run("test-task-1").unwrap().unwrap();
+        assert_eq!(loaded.auto_continue, false);
     }
 }

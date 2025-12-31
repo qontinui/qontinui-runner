@@ -106,7 +106,7 @@ export function AiWorkflowsTab({
       id: "library" as const,
       label: "Library",
       icon: BookOpen,
-      description: "Prompts, workflows, scripts",
+      description: "Tasks, multi-step tasks, scripts",
     },
     {
       id: "monitor" as const,
@@ -120,7 +120,7 @@ export function AiWorkflowsTab({
       id: "configure" as const,
       label: "Configure",
       icon: Settings,
-      description: "Builder, logs, scriptlets",
+      description: "Task builders, logs, scriptlets",
     },
   ];
 

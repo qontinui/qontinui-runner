@@ -4,7 +4,7 @@
  * Displays streaming AI output from AI_PROMPT actions.
  * Shows the prompt followed by Claude's response in real-time.
  * Features:
- * - AI Loop selector to navigate between different conversation sessions
+ * - Session selector to navigate between different AI conversation sessions
  * - Truncation of long responses with expand/collapse toggle
  * - Fixed header that doesn't scroll
  */
@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { issueTracker, findingsTracker } from "../services";
 import { groupEntriesIntoLoops, DEFAULT_MAX_LINES /* type AiLoop */ } from "../types/aiLoop";
+import { useAiTaskPolling } from "../hooks";
 
 export interface AiOutputLine {
   id: string;
@@ -186,6 +187,13 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
     setPromptInput("");
   }, [promptInput, onAddLine, currentLoop]);
 
+  // AI task polling hook
+  const { triggerTask } = useAiTaskPolling({
+    onError: (error) => {
+      console.error("AI prompt failed:", error);
+    },
+  });
+
   // Send a prompt to continue the conversation
   const handleSendPrompt = useCallback(async () => {
     const trimmedPrompt = promptInput.trim();
@@ -207,28 +215,24 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
 
       const fullPrompt = history + hintSection + trimmedPrompt;
 
-      const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: fullPrompt,
-          display_prompt: trimmedPrompt, // Only show the new message in UI
-          timeout_seconds: 600,
-        }),
+      // Use async task triggering - output streams via Tauri events
+      const task = await triggerTask({
+        name: "ai-analysis",
+        content: fullPrompt,
+        max_sessions: 1,
+        display_prompt: trimmedPrompt, // Only show the new message in UI
+        timeout_seconds: 600,
       });
 
-      const result = await response.json();
-      if (result.success) {
+      if (task) {
         setPromptInput(""); // Clear input on success
-      } else {
-        console.error("AI prompt failed:", result.error || result.data?.error);
       }
     } catch (error) {
       console.error("Failed to send AI prompt:", error);
     } finally {
       setIsSending(false);
     }
-  }, [promptInput, isSending, buildConversationHistory, queuedHint]);
+  }, [promptInput, isSending, buildConversationHistory, queuedHint, triggerTask]);
 
   // Handle keyboard shortcuts
   const handleKeyDown = useCallback(
@@ -399,31 +403,31 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       {/* Fixed Header - doesn't scroll */}
       <div className="flex-shrink-0 space-y-2 pb-2 border-b border-border mb-2 bg-background">
-        {/* Loop selector and status row */}
+        {/* Session selector and status row */}
         <div className="flex items-center justify-between">
-          {/* Loop Selector */}
+          {/* Session Selector */}
           <div className="relative">
             <button
               onClick={() => setShowLoopSelector(!showLoopSelector)}
               className="flex items-center gap-2 px-3 py-1.5 bg-muted hover:bg-muted/80 rounded-lg text-sm font-medium transition-colors"
             >
               <Brain className="w-4 h-4" />
-              <span>{currentLoop ? currentLoop.label : "Select Loop"}</span>
+              <span>{currentLoop ? currentLoop.label : "Select Session"}</span>
               <span className="text-xs text-muted-foreground">({loops.length} total)</span>
               <ChevronDown
                 className={`w-4 h-4 transition-transform ${showLoopSelector ? "rotate-180" : ""}`}
               />
             </button>
 
-            {/* Loop dropdown - latest first */}
+            {/* Session dropdown - latest first */}
             {showLoopSelector && (
               <div className="absolute top-full left-0 mt-1 w-72 bg-popover border border-border rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
-                {[...loops].reverse().map((loop) => {
-                  // Find the original index for display (1-based)
-                  const loopNumber = loops.findIndex((l) => l.id === loop.id) + 1;
+                {[...loops].reverse().map((loop, reversedIndex) => {
+                  // First item in reversed array (index 0) is the latest
+                  const isLatest = reversedIndex === 0;
                   return (
                     <button
-                      key={loop.id}
+                      key={`${loop.id}-${reversedIndex}`}
                       onClick={() => handleSelectLoop(loop.id)}
                       className={`w-full flex items-start gap-2 px-3 py-2 text-left hover:bg-muted transition-colors ${
                         loop.id === selectedLoopId ? "bg-muted" : ""
@@ -432,11 +436,11 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
                       <ChevronRight className="w-4 h-4 mt-0.5 flex-shrink-0" />
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <span className="font-medium text-sm">Loop {loopNumber}</span>
+                          <span className="font-medium text-sm">{loop.label}</span>
                           <span className="text-xs text-muted-foreground">
                             {new Date(loop.startTime).toLocaleTimeString()}
                           </span>
-                          {loopNumber === loops.length && (
+                          {isLatest && (
                             <span className="text-xs px-1.5 py-0.5 bg-primary/20 text-primary rounded">
                               Latest
                             </span>
@@ -492,7 +496,7 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
               onClick={handleCopyLoop}
               disabled={!currentLoop}
               className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-              title="Copy all text in this loop"
+              title="Copy all text in this session"
             >
               {copied ? (
                 <>

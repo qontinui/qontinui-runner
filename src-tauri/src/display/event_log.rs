@@ -104,6 +104,16 @@ impl EventLog {
         self.type_index.clear();
         self.node_index.clear();
     }
+
+    /// Get the number of events in the log
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Check if the event log is empty
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
 }
 
 impl Default for EventLog {

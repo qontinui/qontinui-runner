@@ -479,14 +479,16 @@ class RunnerWebSocketClient:
 
         message = {
             "type": "session_start",
-            "project_id": self.project_id,
-            "session_id": generated_session_id,  # Provide session_id for backend to track
-            "runner_version": self.runner_version,
-            "runner_os": self.runner_os,
-            "runner_hostname": self.runner_hostname,
-            "runner_name": self.runner_name,
-            "configuration_snapshot": configuration_snapshot,
-            "timestamp": self._get_timestamp(),
+            "data": {
+                "project_id": self.project_id,
+                "session_id": generated_session_id,  # Provide session_id for backend to track
+                "runner_version": self.runner_version,
+                "runner_os": self.runner_os,
+                "runner_hostname": self.runner_hostname,
+                "runner_name": self.runner_name,
+                "configuration_snapshot": configuration_snapshot,
+                "timestamp": self._get_timestamp(),
+            },
         }
 
         logger.info(f"Starting session for project: {self.project_id}")
@@ -537,10 +539,12 @@ class RunnerWebSocketClient:
 
         message = {
             "type": "session_end",
-            "session_id": self.session_id,
-            "status": status,
-            "error_message": error_message,
-            "timestamp": self._get_timestamp(),
+            "data": {
+                "session_id": self.session_id,
+                "status": status,
+                "error_message": error_message,
+                "timestamp": self._get_timestamp(),
+            },
         }
 
         logger.info(f"Ending session: {self.session_id} with status: {status}")
@@ -614,16 +618,20 @@ class RunnerWebSocketClient:
                 logger.error(f"Unsupported image type: {type(image)}")
                 return None
 
+            # Note: Backend expects "data.image" format for the screenshot
+            # along with "data.metadata" for all metadata
             message = {
                 "type": "screenshot",
-                "session_id": self.session_id,
-                "screenshot_data": base64_data,
-                "name": name,
-                "width": width,
-                "height": height,
-                "content_type": content_type,
-                "automation_metadata": metadata or {},
-                "timestamp": self._get_timestamp(),
+                "data": {
+                    "image": base64_data,
+                    "metadata": {
+                        "name": name,
+                        "width": width,
+                        "height": height,
+                        "content_type": content_type,
+                        **(metadata or {}),
+                    },
+                },
             }
 
             logger.debug(f"Sending screenshot: {name}")
@@ -662,12 +670,14 @@ class RunnerWebSocketClient:
 
         log_message = {
             "type": "log",
-            "session_id": self.session_id,
-            "level": level,
-            "message": message,
-            "log_data": log_data or {},
-            "sequence_number": self.log_sequence,
-            "timestamp": self._get_timestamp(),
+            "data": {
+                "session_id": self.session_id,
+                "level": level,
+                "message": message,
+                "data": log_data or {},
+                "sequence_number": self.log_sequence,
+                "timestamp": self._get_timestamp(),
+            },
         }
 
         try:
@@ -695,8 +705,10 @@ class RunnerWebSocketClient:
 
         message = {
             "type": "heartbeat",
-            "session_id": self.session_id,
-            "timestamp": self._get_timestamp(),
+            "data": {
+                "session_id": self.session_id,
+                "timestamp": self._get_timestamp(),
+            },
         }
 
         try:
@@ -932,10 +944,12 @@ class RunnerWebSocketClient:
 
         message = {
             "type": "issue_detected",
-            "session_id": self.session_id,
-            "project_id": self.project_id,
-            "payload": issue_data,
-            "timestamp": self._get_timestamp(),
+            "data": {
+                "session_id": self.session_id,
+                "project_id": self.project_id,
+                "payload": issue_data,
+                "timestamp": self._get_timestamp(),
+            },
         }
 
         logger.info(f"Sending detected issue: {issue_data.get('title', 'Unknown')[:50]}")
@@ -971,14 +985,16 @@ class RunnerWebSocketClient:
 
         message = {
             "type": "issue_updated",
-            "session_id": self.session_id,
-            "payload": {
-                "id": issue_id,
-                "status": status,
-                "resolution": resolution,
-                "updated_at": self._get_timestamp(),
+            "data": {
+                "session_id": self.session_id,
+                "payload": {
+                    "id": issue_id,
+                    "status": status,
+                    "resolution": resolution,
+                    "updated_at": self._get_timestamp(),
+                },
+                "timestamp": self._get_timestamp(),
             },
-            "timestamp": self._get_timestamp(),
         }
 
         logger.info(f"Sending issue update: {issue_id} -> {status}")
@@ -1008,12 +1024,14 @@ class RunnerWebSocketClient:
 
         message = {
             "type": "issues_sync",
-            "session_id": self.session_id,
-            "project_id": self.project_id,
-            "payload": {
-                "issues": issues,
+            "data": {
+                "session_id": self.session_id,
+                "project_id": self.project_id,
+                "payload": {
+                    "issues": issues,
+                },
+                "timestamp": self._get_timestamp(),
             },
-            "timestamp": self._get_timestamp(),
         }
 
         logger.info(f"Syncing {len(issues)} issues to server")

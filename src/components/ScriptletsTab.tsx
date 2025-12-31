@@ -23,6 +23,7 @@ import {
 import type { Scriptlet, CreateScriptletRequest, UpdateScriptletRequest } from "../types";
 import type { AiOutputLine } from "./AiOutputTab";
 import { groupEntriesIntoLoops } from "../types/aiLoop";
+import { executeAiTask } from "../hooks";
 
 const API_BASE = "http://localhost:9876";
 
@@ -310,22 +311,18 @@ This snippet will be inserted into Playwright test descriptions to help future t
 Provide ONLY the text content that should be saved as a scriptlet. Do not include any explanation or markdown formatting.
 Keep it concise but comprehensive - typically 2-5 sentences.`;
 
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: "Generating scriptlet from AI logs...",
-          timeout_seconds: 60,
-          wait_for_completion: true,
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: "Generating scriptlet from AI logs...",
+        timeout_seconds: 60,
       });
 
-      const result = await response.json();
-
-      if (result.success && result.data?.output) {
+      if (task.output_log) {
         // Extract the content from the AI response
-        let content = result.data.output.trim();
+        let content = task.output_log.trim();
 
         // Remove any code blocks if present
         if (content.startsWith("```")) {
@@ -338,7 +335,7 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
         setGenerationPrompt("");
         onLog("success", "Generated scriptlet content from AI logs");
       } else {
-        onLog("error", `Failed to generate: ${result.error || "Unknown error"}`);
+        onLog("error", "Failed to generate: No output from AI task");
       }
     } catch (error) {
       onLog("error", `Failed to generate scriptlet: ${error}`);

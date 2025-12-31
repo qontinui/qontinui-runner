@@ -2,8 +2,8 @@
  * ConfigureSubTab.tsx
  *
  * Configuration view that combines:
- * - Workflow Builder (create new AI workflows)
- * - Prompt Builder (create/edit prompts with workflow settings)
+ * - Multi-Step Task Builder (create new AI multi-step tasks)
+ * - Task Builder (create/edit single-step tasks with settings)
  * - Script Builder (create Playwright scripts with AI refinement)
  * - Log Sources (external log sources)
  * - Scriptlets (reusable snippets)
@@ -24,7 +24,7 @@ import type { UseProjectLogsReturn } from "../../hooks/useProjectLogs";
 import type { AiOutputLine } from "../AiOutputTab";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
-type ConfigureTab = "builder" | "prompts" | "scripts" | "logs" | "scriptlets" | "findings";
+type ConfigureTab = "multiStepTasks" | "tasks" | "scripts" | "logs" | "scriptlets" | "findings";
 
 interface ConfigureSubTabProps {
   projectLogs: UseProjectLogsReturn;
@@ -39,7 +39,7 @@ export function ConfigureSubTab({
   onLog,
   onConfigureLogLocations,
 }: ConfigureSubTabProps) {
-  const [activeTab, setActiveTab] = useState<ConfigureTab>("builder");
+  const [activeTab, setActiveTab] = useState<ConfigureTab>("multiStepTasks");
 
   const tabTriggerClass = `
     flex items-center gap-2 px-3 py-3 text-sm font-medium
@@ -58,13 +58,13 @@ export function ConfigureSubTab({
       >
         {/* Tab Navigation */}
         <Tabs.List className="flex border-b border-border bg-muted/30 px-2 flex-shrink-0 overflow-x-auto">
-          <Tabs.Trigger value="builder" className={tabTriggerClass}>
+          <Tabs.Trigger value="multiStepTasks" className={tabTriggerClass}>
             <Sparkles className="w-4 h-4" />
-            Workflows
+            Multi-Step Tasks
           </Tabs.Trigger>
-          <Tabs.Trigger value="prompts" className={tabTriggerClass}>
+          <Tabs.Trigger value="tasks" className={tabTriggerClass}>
             <FileText className="w-4 h-4" />
-            Prompts
+            Tasks
           </Tabs.Trigger>
           <Tabs.Trigger value="scripts" className={tabTriggerClass}>
             <TestTube className="w-4 h-4" />
@@ -86,9 +86,9 @@ export function ConfigureSubTab({
 
         {/* Tab Content */}
         <div className="flex-1 min-h-0 overflow-hidden">
-          {/* Workflow Builder */}
+          {/* Multi-Step Task Builder */}
           <Tabs.Content
-            value="builder"
+            value="multiStepTasks"
             className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
           >
             <AiBuilderTab
@@ -97,9 +97,9 @@ export function ConfigureSubTab({
             />
           </Tabs.Content>
 
-          {/* Prompt Builder */}
+          {/* Task Builder */}
           <Tabs.Content
-            value="prompts"
+            value="tasks"
             className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
           >
             <PromptLibraryTab onLog={onLog} />

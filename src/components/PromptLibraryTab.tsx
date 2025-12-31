@@ -23,21 +23,10 @@ import {
   CheckCircle,
   AlertCircle,
   Clock,
-  Workflow,
 } from "lucide-react";
 
-// Types for workflow configuration
-interface WorkflowConfig {
-  enabled: boolean;
-  checkpoint_path: string;
-  phase_field: string;
-  completion_value: number;
-  stall_threshold_secs: number;
-  continuation_prompt: string;
-  auto_continue: boolean; // Default: true - auto-continue on runner restart
-}
-
 // Types for the prompt library
+// Simplified model: every task runs until [TASK_COMPLETE] marker is found
 interface SavedPrompt {
   id: string;
   name: string;
@@ -45,23 +34,20 @@ interface SavedPrompt {
   content: string;
   category: string;
   tags: string[];
-  max_iterations: number;
-  workflow: WorkflowConfig;
+  /** Optional limit on number of sessions (null = unlimited). Sessions continue until [TASK_COMPLETE] is found. */
+  max_sessions: number | null;
   created_at: string;
   modified_at: string;
 }
 
-// Types for unified sessions (replaces WorkflowRun)
+// Types for unified sessions
 interface SessionCheckpoint {
   session_id: string;
-  session_type: string;
-  current_phase: number;
-  total_phases: number;
   completed: boolean;
   status: string;
   started_at: string;
   last_activity: string;
-  sessions_spawned: number;
+  sessions_count: number; // Number of sessions spawned
   restart_permitted: boolean;
   error_message: string | null;
   custom_data: Record<string, unknown>;
@@ -69,15 +55,12 @@ interface SessionCheckpoint {
 }
 
 interface SessionConfig {
-  session_type: string;
   prompt: string;
-  continuation_prompt: string | null;
-  total_phases: number;
   uses_gui: boolean;
   timeout_seconds: number;
-  stall_threshold_seconds: number;
   name: string;
   description: string;
+  max_sessions?: number; // Optional limit on sessions
   custom_config: Record<string, unknown>;
 }
 
@@ -97,55 +80,49 @@ interface Session {
   event_log: { timestamp: number; event_type: string; message: string }[];
 }
 
-// Legacy type alias for backward compatibility in UI
-interface WorkflowRun {
+// Task run status for UI display
+interface TaskRun {
   id: string;
-  prompt_id: string;
-  prompt_name: string;
-  status: "running" | "idle" | "stalled" | "completed" | "failed";
-  current_phase: number;
-  completion_value: number;
-  checkpoint_path: string;
+  task_id: string;
+  task_name: string;
+  status: "running" | "complete" | "failed" | "stopped";
   active_session_id: string | null;
   started_at: number;
-  last_checkpoint_update: number | null;
   last_activity: number;
-  sessions_spawned: number;
+  sessions_count: number; // Number of sessions used
+  max_sessions?: number; // Optional limit
   error_message: string | null;
   event_log: { timestamp: number; event_type: string; message: string }[];
 }
 
-// Convert Session to WorkflowRun for UI compatibility
-function sessionToWorkflowRun(session: Session, promptId?: string): WorkflowRun {
-  const statusMap: Record<string, WorkflowRun["status"]> = {
+// Convert Session to TaskRun for UI display
+function sessionToTaskRun(session: Session, taskId?: string): TaskRun {
+  const statusMap: Record<string, TaskRun["status"]> = {
     starting: "running",
     running: "running",
-    completed: "completed",
+    completed: "complete",
     failed: "failed",
-    stopped: "failed",
-    waiting_for_continuation: "idle",
-    stalled: "stalled",
+    stopped: "stopped",
+    waiting_for_continuation: "running",
+    stalled: "running",
   };
 
   return {
     id: session.id,
-    prompt_id: promptId || session.id,
-    prompt_name: session.config.name,
+    task_id: taskId || session.id,
+    task_name: session.config.name,
     status: statusMap[session.status] || "running",
-    current_phase: session.checkpoint.current_phase,
-    completion_value: session.config.total_phases,
-    checkpoint_path: "",
     active_session_id: session.active_subprocess_id,
     started_at: new Date(session.checkpoint.started_at).getTime() / 1000,
-    last_checkpoint_update: null,
     last_activity: new Date(session.checkpoint.last_activity).getTime() / 1000,
-    sessions_spawned: session.checkpoint.sessions_spawned,
+    sessions_count: session.checkpoint.sessions_count,
+    max_sessions: session.config.max_sessions,
     error_message: session.checkpoint.error_message,
     event_log: session.event_log,
   };
 }
 
-interface SpawnResponse {
+interface _SpawnResponse {
   session_id: string;
   state_file: string;
   log_file: string;
@@ -212,58 +189,34 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     const saved = loadPersistedCreateForm();
     return saved?.formTags ?? "";
   });
-  const [formMaxIterations, setFormMaxIterations] = useState(() => {
-    const saved = loadPersistedCreateForm();
-    return saved?.formMaxIterations ?? 10;
-  });
 
-  // Workflow form state
-  const [formWorkflowEnabled, setFormWorkflowEnabled] = useState(() => {
+  // Optional max sessions limit (null = unlimited)
+  const [formMaxSessions, setFormMaxSessions] = useState<number | undefined>(() => {
     const saved = loadPersistedCreateForm();
-    return saved?.formWorkflowEnabled ?? false;
-  });
-  const [formCheckpointPath, setFormCheckpointPath] = useState(() => {
-    const saved = loadPersistedCreateForm();
-    return saved?.formCheckpointPath ?? "";
-  });
-  const [formPhaseField, setFormPhaseField] = useState(() => {
-    const saved = loadPersistedCreateForm();
-    return saved?.formPhaseField ?? "current_phase";
-  });
-  const [formCompletionValue, setFormCompletionValue] = useState(() => {
-    const saved = loadPersistedCreateForm();
-    return saved?.formCompletionValue ?? 12;
-  });
-  const [formStallThreshold, setFormStallThreshold] = useState(() => {
-    const saved = loadPersistedCreateForm();
-    return saved?.formStallThreshold ?? 300;
-  });
-  const [formContinuationPrompt, setFormContinuationPrompt] = useState(() => {
-    const saved = loadPersistedCreateForm();
-    return saved?.formContinuationPrompt ?? "";
+    return saved?.formMaxSessions;
   });
 
   // Running state
   const [runningPromptId, setRunningPromptId] = useState<string | null>(null);
 
-  // Workflow runs state
-  const [workflowRuns, setWorkflowRuns] = useState<WorkflowRun[]>([]);
-  const [showWorkflowRuns, setShowWorkflowRuns] = useState(false);
+  // Active task runs state
+  const [taskRuns, setTaskRuns] = useState<TaskRun[]>([]);
+  const [showTaskRuns, setShowTaskRuns] = useState(false);
 
   // Load prompts on mount
   useEffect(() => {
     loadPrompts();
     loadCategories();
-    loadWorkflowRuns();
+    loadTaskRuns();
   }, []);
 
-  // Periodically refresh workflow runs
+  // Periodically refresh task runs
   useEffect(() => {
-    if (showWorkflowRuns) {
-      const interval = setInterval(loadWorkflowRuns, 5000);
+    if (showTaskRuns) {
+      const interval = setInterval(loadTaskRuns, 5000);
       return () => clearInterval(interval);
     }
-  }, [showWorkflowRuns]);
+  }, [showTaskRuns]);
 
   // Persist create form state when in creating mode
   useEffect(() => {
@@ -275,34 +228,14 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
         formContent,
         formCategory,
         formTags,
-        formMaxIterations,
-        formWorkflowEnabled,
-        formCheckpointPath,
-        formPhaseField,
-        formCompletionValue,
-        formStallThreshold,
-        formContinuationPrompt,
+        formMaxSessions,
       };
       localStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(formState));
     } else {
       // Clear persisted state when not creating
       localStorage.removeItem(CREATE_FORM_STORAGE_KEY);
     }
-  }, [
-    isCreating,
-    formName,
-    formDescription,
-    formContent,
-    formCategory,
-    formTags,
-    formMaxIterations,
-    formWorkflowEnabled,
-    formCheckpointPath,
-    formPhaseField,
-    formCompletionValue,
-    formStallThreshold,
-    formContinuationPrompt,
-  ]);
+  }, [isCreating, formName, formDescription, formContent, formCategory, formTags, formMaxSessions]);
 
   const loadPrompts = useCallback(async () => {
     setLoading(true);
@@ -333,25 +266,27 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     }
   };
 
-  const loadWorkflowRuns = async () => {
+  const loadTaskRuns = async () => {
     try {
-      // Use new unified sessions API
+      // Use unified sessions API
       const response = await fetch(`${API_BASE}/sessions`);
       const result = await response.json();
       if (result.success) {
-        // Filter to only prompt_workflow sessions and convert to WorkflowRun format
+        // Get all running/active sessions and convert to TaskRun format
         const sessions: Session[] = result.data || [];
-        const promptWorkflows = sessions
-          .filter((s: Session) => s.config.session_type === "prompt_workflow")
-          .map((s: Session) => sessionToWorkflowRun(s));
-        setWorkflowRuns(promptWorkflows);
+        const activeTasks = sessions
+          .filter((s: Session) =>
+            ["running", "starting", "waiting_for_continuation"].includes(s.status),
+          )
+          .map((s: Session) => sessionToTaskRun(s));
+        setTaskRuns(activeTasks);
       }
     } catch (error) {
-      console.error("Failed to load workflow runs:", error);
+      console.error("Failed to load task runs:", error);
     }
   };
 
-  // Create a new prompt
+  // Create a new prompt/task
   const createPrompt = async () => {
     try {
       const response = await fetch(`${API_BASE}/prompts`, {
@@ -366,35 +301,25 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             .split(",")
             .map((t) => t.trim())
             .filter((t) => t),
-          max_iterations: formMaxIterations,
-          workflow: formWorkflowEnabled
-            ? {
-                enabled: true,
-                checkpoint_path: formCheckpointPath,
-                phase_field: formPhaseField,
-                completion_value: formCompletionValue,
-                stall_threshold_secs: formStallThreshold,
-                continuation_prompt: formContinuationPrompt,
-              }
-            : undefined,
+          max_sessions: formMaxSessions ?? null,
         }),
       });
       const result = await response.json();
       if (result.success) {
-        onLog("success", `Created prompt: ${formName}`);
+        onLog("success", `Created task: ${formName}`);
         resetForm();
         setIsCreating(false);
         loadPrompts();
         loadCategories();
       } else {
-        onLog("error", `Failed to create prompt: ${result.error}`);
+        onLog("error", `Failed to create task: ${result.error}`);
       }
     } catch (error) {
-      onLog("error", `Failed to create prompt: ${error}`);
+      onLog("error", `Failed to create task: ${error}`);
     }
   };
 
-  // Update an existing prompt
+  // Update an existing prompt/task
   const updatePrompt = async () => {
     if (!editingPrompt) return;
 
@@ -411,29 +336,21 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             .split(",")
             .map((t) => t.trim())
             .filter((t) => t),
-          max_iterations: formMaxIterations,
-          workflow: {
-            enabled: formWorkflowEnabled,
-            checkpoint_path: formCheckpointPath,
-            phase_field: formPhaseField,
-            completion_value: formCompletionValue,
-            stall_threshold_secs: formStallThreshold,
-            continuation_prompt: formContinuationPrompt,
-          },
+          max_sessions: formMaxSessions ?? null,
         }),
       });
       const result = await response.json();
       if (result.success) {
-        onLog("success", `Updated prompt: ${formName}`);
+        onLog("success", `Updated task: ${formName}`);
         resetForm();
         setEditingPrompt(null);
         loadPrompts();
         loadCategories();
       } else {
-        onLog("error", `Failed to update prompt: ${result.error}`);
+        onLog("error", `Failed to update task: ${result.error}`);
       }
     } catch (error) {
-      onLog("error", `Failed to update prompt: ${error}`);
+      onLog("error", `Failed to update task: ${error}`);
     }
   };
 
@@ -477,118 +394,77 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     }
   };
 
-  // Run a prompt
+  // Run a task
   const runPrompt = async (prompt: SavedPrompt) => {
     setRunningPromptId(prompt.id);
-    onLog("info", `Running prompt: ${prompt.name}`);
+    onLog("info", `Running task: ${prompt.name}`);
 
     try {
-      const response = await fetch(`${API_BASE}/prompts/${prompt.id}/run`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
-      const result = await response.json();
-      if (result.success) {
-        const data = result.data as SpawnResponse;
-        onLog("success", `Started AI session: ${data.session_id}`);
-        onLog("info", `Log file: ${data.log_file}`);
-      } else {
-        onLog("error", `Failed to run prompt: ${result.error}`);
-      }
-    } catch (error) {
-      onLog("error", `Failed to run prompt: ${error}`);
-    } finally {
-      setRunningPromptId(null);
-    }
-  };
-
-  // Run a prompt as a workflow (multi-session with automatic continuation)
-  const runWorkflow = async (prompt: SavedPrompt) => {
-    if (!prompt.workflow?.enabled) {
-      onLog("error", "Workflow mode is not enabled for this prompt");
-      return;
-    }
-
-    setRunningPromptId(prompt.id);
-    onLog("info", `Starting workflow: ${prompt.name}`);
-
-    try {
-      // Use new unified sessions API
+      // Use unified sessions API - every task runs until [TASK_COMPLETE]
       const response = await fetch(`${API_BASE}/sessions/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          session_type: "prompt_workflow",
           name: prompt.name,
           prompt: prompt.content,
-          continuation_prompt: prompt.workflow.continuation_prompt || null,
-          total_phases: prompt.workflow.completion_value,
           uses_gui: false,
           timeout_seconds: 1800,
-          // Multi-session workflow config (runner handles continuation)
-          checkpoint_path: prompt.workflow.enabled ? prompt.workflow.checkpoint_path : null,
-          phase_field: prompt.workflow.phase_field || "current_phase",
-          completion_value: prompt.workflow.enabled ? prompt.workflow.completion_value : null,
         }),
       });
       const result = await response.json();
       if (result.success) {
         const session = result.data?.session as Session;
-        onLog("success", `Started workflow: ${session.id}`);
-        setShowWorkflowRuns(true);
-        loadWorkflowRuns();
+        onLog("success", `Started task: ${session.id}`);
+        setShowTaskRuns(true);
+        loadTaskRuns();
       } else {
-        onLog("error", `Failed to start workflow: ${result.error}`);
+        onLog("error", `Failed to run task: ${result.error}`);
       }
     } catch (error) {
-      onLog("error", `Failed to start workflow: ${error}`);
+      onLog("error", `Failed to run task: ${error}`);
     } finally {
       setRunningPromptId(null);
     }
   };
 
-  // Stop a running workflow
-  const stopWorkflow = async (runId: string) => {
+  // Stop a running task
+  const stopTask = async (runId: string) => {
     try {
-      // Use new unified sessions API
       const response = await fetch(`${API_BASE}/sessions/${runId}/stop`, {
         method: "POST",
       });
       const result = await response.json();
       if (result.success) {
-        onLog("success", `Stopped workflow: ${runId}`);
-        loadWorkflowRuns();
+        onLog("success", `Stopped task: ${runId}`);
+        loadTaskRuns();
       } else {
-        onLog("error", `Failed to stop workflow: ${result.error}`);
+        onLog("error", `Failed to stop task: ${result.error}`);
       }
     } catch (error) {
-      onLog("error", `Failed to stop workflow: ${error}`);
+      onLog("error", `Failed to stop task: ${error}`);
     }
   };
 
-  // Delete a workflow run record
-  const deleteWorkflow = async (runId: string) => {
+  // Delete a task run record
+  const deleteTaskRun = async (runId: string) => {
     try {
-      // Use new unified sessions API
       const response = await fetch(`${API_BASE}/sessions/${runId}`, {
         method: "DELETE",
       });
       const result = await response.json();
       if (result.success) {
-        loadWorkflowRuns();
+        loadTaskRuns();
       } else {
-        onLog("error", `Failed to delete workflow: ${result.error}`);
+        onLog("error", `Failed to delete task: ${result.error}`);
       }
     } catch (error) {
-      onLog("error", `Failed to delete workflow: ${error}`);
+      onLog("error", `Failed to delete task: ${error}`);
     }
   };
 
-  // Delete all workflow run records
-  const deleteAllWorkflows = async () => {
+  // Delete all task runs
+  const deleteAllTaskRuns = async () => {
     try {
-      // Get all sessions and delete prompt_workflow ones
       const listResponse = await fetch(`${API_BASE}/sessions`);
       const listResult = await listResponse.json();
       if (!listResult.success) {
@@ -597,12 +473,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       }
 
       const sessions: Session[] = listResult.data || [];
-      const promptWorkflows = sessions.filter(
-        (s: Session) => s.config.session_type === "prompt_workflow",
-      );
-
       let deletedCount = 0;
-      for (const session of promptWorkflows) {
+      for (const session of sessions) {
         const response = await fetch(`${API_BASE}/sessions/${session.id}`, {
           method: "DELETE",
         });
@@ -612,10 +484,10 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
         }
       }
 
-      onLog("success", `Deleted ${deletedCount} workflow(s)`);
-      loadWorkflowRuns();
+      onLog("success", `Deleted ${deletedCount} task(s)`);
+      loadTaskRuns();
     } catch (error) {
-      onLog("error", `Failed to delete workflows: ${error}`);
+      onLog("error", `Failed to delete tasks: ${error}`);
     }
   };
 
@@ -680,17 +552,10 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     setFormContent("");
     setFormCategory("");
     setFormTags("");
-    setFormMaxIterations(10);
-    // Reset workflow fields
-    setFormWorkflowEnabled(false);
-    setFormCheckpointPath("");
-    setFormPhaseField("current_phase");
-    setFormCompletionValue(12);
-    setFormStallThreshold(300);
-    setFormContinuationPrompt("");
+    setFormMaxSessions(undefined);
   };
 
-  // Start editing a prompt
+  // Start editing a prompt/task
   const startEditing = (prompt: SavedPrompt) => {
     setEditingPrompt(prompt);
     setFormName(prompt.name);
@@ -698,14 +563,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     setFormContent(prompt.content);
     setFormCategory(prompt.category);
     setFormTags(prompt.tags.join(", "));
-    setFormMaxIterations(prompt.max_iterations);
-    // Load workflow fields
-    setFormWorkflowEnabled(prompt.workflow?.enabled || false);
-    setFormCheckpointPath(prompt.workflow?.checkpoint_path || "");
-    setFormPhaseField(prompt.workflow?.phase_field || "current_phase");
-    setFormCompletionValue(prompt.workflow?.completion_value || 12);
-    setFormStallThreshold(prompt.workflow?.stall_threshold_secs || 300);
-    setFormContinuationPrompt(prompt.workflow?.continuation_prompt || "");
+    setFormMaxSessions(prompt.max_sessions ?? undefined);
     setIsCreating(false);
   };
 
@@ -744,8 +602,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <BookOpen className="w-6 h-6 text-primary" />
-          <h2 className="text-xl font-semibold">Prompt Library</h2>
-          <span className="text-sm text-muted-foreground">({prompts.length} prompts)</span>
+          <h2 className="text-xl font-semibold">Task Library</h2>
+          <span className="text-sm text-muted-foreground">({prompts.length} tasks)</span>
         </div>
         <div className="flex items-center gap-2">
           <button
@@ -767,7 +625,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             className="btn-primary flex items-center gap-2 px-3 py-2 text-sm"
           >
             <Plus className="w-4 h-4" />
-            New Prompt
+            New Task
           </button>
         </div>
       </div>
@@ -778,7 +636,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
             type="text"
-            placeholder="Search prompts..."
+            placeholder="Search tasks..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-10 pr-4 py-2 bg-card border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
@@ -804,7 +662,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold flex items-center gap-2">
               <Sparkles className="w-5 h-5 text-primary" />
-              {isCreating ? "Create New Prompt" : "Edit Prompt"}
+              {isCreating ? "Create New Task" : "Edit Task"}
             </h3>
             <button
               onClick={() => {
@@ -825,7 +683,7 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
                 type="text"
                 value={formName}
                 onChange={(e) => setFormName(e.target.value)}
-                placeholder="My Prompt"
+                placeholder="My Task"
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
               />
             </div>
@@ -853,20 +711,23 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
               type="text"
               value={formDescription}
               onChange={(e) => setFormDescription(e.target.value)}
-              placeholder="What does this prompt do?"
+              placeholder="What does this task do?"
               className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
             />
           </div>
 
           <div>
-            <label className="block text-sm font-medium mb-1">Prompt Content *</label>
+            <label className="block text-sm font-medium mb-1">Task Content *</label>
             <textarea
               value={formContent}
               onChange={(e) => setFormContent(e.target.value)}
-              placeholder="Enter the prompt content..."
+              placeholder="Enter the task instructions..."
               rows={10}
               className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 font-mono text-sm"
             />
+            <p className="text-xs text-muted-foreground mt-1">
+              Task runs until [TASK_COMPLETE] marker is found in the output.
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-4">
@@ -880,111 +741,27 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
               />
             </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Max Iterations</label>
-              <input
-                type="number"
-                value={formMaxIterations}
-                onChange={(e) => setFormMaxIterations(parseInt(e.target.value) || 10)}
-                min={1}
-                max={50}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-              />
-            </div>
           </div>
 
-          {/* Workflow Settings */}
-          <div className="border border-border rounded-lg p-4 space-y-4">
-            <div className="flex items-center gap-3">
+          {/* Optional Max Sessions Limit */}
+          <div className="border border-border rounded-lg p-4 space-y-3">
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">Max Sessions (optional)</label>
               <input
-                type="checkbox"
-                id="workflowEnabled"
-                checked={formWorkflowEnabled}
-                onChange={(e) => setFormWorkflowEnabled(e.target.checked)}
-                className="w-4 h-4 rounded border-border"
+                type="number"
+                value={formMaxSessions || ""}
+                onChange={(e) =>
+                  setFormMaxSessions(e.target.value ? parseInt(e.target.value) : undefined)
+                }
+                min={1}
+                placeholder="No limit"
+                className="w-32 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
               />
-              <label
-                htmlFor="workflowEnabled"
-                className="flex items-center gap-2 text-sm font-medium cursor-pointer"
-              >
-                <Workflow className="w-4 h-4 text-primary" />
-                Enable Multi-Session Workflow
-              </label>
             </div>
             <p className="text-xs text-muted-foreground">
-              When enabled, the runner will automatically spawn new AI sessions to continue the
-              workflow based on checkpoint progress. This allows long-running tasks to complete
-              across multiple sessions.
+              Limit the number of AI sessions that can be spawned for this task. Leave empty for no
+              limit (task continues until [TASK_COMPLETE]).
             </p>
-
-            {formWorkflowEnabled && (
-              <div className="space-y-4 pt-2">
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium mb-1">Checkpoint Path *</label>
-                    <input
-                      type="text"
-                      value={formCheckpointPath}
-                      onChange={(e) => setFormCheckpointPath(e.target.value)}
-                      placeholder="C:/path/to/checkpoint.json"
-                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 font-mono text-sm"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium mb-1">Phase Field</label>
-                    <input
-                      type="text"
-                      value={formPhaseField}
-                      onChange={(e) => setFormPhaseField(e.target.value)}
-                      placeholder="current_phase"
-                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-                    />
-                  </div>
-                </div>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium mb-1">Completion Value</label>
-                    <input
-                      type="number"
-                      value={formCompletionValue}
-                      onChange={(e) => setFormCompletionValue(parseInt(e.target.value) || 12)}
-                      min={1}
-                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Workflow is complete when phase reaches this value
-                    </p>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium mb-1">
-                      Stall Threshold (seconds)
-                    </label>
-                    <input
-                      type="number"
-                      value={formStallThreshold}
-                      onChange={(e) => setFormStallThreshold(parseInt(e.target.value) || 300)}
-                      min={60}
-                      className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">
-                      Spawn new session if no progress for this long
-                    </p>
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium mb-1">
-                    Continuation Prompt (optional)
-                  </label>
-                  <textarea
-                    value={formContinuationPrompt}
-                    onChange={(e) => setFormContinuationPrompt(e.target.value)}
-                    placeholder="Custom prompt for continuation sessions. Leave empty to use a default prompt that references the checkpoint."
-                    rows={3}
-                    className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 font-mono text-sm"
-                  />
-                </div>
-              </div>
-            )}
           </div>
 
           <div className="flex justify-end gap-2">
@@ -1010,38 +787,38 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
         </div>
       )}
 
-      {/* Active Workflow Runs */}
-      {workflowRuns.length > 0 && (
+      {/* Active Task Runs */}
+      {taskRuns.length > 0 && (
         <div className="card p-4 space-y-3 border-2 border-blue-500/30">
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold flex items-center gap-2">
-              <Workflow className="w-5 h-5 text-blue-500" />
-              Active Workflows
-              <span className="text-sm text-muted-foreground">({workflowRuns.length})</span>
+              <Sparkles className="w-5 h-5 text-blue-500" />
+              Active Tasks
+              <span className="text-sm text-muted-foreground">({taskRuns.length})</span>
             </h3>
             <div className="flex items-center gap-1">
-              <button onClick={loadWorkflowRuns} className="btn-secondary p-2" title="Refresh">
+              <button onClick={loadTaskRuns} className="btn-secondary p-2" title="Refresh">
                 <RefreshCw className="w-4 h-4" />
               </button>
-              <button onClick={deleteAllWorkflows} className="btn-danger p-2" title="Delete All">
+              <button onClick={deleteAllTaskRuns} className="btn-danger p-2" title="Delete All">
                 <Trash2 className="w-4 h-4" />
               </button>
             </div>
           </div>
           <div className="space-y-2">
-            {workflowRuns.map((run) => (
-              <WorkflowRunCard
+            {taskRuns.map((run) => (
+              <TaskRunCard
                 key={run.id}
                 run={run}
-                onStop={() => stopWorkflow(run.id)}
-                onDelete={() => deleteWorkflow(run.id)}
+                onStop={() => stopTask(run.id)}
+                onDelete={() => deleteTaskRun(run.id)}
               />
             ))}
           </div>
         </div>
       )}
 
-      {/* Prompts List */}
+      {/* Tasks List */}
       {loading ? (
         <div className="flex items-center justify-center py-12">
           <Loader2 className="w-8 h-8 animate-spin text-primary" />
@@ -1051,21 +828,20 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
           {prompts.length === 0 ? (
             <div className="space-y-2">
               <BookOpen className="w-12 h-12 mx-auto opacity-50" />
-              <p>No prompts yet. Create your first prompt to get started!</p>
+              <p>No tasks yet. Create your first task to get started!</p>
             </div>
           ) : (
-            <p>No prompts match your search.</p>
+            <p>No tasks match your search.</p>
           )}
         </div>
       ) : (
         <div className="space-y-3">
           {filteredPrompts.map((prompt) => (
-            <PromptCard
+            <TaskCard
               key={prompt.id}
-              prompt={prompt}
+              task={prompt}
               isRunning={runningPromptId === prompt.id}
               onRun={() => runPrompt(prompt)}
-              onRunWorkflow={() => runWorkflow(prompt)}
               onEdit={() => startEditing(prompt)}
               onDelete={() => deletePrompt(prompt.id, prompt.name)}
               onDuplicate={() => duplicatePrompt(prompt.id)}
@@ -1078,62 +854,56 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   );
 }
 
-// Prompt Card Component
-interface PromptCardProps {
-  prompt: SavedPrompt;
+// Task Card Component
+interface TaskCardProps {
+  task: SavedPrompt;
   isRunning: boolean;
   onRun: () => void;
-  onRunWorkflow: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onDuplicate: () => void;
   formatDate: (date: string) => string;
 }
 
-function PromptCard({
-  prompt,
+function TaskCard({
+  task,
   isRunning,
   onRun,
-  onRunWorkflow,
   onEdit,
   onDelete,
   onDuplicate,
   formatDate,
-}: PromptCardProps) {
+}: TaskCardProps) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div
-      className={`card p-4 hover:border-primary/30 transition-colors ${prompt.workflow?.enabled ? "border-l-4 border-l-blue-500" : ""}`}
-    >
+    <div className="card p-4 hover:border-primary/30 transition-colors">
       <div className="flex items-start justify-between gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-semibold truncate">{prompt.name}</h3>
-            {prompt.workflow?.enabled && (
-              <span className="px-2 py-0.5 text-xs bg-blue-500/10 text-blue-500 rounded-full flex items-center gap-1">
-                <Workflow className="w-3 h-3" />
-                Workflow
-              </span>
-            )}
-            {prompt.category && (
+            <h3 className="font-semibold truncate">{task.name}</h3>
+            {task.category && (
               <span className="px-2 py-0.5 text-xs bg-primary/10 text-primary rounded-full flex items-center gap-1">
                 <FolderOpen className="w-3 h-3" />
-                {prompt.category}
+                {task.category}
+              </span>
+            )}
+            {task.max_sessions && (
+              <span className="px-2 py-0.5 text-xs bg-blue-500/10 text-blue-500 rounded-full">
+                Max {task.max_sessions} sessions
               </span>
             )}
           </div>
-          {prompt.description && (
-            <p className="text-sm text-muted-foreground mt-1 line-clamp-1">{prompt.description}</p>
+          {task.description && (
+            <p className="text-sm text-muted-foreground mt-1 line-clamp-1">{task.description}</p>
           )}
           <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
-            <span>Max iterations: {prompt.max_iterations}</span>
-            <span>Modified: {formatDate(prompt.modified_at)}</span>
+            <span>Modified: {formatDate(task.modified_at)}</span>
           </div>
-          {prompt.tags.length > 0 && (
+          {task.tags.length > 0 && (
             <div className="flex items-center gap-1 mt-2 flex-wrap">
               <Tag className="w-3 h-3 text-muted-foreground" />
-              {prompt.tags.map((tag) => (
+              {task.tags.map((tag) => (
                 <span
                   key={tag}
                   className="px-2 py-0.5 text-xs bg-card border border-border rounded"
@@ -1145,12 +915,11 @@ function PromptCard({
           )}
         </div>
         <div className="flex items-center gap-1">
-          {/* Regular Run button - always available */}
           <button
             onClick={onRun}
             disabled={isRunning}
             className="btn-success p-2 disabled:opacity-50"
-            title="Run prompt once"
+            title="Run task"
           >
             {isRunning ? (
               <Loader2 className="w-4 h-4 animate-spin" />
@@ -1158,17 +927,6 @@ function PromptCard({
               <Play className="w-4 h-4" />
             )}
           </button>
-          {/* Workflow button - only for workflow-enabled prompts */}
-          {prompt.workflow?.enabled && (
-            <button
-              onClick={onRunWorkflow}
-              disabled={isRunning}
-              className="btn-primary p-2 disabled:opacity-50 flex items-center gap-1"
-              title="Run as workflow (multi-session with auto-continuation)"
-            >
-              <Workflow className="w-4 h-4" />
-            </button>
-          )}
           <button
             onClick={() => setExpanded(!expanded)}
             className="btn-secondary p-2"
@@ -1176,13 +934,13 @@ function PromptCard({
           >
             {expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
           </button>
-          <button onClick={onEdit} className="btn-secondary p-2" title="Edit prompt">
+          <button onClick={onEdit} className="btn-secondary p-2" title="Edit task">
             <Pencil className="w-4 h-4" />
           </button>
-          <button onClick={onDuplicate} className="btn-secondary p-2" title="Duplicate prompt">
+          <button onClick={onDuplicate} className="btn-secondary p-2" title="Duplicate task">
             <Copy className="w-4 h-4" />
           </button>
-          <button onClick={onDelete} className="btn-danger p-2" title="Delete prompt">
+          <button onClick={onDelete} className="btn-danger p-2" title="Delete task">
             <Trash2 className="w-4 h-4" />
           </button>
         </div>
@@ -1191,7 +949,7 @@ function PromptCard({
       {expanded && (
         <div className="mt-4 pt-4 border-t border-border">
           <pre className="p-3 bg-background rounded-lg text-sm font-mono whitespace-pre-wrap overflow-x-auto max-h-96">
-            {prompt.content}
+            {task.content}
           </pre>
         </div>
       )}
@@ -1199,27 +957,26 @@ function PromptCard({
   );
 }
 
-// Workflow Run Card Component
-interface WorkflowRunCardProps {
-  run: WorkflowRun;
+// Task Run Card Component - shows running tasks with status
+interface TaskRunCardProps {
+  run: TaskRun;
   onStop: () => void;
   onDelete: () => void;
 }
 
-function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
+function TaskRunCard({ run, onStop, onDelete }: TaskRunCardProps) {
   const [expanded, setExpanded] = useState(false);
   const [aiOutputLogs, setAiOutputLogs] = useState<
     { line: string; source: string; timestamp: number }[]
   >([]);
 
-  // Subscribe to log updates and filter AI output for this workflow
+  // Subscribe to log updates and filter AI output for this task
   useEffect(() => {
     const updateLogs = () => {
       const allLogs = logManager.getAiOutputLogs();
-      // Filter logs that match this workflow's action IDs (workflow-{id.slice(0,8)})
-      const workflowPrefix = `workflow-${run.id.slice(0, 8)}`;
+      const taskPrefix = `task-${run.id.slice(0, 8)}`;
       const filteredLogs = allLogs.filter(
-        (log) => log.actionId?.startsWith(workflowPrefix) && log.source === "claude",
+        (log) => log.actionId?.startsWith(taskPrefix) && log.source === "claude",
       );
       setAiOutputLogs(
         filteredLogs.map((log) => ({
@@ -1239,14 +996,12 @@ function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
     switch (run.status) {
       case "running":
         return <Loader2 className="w-4 h-4 animate-spin text-green-500" />;
-      case "idle":
-        return <Clock className="w-4 h-4 text-yellow-500" />;
-      case "stalled":
-        return <AlertCircle className="w-4 h-4 text-orange-500" />;
-      case "completed":
+      case "complete":
         return <CheckCircle className="w-4 h-4 text-green-500" />;
       case "failed":
         return <AlertCircle className="w-4 h-4 text-red-500" />;
+      case "stopped":
+        return <Square className="w-4 h-4 text-orange-500" />;
       default:
         return <Clock className="w-4 h-4 text-muted-foreground" />;
     }
@@ -1256,14 +1011,12 @@ function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
     switch (run.status) {
       case "running":
         return "text-green-500";
-      case "idle":
-        return "text-yellow-500";
-      case "stalled":
-        return "text-orange-500";
-      case "completed":
+      case "complete":
         return "text-green-500";
       case "failed":
         return "text-red-500";
+      case "stopped":
+        return "text-orange-500";
       default:
         return "text-muted-foreground";
     }
@@ -1273,33 +1026,25 @@ function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
     return new Date(ts * 1000).toLocaleTimeString();
   };
 
-  const progress =
-    run.completion_value > 0 ? Math.round((run.current_phase / run.completion_value) * 100) : 0;
-
   return (
     <div className="p-3 bg-background border border-border rounded-lg">
       <div className="flex items-center justify-between gap-4">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             {getStatusIcon()}
-            <h4 className="font-medium truncate">{run.prompt_name}</h4>
+            <h4 className="font-medium truncate">{run.task_name}</h4>
             <span className={`text-sm ${getStatusColor()}`}>
-              {run.status.charAt(0).toUpperCase() + run.status.slice(1)}
+              {run.status === "running"
+                ? `Running (session ${run.sessions_count})`
+                : run.status.charAt(0).toUpperCase() + run.status.slice(1)}
             </span>
           </div>
           <div className="flex items-center gap-4 mt-1 text-xs text-muted-foreground">
             <span>
-              Phase: {run.current_phase}/{run.completion_value}
+              Sessions: {run.sessions_count}
+              {run.max_sessions && ` / ${run.max_sessions}`}
             </span>
-            <span>Sessions: {run.sessions_spawned}</span>
             <span>Started: {formatTimestamp(run.started_at)}</span>
-          </div>
-          {/* Progress bar */}
-          <div className="mt-2 w-full bg-border rounded-full h-1.5">
-            <div
-              className="bg-blue-500 h-1.5 rounded-full transition-all"
-              style={{ width: `${progress}%` }}
-            />
           </div>
         </div>
         <div className="flex items-center gap-1">
@@ -1310,8 +1055,8 @@ function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
           >
             {expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
           </button>
-          {(run.status === "running" || run.status === "idle" || run.status === "stalled") && (
-            <button onClick={onStop} className="btn-danger p-2" title="Stop workflow">
+          {run.status === "running" && (
+            <button onClick={onStop} className="btn-danger p-2" title="Stop task">
               <Square className="w-4 h-4" />
             </button>
           )}
@@ -1327,7 +1072,6 @@ function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
 
       {expanded && (
         <div className="mt-3 pt-3 border-t border-border space-y-3">
-          {/* AI Output Section */}
           {aiOutputLogs.length > 0 && (
             <div>
               <h5 className="text-xs font-semibold text-muted-foreground mb-2">AI Output</h5>
@@ -1341,10 +1085,9 @@ function WorkflowRunCard({ run, onStop, onDelete }: WorkflowRunCardProps) {
             </div>
           )}
 
-          {/* Workflow Events Section */}
           {run.event_log.length > 0 && (
             <div>
-              <h5 className="text-xs font-semibold text-muted-foreground mb-2">Workflow Events</h5>
+              <h5 className="text-xs font-semibold text-muted-foreground mb-2">Task Events</h5>
               <div className="max-h-40 overflow-y-auto space-y-1">
                 {run.event_log.slice(-10).map((event, idx) => (
                   <div key={idx} className="text-xs font-mono flex gap-2">

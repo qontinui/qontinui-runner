@@ -23,6 +23,7 @@ mod secure_storage;
 mod session_manager;
 mod settings;
 mod storage;
+mod task_monitor;
 mod video_recorder;
 mod workflow_monitor;
 
@@ -131,9 +132,21 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Initialize RAGState
-    let rag_state =
-        Arc::new(commands::rag::RAGState::new().expect("Failed to initialize RAG state"));
+    // Initialize RAGState (graceful degradation if dependencies missing)
+    let rag_state = match commands::rag::RAGState::new() {
+        Ok(state) => {
+            info!("RAG state initialized successfully");
+            Arc::new(state)
+        }
+        Err(e) => {
+            warn!(
+                "RAG initialization failed (non-fatal): {}. RAG features will be disabled.",
+                e
+            );
+            // Create a degraded RAGState that will return errors on use
+            Arc::new(commands::rag::RAGState::new_degraded())
+        }
+    };
 
     // Create broadcast channel for WebSocket event streaming
     // Capacity of 256 allows for burst events without dropping
@@ -252,6 +265,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::logging::clear_ai_output_log,
             commands::logging::get_ai_output_log_path_cmd,
             commands::logging::load_ai_output_log,
+            commands::logging::list_session_checkpoints,
+            commands::logging::delete_session_checkpoints,
+            commands::logging::clear_all_run_history,
             // Verification commands (AI self-healing)
             commands::verification::save_pending_verification,
             commands::verification::load_pending_verification,

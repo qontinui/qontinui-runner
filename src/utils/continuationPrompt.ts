@@ -155,26 +155,24 @@ export function extractFindingsWithResponses(findings: Finding[]): FindingWithRe
  * This is a convenience function that extracts responses and formats them
  *
  * @param findings - All findings (will filter for those with responses)
- * @param phaseNumber - Optional phase number for context
+ * @param stepNumber - Optional step number for context
  * @param options - Formatting options
  * @returns Complete continuation prompt section
  */
 export function generateContinuationPrompt(
   findings: Finding[],
-  phaseNumber?: number,
+  stepNumber?: number,
   options: ContinuationPromptOptions = {},
 ): string {
   const findingsWithResponses = extractFindingsWithResponses(findings);
 
   if (findingsWithResponses.length === 0) {
-    return phaseNumber
-      ? `Continue the workflow from phase ${phaseNumber}.`
-      : "Continue the workflow.";
+    return stepNumber ? `Continue the task from step ${stepNumber}.` : "Continue the task.";
   }
 
-  const basePrompt = phaseNumber
-    ? `Continue the workflow from phase ${phaseNumber}.`
-    : "Continue the workflow.";
+  const basePrompt = stepNumber
+    ? `Continue the task from step ${stepNumber}.`
+    : "Continue the task.";
 
   const responsesSection = generateContinuationPromptSection(findingsWithResponses, options);
 

@@ -92,6 +92,12 @@ pub struct AiOutputEntry {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_id: Option<String>,
+    /// Session/workflow ID for grouping loops by workflow
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Human-readable session/workflow name (the task title)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 /// Issue entry (matches TypeScript DetectedIssue)

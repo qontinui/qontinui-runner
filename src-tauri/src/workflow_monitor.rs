@@ -1,9 +1,13 @@
 //! Workflow Monitor
 //!
-//! Monitors multi-session workflow prompts and automatically spawns
-//! continuation sessions when workflows stall.
+//! NOTE: This module is being deprecated in favor of the simplified task model.
+//! The new model runs tasks until [TASK_COMPLETE] marker is found, without
+//! checkpoint-based phase tracking.
+//!
+//! This module is kept for backward compatibility but should not be used
+//! for new code.
 
-use crate::prompts::{SavedPrompt, WorkflowConfig};
+use crate::prompts::SavedPrompt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -80,7 +84,9 @@ pub struct WorkflowEvent {
 
 impl WorkflowRun {
     /// Create a new workflow run
+    /// NOTE: This is deprecated - use the new task model instead
     #[allow(dead_code)]
+    #[deprecated(note = "Use the new task model instead")]
     pub fn new(prompt: &SavedPrompt) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -94,8 +100,8 @@ impl WorkflowRun {
             status: WorkflowStatus::Idle,
             current_phase: 0,
             previous_phase: 0,
-            completion_value: prompt.workflow.completion_value,
-            checkpoint_path: prompt.workflow.checkpoint_path.clone(),
+            completion_value: 0,            // Deprecated - no phases in new model
+            checkpoint_path: String::new(), // Deprecated - no checkpoint in new model
             active_session_id: None,
             started_at: now,
             last_checkpoint_update: None,
@@ -388,9 +394,9 @@ pub fn write_restart_permission(checkpoint_path: &str, reason: &str) -> Result<(
 pub struct WorkflowManager {
     /// Active workflow runs, keyed by workflow run ID
     runs: Arc<RwLock<HashMap<String, WorkflowRun>>>,
-    /// Workflow config cache (prompt_id -> WorkflowConfig)
-    /// Public so resume_workflow_monitoring can access continuation_prompt
-    pub configs: Arc<RwLock<HashMap<String, WorkflowConfig>>>,
+    /// Prompt ID cache for workflow runs (deprecated)
+    #[allow(dead_code)]
+    configs: Arc<RwLock<HashMap<String, String>>>,
 }
 
 #[allow(dead_code)]
@@ -403,19 +409,15 @@ impl WorkflowManager {
     }
 
     /// Start a new workflow run for a prompt
+    /// NOTE: This is deprecated - use the new task model instead
+    #[allow(deprecated)]
     pub async fn start_workflow(&self, prompt: &SavedPrompt) -> Result<WorkflowRun, String> {
-        if !prompt.workflow.enabled {
-            return Err("Workflow mode not enabled for this prompt".to_string());
-        }
+        // In the new model, all tasks run until [TASK_COMPLETE]
+        // This function is kept for backward compatibility
+        warn!("start_workflow is deprecated - use the new task model instead");
 
         let run = WorkflowRun::new(prompt);
         let run_id = run.id.clone();
-
-        // Store the config
-        {
-            let mut configs = self.configs.write().await;
-            configs.insert(prompt.id.clone(), prompt.workflow.clone());
-        }
 
         // Store the run
         {
@@ -478,107 +480,19 @@ impl WorkflowManager {
     }
 
     /// Check and update workflow status based on checkpoint
-    /// Note: Currently unused - sync loop checks checkpoint directly
+    /// NOTE: This is deprecated - the new task model uses [TASK_COMPLETE] marker
     #[allow(dead_code)]
+    #[deprecated(note = "Use the new task model instead")]
     pub async fn check_workflow_status(
         &self,
         run_id: &str,
-        prompt: &SavedPrompt,
+        _prompt: &SavedPrompt,
     ) -> Option<WorkflowRun> {
-        let mut runs = self.runs.write().await;
-        let run = runs.get_mut(run_id)?;
+        // Deprecated - new model doesn't use checkpoint-based status
+        warn!("check_workflow_status is deprecated - use the new task model instead");
 
-        let config = &prompt.workflow;
-        let mut phase_advanced = false;
-
-        // Check if checkpoint exists and read current phase
-        match read_checkpoint_phase(&config.checkpoint_path, &config.phase_field) {
-            Ok(phase) => {
-                let old_phase = run.current_phase;
-                run.current_phase = phase;
-
-                if phase != old_phase {
-                    // Format phase nicely (u32::MAX means "COMPLETE")
-                    let phase_str = if phase == u32::MAX {
-                        "COMPLETE".to_string()
-                    } else {
-                        phase.to_string()
-                    };
-                    run.log_event(
-                        "phase_update",
-                        &format!("Phase {} -> {}", old_phase, phase_str),
-                    );
-                    // Track if phase advanced (progress was made)
-                    if phase > run.previous_phase {
-                        phase_advanced = true;
-                        run.previous_phase = phase;
-                    }
-                }
-
-                // Update checkpoint mtime
-                if let Some(mtime) = get_checkpoint_mtime(&config.checkpoint_path) {
-                    run.last_checkpoint_update = Some(mtime);
-                }
-
-                // Check if complete (u32::MAX indicates "COMPLETE" string in checkpoint)
-                if phase >= config.completion_value || phase == u32::MAX {
-                    let message = if phase == u32::MAX {
-                        "Workflow marked complete".to_string()
-                    } else {
-                        format!("Reached phase {}", phase)
-                    };
-                    run.set_status(WorkflowStatus::Completed, &message);
-                    return Some(run.clone());
-                }
-            }
-            Err(e) => {
-                // Checkpoint might not exist yet if workflow just started
-                if run.sessions_spawned > 0 {
-                    warn!("Failed to read checkpoint for run {}: {}", run_id, e);
-                }
-            }
-        }
-
-        // Determine workflow status
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let last_activity = run.last_checkpoint_update.unwrap_or(run.last_activity);
-        let seconds_since_activity = now.saturating_sub(last_activity);
-
-        if run.active_session_id.is_some() {
-            // Session is running
-            if run.status != WorkflowStatus::Running {
-                run.status = WorkflowStatus::Running;
-            }
-        } else if phase_advanced && run.sessions_spawned > 0 {
-            // Session ended with progress - ready for immediate continuation
-            run.set_status(
-                WorkflowStatus::ReadyToContinue,
-                &format!(
-                    "Phase advanced to {}, ready for continuation",
-                    run.current_phase
-                ),
-            );
-        } else if run.status == WorkflowStatus::ReadyToContinue {
-            // Keep ReadyToContinue status until continuation is spawned
-        } else if seconds_since_activity > config.stall_threshold_secs as u64
-            && run.sessions_spawned > 0
-        {
-            // No progress for too long - stalled
-            run.set_status(
-                WorkflowStatus::Stalled,
-                &format!("No activity for {}s", seconds_since_activity),
-            );
-        } else if run.status == WorkflowStatus::Stalled {
-            // Keep stalled status
-        } else {
-            run.status = WorkflowStatus::Idle;
-        }
-
-        Some(run.clone())
+        let runs = self.runs.read().await;
+        runs.get(run_id).cloned()
     }
 
     /// Mark a workflow as failed
@@ -592,12 +506,14 @@ impl WorkflowManager {
 }
 
 /// Persisted workflow state for recovery after runner restart
+/// NOTE: This is deprecated - the new task model persists state in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedWorkflowState {
     /// Active workflow runs
     pub runs: Vec<WorkflowRun>,
-    /// Workflow configs (prompt_id -> WorkflowConfig)
-    pub configs: HashMap<String, WorkflowConfig>,
+    /// Prompt ID cache (deprecated - was prompt_id -> WorkflowConfig)
+    #[serde(default)]
+    pub configs: HashMap<String, String>,
     /// Timestamp when state was persisted
     pub persisted_at: u64,
 }
@@ -637,7 +553,7 @@ impl WorkflowManager {
     }
 
     /// Persist current workflow state to disk
-    /// Call this after any significant state change
+    /// NOTE: Deprecated - use database-backed task runs instead
     pub async fn persist_state(&self) -> Result<(), String> {
         let state_file = Self::get_state_file_path()?;
 
@@ -646,7 +562,7 @@ impl WorkflowManager {
             runs_guard.values().cloned().collect()
         };
 
-        let configs: HashMap<String, WorkflowConfig> = {
+        let configs: HashMap<String, String> = {
             let configs_guard = self.configs.read().await;
             configs_guard.clone()
         };
@@ -764,6 +680,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(deprecated)]
     fn test_workflow_run_creation() {
         let prompt = SavedPrompt {
             id: "test-id".to_string(),
@@ -772,15 +689,7 @@ mod tests {
             content: "Test content".to_string(),
             category: String::new(),
             tags: vec![],
-            max_iterations: 50,
-            workflow: WorkflowConfig {
-                enabled: true,
-                checkpoint_path: "/tmp/test.json".to_string(),
-                phase_field: "current_phase".to_string(),
-                completion_value: 12,
-                stall_threshold_secs: 300,
-                continuation_prompt: "Continue".to_string(),
-            },
+            max_sessions: Some(5),
             created_at: String::new(),
             modified_at: String::new(),
         };
@@ -788,11 +697,11 @@ mod tests {
         let run = WorkflowRun::new(&prompt);
         assert_eq!(run.prompt_id, "test-id");
         assert_eq!(run.status, WorkflowStatus::Idle);
-        assert_eq!(run.completion_value, 12);
         assert_eq!(run.sessions_spawned, 0);
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_workflow_event_logging() {
         let prompt = SavedPrompt {
             id: "test-id".to_string(),
@@ -801,8 +710,7 @@ mod tests {
             content: String::new(),
             category: String::new(),
             tags: vec![],
-            max_iterations: 10,
-            workflow: WorkflowConfig::default(),
+            max_sessions: None,
             created_at: String::new(),
             modified_at: String::new(),
         };

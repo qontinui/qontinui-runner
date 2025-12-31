@@ -1,7 +1,7 @@
 //! Unified Session Manager
 //!
-//! Manages all AI sessions (Prompt Library workflows, AI Builder, one-shot)
-//! with a unified checkpoint format and shared execution infrastructure.
+//! Manages all AI sessions with a unified checkpoint format and shared execution
+//! infrastructure.
 //!
 //! Key design decisions:
 //! - All sessions use checkpoint-based continuation (no independent process spawning)
@@ -20,20 +20,8 @@ use tokio::sync::RwLock;
 use tracing::{error, info};
 
 // ============================================================================
-// Session Types
+// Session Status
 // ============================================================================
-
-/// Type of AI session
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionType {
-    /// Multi-phase workflow from Prompt Library
-    PromptWorkflow,
-    /// Iterative AI Builder session
-    AiBuilder,
-    /// Simple single-run session (e.g., /trigger-ai-analysis)
-    OneShot,
-}
 
 /// Status of a session
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -59,20 +47,13 @@ pub enum SessionStatus {
 // Unified Checkpoint Format
 // ============================================================================
 
-/// Unified checkpoint format for all session types.
-///
-/// This combines the features of both Prompt Library checkpoints and
-/// AI Builder state files into a single, consistent format.
+/// Unified checkpoint format for all sessions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     /// Session ID this checkpoint belongs to
     pub session_id: String,
 
-    /// Type of session
-    pub session_type: SessionType,
-
     /// Current phase number (1-indexed for display, 0 = not started)
-    /// For AI Builder, this maps to iteration number
     pub current_phase: u32,
 
     /// Total number of phases (0 = unknown/unlimited)
@@ -111,11 +92,10 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     /// Create a new checkpoint for a session
-    pub fn new(session_id: &str, session_type: SessionType, total_phases: u32) -> Self {
+    pub fn new(session_id: &str, total_phases: u32) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             session_id: session_id.to_string(),
-            session_type,
             current_phase: 0,
             total_phases,
             completed: false,
@@ -231,9 +211,6 @@ impl Checkpoint {
 /// Configuration for starting a new session
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Session type
-    pub session_type: SessionType,
-
     /// Initial prompt content
     pub prompt: String,
 
@@ -266,10 +243,9 @@ pub struct SessionConfig {
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
-            session_type: SessionType::OneShot,
             prompt: String::new(),
             continuation_prompt: None,
-            total_phases: 1,
+            total_phases: 0, // 0 = unlimited
             uses_gui: false,
             timeout_seconds: 1800,        // 30 minutes
             stall_threshold_seconds: 300, // 5 minutes
@@ -317,7 +293,7 @@ pub struct SessionEvent {
 impl Session {
     /// Create a new session
     pub fn new(id: &str, config: SessionConfig) -> Self {
-        let checkpoint = Checkpoint::new(id, config.session_type.clone(), config.total_phases);
+        let checkpoint = Checkpoint::new(id, config.total_phases);
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -429,10 +405,7 @@ impl SessionManager {
             sessions.insert(session_id.clone(), session.clone());
         }
 
-        info!(
-            "Started session {} ({:?})",
-            session_id, session.config.session_type
-        );
+        info!("Started session {}", session_id);
         Ok(session)
     }
 
@@ -536,17 +509,6 @@ impl SessionManager {
         sessions
             .values()
             .filter(|s| s.is_running())
-            .cloned()
-            .collect()
-    }
-
-    /// Get sessions by type
-    #[allow(dead_code)]
-    pub async fn list_sessions_by_type(&self, session_type: SessionType) -> Vec<Session> {
-        let sessions = self.sessions.read().await;
-        sessions
-            .values()
-            .filter(|s| s.config.session_type == session_type)
             .cloned()
             .collect()
     }
@@ -702,7 +664,7 @@ mod tests {
 
     #[test]
     fn test_checkpoint_completion_detection() {
-        let mut checkpoint = Checkpoint::new("test", SessionType::OneShot, 5);
+        let mut checkpoint = Checkpoint::new("test", 5);
 
         // Not complete initially
         assert!(!checkpoint.is_complete());
@@ -725,7 +687,7 @@ mod tests {
     #[test]
     fn test_checkpoint_save_load() {
         let dir = tempdir().unwrap();
-        let checkpoint = Checkpoint::new("test-session", SessionType::AiBuilder, 10);
+        let checkpoint = Checkpoint::new("test-session", 10);
 
         // Save
         checkpoint.save(dir.path()).unwrap();
@@ -742,7 +704,6 @@ mod tests {
         let manager = SessionManager::new(dir.path().to_path_buf());
 
         let config = SessionConfig {
-            session_type: SessionType::OneShot,
             prompt: "Test prompt".to_string(),
             name: "Test Session".to_string(),
             ..Default::default()

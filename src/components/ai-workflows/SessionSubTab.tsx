@@ -1,16 +1,17 @@
 /**
  * SessionSubTab.tsx
  *
- * Unified AI Session view that shows:
+ * Unified AI Run view that shows:
  * - Current AI status (Running/Idle/Resumable) at the top
- * - Workflow/session selector to filter loops by automation
- * - Continue button prominently when a workflow is resumable
+ * - Run history selector to filter by automation run
+ * - Continue button prominently when a run is resumable
  * - Split panel: Quick actions on left, Live AI Output on right
  * - Stop button when AI is running
  *
  * This is the primary view users should see when AI is active.
  */
 
+import { invoke } from "@tauri-apps/api/core";
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Play,
@@ -51,10 +52,10 @@ interface SessionSubTabProps {
   onNavigateToLibrary: () => void;
 }
 
-interface ResumableWorkflow {
+interface ResumableTask {
   name: string;
-  currentPhase: number;
-  totalPhases: number;
+  sessionsCount: number;
+  maxSessions: number | null; // null = unlimited
   status: string;
 }
 
@@ -62,18 +63,17 @@ interface ResumableWorkflow {
 interface ActiveSessionInfo {
   id: string;
   name: string;
-  session_type: string;
   status: string;
   started_at: string;
   uses_gui: boolean;
 }
 
-interface ActiveWorkflowInfo {
+interface ActiveTaskInfo {
   name: string;
-  type: "prompt" | "workflow" | "builder";
+  type: "task" | "one_shot" | "builder";
   startedAt?: string;
-  iteration?: number;
-  maxIterations?: number;
+  sessionsCount?: number;
+  maxSessions?: number | null;
 }
 
 /** Represents a workflow session that groups multiple AI loops */
@@ -86,6 +86,22 @@ interface WorkflowSession {
   isActive: boolean;
 }
 
+/** Information about a resumable workflow/task that can be continued */
+interface _ResumableWorkflow {
+  name: string;
+  currentPhase: number;
+  totalPhases: number;
+  status: string;
+}
+
+/** Information about the currently active workflow */
+interface _ActiveWorkflowInfo {
+  name: string;
+  type: string;
+  iteration: number;
+  maxIterations: number;
+}
+
 export function SessionSubTab({
   aiOutputLines,
   onClearAiOutput,
@@ -96,8 +112,8 @@ export function SessionSubTab({
   const [isRunning, setIsRunning] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
 
-  // Resumable workflow state
-  const [resumableWorkflow, setResumableWorkflow] = useState<ResumableWorkflow | null>(null);
+  // Resumable task state
+  const [resumableTask, setResumableTask] = useState<ResumableTask | null>(null);
   const [isResuming, setIsResuming] = useState(false);
   const [isForceContinuing, setIsForceContinuing] = useState(false);
 
@@ -112,8 +128,8 @@ export function SessionSubTab({
   const [autoFixEnabled, setAutoFixEnabled] = useState(false);
   const [autoFixLoading, setAutoFixLoading] = useState(false);
 
-  // Active workflow info (when running)
-  const [activeWorkflow, setActiveWorkflow] = useState<ActiveWorkflowInfo | null>(null);
+  // Active task info (when running)
+  const [activeTask, setActiveTask] = useState<ActiveTaskInfo | null>(null);
 
   // All currently active sessions (for concurrent session display)
   const [activeSessions, setActiveSessions] = useState<ActiveSessionInfo[]>([]);
@@ -122,8 +138,8 @@ export function SessionSubTab({
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showSessionSelector, setShowSessionSelector] = useState(false);
 
-  // Session management (for deletion)
-  const [isManagingsessions, setIsManagingessions] = useState(false);
+  // Run management (for deletion)
+  const [isManagingRuns, setIsManagingRuns] = useState(false);
   const [selectedForDeletion, setSelectedForDeletion] = useState<Set<string>>(new Set());
   const [deleteBeforeDate, setDeleteBeforeDate] = useState<string>("");
   const [isDeleting, setIsDeleting] = useState(false);
@@ -134,6 +150,10 @@ export function SessionSubTab({
 
   // Last result message
   const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
+
+  // Per-run auto-continue setting (distinct from global auto-continue)
+  const [runAutoContinue, setRunAutoContinue] = useState<boolean | null>(null);
+  const [runAutoContinueLoading, setRunAutoContinueLoading] = useState(false);
 
   // Group AI output lines into loops
   const loops = useMemo(() => groupEntriesIntoLoops(aiOutputLines), [aiOutputLines]);
@@ -200,19 +220,41 @@ export function SessionSubTab({
     for (const temp of sessionMap.values()) {
       let bestName: string | null = null;
 
-      // Look through loops in order to find first meaningful name
+      // Priority 1: Look for explicit sessionName from any loop (this is the task title)
       for (const loop of temp.loops) {
-        const loopName = findBestLoopName(loop);
-        if (loopName) {
-          bestName = loopName;
+        if (loop.sessionName && loop.sessionName !== "AI Response") {
+          bestName = loop.sessionName;
           break;
         }
       }
 
-      // Fallback to a generic name with timestamp
+      // Priority 2: Look for sessionName in any entry (handles cases where loop doesn't have it but entry does)
       if (!bestName) {
-        const date = new Date(temp.startTime);
-        bestName = `Session at ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+        for (const loop of temp.loops) {
+          for (const entry of loop.entries) {
+            if (entry.sessionName && entry.sessionName !== "AI Response") {
+              bestName = entry.sessionName;
+              break;
+            }
+          }
+          if (bestName) break;
+        }
+      }
+
+      // Priority 3: Fall back to first meaningful prompt or other name
+      if (!bestName) {
+        for (const loop of temp.loops) {
+          const loopName = findBestLoopName(loop);
+          if (loopName) {
+            bestName = loopName;
+            break;
+          }
+        }
+      }
+
+      // Priority 4: Generic name with timestamp (only as last resort)
+      if (!bestName) {
+        bestName = "Untitled Run";
       }
 
       sessions.push({
@@ -314,7 +356,57 @@ export function SessionSubTab({
     }
   }, [autoFixEnabled, autoFixLoading]);
 
-  // Check for resumable workflows and running state periodically
+  // Load per-run auto-continue setting when a specific run is selected
+  useEffect(() => {
+    // Only fetch when a specific session is selected (not "All Runs")
+    if (!selectedSessionId) {
+      setRunAutoContinue(null);
+      return;
+    }
+
+    const loadRunAutoContinue = async () => {
+      try {
+        const response = await fetch(
+          `http://localhost:9876/task-runs/${selectedSessionId}/auto-continue`,
+        );
+        const result = await response.json();
+        if (result.auto_continue !== undefined) {
+          setRunAutoContinue(result.auto_continue);
+        }
+      } catch (error) {
+        console.error("Failed to load per-run auto-continue setting:", error);
+        setRunAutoContinue(null);
+      }
+    };
+    loadRunAutoContinue();
+  }, [selectedSessionId]);
+
+  // Toggle per-run auto-continue setting
+  const toggleRunAutoContinue = useCallback(async () => {
+    if (!selectedSessionId || runAutoContinueLoading || runAutoContinue === null) return;
+
+    setRunAutoContinueLoading(true);
+    try {
+      const response = await fetch(
+        `http://localhost:9876/task-runs/${selectedSessionId}/auto-continue`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ auto_continue: !runAutoContinue }),
+        },
+      );
+      const result = await response.json();
+      if (result.success) {
+        setRunAutoContinue(result.auto_continue);
+      }
+    } catch (error) {
+      console.error("Failed to toggle per-run auto-continue setting:", error);
+    } finally {
+      setRunAutoContinueLoading(false);
+    }
+  }, [selectedSessionId, runAutoContinue, runAutoContinueLoading]);
+
+  // Check for resumable tasks and running state periodically
   useEffect(() => {
     const checkStatus = async () => {
       try {
@@ -326,28 +418,28 @@ export function SessionSubTab({
             setIsRunning(result.data.is_running);
           }
           // Note: auto_continue_enabled is now managed by AutoContinueContext
-          // Only show Continue if there's a resumable workflow AND nothing is running
+          // Only show Continue if there's a resumable task AND nothing is running
           if (result.data?.has_resumable && !result.data?.is_running) {
-            setResumableWorkflow({
-              name: result.data.name || "Unknown Workflow",
-              currentPhase: result.data.current_phase || 0,
-              totalPhases: result.data.total_phases || 0,
+            setResumableTask({
+              name: result.data.name || "Unknown Task",
+              sessionsCount: result.data.sessions_count || 0,
+              maxSessions: result.data.max_sessions || null,
               status: result.data.status || "unknown",
             });
           } else {
-            setResumableWorkflow(null);
+            setResumableTask(null);
           }
 
-          // Set active workflow info when running
+          // Set active task info when running
           if (result.data?.is_running && result.data?.name) {
-            setActiveWorkflow({
+            setActiveTask({
               name: result.data.name,
-              type: result.data.workflow_type || "workflow",
-              iteration: result.data.current_phase,
-              maxIterations: result.data.total_phases,
+              type: result.data.task_type || "task",
+              sessionsCount: result.data.sessions_count,
+              maxSessions: result.data.max_sessions,
             });
           } else if (!result.data?.is_running) {
-            setActiveWorkflow(null);
+            setActiveTask(null);
           }
 
           // Update all active sessions (for concurrent session display)
@@ -373,7 +465,7 @@ export function SessionSubTab({
 
   // Handler to resume a workflow
   const handleResumeWorkflow = useCallback(async () => {
-    if (!resumableWorkflow || isResuming) return;
+    if (!resumableTask || isResuming) return;
 
     setIsResuming(true);
     try {
@@ -384,9 +476,9 @@ export function SessionSubTab({
       const result = await response.json();
 
       if (result.success) {
-        setResumableWorkflow(null);
+        setResumableTask(null);
         setIsRunning(true);
-        setLastResult({ success: true, message: `Resuming workflow: ${resumableWorkflow.name}` });
+        setLastResult({ success: true, message: `Resuming task: ${resumableTask.name}` });
       } else {
         setLastResult({
           success: false,
@@ -402,43 +494,51 @@ export function SessionSubTab({
     } finally {
       setIsResuming(false);
     }
-  }, [resumableWorkflow, isResuming]);
+  }, [resumableTask, isResuming]);
 
   // Handler to force continue a stopped session
+  // If a specific session is selected, continue that one; otherwise continue most recent
   const handleForceContinue = useCallback(async () => {
     if (isForceContinuing) return;
 
     setIsForceContinuing(true);
     try {
+      // If a specific session is selected, pass its ID to continue that specific run
+      const requestBody: { task_run_id?: string } = {};
+      if (currentSession) {
+        requestBody.task_run_id = currentSession.id;
+      }
+
       const response = await fetch("http://localhost:9876/workflow/force-continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
+        body: JSON.stringify(requestBody),
       });
       const result = await response.json();
 
       if (result.success) {
         setIsRunning(true);
+        const sessionInfo = currentSession ? ` "${currentSession.name}"` : "";
         setLastResult({
           success: true,
-          message: "Force continue session started. AI will resume with context from last output.",
+          message: `Continuing${sessionInfo}. AI will resume with context from last output.`,
         });
       } else {
         setLastResult({
           success: false,
-          message: result.error || "Failed to force continue",
+          message: result.error || "Failed to continue",
         });
       }
     } catch (error) {
       console.error("Failed to force continue:", error);
       setLastResult({
         success: false,
-        message: `Failed to force continue: ${error instanceof Error ? error.message : String(error)}`,
+        message: `Failed to continue: ${error instanceof Error ? error.message : String(error)}`,
       });
     } finally {
       setIsForceContinuing(false);
     }
-  }, [isForceContinuing]);
+  }, [isForceContinuing, currentSession]);
 
   // Handler to stop AI
   const handleStopAi = useCallback(async () => {
@@ -471,9 +571,9 @@ export function SessionSubTab({
     setShowSessionSelector(false);
   }, []);
 
-  // Toggle session management mode
+  // Toggle run management mode
   const handleToggleManagement = useCallback(() => {
-    setIsManagingessions((prev) => {
+    setIsManagingRuns((prev) => {
       if (prev) {
         // Exiting management mode - clear selections
         setSelectedForDeletion(new Set());
@@ -518,43 +618,51 @@ export function SessionSubTab({
     [workflowSessions],
   );
 
-  // Delete selected sessions
-  const handleDeleteSessions = useCallback(() => {
+  // Delete selected runs (sessions)
+  const handleDeleteRuns = useCallback(async () => {
     if (selectedForDeletion.size === 0) return;
 
     setIsDeleting(true);
 
-    // Get the session IDs to delete and find the corresponding loop entries
-    const sessionIds = Array.from(selectedForDeletion);
-    const sessionsToDelete = workflowSessions.filter((s) => sessionIds.includes(s.id));
+    try {
+      // Get the session IDs to delete
+      const sessionIds = Array.from(selectedForDeletion);
 
-    // Find all entry IDs that belong to these sessions (by time range)
-    const entryIdsToDelete = new Set<string>();
-    for (const session of sessionsToDelete) {
-      const BUFFER_MS = 1000;
-      for (const line of aiOutputLines) {
-        if (
-          line.timestamp >= session.startTime - BUFFER_MS &&
-          line.timestamp <= session.endTime + BUFFER_MS
-        ) {
-          entryIdsToDelete.add(line.id);
-        }
+      // Delete checkpoint files for these sessions via Tauri command
+      const checkpointResult = await invoke<{
+        success: boolean;
+        message?: string;
+        data?: { deleted_count: number };
+      }>("delete_session_checkpoints", { sessionIds });
+
+      if (!checkpointResult.success) {
+        console.warn("Failed to delete some checkpoints:", checkpointResult.message);
+      } else {
+        console.log(`Deleted ${checkpointResult.data?.deleted_count ?? 0} checkpoint files`);
       }
-    }
 
-    // Call the clear function with the IDs to delete
-    // Since onClearAiOutput clears all, we need to filter
-    // For now, we'll just clear all if deleting - proper implementation would need backend support
-    if (entryIdsToDelete.size > 0) {
-      onClearAiOutput();
+      // If deleting all sessions, clear the AI output log entirely
+      if (selectedForDeletion.size === workflowSessions.length) {
+        // Clear the AI output log file via Tauri command
+        await invoke("clear_ai_output_log");
+        // Clear in-memory state
+        onClearAiOutput();
+      } else {
+        // For partial deletion, we still need to clear all (selective deletion not yet supported)
+        // The checkpoint files are deleted, so runs won't reappear after app restart
+        await invoke("clear_ai_output_log");
+        onClearAiOutput();
+      }
+    } catch (error) {
+      console.error("Failed to delete runs:", error);
+    } finally {
+      // Reset state
+      setSelectedForDeletion(new Set());
+      setDeleteBeforeDate("");
+      setIsManagingRuns(false);
+      setIsDeleting(false);
     }
-
-    // Reset state
-    setSelectedForDeletion(new Set());
-    setDeleteBeforeDate("");
-    setIsManagingessions(false);
-    setIsDeleting(false);
-  }, [selectedForDeletion, workflowSessions, aiOutputLines, onClearAiOutput]);
+  }, [selectedForDeletion, workflowSessions, onClearAiOutput]);
 
   // Select/deselect all sessions
   const handleSelectAll = useCallback(() => {
@@ -590,42 +698,41 @@ export function SessionSubTab({
     if (isRunning) {
       // Show count of active sessions if multiple
       const sessionCount = activeSessions.length;
-      const subtitle =
-        sessionCount > 1
-          ? `${sessionCount} sessions running concurrently`
-          : activeWorkflow
-            ? `${activeWorkflow.type} - Phase ${activeWorkflow.iteration || "?"} of ${activeWorkflow.maxIterations || "?"}`
-            : "Processing...";
+      const sessionLabel = activeTask?.sessionsCount
+        ? `Session ${activeTask.sessionsCount}${activeTask.maxSessions ? ` of ${activeTask.maxSessions}` : ""}`
+        : "Processing...";
+      const subtitle = sessionCount > 1 ? `${sessionCount} runs in progress` : sessionLabel;
 
       return {
         status: "running" as const,
         color: "emerald",
         icon: Loader2,
         title:
-          sessionCount > 1
-            ? `${sessionCount} Sessions Running`
-            : activeWorkflow?.name || "AI Running",
+          sessionCount > 1 ? `${sessionCount} Runs in Progress` : activeTask?.name || "AI Running",
         subtitle,
         sessionCount,
       };
     }
-    if (resumableWorkflow) {
+    if (resumableTask) {
+      const sessionLabel = resumableTask.maxSessions
+        ? `Session ${resumableTask.sessionsCount} of ${resumableTask.maxSessions}`
+        : `Session ${resumableTask.sessionsCount}`;
       return {
         status: "resumable" as const,
         color: "orange",
         icon: Clock,
-        title: resumableWorkflow.name,
-        subtitle: `Paused at Phase ${resumableWorkflow.currentPhase} of ${resumableWorkflow.totalPhases}`,
+        title: resumableTask.name,
+        subtitle: `Paused at ${sessionLabel}`,
       };
     }
     return {
       status: "idle" as const,
       color: "gray",
       icon: Sparkles,
-      title: "No Active Session",
-      subtitle: "Start a prompt or workflow from the Library",
+      title: "No Active Run",
+      subtitle: "Start a task from the Library",
     };
-  }, [isRunning, resumableWorkflow, activeWorkflow, activeSessions]);
+  }, [isRunning, resumableTask, activeTask, activeSessions]);
 
   // Format time for display
   const formatTime = (timestamp: number) => {
@@ -684,7 +791,7 @@ export function SessionSubTab({
                         ? "bg-purple-500/20 text-purple-400"
                         : "bg-blue-500/20 text-blue-400"
                     }`}
-                    title={`${session.session_type} - ${session.uses_gui ? "GUI" : "Non-GUI"}`}
+                    title={session.uses_gui ? "GUI Session" : "Non-GUI Session"}
                   >
                     {session.name.length > 20
                       ? session.name.substring(0, 17) + "..."
@@ -695,7 +802,7 @@ export function SessionSubTab({
             )}
 
             {/* Continue Button - Prominent when resumable */}
-            {resumableWorkflow && !isRunning && (
+            {resumableTask && !isRunning && (
               <button
                 onClick={handleResumeWorkflow}
                 disabled={isResuming}
@@ -709,19 +816,19 @@ export function SessionSubTab({
                 ) : (
                   <>
                     <Play className="w-4 h-4" />
-                    Continue Workflow
+                    Continue Task
                   </>
                 )}
               </button>
             )}
 
-            {/* Force Continue Button - When stopped unexpectedly (has output but not running/resumable) */}
-            {!isRunning && !resumableWorkflow && aiOutputLines.length > 0 && (
+            {/* Continue Button - When stopped unexpectedly (has output but not running/resumable) */}
+            {!isRunning && !resumableTask && aiOutputLines.length > 0 && (
               <button
                 onClick={handleForceContinue}
                 disabled={isForceContinuing}
                 className="flex items-center gap-2 px-4 py-2 bg-amber-600 text-white rounded-lg font-medium hover:bg-amber-700 disabled:opacity-50 transition-colors"
-                title="Force continue a session that stopped unexpectedly. Uses recent output as context."
+                title="Continue a run that stopped. Uses recent output as context."
               >
                 {isForceContinuing ? (
                   <>
@@ -731,7 +838,7 @@ export function SessionSubTab({
                 ) : (
                   <>
                     <RotateCcw className="w-4 h-4" />
-                    Force Continue
+                    Continue
                   </>
                 )}
               </button>
@@ -792,7 +899,7 @@ export function SessionSubTab({
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Left Panel - Settings & Issues */}
         <div className="w-80 flex-shrink-0 border-r border-border overflow-y-auto p-4 space-y-4">
-          {/* Session Selector */}
+          {/* Run Selector */}
           {workflowSessions.length > 0 && (
             <div className="card">
               {/* Header */}
@@ -804,29 +911,29 @@ export function SessionSubTab({
                   <History className="w-4 h-4 text-primary" />
                   <div className="text-left">
                     <span className="text-sm font-medium block">
-                      {isManagingsessions
-                        ? "Manage Sessions"
+                      {isManagingRuns
+                        ? "Manage Runs"
                         : currentSession
                           ? currentSession.name.length > 15
                             ? currentSession.name.substring(0, 15) + "..."
                             : currentSession.name
-                          : "All Sessions"}
+                          : "All Runs"}
                     </span>
                     <span className="text-xs text-muted-foreground">
-                      {isManagingsessions
+                      {isManagingRuns
                         ? `${selectedForDeletion.size} selected`
                         : currentSession
-                          ? `${currentSession.loopCount} loops`
-                          : `${workflowSessions.length} sessions`}
+                          ? `${currentSession.loopCount} conversation${currentSession.loopCount !== 1 ? "s" : ""}`
+                          : `${workflowSessions.length} run${workflowSessions.length !== 1 ? "s" : ""}`}
                     </span>
                   </div>
                 </button>
                 <div className="flex items-center gap-1">
-                  {!isManagingsessions ? (
+                  {!isManagingRuns ? (
                     <button
                       onClick={handleToggleManagement}
                       className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded transition-colors"
-                      title="Manage sessions"
+                      title="Manage runs"
                     >
                       <Settings className="w-4 h-4" />
                     </button>
@@ -854,7 +961,7 @@ export function SessionSubTab({
               </div>
 
               {/* Management Controls */}
-              {isManagingsessions && showSessionSelector && (
+              {isManagingRuns && showSessionSelector && (
                 <div className="px-3 py-2 border-b border-border bg-muted/30 space-y-2">
                   {/* Date filter */}
                   <div className="flex items-center gap-2">
@@ -864,7 +971,7 @@ export function SessionSubTab({
                       value={deleteBeforeDate}
                       onChange={(e) => handleSelectBeforeDate(e.target.value)}
                       className="flex-1 text-xs bg-background border border-border rounded px-2 py-1"
-                      title="Select sessions before this date"
+                      title="Select runs before this date"
                     />
                   </div>
 
@@ -880,7 +987,7 @@ export function SessionSubTab({
                         : "Select All"}
                     </button>
                     <button
-                      onClick={handleDeleteSessions}
+                      onClick={handleDeleteRuns}
                       disabled={selectedForDeletion.size === 0 || isDeleting}
                       className="flex items-center gap-1 px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                     >
@@ -895,11 +1002,11 @@ export function SessionSubTab({
                 </div>
               )}
 
-              {/* Session List */}
+              {/* Run List */}
               {showSessionSelector && (
                 <div className="px-2 pb-2 pt-1 space-y-1 max-h-48 overflow-y-auto">
-                  {/* All Sessions option (only in view mode) */}
-                  {!isManagingsessions && (
+                  {/* All Runs option (only in view mode) */}
+                  {!isManagingRuns && (
                     <button
                       onClick={() => handleSelectSession(null)}
                       className={`w-full flex items-center gap-2 p-2 rounded text-left text-sm hover:bg-muted/50 transition-colors ${
@@ -907,19 +1014,19 @@ export function SessionSubTab({
                       }`}
                     >
                       <Filter className="w-3 h-3 text-muted-foreground" />
-                      <span>All Sessions</span>
+                      <span>All Runs</span>
                       <span className="text-xs text-muted-foreground ml-auto">
-                        {loops.length} loops
+                        {workflowSessions.length} runs
                       </span>
                     </button>
                   )}
 
-                  {/* Individual sessions */}
+                  {/* Individual runs */}
                   {workflowSessions.map((session) => (
                     <div
                       key={session.id}
                       className={`flex items-start gap-2 p-2 rounded text-sm hover:bg-muted/50 transition-colors ${
-                        isManagingsessions
+                        isManagingRuns
                           ? selectedForDeletion.has(session.id)
                             ? "bg-red-500/10"
                             : ""
@@ -928,7 +1035,7 @@ export function SessionSubTab({
                             : ""
                       }`}
                     >
-                      {isManagingsessions ? (
+                      {isManagingRuns ? (
                         <input
                           type="checkbox"
                           checked={selectedForDeletion.has(session.id)}
@@ -956,12 +1063,12 @@ export function SessionSubTab({
                             </div>
                             <div className="text-xs text-muted-foreground">
                               {formatDate(session.startTime)} {formatTime(session.startTime)} -{" "}
-                              {session.loopCount} loops
+                              {session.loopCount} conv{session.loopCount !== 1 ? "s" : ""}
                             </div>
                           </div>
                         </button>
                       )}
-                      {isManagingsessions && (
+                      {isManagingRuns && (
                         <button
                           onClick={() => handleToggleSessionSelection(session.id)}
                           className="flex-1 flex items-start gap-2 text-left"
@@ -980,7 +1087,8 @@ export function SessionSubTab({
                               )}
                             </div>
                             <div className="text-xs text-muted-foreground">
-                              {formatDate(session.startTime)} - {session.loopCount} loops
+                              {formatDate(session.startTime)} - {session.loopCount} conv
+                              {session.loopCount !== 1 ? "s" : ""}
                             </div>
                           </div>
                         </button>
@@ -992,7 +1100,7 @@ export function SessionSubTab({
             </div>
           )}
 
-          {/* Auto-Continue Toggle */}
+          {/* Auto-Continue Toggle (Global) */}
           <div className="card p-3">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
@@ -1020,6 +1128,43 @@ export function SessionSubTab({
               </button>
             </div>
           </div>
+
+          {/* Per-Run Auto-Continue Toggle - Only shown when a specific run is selected */}
+          {selectedSessionId && runAutoContinue !== null && (
+            <div className="card p-3 border-l-2 border-l-purple-500/50">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Play className="w-4 h-4 text-purple-500" />
+                  <div>
+                    <span className="text-sm font-medium">Run Auto-Continue</span>
+                    <p className="text-xs text-muted-foreground">
+                      {runAutoContinue
+                        ? "This run will auto-resume"
+                        : "This run requires manual resume"}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={toggleRunAutoContinue}
+                  disabled={runAutoContinueLoading}
+                  className={`flex items-center transition-colors ${runAutoContinue ? "text-purple-500" : "text-muted-foreground"} ${runAutoContinueLoading ? "opacity-50" : ""}`}
+                  title={
+                    runAutoContinue
+                      ? "Per-run auto-continue enabled"
+                      : "Per-run auto-continue disabled"
+                  }
+                >
+                  {runAutoContinueLoading ? (
+                    <Loader2 className="w-6 h-6 animate-spin" />
+                  ) : runAutoContinue ? (
+                    <ToggleRight className="w-6 h-6" />
+                  ) : (
+                    <ToggleLeft className="w-6 h-6" />
+                  )}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* Auto-Fix on Failure Toggle */}
           <div className="card p-3">
@@ -1118,7 +1263,7 @@ export function SessionSubTab({
             <div className="flex items-center gap-2 mb-2">
               <Activity className="w-4 h-4 text-primary" />
               <span className="text-sm font-medium">
-                {currentSession ? "Session Stats" : "All Stats"}
+                {currentSession ? "Run Stats" : "All Stats"}
               </span>
             </div>
             <div className="space-y-1 text-xs text-muted-foreground">
@@ -1127,7 +1272,7 @@ export function SessionSubTab({
                 <span className="font-medium text-foreground">{filteredAiOutputLines.length}</span>
               </div>
               <div className="flex justify-between">
-                <span>Loops</span>
+                <span>Conversations</span>
                 <span className="font-medium text-foreground">{filteredLoops.length}</span>
               </div>
               <div className="flex justify-between">

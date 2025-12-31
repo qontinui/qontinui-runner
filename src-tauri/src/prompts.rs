@@ -3,8 +3,8 @@
 //! This module provides persistent storage for AI prompts that users can
 //! save, organize, and run from the runner UI.
 //!
-//! Supports "workflow" prompts that automatically continue across multiple
-//! AI sessions using checkpoint files.
+//! Simplified model: every task runs until [TASK_COMPLETE] marker is found.
+//! Multi-session support is controlled by max_sessions (optional limit).
 
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -17,49 +17,6 @@ const PROMPTS_FILE: &str = "prompts.json";
 // ============================================================================
 // Data Types
 // ============================================================================
-
-/// Configuration for multi-session workflow prompts
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkflowConfig {
-    /// Enable workflow mode (auto-continue across sessions)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Path to checkpoint file that tracks workflow progress
-    #[serde(default)]
-    pub checkpoint_path: String,
-    /// Field in checkpoint JSON that indicates current phase/step (e.g., "current_phase")
-    #[serde(default = "default_phase_field")]
-    pub phase_field: String,
-    /// Value of phase_field that indicates workflow is complete
-    #[serde(default = "default_completion_value")]
-    pub completion_value: u32,
-    /// Seconds without checkpoint update before considering workflow stalled
-    #[serde(default = "default_stall_threshold")]
-    pub stall_threshold_secs: u32,
-    /// Prompt to use when spawning continuation sessions
-    #[serde(default)]
-    pub continuation_prompt: String,
-    /// Auto-continue workflow on runner restart (default: true for prompts)
-    /// Can be toggled during workflow execution via API
-    #[serde(default = "default_auto_continue")]
-    pub auto_continue: bool,
-}
-
-fn default_auto_continue() -> bool {
-    true // Prompts default to auto-continue enabled
-}
-
-fn default_phase_field() -> String {
-    "current_phase".to_string()
-}
-
-fn default_completion_value() -> u32 {
-    12
-}
-
-fn default_stall_threshold() -> u32 {
-    300 // 5 minutes
-}
 
 /// A saved prompt in the library
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,20 +36,14 @@ pub struct SavedPrompt {
     /// Tags for filtering/searching
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Maximum iterations for AI Developer sessions (default: 10)
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
-    /// Workflow configuration for multi-session prompts
+    /// Maximum number of sessions (null = unlimited)
+    /// Sessions continue until [TASK_COMPLETE] is found or this limit is reached
     #[serde(default)]
-    pub workflow: WorkflowConfig,
+    pub max_sessions: Option<u32>,
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification
     pub modified_at: String,
-}
-
-fn default_max_iterations() -> u32 {
-    10
 }
 
 impl SavedPrompt {
@@ -103,8 +54,7 @@ impl SavedPrompt {
         content: String,
         category: String,
         tags: Vec<String>,
-        max_iterations: u32,
-        workflow: Option<WorkflowConfig>,
+        max_sessions: Option<u32>,
     ) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
@@ -114,8 +64,7 @@ impl SavedPrompt {
             content,
             category,
             tags,
-            max_iterations,
-            workflow: workflow.unwrap_or_default(),
+            max_sessions,
             created_at: now.clone(),
             modified_at: now,
         }
@@ -226,20 +175,12 @@ pub fn create_prompt(
     content: String,
     category: String,
     tags: Vec<String>,
-    max_iterations: u32,
-    workflow: Option<WorkflowConfig>,
+    max_sessions: Option<u32>,
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
-    let prompt = SavedPrompt::with_details(
-        name,
-        description,
-        content,
-        category,
-        tags,
-        max_iterations,
-        workflow,
-    );
+    let prompt =
+        SavedPrompt::with_details(name, description, content, category, tags, max_sessions);
     let created = prompt.clone();
 
     library.prompts.push(prompt);
@@ -250,7 +191,6 @@ pub fn create_prompt(
 }
 
 /// Update an existing prompt
-#[allow(clippy::too_many_arguments)]
 pub fn update_prompt(
     id: &str,
     name: Option<String>,
@@ -258,8 +198,7 @@ pub fn update_prompt(
     content: Option<String>,
     category: Option<String>,
     tags: Option<Vec<String>>,
-    max_iterations: Option<u32>,
-    workflow: Option<WorkflowConfig>,
+    max_sessions: Option<Option<u32>>,
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
@@ -284,11 +223,8 @@ pub fn update_prompt(
     if let Some(tags) = tags {
         prompt.tags = tags;
     }
-    if let Some(max_iterations) = max_iterations {
-        prompt.max_iterations = max_iterations;
-    }
-    if let Some(workflow) = workflow {
-        prompt.workflow = workflow;
+    if let Some(max_sessions) = max_sessions {
+        prompt.max_sessions = max_sessions;
     }
 
     prompt.modified_at = chrono::Utc::now().to_rfc3339();
@@ -407,24 +343,13 @@ pub fn duplicate_prompt(id: &str, new_name: Option<String>) -> Result<SavedPromp
         original.content,
         original.category,
         original.tags,
-        original.max_iterations,
-        Some(original.workflow),
+        original.max_sessions,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_prompt_creation() {
-        let prompt = SavedPrompt::new("Test Prompt".to_string(), "Test content".to_string());
-        assert!(!prompt.id.is_empty());
-        assert_eq!(prompt.name, "Test Prompt");
-        assert_eq!(prompt.content, "Test content");
-        assert_eq!(prompt.max_iterations, 10);
-        assert!(!prompt.workflow.enabled);
-    }
 
     #[test]
     fn test_prompt_with_details() {
@@ -434,33 +359,22 @@ mod tests {
             "Content".to_string(),
             "Dev".to_string(),
             vec!["tag1".to_string()],
-            5,
-            None,
+            Some(5),
         );
         assert_eq!(prompt.category, "Dev");
-        assert_eq!(prompt.max_iterations, 5);
+        assert_eq!(prompt.max_sessions, Some(5));
     }
 
     #[test]
-    fn test_prompt_with_workflow() {
-        let workflow = WorkflowConfig {
-            enabled: true,
-            checkpoint_path: "/tmp/checkpoint.json".to_string(),
-            phase_field: "current_phase".to_string(),
-            completion_value: 12,
-            stall_threshold_secs: 300,
-            continuation_prompt: "Continue the workflow".to_string(),
-        };
+    fn test_prompt_unlimited_sessions() {
         let prompt = SavedPrompt::with_details(
-            "Workflow Test".to_string(),
-            "A workflow prompt".to_string(),
+            "Unlimited Test".to_string(),
+            "A prompt with unlimited sessions".to_string(),
             "Content".to_string(),
             "Dev".to_string(),
             vec![],
-            50,
-            Some(workflow),
+            None,
         );
-        assert!(prompt.workflow.enabled);
-        assert_eq!(prompt.workflow.completion_value, 12);
+        assert_eq!(prompt.max_sessions, None);
     }
 }

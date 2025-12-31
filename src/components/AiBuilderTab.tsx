@@ -44,6 +44,7 @@ import {
   FilePlus2,
   AlertTriangle,
   RotateCcw,
+  FolderOpen,
 } from "lucide-react";
 import { useExecution, useAutoContinue } from "../contexts";
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
@@ -56,6 +57,7 @@ interface StateInfo {
 }
 
 interface ImageInfo {
+  id: string;
   name: string;
   stateName: string;
 }
@@ -103,7 +105,7 @@ interface SavedAiWorkflow {
 /** A single step in the execution sequence */
 interface ExecutionStep {
   id: string;
-  type: "workflow" | "state" | "playwright" | "prompt";
+  type: "workflow" | "state" | "playwright" | "prompt" | "action" | "screenshot";
   name: string;
   takeScreenshot: boolean;
   screenshotDelay?: number; // Delay in seconds before taking screenshot (default 0)
@@ -112,6 +114,12 @@ interface ExecutionStep {
   playwrightTargetUrl?: string;
   promptId?: string;
   promptContent?: string;
+  // Action step fields
+  actionType?: "click" | "double_click" | "right_click";
+  targetImageId?: string;
+  targetImageName?: string;
+  // Screenshot step fields
+  screenshotMonitor?: number | "all"; // Monitor index or "all" for all monitors
 }
 
 interface PromptHistoryEntry {
@@ -121,239 +129,6 @@ interface PromptHistoryEntry {
   goal: string;
   success?: boolean;
 }
-
-// Standard Mode Prompt Template - Runner handles multi-session continuation
-const STANDARD_PROMPT_TEMPLATE = `# AI Automation Analysis
-
-Execute automation, analyze results, fix issues. The runner handles session continuation automatically.
-
-## Runner-Managed Continuation
-
-**You don't need to spawn new sessions.** The runner will:
-1. Check the checkpoint file after your session ends
-2. If \`completed: false\` → automatically spawn next session
-3. If \`completed: true\` → stop (workflow done)
-
-Your job: Do the work, update the checkpoint file when done.
-
-## Goal
-{{GOAL}}
-
-## Iteration Info
-- **Iteration**: {{ITERATION}} of {{MAX_ITERATIONS}}
-- **Workflow**: {{WORKFLOW_NAME}}
-
-## Execution Steps
-{{STEP_COUNT}} steps to execute:
-
-{{EXECUTION_STEPS}}
-
----
-
-## Phase 1: Execute Automation
-
-Run each step in order using the MCP tools available.
-
----
-
-## Phase 2: Analyze Results (CRITICAL - LOOK FOR ANOMALIES)
-
-### 2.1 Check Action Logs
-\`\`\`powershell
-Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-actions.jsonl" -Tail 100 | Select-String -Pattern '"error"|"failed"|"status":"error"'
-\`\`\`
-
-### 2.2 Check Image Recognition Logs (ANOMALY DETECTION)
-\`\`\`powershell
-# Get ALL image recognition results
-$allLogs = Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-image-recognition.jsonl" | ForEach-Object { $_ | ConvertFrom-Json }
-$allLogs | Format-Table timestamp, image_name, found, confidence, location, annotated_screenshot_path -AutoSize
-\`\`\`
-
-**ANOMALY DETECTION - Look for these bugs:**
-
-1. **REDUNDANT SEARCHES**: If the same image appears multiple times:
-   - **Bug**: Image should only be searched once if found - why is it searching again?
-   - Check: Group by image_name and count entries
-
-2. **MISSING DATA in logs**: Each log entry MUST have:
-   - \`annotated_screenshot_path\` - path to screenshot with match visualization
-   - \`template_path\` - path to the template image being matched
-   - \`location\` - MUST be a valid coordinate object {x, y} if found=true
-   - **Bug**: Missing any of these fields indicates corrupt/incomplete log entry
-
-3. **INCONSISTENT LOCATIONS**: For multiple entries of same image:
-   - All found=true entries should have SAME location (within ~5px)
-   - **Bug**: Different locations for same image = coordinate calculation bug
-
-4. **IMPOSSIBLE COORDINATES**: Check for:
-   - Negative x or y values (can't click negative coordinates)
-   - x > 5000 or y > 3000 (beyond reasonable screen bounds)
-   - **Bug**: These indicate coordinate transformation errors
-
-\`\`\`powershell
-# ANOMALY CHECK: Find duplicate image searches
-$grouped = $allLogs | Group-Object image_name
-$grouped | Where-Object { $_.Count -gt 1 } | ForEach-Object {
-    Write-Host "ANOMALY: Image '$($_.Name)' searched $($_.Count) times - should be 1 if found!"
-    $_.Group | ForEach-Object { Write-Host "  - found=$($_.found) loc=$($_.location) screenshot=$($_.annotated_screenshot_path)" }
-}
-
-# ANOMALY CHECK: Find entries with missing data
-$allLogs | Where-Object {
-    -not $_.annotated_screenshot_path -or
-    -not $_.template_path -or
-    ($_.found -eq $true -and (-not $_.location -or -not $_.location.x -or -not $_.location.y))
-} | ForEach-Object {
-    Write-Host "ANOMALY: Incomplete log entry for '$($_.image_name)' - missing required fields!"
-    Write-Host "  screenshot_path: $($_.annotated_screenshot_path)"
-    Write-Host "  template_path: $($_.template_path)"
-    Write-Host "  location: $($_.location)"
-}
-
-# ANOMALY CHECK: Find impossible coordinates
-$allLogs | Where-Object {
-    $_.found -eq $true -and $_.location -and (
-        $_.location.x -lt 0 -or $_.location.y -lt 0 -or
-        $_.location.x -gt 5000 -or $_.location.y -gt 3000
-    )
-} | ForEach-Object {
-    Write-Host "ANOMALY: Impossible coordinates for '$($_.image_name)': ($($_.location.x), $($_.location.y))"
-}
-\`\`\`
-
-### 2.3 Coordinate Validation (CRITICAL)
-For EVERY CLICK action, validate the click actually went where intended:
-
-\`\`\`powershell
-# Get CLICK actions with their clicked_location
-Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-actions.jsonl" | Where-Object { $_ -match '"type":"CLICK"' -and $_ -match 'action_completed' } | ForEach-Object { $_ | ConvertFrom-Json } | Select-Object -ExpandProperty node | Select-Object id, name, status, @{N='clicked_x';E={$_.metadata.execution_record.metadata.runtime.clicked_location.x}}, @{N='clicked_y';E={$_.metadata.execution_record.metadata.runtime.clicked_location.y}}
-\`\`\`
-
-**Compare FIND location vs CLICK location:**
-- The FIND action records where the image was found
-- The CLICK action should click at (or near) that same location
-- **BUG**: If clicked_location differs from found location by >20px, coordinate transformation is broken
-
-{{INPUT_CAPTURE_SECTION}}
-
-### 2.4 View Annotated Screenshots
-**CRITICAL**: Use the Read tool to view the annotated screenshots listed in the logs. These show:
-- Green boxes around matched regions
-- Confidence scores overlaid
-- Why a match succeeded or failed
-
-\`\`\`powershell
-# List annotated screenshots
-Get-Content "{{DEV_LOGS_ESCAPED}}\\runner-image-recognition.jsonl" | ForEach-Object { ($_ | ConvertFrom-Json).annotated_screenshot_path } | Where-Object { $_ } | Select-Object -Unique
-\`\`\`
-
-### 2.5 Check Application Logs
-\`\`\`powershell
-{{LOG_CHECK_COMMANDS}}
-\`\`\`
-
----
-
-## Phase 3: Decision Point
-
-Based on analysis, choose ONE path:
-
-### Path A: ALL PASS (No issues found)
-If automation succeeded with no anomalies:
-1. Update checkpoint: \`completed: true\`
-2. Report success and exit
-
-### Path B: ISSUES FOUND
-If any bugs or anomalies were detected:
-1. **Fix the issues** (see Phase 4)
-2. Update checkpoint with progress (keep \`completed: false\`)
-3. Exit - runner will spawn next session automatically
-
-### Path C: MAX ITERATIONS
-The runner enforces iteration limits. If you're at max iterations, just report and exit.
-
----
-
-## Phase 4: Fix Issues (Path B only)
-
-**If ANY anomalies or bugs were detected:**
-
-1. **Identify the root cause** by reading the relevant source code
-2. **Implement the fix** in the qontinui-runner codebase:
-   - Image recognition issues: Check \`python-bridge/\` and \`src-tauri/src/\`
-   - Coordinate bugs: Check coordinate transformation logic
-   - Action execution: Check \`src-tauri/src/executor/\` or action handlers
-3. **Verify the fix compiles**: Run \`npm run typecheck\` or \`cargo check\`
-
-**Common bug patterns:**
-- Searching for already-found images → fix early return in find logic
-- Missing log fields → fix logger to include all required fields
-- Coordinate bugs → fix monitor offset calculations, DPI scaling
-
----
-
-## Phase 5: Update Checkpoint
-
-**After fixing issues or completing successfully, update the checkpoint:**
-
-\`\`\`powershell
-# Update checkpoint file - runner reads this to decide continuation
-$checkpointPath = "{{DEV_LOGS_ESCAPED}}\\improve-all-checkpoint.json"
-$checkpoint = if (Test-Path $checkpointPath) { Get-Content $checkpointPath | ConvertFrom-Json } else { @{} }
-
-# Update progress
-$checkpoint.current_phase = {{ITERATION}}
-$checkpoint.completed = $false  # Set to $true only if ALL work is done
-$checkpoint.last_update = (Get-Date -Format "o")
-$checkpoint.work_completed = @{
-    fixes_applied = @("fix1", "fix2")  # List what you fixed
-}
-
-$checkpoint | ConvertTo-Json -Depth 10 | Out-File -Encoding UTF8 $checkpointPath
-\`\`\`
-
-**If goal is achieved:** Set \`completed: true\` and the runner will stop spawning sessions.
-
----
-
-## Phase 6: Report (Before Exiting)
-
-Always end with a summary before exiting:
-
-\`\`\`
-## Iteration {{ITERATION}} Summary
-
-### Execution Result
-- **Steps Executed:** X/Y successful
-- **Overall Status:** [PASS/FAIL/CONTINUING]
-
-### Anomalies Detected
-- Redundant searches: [list or "None"]
-- Missing log data: [list or "None"]
-- Coordinate bugs: [list or "None"]
-- Impossible coordinates: [list or "None"]
-
-### Fixes Applied This Iteration
-1. {file}:{line} - {description}
-2. ...
-
-### Next Action
-[SUCCESS - checkpoint.completed=true / CONTINUING - checkpoint.completed=false]
-\`\`\`
-
----
-
-## Rules
-
-- **Work AUTONOMOUSLY** - never ask the user questions
-- **UPDATE CHECKPOINT** - runner reads it to decide continuation
-- **FIX issues found** - don't just report them
-- **Look for ANOMALIES** - not just explicit errors
-- **View screenshots** - they show visual match quality
-- **Set completed: true when done** - runner stops spawning sessions
-- **Don't spawn sessions yourself** - runner handles this deterministically
-`;
 
 // Default Developer Mode Prompt Template - Runner handles continuation deterministically
 // This is the hardcoded default that can be restored if users modify the template
@@ -603,7 +378,6 @@ interface AiDeveloperState {
 // Types for unified sessions API
 interface SessionCheckpoint {
   session_id: string;
-  session_type: string;
   current_phase: number;
   total_phases: number;
   completed: boolean;
@@ -618,7 +392,6 @@ interface SessionCheckpoint {
 }
 
 interface SessionConfig {
-  session_type: string;
   prompt: string;
   continuation_prompt: string | null;
   total_phases: number;
@@ -671,22 +444,6 @@ interface AiBuilderTabProps {
 
 export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilderTabProps) {
   const execution = useExecution();
-
-  // Session Mode - persisted to localStorage
-  // Inline (false): Uses /trigger-ai-analysis, output in AI Output tab, ends if runner restarts
-  // Persistent (true): Uses checkpoint files, can resume from where it left off after runner restarts
-  const [persistentSession, setPersistentSession] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("qontinui-ai-persistent-session") === "true";
-    } catch {
-      return false;
-    }
-  });
-
-  // Persist session mode to localStorage
-  useEffect(() => {
-    localStorage.setItem("qontinui-ai-persistent-session", persistentSession ? "true" : "false");
-  }, [persistentSession]);
 
   // Input capture for coordinate validation - persisted to localStorage
   // When enabled, captures actual mouse/keyboard during automation to compare with reported positions
@@ -858,12 +615,14 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
         const stateName = state.name || state.id || "Unknown";
         const stateImages: string[] = [];
 
-        if (state.images && Array.isArray(state.images)) {
-          for (const img of state.images) {
+        const stateImgs = state.stateImages || state.images;
+        if (stateImgs && Array.isArray(stateImgs)) {
+          for (const img of stateImgs) {
+            const imgId = img.id || "";
             const imgName = img.name || img.id || "";
-            if (imgName) {
+            if (imgId && imgName) {
               stateImages.push(imgName);
-              imageList.push({ name: imgName, stateName });
+              imageList.push({ id: imgId, name: imgName, stateName });
             }
           }
         }
@@ -1085,13 +844,9 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     syncInputCapture();
   }, [captureInputValidation]);
 
-  // Poll session state when there's an active session AND in persistent mode
-  // This useEffect should only manage isRunning for persistent sessions
+  // Poll session state when there's an active session
   useEffect(() => {
     if (!currentSessionId) return;
-    // Only poll and manage isRunning state if we're in persistent session mode
-    // This prevents interfering with standard mode button state
-    if (!persistentSession) return;
 
     const pollState = async () => {
       try {
@@ -1144,7 +899,7 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     const interval = setInterval(pollState, 2000);
 
     return () => clearInterval(interval);
-  }, [currentSessionId, persistentSession]);
+  }, [currentSessionId]);
 
   // Poll Claude log when there's an active session
   useEffect(() => {
@@ -1210,6 +965,55 @@ export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilde
     setHasUnsavedChanges(true);
   };
 
+  // Add an action step (e.g., click on image)
+  const addActionStep = (
+    actionType: "click" | "double_click" | "right_click",
+    imageId: string,
+    imageName: string,
+  ) => {
+    const actionNames = {
+      click: "Click",
+      double_click: "Double Click",
+      right_click: "Right Click",
+    };
+    const newStep: ExecutionStep = {
+      id: crypto.randomUUID(),
+      type: "action",
+      name: `${actionNames[actionType]}: ${imageName}`,
+      takeScreenshot: true,
+      screenshotDelay: 0,
+      actionType,
+      targetImageId: imageId,
+      targetImageName: imageName,
+    };
+    setExecutionSteps((prev) => [...prev, newStep]);
+    setShowAddDropdown(false);
+    setHasUnsavedChanges(true);
+  };
+
+  // Add a screenshot step
+  const addScreenshotStep = () => {
+    const newStep: ExecutionStep = {
+      id: crypto.randomUUID(),
+      type: "screenshot",
+      name: "Capture Screenshot",
+      takeScreenshot: true, // Always true for screenshot steps
+      screenshotDelay: 0,
+      screenshotMonitor: "all",
+    };
+    setExecutionSteps((prev) => [...prev, newStep]);
+    setShowAddDropdown(false);
+    setHasUnsavedChanges(true);
+  };
+
+  // Update screenshot monitor for a step
+  const updateScreenshotMonitor = (stepId: string, monitor: number | "all") => {
+    setExecutionSteps((prev) =>
+      prev.map((s) => (s.id === stepId ? { ...s, screenshotMonitor: monitor } : s)),
+    );
+    setHasUnsavedChanges(true);
+  };
+
   // Remove a step
   const removeStep = (stepId: string) => {
     setExecutionSteps((prev) => prev.filter((s) => s.id !== stepId));
@@ -1270,16 +1074,14 @@ Execute the workflow using the MCP tool:
 mcp__qontinui__run_workflow with workflow_name="${step.name}", timeout_seconds=300
 \`\`\``;
           if (step.takeScreenshot) {
-            const delayParam =
-              step.screenshotDelay && step.screenshotDelay > 0
-                ? `&delay_seconds=${step.screenshotDelay}`
-                : "";
             instruction += `
 
-After the workflow completes, capture a screenshot using the qontinui-api:
+After the workflow completes, capture a screenshot:
 \`\`\`powershell
-Invoke-WebRequest -Uri "http://localhost:8001/api/capture/screenshot/current?quality=95${delayParam}" -OutFile "screenshot.png"
-\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(The API will wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before capturing to allow the UI to settle.)` : ""}`;
+$body = @{ delay_seconds = ${step.screenshotDelay || 0}; task_id = "{{SESSION_ID}}"; step_index = ${stepNum} } | ConvertTo-Json
+$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
+($response.Content | ConvertFrom-Json).data.screenshot_path
+\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(Wait ${step.screenshotDelay}s before capture for UI to settle.)` : ""}`;
           }
           return instruction;
         } else if (step.type === "playwright") {
@@ -1325,16 +1127,14 @@ $body = @{ script_content = @"
 Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}" -Method PUT -ContentType "application/json" -Body $body
 \`\`\``;
           if (step.takeScreenshot) {
-            const delayParam =
-              step.screenshotDelay && step.screenshotDelay > 0
-                ? `&delay_seconds=${step.screenshotDelay}`
-                : "";
             instruction += `
 
-After the test completes, capture an additional screenshot using the qontinui-api:
+After the test completes, capture an additional screenshot:
 \`\`\`powershell
-Invoke-WebRequest -Uri "http://localhost:8001/api/capture/screenshot/current?quality=95${delayParam}" -OutFile "screenshot.png"
-\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(The API will wait ${step.screenshotDelay} second${step.screenshotDelay !== 1 ? "s" : ""} before capturing to allow the UI to settle.)` : ""}`;
+$body = @{ delay_seconds = ${step.screenshotDelay || 0}; task_id = "{{SESSION_ID}}"; step_index = ${stepNum} } | ConvertTo-Json
+$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
+($response.Content | ConvertFrom-Json).data.screenshot_path
+\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(Wait ${step.screenshotDelay}s before capture for UI to settle.)` : ""}`;
           }
           return instruction;
         } else if (step.type === "prompt") {
@@ -1347,6 +1147,53 @@ ${step.promptContent || "(No content)"}
 
 ---
 *Execute the instructions above before proceeding to the next step.*`;
+          return instruction;
+        } else if (step.type === "action" && step.actionType === "click") {
+          let instruction = `### Step ${stepNum}: Click on Image "${step.targetImageName}"
+
+Execute click action via the runner API:
+\`\`\`powershell
+$body = '{"action_type": "click", "image_id": "${step.targetImageId}"}'
+$response = Invoke-WebRequest -Uri "http://localhost:9876/execute-action" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
+$response.Content | ConvertFrom-Json
+\`\`\`
+
+This will find the image on screen and click its center.`;
+          if (step.takeScreenshot) {
+            instruction += `
+
+After the action completes, capture a screenshot:
+\`\`\`powershell
+$body = @{ delay_seconds = ${step.screenshotDelay || 0}; task_id = "{{SESSION_ID}}"; step_index = ${stepNum} } | ConvertTo-Json
+$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
+($response.Content | ConvertFrom-Json).data.screenshot_path
+\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(Wait ${step.screenshotDelay}s before capture for UI to settle.)` : ""}`;
+          }
+          return instruction;
+        } else if (step.type === "screenshot") {
+          // Screenshot step - uses the new unified /capture-screenshot endpoint
+          const monitorParam = step.screenshotMonitor === "all" ? "null" : step.screenshotMonitor;
+          const monitorDesc =
+            step.screenshotMonitor === "all" ? "all monitors" : `monitor ${step.screenshotMonitor}`;
+          const instruction = `### Step ${stepNum}: Capture Screenshot
+
+**Action:** Take screenshot of ${monitorDesc}${step.screenshotDelay && step.screenshotDelay > 0 ? ` (after ${step.screenshotDelay}s delay)` : ""}
+
+Execute via the runner API:
+\`\`\`powershell
+$body = @{
+    monitor = ${monitorParam}
+    delay_seconds = ${step.screenshotDelay || 0}
+    task_id = "{{SESSION_ID}}"
+    step_index = ${stepNum}
+} | ConvertTo-Json
+$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
+$result = $response.Content | ConvertFrom-Json
+Write-Host "Screenshot saved: $($result.data.screenshot_path)"
+\`\`\`
+
+The screenshot will be saved to \`.dev-logs/screenshots/\` and logged to \`ai-output.jsonl\` for your analysis.
+After capture, use the Read tool to view the screenshot for visual verification.`;
           return instruction;
         } else {
           const instruction = `### Step ${stepNum}: Navigate to State "${step.name}"
@@ -1375,7 +1222,7 @@ mcp__qontinui__go_to_state with state_names=["${step.name}"], take_screenshot=${
   };
 
   // Generate input capture validation section (conditional)
-  const generateInputCaptureSection = () => {
+  const _generateInputCaptureSection = () => {
     const devLogsEscaped = workspacePaths?.dev_logs_path_escaped || "{{DEV_LOGS_ESCAPED}}";
 
     if (!captureInputValidation) {
@@ -1405,30 +1252,6 @@ if (Test-Path $inputEventsDir) {
     }
 }
 \`\`\``;
-  };
-
-  // Generate standard mode prompt (for inline execution via MCP API)
-  // iteration parameter allows continuation prompts to pass current iteration
-  // Note: Runner handles session continuation deterministically via checkpoint file
-  const generateStandardPrompt = (iteration: number = 1) => {
-    const goalStr = goal.trim() || "Verify automation works correctly";
-    const devLogsEscaped = workspacePaths?.dev_logs_path_escaped || "{{DEV_LOGS_ESCAPED}}";
-
-    // Get workflow name for re-run (use first workflow step, or placeholder)
-    const workflowStep = executionSteps.find((s) => s.type === "workflow");
-    const workflowName = workflowStep?.name || "{{WORKFLOW_NAME}}";
-    const monitorParam = ""; // Could be extracted from execution context if needed
-
-    return STANDARD_PROMPT_TEMPLATE.replace("{{GOAL}}", goalStr)
-      .replace(/\{\{ITERATION\}\}/g, String(iteration))
-      .replace(/\{\{MAX_ITERATIONS\}\}/g, String(maxIterations))
-      .replace("{{STEP_COUNT}}", String(executionSteps.length))
-      .replace("{{EXECUTION_STEPS}}", generateExecutionInstructions())
-      .replace(/\{\{DEV_LOGS_ESCAPED\}\}/g, devLogsEscaped)
-      .replace("{{LOG_CHECK_COMMANDS}}", generateLogCheckCommands())
-      .replace("{{INPUT_CAPTURE_SECTION}}", generateInputCaptureSection())
-      .replace(/\{\{WORKFLOW_NAME\}\}/g, workflowName)
-      .replace(/\{\{MONITOR_PARAM\}\}/g, monitorParam);
   };
 
   // Generate developer mode prompt
@@ -1469,9 +1292,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       .replace(/\{\{WORKSPACE_ESCAPED\}\}/g, workspaceEscaped);
   };
 
-  // Generate prompt based on current mode (for preview)
+  // Generate prompt for preview
   const generatePrompt = (sessionId: string) => {
-    return persistentSession ? generateDeveloperPrompt(sessionId) : generateStandardPrompt();
+    return generateDeveloperPrompt(sessionId);
   };
 
   // Copy prompt to clipboard (preview mode - uses placeholder session ID)
@@ -1488,7 +1311,6 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     setExecutionSteps(workflow.steps);
     setGoal(workflow.goal);
     setMaxIterations(workflow.max_iterations);
-    setPersistentSession(workflow.persistent_session);
     setCaptureInputValidation(workflow.capture_input_validation);
     setShowWorkflowsPanel(false);
     // Track the loaded workflow for "Save" vs "Save As" behavior
@@ -1515,7 +1337,6 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     setExecutionSteps([]);
     setGoal("");
     setMaxIterations(5);
-    setPersistentSession(false);
     setCaptureInputValidation(false);
     setCurrentWorkflowId(null);
     setCurrentWorkflowName("");
@@ -1574,7 +1395,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           steps: executionSteps,
           goal: goal.trim(),
           max_iterations: maxIterations,
-          persistent_session: persistentSession,
+          persistent_session: true, // Always use persistent/task mode
           capture_input_validation: captureInputValidation,
           category: "",
           tags: [],
@@ -1618,7 +1439,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           steps: executionSteps,
           goal: goal.trim(),
           max_iterations: maxIterations,
-          persistent_session: persistentSession,
+          persistent_session: true, // Always use persistent/task mode
           capture_input_validation: captureInputValidation,
           category: "",
           tags: [],
@@ -1651,80 +1472,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     }
   };
 
-  // Run automation in standard mode (inline via MCP API, output goes to AI Output tab)
-  const runStandardMode = async (sessionId: string, prompt: string) => {
-    console.log("[AI_BUILDER] Running in STANDARD mode via MCP API...");
-
-    const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        prompt,
-        display_prompt: `AI Builder: ${goal.trim() || "Automation analysis"}`,
-        timeout_seconds: 600,
-      }),
-    });
-
-    const result = await response.json();
-    console.log("[AI_BUILDER] trigger-ai-analysis response:", result);
-
-    if (result.success) {
-      setLastResult({
-        success: true,
-        message: "AI analysis started! Check AI Output tab for results.",
-      });
-      setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
-      // Standard mode doesn't track session ID since it uses AI Output tab
-      // Keep button disabled for longer to prevent rapid re-clicking while analysis runs
-      // Analysis typically takes 30-60+ seconds, but we enable after 10s for responsiveness
-      setTimeout(() => setIsRunning(false), 10000);
-      // Note: Input capture is now automatically started/stopped with workflow execution
-      // in Python when captureInputValidation is enabled
-    } else {
-      throw new Error(result.error || "Failed to trigger AI analysis");
-    }
-  };
-
-  // Run automation in persistent mode (uses checkpoint files for resuming after runner restarts)
-  const runPersistentMode = async (sessionId: string, prompt: string) => {
-    console.log("[AI_BUILDER] Running in PERSISTENT mode via unified sessions API...");
-
-    // Use new unified sessions API
-    const response = await fetch("http://localhost:9876/sessions/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        session_type: "ai_builder",
-        name: goal.trim() || "AI Builder Session",
-        prompt: prompt,
-        continuation_prompt: null,
-        total_phases: maxIterations,
-        uses_gui: false,
-        timeout_seconds: 1800,
-      }),
-    });
-    const result = await response.json();
-    console.log("[AI_BUILDER] sessions/start response:", result);
-
-    if (result.success && result.data?.session) {
-      const session = result.data.session as Session;
-      setCurrentSessionId(session.id);
-      setLastResult({
-        success: true,
-        message: `AI Builder session ${session.id} started!`,
-      });
-      setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
-    } else {
-      throw new Error(result.error || "Failed to start AI Builder session");
-    }
-  };
-
-  // Run the automation
+  // Run the automation using task-based execution
   const runAutomation = async () => {
-    console.log(
-      "[AI_BUILDER] Starting AI session...",
-      persistentSession ? "(Persistent)" : "(Inline)",
-    );
+    console.log("[AI_BUILDER] Starting AI session...");
     setIsRunning(true);
     setLastResult(null);
 
@@ -1736,10 +1486,8 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       // Note: Input capture is now automatically started/stopped with workflow execution
       // in Python when captureInputValidation is enabled (synced via useEffect)
 
-      // Generate appropriate prompt based on mode
-      const prompt = persistentSession
-        ? generateDeveloperPrompt(sessionId)
-        : generateStandardPrompt();
+      // Generate prompt
+      const prompt = generateDeveloperPrompt(sessionId);
       console.log("[AI_BUILDER] Generated prompt length:", prompt.length);
 
       // Add to history
@@ -1751,11 +1499,33 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       };
       setHistory((prev) => [historyEntry, ...prev]);
 
-      // Run in appropriate mode
-      if (persistentSession) {
-        await runPersistentMode(sessionId, prompt);
+      // Start session via unified sessions API
+      console.log("[AI_BUILDER] Starting session via unified sessions API...");
+      const response = await fetch("http://localhost:9876/sessions/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: goal.trim() || "AI Builder Session",
+          prompt: prompt,
+          continuation_prompt: null,
+          total_phases: maxIterations,
+          uses_gui: false,
+          timeout_seconds: 1800,
+        }),
+      });
+      const result = await response.json();
+      console.log("[AI_BUILDER] sessions/start response:", result);
+
+      if (result.success && result.data?.session) {
+        const session = result.data.session as Session;
+        setCurrentSessionId(session.id);
+        setLastResult({
+          success: true,
+          message: `AI Builder session ${session.id} started!`,
+        });
+        setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
       } else {
-        await runStandardMode(sessionId, prompt);
+        throw new Error(result.error || "Failed to start AI Builder session");
       }
     } catch (error) {
       setLastResult({
@@ -1864,6 +1634,30 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
                 {showAddDropdown && (
                   <div className="absolute right-0 z-20 w-64 mt-1 bg-card border border-border rounded-md shadow-lg max-h-80 overflow-y-auto">
+                    {/* No config loaded message */}
+                    {!execution.configLoaded && (
+                      <div className="px-3 py-3 border-b border-border">
+                        <div className="flex items-center gap-2 text-amber-500 mb-2">
+                          <AlertTriangle className="w-4 h-4" />
+                          <span className="text-sm font-medium">No Config Loaded</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground mb-2">
+                          Qontinui automation workflows, states, and click actions are only
+                          available when a configuration is loaded.
+                        </p>
+                        <button
+                          onClick={() => {
+                            setShowAddDropdown(false);
+                            execution.loadConfiguration();
+                          }}
+                          className="w-full flex items-center justify-center gap-2 px-3 py-2 text-sm bg-primary/10 text-primary rounded hover:bg-primary/20 transition-colors"
+                        >
+                          <FolderOpen className="w-4 h-4" />
+                          Load Configuration
+                        </button>
+                      </div>
+                    )}
+
                     {/* Workflows section */}
                     {workflows.length > 0 && (
                       <>
@@ -1976,6 +1770,43 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                         ))}
                       </>
                     )}
+
+                    {/* Click Image section */}
+                    {images.length > 0 && (
+                      <>
+                        <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                          <MousePointer2 className="w-3 h-3" />
+                          Click Image
+                        </div>
+                        {images.map((image) => (
+                          <button
+                            key={`${image.stateName}-${image.id}`}
+                            onClick={() => addActionStep("click", image.id, image.name)}
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                          >
+                            <MousePointer2 className="w-4 h-4 text-blue-500" />
+                            <span className="truncate">{image.name}</span>
+                            <span className="text-xs text-muted-foreground ml-auto">
+                              {image.stateName}
+                            </span>
+                          </button>
+                        ))}
+                      </>
+                    )}
+
+                    {/* Capture section */}
+                    <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
+                      <Camera className="w-3 h-3" />
+                      Capture
+                    </div>
+                    <button
+                      onClick={() => addScreenshotStep()}
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+                    >
+                      <Camera className="w-4 h-4 text-cyan-500" />
+                      <span>Screenshot</span>
+                      <span className="text-xs text-muted-foreground ml-auto">for AI analysis</span>
+                    </button>
                   </div>
                 )}
               </div>
@@ -2000,7 +1831,11 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                           ? "bg-green-500/5 border-green-500/20"
                           : step.type === "prompt"
                             ? "bg-amber-500/5 border-amber-500/20"
-                            : "bg-primary/5 border-primary/20"
+                            : step.type === "action"
+                              ? "bg-blue-500/5 border-blue-500/20"
+                              : step.type === "screenshot"
+                                ? "bg-cyan-500/5 border-cyan-500/20"
+                                : "bg-primary/5 border-primary/20"
                     }`}
                   >
                     {/* Step number */}
@@ -2015,6 +1850,10 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       <TestTube className="w-4 h-4 text-green-500 flex-shrink-0" />
                     ) : step.type === "prompt" ? (
                       <FileText className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                    ) : step.type === "action" ? (
+                      <MousePointer2 className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                    ) : step.type === "screenshot" ? (
+                      <Camera className="w-4 h-4 text-cyan-500 flex-shrink-0" />
                     ) : (
                       <Target className="w-4 h-4 text-primary flex-shrink-0" />
                     )}
@@ -2022,8 +1861,54 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                     {/* Name */}
                     <span className="flex-1 text-sm truncate">{step.name}</span>
 
-                    {/* Screenshot toggle (not applicable to prompts) */}
-                    {step.type !== "prompt" && (
+                    {/* Screenshot step: monitor selector and delay */}
+                    {step.type === "screenshot" && (
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={
+                            step.screenshotMonitor === "all"
+                              ? "all"
+                              : (step.screenshotMonitor ?? "all")
+                          }
+                          onChange={(e) => {
+                            const val = e.target.value;
+                            updateScreenshotMonitor(
+                              step.id,
+                              val === "all" ? "all" : parseInt(val, 10),
+                            );
+                          }}
+                          className="px-1 py-0.5 text-xs bg-background border border-border rounded"
+                          title="Monitor to capture"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <option value="all">All monitors</option>
+                          <option value="0">Monitor 0</option>
+                          <option value="1">Monitor 1</option>
+                          <option value="2">Monitor 2</option>
+                        </select>
+                        <div
+                          className="flex items-center gap-0.5"
+                          title="Delay before capture (seconds)"
+                        >
+                          <input
+                            type="number"
+                            min={0}
+                            max={30}
+                            step={0.5}
+                            value={step.screenshotDelay ?? 0}
+                            onChange={(e) =>
+                              updateScreenshotDelay(step.id, parseFloat(e.target.value) || 0)
+                            }
+                            className="w-12 px-1 py-0.5 text-xs text-center bg-background border border-border rounded"
+                            onClick={(e) => e.stopPropagation()}
+                          />
+                          <span className="text-xs text-muted-foreground">s</span>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Screenshot toggle for other step types (not applicable to prompts or screenshot steps) */}
+                    {step.type !== "prompt" && step.type !== "screenshot" && (
                       <div className="flex items-center gap-1">
                         <button
                           onClick={() => toggleStepScreenshot(step.id)}
@@ -2135,8 +2020,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium truncate">{workflow.name}</p>
                         <p className="text-xs text-muted-foreground truncate">
-                          {workflow.steps.length} step{workflow.steps.length !== 1 ? "s" : ""} •{" "}
-                          {workflow.persistent_session ? "Persistent" : "Standard"}
+                          {workflow.steps.length} step{workflow.steps.length !== 1 ? "s" : ""}
                         </p>
                       </div>
                       <button
@@ -2253,87 +2137,40 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           <CollapsiblePanel
             title="Advanced"
             icon={<Code className="w-4 h-4" />}
-            defaultCollapsed={!persistentSession}
+            defaultCollapsed={true}
             storageKey="ai-builder-advanced"
           >
             <div className="space-y-3">
-              {/* Persistent Session Toggle */}
-              <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
-                <div className="flex items-center gap-2">
-                  <Activity className="w-4 h-4 text-orange-500" />
-                  <div>
-                    <span className="text-sm font-medium">Persistent Session Mode</span>
-                    <p className="text-xs text-muted-foreground">
-                      {persistentSession
-                        ? "Multi-iteration loop with fresh AI sessions per iteration"
-                        : "Single iteration - AI runs once, output in AI Output tab"}
-                    </p>
+              {/* Execution Info with hover tooltip */}
+              <div className="flex items-center gap-4 flex-wrap">
+                <label className="flex items-center gap-2 text-sm">
+                  <span className="text-muted-foreground">Max Iterations:</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={maxIterations}
+                    onChange={(e) => {
+                      setMaxIterations(Math.max(1, Math.min(50, parseInt(e.target.value) || 10)));
+                      setHasUnsavedChanges(true);
+                    }}
+                    className="w-16 px-2 py-1 bg-background border border-border rounded text-sm"
+                  />
+                </label>
+                <div className="relative group">
+                  <Info className="w-4 h-4 text-muted-foreground hover:text-foreground cursor-help" />
+                  <div className="absolute left-0 bottom-full mb-2 w-72 p-3 bg-popover border border-border rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                    <p className="text-xs font-medium text-foreground mb-2">How it works</p>
+                    <div className="text-xs text-muted-foreground space-y-1">
+                      <p>
+                        Each iteration spawns a new AI session. AI runs automation, analyzes
+                        results, and fixes issues.
+                      </p>
+                      <p>Loop continues until all checks pass or max iterations reached.</p>
+                    </div>
                   </div>
                 </div>
-                <button
-                  onClick={() => {
-                    setPersistentSession(!persistentSession);
-                    setHasUnsavedChanges(true);
-                  }}
-                  className={`flex items-center transition-colors ${persistentSession ? "text-orange-500" : "text-muted-foreground"}`}
-                  title={persistentSession ? "Persistent Session enabled" : "Inline Session"}
-                >
-                  {persistentSession ? (
-                    <ToggleRight className="w-8 h-8" />
-                  ) : (
-                    <ToggleLeft className="w-8 h-8" />
-                  )}
-                </button>
               </div>
-
-              {/* When Persistent Session is enabled, show additional options */}
-              {persistentSession && (
-                <div className="space-y-3 pl-2 border-l-2 border-orange-500/30">
-                  <div className="space-y-1">
-                    <p className="text-xs font-medium text-foreground">How it works:</p>
-                    <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
-                      <li>
-                        Each iteration spawns a <strong>new AI session</strong> (fresh context)
-                      </li>
-                      <li>AI runs automation → analyzes logs/screenshots → fixes issues</li>
-                      <li>If issues found: spawns next iteration automatically</li>
-                      <li>Loop continues until all checks pass or max iterations reached</li>
-                      <li>Sessions can resume from checkpoint after runner restarts</li>
-                    </ul>
-                  </div>
-                  <div className="flex items-center gap-4 flex-wrap">
-                    <label className="flex items-center gap-2 text-sm">
-                      <span className="text-muted-foreground">Max Iterations:</span>
-                      <input
-                        type="number"
-                        min={1}
-                        max={50}
-                        value={maxIterations}
-                        onChange={(e) => {
-                          setMaxIterations(
-                            Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
-                          );
-                          setHasUnsavedChanges(true);
-                        }}
-                        className="w-16 px-2 py-1 bg-background border border-border rounded text-sm"
-                      />
-                    </label>
-                  </div>
-                </div>
-              )}
-
-              {/* When Persistent Session is disabled, show explanation */}
-              {!persistentSession && (
-                <div className="space-y-1 pl-2 border-l-2 border-muted-foreground/30">
-                  <p className="text-xs font-medium text-foreground">How it works:</p>
-                  <ul className="text-xs text-muted-foreground space-y-0.5 list-disc list-inside">
-                    <li>Single AI session runs one iteration</li>
-                    <li>AI analyzes automation results and suggests/applies fixes</li>
-                    <li>If fixes applied, AI will instruct you to re-run manually</li>
-                    <li>Output appears in the "AI Output" tab</li>
-                  </ul>
-                </div>
-              )}
 
               {/* Input Capture for Coordinate Validation Toggle */}
               <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
@@ -2421,8 +2258,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                       <span className="font-medium">{resumableWorkflow.name}</span>
                       {resumableWorkflow.totalPhases > 0 && (
                         <span className="ml-2">
-                          • Phase {resumableWorkflow.currentPhase} of{" "}
-                          {resumableWorkflow.totalPhases}
+                          • Step {resumableWorkflow.currentPhase} of {resumableWorkflow.totalPhases}
                         </span>
                       )}
                       <span className="ml-2 capitalize">• {resumableWorkflow.status}</span>
@@ -2452,8 +2288,8 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
           {/* Actions */}
           <div className="flex gap-3">
-            {isRunning && persistentSession ? (
-              // Persistent Session: Stop button for spawn sessions
+            {isRunning ? (
+              // Stop button when running
               <button
                 onClick={stopSession}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
@@ -2461,19 +2297,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                 <Square className="w-4 h-4" />
                 Stop Session
               </button>
-            ) : isRunning && !persistentSession ? (
-              // Standard Mode: Running indicator (uses AI Output tab)
-              <button
-                disabled
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-primary/50 text-primary-foreground rounded-md font-medium cursor-not-allowed"
-              >
-                <Loader2 className="w-4 h-4 animate-spin" />
-                Analysis Running...
-              </button>
-            ) : persistentSession &&
-              sessionState &&
+            ) : sessionState &&
               (sessionState.status === "complete" || sessionState.status === "stopped") ? (
-              // Persistent Session: New session button
+              // New session button when previous session completed
               <button
                 onClick={() => {
                   setCurrentSessionId(null);
@@ -2488,18 +2314,14 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                 New Session
               </button>
             ) : (
-              // Start button - different labels for each mode
+              // Start button
               <button
                 onClick={runAutomation}
                 disabled={isRunning}
-                className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${
-                  persistentSession
-                    ? "bg-orange-500 text-white hover:bg-orange-600"
-                    : "bg-primary text-primary-foreground hover:bg-primary/90"
-                }`}
+                className="flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors bg-primary text-primary-foreground hover:bg-primary/90"
               >
                 <Play className="w-4 h-4" />
-                {persistentSession ? "Start Persistent Session" : "Start AI Analysis"}
+                Start AI Analysis
               </button>
             )}
 
@@ -2533,8 +2355,8 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
             </button>
           </div>
 
-          {/* Session Status - Persistent Session only */}
-          {persistentSession && sessionState && (
+          {/* Session Status */}
+          {sessionState && (
             <div className="card p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
@@ -2834,7 +2656,6 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
                     {executionSteps.length} execution step{executionSteps.length !== 1 ? "s" : ""}
                   </li>
                   <li>Goal: {goal.trim() || "(none set)"}</li>
-                  <li>Mode: {persistentSession ? "Persistent Session" : "Standard"}</li>
                   <li>Max iterations: {maxIterations}</li>
                 </ul>
               </div>

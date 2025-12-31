@@ -164,7 +164,10 @@ class WebExtractionService:
                 capture_hover_states=config.get("capture_hover_states", True),
                 capture_focus_states=config.get("capture_focus_states", True),
                 capture_scroll_states=config.get("capture_scroll_states", True),
-                max_interaction_depth=config.get("max_interaction_depth", 3),
+                max_interaction_depth=config.get(
+                    "max_depth", config.get("max_interaction_depth", 5)
+                ),
+                max_pages=config.get("max_pages", 100),
                 correlation_threshold=config.get("correlation_threshold", 0.8),
                 require_correlation=config.get("require_correlation", True),
                 timeout_seconds=config.get("timeout_seconds", 300),
@@ -365,10 +368,16 @@ class WebExtractionService:
             if self._current_extraction_id:
                 self._extraction_results[self._current_extraction_id]["result"] = result
 
+                # Use the orchestrator's extraction_id (where screenshots are saved)
+                # rather than the runner's ID
+                actual_extraction_id = result.extraction_id
+                logger.info(f"Orchestrator extraction_id: {actual_extraction_id}")
+                logger.info(f"Runner extraction_id: {self._current_extraction_id}")
+
                 # Build state_structure for the frontend
                 state_structure = {
                     "type": "application_state_structure",
-                    "extraction_id": self._current_extraction_id,
+                    "extraction_id": actual_extraction_id,  # Use orchestrator's ID for screenshot access
                     "framework": result.framework.value,
                     "mode": result.mode.value,
                     "states": [self._serialize_state(s) for s in result.states],
@@ -401,11 +410,14 @@ class WebExtractionService:
                     stats={
                         "pages_extracted": pages_extracted,
                         "states_found": len(result.states),
+                        "transitions_found": len(result.transitions),
                         "elements_found": (
                             len(result.runtime_extraction.elements)
                             if result.runtime_extraction
                             else 0
                         ),
+                        # Include the screenshot extraction_id so frontend knows where to fetch
+                        "screenshot_extraction_id": actual_extraction_id,
                     },
                 )
 
@@ -415,6 +427,7 @@ class WebExtractionService:
                     {
                         "extraction_id": self._current_extraction_id,
                         "session_id": self._current_extraction_id,
+                        "screenshot_extraction_id": actual_extraction_id,  # For screenshot fetching
                         "framework": result.framework.value,
                         "mode": result.mode.value,
                         "state_structure": state_structure,
@@ -1054,6 +1067,30 @@ class WebExtractionService:
         except Exception as e:
             logger.warning(f"Failed to update backend session: {e}")
 
+    def _convert_to_state_annotation(self, state: dict[str, Any], index: int) -> dict[str, Any]:
+        """
+        Convert a CorrelatedState dict to the StateAnnotation format expected by the backend.
+
+        Args:
+            state: Serialized CorrelatedState dict
+            index: Index for generating default position
+
+        Returns:
+            Dict in StateAnnotation format
+        """
+        return {
+            "id": state.get("id", str(uuid.uuid4())),
+            "name": state.get("name", f"state_{index}"),
+            "bbox": {
+                "x": 0,
+                "y": index * 100,  # Stack states vertically for visualization
+                "width": 200,
+                "height": 80,
+            },
+            "state_type": state.get("correlation_method", "extracted"),
+            "element_ids": state.get("visible_elements", []) or [],
+        }
+
     async def _save_annotations_to_backend(
         self,
         states: list[dict[str, Any]],
@@ -1063,7 +1100,7 @@ class WebExtractionService:
         Save extraction annotations to the backend.
 
         Args:
-            states: List of serialized state dicts
+            states: List of serialized state dicts (CorrelatedState format)
             transitions: List of serialized transition dicts
         """
         if not self._backend_session_id or not self._backend_url:
@@ -1072,13 +1109,14 @@ class WebExtractionService:
 
         import httpx
 
-        # Group states by URL to create annotations per page
-        states_by_url: dict[str, list[dict[str, Any]]] = {}
+        # Group states by their screenshot_id (each screenshot is a separate annotation)
+        states_by_screenshot: dict[str, list[dict[str, Any]]] = {}
         for state in states:
-            state_url = state.get("url", "unknown")
-            if state_url not in states_by_url:
-                states_by_url[state_url] = []
-            states_by_url[state_url].append(state)
+            # Use the state's actual screenshot_id, fallback to URL-based grouping
+            screenshot_id = state.get("screenshot_id") or state.get("url", "unknown")
+            if screenshot_id not in states_by_screenshot:
+                states_by_screenshot[screenshot_id] = []
+            states_by_screenshot[screenshot_id].append(state)
 
         # Build headers with auth token if available
         headers = {"Content-Type": "application/json"}
@@ -1087,24 +1125,33 @@ class WebExtractionService:
 
         try:
             async with httpx.AsyncClient() as client:
-                for source_url, url_states in states_by_url.items():
-                    # Generate a screenshot ID for this URL (could be improved with actual screenshots)
-                    screenshot_id = str(uuid.uuid4())
+                for screenshot_id, screenshot_states in states_by_screenshot.items():
+                    # Get the URL from the first state in this screenshot group
+                    source_url = screenshot_states[0].get("url", "unknown")
+
+                    # Convert CorrelatedState format to StateAnnotation format
+                    converted_states = [
+                        self._convert_to_state_annotation(state, idx)
+                        for idx, state in enumerate(screenshot_states)
+                    ]
 
                     annotation_data = {
                         "screenshot_id": screenshot_id,
+                        "source_url": source_url,
                         "elements": [],  # Elements are embedded in states
-                        "states": url_states,
+                        "states": converted_states,
                     }
 
                     url = f"{self._backend_url}/api/v1/extractions/{self._backend_session_id}/annotations"
+
+                    logger.debug(f"Sending annotation data: {annotation_data}")
 
                     response = await client.put(
                         url, json=annotation_data, headers=headers, timeout=30.0
                     )
                     if response.status_code == 200:
                         logger.info(
-                            f"Saved annotation for {source_url} with {len(url_states)} states"
+                            f"Saved annotation for {source_url} (screenshot: {screenshot_id}) with {len(converted_states)} states"
                         )
                     else:
                         logger.warning(

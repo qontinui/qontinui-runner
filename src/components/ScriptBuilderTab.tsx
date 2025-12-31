@@ -37,6 +37,7 @@ import type {
   DisplayMode,
 } from "../types";
 import { ScriptletSelector, useScriptletMention } from "./ScriptletSelector";
+import { executeAiTask } from "../hooks";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -664,20 +665,18 @@ test('${formName || "test"}', async ({ page }) => {
 \`\`\``;
 
     try {
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `Generate Playwright: ${formName || formDescription.substring(0, 50)}`,
-          timeout_seconds: 300,
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: `Generate Playwright: ${formName || formDescription.substring(0, 50)}`,
+        timeout_seconds: 300,
       });
 
-      const result = await response.json();
-      if (result.success && result.output) {
+      if (task.output_log) {
         // Extract code from the AI response
-        const codeMatch = result.output.match(/```(?:typescript|ts)?\s*([\s\S]*?)```/);
+        const codeMatch = task.output_log.match(/```(?:typescript|ts)?\s*([\s\S]*?)```/);
         if (codeMatch) {
           const generatedCode = codeMatch[1].trim();
           setFormScriptContent(generatedCode);
@@ -693,7 +692,7 @@ test('${formName || "test"}', async ({ page }) => {
           setIsGenerating(false);
         }
       } else {
-        onLog("error", `Failed to generate script: ${result.error || "Unknown error"}`);
+        onLog("error", "Failed to generate script: No output from AI task");
         setIsGenerating(false);
       }
     } catch (error) {
@@ -870,22 +869,18 @@ test('${formName || "test"}', async ({ page }) => {
 \`\`\``;
 
     try {
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `Generate Playwright: ${formName || formDescription.substring(0, 50)}`,
-          timeout_seconds: 120,
-          wait_for_completion: true,
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: `Generate Playwright: ${formName || formDescription.substring(0, 50)}`,
+        timeout_seconds: 120,
       });
 
-      const result = await response.json();
-
-      if (result.success && result.data?.output) {
+      if (task.output_log) {
         // Extract code from the AI response
-        const output = result.data.output;
+        const output = task.output_log;
 
         // Try multiple extraction patterns
         let generatedCode: string | null = null;
@@ -955,14 +950,8 @@ test('${formName || "test"}', async ({ page }) => {
           );
           console.log("AI output:", output);
         }
-      } else if (result.success) {
-        // AI analysis completed but no output field - this shouldn't happen now
-        onLog("info", "Script generation completed. Check AI Output tab for results.");
       } else {
-        onLog(
-          "error",
-          `Failed to generate script: ${result.error || result.data?.error || "Unknown error"}`,
-        );
+        onLog("error", "Failed to generate script: No output from AI task");
       }
     } catch (error) {
       onLog("error", `Failed to generate script: ${error}`);
@@ -1007,21 +996,17 @@ MISSING:
 Be thorough - check each action, assertion, and behavior mentioned in the description.`;
 
     try {
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: "Validating script coverage",
-          timeout_seconds: 60,
-          wait_for_completion: true,
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: "Validating script coverage",
+        timeout_seconds: 60,
       });
 
-      const result = await response.json();
-
-      if (result.success && result.data?.output) {
-        const output = result.data.output;
+      if (task.output_log) {
+        const output = task.output_log;
 
         if (output.includes("COVERAGE: COMPLETE")) {
           onLog("success", "Script implements all requirements from description!");
@@ -1121,21 +1106,17 @@ import { test, expect } from '@playwright/test';
 \`\`\``;
 
     try {
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `Refine Playwright: ${formName || "script"}`,
-          timeout_seconds: 120,
-          wait_for_completion: true,
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: `Refine Playwright: ${formName || "script"}`,
+        timeout_seconds: 120,
       });
 
-      const result = await response.json();
-
-      if (result.success && result.data?.output) {
-        const output = result.data.output;
+      if (task.output_log) {
+        const output = task.output_log;
         let generatedCode: string | null = null;
 
         // Extract code from response - first try explicit TypeScript/JavaScript blocks
@@ -1186,7 +1167,7 @@ import { test, expect } from '@playwright/test';
           onLog("warning", "AI response didn't contain valid code. Check AI Output tab.");
         }
       } else {
-        onLog("error", `Failed to refine script: ${result.error || "Unknown error"}`);
+        onLog("error", "Failed to refine script: No output from AI task");
       }
     } catch (error) {
       onLog("error", `Failed to refine script: ${error}`);
@@ -1249,22 +1230,19 @@ OR
 {"verified": false, "notes": "Objective NOT achieved because..."}`;
 
     try {
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `Verifying: ${objective.substring(0, 50)}...`,
-          timeout_seconds: 60,
-          wait_for_completion: true,
-          image_paths: testResult.screenshots || [],
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: `Verifying: ${objective.substring(0, 50)}...`,
+        timeout_seconds: 60,
+        image_paths: testResult.screenshots || [],
       });
 
-      const result = await response.json();
-      if (result.success && result.data?.output) {
+      if (task.output_log) {
         // Parse JSON from AI response
-        const jsonMatch = result.data.output.match(/\{[\s\S]*\}/);
+        const jsonMatch = task.output_log.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]);
           return {
@@ -1538,23 +1516,28 @@ import { test, expect } from '@playwright/test';
           log(`Iteration ${iteration}: Including video for additional context`);
         }
 
-        // Call AI to refine
+        // Call AI to refine using async task execution with polling
         setIsGenerating(true);
-        const aiResponse = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            prompt,
+        let aiTask;
+        try {
+          aiTask = await executeAiTask({
+            name: "ai-analysis",
+            content: prompt,
+            max_sessions: 1,
             display_prompt: `Auto-refine iteration ${iteration}: ${formName || "script"}`,
             timeout_seconds: 120,
-            wait_for_completion: true,
             image_paths: imagePaths,
             video_paths: videoPaths,
             trace_path: tracePath,
             max_video_frames: 3,
             max_trace_screenshots: 5,
-          }),
-        });
+          });
+        } catch (error) {
+          setIsGenerating(false);
+          log(`AI refinement failed: ${error}`);
+          console.error("[AUTO-REFINE] AI failed:", error);
+          break;
+        }
         setIsGenerating(false);
 
         // Clear user hint after it's been sent to AI
@@ -1564,22 +1547,20 @@ import { test, expect } from '@playwright/test';
           setHintQueued(false);
         }
 
-        const aiResult = await aiResponse.json();
-
         // Check if stopped by user
         if (autoRefineAbortRef.current) {
           log("Stopped by user");
           break;
         }
 
-        if (!aiResult.success || !aiResult.data?.output) {
-          log(`AI refinement failed: ${aiResult.error || "No output"}`);
-          console.error("[AUTO-REFINE] AI failed:", aiResult);
+        if (!aiTask.output_log) {
+          log("AI refinement failed: No output");
+          console.error("[AUTO-REFINE] AI failed: No output_log");
           break;
         }
 
         // Extract code and changes summary from AI response
-        const output = aiResult.data.output;
+        const output = aiTask.output_log;
         console.log("[AUTO-REFINE] AI output length:", output?.length);
         let generatedCode: string | null = null;
 
@@ -1787,21 +1768,17 @@ Return ONLY the description text, no code blocks or extra formatting.
 Example: "Navigate to the dashboard, click the Create button, then select Extract Images. Click the Capture Screen button and verify the screenshot preview appears."`;
 
     try {
-      const response = await fetch(`${API_BASE}/trigger-ai-analysis`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `Generate description for: ${formName || "script"}`,
-          timeout_seconds: 60,
-          wait_for_completion: true,
-        }),
+      // Use async task execution with polling
+      const task = await executeAiTask({
+        name: "ai-analysis",
+        content: prompt,
+        max_sessions: 1,
+        display_prompt: `Generate description for: ${formName || "script"}`,
+        timeout_seconds: 60,
       });
 
-      const result = await response.json();
-
-      if (result.success && result.data?.output) {
-        const output = result.data.output.trim();
+      if (task.output_log) {
+        const output = task.output_log.trim();
         // Remove any markdown formatting if present
         const cleanDescription = output
           .replace(/^```[\s\S]*?```$/gm, "")
@@ -1813,7 +1790,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
         setShowDescriptionPreview(true);
         onLog("info", "Description generated - review and accept or reject");
       } else {
-        onLog("error", `Failed to generate description: ${result.error || "Unknown error"}`);
+        onLog("error", "Failed to generate description: No output from AI task");
       }
     } catch (error) {
       onLog("error", `Failed to generate description: ${error}`);

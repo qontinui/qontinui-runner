@@ -21,6 +21,7 @@ import {
 import type { ExecutionReport as ExecutionReportType, Finding } from "../../types/findings";
 import { findingsTracker, getVisibleCategories } from "../../services";
 import { CategorySection } from "./CategorySection";
+import { useAiTaskPolling } from "../../hooks";
 
 /** Auto-fixable category IDs */
 const AUTO_FIXABLE_CATEGORIES = ["code_bug", "security", "test_issue", "documentation"];
@@ -188,28 +189,39 @@ export function ExecutionReport({
     [onProvideInput],
   );
 
+  // AI task polling hook for analyze all
+  const { triggerTask: triggerAnalyzeAll } = useAiTaskPolling({
+    onComplete: () => {
+      setIsAnalyzingAll(false);
+    },
+    onError: (error) => {
+      console.error("Failed to analyze findings:", error);
+      setIsAnalyzingAll(false);
+    },
+  });
+
   // Handle analyze all auto-fixable findings
   const handleAnalyzeAll = useCallback(async () => {
     if (autoFixableFindings.length === 0) return;
 
     setIsAnalyzingAll(true);
-    try {
-      // Build a prompt with all auto-fixable findings
-      const findingsJson = JSON.stringify(
-        autoFixableFindings.map((f) => ({
-          id: f.id,
-          categoryId: f.categoryId,
-          severity: f.severity,
-          title: f.title,
-          description: f.description,
-          file: f.codeContext?.file,
-          line: f.codeContext?.line,
-        })),
-        null,
-        2,
-      );
 
-      const prompt = `You are fixing auto-fixable findings from a qontinui-runner session.
+    // Build a prompt with all auto-fixable findings
+    const findingsJson = JSON.stringify(
+      autoFixableFindings.map((f) => ({
+        id: f.id,
+        categoryId: f.categoryId,
+        severity: f.severity,
+        title: f.title,
+        description: f.description,
+        file: f.codeContext?.file,
+        line: f.codeContext?.line,
+      })),
+      null,
+      2,
+    );
+
+    const prompt = `You are fixing auto-fixable findings from a qontinui-runner session.
 
 ## Your Task
 
@@ -238,26 +250,15 @@ Resolution: ${"{what you fixed}"}
 
 Work through ALL findings systematically. Fix each one and report your resolution.`;
 
-      // Trigger AI analysis via HTTP endpoint
-      const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: `Fixing ${autoFixableFindings.length} auto-fixable findings`,
-          timeout_seconds: 600,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`AI analysis failed: ${response.statusText}`);
-      }
-    } catch (error) {
-      console.error("Failed to analyze findings:", error);
-    } finally {
-      setIsAnalyzingAll(false);
-    }
-  }, [autoFixableFindings]);
+    // Use async task triggering with polling
+    await triggerAnalyzeAll({
+      name: "ai-analysis",
+      content: prompt,
+      max_sessions: 1,
+      display_prompt: `Fixing ${autoFixableFindings.length} auto-fixable findings`,
+      timeout_seconds: 600,
+    });
+  }, [autoFixableFindings, triggerAnalyzeAll]);
 
   // Handle clear all findings
   const handleClearAll = useCallback(() => {

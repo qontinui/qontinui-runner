@@ -84,6 +84,8 @@ class LogManager {
         line: string;
         source: string;
         action_id?: string;
+        session_id?: string;
+        session_name?: string;
       }
 
       const result = await invoke<{
@@ -100,6 +102,8 @@ class LogManager {
           line: entry.line,
           source: entry.source,
           actionId: entry.action_id,
+          sessionId: entry.session_id,
+          sessionName: entry.session_name,
         }));
 
         this.logStore.loadAiOutputLogs(entries);
@@ -184,13 +188,21 @@ class LogManager {
   /**
    * Add an AI output log entry
    */
-  addAiOutputLog(line: string, source: string, actionId?: string): void {
+  addAiOutputLog(
+    line: string,
+    source: string,
+    actionId?: string,
+    sessionId?: string,
+    sessionName?: string,
+  ): void {
     const entry: AiOutputEntry = {
       id: `ai-${Date.now()}-${Math.random()}`,
       timestamp: Date.now(),
       line,
       source,
       actionId,
+      sessionId,
+      sessionName,
     };
     this.logStore.addAiOutputLog(entry);
 
@@ -202,6 +214,8 @@ class LogManager {
         line: entry.line,
         source: entry.source,
         action_id: entry.actionId,
+        session_id: entry.sessionId,
+        session_name: entry.sessionName,
       },
     }).catch((err) => {
       console.warn("[LogManager] Failed to persist AI output log:", err);

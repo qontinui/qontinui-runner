@@ -105,7 +105,6 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          session_type: workflow.persistent_session ? "ai_builder" : "one_shot",
           name: workflow.name,
           prompt: prompt,
           total_phases: workflow.max_iterations,

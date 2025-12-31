@@ -506,6 +506,8 @@ export function setupEventHandlers(
       const line = data.line || "";
       const source = data.source || "ai";
       const actionId = data.action_id;
+      const sessionId = data.session_id;
+      const sessionName = data.session_name;
 
       // Detect new AI session by checking if action_id changed
       if (actionId && actionId !== currentAiActionId) {
@@ -526,7 +528,7 @@ export function setupEventHandlers(
         console.log(`[EVENT_HANDLER] Started findings report for session: ${actionId}`);
       }
 
-      logManager.addAiOutputLog(line, source, actionId);
+      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName);
     }),
   );
 

@@ -520,7 +520,15 @@ function AppContent() {
               projectLogs={projectLogs}
               aiOutputLines={aiOutputLogs}
               onClearAiOutput={clearAiOutputLogs}
-              onAddAiOutputLine={(line) => addAiOutputLog(line.line, line.source, line.actionId)}
+              onAddAiOutputLine={(line) =>
+                addAiOutputLog(
+                  line.line,
+                  line.source,
+                  line.actionId,
+                  line.sessionId,
+                  line.sessionName,
+                )
+              }
               onLog={addLog}
               onConfigureLogLocations={() => setShowLogSourceManager(true)}
             />

@@ -57,7 +57,8 @@ export interface WorkflowTask {
 export interface PromptTask {
   task_type: "Prompt";
   prompt_id: string;
-  max_iterations?: number;
+  /** Optional override for max_sessions (null = use prompt's setting) */
+  max_sessions?: number;
 }
 
 /**

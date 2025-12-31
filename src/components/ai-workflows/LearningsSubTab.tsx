@@ -1,7 +1,7 @@
 /**
  * LearningsSubTab.tsx
  *
- * Allows users to analyze completed AI workflow loops to extract learnings.
+ * Allows users to analyze completed AI sessions to extract learnings.
  * AI reviews what worked, what didn't, and identifies patterns that can be
  * added to CLAUDE.md, skills, or agent configurations.
  */
@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import type { AiOutputLine } from "../AiOutputTab";
 import { groupEntriesIntoLoops, type AiLoop } from "../../types/aiLoop";
+import { useAiTaskPolling } from "../../hooks";
 
 interface LearningsSubTabProps {
   aiOutputLines: AiOutputLine[];
@@ -73,59 +74,26 @@ export function LearningsSubTab({ aiOutputLines }: LearningsSubTabProps) {
       .join("\n\n");
   };
 
-  // Analyze selected loop
-  const analyzeLoop = async () => {
-    if (!selectedLoop) return;
-
-    setIsAnalyzing(true);
-    try {
-      const loopContent = getLoopContent(selectedLoop);
-
-      const analysisPrompt = `You are analyzing an AI workflow session to extract learnings that can improve future sessions.
-
-## Session Content
-${loopContent}
-
-## Your Task
-Analyze this AI workflow session and provide:
-
-1. **Summary**: Brief 1-2 sentence summary of what this session accomplished
-2. **What Worked Well**: Patterns, approaches, or techniques that were effective
-3. **What Could Be Improved**: Areas where the AI struggled or could have done better
-4. **Project-Specific Patterns**: Any patterns specific to this codebase that should be remembered
-5. **Suggested CLAUDE.md Addition**: If appropriate, provide text that could be added to CLAUDE.md to help future sessions
-
-Format your response as markdown with clear sections.`;
-
-      const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt: analysisPrompt,
-          context: "learnings_analysis",
-        }),
-      });
-
-      const result = await response.json();
-
-      if (result.success) {
-        // Create a new learning entry
-        const newLearning: Learning = {
-          id: `learning-${Date.now()}`,
-          loopId: selectedLoop.id,
-          loopLabel: selectedLoop.label,
-          generatedAt: Date.now(),
-          content: result.data?.response || "Analysis completed. Check AI Output tab for results.",
-          summary: selectedLoop.promptPreview,
-        };
-
-        setLearnings((prev) => [newLearning, ...prev]);
-        setExpandedLearningId(newLearning.id);
-      } else {
-        throw new Error(result.error || "Failed to analyze loop");
-      }
-    } catch (error) {
+  // AI task polling hook
+  const { triggerTask, isRunning: _isAiRunning } = useAiTaskPolling({
+    onComplete: (task) => {
+      if (!selectedLoop) return;
+      // Create a new learning entry with the task output
+      const newLearning: Learning = {
+        id: `learning-${Date.now()}`,
+        loopId: selectedLoop.id,
+        loopLabel: selectedLoop.label,
+        generatedAt: Date.now(),
+        content: task.output_log || "Analysis completed. Check AI Output tab for results.",
+        summary: selectedLoop.promptPreview,
+      };
+      setLearnings((prev) => [newLearning, ...prev]);
+      setExpandedLearningId(newLearning.id);
+      setIsAnalyzing(false);
+    },
+    onError: (error) => {
       console.error("Failed to analyze loop:", error);
+      if (!selectedLoop) return;
       // Still create an entry pointing to AI Output
       const newLearning: Learning = {
         id: `learning-${Date.now()}`,
@@ -137,9 +105,40 @@ Format your response as markdown with clear sections.`;
       };
       setLearnings((prev) => [newLearning, ...prev]);
       setExpandedLearningId(newLearning.id);
-    } finally {
       setIsAnalyzing(false);
-    }
+    },
+  });
+
+  // Analyze selected loop
+  const analyzeLoop = async () => {
+    if (!selectedLoop) return;
+
+    setIsAnalyzing(true);
+    const loopContent = getLoopContent(selectedLoop);
+
+    const analysisPrompt = `You are analyzing an AI session to extract learnings that can improve future runs.
+
+## Session Content
+${loopContent}
+
+## Your Task
+Analyze this AI session and provide:
+
+1. **Summary**: Brief 1-2 sentence summary of what was accomplished
+2. **What Worked Well**: Patterns, approaches, or techniques that were effective
+3. **What Could Be Improved**: Areas where the AI struggled or could have done better
+4. **Project-Specific Patterns**: Any patterns specific to this codebase that should be remembered
+5. **Suggested CLAUDE.md Addition**: If appropriate, provide text that could be added to CLAUDE.md to help future runs
+
+Format your response as markdown with clear sections.`;
+
+    // Use async task triggering with polling
+    await triggerTask({
+      name: "ai-analysis",
+      content: analysisPrompt,
+      max_sessions: 1,
+      display_prompt: `Analyzing session: ${selectedLoop.label}`,
+    });
   };
 
   // Copy learning content to clipboard
@@ -171,13 +170,13 @@ Format your response as markdown with clear sections.`;
         <div>
           <h2 className="text-xl font-semibold">Learnings</h2>
           <p className="text-sm text-muted-foreground">
-            Analyze AI workflow sessions to extract patterns and improve future runs
+            Analyze AI sessions to extract patterns and improve future runs
           </p>
         </div>
       </div>
 
       <div className="flex-1 flex gap-4 min-h-0">
-        {/* Left Panel: Loop Selection */}
+        {/* Left Panel: Session Selection */}
         <div className="w-80 flex flex-col border border-border rounded-lg overflow-hidden">
           <div className="p-3 border-b border-border bg-muted/30">
             <button
@@ -193,7 +192,7 @@ Format your response as markdown with clear sections.`;
               ) : (
                 <>
                   <Play className="w-4 h-4" />
-                  Analyze Selected Loop
+                  Analyze Selected Session
                 </>
               )}
             </button>
@@ -203,8 +202,8 @@ Format your response as markdown with clear sections.`;
             {loops.length === 0 ? (
               <div className="p-4 text-center text-muted-foreground">
                 <Sparkles className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                <p className="text-sm">No AI workflow loops yet</p>
-                <p className="text-xs mt-1">Run an AI workflow to generate loops for analysis</p>
+                <p className="text-sm">No AI sessions yet</p>
+                <p className="text-xs mt-1">Run an AI task to generate sessions for analysis</p>
               </div>
             ) : (
               <div className="divide-y divide-border">
@@ -252,9 +251,7 @@ Format your response as markdown with clear sections.`;
         <div className="flex-1 flex flex-col border border-border rounded-lg overflow-hidden">
           <div className="p-3 border-b border-border bg-muted/30">
             <h3 className="text-sm font-medium">Generated Learnings</h3>
-            <p className="text-xs text-muted-foreground mt-1">
-              Insights extracted from analyzed loops
-            </p>
+            <p className="text-xs text-muted-foreground mt-1">Insights from analyzed sessions</p>
           </div>
 
           <div className="flex-1 overflow-y-auto">
@@ -263,7 +260,7 @@ Format your response as markdown with clear sections.`;
                 <BookOpen className="w-12 h-12 mx-auto mb-3 opacity-50" />
                 <p className="text-sm">No learnings generated yet</p>
                 <p className="text-xs mt-1">
-                  Select a loop and click "Analyze" to extract learnings
+                  Select a session and click "Analyze" to extract learnings
                 </p>
               </div>
             ) : (

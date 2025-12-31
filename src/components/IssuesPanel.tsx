@@ -32,6 +32,7 @@ import {
   IssueSourceType,
 } from "../types/issues";
 import { issueTracker, IssueTrackerEvent } from "../services/IssueTracker";
+import { useAiTaskPolling } from "../hooks";
 
 // Component is self-contained with expand/collapse functionality
 type IssuesPanelProps = Record<string, never>;
@@ -183,53 +184,52 @@ export function IssuesPanel(_props: IssuesPanelProps) {
     issueTracker.clearSession();
   }, []);
 
-  const handleAnalyzeAndFix = useCallback(async () => {
-    setIsAnalyzing(true);
-    try {
-      const currentIssues = issueTracker.getSessionIssues();
-
-      // Build prompt with issues data (only include relevant fields)
-      const issuesJson = JSON.stringify(
-        currentIssues.map((i) => ({
-          id: i.id,
-          type: i.type,
-          severity: i.severity,
-          title: i.title,
-          description: i.description,
-          file: i.file,
-          line: i.line,
-          source: i.source,
-          status: i.status,
-        })),
-        null,
-        2,
-      );
-
-      const prompt = buildAnalyzePrompt(issuesJson);
-
-      // Trigger AI analysis via HTTP endpoint
-      const response = await fetch("http://localhost:9876/trigger-ai-analysis", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prompt,
-          display_prompt: "Analyze and fix detected issues",
-          timeout_seconds: 600,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`AI analysis failed: ${response.statusText}`);
-      }
-
+  // AI task polling hook for analyze and fix
+  const { triggerTask: triggerAnalyzeAndFix } = useAiTaskPolling({
+    onComplete: () => {
+      setIsAnalyzing(false);
       // The AI output will contain [ISSUE:RESOLVED] and [ISSUE:REMOVED] markers
       // that are processed by IssueTracker.processLine() in AiOutputTab
-    } catch (error) {
+    },
+    onError: (error) => {
       console.error("Failed to analyze issues:", error);
-    } finally {
       setIsAnalyzing(false);
-    }
-  }, []);
+    },
+  });
+
+  const handleAnalyzeAndFix = useCallback(async () => {
+    setIsAnalyzing(true);
+
+    const currentIssues = issueTracker.getSessionIssues();
+
+    // Build prompt with issues data (only include relevant fields)
+    const issuesJson = JSON.stringify(
+      currentIssues.map((i) => ({
+        id: i.id,
+        type: i.type,
+        severity: i.severity,
+        title: i.title,
+        description: i.description,
+        file: i.file,
+        line: i.line,
+        source: i.source,
+        status: i.status,
+      })),
+      null,
+      2,
+    );
+
+    const prompt = buildAnalyzePrompt(issuesJson);
+
+    // Use async task triggering with polling
+    await triggerAnalyzeAndFix({
+      name: "ai-analysis",
+      content: prompt,
+      max_sessions: 1,
+      display_prompt: "Analyze and fix detected issues",
+      timeout_seconds: 600,
+    });
+  }, [triggerAnalyzeAndFix]);
 
   if (issues.length === 0) {
     return (

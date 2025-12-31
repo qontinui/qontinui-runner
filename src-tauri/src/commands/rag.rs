@@ -222,6 +222,19 @@ impl RAGState {
             semantic_search: Arc::new(TokioMutex::new(semantic_search)),
         })
     }
+
+    /// Create a degraded RAGState that will return errors on use
+    ///
+    /// This is used when RAG initialization fails but we want the runner to continue.
+    /// All RAG features will be disabled and will return errors when called.
+    pub fn new_degraded() -> Self {
+        warn!("Creating degraded RAGState - all RAG features will be disabled");
+        Self {
+            storage: Arc::new(TokioMutex::new(RAGStorage::new_degraded())),
+            embedding_generator: Arc::new(TokioMutex::new(EmbeddingGenerator::new_degraded())),
+            semantic_search: Arc::new(TokioMutex::new(SemanticSearch::new_degraded())),
+        }
+    }
 }
 
 /// Import a QontinuiConfig for RAG processing

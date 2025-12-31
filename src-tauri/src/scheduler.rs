@@ -53,8 +53,9 @@ pub enum ScheduledTaskType {
     /// Run a prompt from Prompt Library
     Prompt {
         prompt_id: String,
+        /// Optional override for max_sessions (None = use prompt's setting)
         #[serde(default)]
-        max_iterations: Option<u32>,
+        max_sessions: Option<u32>,
     },
     /// Trigger auto-fix (check findings and fix auto-fixable items)
     AutoFix {

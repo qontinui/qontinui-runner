@@ -8,6 +8,7 @@
 
 use crate::auth::AuthManager;
 use serde::{Deserialize, Serialize};
+use std::error::Error as StdError;
 use tracing::{error, info, warn};
 
 /// Get API base URL for qontinui-web backend
@@ -752,28 +753,59 @@ pub async fn get_access_token_for_websocket() -> Result<String, String> {
 /// - Backend API call fails
 #[tauri::command]
 pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<(), String> {
-    info!("Sending device heartbeat");
+    info!(
+        "[HEARTBEAT] Starting device heartbeat (project_id: {:?})",
+        project_id
+    );
 
     let auth_manager = AuthManager::new();
+    info!("[HEARTBEAT] AuthManager created");
 
     // Check authentication
     if !auth_manager.has_tokens() {
+        warn!("[HEARTBEAT] No tokens found - not authenticated");
         return Err("Not authenticated. Please log in first.".to_string());
     }
+    info!("[HEARTBEAT] Tokens present, proceeding");
 
     // Get device ID and access token
+    info!("[HEARTBEAT] Getting device ID...");
     let device_id = auth_manager.get_device_id().map_err(|e| {
-        error!("Failed to get device ID: {}", e);
+        error!("[HEARTBEAT] Failed to get device ID: {}", e);
         format!("Failed to get device ID: {}", e)
     })?;
+    info!("[HEARTBEAT] Got device ID: {}", device_id);
 
+    info!("[HEARTBEAT] Getting access token...");
     let access_token = auth_manager.get_access_token().map_err(|e| {
-        error!("Failed to get access token: {}", e);
+        error!("[HEARTBEAT] Failed to get access token: {}", e);
         format!("Failed to get access token: {}", e)
     })?;
+    info!(
+        "[HEARTBEAT] Got access token (length: {} chars)",
+        access_token.len()
+    );
 
-    // Call heartbeat endpoint
-    let client = reqwest::Client::new();
+    // Build URL first to log it
+    let api_base = get_api_base_url();
+    let url = format!("{}/api/v1/runner-devices/{}/heartbeat", api_base, device_id);
+    info!("[HEARTBEAT] Target URL: {}", url);
+
+    // Create HTTP client with timeout
+    info!("[HEARTBEAT] Creating HTTP client...");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => {
+            info!("[HEARTBEAT] HTTP client created successfully");
+            c
+        }
+        Err(e) => {
+            error!("[HEARTBEAT] Failed to create HTTP client: {}", e);
+            return Err(format!("Failed to create HTTP client: {}", e));
+        }
+    };
 
     #[derive(Serialize)]
     struct HeartbeatRequest {
@@ -781,32 +813,62 @@ pub async fn send_device_heartbeat(project_id: Option<String>) -> Result<(), Str
     }
 
     let heartbeat_request = HeartbeatRequest { project_id };
+    info!("[HEARTBEAT] Request payload prepared");
 
-    let response = client
-        .post(format!(
-            "{}/api/v1/runner-devices/{}/heartbeat",
-            get_api_base_url(),
-            device_id
-        ))
+    info!("[HEARTBEAT] Sending POST request...");
+    let response = match client
+        .post(&url)
         .bearer_auth(&access_token)
         .json(&heartbeat_request)
         .send()
         .await
-        .map_err(|e| {
-            error!("Heartbeat request failed: {}", e);
-            format!("Network error: {}", e)
-        })?;
+    {
+        Ok(resp) => {
+            info!("[HEARTBEAT] Response received: status={}", resp.status());
+            resp
+        }
+        Err(e) => {
+            // Log detailed error information
+            error!("[HEARTBEAT] Request failed: {}", e);
+            if e.is_timeout() {
+                error!("[HEARTBEAT] Error type: TIMEOUT");
+            } else if e.is_connect() {
+                error!("[HEARTBEAT] Error type: CONNECTION");
+            } else if e.is_request() {
+                error!("[HEARTBEAT] Error type: REQUEST BUILD");
+            } else if e.is_body() {
+                error!("[HEARTBEAT] Error type: BODY");
+            } else if e.is_decode() {
+                error!("[HEARTBEAT] Error type: DECODE");
+            } else if e.is_redirect() {
+                error!("[HEARTBEAT] Error type: REDIRECT");
+            } else if e.is_status() {
+                error!("[HEARTBEAT] Error type: STATUS");
+            }
+            if let Some(url) = e.url() {
+                error!("[HEARTBEAT] Failed URL: {}", url);
+            }
+            if let Some(source) = e.source() {
+                error!("[HEARTBEAT] Error source: {}", source);
+            }
+            return Err(format!("Network error: {}", e));
+        }
+    };
 
     if !response.status().is_success() {
         let status = response.status();
+        info!(
+            "[HEARTBEAT] Non-success status: {}, reading body...",
+            status
+        );
         let error_text = response
             .text()
             .await
             .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("Heartbeat failed with status {}: {}", status, error_text);
+        error!("[HEARTBEAT] Failed with status {}: {}", status, error_text);
         return Err(format!("Heartbeat failed: {}", error_text));
     }
 
-    info!("Heartbeat sent successfully");
+    info!("[HEARTBEAT] Heartbeat sent successfully");
     Ok(())
 }

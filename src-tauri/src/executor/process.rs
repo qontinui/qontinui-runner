@@ -62,6 +62,17 @@ impl ProcessManager {
         const SCRIPT_NAME: &str = "qontinui_executor.py";
 
         let possible_paths = vec![
+            // Based on executable location (most reliable - works with supervisor)
+            // Binary is at: qontinui-runner/src-tauri/target/debug/qontinui-runner.exe
+            // Script is at: qontinui-runner/python-bridge/qontinui_executor.py
+            std::env::current_exe().ok().and_then(|p| {
+                // Go up from binary to target/debug or target/release
+                p.parent() // target/debug/
+                    .and_then(|p| p.parent()) // target/
+                    .and_then(|p| p.parent()) // src-tauri/
+                    .and_then(|p| p.parent()) // qontinui-runner/
+                    .map(|p| p.join("python-bridge").join(SCRIPT_NAME))
+            }),
             // When running from src-tauri/target/debug or release
             std::env::current_dir().ok().and_then(|p| {
                 if p.ends_with("debug") || p.ends_with("release") {
@@ -86,6 +97,7 @@ impl ProcessManager {
                 .map(|p| p.join("..").join("python-bridge").join(SCRIPT_NAME)),
         ];
 
+        debug!("Current exe: {:?}", std::env::current_exe());
         debug!("Current directory: {:?}", std::env::current_dir());
 
         possible_paths
