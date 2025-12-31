@@ -302,6 +302,23 @@ impl PlaywrightScript {
             is_workflow_automation: false,
         }
     }
+
+    /// Create a new script with minimal fields (for simple use cases and tests)
+    #[cfg(test)]
+    pub fn new(name: String, script_content: String) -> Self {
+        Self::with_details(
+            name,
+            String::new(),
+            None,
+            String::new(),
+            script_content,
+            String::new(),
+            Vec::new(),
+            default_timeout_seconds(),
+            DisplayMode::default(),
+            default_browser(),
+        )
+    }
 }
 
 /// The script library containing all saved scripts

@@ -5513,6 +5513,19 @@ async fn run_unified_session_loop(
             let _ = state.session_manager.update_session(s).await;
         }
 
+        // Increment sessions_count in database for this phase
+        // This keeps task_run.sessions_count in sync with session.checkpoint.sessions_spawned
+        if let Err(e) = state
+            .app_state
+            .checkpoint_db
+            .append_task_output(&session_id, "", true)
+        {
+            warn!(
+                "Failed to increment sessions_count for task {}: {}",
+                session_id, e
+            );
+        }
+
         emit_ai_output(
             &app_handle,
             &format!(
@@ -5556,6 +5569,26 @@ async fn run_unified_session_loop(
                     warn!("Phase {} completed with errors, continuing...", phase);
                 }
 
+                // Append session output to task_run.output_log in database
+                // This preserves output across restarts and enables debugging
+                // Limit output to last 50KB to prevent database bloat
+                let output_to_store = if output.len() > 50_000 {
+                    format!(
+                        "\n\n=== Phase {} Output (truncated, last 50KB) ===\n{}",
+                        phase,
+                        &output[output.len() - 50_000..]
+                    )
+                } else {
+                    format!("\n\n=== Phase {} Output ===\n{}", phase, output)
+                };
+                if let Err(e) = state.app_state.checkpoint_db.append_task_output(
+                    &session_id,
+                    &output_to_store,
+                    false,
+                ) {
+                    warn!("Failed to append output for task {}: {}", session_id, e);
+                }
+
                 // Note: External checkpoint is now checked by the CROSS-SESSION loop
                 // (in start_session's tokio::spawn), not here. This allows:
                 // - Better separation of concerns: within-session vs cross-session
@@ -5568,6 +5601,12 @@ async fn run_unified_session_loop(
                         s.status = SessionStatus::Completed;
                         s.checkpoint.mark_completed();
                         let _ = state.session_manager.update_session(s).await;
+
+                        // Update task_run in database to match session status
+                        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&session_id)
+                        {
+                            warn!("Failed to mark task_run {} as complete: {}", session_id, e);
+                        }
 
                         emit_ai_output(
                             &app_handle,
@@ -5586,6 +5625,12 @@ async fn run_unified_session_loop(
                         s.checkpoint.completed = true;
                         s.checkpoint.status = "goal_achieved".to_string();
                         let _ = state.session_manager.update_session(s).await;
+
+                        // Update task_run in database to match session status
+                        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&session_id)
+                        {
+                            warn!("Failed to mark task_run {} as complete: {}", session_id, e);
+                        }
 
                         emit_ai_output(
                             &app_handle,
@@ -5610,6 +5655,12 @@ async fn run_unified_session_loop(
                         s.checkpoint.completed = true;
                         s.checkpoint.status = "completed".to_string();
                         let _ = state.session_manager.update_session(s).await;
+
+                        // Update task_run in database to match session status
+                        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&session_id)
+                        {
+                            warn!("Failed to mark task_run {} as complete: {}", session_id, e);
+                        }
 
                         emit_ai_output(
                             &app_handle,
@@ -5687,6 +5738,14 @@ async fn run_unified_session_loop(
                     s.status = SessionStatus::Failed;
                     s.checkpoint.mark_failed(&e);
                     let _ = state.session_manager.update_session(s).await;
+                }
+
+                // Update task_run in database to match session status
+                if let Err(db_err) = state.app_state.checkpoint_db.fail_task_run(&session_id, &e) {
+                    warn!(
+                        "Failed to mark task_run {} as failed: {}",
+                        session_id, db_err
+                    );
                 }
 
                 emit_ai_output(
