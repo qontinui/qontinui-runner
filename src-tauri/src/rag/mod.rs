@@ -43,6 +43,7 @@ pub use embeddings::{EmbeddingGenerator, EmbeddingStatus};
 pub use search::{SearchError, SemanticSearch};
 pub use storage::RAGStorage;
 
+use crate::config::Category;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -75,7 +76,7 @@ pub struct QontinuiConfig {
 
     /// Workflow categories
     #[serde(default)]
-    pub categories: Vec<String>,
+    pub categories: Vec<Category>,
 
     /// Optional settings
     #[serde(default)]
@@ -304,4 +305,32 @@ pub struct SearchResult {
     pub bbox: BoundingBox,
     pub similarity: f32,
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rag_config_with_categories() {
+        let json = r#"{
+            "version": "2.0.0",
+            "metadata": {
+                "name": "Test",
+                "created": "2025-01-01T00:00:00Z",
+                "modified": "2025-01-01T00:00:00Z"
+            },
+            "categories": [
+                {"name": "Main", "automationEnabled": true},
+                {"name": "Incoming Transitions", "automationEnabled": false}
+            ]
+        }"#;
+
+        let config: QontinuiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.categories.len(), 2);
+        assert_eq!(config.categories[0].name, "Main");
+        assert!(config.categories[0].automation_enabled);
+        assert_eq!(config.categories[1].name, "Incoming Transitions");
+        assert!(!config.categories[1].automation_enabled);
+    }
 }

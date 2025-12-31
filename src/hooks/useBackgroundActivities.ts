@@ -23,7 +23,7 @@ export interface BackgroundActivity {
 }
 
 interface UseBackgroundActivitiesProps {
-  // RAG processing state
+  // RAG processing state (passed as props for initial state)
   ragStatus: "idle" | "processing" | "completed" | "failed";
   ragProgress?: number;
   ragProjectName?: string | null;
@@ -42,12 +42,29 @@ interface UseBackgroundActivitiesReturn {
   activityCount: number;
 }
 
+// RAG event status enum values (must match @qontinui/schemas/rag)
+const RAG_STATUS = {
+  IN_PROGRESS: "in_progress",
+  COMPLETED: "completed",
+  FAILED: "failed",
+} as const;
+
+interface RagProgressEvent {
+  project_id: string;
+  status: string;
+  message: string;
+  percent?: number;
+  elements_processed?: number;
+  total_elements?: number;
+  error?: string;
+}
+
 /**
  * Hook to track and aggregate all background activities
  */
 export function useBackgroundActivities({
-  ragStatus,
-  ragProgress,
+  ragStatus: propRagStatus,
+  ragProgress: propRagProgress,
   ragProjectName,
   isExtracting,
   extractionUrl,
@@ -63,6 +80,97 @@ export function useBackgroundActivities({
     label: string;
     startedAt: Date;
   } | null>(null);
+
+  // Track RAG processing via events (more reliable than props)
+  const [ragState, setRagState] = useState<{
+    isProcessing: boolean;
+    progress?: number;
+    projectName?: string;
+    startedAt?: Date;
+  }>({ isProcessing: false });
+
+  // Track web extraction via events (more reliable than props)
+  const [extractionState, setExtractionState] = useState<{
+    isExtracting: boolean;
+    progress?: number;
+    currentUrl?: string;
+    totalPages?: number;
+    pagesExtracted?: number;
+    startedAt?: Date;
+  }>({ isExtracting: false });
+
+  // Listen for RAG progress events directly
+  useEffect(() => {
+    let unlistenProgress: UnlistenFn | null = null;
+    let unlistenCompletion: UnlistenFn | null = null;
+
+    const setupListeners = async () => {
+      // Listen for RAG progress events
+      unlistenProgress = await listen<RagProgressEvent>("rag-progress", (event) => {
+        const payload = event.payload;
+
+        if (payload.status === RAG_STATUS.IN_PROGRESS) {
+          setRagState({
+            isProcessing: true,
+            progress: payload.percent,
+            projectName: payload.project_id,
+            startedAt: new Date(),
+          });
+        } else if (
+          payload.status === RAG_STATUS.COMPLETED ||
+          payload.status === RAG_STATUS.FAILED
+        ) {
+          setRagState({ isProcessing: false });
+        }
+      });
+
+      // Listen for RAG completion events
+      unlistenCompletion = await listen("rag-completion", () => {
+        setRagState({ isProcessing: false });
+      });
+    };
+
+    setupListeners();
+
+    return () => {
+      unlistenProgress?.();
+      unlistenCompletion?.();
+    };
+  }, []);
+
+  // Sync RAG with props if they indicate processing (fallback)
+  useEffect(() => {
+    if (propRagStatus === "processing" && !ragState.isProcessing) {
+      setRagState({
+        isProcessing: true,
+        progress: propRagProgress,
+        projectName: ragProjectName || undefined,
+        startedAt: new Date(),
+      });
+    } else if (
+      propRagStatus !== "processing" &&
+      propRagStatus !== "idle" &&
+      ragState.isProcessing
+    ) {
+      // completed or failed from props
+      setRagState({ isProcessing: false });
+    }
+  }, [propRagStatus, propRagProgress, ragProjectName, ragState.isProcessing]);
+
+  // Sync extraction with props if they indicate extracting (fallback)
+  useEffect(() => {
+    if (isExtracting && !extractionState.isExtracting) {
+      setExtractionState({
+        isExtracting: true,
+        currentUrl: extractionUrl,
+        totalPages: extractionProgress?.total_pages,
+        pagesExtracted: extractionProgress?.pages_extracted,
+        startedAt: new Date(),
+      });
+    } else if (!isExtracting && extractionState.isExtracting) {
+      setExtractionState({ isExtracting: false });
+    }
+  }, [isExtracting, extractionUrl, extractionProgress, extractionState.isExtracting]);
 
   // Listen for AI output events to track active AI sessions
   useEffect(() => {
@@ -115,7 +223,7 @@ export function useBackgroundActivities({
     };
   }, []);
 
-  // Listen for executor events that indicate sync operations
+  // Listen for executor events (extraction and sync operations)
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
 
@@ -125,9 +233,36 @@ export function useBackgroundActivities({
         data?: {
           target?: string;
           status?: string;
+          extraction_id?: string;
+          total_pages?: number;
+          current_url?: string;
+          result?: unknown;
+          error?: string;
         };
       }>("executor-event", (event) => {
         const { event_type, data } = event.payload;
+
+        // Track web extraction events
+        if (event_type === "extraction_started") {
+          setExtractionState({
+            isExtracting: true,
+            totalPages: data?.total_pages,
+            currentUrl: data?.current_url,
+            pagesExtracted: 0,
+            startedAt: new Date(),
+          });
+        } else if (event_type === "extraction_progress") {
+          setExtractionState((prev) => ({
+            ...prev,
+            isExtracting: true,
+            currentUrl: data?.current_url || prev.currentUrl,
+            // Update progress if we have status data
+          }));
+        } else if (event_type === "extraction_completed") {
+          setExtractionState({ isExtracting: false });
+        } else if (event_type === "extraction_failed") {
+          setExtractionState({ isExtracting: false });
+        }
 
         // Track web sync events
         if (event_type === "sync_started" || event_type === "web_sync_started") {
@@ -157,36 +292,38 @@ export function useBackgroundActivities({
   const activities = useMemo(() => {
     const result: BackgroundActivity[] = [];
 
-    // RAG Processing
-    if (ragStatus === "processing") {
+    // RAG Processing - use internal state (more reliable)
+    if (ragState.isProcessing) {
       result.push({
         id: "rag-processing",
         type: "rag",
         label: "RAG Processing",
-        progress: ragProgress,
-        detail: ragProjectName || undefined,
-        startedAt: new Date(), // Ideally track actual start time
+        progress: ragState.progress,
+        detail: ragState.projectName || ragProjectName || undefined,
+        startedAt: ragState.startedAt || new Date(),
       });
     }
 
-    // Web Extraction
-    if (isExtracting) {
+    // Web Extraction - use internal state (more reliable)
+    if (extractionState.isExtracting) {
       let progress: number | undefined;
       let detail: string | undefined;
 
-      if (extractionProgress && extractionProgress.total_pages > 0) {
-        progress = Math.round(
-          (extractionProgress.pages_extracted / extractionProgress.total_pages) * 100,
-        );
+      const totalPages = extractionState.totalPages || extractionProgress?.total_pages;
+      const pagesExtracted = extractionState.pagesExtracted || extractionProgress?.pages_extracted;
+
+      if (totalPages && totalPages > 0 && pagesExtracted !== undefined) {
+        progress = Math.round((pagesExtracted / totalPages) * 100);
       }
 
-      if (extractionUrl) {
+      const currentUrl = extractionState.currentUrl || extractionUrl;
+      if (currentUrl) {
         // Truncate URL for display
         try {
-          const url = new URL(extractionUrl);
+          const url = new URL(currentUrl);
           detail = url.hostname;
         } catch {
-          detail = extractionUrl.substring(0, 30);
+          detail = currentUrl.substring(0, 30);
         }
       }
 
@@ -196,7 +333,7 @@ export function useBackgroundActivities({
         label: "Web Extraction",
         progress,
         detail,
-        startedAt: new Date(),
+        startedAt: extractionState.startedAt || new Date(),
       });
     }
 
@@ -222,10 +359,9 @@ export function useBackgroundActivities({
 
     return result;
   }, [
-    ragStatus,
-    ragProgress,
+    ragState,
     ragProjectName,
-    isExtracting,
+    extractionState,
     extractionUrl,
     extractionProgress,
     activeAiSessions,

@@ -106,11 +106,13 @@ impl EventLog {
     }
 
     /// Get the number of events in the log
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.events.len()
     }
 
     /// Check if the event log is empty
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }

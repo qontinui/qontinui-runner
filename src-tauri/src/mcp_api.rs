@@ -902,12 +902,15 @@ async fn get_status(
         )
     })?;
 
+    // Check AI analysis status using async version to avoid blocking
+    let ai_running = has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await;
+
     Ok(Json(ApiResponse::success(StatusResponse {
         executor_running: result.0,
         executor_state: result.1,
         config_loaded: result.2,
         config_path: result.3,
-        ai_analysis_running: has_running_ai_tasks(),
+        ai_analysis_running: ai_running,
     })))
 }
 
@@ -3080,22 +3083,87 @@ async fn restart_runner(
 // AI Developer (Persistent Mode) HTTP Endpoints
 // ============================================================================
 
-/// Check if any AI analysis tasks are currently running.
-/// Uses the database to check for running task runs instead of an atomic flag.
-fn has_running_ai_tasks() -> bool {
-    match CheckpointDb::new() {
-        Ok(db) => match db.get_running_task_runs() {
-            Ok(tasks) => !tasks.is_empty(),
-            Err(e) => {
-                warn!("Failed to check running tasks: {}", e);
-                false
-            }
-        },
+/// Check if any AI analysis tasks are currently running (sync version).
+/// Uses the provided database to check for running task runs.
+/// NOTE: This is a synchronous function that blocks. For async contexts,
+/// use has_running_ai_tasks_async() or wrap this in spawn_blocking.
+fn has_running_ai_tasks_with_db(db: &CheckpointDb) -> bool {
+    match db.get_running_task_runs() {
+        Ok(tasks) => !tasks.is_empty(),
         Err(e) => {
-            warn!("Failed to open database to check running tasks: {}", e);
+            warn!("Failed to check running tasks: {}", e);
             false
         }
     }
+}
+
+/// Check if any AI analysis tasks are currently running (async version).
+/// Uses spawn_blocking to avoid blocking the async runtime.
+async fn has_running_ai_tasks_async(db: Arc<CheckpointDb>) -> bool {
+    match tokio::task::spawn_blocking(move || db.get_running_task_runs()).await {
+        Ok(Ok(tasks)) => !tasks.is_empty(),
+        Ok(Err(e)) => {
+            warn!("Failed to check running tasks: {}", e);
+            false
+        }
+        Err(e) => {
+            warn!("spawn_blocking error checking running tasks: {}", e);
+            false
+        }
+    }
+}
+
+/// Helper function to mark a task run as complete with retry logic.
+/// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
+/// Returns true if successfully marked complete, false otherwise.
+async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> bool {
+    let task_id_owned = task_id.to_string();
+    let max_retries = 3;
+
+    for retry in 0..max_retries {
+        let db_clone = db.clone();
+        let id = task_id_owned.clone();
+
+        match tokio::task::spawn_blocking(move || db_clone.complete_task_run(&id)).await {
+            Ok(Ok(())) => {
+                if retry > 0 {
+                    info!(
+                        "Task run {} marked complete after {} retries",
+                        task_id_owned, retry
+                    );
+                }
+                return true;
+            }
+            Ok(Err(e)) => {
+                if retry < max_retries - 1 {
+                    let delay_ms = 100 * (1 << retry); // 100, 200, 400ms
+                    warn!(
+                        "Retry {}/{} marking task_run {} complete (waiting {}ms): {}",
+                        retry + 1,
+                        max_retries,
+                        task_id_owned,
+                        delay_ms,
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                } else {
+                    error!(
+                        "Failed to mark task_run {} as complete after {} retries: {}",
+                        task_id_owned, max_retries, e
+                    );
+                }
+            }
+            Err(e) => {
+                error!(
+                    "spawn_blocking error marking task_run {} complete: {}",
+                    task_id_owned, e
+                );
+                return false;
+            }
+        }
+    }
+
+    false
 }
 
 /// Helper function to get workspace paths (reused from config.rs pattern)
@@ -3425,6 +3493,66 @@ If your task requires running visual automation, use the Runner API to execute w
             all_images.iter().map(|p| format!("- {}", p)).collect::<Vec<_>>().join("\n")
         );
     }
+
+    // Add structured finding output instructions
+    // This enables the Monitor tab to parse and display findings categorized by type
+    enhanced_prompt = format!(
+        r#"{}
+
+---
+
+## Structured Finding Output Format
+
+When you identify issues, bugs, or items requiring attention, report them using this format so they can be tracked in the Monitor tab:
+
+### Basic Finding (for issues you can auto-fix)
+```
+[FINDING:category_id:severity]
+Title: Brief title describing the issue
+Description: Detailed description of what's wrong and why
+File: path/to/file.ts (if applicable)
+Line: 42 (if applicable)
+Resolution: What was done to fix it (if already fixed)
+[/FINDING]
+```
+
+### Finding Requiring User Input
+```
+[FINDING:category_id:severity:needs_input]
+Title: Brief title describing the issue
+Description: Detailed description of the situation
+Question: Specific question for the user
+Options: Option A | Option B | Option C
+File: path/to/file.ts (if applicable)
+[/FINDING]
+```
+
+### Available Categories
+- `code_bug`: Code bugs that can be auto-fixed
+- `security`: Security vulnerabilities (auto-fix)
+- `test_issue`: Test code problems (auto-fix)
+- `documentation`: Documentation issues (auto-fix)
+- `todo`: Tasks needing user decisions (needs input)
+- `enhancement`: Improvement suggestions (needs input)
+- `performance`: Performance issues (needs input)
+- `config_issue`: Configuration problems (manual)
+- `runtime_issue`: Operational issues (manual)
+- `data_migration`: Migration tasks (manual)
+- `already_fixed`: Issues resolved in previous sessions (informational)
+- `expected_behavior`: Intentional design (informational)
+- `warning`: Things to be aware of (informational)
+
+### Severity Levels
+- `critical`: System-breaking, security vulnerabilities, data loss
+- `high`: Major functionality issues
+- `medium`: Notable issues to address soon
+- `low`: Minor issues
+- `info`: Informational notes
+
+Use this format for any bugs, issues, or notable items you discover during analysis.
+"#,
+        enhanced_prompt
+    );
 
     info!(
         "MCP API: Running prompt '{}' (session: {}, max_sessions: {:?}, images: {})",
@@ -4689,8 +4817,8 @@ struct ResumableWorkflowInfo {
 async fn get_resumable_workflow(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<ResumableWorkflowInfo>> {
-    // Check if AI is currently running
-    let has_running_tasks = has_running_ai_tasks();
+    // Check if AI is currently running (use async version to avoid blocking)
+    let has_running_tasks = has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await;
 
     // Also check session manager for running sessions
     let sessions = state.session_manager.list_sessions().await;
@@ -4782,8 +4910,8 @@ struct ResumeWorkflowResponse {
 async fn resume_workflow(
     State(state): State<Arc<ApiState>>,
 ) -> Json<ApiResponse<ResumeWorkflowResponse>> {
-    // Check if AI analysis is already running
-    if has_running_ai_tasks() {
+    // Check if AI analysis is already running (use async version to avoid blocking)
+    if has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await {
         return Json(ApiResponse {
             success: false,
             data: None,
@@ -4864,8 +4992,8 @@ async fn force_continue_session(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ForceContinueRequest>,
 ) -> Json<ApiResponse<ForceContinueResponse>> {
-    // Check if AI analysis is already running (using database)
-    if has_running_ai_tasks() {
+    // Check if AI analysis is already running (use async version to avoid blocking)
+    if has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await {
         return Json(ApiResponse {
             success: false,
             data: None,
@@ -5594,11 +5722,12 @@ async fn run_unified_session_loop(
                         s.checkpoint.mark_completed();
                         let _ = state.session_manager.update_session(s).await;
 
-                        // Update task_run in database to match session status
-                        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&session_id)
-                        {
-                            warn!("Failed to mark task_run {} as complete: {}", session_id, e);
-                        }
+                        // Update task_run in database to match session status (with retry)
+                        complete_task_run_with_retry(
+                            state.app_state.checkpoint_db.clone(),
+                            &session_id,
+                        )
+                        .await;
 
                         emit_ai_output(
                             &app_handle,
@@ -5618,11 +5747,12 @@ async fn run_unified_session_loop(
                         s.checkpoint.status = "goal_achieved".to_string();
                         let _ = state.session_manager.update_session(s).await;
 
-                        // Update task_run in database to match session status
-                        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&session_id)
-                        {
-                            warn!("Failed to mark task_run {} as complete: {}", session_id, e);
-                        }
+                        // Update task_run in database to match session status (with retry)
+                        complete_task_run_with_retry(
+                            state.app_state.checkpoint_db.clone(),
+                            &session_id,
+                        )
+                        .await;
 
                         emit_ai_output(
                             &app_handle,
@@ -5648,11 +5778,12 @@ async fn run_unified_session_loop(
                         s.checkpoint.status = "completed".to_string();
                         let _ = state.session_manager.update_session(s).await;
 
-                        // Update task_run in database to match session status
-                        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&session_id)
-                        {
-                            warn!("Failed to mark task_run {} as complete: {}", session_id, e);
-                        }
+                        // Update task_run in database to match session status (with retry)
+                        complete_task_run_with_retry(
+                            state.app_state.checkpoint_db.clone(),
+                            &session_id,
+                        )
+                        .await;
 
                         emit_ai_output(
                             &app_handle,
@@ -5939,27 +6070,37 @@ struct ListTaskRunsQuery {
 }
 
 /// List recent task runs.
+/// Uses spawn_blocking to avoid blocking the async runtime on database operations.
 async fn list_task_runs(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<ListTaskRunsQuery>,
 ) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
     let limit = query.limit.unwrap_or(50);
-    state
-        .app_state
-        .checkpoint_db
-        .get_recent_task_runs(limit)
+    let db = state.app_state.checkpoint_db.clone();
+
+    tokio::task::spawn_blocking(move || db.get_recent_task_runs(limit))
+        .await
+        .map_err(|e| {
+            error!("spawn_blocking error in list_task_runs: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 /// List only running task runs.
+/// Uses spawn_blocking to avoid blocking the async runtime on database operations.
 async fn list_running_task_runs(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<Vec<TaskRun>>, (StatusCode, String)> {
-    state
-        .app_state
-        .checkpoint_db
-        .get_running_task_runs()
+    let db = state.app_state.checkpoint_db.clone();
+
+    tokio::task::spawn_blocking(move || db.get_running_task_runs())
+        .await
+        .map_err(|e| {
+            error!("spawn_blocking error in list_running_task_runs: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }

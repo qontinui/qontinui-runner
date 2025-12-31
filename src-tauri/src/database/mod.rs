@@ -4,15 +4,16 @@
 //! prompts, workflows, and scheduler state.
 
 use chrono::Utc;
+use r2d2::{Pool, PooledConnection};
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{params, Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use tracing::{info, warn};
 
 /// Database handle for checkpoint and session persistence.
 pub struct CheckpointDb {
-    conn: Mutex<Connection>,
+    pool: Pool<SqliteConnectionManager>,
     db_path: PathBuf,
 }
 
@@ -130,24 +131,52 @@ impl CheckpointDb {
 
     /// Create a new database connection at a specific path.
     pub fn new_at_path(db_path: PathBuf) -> Result<Self, String> {
-        let conn = Connection::open(&db_path)
-            .map_err(|e| format!("Failed to open database at {:?}: {}", db_path, e))?;
+        // Create connection manager with PRAGMA initialization
+        // Each connection from the pool will have these settings applied
+        let manager = SqliteConnectionManager::file(&db_path).with_init(|conn| {
+            // Enable WAL mode and configure for better concurrency
+            // - journal_mode=WAL: Write-Ahead Logging for concurrent readers
+            // - foreign_keys=ON: Enforce referential integrity
+            // - busy_timeout=5000: Wait up to 5 seconds on lock contention (instead of immediate failure)
+            // - synchronous=NORMAL: Safe for WAL mode, better performance than FULL
+            // - temp_store=MEMORY: Keep temp tables in memory
+            // - cache_size=-32000: 32MB page cache for better performance
+            conn.execute_batch(
+                r#"
+                PRAGMA journal_mode=WAL;
+                PRAGMA foreign_keys=ON;
+                PRAGMA busy_timeout=5000;
+                PRAGMA synchronous=NORMAL;
+                PRAGMA temp_store=MEMORY;
+                PRAGMA cache_size=-32000;
+                "#,
+            )?;
+            Ok(())
+        });
 
-        // Enable WAL mode for better concurrency
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-            .map_err(|e| format!("Failed to set PRAGMA options: {}", e))?;
+        // Build the connection pool with max 10 connections
+        let pool = Pool::builder()
+            .max_size(10)
+            .build(manager)
+            .map_err(|e| format!("Failed to create connection pool: {}", e))?;
 
-        let db = Self {
-            conn: Mutex::new(conn),
+        // Run migrations using a connection from the pool
+        {
+            let conn = pool
+                .get()
+                .map_err(|e| format!("Failed to get connection from pool: {}", e))?;
+            Self::run_migrations_on_conn(&conn)?;
+        }
+
+        info!(
+            "Checkpoint database initialized with connection pool at {:?}",
+            db_path
+        );
+
+        Ok(Self {
+            pool,
             db_path: db_path.clone(),
-        };
-
-        // Run schema migrations
-        db.run_migrations()?;
-
-        info!("Checkpoint database initialized at {:?}", db_path);
-
-        Ok(db)
+        })
     }
 
     /// Get the database path.
@@ -155,10 +184,16 @@ impl CheckpointDb {
         &self.db_path
     }
 
-    /// Run database migrations.
-    fn run_migrations(&self) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+    /// Get a connection from the pool.
+    fn get_conn(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
+        self.pool
+            .get()
+            .map_err(|e| format!("Failed to get connection from pool: {}", e))
+    }
 
+    /// Run database migrations on a specific connection.
+    /// This is a static method to allow calling during pool initialization.
+    fn run_migrations_on_conn(conn: &Connection) -> Result<(), String> {
         // Check current schema version
         let current_version: i32 = conn
             .query_row(
@@ -170,7 +205,7 @@ impl CheckpointDb {
 
         if current_version == 0 {
             // Fresh database - create schema
-            info!("Creating database schema (version 3)");
+            info!("Creating database schema (version 4)");
             conn.execute_batch(include_str!("schema.sql"))
                 .map_err(|e| format!("Failed to create schema: {}", e))?;
         }
@@ -218,6 +253,63 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 3: {}", e))?;
         }
 
+        // Migration to version 4: Add task_run_output_chunks table for O(1) appending
+        if current_version >= 1 && current_version < 4 {
+            info!("Migrating database to version 4 (adding task_run_output_chunks table)");
+
+            // Create the chunks table
+            conn.execute_batch(
+                r#"
+                -- Task Run Output Chunks (for efficient O(1) appending)
+                CREATE TABLE IF NOT EXISTS task_run_output_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_run_id TEXT NOT NULL,
+                    chunk_sequence INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_chunks_task_run ON task_run_output_chunks(task_run_id, chunk_sequence);
+                "#,
+            )
+            .map_err(|e| format!("Failed to create task_run_output_chunks table: {}", e))?;
+
+            // Migrate existing output_log data to chunks (one-time migration)
+            let now = Utc::now().to_rfc3339();
+
+            // Get all task_runs with non-empty output_log
+            let mut stmt = conn
+                .prepare("SELECT id, output_log FROM task_runs WHERE output_log != '' AND output_log IS NOT NULL")
+                .map_err(|e| format!("Failed to prepare migration query: {}", e))?;
+
+            let tasks: Vec<(String, String)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| format!("Failed to query task_runs for migration: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            drop(stmt); // Release the statement before executing more queries
+
+            for (task_id, output) in &tasks {
+                conn.execute(
+                    "INSERT INTO task_run_output_chunks (task_run_id, chunk_sequence, content, created_at) VALUES (?1, 1, ?2, ?3)",
+                    params![task_id, output, now],
+                )
+                .map_err(|e| format!("Failed to migrate output for task {}: {}", task_id, e))?;
+            }
+
+            if !tasks.is_empty() {
+                info!("Migrated {} task runs' output_log to chunks", tasks.len());
+            }
+
+            conn.execute_batch(
+                r#"
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (4, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to update schema version to 4: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -227,7 +319,7 @@ impl CheckpointDb {
 
     /// Get a checkpoint by workflow name.
     pub fn get_checkpoint(&self, workflow_name: &str) -> Result<Option<CheckpointData>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let result: SqliteResult<CheckpointData> = conn.query_row(
             r#"
@@ -289,7 +381,7 @@ impl CheckpointDb {
 
     /// Save or update a checkpoint.
     pub fn save_checkpoint(&self, data: &CheckpointData) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let workflow_name = data
             .workflow_name
@@ -357,7 +449,7 @@ impl CheckpointDb {
 
     /// Delete a checkpoint by workflow name.
     pub fn delete_checkpoint(&self, workflow_name: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let rows = conn
             .execute(
@@ -371,7 +463,7 @@ impl CheckpointDb {
 
     /// List all active (non-completed) checkpoints.
     pub fn list_active_checkpoints(&self) -> Result<Vec<CheckpointData>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let mut stmt = conn
             .prepare(
@@ -424,7 +516,7 @@ impl CheckpointDb {
         workflow_name: &str,
         completion_value: u32,
     ) -> Result<Option<(bool, u32)>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let result: SqliteResult<(i32, i64)> = conn.query_row(
             r#"
@@ -462,7 +554,7 @@ impl CheckpointDb {
         workflow_name: Option<&str>,
         run_id: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let now = Utc::now().to_rfc3339();
 
@@ -496,7 +588,7 @@ impl CheckpointDb {
         current_phase: Option<u32>,
         error_message: Option<&str>,
     ) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let now = Utc::now().to_rfc3339();
         let completed = status == "completed" || status == "failed";
@@ -544,7 +636,7 @@ impl CheckpointDb {
         workflow_name: Option<&str>,
         limit: u32,
     ) -> Result<Vec<SessionEvent>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         // Helper function to map a row to SessionEvent
         fn map_row(row: &rusqlite::Row) -> rusqlite::Result<SessionEvent> {
@@ -617,7 +709,7 @@ impl CheckpointDb {
         max_sessions: Option<u32>,
         auto_continue: Option<bool>,
     ) -> Result<TaskRun, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
         let auto_continue_val = auto_continue.unwrap_or(true);
 
@@ -647,12 +739,14 @@ impl CheckpointDb {
     }
 
     /// Get a task run by ID.
+    /// Note: output_log is reconstructed from chunks table for backward compatibility.
     pub fn get_task_run(&self, id: &str) -> Result<Option<TaskRun>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
+        // First get the task_run metadata
         let result: SqliteResult<TaskRun> = conn.query_row(
             r#"
-            SELECT id, task_name, prompt, status, sessions_count, max_sessions, output_log, error_message, auto_continue, created_at, updated_at, completed_at
+            SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
             "#,
@@ -665,18 +759,23 @@ impl CheckpointDb {
                     status: row.get(3)?,
                     sessions_count: row.get::<_, i64>(4)? as u32,
                     max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
-                    output_log: row.get(6)?,
-                    error_message: row.get(7)?,
-                    auto_continue: row.get::<_, i32>(8)? != 0,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    completed_at: row.get(11)?,
+                    output_log: String::new(), // Will be filled from chunks
+                    error_message: row.get(6)?,
+                    auto_continue: row.get::<_, i32>(7)? != 0,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    completed_at: row.get(10)?,
                 })
             },
         );
 
         match result {
-            Ok(task_run) => Ok(Some(task_run)),
+            Ok(mut task_run) => {
+                // Get output from chunks
+                drop(conn); // Release connection before calling another method
+                task_run.output_log = self.get_full_task_output(id).unwrap_or_default();
+                Ok(Some(task_run))
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("Failed to get task run: {}", e)),
         }
@@ -684,33 +783,67 @@ impl CheckpointDb {
 
     /// Append output to a task run and increment session count.
     /// Returns true if [TASK_COMPLETE] marker was found in the appended text.
+    ///
+    /// Uses O(1) chunk insertion instead of O(n) string concatenation.
+    /// Output is stored in the task_run_output_chunks table for efficient appending.
+    ///
+    /// NOTE: This method handles task completion inline to avoid multiple connection acquisitions.
     pub fn append_task_output(
         &self,
         id: &str,
         output: &str,
         increment_session: bool,
     ) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
-        let session_increment = if increment_session { 1 } else { 0 };
+        // Get next chunk sequence number
+        let next_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(chunk_sequence), 0) + 1 FROM task_run_output_chunks WHERE task_run_id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
 
+        // Insert new chunk (O(1) operation)
+        conn.execute(
+            "INSERT INTO task_run_output_chunks (task_run_id, chunk_sequence, content, created_at) VALUES (?, ?, ?, ?)",
+            params![id, next_seq, output, now],
+        )
+        .map_err(|e| format!("Failed to insert output chunk: {}", e))?;
+
+        // Update task_run metadata only (no string concatenation)
+        let session_increment = if increment_session { 1 } else { 0 };
         conn.execute(
             r#"
             UPDATE task_runs SET
-                output_log = output_log || ?1,
-                sessions_count = sessions_count + ?2,
-                updated_at = ?3
-            WHERE id = ?4
+                sessions_count = sessions_count + ?1,
+                updated_at = ?2
+            WHERE id = ?3
             "#,
-            params![output, session_increment, now, id],
+            params![session_increment, now, id],
         )
-        .map_err(|e| format!("Failed to append task output: {}", e))?;
+        .map_err(|e| format!("Failed to update task run metadata: {}", e))?;
 
         // Check if task is complete
         let is_complete = output.contains(TASK_COMPLETE_MARKER);
         if is_complete {
-            self.complete_task_run(id)?;
+            // IMPORTANT: Inline the completion logic here instead of calling complete_task_run()
+            // to avoid nested lock acquisition (we already hold the conn lock above).
+            conn.execute(
+                r#"
+                UPDATE task_runs SET
+                    status = 'complete',
+                    updated_at = ?1,
+                    completed_at = ?1
+                WHERE id = ?2 AND status = 'running'
+                "#,
+                params![now, id],
+            )
+            .map_err(|e| format!("Failed to complete task run: {}", e))?;
+
+            info!("Task run {} marked complete via append_task_output", id);
         }
 
         Ok(is_complete)
@@ -718,7 +851,7 @@ impl CheckpointDb {
 
     /// Mark a task run as complete.
     pub fn complete_task_run(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -738,7 +871,7 @@ impl CheckpointDb {
 
     /// Mark a task run as failed.
     pub fn fail_task_run(&self, id: &str, error_message: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -759,7 +892,7 @@ impl CheckpointDb {
 
     /// Stop a task run.
     pub fn stop_task_run(&self, id: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -778,13 +911,14 @@ impl CheckpointDb {
     }
 
     /// Get all running (incomplete) task runs.
+    /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
     pub fn get_running_task_runs(&self) -> Result<Vec<TaskRun>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, task_name, prompt, status, sessions_count, max_sessions, output_log, error_message, auto_continue, created_at, updated_at, completed_at
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE status = 'running'
                 ORDER BY updated_at DESC
@@ -801,12 +935,12 @@ impl CheckpointDb {
                     status: row.get(3)?,
                     sessions_count: row.get::<_, i64>(4)? as u32,
                     max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
-                    output_log: row.get(6)?,
-                    error_message: row.get(7)?,
-                    auto_continue: row.get::<_, i32>(8)? != 0,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    completed_at: row.get(11)?,
+                    output_log: String::new(), // Empty for performance - use get_full_task_output()
+                    error_message: row.get(6)?,
+                    auto_continue: row.get::<_, i32>(7)? != 0,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    completed_at: row.get(10)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -817,13 +951,14 @@ impl CheckpointDb {
     }
 
     /// Get recent task runs (for display in UI).
+    /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
     pub fn get_recent_task_runs(&self, limit: u32) -> Result<Vec<TaskRun>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, task_name, prompt, status, sessions_count, max_sessions, output_log, error_message, auto_continue, created_at, updated_at, completed_at
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, created_at, updated_at, completed_at
                 FROM task_runs
                 ORDER BY updated_at DESC
                 LIMIT ?1
@@ -840,12 +975,12 @@ impl CheckpointDb {
                     status: row.get(3)?,
                     sessions_count: row.get::<_, i64>(4)? as u32,
                     max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
-                    output_log: row.get(6)?,
-                    error_message: row.get(7)?,
-                    auto_continue: row.get::<_, i32>(8)? != 0,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    completed_at: row.get(11)?,
+                    output_log: String::new(), // Empty for performance - use get_full_task_output()
+                    error_message: row.get(6)?,
+                    auto_continue: row.get::<_, i32>(7)? != 0,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    completed_at: row.get(10)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -891,8 +1026,9 @@ impl CheckpointDb {
     }
 
     /// Delete a task run by ID.
+    /// Note: CASCADE DELETE will automatically remove associated chunks.
     pub fn delete_task_run(&self, id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let rows = conn
             .execute("DELETE FROM task_runs WHERE id = ?1", params![id])
@@ -901,9 +1037,29 @@ impl CheckpointDb {
         Ok(rows > 0)
     }
 
+    /// Get the full output log by joining all chunks.
+    /// Use this when you need the complete output (e.g., for display or export).
+    pub fn get_full_task_output(&self, id: &str) -> Result<String, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT content FROM task_run_output_chunks WHERE task_run_id = ? ORDER BY chunk_sequence",
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let chunks: Vec<String> = stmt
+            .query_map(params![id], |row| row.get(0))
+            .map_err(|e| format!("Failed to query chunks: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(chunks.join(""))
+    }
+
     /// Get the auto-continue setting for a specific task run.
     pub fn get_task_auto_continue(&self, id: &str) -> Result<bool, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let result: SqliteResult<i32> = conn.query_row(
             "SELECT auto_continue FROM task_runs WHERE id = ?1",
@@ -920,7 +1076,7 @@ impl CheckpointDb {
 
     /// Set the auto-continue setting for a specific task run.
     pub fn set_task_auto_continue(&self, id: &str, auto_continue: bool) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
         let rows = conn
@@ -948,7 +1104,7 @@ impl CheckpointDb {
 
     /// Get a setting value.
     pub fn get_setting(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let result: SqliteResult<String> = conn.query_row(
             "SELECT value FROM settings WHERE key = ?1",
@@ -969,7 +1125,7 @@ impl CheckpointDb {
 
     /// Set a setting value.
     pub fn set_setting(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let now = Utc::now().to_rfc3339();
         let value_str = value.to_string();
@@ -989,7 +1145,7 @@ impl CheckpointDb {
 
     /// Get all settings as a JSON object.
     pub fn get_all_settings(&self) -> Result<serde_json::Value, String> {
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
 
         let mut stmt = conn
             .prepare("SELECT key, value FROM settings")
@@ -1115,7 +1271,7 @@ impl CheckpointDb {
         let prompts: Vec<serde_json::Value> =
             serde_json::from_str(&content).map_err(|e| format!("Failed to parse JSON: {}", e))?;
 
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
         let mut count = 0;
@@ -1170,7 +1326,7 @@ impl CheckpointDb {
             .cloned()
             .unwrap_or_default();
 
-        let conn = self.conn.lock().map_err(|e| format!("Lock error: {}", e))?;
+        let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
         let mut count = 0;

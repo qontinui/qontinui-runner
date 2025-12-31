@@ -529,6 +529,15 @@ export function setupEventHandlers(
       }
 
       logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName);
+
+      // Process AI output for findings and issues detection
+      // Only process AI responses (not user prompts or hints)
+      if (source === "claude" || source === "ai") {
+        // Process through IssueTracker for legacy issue detection
+        issueTracker.processLine(line);
+        // Process through FindingsTracker for categorized findings detection
+        findingsTracker.processLine(line);
+      }
     }),
   );
 

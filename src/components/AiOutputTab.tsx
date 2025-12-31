@@ -24,7 +24,8 @@ import {
   Copy,
   Check,
 } from "lucide-react";
-import { issueTracker, findingsTracker } from "../services";
+// Note: Issue and findings detection is now done in EventHandlers.ts to ensure
+// ALL lines are processed, not just filtered ones displayed in this component.
 import { groupEntriesIntoLoops, DEFAULT_MAX_LINES /* type AiLoop */ } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
 
@@ -65,8 +66,6 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
   const [hintQueued, setHintQueued] = useState(false);
   const [queuedHint, setQueuedHint] = useState("");
   const lastLineTimestampRef = useRef<number>(0);
-  const processedLinesRef = useRef<Set<string>>(new Set());
-
   // Group lines into AI loops
   const loops = useMemo(() => groupEntriesIntoLoops(lines), [lines]);
 
@@ -89,25 +88,6 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
       }
     }
   }, [loops, selectedLoopId]);
-
-  // Process new lines through IssueTracker and FindingsTracker for detection
-  useEffect(() => {
-    for (const line of lines) {
-      // Skip already processed lines
-      if (processedLinesRef.current.has(line.id)) continue;
-
-      // Only process AI responses (claude source), not user prompts
-      if (line.source === "claude") {
-        // Legacy issue detection
-        issueTracker.processLine(line.line);
-        // New categorized findings detection
-        findingsTracker.processLine(line.line);
-      }
-
-      // Mark as processed
-      processedLinesRef.current.add(line.id);
-    }
-  }, [lines]);
 
   // Build conversation history from lines
   const buildConversationHistory = useCallback(() => {

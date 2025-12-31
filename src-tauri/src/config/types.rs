@@ -1,5 +1,47 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+/// Category in a configuration.
+/// Categories organize workflows and control which are available for automation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Category {
+    pub name: String,
+    #[serde(default = "default_automation_enabled", rename = "automationEnabled")]
+    pub automation_enabled: bool,
+}
+
+fn default_automation_enabled() -> bool {
+    true
+}
+
+/// Custom deserializer for categories that handles both string and object formats.
+/// - String format: `["Main", "Testing"]` - converts to Category with automation_enabled=true
+/// - Object format: `[{"name": "Main", "automationEnabled": true}]` - deserializes directly
+pub fn deserialize_categories<'de, D>(deserializer: D) -> Result<Vec<Category>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values: Vec<Value> = Vec::deserialize(deserializer)?;
+    let mut categories = Vec::with_capacity(values.len());
+
+    for value in values {
+        let category = match value {
+            Value::String(s) => Category {
+                name: s,
+                automation_enabled: true,
+            },
+            Value::Object(_) => serde_json::from_value(value).map_err(serde::de::Error::custom)?,
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "Category must be a string or object",
+                ))
+            }
+        };
+        categories.push(category);
+    }
+
+    Ok(categories)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionSettings {
@@ -55,7 +97,8 @@ pub struct QontinuiConfig {
     pub workflows: Vec<Value>,
     pub states: Vec<Value>,
     pub transitions: Vec<Value>,
-    pub categories: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_categories")]
+    pub categories: Vec<Category>,
     pub settings: Option<Settings>,
 }
 
@@ -130,4 +173,57 @@ pub struct ScreenshotCaptureSettings {
     /// Capture timings in milliseconds (delays after click)
     #[serde(rename = "captureTimings")]
     pub capture_timings: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deserialize_category() {
+        let json = r#"{"name": "Main", "automationEnabled": true}"#;
+        let category: Category = serde_json::from_str(json).unwrap();
+        assert_eq!(category.name, "Main");
+        assert!(category.automation_enabled);
+
+        // Test with automationEnabled=false
+        let json = r#"{"name": "Incoming Transitions", "automationEnabled": false}"#;
+        let category: Category = serde_json::from_str(json).unwrap();
+        assert_eq!(category.name, "Incoming Transitions");
+        assert!(!category.automation_enabled);
+
+        // Test default automationEnabled (true)
+        let json = r#"{"name": "Test"}"#;
+        let category: Category = serde_json::from_str(json).unwrap();
+        assert_eq!(category.name, "Test");
+        assert!(category.automation_enabled);
+    }
+
+    #[test]
+    fn test_deserialize_config_with_categories() {
+        let json = r#"{
+            "version": "2.0.0",
+            "metadata": {
+                "name": "Test Project",
+                "created": "2025-01-01T00:00:00Z",
+                "modified": "2025-01-01T00:00:00Z"
+            },
+            "images": [],
+            "workflows": [],
+            "states": [],
+            "transitions": [],
+            "categories": [
+                {"name": "Main", "automationEnabled": true},
+                {"name": "Incoming Transitions", "automationEnabled": false}
+            ]
+        }"#;
+
+        let config: QontinuiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.version, "2.0.0");
+        assert_eq!(config.categories.len(), 2);
+        assert_eq!(config.categories[0].name, "Main");
+        assert!(config.categories[0].automation_enabled);
+        assert_eq!(config.categories[1].name, "Incoming Transitions");
+        assert!(!config.categories[1].automation_enabled);
+    }
 }

@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 3
+-- Version: 4
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -171,6 +171,19 @@ CREATE TABLE IF NOT EXISTS task_runs (
 CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
 
+-- Task Run Output Chunks (for efficient O(1) appending)
+-- Instead of concatenating to output_log column (O(n)), we insert chunks (O(1))
+-- Full output is reconstructed by joining chunks ordered by chunk_sequence
+CREATE TABLE IF NOT EXISTS task_run_output_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+    chunk_sequence INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_chunks_task_run ON task_run_output_chunks(task_run_id, chunk_sequence);
+
 -- Execution history (automation runs)
 CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY,
@@ -190,4 +203,4 @@ CREATE INDEX IF NOT EXISTS idx_executions_workflow_name ON executions(workflow_n
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (3, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (4, datetime('now'));

@@ -5,90 +5,9 @@
 //!
 //! The runner accepts this format directly on /rag/import - no transformation needed.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use super::types::{deserialize_categories, Category};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
-/// Category in a configuration.
-/// Frontend exports as objects with name + automationEnabled.
-/// We store as objects to preserve the automationEnabled flag.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Category {
-    pub name: String,
-    #[serde(default = "default_automation_enabled", rename = "automationEnabled")]
-    pub automation_enabled: bool,
-}
-
-fn default_automation_enabled() -> bool {
-    true
-}
-
-impl Category {
-    pub fn new(name: String) -> Self {
-        Self {
-            name,
-            automation_enabled: true,
-        }
-    }
-}
-
-/// Custom deserializer for categories that accepts both formats:
-/// - Array of strings: ["Main", "Testing"]
-/// - Array of objects: [{ name: "Main", automationEnabled: true }]
-fn deserialize_categories<'de, D>(deserializer: D) -> Result<Vec<Category>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::{self, SeqAccess, Visitor};
-
-    struct CategoriesVisitor;
-
-    impl<'de> Visitor<'de> for CategoriesVisitor {
-        type Value = Vec<Category>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("an array of strings or category objects")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: SeqAccess<'de>,
-        {
-            let mut categories = Vec::new();
-
-            // Try to deserialize each element as either a string or Category object
-            while let Some(value) = seq.next_element::<serde_json::Value>()? {
-                let category = match value {
-                    serde_json::Value::String(s) => Category::new(s),
-                    serde_json::Value::Object(obj) => {
-                        let name = obj
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .ok_or_else(|| de::Error::custom("category object missing 'name' field"))?
-                            .to_string();
-                        let automation_enabled = obj
-                            .get("automationEnabled")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        Category {
-                            name,
-                            automation_enabled,
-                        }
-                    }
-                    _ => {
-                        return Err(de::Error::custom(
-                            "category must be a string or object with 'name' field",
-                        ))
-                    }
-                };
-                categories.push(category);
-            }
-
-            Ok(categories)
-        }
-    }
-
-    deserializer.deserialize_seq(CategoriesVisitor)
-}
 
 /// Complete Qontinui configuration - mirrors Python/TypeScript QontinuiConfig.
 /// This is the canonical format exported from qontinui-web.
@@ -639,27 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_deserialize_categories_as_strings() {
-        let json = r#"{
-            "version": "2.0.0",
-            "metadata": {
-                "name": "Test",
-                "created": "2025-01-01T00:00:00Z",
-                "modified": "2025-01-01T00:00:00Z"
-            },
-            "categories": ["Main", "Testing", "UI Automation"]
-        }"#;
-
-        let config: QontinuiConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(config.categories.len(), 3);
-        assert_eq!(config.categories[0].name, "Main");
-        assert!(config.categories[0].automation_enabled); // defaults to true
-        assert_eq!(config.categories[1].name, "Testing");
-        assert_eq!(config.categories[2].name, "UI Automation");
-    }
-
-    #[test]
-    fn test_deserialize_categories_as_objects() {
+    fn test_deserialize_categories() {
         let json = r#"{
             "version": "2.0.0",
             "metadata": {
