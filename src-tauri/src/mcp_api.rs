@@ -4702,26 +4702,6 @@ async fn get_resumable_workflow(
 
     let is_running = has_running_tasks || has_running_session;
 
-    // Collect info about all active sessions for the UI
-    let active_sessions: Vec<ActiveSessionInfo> = sessions
-        .iter()
-        .filter(|s| {
-            matches!(
-                s.status,
-                crate::session_manager::SessionStatus::Running
-                    | crate::session_manager::SessionStatus::Starting
-                    | crate::session_manager::SessionStatus::WaitingForContinuation
-            )
-        })
-        .map(|s| ActiveSessionInfo {
-            id: s.id.clone(),
-            name: s.config.name.clone(),
-            status: format!("{:?}", s.status),
-            started_at: s.checkpoint.started_at.clone(),
-            uses_gui: s.config.uses_gui,
-        })
-        .collect();
-
     // Get the global auto-continue setting
     let auto_continue_enabled = settings::get_auto_continue_ai_workflow();
 
@@ -4739,12 +4719,24 @@ async fn get_resumable_workflow(
                 started_at: None,
                 cross_session_count: None,
                 status: None,
-                active_sessions,
+                active_sessions: vec![],
             }));
         }
     };
 
     let running_tasks = db.get_running_task_runs().unwrap_or_default();
+
+    // Build active_sessions from database running tasks (uses task_run_id which matches AI output)
+    let active_sessions: Vec<ActiveSessionInfo> = running_tasks
+        .iter()
+        .map(|t| ActiveSessionInfo {
+            id: t.id.clone(),
+            name: t.task_name.clone(),
+            status: t.status.clone(),
+            started_at: t.created_at.clone(),
+            uses_gui: false, // Database doesn't track this, default to false
+        })
+        .collect();
 
     if running_tasks.is_empty() {
         return Json(ApiResponse::success(ResumableWorkflowInfo {
