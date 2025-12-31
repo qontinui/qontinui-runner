@@ -4603,7 +4603,9 @@ async fn delete_session(
 fn check_goal_completion_markers(output: &str) -> bool {
     // List of markers that indicate goal completion
     // Claude should output one of these when the goal is achieved
+    // NOTE: [TASK_COMPLETE] is the canonical marker used by TaskMonitor and prompts
     let completion_markers = [
+        "[TASK_COMPLETE]", // Primary marker - used by TaskMonitor and prompts
         "[GOAL_COMPLETE]",
         "[GOAL_ACHIEVED]",
         "[STOP_SESSION]",
