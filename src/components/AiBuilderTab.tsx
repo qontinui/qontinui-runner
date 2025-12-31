@@ -2288,8 +2288,8 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
 
           {/* Actions */}
           <div className="flex gap-3">
-            {isRunning ? (
-              // Stop button when running
+            {isRunning && currentSessionId ? (
+              // Stop button when THIS task has a running session
               <button
                 onClick={stopSession}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
