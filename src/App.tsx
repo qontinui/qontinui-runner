@@ -46,6 +46,8 @@ import {
   useProjectLogs,
   useRagProcessing,
   useWebSocketAutoConnect,
+  useWebExtraction,
+  useBackgroundActivities,
 } from "./hooks";
 
 // Components
@@ -169,6 +171,19 @@ function AppContent() {
 
   // RAG processing state
   const ragProcessing = useRagProcessing();
+
+  // Web extraction state (for background activity tracking)
+  const webExtraction = useWebExtraction();
+
+  // Background activities aggregation
+  const { activities: backgroundActivities } = useBackgroundActivities({
+    ragStatus: ragProcessing.state.status,
+    ragProgress: ragProcessing.state.percent,
+    ragProjectName: ragProcessing.state.projectName,
+    isExtracting: webExtraction.isExtracting,
+    extractionUrl: webExtraction.extractionStatus?.progress?.current_url,
+    extractionProgress: webExtraction.extractionStatus?.progress,
+  });
 
   // WebSocket auto-connect (runs at App level to ensure it's always active)
   const webSocket = useWebSocketAutoConnect({
@@ -363,6 +378,7 @@ function AppContent() {
         pythonStatus={execution.pythonStatus}
         configLoaded={execution.configLoaded}
         executionActive={execution.executionActive}
+        backgroundActivities={backgroundActivities}
       />
 
       {/* Main Content with Tabs */}

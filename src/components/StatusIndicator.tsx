@@ -1,6 +1,19 @@
 import React, { useState, useEffect } from "react";
-import { AlertCircle, Info, AlertTriangle, X, Tag, FolderKanban } from "lucide-react";
+import {
+  AlertCircle,
+  Info,
+  AlertTriangle,
+  X,
+  Tag,
+  FolderKanban,
+  Database,
+  Globe,
+  Bot,
+  Cloud,
+  Play,
+} from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
+import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
@@ -19,12 +32,46 @@ interface StatusIndicatorProps {
   pythonStatus: "stopped" | "running";
   configLoaded: boolean;
   executionActive: boolean;
+  backgroundActivities?: BackgroundActivity[];
 }
+
+// Helper to get icon for activity type
+const getActivityIcon = (type: ActivityType) => {
+  switch (type) {
+    case "rag":
+      return Database;
+    case "extraction":
+      return Globe;
+    case "ai":
+      return Bot;
+    case "sync":
+      return Cloud;
+    default:
+      return Info;
+  }
+};
+
+// Helper to get color for activity type
+const getActivityColor = (type: ActivityType) => {
+  switch (type) {
+    case "rag":
+      return "text-purple-500";
+    case "extraction":
+      return "text-blue-500";
+    case "ai":
+      return "text-amber-500";
+    case "sync":
+      return "text-green-500";
+    default:
+      return "text-gray-500";
+  }
+};
 
 const StatusIndicator: React.FC<StatusIndicatorProps> = ({
   pythonStatus,
   configLoaded,
   executionActive,
+  backgroundActivities = [],
 }) => {
   const [error, setError] = useState<ErrorEvent | null>(null);
   const [showError, setShowError] = useState(false);
@@ -159,14 +206,43 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
           </span>
         </div>
 
-        <div className="flex items-center gap-2">
-          <div
-            className={`w-2 h-2 rounded-full ${executionActive ? "bg-blue-500 animate-pulse" : "bg-gray-400"}`}
-          />
-          <span className="text-sm text-gray-600">
-            Execution: {executionActive ? "Active" : "Inactive"}
-          </span>
-        </div>
+        {/* Active Processes Section - Only shown when there is activity */}
+        {(executionActive || backgroundActivities.length > 0) && (
+          <>
+            <div className="h-4 w-px bg-gray-300" />
+            <div className="flex items-center gap-3">
+              {/* GUI Automation - Only shown when active */}
+              {executionActive && (
+                <div
+                  className="flex items-center gap-1.5 px-2 py-0.5 bg-blue-100 rounded-full"
+                  title="GUI Automation workflow is running"
+                >
+                  <Play className="w-3.5 h-3.5 text-blue-600 animate-pulse" />
+                  <span className="text-xs font-medium text-blue-700">GUI Automation</span>
+                </div>
+              )}
+
+              {/* Background Activities */}
+              {backgroundActivities.map((activity) => {
+                const Icon = getActivityIcon(activity.type);
+                const colorClass = getActivityColor(activity.type);
+                return (
+                  <div
+                    key={activity.id}
+                    className="flex items-center gap-1.5 px-2 py-0.5 bg-gray-100 rounded-full"
+                    title={activity.detail || activity.label}
+                  >
+                    <Icon className={`w-3.5 h-3.5 ${colorClass} animate-pulse`} />
+                    <span className="text-xs font-medium text-gray-700">{activity.label}</span>
+                    {activity.progress !== undefined && (
+                      <span className="text-xs text-gray-500">{activity.progress}%</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </>
+        )}
       </div>
 
       {/* Error Display */}

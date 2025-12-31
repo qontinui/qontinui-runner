@@ -59,3 +59,6 @@ export type {
 
 export { useAiTaskPolling, executeAiTask } from "./useAiTaskPolling";
 export type { UseAiTaskPollingOptions, UseAiTaskPollingResult } from "./useAiTaskPolling";
+
+export { useBackgroundActivities } from "./useBackgroundActivities";
+export type { BackgroundActivity, ActivityType } from "./useBackgroundActivities";
