@@ -23,6 +23,8 @@ mod script_storage;
 mod types;
 
 // Re-export public types from types module
+// These are public API exports - may not be used within this crate
+#[allow(unused_imports)]
 pub use types::{DisplayMode, SyncStatus};
 
 // Re-export public types from results module
