@@ -124,6 +124,7 @@ pub struct QontinuiConfig {
     pub schedules: Option<Vec<Schedule>>,
 }
 
+#[allow(dead_code)]
 impl QontinuiConfig {
     /// Get project_id from metadata name (slugified)
     pub fn project_id(&self) -> String {
