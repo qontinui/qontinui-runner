@@ -200,7 +200,22 @@ CREATE TABLE IF NOT EXISTS executions (
 CREATE INDEX IF NOT EXISTS idx_executions_started_at ON executions(started_at);
 CREATE INDEX IF NOT EXISTS idx_executions_workflow_name ON executions(workflow_name);
 
+-- Configs storage (for auto-storing imported/loaded configs)
+-- This enables the runner to track which configs have been loaded and allow quick switching.
+CREATE TABLE IF NOT EXISTS configs (
+    id TEXT PRIMARY KEY,           -- Config ID (project_id for web imports, hash for files)
+    name TEXT NOT NULL,            -- Display name
+    config_json TEXT NOT NULL,     -- Full QontinuiConfig as JSON
+    source_type TEXT NOT NULL,     -- 'web' (from /rag/import) or 'file' (from /load-config)
+    source_path TEXT,              -- File path if source_type='file'
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_configs_name ON configs(name);
+CREATE INDEX IF NOT EXISTS idx_configs_updated_at ON configs(updated_at);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (4, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (5, datetime('now'));

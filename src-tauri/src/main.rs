@@ -1,17 +1,20 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod action_service;
 mod ai_workflows;
 mod auth;
 mod backup;
 mod commands;
 mod config;
+mod config_storage;
 mod database;
 mod debug_lifecycle;
 mod display;
 mod error;
 mod executor;
 mod logging;
+mod mcp;
 mod mcp_api;
 mod playwright;
 mod prompts;
@@ -20,7 +23,7 @@ mod scheduler;
 mod scheduler_service;
 mod scriptlets;
 mod secure_storage;
-mod session_manager;
+mod session;
 mod settings;
 mod storage;
 mod task_monitor;
@@ -194,24 +197,25 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Dataset commands
             commands::dataset::scan_local_images,
             commands::dataset::package_dataset,
-            // Execution commands
-            commands::execution::start_python_executor,
-            commands::execution::stop_python_executor,
-            commands::execution::start_execution,
-            commands::execution::stop_execution,
-            commands::execution::get_executor_status,
-            commands::execution::get_monitors,
-            commands::execution::handle_error,
-            commands::execution::check_for_updates,
-            commands::execution::install_update,
-            commands::execution::open_folder,
-            commands::execution::update_capture_settings,
-            commands::execution::get_workflow_required_screens,
-            // Input validation commands
-            commands::execution::set_input_capture_enabled,
-            commands::execution::get_input_validation_status,
-            // Initial states resolution
-            commands::execution::get_resolved_initial_states,
+            // Execution commands - python_executor
+            commands::execution::python_executor::start_python_executor,
+            commands::execution::python_executor::stop_python_executor,
+            commands::execution::python_executor::update_capture_settings,
+            // Execution commands - workflow_execution
+            commands::execution::workflow_execution::start_execution,
+            commands::execution::workflow_execution::stop_execution,
+            commands::execution::workflow_execution::get_resolved_initial_states,
+            commands::execution::workflow_execution::get_workflow_required_screens,
+            // Execution commands - executor_status
+            commands::execution::executor_status::get_executor_status,
+            commands::execution::executor_status::get_monitors,
+            commands::execution::executor_status::set_input_capture_enabled,
+            commands::execution::executor_status::get_input_validation_status,
+            // Execution commands - system_ops
+            commands::execution::system_ops::handle_error,
+            commands::execution::system_ops::check_for_updates,
+            commands::execution::system_ops::install_update,
+            commands::execution::system_ops::open_folder,
             // State machine commands
             commands::state_machine::execute_transition,
             commands::state_machine::navigate_to_state,

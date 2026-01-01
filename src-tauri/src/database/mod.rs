@@ -104,6 +104,18 @@ fn default_auto_continue() -> bool {
     true
 }
 
+/// Stored config entry metadata (without the full JSON).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigStorageEntry {
+    pub id: String,
+    pub name: String,
+    pub source_type: String, // 'web' or 'file'
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Completion marker that AI uses to signal task is done
 pub const TASK_COMPLETE_MARKER: &str = "[TASK_COMPLETE]";
 
@@ -205,7 +217,7 @@ impl CheckpointDb {
 
         if current_version == 0 {
             // Fresh database - create schema
-            info!("Creating database schema (version 4)");
+            info!("Creating database schema (version 5)");
             conn.execute_batch(include_str!("schema.sql"))
                 .map_err(|e| format!("Failed to create schema: {}", e))?;
         }
@@ -308,6 +320,31 @@ impl CheckpointDb {
                 "#,
             )
             .map_err(|e| format!("Failed to update schema version to 4: {}", e))?;
+        }
+
+        // Migration to version 5: Add configs table for ConfigStorage
+        if current_version >= 1 && current_version < 5 {
+            info!("Migrating database to version 5 (adding configs table)");
+            conn.execute_batch(
+                r#"
+                -- Configs storage (for auto-storing imported/loaded configs)
+                CREATE TABLE IF NOT EXISTS configs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    source_path TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_configs_name ON configs(name);
+                CREATE INDEX IF NOT EXISTS idx_configs_updated_at ON configs(updated_at);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (5, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 5: {}", e))?;
         }
 
         Ok(())
@@ -1168,6 +1205,119 @@ impl CheckpointDb {
         }
 
         Ok(serde_json::Value::Object(settings))
+    }
+
+    // ========================================================================
+    // Config Storage Operations
+    // ========================================================================
+
+    /// Save a config with a specific ID.
+    /// Used when importing from web where we have a project_id.
+    pub fn save_config_with_id(
+        &self,
+        id: &str,
+        config: serde_json::Value,
+        name: &str,
+        source_type: &str,
+        source_path: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+        let config_json = config.to_string();
+
+        conn.execute(
+            r#"
+            INSERT INTO configs (id, name, config_json, source_type, source_path, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            ON CONFLICT(id) DO UPDATE SET
+                name = ?2,
+                config_json = ?3,
+                source_type = ?4,
+                source_path = ?5,
+                updated_at = ?6
+            "#,
+            params![id, name, config_json, source_type, source_path, now],
+        )
+        .map_err(|e| format!("Failed to save config: {}", e))?;
+
+        info!("Saved config '{}' with id '{}'", name, id);
+        Ok(())
+    }
+
+    /// Upsert a config (update if exists, insert if new).
+    /// Used when loading from file.
+    pub fn upsert_config(
+        &self,
+        id: &str,
+        config: serde_json::Value,
+        name: &str,
+        source_path: Option<&str>,
+    ) -> Result<(), String> {
+        self.save_config_with_id(id, config, name, "file", source_path)
+    }
+
+    /// Get a config by ID.
+    pub fn get_config(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<String> = conn.query_row(
+            "SELECT config_json FROM configs WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(json_str) => {
+                let config = serde_json::from_str(&json_str)
+                    .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
+                Ok(Some(config))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get config: {}", e)),
+        }
+    }
+
+    /// List all stored configs.
+    pub fn list_configs(&self) -> Result<Vec<ConfigStorageEntry>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, name, source_type, source_path, created_at, updated_at
+                FROM configs
+                ORDER BY updated_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let configs = stmt
+            .query_map([], |row| {
+                Ok(ConfigStorageEntry {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    source_type: row.get(2)?,
+                    source_path: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(configs)
+    }
+
+    /// Delete a config by ID.
+    pub fn delete_config(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let rows = conn
+            .execute("DELETE FROM configs WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete config: {}", e))?;
+
+        Ok(rows > 0)
     }
 
     // ========================================================================

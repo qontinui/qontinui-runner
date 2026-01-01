@@ -27,6 +27,10 @@ export type {
 export { LocalStorageService } from "./LocalStorageService";
 export type { StorageConfig, StorageUsage, CommandResponse } from "./LocalStorageService";
 
+// Config Storage Services (HTTP API for stored configs)
+export { ConfigStorageService } from "./ConfigStorageService";
+export type { StoredConfigMetadata, StoredConfig } from "./ConfigStorageService";
+
 // Video Recording Services
 export { VideoRecordingService } from "./VideoRecordingService";
 

@@ -4,6 +4,9 @@
  * Comprehensive service for tracking categorized findings from AI analysis.
  * Parses structured output markers like [FINDING:category:severity] from AI output.
  * Manages execution reports and user input requests.
+ *
+ * This file has been refactored to use modules from src/findings/.
+ * It maintains backward compatibility while delegating to focused modules.
  */
 
 import type {
@@ -13,34 +16,43 @@ import type {
   ActionType,
   UserInputRequest,
   ExecutionReport,
-  ReportSummary,
   PhaseInfo,
   ParsedFinding,
   CodeContext,
 } from "../types/findings";
 import { getCategoryById, BUILT_IN_CATEGORIES } from "./FindingCategories";
 
-/** Event types emitted by FindingsTracker */
-export type FindingsTrackerEventType =
-  | "finding_detected"
-  | "finding_updated"
-  | "finding_resolved"
-  | "finding_removed"
-  | "findings_cleared"
-  | "report_created"
-  | "report_updated"
-  | "input_requested"
-  | "input_received";
+// Import from refactored modules
+import {
+  persistFindingsData,
+  loadFindingsData,
+  archiveSession,
+} from "../findings/FindingsPersistence";
+import {
+  getAllFindings as queryGetAllFindings,
+  getSessionFindings as queryGetSessionFindings,
+  getFindingsByCategory as queryGetFindingsByCategory,
+  getFindingsNeedingInput as queryGetFindingsNeedingInput,
+  getActionableFindings as queryGetActionableFindings,
+  getUnresolvedCount as queryGetUnresolvedCount,
+} from "../findings/FindingsQuery";
+import { calculateSummary, createEmptySummary } from "../findings/FindingsExport";
+import {
+  createReport,
+  updateReportWithFindings,
+  completeReport as completeReportSync,
+  startNewPhase as startNewPhaseSync,
+} from "../findings/FindingsSync";
+import type {
+  SessionHistoryEntry,
+  FindingsTrackerEventType,
+  FindingsTrackerEvent,
+  FindingsTrackerListener,
+  FindingParsingMeta,
+} from "../findings/types";
 
-export interface FindingsTrackerEvent {
-  type: FindingsTrackerEventType;
-  finding?: Finding;
-  findings?: Finding[];
-  report?: ExecutionReport;
-  inputRequest?: UserInputRequest;
-}
-
-type FindingsTrackerListener = (event: FindingsTrackerEvent) => void;
+// Re-export types for backward compatibility
+export type { FindingsTrackerEventType, FindingsTrackerEvent, SessionHistoryEntry };
 
 /**
  * Regex patterns for parsing structured finding markers
@@ -62,8 +74,6 @@ const LINE_PATTERN = /^Line:\s*(\d+)$/m;
 const QUESTION_PATTERN = /^Question:\s*(.+)$/m;
 const OPTIONS_PATTERN = /^Options:\s*(.+)$/m;
 const RESOLUTION_PATTERN = /^Resolution:\s*(.+)$/m;
-const _CONTEXT_PATTERN =
-  /^Context:\s*([\s\S]*?)(?=^(?:Title|File|Line|Question|Options|Resolution|Description):|\[\/FINDING\]|$)/m;
 
 /**
  * Legacy issue marker patterns (for backward compatibility)
@@ -129,11 +139,10 @@ export class FindingsTracker {
 
   // Buffer for multi-line finding parsing
   private parsingBuffer: string = "";
-  private currentFindingMeta: {
-    categoryId: string;
-    severity: FindingSeverity;
-    needsInput: boolean;
-  } | null = null;
+  private currentFindingMeta: FindingParsingMeta | null = null;
+
+  // Session history storage
+  private sessionHistory: SessionHistoryEntry[] = [];
 
   private constructor() {
     // Private constructor for singleton
@@ -484,37 +493,35 @@ export class FindingsTracker {
    * Get all findings
    */
   getAllFindings(): Finding[] {
-    return Array.from(this.findings.values());
+    return queryGetAllFindings(this.findings);
   }
 
   /**
    * Get findings for the current session
    */
   getSessionFindings(): Finding[] {
-    return this.getAllFindings().filter((f) => f.sourceSessionId === this.currentSessionId);
+    return queryGetSessionFindings(this.findings, this.currentSessionId);
   }
 
   /**
    * Get findings by category
    */
   getFindingsByCategory(categoryId: string): Finding[] {
-    return this.getAllFindings().filter((f) => f.categoryId === categoryId);
+    return queryGetFindingsByCategory(this.findings, categoryId);
   }
 
   /**
    * Get findings needing user input
    */
   getFindingsNeedingInput(): Finding[] {
-    return this.getAllFindings().filter((f) => f.status === "needs_input" && f.pendingQuestion);
+    return queryGetFindingsNeedingInput(this.findings);
   }
 
   /**
    * Get actionable findings
    */
   getActionableFindings(): Finding[] {
-    return this.getAllFindings().filter(
-      (f) => f.actionable && f.status !== "resolved" && f.status !== "wont_fix",
-    );
+    return queryGetActionableFindings(this.findings);
   }
 
   // ==================== Execution Reports ====================
@@ -523,25 +530,7 @@ export class FindingsTracker {
    * Start a new execution report
    */
   startReport(promptName: string, promptId?: string): ExecutionReport {
-    const report: ExecutionReport = {
-      id: crypto.randomUUID(),
-      sessionId: this.currentSessionId,
-      promptName,
-      promptId,
-      startedAt: Date.now(),
-      status: "running",
-      findings: [],
-      summary: this.createEmptySummary(),
-      pendingInputs: [],
-      phases: [
-        {
-          phase: 1,
-          startedAt: Date.now(),
-          findingsDetected: 0,
-          findingsResolved: 0,
-        },
-      ],
-    };
+    const report = createReport(this.currentSessionId, promptName, promptId);
 
     this.reports.set(report.id, report);
     this.currentReportId = report.id;
@@ -561,27 +550,10 @@ export class FindingsTracker {
 
     // Get findings for this session
     const sessionFindings = this.getSessionFindings();
-    report.findings = sessionFindings;
-    report.summary = this.calculateSummary(sessionFindings);
-    report.pendingInputs = sessionFindings
-      .filter((f) => f.pendingQuestion)
-      .map((f) => f.pendingQuestion!);
+    const updatedReport = updateReportWithFindings(report, sessionFindings);
 
-    // Update phase info
-    const currentPhase = report.phases[report.phases.length - 1];
-    if (currentPhase) {
-      currentPhase.findingsDetected = sessionFindings.filter(
-        (f) => f.status === "detected" || f.status === "in_progress",
-      ).length;
-      currentPhase.findingsResolved = sessionFindings.filter((f) => f.status === "resolved").length;
-    }
-
-    // Update status based on pending inputs
-    if (report.pendingInputs.length > 0 && report.status === "running") {
-      report.status = "paused_for_input";
-    }
-
-    this.emit({ type: "report_updated", report });
+    this.reports.set(reportId, updatedReport);
+    this.emit({ type: "report_updated", report: updatedReport });
   }
 
   /**
@@ -598,21 +570,19 @@ export class FindingsTracker {
     const report = this.reports.get(this.currentReportId);
     if (!report) return null;
 
-    report.status = status;
-    report.completedAt = Date.now();
-    report.duration = report.completedAt - report.startedAt;
+    const completedReport = completeReportSync(report, status);
+    this.reports.set(this.currentReportId, completedReport);
 
-    // Complete current phase
-    const currentPhase = report.phases[report.phases.length - 1];
-    if (currentPhase) {
-      currentPhase.completedAt = Date.now();
-    }
-
+    // Update with final findings
     this.updateReport(this.currentReportId);
+
+    const finalReport = this.reports.get(this.currentReportId)!;
     this.currentReportId = null;
 
-    console.log(`[FindingsTracker] Report completed: ${report.promptName} (${report.id})`);
-    return report;
+    console.log(
+      `[FindingsTracker] Report completed: ${finalReport.promptName} (${finalReport.id})`,
+    );
+    return finalReport;
   }
 
   /**
@@ -624,24 +594,10 @@ export class FindingsTracker {
     const report = this.reports.get(this.currentReportId);
     if (!report) return null;
 
-    // Complete current phase
-    const currentPhase = report.phases[report.phases.length - 1];
-    if (currentPhase) {
-      currentPhase.completedAt = Date.now();
-    }
+    const { report: updatedReport, phase: newPhase } = startNewPhaseSync(report);
+    this.reports.set(this.currentReportId, updatedReport);
 
-    // Start new phase
-    const newPhase: PhaseInfo = {
-      phase: report.phases.length + 1,
-      startedAt: Date.now(),
-      findingsDetected: 0,
-      findingsResolved: 0,
-    };
-
-    report.phases.push(newPhase);
-    report.status = "running";
-
-    this.emit({ type: "report_updated", report });
+    this.emit({ type: "report_updated", report: updatedReport });
     return newPhase;
   }
 
@@ -671,80 +627,6 @@ export class FindingsTracker {
    */
   getSessionReports(): ExecutionReport[] {
     return this.getAllReports().filter((r) => r.sessionId === this.currentSessionId);
-  }
-
-  // ==================== Summary Helpers ====================
-
-  /**
-   * Create an empty summary
-   */
-  private createEmptySummary(): ReportSummary {
-    const byCategory: Record<string, { count: number; actionable: number; resolved: number }> = {};
-    for (const cat of BUILT_IN_CATEGORIES) {
-      byCategory[cat.id] = { count: 0, actionable: 0, resolved: 0 };
-    }
-
-    return {
-      totalFindings: 0,
-      byCategory,
-      bySeverity: { critical: 0, high: 0, medium: 0, low: 0, info: 0 },
-      byStatus: {
-        detected: 0,
-        in_progress: 0,
-        needs_input: 0,
-        resolved: 0,
-        wont_fix: 0,
-        deferred: 0,
-      },
-      actionable: 0,
-      needsUserInput: 0,
-      autoFixed: 0,
-      informational: 0,
-    };
-  }
-
-  /**
-   * Calculate summary from findings
-   */
-  private calculateSummary(findings: Finding[]): ReportSummary {
-    const summary = this.createEmptySummary();
-    summary.totalFindings = findings.length;
-
-    for (const finding of findings) {
-      // By category
-      if (!summary.byCategory[finding.categoryId]) {
-        summary.byCategory[finding.categoryId] = { count: 0, actionable: 0, resolved: 0 };
-      }
-      summary.byCategory[finding.categoryId].count++;
-      if (finding.actionable) {
-        summary.byCategory[finding.categoryId].actionable++;
-      }
-      if (finding.status === "resolved") {
-        summary.byCategory[finding.categoryId].resolved++;
-      }
-
-      // By severity
-      summary.bySeverity[finding.severity]++;
-
-      // By status
-      summary.byStatus[finding.status]++;
-
-      // Action type counts
-      if (finding.actionable) {
-        summary.actionable++;
-      }
-      if (finding.status === "needs_input") {
-        summary.needsUserInput++;
-      }
-      if (finding.actionType === "auto_fix" && finding.status === "resolved") {
-        summary.autoFixed++;
-      }
-      if (finding.actionType === "informational") {
-        summary.informational++;
-      }
-    }
-
-    return summary;
   }
 
   // ==================== Session Management ====================
@@ -794,8 +676,7 @@ export class FindingsTracker {
    * Get unresolved count
    */
   get unresolvedCount(): number {
-    return this.getAllFindings().filter((f) => f.status !== "resolved" && f.status !== "wont_fix")
-      .length;
+    return queryGetUnresolvedCount(this.findings);
   }
 
   // ==================== Persistence ====================
@@ -822,50 +703,19 @@ export class FindingsTracker {
     }
 
     const sessionFindings = this.getSessionFindings();
-    const entry: SessionHistoryEntry = {
-      id: currentReport.id,
-      sessionId: this.currentSessionId,
-      promptName: currentReport.promptName,
-      startedAt: currentReport.startedAt,
-      completedAt: Date.now(),
-      duration: Date.now() - currentReport.startedAt,
+    this.sessionHistory = archiveSession(
+      currentReport,
+      this.currentSessionId,
+      sessionFindings,
+      this.sessionHistory,
       status,
-      phases: currentReport.phases.length,
-      findings: sessionFindings,
-      summary: {
-        total: sessionFindings.length,
-        resolved: sessionFindings.filter((f) => f.status === "resolved").length,
-        pending: sessionFindings.filter(
-          (f) => f.status === "detected" || f.status === "in_progress",
-        ).length,
-        bySeverity: {
-          critical: sessionFindings.filter((f) => f.severity === "critical").length,
-          high: sessionFindings.filter((f) => f.severity === "high").length,
-          medium: sessionFindings.filter((f) => f.severity === "medium").length,
-          low: sessionFindings.filter((f) => f.severity === "low").length,
-          info: sessionFindings.filter((f) => f.severity === "info").length,
-        },
-        byCategory: sessionFindings.reduce(
-          (acc, f) => {
-            acc[f.categoryId] = (acc[f.categoryId] || 0) + 1;
-            return acc;
-          },
-          {} as Record<string, number>,
-        ),
-      },
-    };
-
-    // Add to history (keep last 50 sessions)
-    this.sessionHistory.unshift(entry);
-    if (this.sessionHistory.length > 50) {
-      this.sessionHistory = this.sessionHistory.slice(0, 50);
-    }
+    );
 
     // Persist to disk
     this.persistToDisk();
 
     console.log(
-      `[FindingsTracker] Session archived: ${currentReport.promptName} (${entry.id}) - ${status}`,
+      `[FindingsTracker] Session archived: ${currentReport.promptName} (${currentReport.id}) - ${status}`,
     );
   }
 
@@ -874,18 +724,12 @@ export class FindingsTracker {
    */
   private async persistToDisk(): Promise<void> {
     try {
-      const data: PersistedFindingsData = {
-        version: 1,
-        savedAt: Date.now(),
+      await persistFindingsData({
         currentSessionId: this.currentSessionId,
         findings: this.getAllFindings(),
         reports: this.getAllReports(),
         sessionHistory: this.sessionHistory,
-      };
-
-      // Use Tauri's invoke to save to .dev-logs
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("save_findings_data", { data: JSON.stringify(data, null, 2) });
+      });
       console.log("[FindingsTracker] Persisted to disk");
     } catch (error) {
       console.error("[FindingsTracker] Failed to persist to disk:", error);
@@ -897,15 +741,12 @@ export class FindingsTracker {
    */
   async loadFromDisk(): Promise<void> {
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const jsonStr = await invoke<string>("load_findings_data");
+      const data = await loadFindingsData();
 
-      if (!jsonStr) {
+      if (!data) {
         console.log("[FindingsTracker] No persisted data found");
         return;
       }
-
-      const data: PersistedFindingsData = JSON.parse(jsonStr);
 
       // Restore session history
       this.sessionHistory = data.sessionHistory || [];
@@ -923,43 +764,6 @@ export class FindingsTracker {
       console.error("[FindingsTracker] Failed to load from disk:", error);
     }
   }
-
-  // Session history storage
-  private sessionHistory: SessionHistoryEntry[] = [];
-}
-
-/**
- * Session history entry - a completed session with its findings
- */
-export interface SessionHistoryEntry {
-  id: string;
-  sessionId: string;
-  promptName: string;
-  startedAt: number;
-  completedAt: number;
-  duration: number;
-  status: "completed" | "failed" | "timeout" | "context_limit";
-  phases: number;
-  findings: Finding[];
-  summary: {
-    total: number;
-    resolved: number;
-    pending: number;
-    bySeverity: Record<string, number>;
-    byCategory: Record<string, number>;
-  };
-}
-
-/**
- * Data structure for persisted findings
- */
-interface PersistedFindingsData {
-  version: number;
-  savedAt: number;
-  currentSessionId: string;
-  findings: Finding[];
-  reports: ExecutionReport[];
-  sessionHistory: SessionHistoryEntry[];
 }
 
 // Export singleton instance

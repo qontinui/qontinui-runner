@@ -37,8 +37,8 @@ export { useExecutionControl } from "./useExecutionControl";
 export { useProjectSelection } from "./useProjectSelection";
 export type { ProjectSelectionState } from "./useProjectSelection";
 
-export { useProjectLogs } from "./useProjectLogs";
-export type { UseProjectLogsReturn } from "./useProjectLogs";
+export { useProjectLogs } from "./project-logs";
+export type { UseProjectLogsReturn } from "./project-logs";
 
 export { useWebExtraction } from "./useWebExtraction";
 

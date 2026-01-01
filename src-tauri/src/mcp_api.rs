@@ -77,9 +77,10 @@ use regex::Regex;
 use crate::commands::rag::{send_embeddings_to_web, RAGState};
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
+use crate::config_storage::{ConfigMetadata, ConfigStorage, StoredConfig};
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
-use crate::session_manager::SessionManager;
+use crate::session::SessionManager;
 use crate::settings;
 use crate::task_monitor::TaskMonitor;
 // WorkflowManager import removed - using unified SessionManager instead
@@ -93,6 +94,24 @@ use std::os::windows::process::CommandExt;
 // Windows constants for process creation
 #[cfg(target_os = "windows")]
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+
+/// Generate a stable ID from a file path using a hash.
+fn generate_id_from_path(path: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("file-{:x}", hasher.finish())
+}
+
+/// Extract a human-readable name from a file path.
+fn path_to_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Unnamed Config")
+        .to_string()
+}
 
 /// Spawn Python script with proper console on Windows.
 /// Claude CLI requires a console window to function properly.
@@ -430,9 +449,13 @@ pub struct ApiState {
     pub rag_state: Arc<RAGState>,
     pub app_handle: tauri::AppHandle,
     /// Unified session manager for all AI sessions (Prompt Library + AI Builder)
-    pub session_manager: Arc<SessionManager>,
+    pub session: Arc<SessionManager>,
     /// Task monitor for watching Claude session output
     pub task_monitor: Arc<TaskMonitor>,
+    /// Currently loaded config ID (for tracking which config is active)
+    pub current_config_id: std::sync::Mutex<Option<String>>,
+    /// Persistent storage for configurations
+    pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
 }
 
 /// Response for API endpoints
@@ -922,7 +945,7 @@ async fn get_status(
 /// 2. Stores it in the app state (current_config)
 /// 3. Sends debug settings to the Python executor
 /// 4. Sends the configuration to the Python executor
-fn load_config_internal(
+pub fn load_config_internal(
     app_state: &Arc<crate::AppState>,
     config_path: &str,
 ) -> Result<String, String> {
@@ -1095,6 +1118,45 @@ async fn load_config(
                 info!("MCP API: Config metadata being emitted: {:?}", metadata);
             } else {
                 warn!("MCP API: No metadata in config_data!");
+            }
+
+            // Auto-add to ConfigStorage (database)
+            // Generate ID from project_id in config metadata, or from file path
+            let config_id = config_data
+                .get("metadata")
+                .and_then(|m| m.get("projectId"))
+                .and_then(|p| p.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| generate_id_from_path(&config_path_for_event));
+
+            let config_name = config_data
+                .get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| path_to_name(&config_path_for_event));
+
+            // Upsert: update if exists, insert if new
+            if let Err(e) = state.app_state.checkpoint_db.save_config_with_id(
+                &config_id,
+                config_data.clone(),
+                &config_name,
+                "file",
+                Some(&config_path_for_event),
+            ) {
+                warn!(
+                    "MCP API: Failed to auto-store config in ConfigStorage: {}",
+                    e
+                );
+            } else {
+                info!(
+                    "MCP API: Auto-stored config '{}' with id '{}' in ConfigStorage",
+                    config_name, config_id
+                );
+                // Store current config ID
+                if let Ok(mut current_id) = state.current_config_id.lock() {
+                    *current_id = Some(config_id);
+                }
             }
 
             // Emit event to notify frontend of config load
@@ -2255,6 +2317,32 @@ async fn import_rag(
         }
     });
 
+    // Auto-add to ConfigStorage (database)
+    let config_name = request.config.metadata.name.clone();
+    if let Ok(config_json) = serde_json::to_value(&request.config) {
+        if let Err(e) = state.app_state.checkpoint_db.save_config_with_id(
+            &project_id,
+            config_json,
+            &config_name,
+            "web",
+            None,
+        ) {
+            warn!(
+                "MCP API: Failed to auto-store config in ConfigStorage: {}",
+                e
+            );
+        } else {
+            info!(
+                "MCP API: Auto-stored config '{}' with id '{}' in ConfigStorage",
+                config_name, project_id
+            );
+            // Store current config ID
+            if let Ok(mut current_id) = state.current_config_id.lock() {
+                *current_id = Some(project_id.clone());
+            }
+        }
+    }
+
     let result = ImportResult {
         success: true,
         project_id: project_id.clone(),
@@ -2914,7 +3002,7 @@ pub struct UpdateScriptletRequest {
 }
 
 /// Emit AI output event to frontend
-fn emit_ai_output(
+pub fn emit_ai_output(
     app_handle: &tauri::AppHandle,
     line: &str,
     source: &str,
@@ -3087,7 +3175,7 @@ async fn restart_runner(
 /// Uses the provided database to check for running task runs.
 /// NOTE: This is a synchronous function that blocks. For async contexts,
 /// use has_running_ai_tasks_async() or wrap this in spawn_blocking.
-fn has_running_ai_tasks_with_db(db: &CheckpointDb) -> bool {
+pub fn has_running_ai_tasks(db: &Arc<CheckpointDb>) -> bool {
     match db.get_running_task_runs() {
         Ok(tasks) => !tasks.is_empty(),
         Err(e) => {
@@ -3167,7 +3255,7 @@ async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> b
 }
 
 /// Helper function to get workspace paths (reused from config.rs pattern)
-fn get_workspace_paths_internal(
+pub fn get_workspace_paths_internal(
 ) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf), String> {
     let exe_path =
         std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
@@ -3198,6 +3286,127 @@ fn get_workspace_paths_internal(
         .join("scripts");
 
     Ok((workspace_root, dev_logs_path, scripts_path))
+}
+
+/// Generate MCP tool context documentation for AI sessions.
+///
+/// This function creates a markdown documentation string describing the available
+/// MCP tools for GUI automation, including the specific workflows, states, and
+/// images available in the loaded configuration.
+fn generate_mcp_tool_context(config: &crate::config::QontinuiConfig) -> String {
+    let mut context = String::from(
+        r#"
+## Available GUI Automation Tools
+
+The following MCP tools are available for deterministic GUI automation.
+All actions execute through the unified action service with the pre-loaded config.
+
+### Tools
+
+"#,
+    );
+
+    // Tool: run_workflow
+    let workflows: Vec<String> = config
+        .workflows
+        .iter()
+        .filter_map(|w| w.get("name").and_then(|n| n.as_str()))
+        .map(|n| format!("- {}", n))
+        .collect();
+
+    context.push_str(&format!(
+        r#"
+#### run_workflow
+Run a workflow by name from the loaded configuration.
+
+**Available Workflows:**
+{}
+
+**Usage:**
+```json
+{{"tool": "mcp__qontinui__run_workflow", "workflow_name": "WorkflowName", "monitor": "primary"}}
+```
+"#,
+        if workflows.is_empty() {
+            "- (none loaded)".to_string()
+        } else {
+            workflows.join("\n")
+        }
+    ));
+
+    // Tool: go_to_state
+    let states: Vec<String> = config
+        .states
+        .iter()
+        .filter_map(|s| s.get("name").and_then(|n| n.as_str()))
+        .map(|n| format!("- {}", n))
+        .collect();
+
+    context.push_str(&format!(
+        r#"
+#### go_to_state
+Navigate to a specific state using pathfinding.
+
+**Available States:**
+{}
+
+**Usage:**
+```json
+{{"tool": "mcp__qontinui__go_to_state", "state_id": "StateName"}}
+```
+"#,
+        if states.is_empty() {
+            "- (none loaded)".to_string()
+        } else {
+            states.join("\n")
+        }
+    ));
+
+    // Tool: execute_action
+    let images: Vec<String> = config
+        .images
+        .iter()
+        .take(20) // Limit to avoid context overflow
+        .filter_map(|i| i.get("id").and_then(|id| id.as_str()))
+        .map(|id| format!("- {}", id))
+        .collect();
+
+    context.push_str(&format!(
+        r#"
+#### execute_action
+Execute a single action (click, type, etc.) on a target image.
+
+**Available Images (first 20):**
+{}
+
+**Action Types:** click, double_click, right_click, type
+
+**Usage:**
+```json
+{{"tool": "mcp__qontinui__execute_action", "action_type": "click", "image_id": "image-123"}}
+```
+"#,
+        if images.is_empty() {
+            "- (none loaded)".to_string()
+        } else {
+            images.join("\n")
+        }
+    ));
+
+    // Tool: capture_screenshot
+    context.push_str(
+        r#"
+#### capture_screenshot
+Capture a screenshot from a specified monitor.
+
+**Usage:**
+```json
+{"tool": "mcp__qontinui__capture_screenshot", "monitor": 0, "delay_seconds": 1.0}
+```
+"#,
+    );
+
+    context
 }
 
 // ============================================================================
@@ -3479,6 +3688,15 @@ If your task requires running visual automation, use the Runner API to execute w
         );
 
         enhanced_prompt = format!("{}{}", gui_context, enhanced_prompt);
+    }
+
+    // Add MCP tool context if config is loaded (either pre-loaded or auto-loaded)
+    {
+        let config_lock = state.app_state.current_config.lock().unwrap();
+        if let Some(config) = config_lock.as_ref() {
+            let tool_context = generate_mcp_tool_context(config);
+            enhanced_prompt = format!("{}\n{}", enhanced_prompt, tool_context);
+        }
     }
 
     if let Some(timeline) = &trace_timeline {
@@ -4492,7 +4710,7 @@ fn collect_images_for_analysis(
 // Unified Session API Handlers
 // ============================================================================
 
-use crate::session_manager::{Session, SessionConfig, SessionStatus};
+use crate::session::{Session, SessionConfig, SessionStatus};
 
 /// Request to start a new unified session
 #[derive(Debug, Deserialize)]
@@ -4543,7 +4761,7 @@ struct StartSessionResponse {
 async fn list_sessions(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<Session>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let sessions = state.session_manager.list_sessions().await;
+    let sessions = state.session.list_sessions().await;
     Ok(Json(ApiResponse::success(sessions)))
 }
 
@@ -4552,7 +4770,7 @@ async fn get_session(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<Session>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.session_manager.get_session(&session_id).await {
+    match state.session.get_session(&session_id).await {
         Some(session) => Ok(Json(ApiResponse::success(session))),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -4608,7 +4826,7 @@ async fn start_session(
         custom_config: serde_json::json!({}),
     };
 
-    match state.session_manager.start_session(config).await {
+    match state.session.start_session(config).await {
         Ok(session) => {
             info!("Started unified session: {}", session.id);
 
@@ -4711,7 +4929,7 @@ async fn stop_session(
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<Option<Session>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let session = state
-        .session_manager
+        .session
         .stop_session(&session_id, "Stopped by user")
         .await;
     Ok(Json(ApiResponse::success(session)))
@@ -4722,7 +4940,7 @@ async fn delete_session(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    state.session_manager.remove_session(&session_id).await;
+    state.session.remove_session(&session_id).await;
     Ok(Json(ApiResponse::success(())))
 }
 
@@ -4821,12 +5039,12 @@ async fn get_resumable_workflow(
     let has_running_tasks = has_running_ai_tasks_async(state.app_state.checkpoint_db.clone()).await;
 
     // Also check session manager for running sessions
-    let sessions = state.session_manager.list_sessions().await;
+    let sessions = state.session.list_sessions().await;
     let has_running_session = sessions.iter().any(|s| {
         matches!(
             s.status,
-            crate::session_manager::SessionStatus::Running
-                | crate::session_manager::SessionStatus::WaitingForContinuation
+            crate::session::SessionStatus::Running
+                | crate::session::SessionStatus::WaitingForContinuation
         )
     });
 
@@ -5002,12 +5220,12 @@ async fn force_continue_session(
     }
 
     // Check session manager for running sessions
-    let sessions = state.session_manager.list_sessions().await;
+    let sessions = state.session.list_sessions().await;
     let has_running = sessions.iter().any(|s| {
         matches!(
             s.status,
-            crate::session_manager::SessionStatus::Running
-                | crate::session_manager::SessionStatus::WaitingForContinuation
+            crate::session::SessionStatus::Running
+                | crate::session::SessionStatus::WaitingForContinuation
         )
     });
     if has_running {
@@ -5091,7 +5309,7 @@ async fn force_continue_session(
             task.sessions_count + 1
         );
 
-        let config = crate::session_manager::SessionConfig {
+        let config = crate::session::SessionConfig {
             prompt: continuation_prompt,
             continuation_prompt: None,
             total_phases: 1,
@@ -5108,7 +5326,7 @@ async fn force_continue_session(
 
         // Note: sessions_count will be incremented when output is appended via append_task_output
 
-        match state.session_manager.start_session(config).await {
+        match state.session.start_session(config).await {
             Ok(session) => {
                 let session_id = session.id.clone();
                 let state_clone = state.clone();
@@ -5206,7 +5424,7 @@ async fn force_continue_simple(
     );
 
     // Create a session to continue
-    let config = crate::session_manager::SessionConfig {
+    let config = crate::session::SessionConfig {
         prompt: continuation_prompt,
         continuation_prompt: None,
         total_phases: 1,
@@ -5218,7 +5436,7 @@ async fn force_continue_simple(
         custom_config: serde_json::json!({}),
     };
 
-    match state.session_manager.start_session(config).await {
+    match state.session.start_session(config).await {
         Ok(session) => {
             let session_id = session.id.clone();
 
@@ -5369,7 +5587,7 @@ fn check_supervisor_available() -> bool {
 /// 3. The AI reads output_log to understand context and continue
 ///
 /// Returns the number of tasks resumed.
-async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize {
+pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize {
     // Open the database
     let db = match CheckpointDb::new() {
         Ok(db) => db,
@@ -5501,7 +5719,7 @@ async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize {
         };
 
         // Start the session
-        match state.session_manager.start_session(session_config).await {
+        match state.session.start_session(session_config).await {
             Ok(session) => {
                 info!(
                     "Started resume session {} for task '{}'",
@@ -5582,7 +5800,7 @@ async fn run_unified_session_loop(
     external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
     run_ctx: Option<AiOutputSessionContext>, // Context for grouping output into a single Run
 ) {
-    let session = match state.session_manager.get_session(&session_id).await {
+    let session = match state.session.get_session(&session_id).await {
         Some(s) => s,
         None => {
             error!("Session {} not found for execution", session_id);
@@ -5624,13 +5842,13 @@ async fn run_unified_session_loop(
         };
 
         // Update session state to running
-        if let Some(mut s) = state.session_manager.get_session(&session_id).await {
+        if let Some(mut s) = state.session.get_session(&session_id).await {
             s.status = SessionStatus::Running;
             s.checkpoint.current_phase = phase;
             s.checkpoint.sessions_spawned += 1;
             s.checkpoint.status = "running".to_string();
             s.log_event("phase_started", &format!("Phase {} started", phase));
-            let _ = state.session_manager.update_session(s).await;
+            let _ = state.session.update_session(s).await;
         }
 
         // Increment sessions_count in database for this phase
@@ -5716,11 +5934,11 @@ async fn run_unified_session_loop(
                 // - Sessions end naturally via total_phases or goal markers
 
                 // Check session checkpoint for completion
-                if let Some(mut s) = state.session_manager.get_session(&session_id).await {
+                if let Some(mut s) = state.session.get_session(&session_id).await {
                     if s.checkpoint.is_complete() {
                         s.status = SessionStatus::Completed;
                         s.checkpoint.mark_completed();
-                        let _ = state.session_manager.update_session(s).await;
+                        let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
                         complete_task_run_with_retry(
@@ -5745,7 +5963,7 @@ async fn run_unified_session_loop(
                         s.status = SessionStatus::Completed;
                         s.checkpoint.completed = true;
                         s.checkpoint.status = "goal_achieved".to_string();
-                        let _ = state.session_manager.update_session(s).await;
+                        let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
                         complete_task_run_with_retry(
@@ -5776,7 +5994,7 @@ async fn run_unified_session_loop(
                         s.status = SessionStatus::Completed;
                         s.checkpoint.completed = true;
                         s.checkpoint.status = "completed".to_string();
-                        let _ = state.session_manager.update_session(s).await;
+                        let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
                         complete_task_run_with_retry(
@@ -5819,8 +6037,7 @@ async fn run_unified_session_loop(
                                         s.status = SessionStatus::Completed;
                                         s.checkpoint.completed = true;
                                         s.checkpoint.status = "phase_advanced".to_string();
-                                        let _ =
-                                            state.session_manager.update_session(s.clone()).await;
+                                        let _ = state.session.update_session(s.clone()).await;
 
                                         emit_ai_output(
                                             &app_handle,
@@ -5851,16 +6068,16 @@ async fn run_unified_session_loop(
                         "phase_completed",
                         &format!("Phase {} completed, continuing...", phase),
                     );
-                    let _ = state.session_manager.update_session(s).await;
+                    let _ = state.session.update_session(s).await;
                 }
             }
             Err(e) => {
                 error!("Phase {} failed: {}", phase, e);
 
-                if let Some(mut s) = state.session_manager.get_session(&session_id).await {
+                if let Some(mut s) = state.session.get_session(&session_id).await {
                     s.status = SessionStatus::Failed;
                     s.checkpoint.mark_failed(&e);
-                    let _ = state.session_manager.update_session(s).await;
+                    let _ = state.session.update_session(s).await;
                 }
 
                 // Update task_run in database to match session status
@@ -5883,7 +6100,7 @@ async fn run_unified_session_loop(
         }
 
         // Persist state for restart recovery
-        let _ = state.session_manager.persist_state().await;
+        let _ = state.session.persist_state().await;
     }
 }
 
@@ -6291,6 +6508,147 @@ async fn set_task_auto_continue(
 // End Task Run HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// Config Storage HTTP API Handlers
+// ============================================================================
+
+/// List all stored configurations (metadata only)
+async fn list_configs(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<ConfigMetadata>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = state.config_storage.lock().await;
+    let configs = storage.list();
+    Ok(Json(ApiResponse::success(configs)))
+}
+
+/// Request body for importing a config
+#[derive(Debug, Deserialize)]
+struct ImportConfigRequest {
+    /// Path to the config file to import
+    path: String,
+    /// Name to give the imported config
+    name: String,
+}
+
+/// Response for import config
+#[derive(Debug, Serialize)]
+struct ImportConfigResponse {
+    id: String,
+}
+
+/// Import a configuration from a file
+async fn import_config(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ImportConfigRequest>,
+) -> Result<Json<ApiResponse<ImportConfigResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut storage = state.config_storage.lock().await;
+    match storage.import_from_file(&request.path, &request.name) {
+        Ok(id) => Ok(Json(ApiResponse::success(ImportConfigResponse { id }))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+/// Get a stored configuration by ID
+async fn get_stored_config(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<StoredConfig>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = state.config_storage.lock().await;
+    match storage.get(&id) {
+        Ok(config) => Ok(Json(ApiResponse::success(config))),
+        Err(crate::config_storage::ConfigStorageError::NotFound(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Config not found: {}", id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+/// Request body for updating config metadata
+#[derive(Debug, Deserialize)]
+struct UpdateConfigRequest {
+    /// New name (optional)
+    name: Option<String>,
+    /// New description (optional)
+    description: Option<String>,
+}
+
+/// Update config metadata
+async fn update_stored_config(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<UpdateConfigRequest>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut storage = state.config_storage.lock().await;
+    match storage.update_metadata(&id, request.name, request.description) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(crate::config_storage::ConfigStorageError::NotFound(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Config not found: {}", id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+/// Delete a stored configuration
+async fn delete_stored_config(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut storage = state.config_storage.lock().await;
+    match storage.delete(&id) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(crate::config_storage::ConfigStorageError::NotFound(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Config not found: {}", id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+/// Request body for exporting a config
+#[derive(Debug, Deserialize)]
+struct ExportConfigRequest {
+    /// Path to export the config to
+    path: String,
+}
+
+/// Export a configuration to a file
+async fn export_config(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(request): Json<ExportConfigRequest>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let storage = state.config_storage.lock().await;
+    match storage.export_to_file(&id, &request.path) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(crate::config_storage::ConfigStorageError::NotFound(_)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Config not found: {}", id))),
+        )),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(e.to_string())),
+        )),
+    }
+}
+
+// ============================================================================
+// End Config Storage HTTP API Handlers
+// ============================================================================
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -6311,12 +6669,29 @@ pub fn create_router(
     );
     let task_monitor = Arc::new(TaskMonitor::new(db));
 
+    // Initialize config storage (graceful degradation if directory creation fails)
+    let config_storage = match ConfigStorage::new() {
+        Ok(storage) => {
+            info!("Config storage initialized successfully");
+            Arc::new(tokio::sync::Mutex::new(storage))
+        }
+        Err(e) => {
+            warn!(
+                "Config storage initialization failed (non-fatal): {}. Using degraded mode.",
+                e
+            );
+            Arc::new(tokio::sync::Mutex::new(ConfigStorage::new_degraded()))
+        }
+    };
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
         app_handle: app_handle.clone(),
-        session_manager: Arc::new(SessionManager::new(dev_logs_path)),
+        session: Arc::new(SessionManager::new(dev_logs_path)),
         task_monitor,
+        current_config_id: std::sync::Mutex::new(None),
+        config_storage,
     });
 
     // Restore persisted session state on startup
@@ -6326,17 +6701,17 @@ pub fn create_router(
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         // Restore unified session manager state
-        if let Err(e) = state_for_restore.session_manager.restore_state().await {
+        if let Err(e) = state_for_restore.session.restore_state().await {
             warn!("Failed to restore session state: {}", e);
         } else {
-            let sessions = state_for_restore.session_manager.list_sessions().await;
+            let sessions = state_for_restore.session.list_sessions().await;
             let active_count = sessions
                 .iter()
                 .filter(|s| {
                     matches!(
                         s.status,
-                        crate::session_manager::SessionStatus::Running
-                            | crate::session_manager::SessionStatus::WaitingForContinuation
+                        crate::session::SessionStatus::Running
+                            | crate::session::SessionStatus::WaitingForContinuation
                     )
                 })
                 .count();
@@ -6514,6 +6889,15 @@ pub fn create_router(
             "/task-runs/:id/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
+        // Config Storage routes
+        .route("/configs", get(list_configs).post(import_config))
+        .route(
+            "/configs/:id",
+            get(get_stored_config)
+                .put(update_stored_config)
+                .delete(delete_stored_config),
+        )
+        .route("/configs/:id/export", post(export_config))
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))
