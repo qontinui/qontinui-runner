@@ -40,10 +40,6 @@ export type { ProjectSelectionState } from "./useProjectSelection";
 export { useProjectLogs } from "./project-logs";
 export type { UseProjectLogsReturn } from "./project-logs";
 
-export { useWebExtraction } from "./useWebExtraction";
-
-export { useExtractionState } from "./useExtractionState";
-
 export { useRagProcessing } from "./useRagProcessing";
 
 export { useInitialStatesOverride } from "./useInitialStatesOverride";
@@ -62,3 +58,30 @@ export type { UseAiTaskPollingOptions, UseAiTaskPollingResult } from "./useAiTas
 
 export { useBackgroundActivities } from "./useBackgroundActivities";
 export type { BackgroundActivity, ActivityType } from "./useBackgroundActivities";
+
+export { useUnifiedReport, useFindings, useIssues } from "./useUnifiedReport";
+export type { UseUnifiedReportOptions, UseUnifiedReportResult } from "./useUnifiedReport";
+
+export { useVerificationAgent } from "./useVerificationAgent";
+export type { UseVerificationAgentReturn } from "./useVerificationAgent";
+
+export {
+  statisticsKeys,
+  useConfigStatistics,
+  useFlakyItems,
+  useRecentRuns,
+  useFailedRuns,
+  useRunDetails,
+  useDebuggingContext,
+  useFlakinessSummary,
+} from "./useStatistics";
+
+export {
+  discoveryKeys,
+  useDiscoverySummary,
+  useSyncStatus,
+  usePendingDiscoveries,
+  useSyncDiscoveries,
+  useClearDiscovery,
+  useClearFailedDiscoveries,
+} from "./useDiscoveries";

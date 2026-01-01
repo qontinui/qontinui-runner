@@ -191,8 +191,7 @@ impl ConfigStorage {
         }
 
         // Load and validate the config
-        let config =
-            ConfigLoader::load_from_file(path).map_err(|e| ConfigStorageError::ParseError(e))?;
+        let config = ConfigLoader::load_from_file(path).map_err(ConfigStorageError::ParseError)?;
 
         let id = self.generate_id();
         let now = Utc::now().to_rfc3339();

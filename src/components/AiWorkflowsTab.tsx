@@ -17,7 +17,7 @@ import { Activity, BookOpen, Eye, Settings } from "lucide-react";
 
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
 import type { AiOutputLine } from "./AiOutputTab";
-import { issueTracker } from "../services";
+import { useUnifiedReport } from "../hooks";
 
 // New consolidated sub-tab components
 import { SessionSubTab } from "./ai-workflows/SessionSubTab";
@@ -60,25 +60,8 @@ export function AiWorkflowsTab({
     return "session";
   });
 
-  // Track issue count for badge
-  const [unresolvedCount, setUnresolvedCount] = useState(
-    () =>
-      issueTracker
-        .getSessionIssues()
-        .filter((i) => i.status === "detected" || i.status === "in_progress").length,
-  );
-
-  useEffect(() => {
-    const updateCounts = () => {
-      const sessionIssues = issueTracker.getSessionIssues();
-      setUnresolvedCount(
-        sessionIssues.filter((i) => i.status === "detected" || i.status === "in_progress").length,
-      );
-    };
-    updateCounts();
-    const unsubscribe = issueTracker.subscribe(updateCounts);
-    return unsubscribe;
-  }, []);
+  // Track issue count for badge using unified report service
+  const { unresolvedCount } = useUnifiedReport();
 
   // Persist sub-tab selection
   useEffect(() => {

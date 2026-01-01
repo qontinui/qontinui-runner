@@ -96,6 +96,21 @@ export { DEFAULT_SCRIPT_VALUES } from "./playwright";
 // Scriptlet types
 export type { Scriptlet, CreateScriptletRequest, UpdateScriptletRequest } from "./scriptlet";
 
+// Context types (AI task guidance)
+export type {
+  Context,
+  ContextAutoInclude,
+  ContextScope,
+  ContextMetadata,
+  ContextWithMetadata,
+  CreateContextRequest,
+  UpdateContextRequest,
+  ContextSelection,
+  AutoDetectResult,
+  ContextFilterOptions,
+  ContextEditorState,
+} from "./context";
+
 // Findings types (categorized findings system)
 export type {
   BuiltInCategoryId,
@@ -161,3 +176,60 @@ export {
   isTaskFailed,
   isTaskFinished,
 } from "./taskRun";
+
+// Verification agent types (AI-driven state verification)
+export type {
+  VerificationStrategy,
+  VerificationTaskConfig,
+  VerificationStatus,
+  ElementCheck,
+  StateVerification,
+  TransitionVerification,
+  VerificationResult,
+  VerificationHistoryItem,
+  VerificationPlan,
+} from "./verification-agent";
+
+export { getDefaultVerificationConfig } from "./verification-agent";
+
+// Statistics types (Tiered Information Model for dashboard)
+export type {
+  TieredInfoResponse,
+  RunStatus,
+  AnomalyType,
+  AnomalySeverity,
+  FlakyItemType,
+  ActionsSummary,
+  TransitionRecord,
+  TemplateMatchRecord,
+  Anomaly,
+  RunDetails,
+  TransitionStats,
+  TemplateStats,
+  StateStats,
+  ErrorPattern,
+  ConfigStatistics,
+  FlakyItem,
+  FlakinessSummary,
+  RunFailureSummary,
+  DebuggingContext,
+  ExecutionOptions,
+  RecordRunInput,
+} from "./statistics";
+
+export { DEFAULT_EXECUTION_OPTIONS } from "./statistics";
+
+// Discovery types (Discovery Push mechanism)
+export type {
+  DiscoveryResponse,
+  DiscoveryType,
+  DiscoveryEvidence,
+  DiscoveryPayload,
+  PendingDiscovery,
+  DiscoveryPreview,
+  DiscoverySummary,
+  SyncStatus as DiscoverySyncStatus,
+  SyncResult,
+} from "./discoveries";
+
+export { getDiscoveryTypeLabel, getDiscoveryTypeColor, formatConfidence } from "./discoveries";

@@ -58,9 +58,31 @@ pub fn load_configuration(
         "images": config.images.clone()
     });
 
+    // Extract config_id and project_id for run recording
+    // Use config name as config_id (or path as fallback)
+    let config_id = if !config.metadata.name.is_empty() {
+        config.metadata.name.clone()
+    } else {
+        path.clone()
+    };
+    let project_id = config.metadata.project_id.clone();
+
+    // Set config context on run recording handler
+    {
+        let handler = state.run_recording_handler.clone();
+        let config_id_clone = config_id.clone();
+        let project_id_clone = project_id.clone();
+        tauri::async_runtime::spawn(async move {
+            handler.set_config(config_id_clone, project_id_clone).await;
+        });
+    }
+
     // Store the configuration
     *state.current_config.lock().unwrap() = Some(config);
-    info!("Configuration loaded successfully: {}", summary);
+    info!(
+        "Configuration loaded successfully: {} (config_id: {}, project_id: {:?})",
+        summary, config_id, project_id
+    );
 
     // Save the path as the last loaded config
     if let Err(e) = settings::save_last_config_path(&path) {

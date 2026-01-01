@@ -16,11 +16,11 @@ import {
   Camera,
   Settings as SettingsIcon,
   ScrollText,
-  Globe,
   Package,
   Sparkles,
   HelpCircle,
   Calendar,
+  BookOpen,
 } from "lucide-react";
 
 // Contexts
@@ -46,7 +46,6 @@ import {
   useProjectLogs,
   useRagProcessing,
   useWebSocketAutoConnect,
-  useWebExtraction,
   useBackgroundActivities,
 } from "./hooks";
 
@@ -56,7 +55,6 @@ import { ConfigurationPanel } from "./components/ConfigurationPanel";
 import { ExecutionControlPanel } from "./components/ExecutionControlPanel";
 import { LogsTab } from "./components/LogsTab";
 import { CaptureTab } from "./components/CaptureTab";
-import { ExtractionTab } from "./components/ExtractionTab";
 import { DatasetPackager } from "./components/DatasetPackager";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
@@ -66,6 +64,7 @@ import { LogSourceManager } from "./components/LogSourceManager";
 import { AiWorkflowsTab } from "./components/AiWorkflowsTab";
 import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
+import { ContextList } from "./components/contexts";
 
 // Styles
 import "./index.css";
@@ -74,9 +73,9 @@ type MainTab =
   | "run"
   | "logs"
   | "capture"
-  | "extract"
   | "dataset"
   | "ai-workflows"
+  | "contexts"
   | "scheduler"
   | "settings"
   | "help";
@@ -107,15 +106,19 @@ function AppContent() {
         "run",
         "logs",
         "capture",
-        "extract",
         "dataset",
         "ai-workflows",
+        "contexts",
         "scheduler",
         "settings",
         "help",
       ].includes(stored)
     ) {
       return stored as MainTab;
+    }
+    // Migration: extract tab was removed, redirect to capture
+    if (stored === "extract") {
+      return "capture";
     }
     return "run";
   });
@@ -172,17 +175,15 @@ function AppContent() {
   // RAG processing state
   const ragProcessing = useRagProcessing();
 
-  // Web extraction state (for background activity tracking)
-  const webExtraction = useWebExtraction();
-
   // Background activities aggregation
+  // Note: Extraction tracking handled internally via executor events
   const { activities: backgroundActivities } = useBackgroundActivities({
     ragStatus: ragProcessing.state.status,
     ragProgress: ragProcessing.state.percent,
     ragProjectName: ragProcessing.state.projectName,
-    isExtracting: webExtraction.isExtracting,
-    extractionUrl: webExtraction.extractionStatus?.progress?.current_url,
-    extractionProgress: webExtraction.extractionStatus?.progress,
+    isExtracting: false,
+    extractionUrl: undefined,
+    extractionProgress: undefined,
   });
 
   // WebSocket auto-connect (runs at App level to ensure it's always active)
@@ -363,9 +364,9 @@ function AppContent() {
     { id: "run" as const, label: "Run", icon: Play },
     { id: "logs" as const, label: "Logs", icon: ScrollText },
     { id: "capture" as const, label: "Capture", icon: Camera },
-    { id: "extract" as const, label: "Extract", icon: Globe },
     { id: "dataset" as const, label: "Dataset", icon: Package },
     { id: "ai-workflows" as const, label: "AI Workflows", icon: Sparkles },
+    { id: "contexts" as const, label: "Contexts", icon: BookOpen },
     { id: "scheduler" as const, label: "Scheduler", icon: Calendar },
     { id: "settings" as const, label: "Settings", icon: SettingsIcon },
     { id: "help" as const, label: "Help", icon: HelpCircle },
@@ -505,19 +506,6 @@ function AppContent() {
             />
           </Tabs.Content>
 
-          {/* Extract Tab */}
-          <Tabs.Content
-            value="extract"
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <ExtractionTab
-              onLog={addLog}
-              projects={projectSelection.projects}
-              selectedProjectId={projectSelection.selectedProjectId}
-              selectedProjectName={projectSelection.selectedProjectName}
-            />
-          </Tabs.Content>
-
           {/* Dataset Tab */}
           <Tabs.Content
             value="dataset"
@@ -548,6 +536,14 @@ function AppContent() {
               onLog={addLog}
               onConfigureLogLocations={() => setShowLogSourceManager(true)}
             />
+          </Tabs.Content>
+
+          {/* Contexts Tab */}
+          <Tabs.Content
+            value="contexts"
+            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
+          >
+            <ContextList onLog={addLog} />
           </Tabs.Content>
 
           {/* Scheduler Tab */}

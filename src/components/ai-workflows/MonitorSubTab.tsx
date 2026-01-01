@@ -6,27 +6,53 @@
  * - Findings panel (all categorized findings from AI execution)
  * - Issues panel (legacy detected issues during AI execution)
  * - Learnings panel (AI pattern analysis from sessions)
+ * - Verification panel (AI-driven state verification)
+ * - Statistics panel (config health, flaky items, run history)
  *
  * Uses tabs to organize the different monitoring areas.
  */
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { AlertTriangle, Lightbulb, FileText, ClipboardList } from "lucide-react";
+import {
+  AlertTriangle,
+  Lightbulb,
+  FileText,
+  ClipboardList,
+  FileSearch,
+  BarChart3,
+  Cloud,
+} from "lucide-react";
 import { IssuesPanel } from "../IssuesPanel";
 import { LearningsSubTab } from "./LearningsSubTab";
 import { ExecutionSummaryTab } from "./ExecutionSummaryTab";
 import { ExecutionReport } from "../findings";
+import { VerificationTab } from "../verification";
+import { StatisticsTab } from "../statistics";
+import { DiscoverySyncPanel } from "../discoveries";
+import { useExecution } from "../../contexts/ExecutionContext";
 import type { AiOutputLine } from "../AiOutputTab";
 
 interface MonitorSubTabProps {
   aiOutputLines: AiOutputLine[];
 }
 
-type MonitorTab = "summary" | "findings" | "issues" | "learnings";
+type MonitorTab =
+  | "summary"
+  | "findings"
+  | "issues"
+  | "learnings"
+  | "verification"
+  | "statistics"
+  | "discoveries";
 
 export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
   const [activeTab, setActiveTab] = useState<MonitorTab>("summary");
+  const { config } = useExecution();
+
+  // Use config path as the config ID for statistics
+  const configId = config?.path ?? null;
+  const configName = config?.name ?? undefined;
 
   const tabTriggerClass = `
     flex items-center gap-2 px-4 py-3 text-sm font-medium
@@ -61,6 +87,18 @@ export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
             <Lightbulb className="w-4 h-4" />
             Learnings
           </Tabs.Trigger>
+          <Tabs.Trigger value="verification" className={tabTriggerClass}>
+            <FileSearch className="w-4 h-4" />
+            Verification
+          </Tabs.Trigger>
+          <Tabs.Trigger value="statistics" className={tabTriggerClass}>
+            <BarChart3 className="w-4 h-4" />
+            Statistics
+          </Tabs.Trigger>
+          <Tabs.Trigger value="discoveries" className={tabTriggerClass}>
+            <Cloud className="w-4 h-4" />
+            Discoveries
+          </Tabs.Trigger>
         </Tabs.List>
 
         {/* Tab Content */}
@@ -91,6 +129,27 @@ export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
             className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
             <LearningsSubTab aiOutputLines={aiOutputLines} />
+          </Tabs.Content>
+
+          <Tabs.Content
+            value="verification"
+            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
+          >
+            <VerificationTab />
+          </Tabs.Content>
+
+          <Tabs.Content
+            value="statistics"
+            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
+          >
+            <StatisticsTab configId={configId} configName={configName} />
+          </Tabs.Content>
+
+          <Tabs.Content
+            value="discoveries"
+            className="h-full outline-none overflow-y-auto p-4 data-[state=inactive]:hidden"
+          >
+            <DiscoverySyncPanel />
           </Tabs.Content>
         </div>
       </Tabs.Root>

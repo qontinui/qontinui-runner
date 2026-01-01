@@ -7,7 +7,7 @@ use crate::safe_eprintln;
 use serde_json::json;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Handles event forwarding from Python executor to Tauri frontend and WebSocket clients
 pub struct EventForwarder;
@@ -29,7 +29,7 @@ impl EventForwarder {
 
     /// Emits a message to the Tauri frontend, WebSocket clients, and feeds events to DisplayProcessor
     pub async fn emit_message_to_frontend(app_handle: &tauri::AppHandle, message: ExecutorMessage) {
-        // Feed tree events to DisplayProcessor
+        // Feed tree events to DisplayProcessor and RunRecordingHandler
         if let ExecutorMessage::TreeEvent {
             ref event_type,
             ref node,
@@ -69,9 +69,43 @@ impl EventForwarder {
                 safe_eprintln!("[PYTHON_BRIDGE] Got display_processor lock, calling add_event");
                 processor.event_log_mut().add_event(raw_event);
                 safe_eprintln!("[PYTHON_BRIDGE] add_event completed");
+
+                // Feed tree event to run recording handler
+                app_state
+                    .run_recording_handler
+                    .on_tree_event(event_type, node)
+                    .await;
             } else {
                 safe_eprintln!("[PYTHON_BRIDGE] AppState NOT available!");
                 debug!("AppState not available for feeding events to DisplayProcessor");
+            }
+        }
+
+        // Feed execution_completed events to RunRecordingHandler
+        if let ExecutorMessage::Event {
+            ref event,
+            ref data,
+            ..
+        } = message
+        {
+            if event == "execution_completed" {
+                if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+                    info!("[RUN_RECORDING] Processing execution_completed event");
+                    app_state
+                        .run_recording_handler
+                        .on_execution_completed(data)
+                        .await;
+                }
+            }
+        }
+
+        // Feed image recognition events to RunRecordingHandler
+        if let ExecutorMessage::ImageRecognition { ref data } = message {
+            if let Some(app_state) = app_handle.try_state::<std::sync::Arc<AppState>>() {
+                app_state
+                    .run_recording_handler
+                    .on_image_recognition(data)
+                    .await;
             }
         }
 

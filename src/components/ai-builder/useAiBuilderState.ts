@@ -1042,7 +1042,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: goal.trim() || "AI Builder Session",
+          name: currentWorkflowName || goal.trim() || "AI Builder Session",
           prompt: prompt,
           continuation_prompt: null,
           total_phases: maxIterations,
@@ -1078,7 +1078,7 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       });
       setIsRunning(false);
     }
-  }, [generateDeveloperPrompt, executionSteps, goal, maxIterations]);
+  }, [generateDeveloperPrompt, executionSteps, goal, maxIterations, currentWorkflowName]);
 
   // Stop the current session
   const stopSession = useCallback(async () => {

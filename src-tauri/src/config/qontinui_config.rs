@@ -9,6 +9,99 @@ use super::types::{deserialize_categories, Category};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// =============================================================================
+// Description types for AI Verification Agent
+// =============================================================================
+//
+// These types provide rich descriptions for states, actions, transitions, and
+// workflows that enable an AI verification agent to explore applications using
+// the state machine structure and verify that reality matches expectations.
+
+/// Rich description for a state in the state machine.
+///
+/// Provides context for an AI verification agent to understand what a state
+/// represents and how to verify it matches expectations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StateDescription {
+    /// Brief description of the state (1-2 sentences)
+    pub summary: String,
+    /// UI elements that should be visible in this state (e.g., "Login button", "Username field")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_elements: Option<Vec<String>>,
+    /// UI elements that should NOT be visible in this state - helps detect error dialogs or wrong states
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unexpected_elements: Option<Vec<String>>,
+    /// Business context - what the user is trying to accomplish when in this state
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_goal: Option<String>,
+    /// Custom hints for AI verification - specific things to check or look for
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_prompt: Option<String>,
+}
+
+/// Rich description for an action in a workflow.
+///
+/// Provides context for an AI verification agent to understand what an action
+/// is supposed to accomplish and how to verify it succeeded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ActionDescription {
+    /// What this action is supposed to accomplish (e.g., "Click the submit button to proceed")
+    pub intent: String,
+    /// Conditions that should be true before this action executes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Vec<String>>,
+    /// Conditions that should be true after this action completes successfully
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postconditions: Option<Vec<String>>,
+    /// Known ways this action can fail (e.g., "Button may be disabled", "Network timeout")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_modes: Option<Vec<String>>,
+}
+
+/// Rich description for a transition between states.
+///
+/// Provides context for an AI verification agent to understand what a transition
+/// accomplishes and how to verify it completed successfully.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct TransitionDescription {
+    /// What this transition accomplishes (e.g., "Navigate from login to dashboard")
+    pub intent: String,
+    /// Conditions that must be true before this transition can occur
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preconditions: Option<Vec<String>>,
+    /// Conditions that should be true after this transition completes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postconditions: Option<Vec<String>>,
+    /// Known ways this transition can fail (e.g., "Authentication error", "Server unavailable")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_modes: Option<Vec<String>>,
+    /// Typical duration of this transition in milliseconds - helps detect performance issues
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_duration_ms: Option<u64>,
+}
+
+/// Rich description for an entire workflow.
+///
+/// Provides high-level context for an AI verification agent to understand
+/// the overall purpose and success criteria of a workflow.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct WorkflowDescription {
+    /// Overall goal of the workflow (e.g., "Complete user registration process")
+    pub purpose: String,
+    /// How to determine if the workflow succeeded (e.g., "User sees welcome message")
+    pub success_criteria: String,
+    /// Human-readable summary of the workflow steps for quick understanding
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps_summary: Option<Vec<String>>,
+    /// Why this workflow exists and its importance in the application
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub business_context: Option<String>,
+}
+
 /// Complete Qontinui configuration - mirrors Python/TypeScript QontinuiConfig.
 /// This is the canonical format exported from qontinui-web.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,10 +137,7 @@ impl QontinuiConfig {
 
     /// Count total StateImages across all states
     pub fn state_image_count(&self) -> usize {
-        self.states
-            .iter()
-            .map(|s| s.state_images.len())
-            .sum()
+        self.states.iter().map(|s| s.state_images.len()).sum()
     }
 
     /// Count total patterns across all StateImages
@@ -111,6 +201,9 @@ pub struct Workflow {
     pub metadata: Option<WorkflowMetadata>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "initialStateIds")]
     pub initial_state_ids: Option<Vec<String>>,
+    /// Rich description for AI verification agent
+    #[serde(skip_serializing_if = "Option::is_none", rename = "aiDescription")]
+    pub ai_description: Option<WorkflowDescription>,
 }
 
 /// Action in a workflow
@@ -131,6 +224,9 @@ pub struct Action {
     pub retry_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "continueOnError")]
     pub continue_on_error: Option<bool>,
+    /// Rich description for AI verification agent
+    #[serde(skip_serializing_if = "Option::is_none", rename = "aiDescription")]
+    pub ai_description: Option<ActionDescription>,
 }
 
 /// Connection between actions
@@ -201,6 +297,9 @@ pub struct State {
     pub is_final: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "screenAssociation")]
     pub screen_association: Option<i32>,
+    /// Rich description for AI verification agent
+    #[serde(skip_serializing_if = "Option::is_none", rename = "aiDescription")]
+    pub ai_description: Option<StateDescription>,
 }
 
 /// Position coordinates
@@ -285,7 +384,10 @@ pub struct StateRegion {
     pub fixed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "isSearchRegion")]
     pub is_search_region: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "isInteractionRegion")]
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "isInteractionRegion"
+    )]
     pub is_interaction_region: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitors: Option<Vec<u32>>,
@@ -362,6 +464,9 @@ pub struct Transition {
     // IncomingTransition fields
     #[serde(skip_serializing_if = "Option::is_none", rename = "executeAfter")]
     pub execute_after: Option<Vec<String>>,
+    /// Rich description for AI verification agent
+    #[serde(skip_serializing_if = "Option::is_none", rename = "aiDescription")]
+    pub ai_description: Option<TransitionDescription>,
 }
 
 /// Configuration settings
@@ -581,5 +686,174 @@ mod tests {
         assert!(!config.categories[1].automation_enabled);
         assert_eq!(config.categories[2].name, "Outgoing Transitions");
         assert!(!config.categories[2].automation_enabled);
+    }
+
+    #[test]
+    fn test_deserialize_with_ai_descriptions() {
+        let json = r#"{
+            "version": "2.0.0",
+            "metadata": {
+                "name": "Test AI Descriptions",
+                "created": "2025-01-01T00:00:00Z",
+                "modified": "2025-01-01T00:00:00Z"
+            },
+            "images": [],
+            "workflows": [
+                {
+                    "id": "workflow1",
+                    "name": "Login Workflow",
+                    "format": "graph",
+                    "version": "1.0",
+                    "actions": [],
+                    "connections": {},
+                    "aiDescription": {
+                        "purpose": "Complete user login process",
+                        "success_criteria": "User sees dashboard after login"
+                    }
+                }
+            ],
+            "states": [
+                {
+                    "id": "state1",
+                    "name": "Login Page",
+                    "stateImages": [],
+                    "regions": [],
+                    "locations": [],
+                    "strings": [],
+                    "position": {"x": 0, "y": 0},
+                    "aiDescription": {
+                        "summary": "Login page with username and password fields",
+                        "expected_elements": ["Username field", "Password field", "Login button"],
+                        "unexpected_elements": ["Error dialog"],
+                        "user_goal": "User wants to authenticate"
+                    }
+                }
+            ],
+            "transitions": [
+                {
+                    "id": "trans1",
+                    "type": "outgoing",
+                    "fromState": "state1",
+                    "toState": "state2",
+                    "workflows": [],
+                    "timeout": 30.0,
+                    "retryCount": 3,
+                    "aiDescription": {
+                        "intent": "Submit login credentials",
+                        "preconditions": ["Username and password entered"],
+                        "postconditions": ["Dashboard is visible"],
+                        "expected_duration_ms": 2000
+                    }
+                }
+            ],
+            "categories": []
+        }"#;
+
+        let config: QontinuiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.version, "2.0.0");
+
+        // Check workflow AI description
+        let workflow = &config.workflows[0];
+        assert!(workflow.ai_description.is_some());
+        let workflow_desc = workflow.ai_description.as_ref().unwrap();
+        assert_eq!(workflow_desc.purpose, "Complete user login process");
+        assert_eq!(
+            workflow_desc.success_criteria,
+            "User sees dashboard after login"
+        );
+
+        // Check state AI description
+        let state = &config.states[0];
+        assert!(state.ai_description.is_some());
+        let state_desc = state.ai_description.as_ref().unwrap();
+        assert_eq!(
+            state_desc.summary,
+            "Login page with username and password fields"
+        );
+        assert_eq!(
+            state_desc.expected_elements,
+            Some(vec![
+                "Username field".to_string(),
+                "Password field".to_string(),
+                "Login button".to_string()
+            ])
+        );
+        assert_eq!(
+            state_desc.unexpected_elements,
+            Some(vec!["Error dialog".to_string()])
+        );
+        assert_eq!(
+            state_desc.user_goal,
+            Some("User wants to authenticate".to_string())
+        );
+
+        // Check transition AI description
+        let transition = &config.transitions[0];
+        assert!(transition.ai_description.is_some());
+        let trans_desc = transition.ai_description.as_ref().unwrap();
+        assert_eq!(trans_desc.intent, "Submit login credentials");
+        assert_eq!(
+            trans_desc.preconditions,
+            Some(vec!["Username and password entered".to_string()])
+        );
+        assert_eq!(
+            trans_desc.postconditions,
+            Some(vec!["Dashboard is visible".to_string()])
+        );
+        assert_eq!(trans_desc.expected_duration_ms, Some(2000));
+    }
+
+    #[test]
+    fn test_deserialize_without_ai_descriptions_backward_compatible() {
+        // Test that configs without AI descriptions still work (backward compatibility)
+        let json = r#"{
+            "version": "2.0.0",
+            "metadata": {
+                "name": "Test Backward Compat",
+                "created": "2025-01-01T00:00:00Z",
+                "modified": "2025-01-01T00:00:00Z"
+            },
+            "images": [],
+            "workflows": [
+                {
+                    "id": "workflow1",
+                    "name": "Simple Workflow",
+                    "format": "graph",
+                    "version": "1.0",
+                    "actions": [],
+                    "connections": {}
+                }
+            ],
+            "states": [
+                {
+                    "id": "state1",
+                    "name": "Simple State",
+                    "stateImages": [],
+                    "regions": [],
+                    "locations": [],
+                    "strings": [],
+                    "position": {"x": 0, "y": 0}
+                }
+            ],
+            "transitions": [
+                {
+                    "id": "trans1",
+                    "type": "outgoing",
+                    "fromState": "state1",
+                    "toState": "state2",
+                    "workflows": [],
+                    "timeout": 30.0,
+                    "retryCount": 3
+                }
+            ],
+            "categories": []
+        }"#;
+
+        let config: QontinuiConfig = serde_json::from_str(json).unwrap();
+
+        // Verify all AI descriptions are None (backward compatible)
+        assert!(config.workflows[0].ai_description.is_none());
+        assert!(config.states[0].ai_description.is_none());
+        assert!(config.transitions[0].ai_description.is_none());
     }
 }

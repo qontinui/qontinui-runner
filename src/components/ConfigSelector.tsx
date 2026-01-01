@@ -212,9 +212,7 @@ export function ConfigSelector({
             </div>
 
             {/* Error State */}
-            {error && (
-              <div className="px-3 py-2 text-xs text-red-500 bg-red-500/10">{error}</div>
-            )}
+            {error && <div className="px-3 py-2 text-xs text-red-500 bg-red-500/10">{error}</div>}
 
             {/* Config List */}
             {configs.length === 0 ? (
@@ -285,9 +283,7 @@ export function ConfigSelector({
  * Helper hook to determine if execution steps have GUI steps
  * that require a config to be loaded.
  */
-export function hasGuiStepsInExecutionList(
-  steps: Array<{ type: string }>
-): boolean {
+export function hasGuiStepsInExecutionList(steps: Array<{ type: string }>): boolean {
   const guiStepTypes = ["workflow", "state", "action"];
   return steps.some((step) => guiStepTypes.includes(step.type));
 }

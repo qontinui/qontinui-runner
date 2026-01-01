@@ -15,7 +15,6 @@ import type { HandlerSetupFunction } from "./types";
 import { syncIssuesToBackend } from "../../services/IssueSyncService";
 import { issueTracker } from "../../services/IssueTracker";
 import { findingsTracker } from "../../services/FindingsTracker";
-import { testRunReportingService } from "../../services/TestRunReportingService";
 import { executionReportingService } from "../../services/ExecutionReportingService";
 import { RunType, RunStatus } from "../../types/execution";
 
@@ -106,7 +105,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
             `[EXECUTION_HANDLER] Starting ${runType} run for project ${projectId}, workflow ${workflowName}, initial states: ${JSON.stringify(initialStateIds)}`,
           );
 
-          // Start using new unified service
+          // Start execution run reporting
           await executionReportingService
             .startRun(
               projectId,
@@ -117,13 +116,6 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
             )
             .catch((error) => {
               console.error("[EXECUTION_HANDLER] Failed to start execution run:", error);
-            });
-
-          // Also start legacy test run for backward compatibility
-          await testRunReportingService
-            .startTestRun(projectId, workflowId, workflowName)
-            .catch((error) => {
-              console.error("[EXECUTION_HANDLER] Failed to start legacy test run:", error);
             });
         } else {
           console.log("[EXECUTION_HANDLER] No project selected, skipping execution run reporting");
@@ -139,19 +131,11 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
       setExecutionActive(false);
       logManager.addLog("success", "Execution completed successfully");
 
-      // Complete execution run using new unified service (success)
+      // Complete execution run (success)
       if (executionReportingService.isActive) {
         console.log("[EXECUTION_HANDLER] Completing execution run (success)");
         await executionReportingService.completeRun(RunStatus.COMPLETED).catch((error) => {
           console.error("[EXECUTION_HANDLER] Failed to complete execution run:", error);
-        });
-      }
-
-      // Complete legacy test run reporting (success) for backward compatibility
-      if (testRunReportingService.isActive) {
-        console.log("[EXECUTION_HANDLER] Completing legacy test run (success)");
-        await testRunReportingService.completeTestRun(true).catch((error) => {
-          console.error("[EXECUTION_HANDLER] Failed to complete legacy test run:", error);
         });
       }
 
@@ -187,7 +171,9 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
       const findingsCount = findingsTracker.count;
       if (findingsCount > 0) {
         console.log(`[EXECUTION_HANDLER] Archiving ${findingsCount} findings from session`);
-        findingsTracker.archiveCurrentSession("completed");
+        findingsTracker.archiveCurrentSession("completed").catch((error) => {
+          console.error("[EXECUTION_HANDLER] Failed to archive session:", error);
+        });
       }
     }),
   );
@@ -202,7 +188,7 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
         const errorMessage = payload?.data?.error_message;
 
-        // Complete execution run using new unified service (failure)
+        // Complete execution run (failure)
         if (executionReportingService.isActive) {
           console.log("[EXECUTION_HANDLER] Completing execution run (failed)");
           await executionReportingService
@@ -212,21 +198,15 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
             });
         }
 
-        // Complete legacy test run reporting (failure) for backward compatibility
-        if (testRunReportingService.isActive) {
-          console.log("[EXECUTION_HANDLER] Completing legacy test run (failed)");
-          await testRunReportingService.completeTestRun(false).catch((error) => {
-            console.error("[EXECUTION_HANDLER] Failed to complete legacy test run:", error);
-          });
-        }
-
         // Archive findings from the session (even on failure)
         const findingsCount = findingsTracker.count;
         if (findingsCount > 0) {
           console.log(
             `[EXECUTION_HANDLER] Archiving ${findingsCount} findings from failed session`,
           );
-          findingsTracker.archiveCurrentSession("failed");
+          findingsTracker.archiveCurrentSession("failed").catch((error) => {
+            console.error("[EXECUTION_HANDLER] Failed to archive failed session:", error);
+          });
         }
       },
     ),

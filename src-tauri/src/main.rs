@@ -8,11 +8,14 @@ mod backup;
 mod commands;
 mod config;
 mod config_storage;
+mod context;
 mod database;
 mod debug_lifecycle;
+mod discoveries;
 mod display;
 mod error;
 mod executor;
+mod findings;
 mod logging;
 mod mcp;
 mod mcp_api;
@@ -27,6 +30,8 @@ mod session;
 mod settings;
 mod storage;
 mod task_monitor;
+mod tiered_info;
+mod verification_agent;
 mod video_recorder;
 mod workflow_monitor;
 
@@ -38,6 +43,7 @@ use logging::{init_logging, setup_panic_handler, LoggingConfig};
 use std::sync::{Arc, Mutex};
 use storage::LocalStorage;
 use tauri::Manager;
+use tiered_info::RunRecordingHandler;
 use tokio::sync::Mutex as TokioMutex;
 use tracing::{error, info, warn};
 use video_recorder::VideoRecordingService;
@@ -155,6 +161,9 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Capacity of 256 allows for burst events without dropping
     let (event_broadcast, _) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
+    // Create run recording handler for automatic workflow execution recording
+    let run_recording_handler = Arc::new(RunRecordingHandler::new(checkpoint_db.clone()));
+
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
         python_bridge: Mutex::new(None),
@@ -164,6 +173,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         video_recorder,
         event_broadcast,
         checkpoint_db,
+        run_recording_handler,
     });
     let mcp_app_state = shared_app_state.clone();
     let mcp_rag_state = rag_state.clone();
@@ -308,11 +318,6 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::playwright_settings::save_playwright_settings,
             // Issues sync commands
             commands::issues::sync_issues_to_backend,
-            // Test run reporting commands (deprecated - use execution_reporting)
-            commands::testing::create_test_run,
-            commands::testing::report_test_transitions,
-            commands::testing::complete_test_run,
-            commands::testing::report_image_recognitions,
             // Unified execution reporting commands
             commands::execution_reporting::create_execution_run,
             commands::execution_reporting::report_action_executions,
@@ -331,6 +336,54 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checkpoints::setting_get,
             commands::checkpoints::setting_set,
             commands::checkpoints::settings_get_all,
+            // Findings commands (AI-detected issues)
+            commands::findings::get_task_findings,
+            commands::findings::get_findings_by_status_cmd,
+            commands::findings::get_finding_by_id,
+            commands::findings::update_finding,
+            commands::findings::resolve_finding,
+            commands::findings::provide_finding_response,
+            commands::findings::get_findings_summary,
+            // AI Verification Agent commands
+            commands::ai_verification::start_verification_task,
+            commands::ai_verification::get_verification_strategies,
+            commands::ai_verification::preview_verification_plan,
+            commands::ai_verification::get_verification_history,
+            commands::ai_verification::get_verification_report,
+            commands::ai_verification::get_verification_analysis_prompt,
+            commands::ai_verification::clear_verification_history,
+            // Tiered Information Model commands
+            commands::tiered_info::get_config_statistics,
+            commands::tiered_info::get_flaky_transitions,
+            commands::tiered_info::get_flaky_templates,
+            commands::tiered_info::get_debugging_context,
+            commands::tiered_info::get_debugging_context_prompt,
+            commands::tiered_info::get_run_details,
+            commands::tiered_info::get_recent_runs,
+            commands::tiered_info::get_failed_runs,
+            commands::tiered_info::record_run,
+            commands::tiered_info::cleanup_old_runs,
+            commands::tiered_info::get_execution_options,
+            commands::tiered_info::get_flakiness_summary,
+            // Discovery Push commands
+            commands::discoveries::get_pending_discoveries_cmd,
+            commands::discoveries::get_discovery_summary,
+            commands::discoveries::sync_discoveries,
+            commands::discoveries::clear_discovery,
+            commands::discoveries::clear_failed_discoveries,
+            commands::discoveries::get_discovery_sync_status,
+            // Context commands (AI knowledge snippets)
+            commands::context::get_all_contexts,
+            commands::context::get_context,
+            commands::context::create_context,
+            commands::context::update_context,
+            commands::context::delete_context,
+            commands::context::search_contexts,
+            commands::context::get_context_categories,
+            commands::context::set_context_enabled,
+            commands::context::record_context_usage,
+            commands::context::get_builtin_contexts_cmd,
+            commands::context::evaluate_auto_include,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

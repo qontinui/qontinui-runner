@@ -5,12 +5,7 @@
  * Manages execution reports, phases, and report lifecycle.
  */
 
-import type {
-  Finding,
-  ExecutionReport,
-  PhaseInfo,
-  UserInputRequest,
-} from "../types/findings";
+import type { Finding, ExecutionReport, PhaseInfo, UserInputRequest } from "../types/findings";
 import { calculateSummary, createEmptySummary } from "./FindingsExport";
 
 /**

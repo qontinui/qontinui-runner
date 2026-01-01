@@ -9,11 +9,10 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { ActionStatus, ActionType } from "../types/execution";
 import type {
   RunType,
   RunStatus,
-  ActionStatus,
-  ActionType,
   RunnerMetadata,
   WorkflowMetadata,
   ExecutionStats,
@@ -46,6 +45,49 @@ export type {
 };
 
 // ============================================================================
+// Legacy Compatibility Types
+// ============================================================================
+
+/**
+ * Legacy transition data format for backward compatibility.
+ * Maps to ActionExecutionCreate with action_type = TRANSITION.
+ */
+export interface TransitionData {
+  sequence_number: number;
+  from_state: string;
+  to_state: string;
+  transition_name: string;
+  status: "success" | "failed" | "skipped" | "timeout";
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  error_message?: string;
+  error_type?: string;
+  screenshot_id?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * Legacy image recognition data format for backward compatibility.
+ * Maps to ActionExecutionCreate with action_type = FIND.
+ */
+export interface ImageRecognitionData {
+  pattern_id: string;
+  pattern_name?: string;
+  action_type: string;
+  active_states: string[];
+  success: boolean;
+  match_count?: number;
+  best_match_score?: number;
+  match_x?: number;
+  match_y?: number;
+  match_width?: number;
+  match_height?: number;
+  duration_ms?: number;
+  result_data?: Record<string, unknown>;
+}
+
+// ============================================================================
 // Internal Types
 // ============================================================================
 
@@ -59,6 +101,10 @@ interface InternalExecutionStats {
   statesCovered: Set<string>;
   transitionsCovered: Set<string>;
   startTime: number;
+  // Recognition-specific stats (for backward compatibility with legacy service)
+  totalRecognitions: number;
+  successfulRecognitions: number;
+  failedRecognitions: number;
 }
 
 // ============================================================================
@@ -236,6 +282,109 @@ class ExecutionReportingServiceImpl {
     }
   }
 
+  // ============================================================================
+  // Legacy Compatibility Methods
+  // ============================================================================
+
+  /**
+   * Report an image recognition result.
+   *
+   * This method provides backward compatibility with TestRunReportingService.
+   * It converts ImageRecognitionData to ActionExecutionCreate with action_type = FIND.
+   *
+   * @param recognition - The image recognition data to report
+   */
+  async reportImageRecognition(recognition: ImageRecognitionData): Promise<void> {
+    if (!this.activeRunId) {
+      console.warn("[ExecutionReporting] No active run for image recognition report");
+      return;
+    }
+
+    // Update recognition-specific stats
+    this.executionStats.totalRecognitions++;
+    if (recognition.success) {
+      this.executionStats.successfulRecognitions++;
+    } else {
+      this.executionStats.failedRecognitions++;
+    }
+
+    // Track states covered from active_states
+    for (const state of recognition.active_states) {
+      this.executionStats.statesCovered.add(state);
+    }
+
+    // Map ImageRecognitionData to ActionExecutionCreate
+    const action: ActionExecutionCreate = {
+      sequence_number: this.getNextActionSequenceNumber(),
+      action_type: ActionType.FIND,
+      action_name: recognition.pattern_name || recognition.pattern_id,
+      status: recognition.success ? ActionStatus.SUCCESS : ActionStatus.FAILED,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+      duration_ms: recognition.duration_ms || 0,
+      pattern_id: recognition.pattern_id,
+      pattern_name: recognition.pattern_name,
+      active_states: recognition.active_states,
+      confidence_score: recognition.best_match_score,
+      match_location:
+        recognition.match_x !== undefined
+          ? {
+              x: recognition.match_x,
+              y: recognition.match_y!,
+              width: recognition.match_width,
+              height: recognition.match_height,
+            }
+          : undefined,
+      output_data: {
+        match_count: recognition.match_count,
+        ...recognition.result_data,
+      },
+    };
+
+    await this.reportAction(action);
+  }
+
+  /**
+   * Report a transition that occurred during the run.
+   *
+   * This method provides backward compatibility with TestRunReportingService.
+   * It converts TransitionData to ActionExecutionCreate with action_type = TRANSITION.
+   *
+   * @param transition - The transition data to report
+   */
+  async reportTransition(transition: TransitionData): Promise<void> {
+    if (!this.activeRunId) {
+      console.warn("[ExecutionReporting] No active run for transition report");
+      return;
+    }
+
+    // Map status string to ActionStatus enum
+    const statusMap: Record<TransitionData["status"], ActionStatus> = {
+      success: ActionStatus.SUCCESS,
+      failed: ActionStatus.FAILED,
+      skipped: ActionStatus.SKIPPED,
+      timeout: ActionStatus.TIMEOUT,
+    };
+
+    // Map TransitionData to ActionExecutionCreate
+    const action: ActionExecutionCreate = {
+      sequence_number: transition.sequence_number,
+      action_type: ActionType.TRANSITION,
+      action_name: transition.transition_name,
+      status: statusMap[transition.status],
+      started_at: transition.started_at,
+      completed_at: transition.completed_at,
+      duration_ms: transition.duration_ms,
+      from_state: transition.from_state,
+      to_state: transition.to_state,
+      error_message: transition.error_message,
+      screenshot_id: transition.screenshot_id,
+      metadata: transition.metadata,
+    };
+
+    await this.reportAction(action);
+  }
+
   /**
    * Complete the active execution run with final status and statistics.
    *
@@ -362,6 +511,9 @@ class ExecutionReportingServiceImpl {
       statesCovered: new Set(),
       transitionsCovered: new Set(),
       startTime: Date.now(),
+      totalRecognitions: 0,
+      successfulRecognitions: 0,
+      failedRecognitions: 0,
     };
   }
 
@@ -507,6 +659,10 @@ export const reportAction = executionReportingService.reportAction.bind(executio
 export const reportScreenshot =
   executionReportingService.reportScreenshot.bind(executionReportingService);
 export const reportIssues = executionReportingService.reportIssues.bind(executionReportingService);
+export const reportImageRecognition =
+  executionReportingService.reportImageRecognition.bind(executionReportingService);
+export const reportTransition =
+  executionReportingService.reportTransition.bind(executionReportingService);
 export const completeRun = executionReportingService.completeRun.bind(executionReportingService);
 export const getNextActionSequenceNumber =
   executionReportingService.getNextActionSequenceNumber.bind(executionReportingService);

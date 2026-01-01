@@ -426,6 +426,7 @@ mod tests {
                 timeout: None,
                 is_initial: Some(true),
                 is_final: None,
+                ai_description: None,
             }],
             transitions: vec![],
             categories: vec![],

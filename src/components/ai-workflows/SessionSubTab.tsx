@@ -40,8 +40,8 @@ import {
 } from "lucide-react";
 import { AiOutputTab } from "../AiOutputTab";
 import type { AiOutputLine } from "../AiOutputTab";
-import { issueTracker } from "../../services";
-import type { DetectedIssue } from "../../types/issues";
+import { useIssues } from "../../hooks";
+import type { UnifiedReportItem } from "../../services/UnifiedReportService";
 import { groupEntriesIntoLoops, type AiLoop } from "../../types/aiLoop";
 import { useAutoContinue } from "../../contexts";
 
@@ -144,8 +144,8 @@ export function SessionSubTab({
   const [deleteBeforeDate, setDeleteBeforeDate] = useState<string>("");
   const [isDeleting, setIsDeleting] = useState(false);
 
-  // Issues tracking
-  const [sessionIssues, setSessionIssues] = useState<DetectedIssue[]>([]);
+  // Issues tracking - using unified report hook
+  const { items: sessionIssues } = useIssues();
   const [showIssues, setShowIssues] = useState(true);
 
   // Last result message
@@ -300,16 +300,6 @@ export function SessionSubTab({
 
     return aiOutputLines.filter((line) => filteredEntryIds.has(line.id));
   }, [aiOutputLines, currentSession, filteredLoops]);
-
-  // Subscribe to issue tracker updates
-  useEffect(() => {
-    const updateIssues = () => {
-      setSessionIssues(issueTracker.getSessionIssues());
-    };
-    updateIssues();
-    const unsubscribe = issueTracker.subscribe(updateIssues);
-    return unsubscribe;
-  }, []);
 
   // Load auto-fix setting on mount
   useEffect(() => {

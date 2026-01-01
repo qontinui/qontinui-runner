@@ -24,6 +24,8 @@ import {
   AlertCircle,
   Clock,
 } from "lucide-react";
+import { ContextSelector, useContexts } from "./contexts";
+import type { ContextSelection } from "../types/context";
 
 // Types for the prompt library
 // Simplified model: every task runs until [TASK_COMPLETE] marker is found
@@ -202,6 +204,15 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
   // Active task runs state
   const [taskRuns, setTaskRuns] = useState<TaskRun[]>([]);
   const [showTaskRuns, setShowTaskRuns] = useState(false);
+
+  // Context selection state for running tasks
+  const [contextSelection, setContextSelection] = useState<ContextSelection>({
+    selectedIds: [],
+    autoDetect: true,
+  });
+
+  // Context hook for getting selected context content
+  const { getSelectedContextsContent, recordUsage } = useContexts();
 
   // Load prompts on mount
   useEffect(() => {
@@ -400,13 +411,26 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     onLog("info", `Running task: ${prompt.name}`);
 
     try {
+      // Build the full prompt with context content
+      let fullPrompt = prompt.content;
+
+      // Include selected contexts if any
+      if (contextSelection.selectedIds.length > 0) {
+        const contextContent = getSelectedContextsContent(contextSelection);
+        if (contextContent) {
+          fullPrompt = `# Context\n\n${contextContent}\n\n---\n\n# Task\n\n${prompt.content}`;
+          // Record context usage
+          recordUsage(contextSelection.selectedIds);
+        }
+      }
+
       // Use unified sessions API - every task runs until [TASK_COMPLETE]
       const response = await fetch(`${API_BASE}/sessions/start`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: prompt.name,
-          prompt: prompt.content,
+          prompt: fullPrompt,
           uses_gui: false,
           timeout_seconds: 1800,
         }),
@@ -654,6 +678,15 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             </option>
           ))}
         </select>
+      </div>
+
+      {/* Context Selection - compact mode for selecting contexts to include when running tasks */}
+      <div className="card p-4 border border-border">
+        <ContextSelector
+          selection={contextSelection}
+          onSelectionChange={setContextSelection}
+          compact={true}
+        />
       </div>
 
       {/* Create/Edit Form */}

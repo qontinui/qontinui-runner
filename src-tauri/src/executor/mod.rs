@@ -1,6 +1,7 @@
 pub mod event_handler;
 pub mod events;
 pub mod file_logger;
+pub mod flakiness;
 pub mod health;
 pub mod lifecycle;
 pub mod output;

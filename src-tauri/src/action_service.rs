@@ -381,7 +381,7 @@ impl UnifiedActionService {
 
         // Start the workflow execution
         let app_state = self.app_state.clone();
-        let _start_result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
                 warn!("python_bridge mutex was poisoned, recovering");
                 poisoned.into_inner()

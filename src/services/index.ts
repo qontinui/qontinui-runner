@@ -41,6 +41,10 @@ export { StateDetectionService } from "./StateDetectionService";
 export { IssueTracker, issueTracker } from "./IssueTracker";
 export type { IssueTrackerEventType, IssueTrackerEvent } from "./IssueTracker";
 
+// Session Management Services
+export { SessionManager, sessionManager } from "./SessionManager";
+export type { SessionContext, SessionStatus, SessionChangeListener } from "./SessionManager";
+
 // Issue Sync Services (runner → web backend)
 export {
   syncIssuesToBackend,
@@ -101,12 +105,31 @@ export type {
   ExecutionIssueCreate,
 } from "./ExecutionReportingService";
 
-// Legacy Test Run Reporting Services (deprecated - use ExecutionReportingService)
-// @deprecated Use ExecutionReportingService instead
+// Report Persistence Services (unified local + backend persistence)
+export { ReportPersistenceService, reportPersistenceService } from "./ReportPersistenceService";
+export type { BackendConfig, SyncResult, PendingSyncItem } from "./ReportPersistenceService";
+
+// Unified Report Service (aggregates findings + issues)
+export { UnifiedReportService, unifiedReportService } from "./UnifiedReportService";
+export type {
+  UnifiedReportItem,
+  UnifiedSeverity,
+  UnifiedStatus,
+  UnifiedReportSummary,
+  UnifiedReportEventType,
+  UnifiedReportEvent,
+} from "./UnifiedReportService";
+
+// Statistics Service (Tiered Information Model dashboard)
 export {
-  testRunReportingService,
-  startTestRun,
-  reportTransition,
-  completeTestRun,
-} from "./TestRunReportingService";
-export type { TransitionData } from "./TestRunReportingService";
+  statisticsService,
+  isSuccess,
+  unwrapResponse,
+  calculateSuccessRate,
+  formatDuration,
+  getAnomalySeverityColor,
+  getRunStatusColor,
+} from "./statistics-service";
+
+// Discoveries Service (Discovery Push mechanism)
+export { discoveriesService } from "./discoveries-service";

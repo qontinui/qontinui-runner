@@ -5,7 +5,7 @@
  * Shows a summary of issues by status and severity, with expandable details.
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import {
   AlertTriangle,
   CheckCircle,
@@ -24,15 +24,14 @@ import {
   Loader2,
 } from "lucide-react";
 import {
-  DetectedIssue,
-  IssueSessionSummary,
   SEVERITY_CONFIG,
   STATUS_CONFIG,
   SOURCE_TYPE_LABELS,
   IssueSourceType,
 } from "../types/issues";
-import { issueTracker, IssueTrackerEvent } from "../services/IssueTracker";
-import { useAiTaskPolling } from "../hooks";
+import { useIssues, useAiTaskPolling } from "../hooks";
+import type { UnifiedReportItem, UnifiedStatus } from "../services/UnifiedReportService";
+import { issueTracker } from "../services/IssueTracker";
 
 // Component is self-contained with expand/collapse functionality
 type IssuesPanelProps = Record<string, never>;
@@ -132,28 +131,11 @@ Work autonomously. Fix what you can, categorize everything appropriately.`;
 }
 
 export function IssuesPanel(_props: IssuesPanelProps) {
-  const [issues, setIssues] = useState<DetectedIssue[]>([]);
-  const [summary, setSummary] = useState<IssueSessionSummary | null>(null);
+  // Use unified issues hook for reactive data
+  const { items: issues, summary, resolveItem, updateItemStatus, clearSession } = useIssues();
+
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-
-  // Subscribe to issue changes
-  useEffect(() => {
-    const updateIssues = () => {
-      setIssues(issueTracker.getSessionIssues());
-      setSummary(issueTracker.getSessionSummary());
-    };
-
-    // Initial load
-    updateIssues();
-
-    // Subscribe to changes
-    const unsubscribe = issueTracker.subscribe((_event: IssueTrackerEvent) => {
-      updateIssues();
-    });
-
-    return unsubscribe;
-  }, []);
 
   const toggleExpanded = useCallback((issueId: string) => {
     setExpandedIssues((prev) => {
@@ -170,19 +152,17 @@ export function IssuesPanel(_props: IssuesPanelProps) {
   const handleStatusChange = useCallback(
     (issueId: string, newStatus: "in_progress" | "resolved" | "skipped") => {
       if (newStatus === "resolved") {
-        issueTracker.resolveIssue(issueId, "Manually marked as resolved");
-      } else if (newStatus === "skipped") {
-        issueTracker.skipIssue(issueId);
+        resolveItem(issueId, "Manually marked as resolved");
       } else {
-        issueTracker.updateIssueStatus(issueId, newStatus);
+        updateItemStatus(issueId, newStatus as UnifiedStatus);
       }
     },
-    [],
+    [resolveItem, updateItemStatus],
   );
 
   const handleClearAll = useCallback(() => {
-    issueTracker.clearSession();
-  }, []);
+    clearSession();
+  }, [clearSession]);
 
   // AI task polling hook for analyze and fix
   const { triggerTask: triggerAnalyzeAndFix } = useAiTaskPolling({
@@ -281,21 +261,21 @@ export function IssuesPanel(_props: IssuesPanelProps) {
           {/* Status counts */}
           <div className="grid grid-cols-4 gap-2 mb-3">
             <div className="flex flex-col items-center p-2 rounded bg-red-500/10">
-              <span className="text-lg font-bold text-red-400">{summary.by_status.detected}</span>
+              <span className="text-lg font-bold text-red-400">{summary.byStatus.detected}</span>
               <span className="text-xs text-muted-foreground">Detected</span>
             </div>
             <div className="flex flex-col items-center p-2 rounded bg-yellow-500/10">
               <span className="text-lg font-bold text-yellow-400">
-                {summary.by_status.in_progress}
+                {summary.byStatus.in_progress}
               </span>
               <span className="text-xs text-muted-foreground">In Progress</span>
             </div>
             <div className="flex flex-col items-center p-2 rounded bg-green-500/10">
-              <span className="text-lg font-bold text-green-400">{summary.by_status.resolved}</span>
+              <span className="text-lg font-bold text-green-400">{summary.byStatus.resolved}</span>
               <span className="text-xs text-muted-foreground">Resolved</span>
             </div>
             <div className="flex flex-col items-center p-2 rounded bg-gray-500/10">
-              <span className="text-lg font-bold text-gray-400">{summary.by_status.skipped}</span>
+              <span className="text-lg font-bold text-gray-400">{summary.byStatus.skipped}</span>
               <span className="text-xs text-muted-foreground">Skipped</span>
             </div>
           </div>
@@ -303,7 +283,7 @@ export function IssuesPanel(_props: IssuesPanelProps) {
           {/* Severity breakdown */}
           <div className="flex gap-4 text-xs">
             {(["critical", "high", "medium", "low"] as const).map((severity) => {
-              const count = summary.by_severity[severity];
+              const count = summary.bySeverity[severity];
               if (count === 0) return null;
               const config = SEVERITY_CONFIG[severity];
               return (
@@ -357,12 +337,14 @@ export function IssuesPanel(_props: IssuesPanelProps) {
                   </span>
 
                   {/* Source indicator */}
-                  <span
-                    className="flex items-center gap-1 text-xs text-muted-foreground"
-                    title={SOURCE_TYPE_LABELS[issue.source.type]}
-                  >
-                    {SOURCE_ICONS[issue.source.type]}
-                  </span>
+                  {issue.originalIssue?.source && (
+                    <span
+                      className="flex items-center gap-1 text-xs text-muted-foreground"
+                      title={SOURCE_TYPE_LABELS[issue.originalIssue.source.type]}
+                    >
+                      {SOURCE_ICONS[issue.originalIssue.source.type]}
+                    </span>
+                  )}
                 </div>
 
                 {/* Expanded Details */}
@@ -387,16 +369,20 @@ export function IssuesPanel(_props: IssuesPanelProps) {
                     )}
 
                     {/* Source */}
-                    <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                      {SOURCE_ICONS[issue.source.type]}
-                      <span>
-                        Found in:{" "}
-                        {issue.source.description || SOURCE_TYPE_LABELS[issue.source.type]}
-                        {issue.source.path && ` (${issue.source.path})`}
-                        {issue.source.line_range &&
-                          ` lines ${issue.source.line_range[0]}-${issue.source.line_range[1]}`}
-                      </span>
-                    </div>
+                    {issue.originalIssue?.source && (
+                      <div className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                        {SOURCE_ICONS[issue.originalIssue.source.type]}
+                        <span>
+                          Found in:{" "}
+                          {issue.originalIssue.source.description ||
+                            SOURCE_TYPE_LABELS[issue.originalIssue.source.type]}
+                          {issue.originalIssue.source.path &&
+                            ` (${issue.originalIssue.source.path})`}
+                          {issue.originalIssue.source.line_range &&
+                            ` lines ${issue.originalIssue.source.line_range[0]}-${issue.originalIssue.source.line_range[1]}`}
+                        </span>
+                      </div>
+                    )}
 
                     {/* Resolution */}
                     {issue.resolution && (
@@ -408,9 +394,9 @@ export function IssuesPanel(_props: IssuesPanelProps) {
 
                     {/* Timestamps */}
                     <div className="mt-2 flex gap-4 text-xs text-muted-foreground">
-                      <span>Detected: {new Date(issue.detected_at).toLocaleTimeString()}</span>
-                      {issue.resolved_at && (
-                        <span>Resolved: {new Date(issue.resolved_at).toLocaleTimeString()}</span>
+                      <span>Detected: {new Date(issue.detectedAt).toLocaleTimeString()}</span>
+                      {issue.resolvedAt && (
+                        <span>Resolved: {new Date(issue.resolvedAt).toLocaleTimeString()}</span>
                       )}
                     </div>
 

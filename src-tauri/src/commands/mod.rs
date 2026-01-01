@@ -5,12 +5,15 @@
 //!
 //! # Module Organization
 //!
+//! - `ai_verification` - AI verification agent for state machine exploration
 //! - `auth` - Authentication and device management
 //! - `config` - Configuration file loading and management
 //! - `dataset` - Dataset packaging and YOLO format export
 //! - `debug` - Debug settings management
 //! - `execution` - Python executor lifecycle and workflow execution
 //! - `extraction` - Web GUI extraction and training data export
+//! - `discoveries` - Discovery Push mechanism for syncing detected patterns
+//! - `findings` - AI-detected findings (issues, bugs, questions)
 //! - `project_logs` - Project-specific log management and external log sources
 //! - `screenshot` - Screenshot capture operations
 //! - `state_machine` - State navigation and transition execution
@@ -27,6 +30,7 @@ use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
 use crate::executor::PythonBridge;
 use crate::storage::LocalStorage;
+use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -35,14 +39,18 @@ use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
 pub mod ai_settings;
+pub mod ai_verification;
 pub mod auth;
 pub mod checkpoints;
 pub mod config;
+pub mod context;
 pub mod dataset;
 pub mod debug;
+pub mod discoveries;
 pub mod execution;
 pub mod execution_reporting;
 pub mod extraction;
+pub mod findings;
 pub mod issues;
 pub mod logging;
 pub mod playwright_settings;
@@ -51,7 +59,7 @@ pub mod rag;
 pub mod screenshot;
 pub mod state_machine;
 pub mod storage;
-pub mod testing;
+pub mod tiered_info;
 pub mod verification;
 pub mod video;
 pub mod websocket;
@@ -68,6 +76,7 @@ pub mod websocket;
 /// - Video recording service
 /// - Event broadcast channel for WebSocket clients
 /// - Checkpoint database for persistent storage
+/// - Run recording handler for automatic run recording
 pub struct AppState {
     pub python_bridge: Mutex<Option<PythonBridge>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
@@ -79,6 +88,9 @@ pub struct AppState {
     pub event_broadcast: broadcast::Sender<serde_json::Value>,
     /// SQLite database for checkpoints, sessions, settings, and scheduler state.
     pub checkpoint_db: Arc<CheckpointDb>,
+    /// Run recording handler for automatic workflow execution recording.
+    /// Records runs to the Tiered Information system.
+    pub run_recording_handler: Arc<RunRecordingHandler>,
 }
 
 /// Standard response structure for command handlers.

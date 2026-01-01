@@ -1327,6 +1327,20 @@ class QontinuiExecutor:
         elif cmd_type == "segment_screenshot":
             return self._handle_segment_screenshot(params)
 
+        # Verification Agent commands
+        elif cmd_type == "detect_current_states":
+            return self._handle_detect_current_states(params)
+
+        elif cmd_type == "verify_elements":
+            return self._handle_verify_elements(params)
+
+        elif cmd_type == "verification_capture_screenshot":
+            return self._handle_verification_capture_screenshot(params)
+
+        # Flakiness-aware execution commands
+        elif cmd_type == "get_flakiness_options":
+            return self._handle_get_flakiness_options(params)
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -1910,6 +1924,380 @@ class QontinuiExecutor:
             )
             self.event_manager.emit_log("error", f"Failed to execute workflow: {e}")
             return {"success": False, "error": str(e)}
+
+    def _handle_detect_current_states(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle detect_current_states command for AI Verification Agent.
+
+        This command detects which of the specified states are currently active
+        by checking for their identifying images on the screen.
+
+        Args:
+            params: Command parameters:
+                - state_ids: List of state IDs to check
+                - monitor_index: Optional monitor index (0-based)
+                - capture_screenshot: Whether to capture and return screenshot
+
+        Returns:
+            Dictionary with:
+                - success: Whether detection completed
+                - detected_states: List of state IDs that are currently active
+                - detection_details: Per-state detection results
+                - screenshot_base64: Optional screenshot if requested
+                - detection_time_ms: Total detection time
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_detect_current_states called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                    "detected_states": [],
+                    "detection_details": [],
+                }
+
+            if not self.config:
+                return {
+                    "success": False,
+                    "error": "Configuration not loaded",
+                    "detected_states": [],
+                    "detection_details": [],
+                }
+
+            # Import verification service
+            from services.verification_service import VerificationService
+
+            # Create verification service with current config
+            verification_service = VerificationService(
+                state_executor=self.executor_core.state_executor if self.executor_core else None,
+                action_executor=self.executor_core.action_executor if self.executor_core else None,
+                config=self.config,
+            )
+
+            # Set screenshot directory if capture is requested
+            capture_screenshot = params.get("capture_screenshot", False)
+            if capture_screenshot:
+                dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs" / "verification"
+                verification_service.set_screenshot_directory(dev_logs_dir)
+
+            # Detect states
+            state_ids = params.get("state_ids", [])
+            monitor_index = params.get("monitor_index")
+
+            result = verification_service.detect_current_states(
+                state_ids=state_ids,
+                monitor_index=monitor_index,
+            )
+
+            self.event_manager.emit_log(
+                "info",
+                f"State detection complete: {len(result.get('detected_states', []))} states detected",
+            )
+
+            return result
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to detect states: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to detect states: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "detected_states": [],
+                "detection_details": [],
+            }
+
+    def _handle_verify_elements(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle verify_elements command for AI Verification Agent.
+
+        This command verifies the presence of expected elements and absence
+        of unexpected elements on the screen.
+
+        Args:
+            params: Command parameters:
+                - expected_elements: List of image IDs that should be visible
+                - unexpected_elements: List of image IDs that should NOT be visible
+                - monitor_index: Optional monitor index (0-based)
+
+        Returns:
+            Dictionary with:
+                - success: Whether verification completed
+                - all_expected_found: True if all expected elements were found
+                - no_unexpected_found: True if no unexpected elements were found
+                - expected_results: Per-element results for expected elements
+                - unexpected_results: Per-element results for unexpected elements
+                - verification_time_ms: Total verification time
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_verify_elements called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                    "all_expected_found": False,
+                    "no_unexpected_found": True,
+                    "expected_results": [],
+                    "unexpected_results": [],
+                }
+
+            if not self.config:
+                return {
+                    "success": False,
+                    "error": "Configuration not loaded",
+                    "all_expected_found": False,
+                    "no_unexpected_found": True,
+                    "expected_results": [],
+                    "unexpected_results": [],
+                }
+
+            # Import verification service
+            from services.verification_service import VerificationService
+
+            # Create verification service with current config
+            verification_service = VerificationService(
+                state_executor=self.executor_core.state_executor if self.executor_core else None,
+                action_executor=self.executor_core.action_executor if self.executor_core else None,
+                config=self.config,
+            )
+
+            # Verify elements
+            expected_elements = params.get("expected_elements", [])
+            unexpected_elements = params.get("unexpected_elements", [])
+            monitor_index = params.get("monitor_index")
+
+            result = verification_service.verify_elements(
+                expected_elements=expected_elements,
+                unexpected_elements=unexpected_elements,
+                monitor_index=monitor_index,
+            )
+
+            self.event_manager.emit_log(
+                "info",
+                f"Element verification complete: expected_found={result.get('all_expected_found')}, "
+                f"no_unexpected={result.get('no_unexpected_found')}",
+            )
+
+            return result
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to verify elements: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to verify elements: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+                "all_expected_found": False,
+                "no_unexpected_found": True,
+                "expected_results": [],
+                "unexpected_results": [],
+            }
+
+    def _handle_verification_capture_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle verification_capture_screenshot command for AI Verification Agent.
+
+        This command captures a screenshot specifically for verification documentation.
+        It uses the VerificationService to capture and optionally save the screenshot.
+
+        Args:
+            params: Command parameters:
+                - context: Context string for naming (e.g., state_id)
+                - monitor_index: Optional monitor index (0-based)
+                - save_to_file: Whether to save to file (default: True)
+                - output_directory: Optional output directory path
+
+        Returns:
+            Dictionary with:
+                - success: Whether capture succeeded
+                - screenshot_base64: Base64 encoded PNG data
+                - file_path: Path where screenshot was saved (if save_to_file=True)
+                - width: Screenshot width in pixels
+                - height: Screenshot height in pixels
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_verification_capture_screenshot called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            # Import verification service
+            from services.verification_service import VerificationService
+
+            # Create verification service
+            verification_service = VerificationService(
+                state_executor=self.executor_core.state_executor if self.executor_core else None,
+                action_executor=self.executor_core.action_executor if self.executor_core else None,
+                config=self.config,
+            )
+
+            # Set output directory
+            output_directory = params.get("output_directory")
+            if output_directory:
+                verification_service.set_screenshot_directory(output_directory)
+            else:
+                dev_logs_dir = (
+                    Path(__file__).parent.parent.parent
+                    / ".dev-logs"
+                    / "verification"
+                    / "screenshots"
+                )
+                verification_service.set_screenshot_directory(dev_logs_dir)
+
+            # Capture screenshot
+            context = params.get("context", "verification")
+            monitor_index = params.get("monitor_index")
+            save_to_file = params.get("save_to_file", True)
+
+            result = verification_service.capture_screenshot(
+                context=context,
+                monitor_index=monitor_index,
+                save_to_file=save_to_file,
+            )
+
+            if result.get("success"):
+                self.event_manager.emit_log(
+                    "info",
+                    f"Verification screenshot captured: {result.get('width')}x{result.get('height')} pixels",
+                )
+            else:
+                self.event_manager.emit_log(
+                    "error",
+                    f"Failed to capture verification screenshot: {result.get('error')}",
+                )
+
+            return result
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to capture verification screenshot: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to capture verification screenshot: {e}")
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    def _handle_get_flakiness_options(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Get flakiness-aware execution options for a transition or template.
+
+        This command is called before executing transitions or matching templates
+        to get adjusted execution options based on historical flakiness data.
+
+        The actual flakiness data is stored in the Rust runner's SQLite database.
+        This Python handler provides a convenient way to query it and cache
+        the options for use during execution.
+
+        Args:
+            params: Command parameters:
+                - config_id: Configuration ID to load flakiness data for
+                - transition_id: Optional transition ID (format: "FromState|ToState")
+                - template_id: Optional template/image ID
+
+        Returns:
+            Dictionary with:
+                - success: Whether the query succeeded
+                - options: ExecutionOptions dict with:
+                    - retry_count: Number of retry attempts
+                    - timeout_multiplier: Multiplier for timeout duration
+                    - confidence_threshold: Confidence threshold for matching
+                    - use_alternative_path: Whether to use alternative path
+                - is_flaky: Whether the item is known to be flaky
+        """
+        import sys
+
+        config_id = params.get("config_id")
+        transition_id = params.get("transition_id")
+        template_id = params.get("template_id")
+
+        print(
+            f"[info    ] EXECUTOR: _handle_get_flakiness_options: config_id={config_id}, "
+            f"transition_id={transition_id}, template_id={template_id}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        # Default execution options
+        default_options = {
+            "retry_count": 1,
+            "timeout_multiplier": 1.0,
+            "confidence_threshold": 0.8,
+            "use_alternative_path": False,
+        }
+
+        if not config_id:
+            return {
+                "success": True,
+                "options": default_options,
+                "is_flaky": False,
+                "note": "No config_id provided, returning defaults",
+            }
+
+        # Note: The actual flakiness data is queried via Tauri commands from the Rust side.
+        # This Python handler is primarily for cases where the Python executor needs to
+        # make decisions about execution strategy before calling back to Rust.
+        #
+        # For most use cases, the frontend or Rust code should call the Tauri command
+        # `get_execution_options` directly.
+        #
+        # Here we return sensible defaults and let the caller know they should
+        # query the Rust side for accurate flakiness data.
+
+        self.event_manager.emit_log(
+            "debug",
+            f"Flakiness options requested for config={config_id}, "
+            f"transition={transition_id}, template={template_id}",
+        )
+
+        return {
+            "success": True,
+            "options": default_options,
+            "is_flaky": False,
+            "note": "Query Rust get_execution_options command for accurate flakiness data",
+        }
 
     def __del__(self):
         """Clean up resources on exit."""

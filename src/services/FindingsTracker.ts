@@ -27,6 +27,7 @@ import {
   loadFindingsData,
   archiveSession,
 } from "../findings/FindingsPersistence";
+import { reportPersistenceService } from "./ReportPersistenceService";
 import {
   getAllFindings as queryGetAllFindings,
   getSessionFindings as queryGetSessionFindings,
@@ -691,14 +692,19 @@ export class FindingsTracker {
    * Archive the current session to history
    * Called when a session ends (completes, fails, or times out)
    */
-  archiveCurrentSession(
+  async archiveCurrentSession(
     status: "completed" | "failed" | "timeout" | "context_limit" = "completed",
-  ): void {
+  ): Promise<void> {
     const currentReport = this.getCurrentReport();
     if (!currentReport) {
       console.log("[FindingsTracker] No current report to archive");
       return;
     }
+
+    // Complete the report before archiving
+    const completedReport = this.completeReport(
+      status === "timeout" || status === "context_limit" ? "failed" : status,
+    );
 
     const sessionFindings = this.getSessionFindings();
     this.sessionHistory = archiveSession(
@@ -709,8 +715,24 @@ export class FindingsTracker {
       status,
     );
 
-    // Persist to disk
+    // Persist to local disk
     this.persistToDisk();
+
+    // Sync to backend via ReportPersistenceService
+    if (completedReport) {
+      try {
+        console.log("[FindingsTracker] Syncing report to backend...");
+        await reportPersistenceService.saveReport(completedReport);
+
+        if (sessionFindings.length > 0) {
+          console.log(`[FindingsTracker] Syncing ${sessionFindings.length} findings to backend...`);
+          await reportPersistenceService.saveFindings(sessionFindings);
+        }
+      } catch (error) {
+        console.error("[FindingsTracker] Backend sync failed (will retry):", error);
+        // ReportPersistenceService handles retry queue internally
+      }
+    }
 
     console.log(
       `[FindingsTracker] Session archived: ${currentReport.promptName} (${currentReport.id}) - ${status}`,

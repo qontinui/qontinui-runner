@@ -77,6 +77,9 @@ use crate::commands::rag::{send_embeddings_to_web, RAGState};
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
 use crate::config_storage::{ConfigMetadata, ConfigStorage, StoredConfig};
+use crate::context;
+use crate::findings::storage as finding_storage;
+use crate::findings::{Finding, FindingParser, ParsedFinding};
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
 use crate::session::SessionManager;
@@ -191,6 +194,9 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
 ///
 /// This is the new "in-runner" execution model that replaces independent process spawning.
 /// Claude runs as a child process, we wait for completion, then check checkpoint to continue.
+///
+/// If `finding_ctx` is provided, the function will parse AI output for [FINDING:...] markers
+/// and store detected findings in the database, emitting events for each finding.
 fn run_claude_session_inline(
     working_dir: &str,
     prompt: &str,
@@ -198,6 +204,7 @@ fn run_claude_session_inline(
     app_handle: &tauri::AppHandle,
     timeout_seconds: u64,
     session_ctx: Option<AiOutputSessionContext>,
+    finding_ctx: Option<FindingContext>,
 ) -> Result<(bool, String), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -319,14 +326,25 @@ fn run_claude_session_inline(
         }
     });
 
+    // Channel for parsed findings (sent from stdout thread to finding processor thread)
+    let (finding_tx, finding_rx) = mpsc::channel::<ParsedFinding>();
+
     // Stdout reader thread
     let stdout = child.stdout.take();
     let app_handle_stdout = app_handle.clone();
     let has_output_stdout = has_output.clone();
     let session_ctx_stdout = session_ctx.clone();
+    let finding_ctx_for_stdout = finding_ctx.clone();
 
     let stdout_handle = thread::spawn(move || {
         let mut all_text = String::new();
+        // Create finding parser if we have a finding context
+        let mut finding_parser = if finding_ctx_for_stdout.is_some() {
+            Some(FindingParser::new())
+        } else {
+            None
+        };
+
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
@@ -350,12 +368,129 @@ fn run_claude_session_inline(
                                 session_ctx_stdout.as_ref(),
                             );
                         }));
+
+                        // Parse each line for findings
+                        if let Some(ref mut parser) = finding_parser {
+                            // Process each line of the text for finding markers
+                            for text_line in text.lines() {
+                                if let Some(parsed_finding) = parser.process_line(text_line) {
+                                    // Send the parsed finding to the processor thread
+                                    let _ = finding_tx.send(parsed_finding);
+                                }
+                            }
+                        }
+
                         all_text.push_str(&text);
                     }
                 }
             }
         }
         all_text
+    });
+
+    // Finding processor thread - stores findings in DB and emits events
+    let app_handle_findings = app_handle.clone();
+    let finding_ctx_for_processor = finding_ctx.clone();
+    let session_ctx_for_findings = session_ctx.clone();
+
+    let finding_processor_handle = thread::spawn(move || {
+        let mut detected_findings: Vec<Finding> = Vec::new();
+
+        // Only process if we have a finding context
+        if let Some(ctx) = finding_ctx_for_processor {
+            // Open a database connection for this thread
+            let db = match CheckpointDb::new() {
+                Ok(db) => Some(db),
+                Err(e) => {
+                    warn!("Failed to open database for finding storage: {}", e);
+                    None
+                }
+            };
+
+            // Process incoming findings from the channel
+            while let Ok(parsed_finding) = finding_rx.recv() {
+                // Log the detection
+                info!(
+                    "Detected finding: {} ({}:{})",
+                    parsed_finding.title,
+                    parsed_finding.category.as_str(),
+                    parsed_finding.severity.as_str()
+                );
+
+                // Store in database if connection is available
+                if let Some(ref db) = db {
+                    // Get a connection from the pool for this operation
+                    let conn = match db.connection() {
+                        Ok(c) => c,
+                        Err(e) => {
+                            warn!("Failed to get database connection: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Check if this is a resolved finding (marked via :resolved modifier)
+                    let is_resolved = parsed_finding.is_resolved;
+
+                    match finding_storage::insert_finding(
+                        &conn,
+                        &ctx.task_run_id,
+                        ctx.session_num,
+                        &parsed_finding,
+                    ) {
+                        Ok(finding) => {
+                            // Emit appropriate event to frontend based on status
+                            let event_name = if is_resolved {
+                                "finding_resolved"
+                            } else {
+                                "finding_detected"
+                            };
+
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                if let Err(e) = app_handle_findings.emit(event_name, &finding) {
+                                    warn!("Failed to emit {} event: {}", event_name, e);
+                                }
+                            }));
+
+                            // Also emit as AI output for visibility in the session log
+                            let finding_msg = if is_resolved {
+                                format!(
+                                    "✅ Finding resolved: [{}:{}] {}",
+                                    finding.category.as_str(),
+                                    finding.severity.as_str(),
+                                    finding.title
+                                )
+                            } else {
+                                format!(
+                                    "📋 Finding detected: [{}:{}] {}",
+                                    finding.category.as_str(),
+                                    finding.severity.as_str(),
+                                    finding.title
+                                )
+                            };
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                emit_ai_output(
+                                    &app_handle_findings,
+                                    &finding_msg,
+                                    "finding",
+                                    None,
+                                    session_ctx_for_findings.as_ref(),
+                                );
+                            }));
+
+                            detected_findings.push(finding);
+                        }
+                        Err(e) => {
+                            warn!("Failed to store finding '{}': {}", parsed_finding.title, e);
+                        }
+                    }
+                }
+            }
+        } else {
+            // No finding context - just drain the channel to avoid blocking
+            while finding_rx.recv().is_ok() {}
+        }
+
+        detected_findings
     });
 
     // Stderr reader thread
@@ -411,7 +546,19 @@ fn run_claude_session_inline(
     let _ = heartbeat_handle.join();
     let all_output = stdout_handle.join().unwrap_or_default();
     let stderr_output = stderr_handle.join().unwrap_or_default();
+    // Wait for the finding processor thread to complete
+    // (it will exit when the stdout thread closes the channel sender)
+    let detected_findings = finding_processor_handle.join().unwrap_or_default();
     let _ = std::fs::remove_file(&prompt_file);
+
+    // Log summary of detected findings
+    if !detected_findings.is_empty() {
+        info!(
+            "Session {} detected {} findings",
+            session_id,
+            detected_findings.len()
+        );
+    }
 
     // Emit stderr if any
     if !stderr_output.is_empty() {
@@ -430,10 +577,11 @@ fn run_claude_session_inline(
 
     let success = status.success();
     info!(
-        "Session {} completed: success={}, output_len={}",
+        "Session {} completed: success={}, output_len={}, findings={}",
         session_id,
         success,
-        all_output.len()
+        all_output.len(),
+        detected_findings.len()
     );
 
     Ok((success, all_output))
@@ -2652,6 +2800,14 @@ pub struct RunPromptRequest {
     /// Maximum number of screenshots to extract from trace (default: 5)
     #[serde(default)]
     pub max_trace_screenshots: Option<usize>,
+
+    // Context injection options
+    /// Context IDs to explicitly include in the prompt
+    #[serde(default)]
+    pub context_ids: Option<Vec<String>>,
+    /// Whether to auto-detect and include relevant contexts (default: false)
+    #[serde(default)]
+    pub auto_include_contexts: Option<bool>,
 }
 
 /// Response from running a prompt
@@ -2756,6 +2912,16 @@ pub struct AiOutputEvent {
 pub struct AiOutputSessionContext {
     pub session_id: Option<String>,
     pub session_name: Option<String>,
+}
+
+/// Context for finding detection during AI sessions.
+/// Contains the information needed to store findings in the database.
+#[derive(Debug, Clone)]
+pub struct FindingContext {
+    /// The task_run_id for storing findings (same as session_id in most cases)
+    pub task_run_id: String,
+    /// The current session/phase number within the task run
+    pub session_num: u32,
 }
 
 // ============================================================================
@@ -3476,6 +3642,70 @@ async fn run_prompt(
     // Build enhanced prompt with trace timeline and image references if available
     let mut enhanced_prompt = prompt_content.clone();
 
+    // Inject contexts into the prompt if requested
+    let context_ids = request.context_ids.unwrap_or_default();
+    let auto_include_contexts = request.auto_include_contexts.unwrap_or(false);
+
+    // Extract action types from loaded config for auto-detection
+    let action_types: Vec<String> = {
+        let config_lock = state.app_state.current_config.lock().unwrap();
+        if let Some(ref config) = *config_lock {
+            // Extract action types from workflows
+            config
+                .workflows
+                .iter()
+                .flat_map(|w| {
+                    w.get("actions")
+                        .and_then(|a| a.as_array())
+                        .map(|actions| {
+                            actions
+                                .iter()
+                                .filter_map(|action| {
+                                    action
+                                        .get("type")
+                                        .and_then(|t| t.as_str())
+                                        .map(String::from)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    };
+
+    // For now, we pass an empty error list for auto-detection
+    // In the future, this could be populated from recent log errors
+    let recent_errors: Vec<String> = Vec::new();
+
+    // Inject contexts and track which ones were used
+    let (prompt_with_contexts, used_context_ids) =
+        if !context_ids.is_empty() || auto_include_contexts {
+            let (enhanced, used_ids) = context::inject_contexts(
+                &enhanced_prompt,
+                &context_ids,
+                auto_include_contexts,
+                &prompt_content, // Use original prompt for auto-detection matching
+                &action_types,
+                &recent_errors,
+            );
+
+            if !used_ids.is_empty() {
+                info!(
+                    "MCP API: Injected {} contexts into prompt: {:?}",
+                    used_ids.len(),
+                    used_ids
+                );
+            }
+
+            (enhanced, used_ids)
+        } else {
+            (enhanced_prompt.clone(), Vec::new())
+        };
+    enhanced_prompt = prompt_with_contexts;
+
     // Prepend runner-triggered context and supervisor instructions
     // This tells the AI session how to safely restart the runner if needed
     let supervisor_available = check_supervisor_available();
@@ -3703,6 +3933,11 @@ Use this format for any bugs, issues, or notable items you discover during analy
         Some(&task_run_id),
         Some(&session_ctx),
     );
+
+    // Record context usage now that the session is starting
+    if !used_context_ids.is_empty() {
+        context::record_contexts_used(&used_context_ids);
+    }
 
     let prompt_name_for_state = prompt_name.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -5163,17 +5398,35 @@ async fn force_continue_session(
             task.output_log.clone()
         };
 
-        // Create continuation prompt using task's prompt and output context
+        // Get findings context from database for this task run
+        let findings_context = state
+            .app_state
+            .checkpoint_db
+            .format_findings_for_continuation_prompt(&task.id)
+            .unwrap_or_else(|e| {
+                warn!("Failed to get findings context: {}", e);
+                String::new()
+            });
+
+        // Create continuation prompt using task's prompt, output context, and findings
         let continuation_prompt = request.prompt.unwrap_or_else(|| {
-            format!(
+            let mut prompt = format!(
                 "{}\n\n## Force Continue (Session #{})\n\n\
                 The previous session was interrupted. Here's the output from the previous session:\n\n\
-                ### Previous Session Output\n```\n{}\n```\n\n\
-                Continue the task from where you left off. When complete, print [TASK_COMPLETE].",
+                ### Previous Session Output\n```\n{}\n```\n\n",
                 task.prompt,
                 task.sessions_count + 1,
                 output_context
-            )
+            );
+
+            // Include findings context if there are any findings
+            if !findings_context.is_empty() {
+                prompt.push_str(&findings_context);
+                prompt.push_str("\n\n");
+            }
+
+            prompt.push_str("Continue the task from where you left off. When complete, print [TASK_COMPLETE].");
+            prompt
         });
 
         // Create session name
@@ -5557,18 +5810,34 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
             task.output_log.clone()
         };
 
-        let continuation_prompt = format!(
+        // Get findings context from database for this task run
+        let findings_context = db
+            .format_findings_for_continuation_prompt(&task.id)
+            .unwrap_or_else(|e| {
+                warn!("Failed to get findings context for resume: {}", e);
+                String::new()
+            });
+
+        // Build continuation prompt including findings context
+        let mut continuation_prompt = format!(
             "{}\n\n\
             ## Resume After Runner Restart (Session #{})\n\n\
             This session is resuming after a runner restart. \
             Read the previous output below to understand context and continue from where the last session left off.\n\n\
             ### Previous Session Output\n\
-            ```\n{}\n```\n\n\
-            Continue the task. When complete, print [TASK_COMPLETE].\n",
+            ```\n{}\n```\n\n",
             task.prompt,
             task.sessions_count + 1,
             output_context
         );
+
+        // Include findings context if there are any findings
+        if !findings_context.is_empty() {
+            continuation_prompt.push_str(&findings_context);
+            continuation_prompt.push_str("\n\n");
+        }
+
+        continuation_prompt.push_str("Continue the task. When complete, print [TASK_COMPLETE].\n");
 
         // Create session config
         let session_config = SessionConfig {
@@ -5757,6 +6026,13 @@ async fn run_unified_session_loop(
         let timeout_secs = timeout;
         let ctx_for_claude = Some(session_ctx.clone());
 
+        // Create finding context for this phase
+        // The session_id is used as the task_run_id for finding storage
+        let finding_ctx_for_claude = Some(FindingContext {
+            task_run_id: session_id.clone(),
+            session_num: phase,
+        });
+
         let result = tokio::task::spawn_blocking(move || {
             run_claude_session_inline(
                 &workspace,
@@ -5765,6 +6041,7 @@ async fn run_unified_session_loop(
                 &handle,
                 timeout_secs,
                 ctx_for_claude,
+                finding_ctx_for_claude,
             )
         })
         .await;
@@ -6523,6 +6800,339 @@ async fn export_config(
 // End Config Storage HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// AI Verification Agent HTTP API Handlers
+// ============================================================================
+
+use crate::verification_agent::{
+    ExplorationStrategy, StateExplorer, StateMachineGraph, VerificationTask, VerificationTaskConfig,
+};
+
+/// Request body for starting verification
+#[derive(Debug, Deserialize)]
+struct StartVerificationRequest {
+    /// Path to the qontinui config file
+    config_path: String,
+    /// Exploration strategy: "exhaustive", "smoke_test", "regression", "random_walk", "targeted"
+    #[serde(default = "default_verification_strategy")]
+    strategy: String,
+    /// Maximum number of states to visit (0 = unlimited)
+    #[serde(default)]
+    max_states: u32,
+    /// Maximum time in seconds (0 = unlimited)
+    #[serde(default)]
+    max_duration_seconds: u64,
+    /// Target state IDs for targeted strategy
+    #[serde(default)]
+    target_state_ids: Vec<String>,
+    /// Target transition IDs for targeted strategy
+    #[serde(default)]
+    target_transition_ids: Vec<String>,
+    /// Monitor index
+    #[serde(default)]
+    monitor_index: Option<i32>,
+    /// Whether to capture screenshots
+    #[serde(default = "default_capture_screenshots")]
+    capture_screenshots: bool,
+    /// Whether to stop on first failure
+    #[serde(default)]
+    stop_on_first_failure: bool,
+}
+
+fn default_verification_strategy() -> String {
+    "exhaustive".to_string()
+}
+
+fn default_capture_screenshots() -> bool {
+    true
+}
+
+/// Start a verification task
+async fn start_verification(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartVerificationRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting verification for {} with strategy {}",
+        request.config_path, request.strategy
+    );
+
+    let config = VerificationTaskConfig {
+        config_path: request.config_path,
+        strategy: request.strategy,
+        max_states: request.max_states,
+        max_duration_seconds: request.max_duration_seconds,
+        target_state_ids: request.target_state_ids,
+        target_transition_ids: request.target_transition_ids,
+        monitor_index: request.monitor_index,
+        capture_screenshots: request.capture_screenshots,
+        capture_transition_screenshots: false,
+        state_delay_ms: 500,
+        output_directory: None,
+        stop_on_first_failure: request.stop_on_first_failure,
+        random_seed: None,
+    };
+
+    let task = VerificationTask::new(config, state.app_state.clone());
+
+    // Run the task
+    match task.execute().await {
+        Ok(result) => {
+            let result_json = serde_json::to_value(&result).unwrap_or_default();
+            Ok(Json(ApiResponse::success(result_json)))
+        }
+        Err(e) => {
+            error!("Verification failed: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get available verification strategies
+async fn get_verification_strategies() -> Json<ApiResponse<serde_json::Value>> {
+    let strategies = serde_json::json!({
+        "strategies": [
+            {
+                "id": "exhaustive",
+                "name": "Exhaustive",
+                "description": "Visit every state and transition - complete but slow",
+                "recommended_for": "Full verification runs, nightly builds"
+            },
+            {
+                "id": "smoke_test",
+                "name": "Smoke Test",
+                "description": "Quick path through critical states with descriptions",
+                "recommended_for": "Quick checks, CI/CD pipelines"
+            },
+            {
+                "id": "regression",
+                "name": "Regression",
+                "description": "Focus on previously-failed areas",
+                "recommended_for": "After fixes, before releases"
+            },
+            {
+                "id": "random_walk",
+                "name": "Random Walk",
+                "description": "Random exploration to discover unexpected behaviors",
+                "recommended_for": "Exploratory testing, chaos engineering"
+            },
+            {
+                "id": "targeted",
+                "name": "Targeted",
+                "description": "Verify only specific states/transitions",
+                "recommended_for": "Specific feature verification"
+            }
+        ]
+    });
+
+    Json(ApiResponse::success(strategies))
+}
+
+/// Preview verification plan without executing
+async fn preview_verification(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartVerificationRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Load the current config
+    let config_lock = state.app_state.current_config.lock().unwrap();
+    let qontinui_config = match config_lock.as_ref() {
+        Some(c) => c,
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error("No configuration loaded".to_string())),
+            ));
+        }
+    };
+
+    // Convert to JSON value for graph building
+    let config_value = match serde_json::to_value(qontinui_config) {
+        Ok(v) => v,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to serialize config: {}", e))),
+            ));
+        }
+    };
+
+    drop(config_lock);
+
+    // Build graph and generate path
+    let graph = StateMachineGraph::from_config(&config_value);
+
+    let strategy = ExplorationStrategy::from_str(&request.strategy);
+    let mut explorer = StateExplorer::new(graph.clone(), strategy);
+
+    if request.max_states > 0 {
+        explorer = explorer.with_max_states(request.max_states);
+    }
+
+    if !request.target_state_ids.is_empty() || !request.target_transition_ids.is_empty() {
+        explorer = explorer.with_targets(
+            request.target_state_ids.clone(),
+            request.target_transition_ids.clone(),
+        );
+    }
+
+    let path = explorer.generate_path();
+
+    let plan = serde_json::json!({
+        "strategy": format!("{:?}", strategy),
+        "total_states_in_config": graph.states.len(),
+        "total_transitions_in_config": graph.transitions.len(),
+        "states_to_visit": path.states.len(),
+        "transitions_to_verify": path.transitions.len(),
+        "estimated_cost": path.estimated_cost,
+        "states": path.states,
+        "transitions": path.transitions,
+    });
+
+    Ok(Json(ApiResponse::success(plan)))
+}
+
+/// Get verification history
+async fn get_verification_history(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<ApiResponse<serde_json::Value>> {
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+
+    let reports_dir = std::path::PathBuf::from(
+        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\verification",
+    );
+
+    if !reports_dir.exists() {
+        return Json(ApiResponse::success(serde_json::json!({ "runs": [] })));
+    }
+
+    let mut runs = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir(&reports_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().starts_with("verification-report-"))
+                    .unwrap_or(false)
+            {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(report) = serde_json::from_str::<serde_json::Value>(&content) {
+                        runs.push(serde_json::json!({
+                            "run_id": report.get("run_id"),
+                            "config_name": report.get("config_name"),
+                            "strategy": report.get("strategy"),
+                            "started_at": report.get("started_at"),
+                            "completed_at": report.get("completed_at"),
+                            "summary": report.get("summary"),
+                            "report_path": path.to_string_lossy(),
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by started_at descending and limit
+    runs.sort_by(|a, b| {
+        let a_time = a.get("started_at").and_then(|t| t.as_str()).unwrap_or("");
+        let b_time = b.get("started_at").and_then(|t| t.as_str()).unwrap_or("");
+        b_time.cmp(a_time)
+    });
+
+    runs.truncate(limit);
+
+    Json(ApiResponse::success(serde_json::json!({ "runs": runs })))
+}
+
+/// Get a specific verification report
+async fn get_verification_report(
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let reports_dir = std::path::PathBuf::from(
+        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\verification",
+    );
+    let report_path = reports_dir.join(format!("verification-report-{}.json", run_id));
+
+    if !report_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!(
+                "Report not found for run ID: {}",
+                run_id
+            ))),
+        ));
+    }
+
+    let content = std::fs::read_to_string(&report_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to read report: {}", e))),
+        )
+    })?;
+
+    let report: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to parse report: {}", e))),
+        )
+    })?;
+
+    Ok(Json(ApiResponse::success(report)))
+}
+
+/// Get AI analysis prompt for a verification report
+async fn get_verification_prompt(
+    axum::extract::Path(run_id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let reports_dir = std::path::PathBuf::from(
+        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\verification",
+    );
+    let report_path = reports_dir.join(format!("verification-report-{}.json", run_id));
+
+    if !report_path.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!(
+                "Report not found for run ID: {}",
+                run_id
+            ))),
+        ));
+    }
+
+    let content = std::fs::read_to_string(&report_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to read report: {}", e))),
+        )
+    })?;
+
+    let report: serde_json::Value = serde_json::from_str(&content).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to parse report: {}", e))),
+        )
+    })?;
+
+    let ai_prompt = report
+        .get("ai_analysis_prompt")
+        .and_then(|p| p.as_str())
+        .unwrap_or("No analysis prompt available")
+        .to_string();
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "run_id": run_id,
+        "prompt": ai_prompt,
+    }))))
+}
+
+// ============================================================================
+// End AI Verification Agent HTTP API Handlers
+// ============================================================================
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -6779,6 +7389,13 @@ pub fn create_router(
                 .delete(delete_stored_config),
         )
         .route("/configs/:id/export", post(export_config))
+        // AI Verification Agent routes
+        .route("/verification/start", post(start_verification))
+        .route("/verification/strategies", get(get_verification_strategies))
+        .route("/verification/preview", post(preview_verification))
+        .route("/verification/history", get(get_verification_history))
+        .route("/verification/:run_id", get(get_verification_report))
+        .route("/verification/:run_id/prompt", get(get_verification_prompt))
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

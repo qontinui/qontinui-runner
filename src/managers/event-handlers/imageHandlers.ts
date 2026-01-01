@@ -9,9 +9,9 @@ import { logManager } from "../index";
 import type { HandlerSetupFunction } from "./types";
 import type { ImageRecognitionEventPayload } from "../../types/eventPayloads";
 import {
-  testRunReportingService,
+  executionReportingService,
   type ImageRecognitionData,
-} from "../../services/TestRunReportingService";
+} from "../../services/ExecutionReportingService";
 
 /**
  * Setup image recognition event handlers
@@ -34,8 +34,8 @@ export const setupImageHandlers: HandlerSetupFunction = (context) => {
       // Delegate image recognition processing to LogManager
       logManager.processImageRecognitionData(data);
 
-      // Report image recognition for historical storage (if test run is active)
-      if (testRunReportingService.isActive) {
+      // Report image recognition for historical storage (if execution run is active)
+      if (executionReportingService.isActive) {
         // Parse location if it's a string
         let location: { x: number; y: number; width?: number; height?: number } | undefined;
         if (typeof data.location === "string") {
@@ -86,7 +86,7 @@ export const setupImageHandlers: HandlerSetupFunction = (context) => {
           },
         };
 
-        testRunReportingService.reportImageRecognition(recognitionData).catch((error) => {
+        executionReportingService.reportImageRecognition(recognitionData).catch((error) => {
           console.error("[IMAGE_HANDLER] Failed to report image recognition:", error);
         });
       }

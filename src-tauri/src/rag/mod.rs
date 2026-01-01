@@ -43,6 +43,7 @@ pub use embeddings::{EmbeddingGenerator, EmbeddingStatus};
 pub use search::{SearchError, SemanticSearch};
 pub use storage::RAGStorage;
 
+use crate::config::qontinui_config::StateDescription;
 use crate::config::Category;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -148,6 +149,9 @@ pub struct State {
     pub is_initial: Option<bool>,
     #[serde(default, rename = "isFinal")]
     pub is_final: Option<bool>,
+    /// Rich description for AI verification agent
+    #[serde(skip_serializing_if = "Option::is_none", rename = "aiDescription")]
+    pub ai_description: Option<StateDescription>,
 }
 
 /// Position coordinates

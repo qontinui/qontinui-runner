@@ -203,6 +203,15 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to get connection from pool: {}", e))
     }
 
+    /// Get a reference to the underlying connection for direct rusqlite operations.
+    /// This is useful for modules that need raw rusqlite::Connection access (e.g., findings storage).
+    ///
+    /// Note: The returned reference borrows the PooledConnection, so the caller must
+    /// ensure the PooledConnection stays alive while using the Connection.
+    pub fn connection(&self) -> Result<PooledConnection<SqliteConnectionManager>, String> {
+        self.get_conn()
+    }
+
     /// Run database migrations on a specific connection.
     /// This is a static method to allow calling during pool initialization.
     fn run_migrations_on_conn(conn: &Connection) -> Result<(), String> {
@@ -266,7 +275,7 @@ impl CheckpointDb {
         }
 
         // Migration to version 4: Add task_run_output_chunks table for O(1) appending
-        if current_version >= 1 && current_version < 4 {
+        if (1..4).contains(&current_version) {
             info!("Migrating database to version 4 (adding task_run_output_chunks table)");
 
             // Create the chunks table
@@ -323,7 +332,7 @@ impl CheckpointDb {
         }
 
         // Migration to version 5: Add configs table for ConfigStorage
-        if current_version >= 1 && current_version < 5 {
+        if (1..5).contains(&current_version) {
             info!("Migrating database to version 5 (adding configs table)");
             conn.execute_batch(
                 r#"
@@ -345,6 +354,137 @@ impl CheckpointDb {
                 "#,
             )
             .map_err(|e| format!("Failed to migrate to version 5: {}", e))?;
+        }
+
+        // Migration to version 6: Add task_run_findings table
+        // (This migration was added between 5 and 7, keeping the version gap for backward compat)
+        if (1..6).contains(&current_version) {
+            info!("Migrating database to version 6 (adding task_run_findings table)");
+            conn.execute_batch(
+                r#"
+                -- Task Run Findings (AI-detected issues tied to task runs)
+                CREATE TABLE IF NOT EXISTS task_run_findings (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    signature_hash TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    file_path TEXT,
+                    line_number INTEGER,
+                    column_number INTEGER,
+                    code_snippet TEXT,
+                    status TEXT NOT NULL DEFAULT 'detected',
+                    action_type TEXT NOT NULL DEFAULT 'auto_fix',
+                    resolution TEXT,
+                    detected_in_session INTEGER NOT NULL,
+                    resolved_in_session INTEGER,
+                    needs_input BOOLEAN DEFAULT 0,
+                    question TEXT,
+                    input_options TEXT,
+                    user_response TEXT,
+                    detected_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_findings_task_run ON task_run_findings(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_findings_status ON task_run_findings(status);
+                CREATE INDEX IF NOT EXISTS idx_findings_signature ON task_run_findings(signature_hash);
+                CREATE INDEX IF NOT EXISTS idx_findings_category ON task_run_findings(category);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (6, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 6: {}", e))?;
+        }
+
+        // Migration to version 7: Add Tiered Information Model tables
+        if (1..7).contains(&current_version) {
+            info!("Migrating database to version 7 (adding tiered information tables)");
+            conn.execute_batch(
+                r#"
+                -- Run Details (Tier 1 - Detailed run data)
+                CREATE TABLE IF NOT EXISTS run_details (
+                    id TEXT PRIMARY KEY,
+                    config_id TEXT NOT NULL,
+                    workflow_name TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    duration_ms INTEGER,
+                    status TEXT NOT NULL,
+                    success BOOLEAN,
+                    error_type TEXT,
+                    error_message TEXT,
+                    actions_summary TEXT,
+                    states_visited TEXT,
+                    transitions_executed TEXT,
+                    template_matches TEXT,
+                    anomalies TEXT,
+                    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_run_details_config_id ON run_details(config_id);
+                CREATE INDEX IF NOT EXISTS idx_run_details_started_at ON run_details(started_at);
+                CREATE INDEX IF NOT EXISTS idx_run_details_status ON run_details(status);
+
+                -- Config Statistics (Tier 4 - Aggregated statistics)
+                CREATE TABLE IF NOT EXISTS config_statistics (
+                    id TEXT PRIMARY KEY,
+                    config_id TEXT NOT NULL UNIQUE,
+                    config_hash TEXT,
+                    total_runs INTEGER DEFAULT 0,
+                    successful_runs INTEGER DEFAULT 0,
+                    failed_runs INTEGER DEFAULT 0,
+                    timeout_runs INTEGER DEFAULT 0,
+                    avg_duration_ms INTEGER,
+                    recent_success_rate REAL,
+                    recent_avg_duration_ms INTEGER,
+                    transition_stats TEXT,
+                    template_stats TEXT,
+                    state_stats TEXT,
+                    error_patterns TEXT,
+                    flaky_transitions TEXT,
+                    flaky_templates TEXT,
+                    first_run_at TEXT,
+                    last_run_at TEXT,
+                    last_updated_at TEXT,
+                    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_config_statistics_config_id ON config_statistics(config_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (7, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 7: {}", e))?;
+        }
+
+        // Migration to version 8: Add pending_discoveries table for Discovery Push
+        if (1..8).contains(&current_version) {
+            info!("Migrating database to version 8 (adding pending_discoveries table)");
+            conn.execute_batch(
+                r#"
+                -- Pending Discoveries (Discovery Push queue)
+                -- Stores discoveries awaiting sync to qontinui-web
+                CREATE TABLE IF NOT EXISTS pending_discoveries (
+                    id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    last_attempt TEXT,
+                    attempt_count INTEGER DEFAULT 0,
+                    error TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pending_discoveries_created_at ON pending_discoveries(created_at);
+                CREATE INDEX IF NOT EXISTS idx_pending_discoveries_attempt_count ON pending_discoveries(attempt_count);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (8, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 8: {}", e))?;
         }
 
         Ok(())
@@ -1564,6 +1704,74 @@ impl CheckpointDb {
         }
 
         Ok(count)
+    }
+
+    // ========================================================================
+    // Findings Operations (wrapper methods for findings::storage)
+    // ========================================================================
+
+    /// Get a finding by ID.
+    pub fn get_finding(&self, id: &str) -> Result<Option<crate::findings::Finding>, String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::get_finding(&conn, id)
+    }
+
+    /// Get all findings for a task run.
+    pub fn get_findings_for_task(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<crate::findings::Finding>, String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::get_findings_for_task(&conn, task_run_id)
+    }
+
+    /// Get findings by status for a task run.
+    pub fn get_findings_by_status(
+        &self,
+        task_run_id: &str,
+        status: &crate::findings::FindingStatus,
+    ) -> Result<Vec<crate::findings::Finding>, String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::get_findings_by_status(&conn, task_run_id, status)
+    }
+
+    /// Update finding status.
+    pub fn update_finding_status(
+        &self,
+        id: &str,
+        status: &crate::findings::FindingStatus,
+        resolution: Option<&str>,
+        session_num: Option<u32>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::update_finding_status(&conn, id, status, resolution, session_num)
+    }
+
+    /// Set user response for a finding.
+    pub fn set_finding_user_response(&self, id: &str, response: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::set_user_response(&conn, id, response)
+    }
+
+    /// Get summary statistics for a task run.
+    pub fn get_finding_summary(
+        &self,
+        task_run_id: &str,
+    ) -> Result<crate::findings::FindingSummary, String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::get_finding_summary(&conn, task_run_id)
+    }
+
+    /// Format findings for inclusion in a continuation prompt.
+    ///
+    /// This creates a structured section showing resolved, outstanding,
+    /// and needs_input findings to provide context for continuation sessions.
+    pub fn format_findings_for_continuation_prompt(
+        &self,
+        task_run_id: &str,
+    ) -> Result<String, String> {
+        let conn = self.get_conn()?;
+        crate::findings::storage::format_findings_for_continuation_prompt(&conn, task_run_id)
     }
 }
 

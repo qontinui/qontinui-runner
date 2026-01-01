@@ -6,7 +6,7 @@
  * - log: General log events
  * - action_started: Action lifecycle events
  * - action_completed: Action lifecycle events
- * - tree_event: Tree-based execution events (reports to both services)
+ * - tree_event: Tree-based execution events
  */
 
 import { logManager, actionLogManager } from "../index";
@@ -17,10 +17,6 @@ import type {
   ActionEventPayload,
 } from "../../types/eventPayloads";
 import type { TreeEventData, TreeNode } from "../../types/treeEvents";
-import {
-  testRunReportingService,
-  type TransitionData,
-} from "../../services/TestRunReportingService";
 import {
   executionReportingService,
   type ActionExecutionCreate,
@@ -83,7 +79,7 @@ export const setupReportingHandlers: HandlerSetupFunction = (context) => {
       console.log("[REPORTING_HANDLER] tree_event received, triggering action log refresh");
       actionLogManager.triggerRefresh();
 
-      // Report completed actions to both new and legacy services
+      // Report completed actions to execution service
       // NOTE: Tree event data is at the top level of the payload, not nested under "data"
       // The Rust backend sends: { type: "tree_event", event_type: "...", node: {...}, ... }
       const treeEventData = payload as unknown as TreeEventData | undefined;
@@ -103,9 +99,13 @@ export const setupReportingHandlers: HandlerSetupFunction = (context) => {
 };
 
 /**
- * Process a tree event and report it to both execution and legacy services
+ * Process a tree event and report it to the unified execution service
  */
 function processTreeEventForReporting(eventData: TreeEventData): void {
+  if (!executionReportingService.isActive) {
+    return;
+  }
+
   const node = eventData.node!;
   const metadata = (node.metadata || {}) as Record<string, unknown>;
   const stateContext = metadata.state_context as
@@ -128,31 +128,15 @@ function processTreeEventForReporting(eventData: TreeEventData): void {
         ? confidenceFromMeta
         : undefined;
 
-  // Report to new unified execution service
-  if (executionReportingService.isActive) {
-    reportToExecutionService(
-      node,
-      metadata,
-      stateContext,
-      startedAt,
-      completedAt,
-      durationMs,
-      confidenceScore,
-    );
-  }
-
-  // Report to legacy test run service for backward compatibility
-  if (testRunReportingService.isActive) {
-    reportToLegacyService(
-      node,
-      metadata,
-      stateContext,
-      startedAt,
-      completedAt,
-      durationMs,
-      confidenceScore,
-    );
-  }
+  reportToExecutionService(
+    node,
+    metadata,
+    stateContext,
+    startedAt,
+    completedAt,
+    durationMs,
+    confidenceScore,
+  );
 }
 
 /**
@@ -211,43 +195,5 @@ function reportToExecutionService(
   // Report the action (async, don't block)
   executionReportingService.reportAction(actionExecution).catch((error) => {
     console.error("[REPORTING_HANDLER] Failed to report action execution:", error);
-  });
-}
-
-/**
- * Report action to the legacy test run service
- */
-function reportToLegacyService(
-  node: TreeNode,
-  metadata: Record<string, unknown>,
-  stateContext: { active_before?: string[]; active_after?: string[] } | undefined,
-  startedAt: Date,
-  completedAt: Date,
-  durationMs: number,
-  confidenceScore: number | undefined,
-): void {
-  // Build transition data with new field names matching backend schema
-  const transition: TransitionData = {
-    sequence_number: testRunReportingService.getNextTransitionSequenceNumber(),
-    transition_name: node.name || "Unknown Action",
-    from_state: stateContext?.active_before?.[0] || "unknown",
-    to_state: stateContext?.active_after?.[0] || "unknown",
-    status: node.status === "success" ? "success" : "failed",
-    started_at: startedAt.toISOString(),
-    completed_at: completedAt.toISOString(),
-    duration_ms: durationMs,
-    error_message: node.error,
-    error_type: node.error ? "other" : undefined, // Backend allows: element_not_found, timeout, assertion_failed, crash, other
-    screenshot_id: metadata.screenshot_reference as string | undefined,
-    metadata: {
-      node_id: node.id,
-      actions_executed: 1,
-      confidence_score: confidenceScore,
-    },
-  };
-
-  // Report the transition (async, don't block)
-  testRunReportingService.reportTransition(transition).catch((error) => {
-    console.error("[REPORTING_HANDLER] Failed to report legacy transition:", error);
   });
 }
