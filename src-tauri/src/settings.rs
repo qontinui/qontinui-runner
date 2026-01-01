@@ -384,12 +384,14 @@ pub fn save_playwright_settings(playwright_settings: PlaywrightSettings) -> Resu
 }
 
 /// Get the session auto-fix on failure setting
+#[allow(dead_code)]
 pub fn get_session_auto_fix_on_failure() -> bool {
     let settings = load_settings();
     settings.session_auto_fix_on_failure
 }
 
 /// Save the session auto-fix on failure setting
+#[allow(dead_code)]
 pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
     info!("Saving session auto-fix on failure setting: {}", enabled);
     let mut settings = load_settings();

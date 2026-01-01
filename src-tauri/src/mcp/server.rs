@@ -15,6 +15,7 @@ use crate::commands::AppState;
 /// Note: This currently delegates to the mcp_api module's create_router.
 /// Once refactoring is complete, this will directly configure the router
 /// using handlers from the mcp submodules.
+#[allow(dead_code)]
 pub fn create_router(
     app_state: Arc<AppState>,
     rag_state: Arc<RAGState>,
@@ -26,6 +27,7 @@ pub fn create_router(
 }
 
 /// Start the MCP API server
+#[allow(dead_code)]
 pub async fn start_server(
     app_state: Arc<AppState>,
     rag_state: Arc<RAGState>,

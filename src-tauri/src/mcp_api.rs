@@ -66,8 +66,6 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tracing::{debug, error, info, warn};
@@ -2903,6 +2901,7 @@ pub fn emit_ai_output(
 }
 
 /// Write AI debug log to file
+#[allow(dead_code)]
 fn write_ai_debug_log(message: &str) {
     use std::io::Write;
 
@@ -3049,6 +3048,7 @@ async fn restart_runner(
 /// Uses the provided database to check for running task runs.
 /// NOTE: This is a synchronous function that blocks. For async contexts,
 /// use has_running_ai_tasks_async() or wrap this in spawn_blocking.
+#[allow(dead_code)]
 pub fn has_running_ai_tasks(db: &Arc<CheckpointDb>) -> bool {
     match db.get_running_task_runs() {
         Ok(tasks) => !tasks.is_empty(),

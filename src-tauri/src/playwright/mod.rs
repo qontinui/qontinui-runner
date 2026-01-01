@@ -28,12 +28,16 @@ mod types;
 pub use types::{DisplayMode, SyncStatus};
 
 // Re-export public types from results module
+// These are public API exports - may not be used within this crate
+#[allow(unused_imports)]
 pub use results::{
     CriteriaResult, NetworkRequest, PlaywrightResult, StructuredTestOutput, TestSpec,
     WorkflowStatus,
 };
 
 // Re-export public types and functions from script_storage module
+// These are public API exports - may not be used within this crate
+#[allow(unused_imports)]
 pub use script_storage::{
     create_script, delete_script, duplicate_script, export_scripts, get_all_scripts, get_all_tags,
     get_categories, get_results_dir, get_script, import_scripts, load_script_library,

@@ -149,6 +149,7 @@ impl WorkflowRun {
 ///
 /// Also checks for "status" and "workflow_status" fields to detect completion
 /// even when current_phase hasn't been updated.
+#[allow(dead_code)]
 pub fn read_checkpoint_phase(checkpoint_path: &str, phase_field: &str) -> Result<u32, String> {
     let path = Path::new(checkpoint_path);
     if !path.exists() {

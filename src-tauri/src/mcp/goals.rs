@@ -57,6 +57,7 @@ pub struct GoalConfig {
 
 /// Check if AI output contains goal completion markers
 /// Returns true if any marker indicates the goal has been achieved
+#[allow(dead_code)]
 pub fn check_goal_completion_markers(output: &str) -> bool {
     // List of markers that indicate goal completion
     // Claude should output one of these when the goal is achieved

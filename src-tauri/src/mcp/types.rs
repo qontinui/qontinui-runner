@@ -2,6 +2,10 @@
 //!
 //! Contains all request/response types used across the MCP API modules.
 
+// These types are used for JSON serialization via serde - the compiler doesn't
+// see the fields as "used" but they are accessed at runtime during serialization.
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

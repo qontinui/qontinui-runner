@@ -101,6 +101,7 @@ impl SemanticSearch {
     }
 
     /// Check if this is a degraded instance
+    #[allow(dead_code)]
     pub fn is_degraded(&self) -> bool {
         self.script_path.as_os_str().is_empty()
     }

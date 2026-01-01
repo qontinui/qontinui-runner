@@ -3,6 +3,10 @@
 //! This module provides scheduling functionality for workflows and prompts,
 //! enabling automated execution at specified times with completion tracking.
 
+// Allow dead code - these are public API functions that may not be called yet
+// but are part of the complete scheduler interface
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;

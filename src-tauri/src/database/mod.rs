@@ -1246,6 +1246,7 @@ impl CheckpointDb {
 
     /// Upsert a config (update if exists, insert if new).
     /// Used when loading from file.
+    #[allow(dead_code)]
     pub fn upsert_config(
         &self,
         id: &str,
@@ -1257,6 +1258,7 @@ impl CheckpointDb {
     }
 
     /// Get a config by ID.
+    #[allow(dead_code)]
     pub fn get_config(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
         let conn = self.get_conn()?;
 
@@ -1278,6 +1280,7 @@ impl CheckpointDb {
     }
 
     /// List all stored configs.
+    #[allow(dead_code)]
     pub fn list_configs(&self) -> Result<Vec<ConfigStorageEntry>, String> {
         let conn = self.get_conn()?;
 
@@ -1310,6 +1313,7 @@ impl CheckpointDb {
     }
 
     /// Delete a config by ID.
+    #[allow(dead_code)]
     pub fn delete_config(&self, id: &str) -> Result<bool, String> {
         let conn = self.get_conn()?;
 

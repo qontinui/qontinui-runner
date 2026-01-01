@@ -4,6 +4,10 @@
 //! at their scheduled times. Integrates with existing workflow and prompt
 //! execution infrastructure.
 
+// Allow dead code - these are public API functions that may not be called yet
+// but are part of the complete scheduler interface
+#![allow(dead_code)]
+
 use crate::scheduler::{
     compute_next_run, get_scheduler_settings, get_task, load_scheduler_state, record_execution,
     save_scheduler_state, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType,

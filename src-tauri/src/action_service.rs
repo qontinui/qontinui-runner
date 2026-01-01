@@ -20,6 +20,7 @@ use tracing::{debug, error, info, warn};
 
 /// Errors that can occur during action execution
 #[derive(Debug, Error)]
+#[allow(dead_code)] // Some variants are defined for future use or API completeness
 pub enum ActionError {
     #[error("Python executor not initialized")]
     ExecutorNotInitialized,
@@ -67,6 +68,7 @@ pub struct ActionResult {
 
 impl ActionResult {
     /// Create a successful result
+    #[allow(dead_code)] // Part of public API, reserved for future use
     pub fn success() -> Self {
         Self {
             success: true,
@@ -87,6 +89,7 @@ impl ActionResult {
     }
 
     /// Create a successful result with data
+    #[allow(dead_code)] // Part of public API, reserved for future use
     pub fn success_with_data(data: serde_json::Value) -> Self {
         Self {
             success: true,
@@ -167,6 +170,7 @@ pub struct UnifiedActionService {
     /// Reference to the application state containing the Python bridge
     app_state: Arc<AppState>,
     /// Config storage for resolving config IDs
+    #[allow(dead_code)] // Reserved for future use
     config_storage: Arc<TokioMutex<ConfigStorage>>,
 }
 
@@ -181,6 +185,7 @@ impl UnifiedActionService {
     }
 
     /// Check if the Python executor is running
+    #[allow(dead_code)] // Part of public API, reserved for future use
     pub fn is_executor_running(&self) -> bool {
         let bridge_lock = self
             .app_state
@@ -199,6 +204,7 @@ impl UnifiedActionService {
     }
 
     /// Get the current loaded configuration
+    #[allow(dead_code)] // Part of public API, reserved for future use
     pub fn get_current_config(&self) -> Option<QontinuiConfig> {
         let config_lock = self
             .app_state
@@ -375,7 +381,7 @@ impl UnifiedActionService {
 
         // Start the workflow execution
         let app_state = self.app_state.clone();
-        let start_result = tokio::task::spawn_blocking(move || {
+        let _start_result = tokio::task::spawn_blocking(move || {
             let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
                 warn!("python_bridge mutex was poisoned, recovering");
                 poisoned.into_inner()
@@ -440,6 +446,7 @@ impl UnifiedActionService {
     ///
     /// # Returns
     /// `StateResult` with success/failure information
+    #[allow(dead_code)] // Part of public API, reserved for future use
     pub async fn go_to_state(
         &self,
         state_id: &str,
@@ -528,6 +535,7 @@ impl UnifiedActionService {
     ///
     /// # Returns
     /// `ScreenshotResult` with path and metadata
+    #[allow(dead_code)] // Part of public API, reserved for future use
     pub async fn capture_screenshot(
         &self,
         monitor_index: Option<i32>,
@@ -659,6 +667,7 @@ impl UnifiedActionService {
 ///
 /// # Returns
 /// The configuration data as JSON value
+#[allow(dead_code)] // Part of public API, reserved for future use
 pub async fn get_config_for_execution(
     config_id: &str,
     config_storage: &Arc<TokioMutex<ConfigStorage>>,
@@ -684,6 +693,7 @@ pub async fn get_config_for_execution(
 ///
 /// # Returns
 /// Summary of the loaded configuration
+#[allow(dead_code)] // Part of public API, reserved for future use
 pub async fn load_config_from_storage(
     config_id: &str,
     config_storage: &Arc<TokioMutex<ConfigStorage>>,

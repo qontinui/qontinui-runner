@@ -125,6 +125,7 @@ impl Checkpoint {
     }
 
     /// Advance to next phase
+    #[allow(dead_code)]
     pub fn advance_phase(&mut self) {
         self.current_phase += 1;
         self.sessions_spawned += 1;

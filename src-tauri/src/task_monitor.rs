@@ -31,6 +31,7 @@ const CONTEXT_WARNING_PATTERNS: &[&str] = &[
 
 /// State for an individual task monitor
 #[derive(Debug)]
+#[allow(dead_code)]
 struct MonitorState {
     /// Task run ID being monitored
     task_run_id: String,
@@ -139,12 +140,14 @@ impl TaskMonitor {
     }
 
     /// Check if a task is currently being monitored
+    #[allow(dead_code)]
     pub async fn is_monitoring(&self, task_run_id: &str) -> bool {
         let monitors = self.monitors.read().await;
         monitors.contains_key(task_run_id)
     }
 
     /// Get all currently monitored task IDs
+    #[allow(dead_code)]
     pub async fn get_monitored_tasks(&self) -> Vec<String> {
         let monitors = self.monitors.read().await;
         monitors.keys().cloned().collect()
@@ -316,6 +319,7 @@ impl TaskMonitor {
     }
 
     /// Check if a task's output contains [TASK_COMPLETE]
+    #[allow(dead_code)]
     pub fn check_for_completion(output: &str) -> bool {
         output.contains(TASK_COMPLETE_MARKER)
     }
