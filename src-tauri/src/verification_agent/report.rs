@@ -505,7 +505,7 @@ impl VerificationReport {
 
         // Summary
         md.push_str("## Summary\n\n");
-        md.push_str(&"| Metric | Value |\n|--------|-------|\n".to_string());
+        md.push_str("| Metric | Value |\n|--------|-------|\n");
         md.push_str(&format!(
             "| States Verified | {}/{} |\n",
             self.summary.states_verified, self.summary.total_states
