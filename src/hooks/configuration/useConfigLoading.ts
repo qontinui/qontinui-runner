@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { configManager } from "../../managers";
 import type { Config, Workflow, LogFunction, LoadConfigurationResponse, Category } from "./types";
-import { createConfigFromData, deriveProjectId } from "./utils";
+import { createConfigFromData } from "./utils";
 import { useConfigFiltering } from "./useConfigFiltering";
 
 interface UseConfigLoadingOptions {

@@ -8,11 +8,7 @@ import type { EventRouter } from "../EventRouter";
 import type { ExecutionContextActions, HandlerContext, HandlerSetupFunction } from "./types";
 import { setupExecutionHandlers } from "./executionHandlers";
 import { setupImageHandlers } from "./imageHandlers";
-import {
-  setupAiOutputHandlers,
-  getCurrentAiActionId,
-  resetAiSessionState,
-} from "./aiOutputHandlers";
+import { setupAiOutputHandlers } from "./aiOutputHandlers";
 import { setupReportingHandlers } from "./reportingHandlers";
 
 // Re-export types

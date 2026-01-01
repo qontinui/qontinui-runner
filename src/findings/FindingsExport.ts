@@ -4,7 +4,7 @@
  * Handles exporting findings to various formats and calculating summaries.
  */
 
-import type { Finding, ReportSummary, FindingSeverity, FindingStatus } from "../types/findings";
+import type { Finding, ReportSummary } from "../types/findings";
 import { BUILT_IN_CATEGORIES } from "../services/FindingCategories";
 
 /**

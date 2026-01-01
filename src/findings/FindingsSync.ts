@@ -8,10 +8,8 @@
 import type {
   Finding,
   ExecutionReport,
-  ReportSummary,
   PhaseInfo,
   UserInputRequest,
-  ReportStatus,
 } from "../types/findings";
 import { calculateSummary, createEmptySummary } from "./FindingsExport";
 

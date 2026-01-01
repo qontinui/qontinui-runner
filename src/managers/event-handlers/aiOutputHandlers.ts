@@ -8,7 +8,7 @@
  */
 
 import { logManager } from "../index";
-import type { HandlerContext, HandlerSetupFunction } from "./types";
+import type { HandlerSetupFunction } from "./types";
 import type { AiOutputStreamEventPayload } from "../../types/eventPayloads";
 import { issueTracker } from "../../services/IssueTracker";
 import { findingsTracker } from "../../services/FindingsTracker";

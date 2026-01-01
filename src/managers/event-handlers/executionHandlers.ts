@@ -11,7 +11,7 @@
 
 import { logManager, windowManager, configManager } from "../index";
 import { APP_VERSION } from "../../lib/appInfo";
-import type { HandlerContext, HandlerSetupFunction } from "./types";
+import type { HandlerSetupFunction } from "./types";
 import { syncIssuesToBackend } from "../../services/IssueSyncService";
 import { issueTracker } from "../../services/IssueTracker";
 import { findingsTracker } from "../../services/FindingsTracker";

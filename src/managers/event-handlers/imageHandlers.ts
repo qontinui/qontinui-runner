@@ -6,7 +6,7 @@
  */
 
 import { logManager } from "../index";
-import type { HandlerContext, HandlerSetupFunction } from "./types";
+import type { HandlerSetupFunction } from "./types";
 import type { ImageRecognitionEventPayload } from "../../types/eventPayloads";
 import {
   testRunReportingService,

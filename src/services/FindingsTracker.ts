@@ -14,13 +14,12 @@ import type {
   FindingSeverity,
   FindingStatus,
   ActionType,
-  UserInputRequest,
   ExecutionReport,
   PhaseInfo,
   ParsedFinding,
   CodeContext,
 } from "../types/findings";
-import { getCategoryById, BUILT_IN_CATEGORIES } from "./FindingCategories";
+import { getCategoryById } from "./FindingCategories";
 
 // Import from refactored modules
 import {
@@ -36,7 +35,6 @@ import {
   getActionableFindings as queryGetActionableFindings,
   getUnresolvedCount as queryGetUnresolvedCount,
 } from "../findings/FindingsQuery";
-import { calculateSummary, createEmptySummary } from "../findings/FindingsExport";
 import {
   createReport,
   updateReportWithFindings,
