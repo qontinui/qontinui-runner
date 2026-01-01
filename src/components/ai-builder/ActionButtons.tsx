@@ -4,7 +4,16 @@
  * Main action buttons for starting/stopping automation and saving workflows.
  */
 
-import { Copy, FilePlus2, Loader2, Play, RefreshCw, Save, Square } from "lucide-react";
+import {
+  AlertTriangle,
+  Copy,
+  FilePlus2,
+  Loader2,
+  Play,
+  RefreshCw,
+  Save,
+  Square,
+} from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
 
 export function ActionButtons() {
@@ -21,7 +30,26 @@ export function ActionButtons() {
     handleNewWorkflow,
     handleSaveWorkflow,
     clearSessionForNew,
+    hasGuiSteps,
+    selectedConfigId,
+    setLastResult,
   } = useAiBuilder();
+
+  // Check if we can run (no GUI steps without config)
+  const canRun = !hasGuiSteps || !!selectedConfigId;
+
+  // Handler that validates before running
+  const handleRunAutomation = () => {
+    if (hasGuiSteps && !selectedConfigId) {
+      setLastResult({
+        success: false,
+        message:
+          "Cannot start: GUI steps require a stored configuration. Please select a config above.",
+      });
+      return;
+    }
+    runAutomation();
+  };
 
   return (
     <div className="flex gap-3">
@@ -47,12 +75,17 @@ export function ActionButtons() {
       ) : (
         // Start button
         <button
-          onClick={runAutomation}
+          onClick={handleRunAutomation}
           disabled={isRunning}
-          className="flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors bg-primary text-primary-foreground hover:bg-primary/90"
+          className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${
+            canRun
+              ? "bg-primary text-primary-foreground hover:bg-primary/90"
+              : "bg-amber-500/20 text-amber-600 hover:bg-amber-500/30"
+          }`}
+          title={canRun ? "Start AI analysis" : "Select a config before running"}
         >
-          <Play className="w-4 h-4" />
-          Start AI Analysis
+          {canRun ? <Play className="w-4 h-4" /> : <AlertTriangle className="w-4 h-4" />}
+          {canRun ? "Start AI Analysis" : "Config Required"}
         </button>
       )}
 

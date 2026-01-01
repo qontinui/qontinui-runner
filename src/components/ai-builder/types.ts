@@ -291,6 +291,11 @@ export interface AiBuilderContextValue {
 
   // Set Result
   setLastResult: (result: ResultMessage | null) => void;
+
+  // Stored Config Selection
+  selectedConfigId: string | null;
+  setSelectedConfigId: (configId: string | null) => void;
+  hasGuiSteps: boolean;
 }
 
 /** Convert Session to AiDeveloperState for UI compatibility */

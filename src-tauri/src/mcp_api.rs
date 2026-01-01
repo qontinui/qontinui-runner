@@ -74,6 +74,7 @@ use tracing::{debug, error, info, warn};
 
 use regex::Regex;
 
+use crate::action_service::UnifiedActionService;
 use crate::commands::rag::{send_embeddings_to_web, RAGState};
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
@@ -456,6 +457,8 @@ pub struct ApiState {
     pub current_config_id: std::sync::Mutex<Option<String>>,
     /// Persistent storage for configurations
     pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
+    /// Unified action service for deterministic execution
+    pub action_service: Arc<UnifiedActionService>,
 }
 
 /// Response for API endpoints
@@ -1184,6 +1187,9 @@ async fn load_config(
 }
 
 /// Run a workflow by name and wait for completion
+///
+/// Uses the UnifiedActionService for deterministic execution, ensuring both
+/// manual API calls and AI task execution use the same code path.
 async fn run_workflow(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunWorkflowRequest>,
@@ -1198,155 +1204,52 @@ async fn run_workflow(
         request.monitor_index
     );
 
-    let app_state = state.app_state.clone();
-    let workflow_name = request.workflow_name.clone();
-    let monitor_index = request.monitor_index;
-    let timeout_duration = Duration::from_secs(request.timeout_seconds);
+    // Use UnifiedActionService for deterministic execution
+    let action_service = state.action_service.clone();
 
-    info!("MCP API: Step 1 - Getting lifecycle from bridge");
-
-    // First, get the lifecycle Arc from the bridge
-    // We need to use spawn_blocking here because bridge.is_running() uses block_on internally
-    let app_state_clone = app_state.clone();
-    let lifecycle = tokio::task::spawn_blocking(move || {
-        let bridge_lock = app_state_clone
-            .python_bridge
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("MCP API: python_bridge mutex was poisoned, recovering");
-                poisoned.into_inner()
-            });
-
-        if let Some(ref bridge) = *bridge_lock {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-            Ok(bridge.get_lifecycle())
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error getting lifecycle: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
+    match action_service
+        .run_workflow(
+            &request.workflow_name,
+            None, // No additional config
+            request.monitor_index,
+            request.timeout_seconds,
         )
-    })?
-    .map_err(|e| {
-        error!("MCP API: Bridge error: {}", e);
-        (StatusCode::BAD_REQUEST, Json(api_error(e)))
-    })?;
-
-    info!("MCP API: Step 2 - Got lifecycle, registering for completion");
-
-    // Register for completion notification - we're already in an async context,
-    // so we can just await directly instead of using block_on
-    let lifecycle_guard = lifecycle.read().await;
-    info!("MCP API: Step 3 - Got read lock on lifecycle");
-    let completion_rx = lifecycle_guard.register_execution_completion().await;
-    drop(lifecycle_guard);
-    info!("MCP API: Step 4 - Registered for completion, dropped read lock");
-
-    // ==========================================================================
-    // MONITOR SELECTION - Passed to Python, offset calculated by qontinui library
-    // ==========================================================================
-    //
-    // The qontinui Python library handles monitor offset calculation internally
-    // using MSS (the same library used for screen capture). This ensures the
-    // coordinate system is consistent between screenshot capture and click actions.
-    //
-    // The runner only passes the monitor_index to Python. The library's
-    // StateExecutor.set_monitor() method looks up the monitor position via MSS.
-    // ==========================================================================
-
-    // Start the workflow execution - use spawn_blocking because send_command uses block_on internally
-    // which cannot be called from within an async context
-    let start_result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
-            // Build params for execution - only pass monitor_index, Python looks up offset via MSS
-            let mut params = serde_json::Map::new();
-            let resolved_monitor = monitor_index.unwrap_or(0);
-            safe_eprintln!(
-                "[MCP_API] Building params: monitor_index={:?}, resolved to {}",
-                monitor_index,
-                resolved_monitor
-            );
-            params.insert(
-                "monitor_index".to_string(),
-                serde_json::json!(resolved_monitor),
-            );
-            params.insert(
-                "workflow".to_string(),
-                serde_json::json!(workflow_name.clone()),
-            );
-            safe_eprintln!("[MCP_API] Sending to Python: {:?}", params);
-
-            match bridge.start_execution_with_params(Some(serde_json::Value::Object(params))) {
-                Ok(_) => Ok(()),
-                Err(e) => Err(format!("Failed to start workflow: {}", e)),
-            }
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    if let Err(e) = start_result {
-        error!("MCP API: Failed to start workflow: {}", e);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))));
-    }
-
-    info!("MCP API: Workflow started, waiting for completion...");
-
-    // Wait for execution completion with timeout
-    match timeout(timeout_duration, completion_rx).await {
-        Ok(Ok(completion_result)) => {
+        .await
+    {
+        Ok(result) => {
             info!(
-                "MCP API: Workflow completed: success={}, error={:?}",
-                completion_result.success, completion_result.error
+                "MCP API: Workflow completed via UnifiedActionService: success={}, error={:?}",
+                result.success, result.error
             );
-
             Ok(Json(ApiResponse::success(ExecutionResult {
-                success: completion_result.success,
-                workflow_name: request.workflow_name,
-                error: completion_result.error,
+                success: result.success,
+                workflow_name: result.workflow_name,
+                error: result.error,
             })))
         }
-        Ok(Err(_)) => {
-            // Channel was closed without sending - this shouldn't normally happen
-            warn!("MCP API: Completion channel closed unexpectedly");
-            Ok(Json(ApiResponse::success(ExecutionResult {
-                success: true,
-                workflow_name: request.workflow_name,
-                error: Some("Completion channel closed unexpectedly".to_string()),
-            })))
-        }
-        Err(_) => {
-            error!(
-                "MCP API: Workflow execution timed out after {}s",
-                request.timeout_seconds
-            );
-            Err((
-                StatusCode::REQUEST_TIMEOUT,
-                Json(api_error(format!(
-                    "Workflow execution timed out after {} seconds",
-                    request.timeout_seconds
-                ))),
-            ))
+        Err(e) => {
+            error!("MCP API: Workflow execution failed: {}", e);
+            match e {
+                crate::action_service::ActionError::Timeout(seconds) => Err((
+                    StatusCode::REQUEST_TIMEOUT,
+                    Json(api_error(format!(
+                        "Workflow execution timed out after {} seconds",
+                        seconds
+                    ))),
+                )),
+                crate::action_service::ActionError::ExecutorNotRunning => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("Python executor not running")),
+                )),
+                crate::action_service::ActionError::ExecutorNotInitialized => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("Python executor not initialized")),
+                )),
+                _ => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(e.to_string())),
+                )),
+            }
         }
     }
 }
@@ -1555,7 +1458,8 @@ async fn stop_execution(
 /// Execute a single action (e.g., click on an image)
 ///
 /// This endpoint allows executing individual GUI actions without running a full workflow.
-/// It sends the action to the Python executor and waits for completion.
+/// Uses the UnifiedActionService for deterministic execution, ensuring both
+/// manual API calls and AI task execution use the same code path.
 async fn execute_action(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ExecuteActionRequest>,
@@ -1565,74 +1469,31 @@ async fn execute_action(
         request.action_type, request.image_id, request.timeout_seconds
     );
 
-    let app_state = state.app_state.clone();
+    // Use UnifiedActionService for deterministic execution
+    let action_service = state.action_service.clone();
     let action_type = request.action_type.clone();
     let image_id = request.image_id.clone();
-    let monitor_index = request.monitor_index;
-    let timeout_duration = Duration::from_secs(request.timeout_seconds);
 
-    // Build action parameters
-    let action_params = serde_json::json!({
-        "action_type": action_type.to_uppercase(),
-        "image_id": image_id,
-        "monitor_index": monitor_index.unwrap_or(0)
-    });
-
-    // Send command and wait for response using spawn_blocking
-    let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
-
-        if let Some(ref mut bridge) = *bridge_lock {
-            if !bridge.is_running() {
-                return Err("Python executor not running".to_string());
-            }
-
-            // Use send_command_and_wait to get synchronous response
-            match bridge.send_command_and_wait(
-                "execute_action",
-                Some(action_params),
-                timeout_duration,
-            ) {
-                Ok(response) => {
-                    if response.success {
-                        Ok(ExecuteActionResult {
-                            success: true,
-                            action_type: request.action_type,
-                            image_id: request.image_id,
-                            error: None,
-                        })
-                    } else {
-                        Ok(ExecuteActionResult {
-                            success: false,
-                            action_type: request.action_type,
-                            image_id: request.image_id,
-                            error: response.error,
-                        })
-                    }
-                }
-                Err(e) => Err(format!("Failed to execute action: {}", e)),
-            }
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
+    match action_service
+        .execute_action(
+            &request.action_type,
+            &request.image_id,
+            None, // No additional config
+            request.monitor_index,
         )
-    })?;
+        .await
+    {
+        Ok(result) => {
+            let action_result = ExecuteActionResult {
+                success: result.success,
+                action_type: action_type.clone(),
+                image_id: image_id.clone(),
+                error: if result.success { None } else { result.message },
+            };
 
-    match result {
-        Ok(action_result) => {
             if action_result.success {
                 info!(
-                    "MCP API: Action {} on image {} succeeded",
+                    "MCP API: Action {} on image {} succeeded via UnifiedActionService",
                     action_result.action_type, action_result.image_id
                 );
             } else {
@@ -1645,7 +1506,20 @@ async fn execute_action(
         }
         Err(e) => {
             error!("MCP API: Failed to execute action: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+            match e {
+                crate::action_service::ActionError::ExecutorNotRunning => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("Python executor not running")),
+                )),
+                crate::action_service::ActionError::ExecutorNotInitialized => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("Python executor not initialized")),
+                )),
+                _ => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(e.to_string())),
+                )),
+            }
         }
     }
 }
@@ -6684,6 +6558,12 @@ pub fn create_router(
         }
     };
 
+    // Create UnifiedActionService for deterministic execution
+    let action_service = Arc::new(UnifiedActionService::new(
+        app_state.clone(),
+        config_storage.clone(),
+    ));
+
     let api_state = Arc::new(ApiState {
         app_state,
         rag_state,
@@ -6692,6 +6572,7 @@ pub fn create_router(
         task_monitor,
         current_config_id: std::sync::Mutex::new(None),
         config_storage,
+        action_service,
     });
 
     // Restore persisted session state on startup

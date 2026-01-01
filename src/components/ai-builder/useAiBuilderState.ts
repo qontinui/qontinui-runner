@@ -32,6 +32,7 @@ import {
   CAPTURE_INPUT_VALIDATION_KEY,
   HISTORY_KEY,
   SESSION_KEY,
+  SELECTED_CONFIG_KEY,
   getDeveloperPromptTemplate,
   saveCustomPromptTemplate,
   resetPromptTemplateToDefault,
@@ -120,6 +121,24 @@ export function useAiBuilderState({
 
   // Saved prompts from the prompt library
   const [savedPrompts, setSavedPrompts] = useState<SavedPromptInfo[]>([]);
+
+  // Selected stored config ID - persisted to localStorage
+  const [selectedConfigId, setSelectedConfigId] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(SELECTED_CONFIG_KEY) || null;
+    } catch {
+      return null;
+    }
+  });
+
+  // Persist selected config ID to localStorage
+  useEffect(() => {
+    if (selectedConfigId) {
+      localStorage.setItem(SELECTED_CONFIG_KEY, selectedConfigId);
+    } else {
+      localStorage.removeItem(SELECTED_CONFIG_KEY);
+    }
+  }, [selectedConfigId]);
 
   // Save workflow dialog state
   const [showSaveDialog, setShowSaveDialog] = useState(false);
@@ -245,6 +264,12 @@ export function useAiBuilderState({
 
     return { states: stateList, images: imageList, workflows: workflowList };
   }, [execution.config]);
+
+  // Compute whether execution steps have GUI steps that require a stored config
+  const hasGuiSteps = useMemo(() => {
+    const guiStepTypes = ["workflow", "state", "action"];
+    return executionSteps.some((step) => guiStepTypes.includes(step.type));
+  }, [executionSteps]);
 
   // Save history to localStorage
   useEffect(() => {
@@ -1244,5 +1269,13 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     // Config Loading
     configLoaded: execution.configLoaded,
     loadConfiguration: execution.loadConfiguration,
+
+    // Stored Config Selection
+    selectedConfigId,
+    setSelectedConfigId: (configId: string | null) => {
+      setSelectedConfigId(configId);
+      setHasUnsavedChanges(true);
+    },
+    hasGuiSteps,
   };
 }

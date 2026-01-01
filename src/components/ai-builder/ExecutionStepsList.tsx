@@ -2,15 +2,24 @@
  * ExecutionStepsList.tsx
  *
  * Displays the list of execution steps with the add step dropdown.
+ * Includes ConfigSelector for GUI-based steps.
  */
 
 import { Camera, ChevronDown, GripVertical, Play, Plus } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
 import { ExecutionStepItem } from "./ExecutionStepItem";
 import { AddStepDropdown } from "./AddStepDropdown";
+import { ConfigSelector } from "../ConfigSelector";
 
 export function ExecutionStepsList() {
-  const { executionSteps, showAddDropdown, setShowAddDropdown } = useAiBuilder();
+  const {
+    executionSteps,
+    showAddDropdown,
+    setShowAddDropdown,
+    selectedConfigId,
+    setSelectedConfigId,
+    hasGuiSteps,
+  } = useAiBuilder();
 
   return (
     <div className="card p-4 space-y-3">
@@ -65,6 +74,19 @@ export function ExecutionStepsList() {
           <Camera className="w-3 h-3 inline mr-1" />
           Click the camera icon to toggle screenshots for each step
         </p>
+      )}
+
+      {/* Config Selector - shown when there are GUI steps */}
+      {hasGuiSteps && (
+        <div className="pt-2 border-t border-border">
+          <div className="text-xs font-medium text-muted-foreground mb-2">Stored Configuration</div>
+          <ConfigSelector
+            selectedConfigId={selectedConfigId}
+            onConfigSelect={setSelectedConfigId}
+            hasGuiSteps={hasGuiSteps}
+            compact
+          />
+        </div>
       )}
     </div>
   );

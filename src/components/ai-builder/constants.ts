@@ -12,6 +12,7 @@ export const MAX_ITERATIONS_KEY = "qontinui-ai-max-iterations";
 export const CAPTURE_INPUT_VALIDATION_KEY = "qontinui-ai-capture-input-validation";
 export const HISTORY_KEY = "qontinui-ai-builder-history";
 export const SESSION_KEY = "qontinui-ai-developer-session";
+export const SELECTED_CONFIG_KEY = "qontinui-ai-selected-config";
 
 // Default Developer Mode Prompt Template - Runner handles continuation deterministically
 export const DEFAULT_DEVELOPER_PROMPT_TEMPLATE = `# AI Developer Loop
