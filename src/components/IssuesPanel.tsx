@@ -30,7 +30,7 @@ import {
   IssueSourceType,
 } from "../types/issues";
 import { useIssues, useAiTaskPolling } from "../hooks";
-import type { UnifiedReportItem, UnifiedStatus } from "../services/UnifiedReportService";
+import type { UnifiedStatus } from "../services/UnifiedReportService";
 import { issueTracker } from "../services/IssueTracker";
 
 // Component is self-contained with expand/collapse functionality

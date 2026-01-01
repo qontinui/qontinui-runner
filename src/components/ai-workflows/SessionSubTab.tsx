@@ -41,7 +41,6 @@ import {
 import { AiOutputTab } from "../AiOutputTab";
 import type { AiOutputLine } from "../AiOutputTab";
 import { useIssues } from "../../hooks";
-import type { UnifiedReportItem } from "../../services/UnifiedReportService";
 import { groupEntriesIntoLoops, type AiLoop } from "../../types/aiLoop";
 import { useAutoContinue } from "../../contexts";
 

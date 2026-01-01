@@ -14,8 +14,6 @@ import {
   AlertCircle,
   FolderOpen,
   User,
-  Download,
-  Upload,
 } from "lucide-react";
 import { useContexts } from "./hooks/useContexts";
 import { ContextFilters } from "./ContextFilters";

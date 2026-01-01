@@ -8,7 +8,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  Context,
   ContextWithMetadata,
   ContextScope,
   ContextFilterOptions,

@@ -9,8 +9,8 @@
  * It allows UI components to use a single API while both systems are active.
  */
 
-import type { Finding, FindingSeverity, FindingStatus, ReportSummary } from "../types/findings";
-import type { DetectedIssue, IssueSessionSummary } from "../types/issues";
+import type { Finding, FindingSeverity, FindingStatus } from "../types/findings";
+import type { DetectedIssue } from "../types/issues";
 import { findingsTracker } from "./FindingsTracker";
 import { issueTracker } from "./IssueTracker";
 import { sessionManager, type SessionContext } from "./SessionManager";

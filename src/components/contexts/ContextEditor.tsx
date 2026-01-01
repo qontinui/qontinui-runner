@@ -16,13 +16,11 @@ import {
   Zap,
   FileText,
   Plus,
-  Trash2,
   AlertTriangle,
   Eye,
   HelpCircle,
 } from "lucide-react";
 import type {
-  Context,
   ContextWithMetadata,
   ContextAutoInclude,
   CreateContextRequest,
