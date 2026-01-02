@@ -345,6 +345,12 @@ fn run_claude_session_inline(
             None
         };
 
+        // Buffer to accumulate text until we have complete lines for finding parsing.
+        // Stream-json sends partial text chunks (content_block_delta), so markers like
+        // [FINDING:code_bug:high] can be split across multiple events. We need to buffer
+        // and only parse complete lines (ending with \n) for findings.
+        let mut line_buffer = String::new();
+
         if let Some(stdout) = stdout {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
@@ -369,11 +375,18 @@ fn run_claude_session_inline(
                             );
                         }));
 
-                        // Parse each line for findings
+                        // Parse complete lines for findings
+                        // We buffer text until we encounter newlines, then process
+                        // complete lines through the finding parser
                         if let Some(ref mut parser) = finding_parser {
-                            // Process each line of the text for finding markers
-                            for text_line in text.lines() {
-                                if let Some(parsed_finding) = parser.process_line(text_line) {
+                            line_buffer.push_str(&text);
+
+                            // Process complete lines from the buffer
+                            while let Some(newline_pos) = line_buffer.find('\n') {
+                                let complete_line = line_buffer[..newline_pos].to_string();
+                                line_buffer = line_buffer[newline_pos + 1..].to_string();
+
+                                if let Some(parsed_finding) = parser.process_line(&complete_line) {
                                     // Send the parsed finding to the processor thread
                                     let _ = finding_tx.send(parsed_finding);
                                 }
@@ -385,6 +398,16 @@ fn run_claude_session_inline(
                 }
             }
         }
+
+        // Process any remaining text in the buffer (final line without trailing newline)
+        if let Some(ref mut parser) = finding_parser {
+            if !line_buffer.is_empty() {
+                if let Some(parsed_finding) = parser.process_line(&line_buffer) {
+                    let _ = finding_tx.send(parsed_finding);
+                }
+            }
+        }
+
         all_text
     });
 
@@ -6092,11 +6115,17 @@ async fn run_unified_session_loop(
                         let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
-                        complete_task_run_with_retry(
+                        if !complete_task_run_with_retry(
                             state.app_state.checkpoint_db.clone(),
                             &session_id,
                         )
-                        .await;
+                        .await
+                        {
+                            error!(
+                                "Failed to mark task_run {} as complete in database - AI status may be stale",
+                                session_id
+                            );
+                        }
 
                         emit_ai_output(
                             &app_handle,
@@ -6117,11 +6146,17 @@ async fn run_unified_session_loop(
                         let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
-                        complete_task_run_with_retry(
+                        if !complete_task_run_with_retry(
                             state.app_state.checkpoint_db.clone(),
                             &session_id,
                         )
-                        .await;
+                        .await
+                        {
+                            error!(
+                                "Failed to mark task_run {} as complete in database - AI status may be stale",
+                                session_id
+                            );
+                        }
 
                         emit_ai_output(
                             &app_handle,
@@ -6148,11 +6183,17 @@ async fn run_unified_session_loop(
                         let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
-                        complete_task_run_with_retry(
+                        if !complete_task_run_with_retry(
                             state.app_state.checkpoint_db.clone(),
                             &session_id,
                         )
-                        .await;
+                        .await
+                        {
+                            error!(
+                                "Failed to mark task_run {} as complete in database - AI status may be stale",
+                                session_id
+                            );
+                        }
 
                         emit_ai_output(
                             &app_handle,

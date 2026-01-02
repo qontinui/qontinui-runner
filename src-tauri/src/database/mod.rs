@@ -1181,7 +1181,7 @@ impl CheckpointDb {
         }
     }
 
-    /// Check if a task run should continue (not complete, not stopped, not at max sessions).
+    /// Check if a task run should continue (not complete, not stopped, not at max sessions, auto_continue enabled).
     pub fn should_continue_task(&self, id: &str) -> Result<bool, String> {
         let task_run = self
             .get_task_run(id)?
@@ -1189,6 +1189,11 @@ impl CheckpointDb {
 
         // Already complete or stopped
         if task_run.status != "running" {
+            return Ok(false);
+        }
+
+        // Check if auto_continue is enabled for this task
+        if !task_run.auto_continue {
             return Ok(false);
         }
 

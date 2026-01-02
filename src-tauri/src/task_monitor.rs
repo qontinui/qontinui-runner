@@ -394,6 +394,15 @@ impl TaskMonitor {
                             &format!("Max sessions reached ({}) without task completion", max),
                         )?;
                     }
+                } else {
+                    // Task has no max_sessions limit but should_continue returned false
+                    // This can happen when auto_continue is disabled globally or per-task
+                    // In this case, mark the task as complete since the session finished normally
+                    info!(
+                        "Task {} session ended, auto-continue disabled, marking as complete",
+                        task_run_id
+                    );
+                    db.complete_task_run(task_run_id)?;
                 }
             }
         }
