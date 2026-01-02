@@ -847,6 +847,7 @@ fn row_to_config_statistics(row: &rusqlite::Row) -> rusqlite::Result<ConfigStati
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiered_info::TransitionStats;
     use rusqlite::Connection;
 
     fn create_test_db() -> Connection {

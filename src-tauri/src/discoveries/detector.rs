@@ -415,8 +415,7 @@ fn calculate_flaky_confidence(total_runs: u32, success_rate: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiered_info::TransitionStats;
-    use std::collections::HashMap;
+    use crate::tiered_info::{RunStatus, TransitionStats};
 
     fn create_test_context() -> DetectionContext {
         DetectionContext {

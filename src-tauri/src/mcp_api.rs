@@ -5040,6 +5040,7 @@ async fn start_session(
                     workspace_root.clone(),
                     None, // No external checkpoint - database tracks state
                     Some(session_ctx),
+                    None, // No task_run_id - use session_id
                 )
                 .await;
 
@@ -5490,8 +5491,15 @@ async fn force_continue_session(
 
                 // Spawn the execution
                 tokio::spawn(async move {
-                    run_unified_session_loop(state_clone, sid, workspace_root, None, Some(run_ctx))
-                        .await;
+                    run_unified_session_loop(
+                        state_clone,
+                        sid,
+                        workspace_root,
+                        None,
+                        Some(run_ctx),
+                        None,
+                    )
+                    .await;
                 });
 
                 return Json(ApiResponse::success(ForceContinueResponse {
@@ -5598,7 +5606,7 @@ async fn force_continue_simple(
                 .unwrap_or_else(|_| ".".to_string());
 
             tokio::spawn(async move {
-                run_unified_session_loop(state_clone, sid, workspace_root, None, None).await;
+                run_unified_session_loop(state_clone, sid, workspace_root, None, None, None).await;
             });
 
             Json(ApiResponse::success(ForceContinueResponse {
@@ -5920,6 +5928,7 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
 
                 let state_clone = state.clone();
                 let task_name = task.task_name.clone();
+                let task_id = task.id.clone();
                 let run_ctx = session_ctx.clone();
 
                 tokio::spawn(async move {
@@ -5929,6 +5938,7 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                         workspace_root,
                         None,
                         Some(run_ctx),
+                        Some(task_id), // Use original task ID for resumed tasks
                     )
                     .await;
                     info!(
@@ -5959,13 +5969,21 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
 ///
 /// For multi-session workflows, pass the external checkpoint info so the loop
 /// can exit when the external checkpoint advances, allowing cross-session continuation.
+///
+/// The `task_run_id` parameter is used for database operations (append_task_output,
+/// complete_task_run, fail_task_run). When resuming a task, the session_id is a NEW
+/// session but we need to update the ORIGINAL task_run record. Pass `Some(task.id)`
+/// for resumed tasks, or `None` to use session_id as the task_run_id.
 async fn run_unified_session_loop(
     state: Arc<ApiState>,
     session_id: String,
     workspace_root: String,
     external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
     run_ctx: Option<AiOutputSessionContext>, // Context for grouping output into a single Run
+    task_run_id: Option<String>, // ID to use for database task_run operations (for resumed tasks)
 ) {
+    // Use task_run_id if provided (for resumed tasks), otherwise use session_id
+    let db_task_id = task_run_id.unwrap_or_else(|| session_id.clone());
     let session = match state.session.get_session(&session_id).await {
         Some(s) => s,
         None => {
@@ -6019,14 +6037,15 @@ async fn run_unified_session_loop(
 
         // Increment sessions_count in database for this phase
         // This keeps task_run.sessions_count in sync with session.checkpoint.sessions_spawned
+        // Use db_task_id (not session_id) for database operations - critical for resumed tasks
         if let Err(e) = state
             .app_state
             .checkpoint_db
-            .append_task_output(&session_id, "", true)
+            .append_task_output(&db_task_id, "", true)
         {
             warn!(
                 "Failed to increment sessions_count for task {}: {}",
-                session_id, e
+                db_task_id, e
             );
         }
 
@@ -6050,9 +6069,9 @@ async fn run_unified_session_loop(
         let ctx_for_claude = Some(session_ctx.clone());
 
         // Create finding context for this phase
-        // The session_id is used as the task_run_id for finding storage
+        // Use db_task_id for finding storage - critical for resumed tasks
         let finding_ctx_for_claude = Some(FindingContext {
-            task_run_id: session_id.clone(),
+            task_run_id: db_task_id.clone(),
             session_num: phase,
         });
 
@@ -6084,6 +6103,7 @@ async fn run_unified_session_loop(
                 // Append session output to task_run.output_log in database
                 // This preserves output across restarts and enables debugging
                 // Limit output to last 50KB to prevent database bloat
+                // Use db_task_id (not session_id) - critical for resumed tasks
                 let output_to_store = if output.len() > 50_000 {
                     format!(
                         "\n\n=== Phase {} Output (truncated, last 50KB) ===\n{}",
@@ -6094,11 +6114,11 @@ async fn run_unified_session_loop(
                     format!("\n\n=== Phase {} Output ===\n{}", phase, output)
                 };
                 if let Err(e) = state.app_state.checkpoint_db.append_task_output(
-                    &session_id,
+                    &db_task_id,
                     &output_to_store,
                     false,
                 ) {
-                    warn!("Failed to append output for task {}: {}", session_id, e);
+                    warn!("Failed to append output for task {}: {}", db_task_id, e);
                 }
 
                 // Note: External checkpoint is now checked by the CROSS-SESSION loop
@@ -6115,15 +6135,16 @@ async fn run_unified_session_loop(
                         let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
+                        // Use db_task_id (not session_id) - critical for resumed tasks
                         if !complete_task_run_with_retry(
                             state.app_state.checkpoint_db.clone(),
-                            &session_id,
+                            &db_task_id,
                         )
                         .await
                         {
                             error!(
                                 "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                session_id
+                                db_task_id
                             );
                         }
 
@@ -6146,15 +6167,16 @@ async fn run_unified_session_loop(
                         let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
+                        // Use db_task_id (not session_id) - critical for resumed tasks
                         if !complete_task_run_with_retry(
                             state.app_state.checkpoint_db.clone(),
-                            &session_id,
+                            &db_task_id,
                         )
                         .await
                         {
                             error!(
                                 "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                session_id
+                                db_task_id
                             );
                         }
 
@@ -6183,15 +6205,16 @@ async fn run_unified_session_loop(
                         let _ = state.session.update_session(s).await;
 
                         // Update task_run in database to match session status (with retry)
+                        // Use db_task_id (not session_id) - critical for resumed tasks
                         if !complete_task_run_with_retry(
                             state.app_state.checkpoint_db.clone(),
-                            &session_id,
+                            &db_task_id,
                         )
                         .await
                         {
                             error!(
                                 "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                session_id
+                                db_task_id
                             );
                         }
 
@@ -6273,10 +6296,11 @@ async fn run_unified_session_loop(
                 }
 
                 // Update task_run in database to match session status
-                if let Err(db_err) = state.app_state.checkpoint_db.fail_task_run(&session_id, &e) {
+                // Use db_task_id (not session_id) - critical for resumed tasks
+                if let Err(db_err) = state.app_state.checkpoint_db.fail_task_run(&db_task_id, &e) {
                     warn!(
                         "Failed to mark task_run {} as failed: {}",
-                        session_id, db_err
+                        db_task_id, db_err
                     );
                 }
 
