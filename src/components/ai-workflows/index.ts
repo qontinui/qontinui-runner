@@ -7,5 +7,4 @@ export { WorkflowLibrarySubTab } from "./WorkflowLibrarySubTab";
 export { PromptsSubTab } from "./PromptsSubTab";
 export { ScriptsSubTab } from "./ScriptsSubTab";
 export { AiOutputSubTab } from "./AiOutputSubTab";
-export { LearningsSubTab } from "./LearningsSubTab";
 export { ScriptletsSubTab } from "./ScriptletsSubTab";

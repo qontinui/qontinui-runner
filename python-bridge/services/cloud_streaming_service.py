@@ -271,7 +271,8 @@ class CloudStreamingService:
         Returns:
             ISO 8601 formatted timestamp string
         """
-        return utc_now().isoformat().replace("+00:00", "Z")
+        timestamp: str = utc_now().isoformat().replace("+00:00", "Z")
+        return timestamp
 
     async def connect(self, jwt_token: str) -> bool:
         """Establish WebSocket connection to cloud.

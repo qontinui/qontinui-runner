@@ -165,7 +165,8 @@ class RunnerWebSocketClient:
 
     def _get_timestamp(self) -> str:
         """Get current UTC timestamp in ISO format."""
-        return utc_now().isoformat().replace("+00:00", "Z")
+        timestamp: str = utc_now().isoformat().replace("+00:00", "Z")
+        return timestamp
 
     async def connect(self) -> bool:
         """
@@ -333,7 +334,7 @@ class RunnerWebSocketClient:
 
         try:
             # Determine expected response type based on request type
-            request_type = message.get("type")
+            request_type = message.get("type", "")
             expected_response_type = self._request_response_map.get(request_type)
 
             # Create a response queue keyed by expected response type

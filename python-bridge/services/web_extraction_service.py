@@ -13,9 +13,21 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
+from PIL import Image
 from qontinui_schemas.common import utc_now
 
 logger = logging.getLogger(__name__)
+
+# Try to import OCR name generator
+try:
+    from qontinui.discovery.state_construction.ocr_name_generator import OCRNameGenerator
+
+    HAS_OCR = True
+except ImportError:
+    HAS_OCR = False
+    logger.warning("OCRNameGenerator not available - elements will use default names")
 
 
 class WebExtractionService:
@@ -398,8 +410,18 @@ class WebExtractionService:
                 serialized_states = [self._serialize_state(s) for s in result.states]
                 serialized_transitions = [self._serialize_transition(t) for t in result.transitions]
 
+                # Serialize elements from runtime extraction
+                serialized_elements = []
+                if result.runtime_extraction and result.runtime_extraction.elements:
+                    serialized_elements = [
+                        self._serialize_element(e) for e in result.runtime_extraction.elements
+                    ]
+                    logger.info(f"Serialized {len(serialized_elements)} elements for backend")
+
                 # Save annotations to backend
-                await self._save_annotations_to_backend(serialized_states, serialized_transitions)
+                await self._save_annotations_to_backend(
+                    serialized_states, serialized_transitions, serialized_elements
+                )
 
                 # Update backend session to completed with stats
                 pages_extracted = (
@@ -978,7 +1000,26 @@ class WebExtractionService:
         Returns:
             Serialized state dict.
         """
-        return {
+        # Serialize bbox if available
+        bbox_dict = None
+        bbox = getattr(state, "bounding_box", None)
+        if bbox:
+            if hasattr(bbox, "to_dict"):
+                bbox_dict = bbox.to_dict()
+            elif hasattr(bbox, "x"):
+                bbox_dict = {
+                    "x": bbox.x,
+                    "y": bbox.y,
+                    "width": bbox.width,
+                    "height": bbox.height,
+                }
+
+        # Also check metadata for bbox (set by orchestrator from ExtractedState)
+        metadata = state.metadata if hasattr(state, "metadata") else {}
+        if bbox_dict is None and isinstance(metadata, dict) and "bbox" in metadata:
+            bbox_dict = metadata["bbox"]
+
+        result = {
             "id": state.id,
             "name": state.name,
             "confidence": state.confidence,
@@ -993,8 +1034,14 @@ class WebExtractionService:
             "visible_elements": state.visible_elements,
             "correlation_method": state.correlation_method,
             "correlation_score": state.correlation_score,
-            "metadata": state.metadata,
+            "metadata": metadata,
         }
+
+        # Include bbox at top level for easy access
+        if bbox_dict:
+            result["bbox"] = bbox_dict
+
+        return result
 
     def _serialize_transition(self, transition) -> dict[str, Any]:
         """
@@ -1018,6 +1065,219 @@ class WebExtractionService:
             "confidence": transition.confidence,
             "metadata": transition.metadata,
         }
+
+    def _serialize_element(self, element) -> dict[str, Any]:
+        """
+        Serialize an ExtractedElement to dict for the backend API.
+
+        Args:
+            element: ExtractedElement object
+
+        Returns:
+            Serialized element dict in ElementAnnotation format.
+        """
+        # Get bbox dict
+        bbox_dict = {"x": 0, "y": 0, "width": 0, "height": 0}
+        bbox = getattr(element, "bbox", None)
+        if bbox:
+            if hasattr(bbox, "to_dict"):
+                bbox_dict = bbox.to_dict()
+            elif hasattr(bbox, "x"):
+                bbox_dict = {
+                    "x": int(bbox.x),
+                    "y": int(bbox.y),
+                    "width": int(bbox.width),
+                    "height": int(bbox.height),
+                }
+
+        # Get element type as string
+        element_type = getattr(element, "element_type", None)
+        if element_type:
+            if hasattr(element_type, "value"):
+                element_type = element_type.value
+            else:
+                element_type = str(element_type)
+        else:
+            element_type = "unknown"
+
+        return {
+            "id": element.id,
+            "name": None,  # Will be populated by _apply_ocr_to_elements
+            "element_type": element_type,
+            "bbox": bbox_dict,
+            "text": getattr(element, "text_content", None),
+            "selector": getattr(element, "selector", None),
+            "confidence": getattr(element, "confidence", 1.0),
+        }
+
+    def _sanitize_text_for_name(self, text: str) -> str:
+        """
+        Sanitize text to create a valid element name.
+
+        Converts text to lowercase, replaces spaces and special characters
+        with underscores, and removes non-alphanumeric characters.
+
+        Args:
+            text: Raw text to sanitize
+
+        Returns:
+            Sanitized text suitable for use as an element name
+        """
+        import re
+
+        if not text:
+            return ""
+
+        # Convert to lowercase
+        sanitized = text.lower().strip()
+
+        # Replace common separators with underscores
+        sanitized = re.sub(r"[\s\-/\\.,;:!?()]+", "_", sanitized)
+
+        # Remove any remaining non-alphanumeric characters (except underscores)
+        sanitized = re.sub(r"[^a-z0-9_]", "", sanitized)
+
+        # Collapse multiple underscores into single underscore
+        sanitized = re.sub(r"_+", "_", sanitized)
+
+        # Remove leading/trailing underscores
+        sanitized = sanitized.strip("_")
+
+        # Truncate to reasonable length (50 chars max)
+        if len(sanitized) > 50:
+            sanitized = sanitized[:50].rstrip("_")
+
+        return sanitized
+
+    def _apply_ocr_to_elements(
+        self,
+        elements: list[dict[str, Any]],
+        screenshot_path: Path,
+    ) -> list[dict[str, Any]]:
+        """
+        Apply OCR to elements to generate meaningful names from their visual content.
+
+        Args:
+            elements: List of serialized element dicts
+            screenshot_path: Path to the screenshot image
+
+        Returns:
+            Updated elements with OCR-based names
+        """
+        if not elements:
+            return elements
+
+        # First, try to set names from existing text content (DOM-extracted)
+        # This works even without OCR
+        logger.info(f"Processing {len(elements)} elements for naming")
+        for element in elements:
+            text = element.get("text")
+            current_name = element.get("name")
+            logger.debug(
+                f"Element {element.get('id')}: name={current_name}, text={text[:50] if text else None}"
+            )
+            if not current_name and text:
+                # Sanitize the text to create a valid name
+                sanitized = self._sanitize_text_for_name(text)
+                logger.debug(f"  Sanitized text: {sanitized}")
+                if sanitized and len(sanitized) >= 2:
+                    element["name"] = sanitized
+                    logger.debug(f"  Set name to: {sanitized}")
+
+        # If OCR is not available, we're done
+        if not HAS_OCR:
+            named_count = sum(1 for e in elements if e.get("name"))
+            logger.info(
+                f"Set names from DOM text for {len(elements)} elements: "
+                f"{named_count} named (OCR not available)"
+            )
+            return elements
+
+        if not screenshot_path.exists():
+            logger.warning(f"Screenshot not found for OCR: {screenshot_path}")
+            named_count = sum(1 for e in elements if e.get("name"))
+            logger.info(
+                f"Set names from DOM text for {len(elements)} elements: "
+                f"{named_count} named (screenshot not found)"
+            )
+            return elements
+
+        try:
+            # Initialize OCR generator (will auto-select best available engine)
+            ocr_generator = OCRNameGenerator(engine="auto")
+
+            # Load screenshot as numpy array for OpenCV processing
+            pil_image = Image.open(screenshot_path)
+            screenshot = np.array(pil_image)
+
+            # Convert RGB to BGR for OpenCV (if color image)
+            if len(screenshot.shape) == 3 and screenshot.shape[2] == 3:
+                screenshot = cv2.cvtColor(screenshot, cv2.COLOR_RGB2BGR)
+
+            img_height, img_width = screenshot.shape[:2]
+
+            for element in elements:
+                bbox = element.get("bbox", {})
+                x = int(bbox.get("x", 0))
+                y = int(bbox.get("y", 0))
+                width = int(bbox.get("width", 0))
+                height = int(bbox.get("height", 0))
+
+                # Skip invalid bboxes
+                if width <= 0 or height <= 0:
+                    continue
+
+                # Clamp to image bounds
+                x = max(0, min(x, img_width - 1))
+                y = max(0, min(y, img_height - 1))
+                x2 = max(0, min(x + width, img_width))
+                y2 = max(0, min(y + height, img_height))
+
+                # Skip if region is too small
+                if x2 - x < 5 or y2 - y < 5:
+                    continue
+
+                # Crop element region
+                element_image = screenshot[y:y2, x:x2]
+
+                # First, try to extract raw OCR text
+                raw_ocr_text = ocr_generator._extract_text(element_image)
+
+                # Determine the best name for this element
+                element_name = None
+
+                if raw_ocr_text and raw_ocr_text.strip():
+                    # Use OCR text to generate a sanitized name
+                    sanitized_name = ocr_generator._sanitize_text(raw_ocr_text)
+                    if sanitized_name and len(sanitized_name) >= 2:
+                        element_name = sanitized_name
+                        # Update text field with raw OCR if it was empty
+                        if not element.get("text"):
+                            element["text"] = raw_ocr_text.strip()
+
+                # If no OCR text, try using existing text content from DOM
+                if not element_name and element.get("text"):
+                    sanitized_name = ocr_generator._sanitize_text(element["text"])
+                    if sanitized_name and len(sanitized_name) >= 2:
+                        element_name = sanitized_name
+
+                # Set the name if we found something meaningful
+                if element_name:
+                    element["name"] = element_name
+                    logger.debug(f"Element {element['id']} named: {element_name}")
+
+            # Log summary of naming results
+            named_count = sum(1 for e in elements if e.get("name"))
+            logger.info(
+                f"Applied OCR naming to {len(elements)} elements: "
+                f"{named_count} named, {len(elements) - named_count} unnamed"
+            )
+
+        except Exception as e:
+            logger.warning(f"OCR processing failed: {e}", exc_info=True)
+            # Return elements unchanged on error
+
+        return elements
 
     async def _update_backend_session(
         self,
@@ -1078,23 +1338,75 @@ class WebExtractionService:
         Returns:
             Dict in StateAnnotation format
         """
-        return {
-            "id": state.get("id", str(uuid.uuid4())),
-            "name": state.get("name", f"state_{index}"),
-            "bbox": {
+        # Try to get bbox from various sources in the state data
+        bbox = None
+
+        # 1. Check metadata for bbox (stored by state builder)
+        metadata = state.get("metadata", {})
+        if isinstance(metadata, dict):
+            if "bbox" in metadata:
+                bbox_data = metadata["bbox"]
+                # Handle tuple format (x, y, w, h)
+                if isinstance(bbox_data, (list, tuple)) and len(bbox_data) >= 4:
+                    bbox = {
+                        "x": int(bbox_data[0]),
+                        "y": int(bbox_data[1]),
+                        "width": int(bbox_data[2]),
+                        "height": int(bbox_data[3]),
+                    }
+                # Handle dict format
+                elif isinstance(bbox_data, dict):
+                    bbox = {
+                        "x": int(bbox_data.get("x", 0)),
+                        "y": int(bbox_data.get("y", 0)),
+                        "width": int(bbox_data.get("width", 200)),
+                        "height": int(bbox_data.get("height", 80)),
+                    }
+
+        # 2. Check for bounding_box field directly on state (CorrelatedState model)
+        if bbox is None and "bounding_box" in state:
+            bbox_data = state["bounding_box"]
+            if isinstance(bbox_data, dict):
+                bbox = {
+                    "x": int(bbox_data.get("x", 0)),
+                    "y": int(bbox_data.get("y", 0)),
+                    "width": int(bbox_data.get("width", 200)),
+                    "height": int(bbox_data.get("height", 80)),
+                }
+
+        # 3. Check for bbox field directly on state (ExtractedState model)
+        if bbox is None and "bbox" in state:
+            bbox_data = state["bbox"]
+            if isinstance(bbox_data, dict):
+                bbox = {
+                    "x": int(bbox_data.get("x", 0)),
+                    "y": int(bbox_data.get("y", 0)),
+                    "width": int(bbox_data.get("width", 200)),
+                    "height": int(bbox_data.get("height", 80)),
+                }
+
+        # 4. Fallback to placeholder values
+        if bbox is None:
+            bbox = {
                 "x": 0,
                 "y": index * 100,  # Stack states vertically for visualization
                 "width": 200,
                 "height": 80,
-            },
-            "state_type": state.get("correlation_method", "extracted"),
-            "element_ids": state.get("visible_elements", []) or [],
+            }
+
+        return {
+            "id": state.get("id", str(uuid.uuid4())),
+            "name": state.get("name", f"state_{index}"),
+            "bbox": bbox,
+            "state_type": state.get("correlation_method", state.get("state_type", "extracted")),
+            "element_ids": state.get("visible_elements", state.get("element_ids", [])) or [],
         }
 
     async def _save_annotations_to_backend(
         self,
         states: list[dict[str, Any]],
         transitions: list[dict[str, Any]],
+        elements: list[dict[str, Any]] | None = None,
     ) -> None:
         """
         Save extraction annotations to the backend.
@@ -1102,12 +1414,15 @@ class WebExtractionService:
         Args:
             states: List of serialized state dicts (CorrelatedState format)
             transitions: List of serialized transition dicts
+            elements: List of serialized element dicts (ExtractedElement format)
         """
         if not self._backend_session_id or not self._backend_url:
             logger.debug("No backend session configured, skipping annotation save")
             return
 
         import httpx
+
+        elements = elements or []
 
         # Group states by their screenshot_id (each screenshot is a separate annotation)
         states_by_screenshot: dict[str, list[dict[str, Any]]] = {}
@@ -1118,10 +1433,49 @@ class WebExtractionService:
                 states_by_screenshot[screenshot_id] = []
             states_by_screenshot[screenshot_id].append(state)
 
+        # Group elements by their screenshot (elements belong to states which have screenshot_ids)
+        # We need to associate elements with states via element_ids
+        # For now, we group all elements with the first screenshot since runtime extraction
+        # captures elements per page visit
+        elements_by_screenshot: dict[str, list[dict[str, Any]]] = {}
+
+        # Build a mapping of element_id -> element
+        element_map = {elem["id"]: elem for elem in elements}
+        logger.debug(f"Element map has {len(element_map)} elements")
+
+        # Assign elements to screenshots based on which states reference them
+        for screenshot_id, screenshot_states in states_by_screenshot.items():
+            if screenshot_id not in elements_by_screenshot:
+                elements_by_screenshot[screenshot_id] = []
+
+            # Collect all element IDs referenced by states in this screenshot
+            for state in screenshot_states:
+                element_ids = state.get("visible_elements", []) or []
+                logger.debug(
+                    f"State {state.get('name', state.get('id', 'unknown'))} "
+                    f"has {len(element_ids)} element IDs"
+                )
+                for elem_id in element_ids:
+                    if elem_id in element_map:
+                        elem = element_map[elem_id]
+                        # Avoid duplicates
+                        if elem not in elements_by_screenshot[screenshot_id]:
+                            elements_by_screenshot[screenshot_id].append(elem)
+                    else:
+                        logger.debug(f"Element {elem_id} not found in element_map")
+
         # Build headers with auth token if available
         headers = {"Content-Type": "application/json"}
         if self._backend_auth_token:
             headers["Authorization"] = f"Bearer {self._backend_auth_token}"
+
+        # Get extraction ID for screenshot lookup
+        extraction_id = None
+        if self._current_extraction_id and self._current_extraction_id in self._extraction_results:
+            extraction_data = self._extraction_results[self._current_extraction_id]
+            result = extraction_data.get("result")
+            if result:
+                extraction_id = result.extraction_id
 
         try:
             async with httpx.AsyncClient() as client:
@@ -1135,10 +1489,25 @@ class WebExtractionService:
                         for idx, state in enumerate(screenshot_states)
                     ]
 
+                    # Get elements for this screenshot
+                    screenshot_elements = elements_by_screenshot.get(screenshot_id, [])
+
+                    # Apply OCR to elements if we can find the screenshot
+                    if screenshot_elements and extraction_id:
+                        screenshot_path = (
+                            self.extractions_dir
+                            / extraction_id
+                            / "screenshots"
+                            / f"{screenshot_id}.png"
+                        )
+                        screenshot_elements = self._apply_ocr_to_elements(
+                            screenshot_elements, screenshot_path
+                        )
+
                     annotation_data = {
                         "screenshot_id": screenshot_id,
                         "source_url": source_url,
-                        "elements": [],  # Elements are embedded in states
+                        "elements": screenshot_elements,
                         "states": converted_states,
                     }
 
@@ -1151,7 +1520,8 @@ class WebExtractionService:
                     )
                     if response.status_code == 200:
                         logger.info(
-                            f"Saved annotation for {source_url} (screenshot: {screenshot_id}) with {len(converted_states)} states"
+                            f"Saved annotation for {source_url} (screenshot: {screenshot_id}) "
+                            f"with {len(converted_states)} states and {len(screenshot_elements)} elements"
                         )
                     else:
                         logger.warning(

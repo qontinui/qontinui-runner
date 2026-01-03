@@ -199,6 +199,8 @@ class ExecutionTree:
     def end_workflow(self, workflow_id: str, success: bool, error: str | None = None) -> None:
         """Mark workflow as complete and move up the tree.
 
+        If any child action/transition failed, the workflow is also marked as failed.
+
         Args:
             workflow_id: ID of the workflow to complete
             success: Whether the workflow completed successfully
@@ -206,6 +208,15 @@ class ExecutionTree:
         """
         node = self.node_map.get(workflow_id)
         if node is not None:
+            # Check if any child failed - if so, this workflow should also fail
+            child_failed = any(child.status == "failed" for child in node.children)
+            if child_failed and success:
+                success = False
+                if not error:
+                    failed_child = next((c for c in node.children if c.status == "failed"), None)
+                    if failed_child:
+                        error = f"Child '{failed_child.name}' failed"
+
             node.status = "success" if success else "failed"
             node.error = error
             node.end_timestamp = time.time()
@@ -246,6 +257,8 @@ class ExecutionTree:
     def end_transition(self, transition_id: str, success: bool, error: str | None = None) -> None:
         """Mark transition as complete and move up the tree.
 
+        If any child action failed, the transition is also marked as failed.
+
         Args:
             transition_id: ID of the transition to complete
             success: Whether the transition completed successfully
@@ -253,6 +266,15 @@ class ExecutionTree:
         """
         node = self.node_map.get(transition_id)
         if node is not None:
+            # Check if any child action failed - if so, this transition should also fail
+            child_failed = any(child.status == "failed" for child in node.children)
+            if child_failed and success:
+                success = False
+                if not error:
+                    failed_child = next((c for c in node.children if c.status == "failed"), None)
+                    if failed_child:
+                        error = f"Child action '{failed_child.name}' failed"
+
             node.status = "success" if success else "failed"
             node.error = error
             node.end_timestamp = time.time()
@@ -293,6 +315,11 @@ class ExecutionTree:
     def end_action(self, action_id: str, success: bool, error: str | None = None) -> None:
         """Mark action as complete and move up the tree.
 
+        If any child action failed, the parent action is also marked as failed,
+        regardless of the success parameter. This ensures that composite actions
+        (like CLICK with StateImage target that internally does FIND + CLICK)
+        properly propagate child failures to the parent.
+
         Args:
             action_id: ID of the action to complete
             success: Whether the action completed successfully
@@ -300,6 +327,18 @@ class ExecutionTree:
         """
         node = self.node_map.get(action_id)
         if node is not None:
+            # Check if any child action failed - if so, this action should also fail
+            # This handles cases like CLICK StateImage where FIND is a child action
+            child_failed = any(child.status == "failed" for child in node.children)
+            if child_failed and success:
+                # Override success - a child failed so this action should fail too
+                success = False
+                if not error:
+                    # Find the first failed child for error context
+                    failed_child = next((c for c in node.children if c.status == "failed"), None)
+                    if failed_child:
+                        error = f"Child action '{failed_child.name}' failed"
+
             node.status = "success" if success else "failed"
             node.error = error
             node.end_timestamp = time.time()

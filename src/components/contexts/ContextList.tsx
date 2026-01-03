@@ -6,15 +6,7 @@
  */
 
 import { useState, useCallback } from "react";
-import {
-  BookOpen,
-  Plus,
-  RefreshCw,
-  Loader2,
-  AlertCircle,
-  FolderOpen,
-  User,
-} from "lucide-react";
+import { BookOpen, Plus, RefreshCw, Loader2, AlertCircle, FolderOpen, User } from "lucide-react";
 import { useContexts } from "./hooks/useContexts";
 import { ContextFilters } from "./ContextFilters";
 import { ContextCard } from "./ContextCard";
@@ -58,15 +50,17 @@ export function ContextList({ onLog }: ContextListProps) {
     duplicateContext,
     enableContext,
     disableContext,
+    approveContextSync,
+    dismissContextSync,
     refresh,
   } = useContexts();
 
-  // Editor state
+  // Editor state - default to user scope since it's always available
   const [editorState, setEditorState] = useState<LocalEditorState>({
     isOpen: false,
     context: null,
     mode: "create",
-    createScope: "project",
+    createScope: "user",
   });
   const [isSaving, setIsSaving] = useState(false);
   const [processingId, setProcessingId] = useState<string | null>(null);
@@ -166,6 +160,28 @@ export function ContextList({ onLog }: ContextListProps) {
     }
   };
 
+  const handleApproveSync = async (context: ContextWithMetadata) => {
+    setProcessingId(context.id);
+    const success = await approveContextSync(context.id);
+    setProcessingId(null);
+
+    if (success) {
+      log("success", `Synced context to qontinui-web: ${context.name}`);
+    } else {
+      log("error", `Failed to sync context: ${context.name}`);
+    }
+  };
+
+  const handleDismissSync = async (context: ContextWithMetadata) => {
+    setProcessingId(context.id);
+    const success = await dismissContextSync(context.id);
+    setProcessingId(null);
+
+    if (success) {
+      log("info", `Context kept local only: ${context.name}`);
+    }
+  };
+
   const handleSave = async (
     data: CreateContextRequest | UpdateContextRequest,
   ): Promise<boolean> => {
@@ -174,7 +190,7 @@ export function ContextList({ onLog }: ContextListProps) {
     try {
       if (editorState.mode === "create") {
         const result = await createContext(
-          editorState.createScope || "project",
+          editorState.createScope || "user",
           data as CreateContextRequest,
         );
         if (result) {
@@ -237,20 +253,26 @@ export function ContextList({ onLog }: ContextListProps) {
               New Context
             </button>
             {/* Dropdown for scope selection */}
-            <div className="absolute right-0 top-full mt-1 w-48 bg-card border border-border rounded-lg shadow-lg py-1 hidden group-hover:block z-10">
-              <button
-                onClick={() => handleCreate("project")}
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted/50 transition-colors"
-              >
-                <FolderOpen className="w-4 h-4 text-blue-400" />
-                Project Context
-              </button>
+            <div className="absolute right-0 top-full mt-1 w-64 bg-card border border-border rounded-lg shadow-lg py-1 hidden group-hover:block z-10">
               <button
                 onClick={() => handleCreate("user")}
-                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted/50 transition-colors"
+                className="w-full flex items-start gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted/50 transition-colors"
               >
-                <User className="w-4 h-4 text-purple-400" />
-                User Context
+                <User className="w-4 h-4 text-purple-400 mt-0.5" />
+                <div className="text-left">
+                  <div className="font-medium">User Context</div>
+                  <div className="text-xs text-muted-foreground">Available across all projects</div>
+                </div>
+              </button>
+              <button
+                onClick={() => handleCreate("project")}
+                className="w-full flex items-start gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted/50 transition-colors"
+              >
+                <FolderOpen className="w-4 h-4 text-blue-400 mt-0.5" />
+                <div className="text-left">
+                  <div className="font-medium">Project Context</div>
+                  <div className="text-xs text-muted-foreground">Saved with loaded config file</div>
+                </div>
               </button>
             </div>
           </div>
@@ -296,15 +318,18 @@ export function ContextList({ onLog }: ContextListProps) {
         </div>
       ) : (
         <div className="space-y-6">
-          {/* Project Contexts */}
-          {groupedContexts.project.length > 0 && (
+          {/* User Contexts */}
+          {groupedContexts.user.length > 0 && (
             <div>
               <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
-                <FolderOpen className="w-4 h-4 text-blue-400" />
-                Project Contexts ({groupedContexts.project.length})
+                <User className="w-4 h-4 text-purple-400" />
+                User Contexts ({groupedContexts.user.length})
+                <span className="text-xs text-muted-foreground/70">
+                  &mdash; Available across all projects
+                </span>
               </h3>
               <div className="space-y-2">
-                {groupedContexts.project.map((context) => (
+                {groupedContexts.user.map((context) => (
                   <ContextCard
                     key={context.id}
                     context={context}
@@ -319,15 +344,18 @@ export function ContextList({ onLog }: ContextListProps) {
             </div>
           )}
 
-          {/* User Contexts */}
-          {groupedContexts.user.length > 0 && (
+          {/* Project Contexts */}
+          {groupedContexts.project.length > 0 && (
             <div>
               <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
-                <User className="w-4 h-4 text-purple-400" />
-                User Contexts ({groupedContexts.user.length})
+                <FolderOpen className="w-4 h-4 text-blue-400" />
+                Project Contexts ({groupedContexts.project.length})
+                <span className="text-xs text-muted-foreground/70">
+                  &mdash; Saved with loaded config
+                </span>
               </h3>
               <div className="space-y-2">
-                {groupedContexts.user.map((context) => (
+                {groupedContexts.project.map((context) => (
                   <ContextCard
                     key={context.id}
                     context={context}
@@ -335,6 +363,8 @@ export function ContextList({ onLog }: ContextListProps) {
                     onDelete={handleDelete}
                     onDuplicate={handleDuplicate}
                     onToggleEnabled={handleToggleEnabled}
+                    onApproveSync={handleApproveSync}
+                    onDismissSync={handleDismissSync}
                     isProcessing={processingId === context.id}
                   />
                 ))}

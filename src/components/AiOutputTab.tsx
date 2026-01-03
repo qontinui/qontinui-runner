@@ -5,7 +5,7 @@
  * Shows the prompt followed by Claude's response in real-time.
  * Features:
  * - Session selector to navigate between different AI conversation sessions
- * - Truncation of long responses with expand/collapse toggle
+ * - Scrollable output area for viewing all lines
  * - Fixed header that doesn't scroll
  */
 
@@ -18,7 +18,6 @@ import {
   Loader2,
   Send,
   ChevronDown,
-  ChevronUp,
   ChevronRight,
   Square,
   Copy,
@@ -26,7 +25,7 @@ import {
 } from "lucide-react";
 // Note: Issue and findings detection is now done in EventHandlers.ts to ensure
 // ALL lines are processed, not just filtered ones displayed in this component.
-import { groupEntriesIntoLoops, DEFAULT_MAX_LINES /* type AiLoop */ } from "../types/aiLoop";
+import { groupEntriesIntoLoops /* type AiLoop */ } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
 
 export interface AiOutputLine {
@@ -46,6 +45,8 @@ interface AiOutputTabProps {
   onClear: () => void;
   /** Callback to add a line to the output (for hints) */
   onAddLine?: (line: Omit<AiOutputLine, "id">) => void;
+  /** Optional filter to only show sessions with these IDs. If empty/undefined, shows all sessions. */
+  filterSessionIds?: string[];
 }
 
 // Time threshold (ms) to consider AI as "recently active"
@@ -53,21 +54,43 @@ const AI_ACTIVITY_THRESHOLD_MS = 5000;
 // Polling interval for executor status
 const STATUS_POLL_INTERVAL_MS = 1000;
 
-export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutputTabProps) {
+export function AiOutputTab({
+  lines = [],
+  onClear: _onClear,
+  onAddLine,
+  filterSessionIds,
+}: AiOutputTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [isAiWorking, setIsAiWorking] = useState(false);
   const [promptInput, setPromptInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [selectedLoopId, setSelectedLoopId] = useState<string | null>(null);
-  const [expandedResponses, setExpandedResponses] = useState<Set<string>>(new Set());
   const [showLoopSelector, setShowLoopSelector] = useState(false);
   const [copied, setCopied] = useState(false);
   const [hintQueued, setHintQueued] = useState(false);
   const [queuedHint, setQueuedHint] = useState("");
   const lastLineTimestampRef = useRef<number>(0);
-  // Group lines into AI loops
-  const loops = useMemo(() => groupEntriesIntoLoops(lines), [lines]);
+  // Group lines into AI loops and optionally filter by session IDs
+  const loops = useMemo(() => {
+    const allLoops = groupEntriesIntoLoops(lines);
+    // If filterSessionIds is provided and non-empty, only show matching sessions
+    if (filterSessionIds && filterSessionIds.length > 0) {
+      const filtered = allLoops.filter(
+        (loop) => loop.sessionId && filterSessionIds.includes(loop.sessionId),
+      );
+      // If filtering resulted in no matches, fall back to showing all sessions
+      if (filtered.length === 0) {
+        return allLoops;
+      }
+      // Renumber filtered sessions to show "Session 1, 2, 3..." instead of original numbering
+      return filtered.map((loop, index) => ({
+        ...loop,
+        label: `Session ${index + 1}`,
+      }));
+    }
+    return allLoops;
+  }, [lines, filterSessionIds]);
 
   // Get current loop (selected or most recent)
   const currentLoop = useMemo(() => {
@@ -257,6 +280,27 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
   // Check executor status and determine if AI is working
   const checkAiStatus = useCallback(async () => {
     try {
+      // First check if there are actually running tasks in the database
+      // This is the authoritative source - if no tasks are running, AI is not working
+      let hasRunningTasks = false;
+      try {
+        const response = await fetch("http://localhost:9876/task-runs/running");
+        if (response.ok) {
+          const tasks = await response.json();
+          hasRunningTasks = Array.isArray(tasks) && tasks.length > 0;
+        }
+      } catch {
+        // If API is unavailable, fall back to other checks
+        hasRunningTasks = true; // Assume running if we can't check
+      }
+
+      // If no running tasks in database, AI is definitely not working
+      if (!hasRunningTasks) {
+        setIsAiWorking(false);
+        return;
+      }
+
+      // Additional checks for real-time activity indication
       const result = (await invoke("get_executor_status")) as {
         data?: { state?: string };
       };
@@ -269,8 +313,9 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
       const lastLine = lines.length > 0 ? lines[lines.length - 1] : null;
       const isStreamingResponse = lastLine?.source === "claude";
 
+      // Show as working if: has running tasks AND (recent activity OR executor running)
       setIsAiWorking(
-        lines.length > 0 && isExecutorRunning && hasRecentActivity && isStreamingResponse,
+        hasRunningTasks && (hasRecentActivity || isExecutorRunning || isStreamingResponse),
       );
     } catch (error) {
       console.warn("[AiOutputTab] Failed to get executor status:", error);
@@ -299,19 +344,6 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
       containerRef.current.scrollTop = containerRef.current.scrollHeight;
     }
   }, [currentLoop?.entries.length]);
-
-  // Toggle response expansion
-  const toggleResponseExpand = useCallback((entryId: string) => {
-    setExpandedResponses((prev) => {
-      const next = new Set(prev);
-      if (next.has(entryId)) {
-        next.delete(entryId);
-      } else {
-        next.add(entryId);
-      }
-      return next;
-    });
-  }, []);
 
   // Select a loop
   const handleSelectLoop = useCallback((loopId: string) => {
@@ -546,13 +578,7 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
             }
 
             const fullResponse = responseLines.join("\n");
-            const lines = fullResponse.split("\n");
-            const isExpanded = expandedResponses.has(entry.id);
-            const shouldTruncate = lines.length > DEFAULT_MAX_LINES;
-            const displayLines =
-              shouldTruncate && !isExpanded
-                ? lines.slice(0, DEFAULT_MAX_LINES).join("\n")
-                : fullResponse;
+            const lineCount = fullResponse.split("\n").length;
 
             return (
               <div key={entry.id}>
@@ -560,31 +586,13 @@ export function AiOutputTab({ lines = [], onClear: _onClear, onAddLine }: AiOutp
                   <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold mb-2 mt-1">
                     <Bot className="w-4 h-4" />
                     <span>RESPONSE</span>
-                    <span className="text-muted-foreground font-normal">{lines.length} lines</span>
+                    <span className="text-muted-foreground font-normal">{lineCount} lines</span>
                   </div>
                 )}
                 <div className="py-0.5 pl-6">
                   <span className="text-foreground whitespace-pre-wrap break-words">
-                    {displayLines}
+                    {fullResponse}
                   </span>
-                  {shouldTruncate && (
-                    <button
-                      onClick={() => toggleResponseExpand(entry.id)}
-                      className="mt-2 flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors"
-                    >
-                      {isExpanded ? (
-                        <>
-                          <ChevronUp className="w-3 h-3" />
-                          Show less
-                        </>
-                      ) : (
-                        <>
-                          <ChevronDown className="w-3 h-3" />
-                          Show {lines.length - DEFAULT_MAX_LINES} more lines
-                        </>
-                      )}
-                    </button>
-                  )}
                 </div>
               </div>
             );

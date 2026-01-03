@@ -27,6 +27,10 @@ import {
   FileText,
   AlertTriangle,
   FolderOpen,
+  Cloud,
+  CloudOff,
+  Check,
+  X,
 } from "lucide-react";
 import type { ContextWithMetadata, ContextScope } from "../../types/context";
 
@@ -36,6 +40,8 @@ interface ContextCardProps {
   onDelete: (context: ContextWithMetadata) => void;
   onDuplicate: (context: ContextWithMetadata) => void;
   onToggleEnabled: (context: ContextWithMetadata) => void;
+  onApproveSync?: (context: ContextWithMetadata) => void;
+  onDismissSync?: (context: ContextWithMetadata) => void;
   isProcessing?: boolean;
 }
 
@@ -66,6 +72,8 @@ export function ContextCard({
   onDelete,
   onDuplicate,
   onToggleEnabled,
+  onApproveSync,
+  onDismissSync,
   isProcessing = false,
 }: ContextCardProps) {
   const [isExpanded, setIsExpanded] = useState(false);
@@ -73,6 +81,9 @@ export function ContextCard({
 
   const scopeInfo = scopeConfig[context.scope];
   const ScopeIcon = scopeInfo.icon;
+
+  // Check if this is a project context with pending web sync
+  const isPendingSync = context.scope === "project" && context.webSyncStatus === "pending";
 
   const formatDate = (dateStr: string | null | undefined) => {
     if (!dateStr) return "Never";
@@ -125,11 +136,43 @@ export function ContextCard({
   return (
     <div
       className={`rounded-lg border transition-all ${
-        context.enabled
-          ? "border-border bg-card hover:border-primary/30"
-          : "border-border/50 bg-card/50 opacity-60"
+        isPendingSync
+          ? "border-blue-500/50 bg-card"
+          : context.enabled
+            ? "border-border bg-card hover:border-primary/30"
+            : "border-border/50 bg-card/50 opacity-60"
       }`}
     >
+      {/* Pending Sync Banner */}
+      {isPendingSync && (
+        <div className="flex items-center justify-between gap-3 px-3 py-2 bg-blue-500/10 border-b border-blue-500/30">
+          <div className="flex items-center gap-2 text-sm text-blue-400">
+            <Cloud className="w-4 h-4" />
+            <span>Sync this context to qontinui-web?</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => onApproveSync?.(context)}
+              disabled={isProcessing}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-white bg-blue-500 hover:bg-blue-600 rounded transition-colors disabled:opacity-50"
+              title="Approve sync to qontinui-web"
+            >
+              <Check className="w-3 h-3" />
+              Sync
+            </button>
+            <button
+              onClick={() => onDismissSync?.(context)}
+              disabled={isProcessing}
+              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-muted-foreground hover:text-foreground bg-muted hover:bg-muted/80 rounded transition-colors disabled:opacity-50"
+              title="Keep local only"
+            >
+              <X className="w-3 h-3" />
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="p-3">
         <div className="flex items-start gap-3">
@@ -176,6 +219,26 @@ export function ContextCard({
                   title="Has auto-include rules"
                 >
                   <Zap className="w-3 h-3 inline-block" />
+                </span>
+              )}
+
+              {/* Web Sync Status for Project Contexts */}
+              {context.scope === "project" && context.webSyncStatus === "synced" && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/20 text-green-400 border border-green-500/30"
+                  title="Synced to qontinui-web"
+                >
+                  <Cloud className="w-3 h-3 inline-block mr-0.5" />
+                  Synced
+                </span>
+              )}
+              {context.scope === "project" && context.webSyncStatus === "dismissed" && (
+                <span
+                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-500/20 text-gray-400 border border-gray-500/30"
+                  title="Local only (not synced to web)"
+                >
+                  <CloudOff className="w-3 h-3 inline-block mr-0.5" />
+                  Local
                 </span>
               )}
             </div>

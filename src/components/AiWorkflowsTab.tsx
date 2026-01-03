@@ -13,7 +13,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Activity, BookOpen, Eye, Settings } from "lucide-react";
+import { Activity, BookOpen, Eye, Settings, FileText } from "lucide-react";
 
 import type { UseProjectLogsReturn } from "../hooks/useProjectLogs";
 import type { AiOutputLine } from "./AiOutputTab";
@@ -24,8 +24,9 @@ import { SessionSubTab } from "./ai-workflows/SessionSubTab";
 import { LibrarySubTab } from "./ai-workflows/LibrarySubTab";
 import { MonitorSubTab } from "./ai-workflows/MonitorSubTab";
 import { ConfigureSubTab } from "./ai-workflows/ConfigureSubTab";
+import { ContextList } from "./contexts";
 
-type AiWorkflowSubTab = "session" | "library" | "monitor" | "configure";
+type AiWorkflowSubTab = "session" | "library" | "monitor" | "configure" | "contexts";
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
 const SUB_TAB_STORAGE_KEY = "qontinui-ai-workflows-sub-tab-v2";
@@ -54,7 +55,7 @@ export function AiWorkflowsTab({
     if (stored === "prompts" || stored === "library" || stored === "scripts") return "library";
     if (stored === "issues" || stored === "learnings") return "monitor";
     if (stored === "scriptlets" || stored === "log-locations") return "configure";
-    if (stored && ["session", "library", "monitor", "configure"].includes(stored)) {
+    if (stored && ["session", "library", "monitor", "configure", "contexts"].includes(stored)) {
       return stored as AiWorkflowSubTab;
     }
     return "session";
@@ -104,6 +105,12 @@ export function AiWorkflowsTab({
       label: "Configure",
       icon: Settings,
       description: "Task builders, logs, scriptlets",
+    },
+    {
+      id: "contexts" as const,
+      label: "Contexts",
+      icon: FileText,
+      description: "AI knowledge snippets",
     },
   ];
 
@@ -177,7 +184,7 @@ export function AiWorkflowsTab({
             value="monitor"
             className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
-            <MonitorSubTab aiOutputLines={aiOutputLines} />
+            <MonitorSubTab />
           </Tabs.Content>
 
           {/* Configure Tab - Builder, Log Sources, Scriptlets */}
@@ -191,6 +198,14 @@ export function AiWorkflowsTab({
               onLog={onLog}
               onConfigureLogLocations={onConfigureLogLocations}
             />
+          </Tabs.Content>
+
+          {/* Contexts Tab - AI Knowledge Snippets */}
+          <Tabs.Content
+            value="contexts"
+            className="h-full outline-none overflow-y-auto data-[state=inactive]:hidden"
+          >
+            <ContextList onLog={onLog} />
           </Tabs.Content>
         </div>
       </Tabs.Root>

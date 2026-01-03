@@ -142,12 +142,25 @@ pub enum ContextScope {
     Builtin,
 }
 
+/// Status of syncing a project context to qontinui-web
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSyncStatus {
+    /// Context needs user approval to sync
+    Pending,
+    /// Context has been synced to qontinui-web
+    Synced,
+    /// User dismissed the sync (chose not to sync)
+    Dismissed,
+}
+
 /// Runner-specific metadata for a context.
 ///
 /// This extends the core Context with fields specific to the runner:
 /// - enabled: allows disabling without deleting
 /// - use_count: tracks popularity
 /// - last_used_at: for sorting by recency
+/// - web_sync_status: for project contexts, tracks sync to qontinui-web
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextMetadata {
     /// Reference to the context ID
@@ -168,6 +181,14 @@ pub struct ContextMetadata {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_used_at: Option<String>,
+
+    /// Sync status for project contexts (pending approval to sync to qontinui-web)
+    #[serde(
+        default,
+        rename = "webSyncStatus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub web_sync_status: Option<WebSyncStatus>,
 }
 
 fn default_enabled() -> bool {
@@ -181,6 +202,7 @@ impl ContextMetadata {
             enabled: true,
             use_count: 0,
             last_used_at: None,
+            web_sync_status: None,
         }
     }
 
@@ -214,6 +236,14 @@ pub struct ContextWithMetadata {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_used_at: Option<String>,
+
+    /// Sync status for project contexts (pending approval to sync to qontinui-web)
+    #[serde(
+        default,
+        rename = "webSyncStatus",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub web_sync_status: Option<WebSyncStatus>,
 }
 
 // ============================================================================
@@ -492,6 +522,16 @@ pub fn set_context_enabled(context_id: &str, enabled: bool) -> Result<(), String
         context_id,
         if enabled { "true" } else { "false" }
     );
+    Ok(())
+}
+
+/// Set the web sync status for a context
+pub fn set_web_sync_status(context_id: &str, status: Option<WebSyncStatus>) -> Result<(), String> {
+    let mut library = load_user_context_library();
+    let metadata = library.get_or_create_metadata(context_id);
+    metadata.web_sync_status = status.clone();
+    save_user_context_library(&library)?;
+    info!("Set context {} web_sync_status={:?}", context_id, status);
     Ok(())
 }
 
@@ -868,15 +908,23 @@ pub fn get_builtin_contexts() -> Vec<Context> {
 
 When debugging issues:
 
-1. **Check logs first** - Use the debugging API endpoints or read log files directly
+1. **Check the Iteration Bundle first** - Look for `## Iteration N Data Bundle` in your prompt
+   - Pre-Execution Results show step success/failure
+   - Application Logs are captured and included
+   - Errors and warnings are highlighted
 2. **Identify the root cause** - Don't fix symptoms, fix the source
 3. **Work autonomously** - Restart services as needed, don't ask the user
 4. **Iterate until fixed** - Make changes, test, repeat
 
-### Log Locations
-- Backend: `.dev-logs/backend.log`
-- Frontend: `.dev-logs/frontend.log`
-- Runner: `.dev-logs/runner-tauri.log`
+### Log Data is Bundled
+
+All relevant logs are delivered in the Iteration Bundle - no file searching required:
+- Application logs from user-defined sources
+- GUI automation events (if workflow has GUI steps)
+- Playwright test results (if workflow has test steps)
+- Screenshots from automation steps
+
+Only access raw log files in `.dev-logs/` as a fallback if bundled data is insufficient.
 "#
             .to_string(),
             category: Some("debugging".to_string()),
@@ -926,7 +974,527 @@ This project is in active development. Backward compatibility is NOT a priority.
                 ..Default::default()
             }),
             created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-runner-architecture".to_string(),
+            name: "Runner Architecture & Logs".to_string(),
+            content: r#"## Runner Architecture & Iteration Bundle System
+
+The qontinui-runner executes GUI automation and spawns AI sessions. All relevant data is bundled and delivered to you automatically - no file searching required.
+
+### CRITICAL: When Pre-Execution Runs
+
+**Pre-execution steps (GUI automation, screenshots, Playwright tests) run at the START of each new iteration, BEFORE your AI session starts.**
+
+The iteration lifecycle is:
+1. **Runner starts new iteration** → Runs all pre-execution steps (clicks, screenshots, tests)
+2. **Runner captures results** → Creates the Iteration Data Bundle
+3. **Runner spawns AI session** → Delivers the bundle to you
+4. **AI session works** → You analyze results, make code changes, debug
+5. **AI session ends** → Via [TASK_COMPLETE], context limit, or timeout
+6. **Go to step 1** for next iteration (if not complete)
+
+**Key implications:**
+- The Pre-Execution Results you see are from steps that ALREADY RAN
+- To get NEW screenshots or automation results, you must END your current iteration
+- You CANNOT re-run pre-execution steps mid-iteration - they only run at iteration start
+- If you're resuming mid-iteration after a restart, pre-execution will NOT re-run
+
+### Iteration Data Bundle
+
+When your session starts, the runner provides a complete **Iteration Data Bundle** containing everything you need. Look for the `## Iteration N Data Bundle` section in your prompt. It contains:
+
+1. **Pre-Execution Results** - Step-by-step results from automation (ALREADY COMPLETED)
+   - Which steps succeeded or failed (with checkmarks/crosses)
+   - Error messages for any failures
+   - Screenshot paths for each step (use Read tool to view)
+   - Duration for each step
+
+2. **Application Logs** - User-defined log sources (e.g., backend.log, frontend.log)
+   - Captured ONLY during this iteration
+   - Errors and warnings are highlighted at the top
+   - Full log content follows
+
+3. **Runner GUI Automation Logs** (if workflow has GUI steps)
+   - Image recognition table with template names, confidence, and thresholds
+   - Failed matches explained with confidence vs threshold
+   - Action timeline in JSON format
+
+4. **Playwright Test Results** (if workflow has Playwright steps)
+   - Overall pass/fail status
+   - Individual test spec results
+   - Error messages for failed tests
+   - Failure screenshot paths
+
+5. **Previous Iteration Findings** - Your structured findings from prior iterations
+   - Status indicators (resolved, in progress, pending)
+   - Helps you avoid repeating work
+
+### Key Principles
+
+- **Everything is bundled** - Don't search log files; data is delivered to you
+- **Relevance-filtered** - Only logs relevant to your workflow's step types are included
+- **Iteration-scoped** - Only data from the current iteration, not historical noise
+- **Source-labeled** - Every piece of data says where it came from
+- **Pre-execution is past tense** - Results show what ALREADY happened, not what will happen
+
+### Start Here
+
+1. Find the `## Iteration N Data Bundle` section (near the end of your prompt)
+2. Check the Pre-Execution Results table for failures
+3. If GUI steps failed, check the Image Recognition table for low confidence matches
+4. If tests failed, check Playwright Results for error details
+5. Review Application Logs for related errors
+
+### Getting Fresh Screenshots
+
+If you need new screenshots after making code changes:
+1. Complete your current work (make fixes, commit if needed)
+2. End the iteration by outputting `[TASK_COMPLETE]` or letting the session end naturally
+3. The runner will start a new iteration with fresh pre-execution results
+4. Your next AI session will receive updated screenshots and test results
+
+**Do NOT try to manually trigger screenshots or re-run automation steps** - that's not how the system works.
+
+### Raw Log Files (Fallback Only)
+
+If you need raw files (rare), they're in `.dev-logs/`:
+
+| File | Contains |
+|------|----------|
+| `runner-general.jsonl` | Executor events |
+| `runner-actions.jsonl` | Action execution |
+| `runner-image-recognition.jsonl` | Template matching |
+| `screenshots/` | Annotated screenshots |
+
+### Accessing Data
+
+**Your Iteration Bundle contains everything you need.** Don't search for log files - they're already provided.
+
+If you need data NOT in the bundle (rare):
+
+**Raw log files (.dev-logs/):**
+| File | What it contains |
+|------|------------------|
+| `runner-general.jsonl` | Executor events |
+| `runner-actions.jsonl` | Action/tree events |
+| `runner-image-recognition.jsonl` | Image match results |
+| `runner-playwright.jsonl` | Playwright test results |
+| `screenshots/*.png` | Annotated screenshots |
+
+**Database (direct file access):**
+- Windows: `C:\Users\<USER>\AppData\Roaming\com.qontinui.runner\runner.db`
+- macOS/Linux: `~/.config/com.qontinui.runner/runner.db`
+- Tables: `task_runs` (status, output, findings), `run_details` (execution data)
+
+**MCP tools (if available in your session):**
+- `get_task_runs`, `get_task_run`, `read_runner_logs`, `list_screenshots`
+- Note: MCP tools may not be available in all runner-spawned sessions
+
+### What NOT to Do
+
+- Don't search for log files - they're already in your Iteration Bundle
+- Don't read source code to understand architecture - use this context
+- Don't look at historical data from other sessions - focus on this iteration
+- Don't try to re-run pre-execution steps - they already ran at iteration start
+- Don't expect new screenshots mid-iteration - end the iteration first
+"#
+            .to_string(),
+            category: Some("architecture".to_string()),
+            tags: vec!["runner".to_string(), "logs".to_string(), "debugging".to_string(), "architecture".to_string()],
+            auto_include: Some(ContextAutoInclude {
+                task_mentions: Some(vec![
+                    "runner".to_string(),
+                    "log".to_string(),
+                    "automation".to_string(),
+                    "workflow".to_string(),
+                    "screenshot".to_string(),
+                    "execution".to_string(),
+                ]),
+                error_patterns: Some(vec![
+                    "failed".to_string(),
+                    "error".to_string(),
+                    "not found".to_string(),
+                ]),
+                ..Default::default()
+            }),
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-multi-step-guide".to_string(),
+            name: "Multi-Step Task Guide".to_string(),
+            content: r#"## Multi-Step Task Guide
+
+You are running as a multi-session task in the qontinui-runner.
+
+## ⚠️ CRITICAL: READ THIS FIRST
+
+**[TASK_COMPLETE] ENDS THE ENTIRE TASK.** It does NOT start a new iteration.
+
+If you need fresh pre-execution results, let your session end naturally WITHOUT outputting [TASK_COMPLETE].
+
+### How It Works
+
+```
+TASK START:
+  ├─ Pre-execution runs (screenshots, tests, GUI automation)
+  ├─ Session 1 starts with Iteration Bundle
+  ├─ Session 1 works... ends (context limit, timeout, OR you stop responding)
+  │
+  ├─ Pre-execution runs AGAIN (fresh results!)
+  ├─ Session 2 continues with NEW Iteration Bundle
+  ├─ Session 2 works... outputs [TASK_COMPLETE]
+  └─ TASK ENDS (no more sessions)
+```
+
+### Key Rules
+
+| Action | What Happens |
+|--------|-------------|
+| Output `[TASK_COMPLETE]` | **Task ENDS entirely** - no more sessions, no fresh pre-execution |
+| Session ends naturally (no marker) | **New session starts** with fresh pre-execution |
+| Session times out | Same as above - new session with fresh pre-execution |
+
+### Getting Fresh Pre-Execution Results
+
+If you made code changes and need to verify with fresh screenshots/tests:
+
+1. **DO NOT output [TASK_COMPLETE]**
+2. Simply stop responding or let the session end naturally
+3. Runner will start a new session with fresh pre-execution
+4. You'll receive updated results in the new Iteration Bundle
+
+**Example - Correct approach:**
+```
+I've fixed the bug in LibrarySubTab.tsx. The fix needs verification with fresh
+screenshots. Ending this session to trigger fresh pre-execution.
+
+(Session ends - no [TASK_COMPLETE] marker)
+```
+
+**Example - WRONG approach (what the AI did):**
+```
+I've fixed the bug. Ending session for fresh pre-execution.
+
+[TASK_COMPLETE]  ← WRONG! This ends the task entirely!
+```
+
+### Output Marker: [TASK_COMPLETE]
+
+**CRITICAL**: Only output `[TASK_COMPLETE]` when the ENTIRE TASK is done - not when you want fresh results.
+
+**FORMAT**: The marker must be ALONE on its line:
+```
+All work complete. Tests pass. Changes committed.
+
+[TASK_COMPLETE]
+```
+
+**When to use [TASK_COMPLETE]:**
+- ✅ All requested work is FULLY done
+- ✅ No verification needed
+- ✅ Task goal is achieved
+
+**When NOT to use [TASK_COMPLETE]:**
+- ❌ You need fresh pre-execution results
+- ❌ You want to verify your changes work
+- ❌ There's more work to do
+- ❌ You hit an error and need to continue
+
+### What Happens on Session Resume
+
+When your session ends without `[TASK_COMPLETE]`:
+1. Runner captures your output
+2. **Pre-execution runs AGAIN** (fresh screenshots, tests, etc.)
+3. New session spawns with header "Resume After Runner Restart"
+4. You receive a NEW Iteration Bundle with fresh results
+5. Your previous output (last 4000 chars) is included for context
+6. Your structured findings are preserved
+
+### Iteration Data Bundle
+
+Each session receives a complete **Iteration Data Bundle** (look for `## Iteration N Data Bundle` in your prompt). It contains:
+
+1. **Pre-Execution Results** - Automation step results (ALREADY COMPLETED at iteration start)
+2. **Application Logs** - Captured from user-defined log sources during this iteration
+3. **GUI Automation Logs** - Image recognition and action events (if applicable)
+4. **Playwright Results** - Test results (if applicable)
+5. **Previous Findings** - Your structured findings from prior iterations
+
+**Start with the bundle** - all relevant data is provided. Don't search for log files.
+
+### Structured Findings
+
+Use the `[FINDING:category:severity]...[/FINDING]` format for all discoveries. Findings are:
+- Displayed in the Monitor tab
+- Preserved across sessions
+- Included in subsequent iteration bundles
+- Used to show progress to the user
+
+### Debugging Tips
+
+1. **Check the Iteration Bundle first** - All relevant logs are included
+2. **Review Pre-Execution Results** - See which automation steps succeeded/failed
+3. **Work autonomously** - Restart services as needed (except the runner itself)
+4. **Iterate until fixed** - Make changes, test, end iteration for fresh results
+
+### ❌ What You Should NEVER Do
+
+**DO NOT manually trigger GUI automation.** The runner handles this via pre-execution.
+
+| ❌ WRONG | ✅ CORRECT |
+|----------|-----------|
+| "Let me reload the config and re-run automation" | "I've made the fix. Ending session to get fresh results." |
+| "I'll call the runner API to trigger a click" | "The pre-execution will click the button next session." |
+| "Let me load the workflow config..." | "I'll analyze the pre-execution results in my bundle." |
+| Calling `/load-config`, `/run-workflow`, etc. | Just make code fixes and let session end |
+
+**Your job:**
+1. Analyze results from the Iteration Bundle (already captured)
+2. Make code fixes if needed
+3. Let session end to trigger fresh pre-execution
+
+**Runner's job (NOT yours):**
+1. Load configs
+2. Execute GUI automation (clicks, screenshots)
+3. Run Playwright tests
+4. Capture logs
+
+If you find yourself trying to "trigger" or "run" automation, STOP. That's pre-execution's job.
+
+### Avoiding Infinite Loops
+
+- Don't repeat the same fix that already failed
+- Check Previous Findings - the issue may already be tracked
+- If stuck, explain what's blocking you instead of retrying endlessly
+- To get fresh pre-execution results, just let the session end (no [TASK_COMPLETE])
+"#
+            .to_string(),
+            category: Some("workflow".to_string()),
+            tags: vec!["multi-step".to_string(), "workflow".to_string(), "runner".to_string()],
+            auto_include: None, // Always injected for runner-triggered sessions
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-input-validation".to_string(),
+            name: "Input Validation Guide".to_string(),
+            content: r#"## Input Validation: Debugging Click Position Issues
+
+When "Capture Input for Validation" is enabled in the Advanced settings, the runner records actual mouse events and compares them to reported click positions. This helps debug coordinate calculation bugs.
+
+### When to Use This Feature
+
+Enable input validation when clicks are:
+- Missing their targets despite correct image recognition
+- Landing in wrong locations on multi-monitor setups
+- Offset due to DPI scaling issues
+- Affected by coordinate transformation bugs
+
+### Understanding the Data
+
+When enabled, the Iteration Bundle includes an **Input Validation** section with:
+
+1. **Summary** - Overview of discrepancies found
+   - Total clicks vs captured clicks
+   - Number of significant discrepancies
+   - Max/average offset in pixels
+
+2. **Click Position Comparisons Table**
+   - **Reported**: Where the automation engine said it would click
+   - **Actual**: Where the mouse actually clicked (captured by input monitor)
+   - **Δ px**: Distance between reported and actual positions
+   - **Status**: ✅ OK, ⚠️ OFFSET, or ❓ N/A
+
+3. **Highlighted Discrepancies** - Details on each significant offset
+
+### Interpreting Results
+
+| Discrepancy | Likely Cause |
+|-------------|--------------|
+| Consistent offset (e.g., always +1920px X) | Multi-monitor coordinate issue |
+| Scaled offset (e.g., 1.5x or 2x) | DPI scaling not applied |
+| Random small offsets (< 5px) | Normal - click targets still hit |
+| Large variable offsets | Coordinate transformation bug |
+
+### Common Fixes
+
+**Multi-monitor offset**: Check that monitor bounds are correctly calculated and the target monitor index is correct.
+
+**DPI scaling**: Ensure coordinates are scaled by the display's scale factor before clicking.
+
+**Wrong monitor**: Verify the image recognition is searching the correct monitor and coordinates are relative to that monitor.
+
+### Raw Events File
+
+The raw input events are saved to `.dev-logs/input_events/{session_id}_events.jsonl` and include:
+- All mouse clicks with exact timestamps and positions
+- Mouse movements (sampled)
+- Keyboard events
+- Frame numbers for video correlation
+"#
+            .to_string(),
+            category: Some("debugging".to_string()),
+            tags: vec!["debugging".to_string(), "input".to_string(), "coordinates".to_string(), "multi-monitor".to_string()],
+            auto_include: None, // Explicitly added when "Capture Input for Validation" is enabled
+            created_at: now.clone(),
             modified_at: now,
         },
     ]
+}
+
+// ============================================================================
+// Project Context Functions
+// ============================================================================
+
+/// Get all contexts from a loaded configuration.
+///
+/// Returns contexts stored in the project config as Context objects.
+pub fn get_project_contexts_from_config(contexts_json: &[serde_json::Value]) -> Vec<Context> {
+    contexts_json
+        .iter()
+        .filter_map(|v| serde_json::from_value::<Context>(v.clone()).ok())
+        .collect()
+}
+
+/// Find a project context by ID in a configuration.
+pub fn get_project_context_from_config(
+    contexts_json: &[serde_json::Value],
+    context_id: &str,
+) -> Option<Context> {
+    get_project_contexts_from_config(contexts_json)
+        .into_iter()
+        .find(|c| c.id == context_id)
+}
+
+/// Add a context to a configuration's contexts array.
+///
+/// Returns the updated contexts array.
+pub fn add_project_context_to_config(
+    contexts_json: &mut Vec<serde_json::Value>,
+    context: Context,
+) -> Result<(), String> {
+    // Check for duplicate ID
+    if get_project_context_from_config(contexts_json, &context.id).is_some() {
+        return Err(format!("Context with ID '{}' already exists", context.id));
+    }
+
+    let json_value = serde_json::to_value(&context)
+        .map_err(|e| format!("Failed to serialize context: {}", e))?;
+    contexts_json.push(json_value);
+
+    info!(
+        "Added project context '{}' (id: {})",
+        context.name, context.id
+    );
+    Ok(())
+}
+
+/// Update a context in a configuration's contexts array.
+///
+/// Returns the updated contexts array.
+pub fn update_project_context_in_config(
+    contexts_json: &mut Vec<serde_json::Value>,
+    context: Context,
+) -> Result<(), String> {
+    let index = contexts_json
+        .iter()
+        .position(|v| {
+            v.get("id")
+                .and_then(|id| id.as_str())
+                .map(|id| id == context.id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("Context with ID '{}' not found", context.id))?;
+
+    let json_value = serde_json::to_value(&context)
+        .map_err(|e| format!("Failed to serialize context: {}", e))?;
+    contexts_json[index] = json_value;
+
+    info!(
+        "Updated project context '{}' (id: {})",
+        context.name, context.id
+    );
+    Ok(())
+}
+
+/// Delete a context from a configuration's contexts array.
+pub fn delete_project_context_from_config(
+    contexts_json: &mut Vec<serde_json::Value>,
+    context_id: &str,
+) -> Result<(), String> {
+    let index = contexts_json
+        .iter()
+        .position(|v| {
+            v.get("id")
+                .and_then(|id| id.as_str())
+                .map(|id| id == context_id)
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| format!("Context with ID '{}' not found", context_id))?;
+
+    contexts_json.remove(index);
+
+    info!("Deleted project context (id: {})", context_id);
+    Ok(())
+}
+
+/// Create a new project context with the given details.
+pub fn create_project_context(
+    name: String,
+    content: String,
+    category: Option<String>,
+    tags: Vec<String>,
+    auto_include: Option<ContextAutoInclude>,
+) -> Context {
+    Context::new(name, content, category, tags, auto_include)
+}
+
+// ============================================================================
+// Multi-Step Task Guide (special handling)
+// ============================================================================
+
+/// ID of the builtin Multi-Step Task Guide context.
+pub const MULTI_STEP_GUIDE_ID: &str = "builtin-multi-step-guide";
+
+/// Get the Multi-Step Task Guide context, preferring user override if exists.
+///
+/// Checks if the user has a context with the same name ("Multi-Step Task Guide").
+/// If so, returns the user's version (allowing customization).
+/// Otherwise, returns the builtin version.
+pub fn get_multi_step_guide() -> Context {
+    // Check for user override by name
+    let user_contexts = get_all_user_contexts();
+    if let Some(user_override) = user_contexts
+        .into_iter()
+        .find(|c| c.name == "Multi-Step Task Guide")
+    {
+        info!(
+            "Using user-customized Multi-Step Task Guide (id: {})",
+            user_override.id
+        );
+        return user_override;
+    }
+
+    // Return builtin version
+    get_builtin_contexts()
+        .into_iter()
+        .find(|c| c.id == MULTI_STEP_GUIDE_ID)
+        .expect("Builtin Multi-Step Task Guide should exist")
+}
+
+/// Format a context for injection into a prompt (used for special contexts).
+pub fn format_single_context(ctx: &Context) -> String {
+    let category_attr = ctx
+        .category
+        .as_ref()
+        .map(|c| format!(" category=\"{}\"", c))
+        .unwrap_or_default();
+
+    format!(
+        "<context name=\"{}\"{}>\n{}\n</context>",
+        ctx.name, category_attr, ctx.content
+    )
 }

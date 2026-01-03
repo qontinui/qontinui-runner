@@ -1,8 +1,11 @@
 /**
- * SchedulerTab
+ * SchedulerTab (Tasks)
  *
- * Main tab component for the CI/CD scheduler.
- * Provides task management, history viewing, and settings configuration.
+ * Main component for the task scheduler.
+ * Provides scheduled task management, execution history, and settings configuration.
+ *
+ * Note: This component is designed to work standalone and fill its parent container.
+ * It handles its own scrolling internally.
  */
 
 import { useState } from "react";
@@ -75,7 +78,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
       <div className="flex items-center justify-between p-4 border-b border-border">
         <div className="flex items-center gap-3">
           <Calendar className="w-5 h-5 text-primary" />
-          <h2 className="text-lg font-semibold">Scheduler</h2>
+          <h2 className="text-lg font-semibold">Scheduled Tasks</h2>
           {status && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <span
@@ -137,7 +140,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
             className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground data-[state=active]:text-foreground data-[state=active]:border-b-2 data-[state=active]:border-primary transition-colors"
           >
             <Calendar className="w-4 h-4" />
-            Tasks ({tasks.length})
+            Scheduled ({tasks.length})
           </Tabs.Trigger>
           <Tabs.Trigger
             value="history"

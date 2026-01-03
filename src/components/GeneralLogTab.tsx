@@ -17,8 +17,7 @@ export function GeneralLogTab({ logs, containerRef }: GeneralLogTabProps) {
   return (
     <div
       ref={containerRef}
-      className="log-container font-mono text-sm space-y-1"
-      style={{ maxHeight: "400px", overflowY: "auto" }}
+      className="log-container font-mono text-sm space-y-1 flex-1 min-h-0 overflow-y-auto"
     >
       {logs.length === 0 ? (
         <div className="text-center text-muted-foreground py-8">

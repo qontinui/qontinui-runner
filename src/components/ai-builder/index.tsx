@@ -66,17 +66,26 @@ export { AiBuilderContent } from "./AiBuilderContent";
 interface AiBuilderTabProps {
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
+  onNavigateToAiOutput?: () => void;
+  editWorkflowId?: string | null;
 }
 
 /**
  * Main AI Builder Tab component.
  * This is the primary export that wraps the content with the context provider.
  */
-export function AiBuilderTab({ projectLogs, onNavigateToLogLocations }: AiBuilderTabProps) {
+export function AiBuilderTab({
+  projectLogs,
+  onNavigateToLogLocations,
+  onNavigateToAiOutput,
+  editWorkflowId,
+}: AiBuilderTabProps) {
   return (
     <AiBuilderProvider
       projectLogs={projectLogs}
       onNavigateToLogLocations={onNavigateToLogLocations}
+      onNavigateToAiOutput={onNavigateToAiOutput}
+      editWorkflowId={editWorkflowId}
     >
       <AiBuilderContent />
     </AiBuilderProvider>

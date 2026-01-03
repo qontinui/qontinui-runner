@@ -14,9 +14,9 @@
     "windows": [
       {
         "title": "Qontinui Runner",
-        "width": 1200,
-        "height": 750,
-        "minWidth": 1100,
+        "width": 1400,
+        "height": 800,
+        "minWidth": 1200,
         "minHeight": 700
       }
     ],

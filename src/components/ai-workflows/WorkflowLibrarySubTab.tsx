@@ -21,12 +21,19 @@ import {
 /** Execution step in a workflow */
 interface ExecutionStep {
   id: string;
-  type: "workflow" | "state" | "playwright" | "prompt";
+  type: "workflow" | "state" | "playwright" | "prompt" | "action" | "screenshot";
   name: string;
   takeScreenshot: boolean;
+  screenshotDelay?: number;
+  screenshotMonitor?: number | "all" | null;
   playwrightScriptId?: string;
+  playwrightScriptContent?: string;
+  playwrightTargetUrl?: string;
   promptId?: string;
   promptContent?: string;
+  actionType?: "click" | "double_click" | "right_click";
+  targetImageId?: string;
+  targetImageName?: string;
 }
 
 /** Saved AI Workflow */
@@ -101,6 +108,26 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
       // Generate the prompt from the workflow
       const prompt = generatePromptFromWorkflow(workflow);
 
+      // Determine if this session uses GUI (has any execution steps that need GUI)
+      const guiStepTypes = ["workflow", "state", "action", "screenshot"];
+      const usesGui = workflow.steps.some((step) => guiStepTypes.includes(step.type));
+
+      // Convert ExecutionStep[] to ExecutionStepConfig[] for deterministic execution
+      // The backend will execute these steps BEFORE spawning the AI session
+      const executionStepsConfig = workflow.steps.map((step) => ({
+        type: step.type,
+        name: step.name,
+        actionType: step.actionType || null,
+        targetImageId: step.targetImageId || null,
+        targetImageName: step.targetImageName || null,
+        monitorIndex: null,
+        takeScreenshot: step.takeScreenshot,
+        screenshotDelay: step.screenshotDelay || 0,
+        screenshotMonitor: step.screenshotMonitor ?? null,
+        playwrightScriptId: step.playwrightScriptId || null,
+        promptContent: step.promptContent || null,
+      }));
+
       const response = await fetch("http://localhost:9876/sessions/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -108,8 +135,10 @@ export function WorkflowLibrarySubTab({ onLog }: WorkflowLibrarySubTabProps) {
           name: workflow.name,
           prompt: prompt,
           total_phases: workflow.max_iterations,
-          uses_gui: false,
+          uses_gui: usesGui,
           timeout_seconds: 1800,
+          // Execution steps for deterministic execution before AI spawns
+          execution_steps: executionStepsConfig,
         }),
       });
 

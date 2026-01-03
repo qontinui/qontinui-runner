@@ -7,6 +7,7 @@
 
 use crate::settings::{
     self, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings, CliExecutionMode,
+    GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings,
 };
 use anyhow::{Context, Result};
 use keyring::Entry;
@@ -134,6 +135,8 @@ pub fn save_ai_settings(
     let ai_provider = match provider.as_str() {
         "claude_cli" => AiProvider::ClaudeCli,
         "claude_api" => AiProvider::ClaudeApi,
+        "gemini_cli" => AiProvider::GeminiCli,
+        "gemini_api" => AiProvider::GeminiApi,
         _ => return Err(format!("Invalid provider: {}", provider)),
     };
 
@@ -145,6 +148,9 @@ pub fn save_ai_settings(
         _ => return Err(format!("Invalid execution mode: {}", execution_mode)),
     };
 
+    // Get existing settings to preserve Gemini configuration when saving Claude settings
+    let existing_settings = settings::get_ai_settings();
+
     let ai_settings = AiSettings {
         provider: ai_provider,
         claude_cli: ClaudeCliSettings {
@@ -153,6 +159,9 @@ pub fn save_ai_settings(
             timeout_seconds,
         },
         claude_api: ClaudeApiSettings { model, max_tokens },
+        // Preserve existing Gemini settings
+        gemini_cli: existing_settings.gemini_cli,
+        gemini_api: existing_settings.gemini_api,
         auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
     };
 
@@ -162,6 +171,92 @@ pub fn save_ai_settings(
     Ok(CommandResponse {
         success: true,
         message: Some("AI settings saved".to_string()),
+        data: None,
+    })
+}
+
+/// Save Gemini-specific AI settings.
+///
+/// Updates the Gemini settings in the persistent settings file.
+///
+/// # Arguments
+/// * `provider` - AI provider ("gemini_cli" or "gemini_api")
+/// * `execution_mode` - CLI execution mode ("auto", "windows_native", "wsl", "native")
+/// * `custom_path` - Optional custom path to gemini executable
+/// * `timeout_seconds` - CLI timeout in seconds
+/// * `auth_method` - Gemini CLI auth method ("oauth" or "api_key")
+/// * `model` - Gemini model name (e.g., "gemini-3-flash")
+/// * `max_output_tokens` - Maximum output tokens for API calls
+/// * `temperature` - Temperature for API calls
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success
+/// * `Err(String)` - Error message if settings cannot be saved
+#[tauri::command]
+pub fn save_gemini_settings(
+    provider: String,
+    execution_mode: String,
+    custom_path: Option<String>,
+    timeout_seconds: u64,
+    auth_method: String,
+    model: String,
+    max_output_tokens: u32,
+    temperature: f32,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Saving Gemini settings: provider={}, model={}, auth={}",
+        provider, model, auth_method
+    );
+
+    let ai_provider = match provider.as_str() {
+        "gemini_cli" => AiProvider::GeminiCli,
+        "gemini_api" => AiProvider::GeminiApi,
+        _ => return Err(format!("Invalid Gemini provider: {}", provider)),
+    };
+
+    let cli_execution_mode = match execution_mode.as_str() {
+        "auto" => CliExecutionMode::Auto,
+        "windows_native" => CliExecutionMode::WindowsNative,
+        "wsl" => CliExecutionMode::Wsl,
+        "native" => CliExecutionMode::Native,
+        _ => return Err(format!("Invalid execution mode: {}", execution_mode)),
+    };
+
+    let gemini_auth_method = match auth_method.as_str() {
+        "oauth" => GeminiAuthMethod::OAuth,
+        "api_key" => GeminiAuthMethod::ApiKey,
+        _ => return Err(format!("Invalid auth method: {}", auth_method)),
+    };
+
+    // Get existing settings to preserve Claude configuration
+    let existing_settings = settings::get_ai_settings();
+
+    let ai_settings = AiSettings {
+        provider: ai_provider,
+        // Preserve existing Claude settings
+        claude_cli: existing_settings.claude_cli,
+        claude_api: existing_settings.claude_api,
+        gemini_cli: GeminiCliSettings {
+            execution_mode: cli_execution_mode,
+            custom_path,
+            timeout_seconds,
+            auth_method: gemini_auth_method,
+            model: model.clone(),
+        },
+        gemini_api: GeminiApiSettings {
+            model,
+            max_output_tokens,
+            temperature,
+        },
+        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
+    };
+
+    settings::save_ai_settings(ai_settings)
+        .map_err(|e| format!("Failed to save Gemini settings: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Gemini settings saved".to_string()),
         data: None,
     })
 }
@@ -252,6 +347,8 @@ pub async fn test_ai_connection() -> Result<CommandResponse, String> {
     let result = match ai_settings.provider {
         AiProvider::ClaudeCli => test_claude_cli_connection(&ai_settings.claude_cli).await,
         AiProvider::ClaudeApi => test_claude_api_connection(&ai_settings.claude_api).await,
+        AiProvider::GeminiCli => test_gemini_cli_connection(&ai_settings.gemini_cli).await,
+        AiProvider::GeminiApi => test_gemini_api_connection(&ai_settings.gemini_api).await,
     };
 
     let test_result = match result {
@@ -384,6 +481,144 @@ async fn test_claude_api_connection(settings: &ClaudeApiSettings) -> Result<Stri
         // Parse error for user-friendly message
         if status.as_u16() == 401 {
             Err("Invalid API key. Please check your API key and try again.".to_string())
+        } else if status.as_u16() == 404 {
+            Err(format!(
+                "Model '{}' not found. Please check the model name.",
+                settings.model
+            ))
+        } else {
+            Err(format!("API error ({}): {}", status, error_body))
+        }
+    }
+}
+
+/// Test Gemini CLI connection
+async fn test_gemini_cli_connection(settings: &GeminiCliSettings) -> Result<String, String> {
+    let system = std::env::consts::OS;
+
+    // Determine effective execution mode
+    let effective_mode = match settings.execution_mode {
+        CliExecutionMode::Auto => {
+            if system == "windows" {
+                CliExecutionMode::WindowsNative
+            } else {
+                CliExecutionMode::Native
+            }
+        }
+        mode => mode,
+    };
+
+    // Get the gemini program name (custom or default)
+    let gemini_program = settings.custom_path.as_deref().unwrap_or("gemini");
+
+    info!(
+        "Testing Gemini CLI connection with mode: {:?}, program: {}, auth: {:?}",
+        effective_mode, gemini_program, settings.auth_method
+    );
+
+    let output = match effective_mode {
+        CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
+            // On Windows, use cmd.exe /c to handle .cmd files from npm install
+            tokio::process::Command::new("cmd.exe")
+                .args(["/c", gemini_program, "--version"])
+                .output()
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to execute gemini CLI: {}. Is Gemini CLI installed and in PATH?",
+                        e
+                    )
+                })?
+        }
+        CliExecutionMode::Wsl => tokio::process::Command::new("wsl")
+            .args([gemini_program, "--version"])
+            .output()
+            .await
+            .map_err(|e| format!("Failed to execute gemini via WSL: {}. Is WSL installed?", e))?,
+        CliExecutionMode::Native => tokio::process::Command::new(gemini_program)
+            .args(["--version"])
+            .output()
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to execute gemini CLI: {}. Is Gemini CLI installed and in PATH?",
+                    e
+                )
+            })?,
+    };
+
+    if output.status.success() {
+        let version = String::from_utf8_lossy(&output.stdout);
+        let auth_info = match settings.auth_method {
+            GeminiAuthMethod::OAuth => "OAuth authentication",
+            GeminiAuthMethod::ApiKey => "API key authentication",
+        };
+        Ok(format!(
+            "Gemini CLI connected successfully ({}) using model: {}. {}",
+            auth_info,
+            settings.model,
+            version.trim()
+        ))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Gemini CLI returned error: {}", stderr.trim()))
+    }
+}
+
+/// Test Gemini API connection
+async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<String, String> {
+    // Get API key from keychain
+    let api_key = get_ai_api_key("gemini_api")
+        .map_err(|e| format!("Failed to retrieve API key: {}", e))?
+        .ok_or_else(|| "No API key configured. Please enter your Gemini API key.".to_string())?;
+
+    info!(
+        "Testing Gemini API connection with model: {}",
+        settings.model
+    );
+
+    // Make a minimal API request to test the connection
+    // Using the Gemini API generateContent endpoint
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        settings.model, api_key
+    );
+
+    let response = client
+        .post(&url)
+        .header("content-type", "application/json")
+        .json(&serde_json::json!({
+            "contents": [{"parts": [{"text": "Hi"}]}],
+            "generationConfig": {
+                "maxOutputTokens": 10
+            }
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {}", e))?;
+
+    if response.status().is_success() {
+        Ok(format!(
+            "Gemini API connected successfully using model: {}",
+            settings.model
+        ))
+    } else {
+        let status = response.status();
+        let error_body = response.text().await.unwrap_or_default();
+
+        // Parse error for user-friendly message
+        if status.as_u16() == 400 {
+            // Check if it's an invalid API key error
+            if error_body.contains("API_KEY_INVALID") {
+                return Err("Invalid API key. Please check your API key and try again.".to_string());
+            }
+            Err(format!("Bad request: {}", error_body))
+        } else if status.as_u16() == 403 {
+            Err(
+                "API key doesn't have permission. Please check your API key permissions."
+                    .to_string(),
+            )
         } else if status.as_u16() == 404 {
             Err(format!(
                 "Model '{}' not found. Please check the model name.",

@@ -5,13 +5,17 @@
  */
 
 import { useState, useEffect } from "react";
-import { X, Save, Loader2 } from "lucide-react";
+import { X, Save, Loader2, Trash2, Plus, FolderOpen } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ScheduledTask,
   ScheduleExpression,
   ScheduledTaskType,
   CreateScheduledTaskRequest,
+  ScheduleConditions,
+  RepositoryWatch,
 } from "../../types/scheduler";
+import { useExecution } from "../../contexts";
 
 interface WorkflowOption {
   id: string;
@@ -99,7 +103,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
   const [workflowName, setWorkflowName] = useState(
     task?.task.task_type === "Workflow" ? task.task.workflow_name : "",
   );
-  const [configPath, setConfigPath] = useState(
+  const [taskConfigPath, setTaskConfigPath] = useState(
     task?.task.task_type === "Workflow" ? task.task.config_path || "" : "",
   );
   const [monitorIndex, setMonitorIndex] = useState<string>(
@@ -122,38 +126,32 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     task?.task.task_type === "AutoFix" ? task.task.force_run : false,
   );
 
-  // Available workflows and prompts
-  const [workflows, setWorkflows] = useState<WorkflowOption[]>([]);
-  const [prompts, setPrompts] = useState<PromptOption[]>([]);
-  const [loadingWorkflows, setLoadingWorkflows] = useState(false);
-  const [loadingPrompts, setLoadingPrompts] = useState(false);
+  // Conditions state
+  const [requireIdle, setRequireIdle] = useState(task?.conditions?.require_idle?.enabled ?? false);
+  const [requireRepoInactive, setRequireRepoInactive] = useState(
+    task?.conditions?.require_repo_inactive?.enabled ?? false,
+  );
+  const [repositories, setRepositories] = useState<RepositoryWatch[]>(
+    task?.conditions?.require_repo_inactive?.repositories ?? [],
+  );
+  const [timeoutMinutes, setTimeoutMinutes] = useState<number | undefined>(
+    task?.conditions?.timeout_minutes,
+  );
 
-  // Fetch workflows from config
-  useEffect(() => {
-    const fetchWorkflows = async () => {
-      setLoadingWorkflows(true);
-      try {
-        // Get the current loaded config which contains workflows
-        const response = await fetch("http://localhost:9876/config");
-        const result = await response.json();
-        if (result.success && result.data?.workflows) {
-          const workflowOptions: WorkflowOption[] = result.data.workflows.map(
-            (w: { id: string; name: string }) => ({
-              id: w.id,
-              name: w.name,
-              configPath: result.data.config_path,
-            }),
-          );
-          setWorkflows(workflowOptions);
-        }
-      } catch (error) {
-        console.error("Failed to fetch workflows:", error);
-      } finally {
-        setLoadingWorkflows(false);
-      }
-    };
-    fetchWorkflows();
-  }, []);
+  // Get workflows from ExecutionContext
+  const { workflows: contextWorkflows, config } = useExecution();
+  const contextConfigPath = config?.path;
+
+  // Convert context workflows to WorkflowOption format
+  const workflowOptions: WorkflowOption[] = contextWorkflows.map((w) => ({
+    id: w.id,
+    name: w.name,
+    configPath: contextConfigPath,
+  }));
+
+  // Available prompts
+  const [prompts, setPrompts] = useState<PromptOption[]>([]);
+  const [loadingPrompts, setLoadingPrompts] = useState(false);
 
   // Fetch prompts from library
   useEffect(() => {
@@ -200,7 +198,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
         return {
           task_type: "Workflow",
           workflow_name: workflowName,
-          config_path: configPath || undefined,
+          config_path: taskConfigPath || undefined,
           monitor_index: monitorIndex ? parseInt(monitorIndex, 10) : undefined,
         };
       case "prompt":
@@ -218,6 +216,71 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
     }
   };
 
+  // Build the conditions configuration
+  const buildConditions = (): ScheduleConditions | undefined => {
+    // Only include conditions if at least one is enabled
+    if (!requireIdle && !requireRepoInactive) {
+      return undefined;
+    }
+
+    const conditions: ScheduleConditions = {};
+
+    if (requireIdle) {
+      conditions.require_idle = { enabled: true };
+    }
+
+    if (requireRepoInactive && repositories.length > 0) {
+      conditions.require_repo_inactive = {
+        enabled: true,
+        repositories: repositories.filter((r) => r.path.trim() !== ""),
+      };
+    }
+
+    if (timeoutMinutes !== undefined && timeoutMinutes > 0) {
+      conditions.timeout_minutes = timeoutMinutes;
+    }
+
+    return conditions;
+  };
+
+  // Repository management helpers
+  const addRepository = () => {
+    setRepositories([...repositories, { path: "", inactive_minutes: 10 }]);
+  };
+
+  const removeRepository = (index: number) => {
+    setRepositories(repositories.filter((_, i) => i !== index));
+  };
+
+  const updateRepository = (
+    index: number,
+    field: keyof RepositoryWatch,
+    value: string | number,
+  ) => {
+    const updated = [...repositories];
+    if (field === "path") {
+      updated[index].path = value as string;
+    } else if (field === "inactive_minutes") {
+      updated[index].inactive_minutes = value as number;
+    }
+    setRepositories(updated);
+  };
+
+  const browseForRepository = async (index: number) => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Select Repository Directory",
+      });
+      if (selected && typeof selected === "string") {
+        updateRepository(index, "path", selected);
+      }
+    } catch (error) {
+      console.error("Failed to open directory picker:", error);
+    }
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     onSubmit({
@@ -225,6 +288,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
       description: description || undefined,
       schedule: buildSchedule(),
       task: buildTaskType(),
+      conditions: buildConditions(),
       skip_if_completed: skipIfCompleted,
       auto_fix_on_failure: autoFixOnFailure,
       success_criteria: successCriteria || undefined,
@@ -410,26 +474,21 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
           <div className="space-y-3">
             <div>
               <label className="block text-sm font-medium mb-1">Workflow *</label>
-              {loadingWorkflows ? (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading workflows...
-                </div>
-              ) : workflows.length > 0 ? (
+              {workflowOptions.length > 0 ? (
                 <select
                   value={workflowName}
                   onChange={(e) => {
-                    const selected = workflows.find((w) => w.name === e.target.value);
+                    const selected = workflowOptions.find((w) => w.name === e.target.value);
                     setWorkflowName(e.target.value);
-                    if (selected?.configPath && !configPath) {
-                      setConfigPath(selected.configPath);
+                    if (selected?.configPath && !taskConfigPath) {
+                      setTaskConfigPath(selected.configPath);
                     }
                   }}
                   className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
                   required={taskType === "workflow"}
                 >
                   <option value="">Select a workflow...</option>
-                  {workflows.map((workflow) => (
+                  {workflowOptions.map((workflow) => (
                     <option key={workflow.id} value={workflow.name}>
                       {workflow.name}
                     </option>
@@ -455,8 +514,8 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
               <label className="block text-sm font-medium mb-1">Config Path</label>
               <input
                 type="text"
-                value={configPath}
-                onChange={(e) => setConfigPath(e.target.value)}
+                value={taskConfigPath}
+                onChange={(e) => setTaskConfigPath(e.target.value)}
                 placeholder="Path to config file (optional, uses current if empty)"
                 className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
               />
@@ -557,6 +616,118 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
               />
               <span className="text-sm">Force run even if no findings</span>
             </label>
+          </div>
+        )}
+      </div>
+
+      {/* Execution Conditions */}
+      <div className="space-y-4">
+        <div>
+          <h4 className="text-sm font-medium">Execution Conditions</h4>
+          <p className="text-xs text-muted-foreground mt-1">
+            Optional conditions that must be met before the task executes
+          </p>
+        </div>
+
+        {/* Idle Condition */}
+        <label className="flex items-center gap-2">
+          <input
+            type="checkbox"
+            checked={requireIdle}
+            onChange={(e) => setRequireIdle(e.target.checked)}
+            className="text-primary"
+          />
+          <span className="text-sm">Wait for runner to be idle</span>
+        </label>
+
+        {/* Repository Inactivity Condition */}
+        <div className="space-y-2">
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={requireRepoInactive}
+              onChange={(e) => {
+                setRequireRepoInactive(e.target.checked);
+                if (e.target.checked && repositories.length === 0) {
+                  addRepository();
+                }
+              }}
+              className="text-primary"
+            />
+            <span className="text-sm">Wait for repository inactivity</span>
+          </label>
+
+          {requireRepoInactive && (
+            <div className="ml-6 space-y-3">
+              <p className="text-xs text-muted-foreground">
+                All repositories must be inactive (no file changes) for the specified time
+              </p>
+              {repositories.map((repo, idx) => (
+                <div key={idx} className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={repo.path}
+                    onChange={(e) => updateRepository(idx, "path", e.target.value)}
+                    placeholder="Repository path"
+                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => browseForRepository(idx)}
+                    className="p-2 rounded hover:bg-muted transition-colors"
+                    title="Browse for directory"
+                  >
+                    <FolderOpen className="w-4 h-4" />
+                  </button>
+                  <input
+                    type="number"
+                    value={repo.inactive_minutes}
+                    onChange={(e) =>
+                      updateRepository(idx, "inactive_minutes", parseInt(e.target.value, 10) || 1)
+                    }
+                    min={1}
+                    className="w-20 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                  />
+                  <span className="text-xs text-muted-foreground">min</span>
+                  {repositories.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => removeRepository(idx)}
+                      className="p-2 rounded text-red-500 hover:bg-red-500/10 transition-colors"
+                      title="Remove repository"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={addRepository}
+                className="flex items-center gap-1 text-sm text-primary hover:text-primary/80 transition-colors"
+              >
+                <Plus className="w-4 h-4" />
+                Add repository
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Timeout */}
+        {(requireIdle || requireRepoInactive) && (
+          <div className="flex items-center gap-2">
+            <span className="text-sm">Timeout after</span>
+            <input
+              type="number"
+              value={timeoutMinutes ?? ""}
+              onChange={(e) =>
+                setTimeoutMinutes(e.target.value ? parseInt(e.target.value, 10) : undefined)
+              }
+              placeholder="No limit"
+              min={1}
+              className="w-24 px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+            />
+            <span className="text-sm text-muted-foreground">minutes (empty = no limit)</span>
           </div>
         )}
       </div>

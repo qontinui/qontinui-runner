@@ -38,6 +38,7 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
+pub mod ai_data;
 pub mod ai_settings;
 pub mod ai_verification;
 pub mod auth;

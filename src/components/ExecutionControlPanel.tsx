@@ -36,6 +36,9 @@ export interface ExecutionControlPanelProps {
   onStartExecution: () => void;
   onStopExecution: () => void;
 
+  // Navigation after start
+  onNavigateToActive?: () => void;
+
   // Initial states (optional - only show if provided)
   states?: ConfigState[];
   resolvedInitialStates?: ResolvedInitialStates;
@@ -57,6 +60,7 @@ export function ExecutionControlPanel({
   executionActive,
   onStartExecution,
   onStopExecution,
+  onNavigateToActive,
   states,
   resolvedInitialStates,
   initialStatesOverride,
@@ -242,7 +246,10 @@ export function ExecutionControlPanel({
         {/* Start/Stop Buttons */}
         <div className="flex gap-2">
           <button
-            onClick={onStartExecution}
+            onClick={() => {
+              onStartExecution();
+              onNavigateToActive?.();
+            }}
             disabled={executionActive || !configLoaded || !selectedWorkflow}
             className="flex-1 btn-success flex items-center justify-center gap-2"
           >

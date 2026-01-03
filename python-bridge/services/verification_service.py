@@ -17,7 +17,6 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import logging
@@ -111,7 +110,7 @@ class VerificationService:
         self._screenshot_dir = Path(directory)
         self._screenshot_dir.mkdir(parents=True, exist_ok=True)
 
-    def detect_current_states(
+    async def detect_current_states(
         self,
         state_ids: list[str],
         monitor_index: int | None = None,
@@ -178,7 +177,7 @@ class VerificationService:
             state_images = state_config.get("stateImages", [])
 
             # Check identifying images for this state
-            result = self._check_state_images(
+            result = await self._check_state_images(
                 state_id=state_id,
                 state_name=state_name,
                 state_images=state_images,
@@ -204,7 +203,7 @@ class VerificationService:
             "detection_time_ms": total_time,
         }
 
-    def _check_state_images(
+    async def _check_state_images(
         self,
         state_id: str,
         state_name: str,
@@ -249,7 +248,7 @@ class VerificationService:
         action = FindAction()
 
         for state_image in identifying_images:
-            image_id = state_image.get("id")
+            image_id = state_image.get("id") or "unknown"
             image_name = state_image.get("name", image_id)
             threshold = state_image.get("threshold", 0.8)
 
@@ -287,7 +286,7 @@ class VerificationService:
             ).with_similarity(threshold)
 
             # Perform find operation
-            find_result = action.find(
+            find_result = await action.find(
                 pattern=pattern,
                 options=FindOptions(
                     similarity=threshold,
@@ -318,7 +317,7 @@ class VerificationService:
             "detection_time_ms": (time.time() - start_time) * 1000,
         }
 
-    def verify_elements(
+    async def verify_elements(
         self,
         expected_elements: list[str],
         unexpected_elements: list[str],
@@ -358,7 +357,7 @@ class VerificationService:
 
         # Check expected elements
         for element_id in expected_elements:
-            result = self._verify_single_element(
+            result = await self._verify_single_element(
                 element_id=element_id,
                 action=action,
                 monitor_index=monitor_index,
@@ -368,7 +367,7 @@ class VerificationService:
 
         # Check unexpected elements
         for element_id in unexpected_elements:
-            result = self._verify_single_element(
+            result = await self._verify_single_element(
                 element_id=element_id,
                 action=action,
                 monitor_index=monitor_index,
@@ -390,7 +389,7 @@ class VerificationService:
             "verification_time_ms": total_time,
         }
 
-    def _verify_single_element(
+    async def _verify_single_element(
         self,
         element_id: str,
         action: FindAction,
@@ -450,7 +449,7 @@ class VerificationService:
         )  # Default threshold
 
         # Perform find operation
-        find_result = action.find(
+        find_result = await action.find(
             pattern=pattern,
             options=FindOptions(
                 similarity=0.8,

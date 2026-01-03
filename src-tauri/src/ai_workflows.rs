@@ -25,7 +25,7 @@ const AI_WORKFLOWS_FILE: &str = "ai_workflows.json";
 pub struct ExecutionStep {
     /// Unique identifier for this step
     pub id: String,
-    /// Type of step: "workflow", "state", "playwright", or "prompt"
+    /// Type of step: "workflow", "state", "playwright", "prompt", "action", or "screenshot"
     #[serde(rename = "type")]
     pub step_type: String,
     /// Display name for the step
@@ -39,12 +39,30 @@ pub struct ExecutionStep {
     /// For playwright steps: the script ID
     #[serde(default, rename = "playwrightScriptId")]
     pub playwright_script_id: Option<String>,
+    /// For playwright steps: the script content
+    #[serde(default, rename = "playwrightScriptContent")]
+    pub playwright_script_content: Option<String>,
+    /// For playwright steps: the target URL
+    #[serde(default, rename = "playwrightTargetUrl")]
+    pub playwright_target_url: Option<String>,
     /// For prompt steps: the prompt ID from the library
     #[serde(default, rename = "promptId")]
     pub prompt_id: Option<String>,
     /// For prompt steps: the actual prompt content
     #[serde(default, rename = "promptContent")]
     pub prompt_content: Option<String>,
+    /// For action steps: the action type ("click", "double_click", "right_click")
+    #[serde(default, rename = "actionType")]
+    pub action_type: Option<String>,
+    /// For action steps: the target image ID
+    #[serde(default, rename = "targetImageId")]
+    pub target_image_id: Option<String>,
+    /// For action steps: the target image name (for display)
+    #[serde(default, rename = "targetImageName")]
+    pub target_image_name: Option<String>,
+    /// Monitor for screenshot capture (number for specific monitor, "all" for all monitors)
+    #[serde(default, rename = "screenshotMonitor")]
+    pub screenshot_monitor: Option<serde_json::Value>,
 }
 
 /// A saved AI Builder workflow
@@ -75,10 +93,23 @@ pub struct AiWorkflow {
     /// Tags for filtering/searching
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Manually added context IDs
+    #[serde(default)]
+    pub context_ids: Vec<String>,
+    /// Disabled context IDs (excluded from auto-include)
+    #[serde(default)]
+    pub disabled_context_ids: Vec<String>,
+    /// Whether to auto-include contexts based on task mentions (default: true)
+    #[serde(default = "default_auto_include_contexts")]
+    pub auto_include_contexts: bool,
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification
     pub modified_at: String,
+}
+
+fn default_auto_include_contexts() -> bool {
+    true
 }
 
 fn default_max_iterations() -> u32 {
@@ -97,6 +128,9 @@ impl AiWorkflow {
         capture_input_validation: bool,
         category: String,
         tags: Vec<String>,
+        context_ids: Vec<String>,
+        disabled_context_ids: Vec<String>,
+        auto_include_contexts: bool,
     ) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
@@ -109,6 +143,9 @@ impl AiWorkflow {
             capture_input_validation,
             category,
             tags,
+            context_ids,
+            disabled_context_ids,
+            auto_include_contexts,
             created_at: now.clone(),
             modified_at: now,
         }
@@ -187,6 +224,9 @@ pub fn create_workflow(
     capture_input_validation: bool,
     category: String,
     tags: Vec<String>,
+    context_ids: Vec<String>,
+    disabled_context_ids: Vec<String>,
+    auto_include_contexts: bool,
 ) -> Result<AiWorkflow, String> {
     let mut workflows = load_workflows();
 
@@ -199,6 +239,9 @@ pub fn create_workflow(
         capture_input_validation,
         category,
         tags,
+        context_ids,
+        disabled_context_ids,
+        auto_include_contexts,
     );
 
     workflows.push(workflow.clone());
@@ -226,6 +269,9 @@ pub fn update_workflow(
     capture_input_validation: Option<bool>,
     category: Option<String>,
     tags: Option<Vec<String>>,
+    context_ids: Option<Vec<String>>,
+    disabled_context_ids: Option<Vec<String>>,
+    auto_include_contexts: Option<bool>,
 ) -> Result<AiWorkflow, String> {
     let mut workflows = load_workflows();
 
@@ -257,6 +303,15 @@ pub fn update_workflow(
     }
     if let Some(t) = tags {
         workflow.tags = t;
+    }
+    if let Some(ctx) = context_ids {
+        workflow.context_ids = ctx;
+    }
+    if let Some(dis) = disabled_context_ids {
+        workflow.disabled_context_ids = dis;
+    }
+    if let Some(auto) = auto_include_contexts {
+        workflow.auto_include_contexts = auto;
     }
 
     workflow.modified_at = chrono::Utc::now().to_rfc3339();

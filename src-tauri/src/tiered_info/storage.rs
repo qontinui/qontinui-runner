@@ -766,7 +766,7 @@ pub fn format_debugging_context_for_prompt(context: &DebuggingContext) -> String
 // Helper Functions
 // ==============================================================================
 
-fn row_to_run_details(row: &rusqlite::Row) -> rusqlite::Result<RunDetails> {
+pub fn row_to_run_details(row: &rusqlite::Row) -> rusqlite::Result<RunDetails> {
     let status_str: String = row.get(6)?;
     let actions_json: Option<String> = row.get(10)?;
     let states_json: Option<String> = row.get(11)?;
@@ -847,7 +847,7 @@ fn row_to_config_statistics(row: &rusqlite::Row) -> rusqlite::Result<ConfigStati
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tiered_info::TransitionStats;
+    use crate::tiered_info::{TemplateMatchRecord, TransitionRecord, TransitionStats};
     use rusqlite::Connection;
 
     fn create_test_db() -> Connection {

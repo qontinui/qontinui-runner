@@ -70,6 +70,14 @@ export interface Context {
 export type ContextScope = "project" | "user" | "builtin";
 
 /**
+ * Sync status for project contexts to qontinui-web.
+ *
+ * When a context is created in project scope, it can optionally be synced
+ * to qontinui-web so it's included in the web project configuration.
+ */
+export type WebSyncStatus = "pending" | "synced" | "dismissed";
+
+/**
  * Runner-specific metadata for a context.
  *
  * This extends the core Context with fields specific to the runner:
@@ -86,6 +94,8 @@ export interface ContextMetadata {
   useCount: number;
   /** ISO 8601 timestamp of last use */
   lastUsedAt?: string | null;
+  /** Sync status for project contexts (pending approval to sync to qontinui-web) */
+  webSyncStatus?: WebSyncStatus | null;
 }
 
 /**
@@ -101,6 +111,8 @@ export interface ContextWithMetadata extends Context {
   useCount: number;
   /** ISO 8601 timestamp of last use */
   lastUsedAt?: string | null;
+  /** Sync status for project contexts (pending approval to sync to qontinui-web) */
+  webSyncStatus?: WebSyncStatus | null;
 }
 
 // ============================================================================

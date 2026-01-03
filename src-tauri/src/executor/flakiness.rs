@@ -61,6 +61,7 @@ impl Severity {
 ///
 /// This cache is loaded once and can be reused for multiple operations
 /// within a workflow execution. The cache has a 5-minute TTL.
+#[allow(dead_code)]
 pub struct FlakinessCache {
     config_id: String,
     flaky_transitions: HashMap<String, FlakyItem>,

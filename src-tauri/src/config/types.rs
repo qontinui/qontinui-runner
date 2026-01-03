@@ -100,6 +100,9 @@ pub struct QontinuiConfig {
     #[serde(default, deserialize_with = "deserialize_categories")]
     pub categories: Vec<Category>,
     pub settings: Option<Settings>,
+    /// AI contexts stored with the project configuration
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contexts: Vec<Value>,
 }
 
 impl QontinuiConfig {
@@ -130,14 +133,15 @@ impl QontinuiConfig {
 
     pub fn summary(&self) -> String {
         format!(
-            "Configuration: {} (v{})\nStates: {}, Workflows: {}, Transitions: {}, Images: {}, Categories: {}",
+            "Configuration: {} (v{})\nStates: {}, Workflows: {}, Transitions: {}, Images: {}, Categories: {}, Contexts: {}",
             self.metadata.name,
             self.version,
             self.states.len(),
             self.workflows.len(),
             self.transitions.len(),
             self.images.len(),
-            self.categories.len()
+            self.categories.len(),
+            self.contexts.len()
         )
     }
 }

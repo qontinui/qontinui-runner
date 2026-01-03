@@ -8,7 +8,7 @@
 import { useState, useEffect } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import {
-  Wifi,
+  User,
   Settings as SettingsIcon,
   HardDrive,
   Wrench,
@@ -47,7 +47,7 @@ interface SettingsProps {
 }
 
 type SettingsTab =
-  | "connection"
+  | "account"
   | "ai"
   | "playwright"
   | "general"
@@ -70,10 +70,14 @@ export function Settings({
   const [activeTab, setActiveTab] = useState<SettingsTab>(() => {
     // Load persisted tab on mount
     const stored = localStorage.getItem(STORAGE_KEY);
+    // Handle migration from old "connection" tab name
+    if (stored === "connection") {
+      return "account";
+    }
     if (
       stored &&
       [
-        "connection",
+        "account",
         "ai",
         "playwright",
         "general",
@@ -85,7 +89,7 @@ export function Settings({
     ) {
       return stored as SettingsTab;
     }
-    return "connection";
+    return "account";
   });
 
   // Persist active tab
@@ -94,8 +98,8 @@ export function Settings({
   }, [activeTab]);
 
   const tabs = [
-    { id: "connection" as const, label: "Connection", icon: Wifi },
-    { id: "ai" as const, label: "AI", icon: Bot },
+    { id: "account" as const, label: "Account", icon: User },
+    { id: "ai" as const, label: "AI Providers", icon: Bot },
     { id: "playwright" as const, label: "Playwright", icon: FlaskConical },
     { id: "general" as const, label: "Preferences", icon: SettingsIcon },
     { id: "storage" as const, label: "Storage", icon: HardDrive },
@@ -151,7 +155,7 @@ export function Settings({
 
       {/* Content area */}
       <div className="flex-1 overflow-y-auto p-6">
-        <Tabs.Content value="connection" className="outline-none">
+        <Tabs.Content value="account" className="outline-none">
           <AuthConnectionSettings
             onLog={onLog}
             projects={projects}

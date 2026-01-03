@@ -15,6 +15,7 @@ import type {
   AutoDetectResult,
   CreateContextRequest,
   UpdateContextRequest,
+  WebSyncStatus,
 } from "../../../types/context";
 
 interface CommandResponse {
@@ -66,6 +67,10 @@ interface UseContextsReturn {
   // Enable/disable
   enableContext: (id: string) => Promise<boolean>;
   disableContext: (id: string) => Promise<boolean>;
+
+  // Web sync approval (for project contexts)
+  approveContextSync: (id: string) => Promise<boolean>;
+  dismissContextSync: (id: string) => Promise<boolean>;
 
   // Refresh
   refresh: () => Promise<void>;
@@ -329,6 +334,48 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
   }, []);
 
   /**
+   * Approve syncing a project context to qontinui-web.
+   * This will send the context to the web project and mark it as synced.
+   */
+  const approveContextSync = useCallback(async (id: string): Promise<boolean> => {
+    setLoading(true);
+    setError(null);
+    try {
+      await apiRequest("POST", `/contexts/${id}/approve-sync`);
+      setContexts((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, webSyncStatus: "synced" as WebSyncStatus } : c)),
+      );
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to sync context to web");
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  /**
+   * Dismiss syncing a project context to qontinui-web.
+   * The context will remain local and won't be synced.
+   */
+  const dismissContextSync = useCallback(async (id: string): Promise<boolean> => {
+    setLoading(true);
+    setError(null);
+    try {
+      await apiRequest("POST", `/contexts/${id}/dismiss-sync`);
+      setContexts((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, webSyncStatus: "dismissed" as WebSyncStatus } : c)),
+      );
+      return true;
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to dismiss context sync");
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  /**
    * Refresh all data
    */
   const refresh = useCallback(async () => {
@@ -497,6 +544,8 @@ export function useContexts(autoRefresh = false, refreshInterval = 30000): UseCo
     duplicateContext,
     enableContext,
     disableContext,
+    approveContextSync,
+    dismissContextSync,
     refresh,
     evaluateAutoInclude,
     recordUsage,

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ai_prompt_executor import AIPromptExecutor
+from gemini_executor import GeminiExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +82,11 @@ class GUIAutomation:
         self.is_running = False
         self._last_find_location = None
 
-        # Initialize AI prompt executor for AI_PROMPT and RUN_PROMPT_SEQUENCE actions
+        # Initialize AI prompt executors for AI_PROMPT and RUN_PROMPT_SEQUENCE actions
         self.ai_prompt_executor = AIPromptExecutor(emit_log_fn=emit_log_fn)
+        self.gemini_executor = GeminiExecutor(emit_log_fn=emit_log_fn)
 
-    def execute_action(self, action_data: dict[str, Any]) -> bool:
+    async def execute_action(self, action_data: dict[str, Any]) -> bool:
         """
         Execute a single action using ExecutionTree and UnifiedDataCollector.
 
@@ -153,30 +155,51 @@ class GUIAutomation:
             if action_type == "RUN_WORKFLOW":
                 workflow_id = config.get("workflowId")
                 if workflow_id:
-                    success = self.execute_workflow(workflow_id)
+                    success = await self.execute_workflow(workflow_id)
                 else:
                     self.emit_log("error", "RUN_WORKFLOW action missing workflowId")
                     success = False
 
-            # Handle AI_PROMPT - execute AI prompt via Claude CLI
+            # Handle AI_PROMPT - execute AI prompt via Claude CLI or Gemini
             elif action_type == "AI_PROMPT":
                 prompt = config.get("prompt")
                 fresh_context = config.get("freshContext", True)
                 timeout = config.get("timeout", 600000)
                 working_directory = config.get("workingDirectory")
                 output_variable = config.get("outputVariable")
+                # Provider/model override (if not specified, use Claude CLI as default)
+                provider = config.get("provider", "claude_cli")
+                model = config.get("model")
 
                 if not prompt:
                     self.emit_log("error", "AI_PROMPT action missing prompt")
                     success = False
                 else:
-                    result = self.ai_prompt_executor.execute_prompt(
-                        prompt=prompt,
-                        fresh_context=fresh_context,
-                        working_directory=working_directory,
-                        timeout=timeout,
-                        output_variable=output_variable,
-                    )
+                    # Route to appropriate executor based on provider
+                    if provider and provider.startswith("gemini"):
+                        # Use Gemini executor
+                        gemini_model = model or "gemini-3-flash"
+                        self.emit_log(
+                            "info", f"Using Gemini provider: {provider}, model: {gemini_model}"
+                        )
+                        result = self.gemini_executor.execute_prompt(
+                            prompt=prompt,
+                            provider=provider,
+                            model=gemini_model,
+                            working_directory=working_directory,
+                            timeout=timeout,
+                            max_output_tokens=config.get("maxOutputTokens", 8192),
+                            temperature=config.get("temperature", 0.7),
+                        )
+                    else:
+                        # Use Claude executor (default)
+                        result = self.ai_prompt_executor.execute_prompt(
+                            prompt=prompt,
+                            fresh_context=fresh_context,
+                            working_directory=working_directory,
+                            timeout=timeout,
+                            output_variable=output_variable,
+                        )
                     success = result["success"]
 
                     # Store output in metadata for tree display
@@ -219,7 +242,7 @@ class GUIAutomation:
 
             else:
                 # Normal action delegation to library
-                success = self.action_executor.execute_action(action)
+                success = await self.action_executor.execute_action(action)
 
             # Capture error message for failed GO_TO_STATE actions
             if action_type == "GO_TO_STATE" and not success and not error_message:
@@ -312,7 +335,9 @@ class GUIAutomation:
 
         return success
 
-    def execute_workflow(self, workflow_id: str, transition_context: dict | None = None) -> bool:
+    async def execute_workflow(
+        self, workflow_id: str, transition_context: dict | None = None
+    ) -> bool:
         """
         Execute a workflow and return success status.
 
@@ -344,7 +369,7 @@ class GUIAutomation:
 
                 try:
                     # Execute workflow under this transition
-                    success = self._execute_workflow_internal(workflow_id)
+                    success = await self._execute_workflow_internal(workflow_id)
 
                     # End transition node
                     self.execution_tree.end_transition(transition_id, success=success)
@@ -360,12 +385,12 @@ class GUIAutomation:
                     raise
             else:
                 # No transition context - execute workflow normally
-                return self._execute_workflow_internal(workflow_id)
+                return await self._execute_workflow_internal(workflow_id)
         except Exception as e:
             self.emit_log("error", f"Workflow execution failed: {e}")
             return False
 
-    def _execute_workflow_internal(self, workflow_id: str) -> bool:
+    async def _execute_workflow_internal(self, workflow_id: str) -> bool:
         """
         Internal workflow execution using ExecutionTree for tracking.
 
@@ -439,7 +464,7 @@ class GUIAutomation:
                     break
 
                 # Execute action and track success, but always continue
-                action_success = self.execute_action(action)
+                action_success = await self.execute_action(action)
 
                 if not action_success:
                     success = False

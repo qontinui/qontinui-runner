@@ -607,7 +607,7 @@ class FrameExtractorService:
         output_path_obj.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            frame.save_image(str(output_path_obj), format=output_format.upper())
+            frame.save_image(str(output_path_obj), image_format=output_format.upper())
             logger.debug(f"Saved frame to {output_path_obj}")
             return str(output_path_obj.absolute())
         except Exception as e:
@@ -658,7 +658,7 @@ class FrameExtractorService:
             output_path = output_dir_obj / filename
 
             try:
-                frame.save_image(str(output_path), format=output_format.upper())
+                frame.save_image(str(output_path), image_format=output_format.upper())
                 saved_paths.append(str(output_path.absolute()))
             except Exception as e:
                 logger.error(f"Failed to save frame {frame.frame_number}: {e}")

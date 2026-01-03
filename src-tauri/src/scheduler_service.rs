@@ -9,14 +9,16 @@
 #![allow(dead_code)]
 
 use crate::scheduler::{
-    compute_next_run, get_scheduler_settings, get_task, load_scheduler_state, record_execution,
-    save_scheduler_state, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType,
+    clear_task_condition_status, compute_next_run, get_scheduler_settings, get_task,
+    load_scheduler_state, record_execution, save_scheduler_state, update_task_condition_status,
+    ConditionStatus, RepositoryWatch, ScheduledTask, ScheduledTaskStatus, ScheduledTaskType,
     TaskExecutionRecord,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use walkdir::WalkDir;
 
 // ============================================================================
 // Scheduler Service
@@ -77,7 +79,9 @@ impl SchedulerService {
         let state = load_scheduler_state();
         let settings = state.settings;
 
-        // Find tasks due for execution
+        // Find tasks that are:
+        // 1. Due for execution (next_run <= now), OR
+        // 2. Already waiting for conditions (have condition_status set)
         let mut due_tasks: Vec<ScheduledTask> = state
             .tasks
             .into_iter()
@@ -87,7 +91,12 @@ impl SchedulerService {
                     return false;
                 }
 
-                // Must have next_run set and be due
+                // Include if already waiting for conditions
+                if task.is_waiting_for_conditions() {
+                    return true;
+                }
+
+                // Include if due for execution
                 if let Some(ref next_run) = task.next_run {
                     if let Ok(next_dt) = chrono::DateTime::parse_from_rfc3339(next_run) {
                         return next_dt.with_timezone(&chrono::Utc) <= now;
@@ -98,11 +107,22 @@ impl SchedulerService {
             })
             .collect();
 
-        // Sort by next_run time
+        // Sort by: waiting tasks first (by waiting_since), then by next_run time
         due_tasks.sort_by(|a, b| {
-            let a_time = a.next_run.as_ref().unwrap();
-            let b_time = b.next_run.as_ref().unwrap();
-            a_time.cmp(b_time)
+            // Waiting tasks come first
+            match (&a.condition_status, &b.condition_status) {
+                (Some(a_status), Some(b_status)) => {
+                    a_status.waiting_since.cmp(&b_status.waiting_since)
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => match (&a.next_run, &b.next_run) {
+                    (Some(a_time), Some(b_time)) => a_time.cmp(b_time),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
+            }
         });
 
         // Check concurrent task limit
@@ -137,6 +157,37 @@ impl SchedulerService {
                 );
                 self.record_skipped(&task).await;
                 continue;
+            }
+
+            // Check conditions if task has any
+            if task.has_conditions() {
+                let (conditions_met, status) = self.check_conditions(&task).await;
+
+                if status.timed_out {
+                    info!(
+                        "Scheduler: Task '{}' timed out waiting for conditions",
+                        task.name
+                    );
+                    self.record_condition_timeout(&task).await;
+                    continue;
+                }
+
+                if !conditions_met {
+                    info!(
+                        "Scheduler: Task '{}' waiting for conditions (idle: {:?}, repos: {:?})",
+                        task.name, status.idle_met, status.repo_inactive_met
+                    );
+                    if let Err(e) = update_task_condition_status(&task.id, status) {
+                        error!("Failed to update condition status: {}", e);
+                    }
+                    continue;
+                }
+
+                // Conditions met - clear status before execution
+                if let Err(e) = clear_task_condition_status(&task.id) {
+                    error!("Failed to clear condition status: {}", e);
+                }
+                info!("Scheduler: Task '{}' conditions met, executing", task.name);
             }
 
             info!("Scheduler: Executing task '{}'", task.name);
@@ -477,6 +528,204 @@ After making fixes, run tests if applicable to verify the fixes work."#
         let running = self.running_tasks.read().await;
         running.clone()
     }
+
+    // ========================================================================
+    // Condition Checking
+    // ========================================================================
+
+    /// Check if a task's conditions are met
+    /// Returns (all_conditions_met, updated_status)
+    async fn check_conditions(&self, task: &ScheduledTask) -> (bool, ConditionStatus) {
+        let conditions = match &task.conditions {
+            Some(c) => c,
+            None => return (true, ConditionStatus::default()),
+        };
+
+        // Check if any conditions are actually enabled
+        if !task.has_conditions() {
+            return (true, ConditionStatus::default());
+        }
+
+        // Use existing status or create new one
+        let mut status = task
+            .condition_status
+            .clone()
+            .unwrap_or_else(|| ConditionStatus {
+                waiting_since: chrono::Utc::now().to_rfc3339(),
+                idle_met: None,
+                repo_inactive_met: None,
+                timed_out: false,
+            });
+
+        // Check timeout first
+        if let Some(timeout_mins) = conditions.timeout_minutes {
+            if let Ok(waiting_since) = chrono::DateTime::parse_from_rfc3339(&status.waiting_since) {
+                let elapsed = chrono::Utc::now() - waiting_since.with_timezone(&chrono::Utc);
+                if elapsed > chrono::Duration::minutes(timeout_mins as i64) {
+                    status.timed_out = true;
+                    return (false, status);
+                }
+            }
+        }
+
+        let mut all_met = true;
+
+        // Check idle condition
+        if let Some(idle_cond) = &conditions.require_idle {
+            if idle_cond.enabled {
+                let idle = self.check_idle().await;
+                status.idle_met = Some(idle);
+                if !idle {
+                    all_met = false;
+                }
+            }
+        }
+
+        // Check repo inactive condition
+        if let Some(repo_cond) = &conditions.require_repo_inactive {
+            if repo_cond.enabled && !repo_cond.repositories.is_empty() {
+                let repo_status = self.check_repos_inactive(&repo_cond.repositories);
+                let all_repos_inactive = repo_status.iter().all(|(_, inactive)| *inactive);
+                status.repo_inactive_met = Some(repo_status);
+                if !all_repos_inactive {
+                    all_met = false;
+                }
+            }
+        }
+
+        (all_met, status)
+    }
+
+    /// Check if runner is idle (not executing workflows or AI tasks)
+    async fn check_idle(&self) -> bool {
+        let client = reqwest::Client::new();
+        match client.get("http://localhost:9876/status").send().await {
+            Ok(resp) => {
+                if let Ok(json) = resp.json::<serde_json::Value>().await {
+                    let executor_state = json
+                        .get("executor_state")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("Unknown");
+                    let ai_running = json
+                        .get("ai_analysis_running")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    // Idle = Ready state and no AI analysis running
+                    executor_state == "Ready" && !ai_running
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                warn!("Failed to check idle status: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Check if repositories have been inactive for the required duration
+    fn check_repos_inactive(&self, repos: &[RepositoryWatch]) -> Vec<(String, bool)> {
+        let now = std::time::SystemTime::now();
+
+        repos
+            .iter()
+            .map(|repo| {
+                let inactive = match get_most_recent_modification(&repo.path) {
+                    Ok(last_modified) => {
+                        let elapsed = now.duration_since(last_modified).unwrap_or_default();
+                        elapsed.as_secs() >= (repo.inactive_minutes as u64 * 60)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to check repository inactivity for '{}': {}",
+                            repo.path, e
+                        );
+                        // If we can't read, assume not inactive (safer)
+                        false
+                    }
+                };
+                (repo.path.clone(), inactive)
+            })
+            .collect()
+    }
+
+    /// Record a condition timeout execution
+    async fn record_condition_timeout(&self, task: &ScheduledTask) {
+        let mut record = TaskExecutionRecord::new();
+        record.status = ScheduledTaskStatus::Skipped;
+        record.ended_at = Some(chrono::Utc::now().to_rfc3339());
+        record.error_message = Some("Condition timeout exceeded".to_string());
+
+        if let Err(e) = record_execution(&task.id, record) {
+            error!("Failed to record condition timeout: {}", e);
+        }
+
+        // Clear condition status
+        if let Err(e) = clear_task_condition_status(&task.id) {
+            error!("Failed to clear condition status: {}", e);
+        }
+
+        // Update next_run
+        self.update_task_next_run(&task.id).await;
+    }
+}
+
+// ============================================================================
+// File System Helpers
+// ============================================================================
+
+/// Get the most recent modification time of any file in a directory tree
+fn get_most_recent_modification(path: &str) -> Result<std::time::SystemTime, std::io::Error> {
+    let mut most_recent = std::time::SystemTime::UNIX_EPOCH;
+
+    for entry in WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !is_ignored_path(e.path()))
+    {
+        if let Ok(entry) = entry {
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > most_recent {
+                        most_recent = modified;
+                    }
+                }
+            }
+        }
+    }
+
+    if most_recent == std::time::SystemTime::UNIX_EPOCH {
+        // No files found - return current time (treat as not inactive)
+        return Ok(std::time::SystemTime::now());
+    }
+
+    Ok(most_recent)
+}
+
+/// Check if a path should be ignored (common build/cache directories)
+fn is_ignored_path(path: &std::path::Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    matches!(
+        name,
+        "node_modules"
+            | ".git"
+            | "target"
+            | "__pycache__"
+            | ".venv"
+            | "venv"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".cache"
+            | ".turbo"
+            | ".nuxt"
+            | ".svelte-kit"
+            | "coverage"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".ruff_cache"
+    )
 }
 
 impl Default for SchedulerService {

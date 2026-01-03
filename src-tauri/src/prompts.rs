@@ -28,7 +28,7 @@ pub struct SavedPrompt {
     /// Optional description of what this prompt does
     #[serde(default)]
     pub description: String,
-    /// The actual prompt content to send to Claude
+    /// The actual prompt content to send to the AI
     pub content: String,
     /// Category for organization (e.g., "Development", "Testing", "Deployment")
     #[serde(default)]
@@ -40,6 +40,14 @@ pub struct SavedPrompt {
     /// Sessions continue until [TASK_COMPLETE] is found or this limit is reached
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    /// AI provider override (e.g., "claude_cli", "gemini_api")
+    /// If not set, uses global settings
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// AI model override (e.g., "gemini-3-flash", "claude-sonnet-4")
+    /// If not set, uses provider's default model
+    #[serde(default)]
+    pub model: Option<String>,
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification
@@ -55,6 +63,8 @@ impl SavedPrompt {
         category: String,
         tags: Vec<String>,
         max_sessions: Option<u32>,
+        provider: Option<String>,
+        model: Option<String>,
     ) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
@@ -65,6 +75,8 @@ impl SavedPrompt {
             category,
             tags,
             max_sessions,
+            provider,
+            model,
             created_at: now.clone(),
             modified_at: now,
         }
@@ -176,11 +188,21 @@ pub fn create_prompt(
     category: String,
     tags: Vec<String>,
     max_sessions: Option<u32>,
+    provider: Option<String>,
+    model: Option<String>,
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
-    let prompt =
-        SavedPrompt::with_details(name, description, content, category, tags, max_sessions);
+    let prompt = SavedPrompt::with_details(
+        name,
+        description,
+        content,
+        category,
+        tags,
+        max_sessions,
+        provider,
+        model,
+    );
     let created = prompt.clone();
 
     library.prompts.push(prompt);
@@ -199,6 +221,8 @@ pub fn update_prompt(
     category: Option<String>,
     tags: Option<Vec<String>>,
     max_sessions: Option<Option<u32>>,
+    provider: Option<Option<String>>,
+    model: Option<Option<String>>,
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
@@ -225,6 +249,12 @@ pub fn update_prompt(
     }
     if let Some(max_sessions) = max_sessions {
         prompt.max_sessions = max_sessions;
+    }
+    if let Some(provider) = provider {
+        prompt.provider = provider;
+    }
+    if let Some(model) = model {
+        prompt.model = model;
     }
 
     prompt.modified_at = chrono::Utc::now().to_rfc3339();
@@ -344,6 +374,8 @@ pub fn duplicate_prompt(id: &str, new_name: Option<String>) -> Result<SavedPromp
         original.category,
         original.tags,
         original.max_sessions,
+        original.provider,
+        original.model,
     )
 }
 
@@ -360,9 +392,13 @@ mod tests {
             "Dev".to_string(),
             vec!["tag1".to_string()],
             Some(5),
+            None,
+            None,
         );
         assert_eq!(prompt.category, "Dev");
         assert_eq!(prompt.max_sessions, Some(5));
+        assert_eq!(prompt.provider, None);
+        assert_eq!(prompt.model, None);
     }
 
     #[test]
@@ -374,7 +410,25 @@ mod tests {
             "Dev".to_string(),
             vec![],
             None,
+            None,
+            None,
         );
         assert_eq!(prompt.max_sessions, None);
+    }
+
+    #[test]
+    fn test_prompt_with_gemini_provider() {
+        let prompt = SavedPrompt::with_details(
+            "Gemini Task".to_string(),
+            "A task using Gemini".to_string(),
+            "Fix linting errors".to_string(),
+            "Dev".to_string(),
+            vec!["lint".to_string()],
+            None,
+            Some("gemini_api".to_string()),
+            Some("gemini-3-flash".to_string()),
+        );
+        assert_eq!(prompt.provider, Some("gemini_api".to_string()));
+        assert_eq!(prompt.model, Some("gemini-3-flash".to_string()));
     }
 }

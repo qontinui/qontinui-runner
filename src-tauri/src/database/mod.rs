@@ -94,6 +94,13 @@ pub struct TaskRun {
     /// Per-run auto-continue setting (defaults to true)
     #[serde(default = "default_auto_continue")]
     pub auto_continue: bool,
+    /// Execution steps JSON (for re-execution on resume)
+    /// Stores the deterministic steps to run before each AI session
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_steps_json: Option<String>,
+    /// Log sources JSON (for capturing logs during execution)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_sources_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -487,6 +494,21 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 8: {}", e))?;
         }
 
+        // Migration to version 9: Add execution_steps_json and log_sources_json to task_runs
+        if (1..9).contains(&current_version) {
+            info!("Migrating database to version 9 (adding execution_steps_json and log_sources_json to task_runs)");
+            conn.execute_batch(
+                r#"
+                -- Add columns for storing execution steps and log sources for re-execution on resume
+                ALTER TABLE task_runs ADD COLUMN execution_steps_json TEXT;
+                ALTER TABLE task_runs ADD COLUMN log_sources_json TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (9, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 9: {}", e))?;
+        }
+
         Ok(())
     }
 
@@ -878,6 +900,8 @@ impl CheckpointDb {
 
     /// Create a new task run.
     /// If `auto_continue` is None, defaults to true.
+    /// `execution_steps_json` and `log_sources_json` are optional JSON strings
+    /// that store the deterministic steps to re-execute on session resume.
     pub fn create_task_run(
         &self,
         id: &str,
@@ -885,6 +909,8 @@ impl CheckpointDb {
         prompt: &str,
         max_sessions: Option<u32>,
         auto_continue: Option<bool>,
+        execution_steps_json: Option<String>,
+        log_sources_json: Option<String>,
     ) -> Result<TaskRun, String> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
@@ -892,10 +918,10 @@ impl CheckpointDb {
 
         conn.execute(
             r#"
-            INSERT INTO task_runs (id, task_name, prompt, status, sessions_count, max_sessions, output_log, auto_continue, created_at, updated_at)
-            VALUES (?1, ?2, ?3, 'running', 0, ?4, '', ?5, ?6, ?6)
+            INSERT INTO task_runs (id, task_name, prompt, status, sessions_count, max_sessions, output_log, auto_continue, execution_steps_json, log_sources_json, created_at, updated_at)
+            VALUES (?1, ?2, ?3, 'running', 0, ?4, '', ?5, ?6, ?7, ?8, ?8)
             "#,
-            params![id, task_name, prompt, max_sessions.map(|v| v as i64), auto_continue_val as i32, now],
+            params![id, task_name, prompt, max_sessions.map(|v| v as i64), auto_continue_val as i32, execution_steps_json, log_sources_json, now],
         )
         .map_err(|e| format!("Failed to create task run: {}", e))?;
 
@@ -909,6 +935,8 @@ impl CheckpointDb {
             output_log: String::new(),
             error_message: None,
             auto_continue: auto_continue_val,
+            execution_steps_json,
+            log_sources_json,
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -920,10 +948,10 @@ impl CheckpointDb {
     pub fn get_task_run(&self, id: &str) -> Result<Option<TaskRun>, String> {
         let conn = self.get_conn()?;
 
-        // First get the task_run metadata
+        // First get the task_run metadata including execution_steps_json and log_sources_json
         let result: SqliteResult<TaskRun> = conn.query_row(
             r#"
-            SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, created_at, updated_at, completed_at
+            SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, execution_steps_json, log_sources_json, created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
             "#,
@@ -939,9 +967,11 @@ impl CheckpointDb {
                     output_log: String::new(), // Will be filled from chunks
                     error_message: row.get(6)?,
                     auto_continue: row.get::<_, i32>(7)? != 0,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                    completed_at: row.get(10)?,
+                    execution_steps_json: row.get(8)?,
+                    log_sources_json: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                    completed_at: row.get(12)?,
                 })
             },
         );
@@ -1003,8 +1033,11 @@ impl CheckpointDb {
         )
         .map_err(|e| format!("Failed to update task run metadata: {}", e))?;
 
-        // Check if task is complete
-        let is_complete = output.contains(TASK_COMPLETE_MARKER);
+        // Check if task is complete - marker must be on its own line (not embedded in text)
+        // This prevents false positives like "I should NOT output [TASK_COMPLETE] yet"
+        let is_complete = output
+            .lines()
+            .any(|line| line.trim() == TASK_COMPLETE_MARKER);
         if is_complete {
             // IMPORTANT: Inline the completion logic here instead of calling complete_task_run()
             // to avoid nested lock acquisition (we already hold the conn lock above).
@@ -1068,6 +1101,7 @@ impl CheckpointDb {
     }
 
     /// Stop a task run.
+    /// Also disables auto_continue to prevent multi-step tasks from restarting.
     pub fn stop_task_run(&self, id: &str) -> Result<(), String> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
@@ -1076,6 +1110,7 @@ impl CheckpointDb {
             r#"
             UPDATE task_runs SET
                 status = 'stopped',
+                auto_continue = 0,
                 updated_at = ?1,
                 completed_at = ?1
             WHERE id = ?2
@@ -1087,15 +1122,42 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Update execution steps for a task run.
+    /// Used to add/update deterministic execution steps that should be re-run on session resume.
+    pub fn update_task_run_execution_steps(
+        &self,
+        id: &str,
+        execution_steps_json: Option<String>,
+        log_sources_json: Option<String>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                execution_steps_json = ?1,
+                log_sources_json = ?2,
+                updated_at = ?3
+            WHERE id = ?4
+            "#,
+            params![execution_steps_json, log_sources_json, now, id],
+        )
+        .map_err(|e| format!("Failed to update task run execution steps: {}", e))?;
+
+        Ok(())
+    }
+
     /// Get all running (incomplete) task runs.
     /// Note: output_log is empty for performance. Use get_full_task_output() to get output.
+    /// Includes execution_steps_json and log_sources_json for re-execution on resume.
     pub fn get_running_task_runs(&self) -> Result<Vec<TaskRun>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, created_at, updated_at, completed_at
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, execution_steps_json, log_sources_json, created_at, updated_at, completed_at
                 FROM task_runs
                 WHERE status = 'running'
                 ORDER BY updated_at DESC
@@ -1115,9 +1177,11 @@ impl CheckpointDb {
                     output_log: String::new(), // Empty for performance - use get_full_task_output()
                     error_message: row.get(6)?,
                     auto_continue: row.get::<_, i32>(7)? != 0,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                    completed_at: row.get(10)?,
+                    execution_steps_json: row.get(8)?,
+                    log_sources_json: row.get(9)?,
+                    created_at: row.get(10)?,
+                    updated_at: row.get(11)?,
+                    completed_at: row.get(12)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -1155,6 +1219,8 @@ impl CheckpointDb {
                     output_log: String::new(), // Empty for performance - use get_full_task_output()
                     error_message: row.get(6)?,
                     auto_continue: row.get::<_, i32>(7)? != 0,
+                    execution_steps_json: None,
+                    log_sources_json: None,
                     created_at: row.get(8)?,
                     updated_at: row.get(9)?,
                     completed_at: row.get(10)?,
@@ -1929,7 +1995,15 @@ mod tests {
 
         // Create task run with default auto_continue (true)
         let task_run = db
-            .create_task_run("test-task-1", "Test Task", "Do something", None, None)
+            .create_task_run(
+                "test-task-1",
+                "Test Task",
+                "Do something",
+                None,
+                None,
+                None,
+                None,
+            )
             .unwrap();
         assert_eq!(task_run.auto_continue, true);
 
@@ -1941,6 +2015,8 @@ mod tests {
                 "Do something else",
                 None,
                 Some(false),
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(task_run_disabled.auto_continue, false);

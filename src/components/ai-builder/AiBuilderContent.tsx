@@ -8,7 +8,6 @@
 import { Header } from "./Header";
 import { ExecutionStepsList } from "./ExecutionStepsList";
 import { SavedWorkflowsPanel } from "./SavedWorkflowsPanel";
-import { GoalInput } from "./GoalInput";
 import { SettingsPanel } from "./SettingsPanel";
 import { AdvancedSettingsPanel } from "./AdvancedSettingsPanel";
 import { ResumeWorkflowBanner } from "./ResumeWorkflowBanner";
@@ -16,7 +15,7 @@ import { ActionButtons } from "./ActionButtons";
 import { SessionStatus } from "./SessionStatus";
 import { ResultMessage } from "./ResultMessage";
 import { RunningIndicator } from "./RunningIndicator";
-import { PromptPreview } from "./PromptPreview";
+import { PromptComponentsView } from "./PromptComponentsView";
 import { HistoryPanel } from "./HistoryPanel";
 import { AvailableImagesPanel } from "./AvailableImagesPanel";
 import { SaveWorkflowDialog } from "./SaveWorkflowDialog";
@@ -35,12 +34,6 @@ export function AiBuilderContent() {
           {/* Execution Steps */}
           <ExecutionStepsList />
 
-          {/* Saved Workflows */}
-          <SavedWorkflowsPanel />
-
-          {/* Goal */}
-          <GoalInput />
-
           {/* Settings */}
           <SettingsPanel />
 
@@ -50,8 +43,14 @@ export function AiBuilderContent() {
           {/* Resume Workflow Banner */}
           <ResumeWorkflowBanner />
 
-          {/* Action Buttons */}
+          {/* Action Buttons (Start AI Analysis) */}
           <ActionButtons />
+
+          {/* Saved Workflows */}
+          <SavedWorkflowsPanel />
+
+          {/* Recent Runs (History) */}
+          <HistoryPanel />
 
           {/* Session Status */}
           <SessionStatus />
@@ -60,16 +59,13 @@ export function AiBuilderContent() {
           <ResultMessage />
         </div>
 
-        {/* Right Panel - Preview & History */}
+        {/* Right Panel - Preview & Status */}
         <div className="space-y-4">
           {/* Running Indicator */}
           <RunningIndicator />
 
-          {/* Prompt Preview */}
-          <PromptPreview />
-
-          {/* History */}
-          <HistoryPanel />
+          {/* Prompt Components View */}
+          <PromptComponentsView />
 
           {/* Available Images */}
           <AvailableImagesPanel />

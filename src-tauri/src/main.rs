@@ -16,6 +16,7 @@ mod display;
 mod error;
 mod executor;
 mod findings;
+mod iteration_bundle;
 mod logging;
 mod mcp;
 mod mcp_api;
@@ -28,6 +29,7 @@ mod scriptlets;
 mod secure_storage;
 mod session;
 mod settings;
+mod step_executor;
 mod storage;
 mod task_monitor;
 mod tiered_info;
@@ -306,9 +308,17 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::project_logs::read_project_logs,
             commands::project_logs::get_project_directories,
             commands::project_logs::append_project_log,
+            // Log source profile commands
+            commands::project_logs::create_log_source_profile,
+            commands::project_logs::update_log_source_profile,
+            commands::project_logs::delete_log_source_profile,
+            commands::project_logs::set_active_profile,
+            commands::project_logs::list_log_source_profiles,
+            commands::project_logs::duplicate_log_source_profile,
             // AI settings commands
             commands::ai_settings::get_ai_settings,
             commands::ai_settings::save_ai_settings,
+            commands::ai_settings::save_gemini_settings,
             commands::ai_settings::save_ai_api_key_command,
             commands::ai_settings::delete_ai_api_key_command,
             commands::ai_settings::has_ai_api_key,
@@ -384,6 +394,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::context::record_context_usage,
             commands::context::get_builtin_contexts_cmd,
             commands::context::evaluate_auto_include,
+            // AI Data Viewer commands
+            commands::ai_data::get_task_runs_for_viewer,
+            commands::ai_data::get_task_run_for_viewer,
+            commands::ai_data::read_jsonl_logs_for_viewer,
+            commands::ai_data::get_jsonl_logs_summary,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

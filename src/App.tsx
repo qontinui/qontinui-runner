@@ -1,27 +1,28 @@
 /**
- * App.tsx (Refactored - New Tab Structure)
+ * App.tsx (Refactored - Sidebar Navigation Layout)
  *
- * Main application component with reorganized tab structure:
- * - Run: Execute workflows (configuration + execution controls)
+ * Main application component with sidebar navigation:
+ *
+ * RUN group:
+ * - Execute: Configure and start workflows
+ * - Active: Real-time monitoring dashboard (GUI + AI)
+ * - History: View past runs
+ *
+ * OBSERVE group:
  * - Logs: View logs (General, Image Recognition, Actions)
- * - Capture: Screenshot capture operations
- * - Settings: Passive configuration only
+ * - AI Output: Full AI session output view
+ * - Monitor tabs: Summary, Findings, Issues, etc.
+ *
+ * BUILD group:
+ * - Library: Unified asset library
+ * - Workflow/Script builders
+ * - Capture: Screenshot capture
+ *
+ * Other: Configure, Schedule, System
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import * as Tabs from "@radix-ui/react-tabs";
-import {
-  Play,
-  Camera,
-  Settings as SettingsIcon,
-  ScrollText,
-  Package,
-  Sparkles,
-  HelpCircle,
-  Calendar,
-  BookOpen,
-} from "lucide-react";
 
 // Contexts
 import {
@@ -44,44 +45,182 @@ import {
   useLogFilter,
   useProjectSelection,
   useProjectLogs,
-  useRagProcessing,
   useWebSocketAutoConnect,
   useBackgroundActivities,
 } from "./hooks";
 
 // Components
 import StatusIndicator from "./components/StatusIndicator";
-import { ConfigurationPanel } from "./components/ConfigurationPanel";
-import { ExecutionControlPanel } from "./components/ExecutionControlPanel";
+import { ConfigurationPanel as _ConfigurationPanel } from "./components/ConfigurationPanel";
+import { ExecutionControlPanel as _ExecutionControlPanel } from "./components/ExecutionControlPanel";
 import { LogsTab } from "./components/LogsTab";
 import { CaptureTab } from "./components/CaptureTab";
-import { DatasetPackager } from "./components/DatasetPackager";
 import ActionDetailModal from "./components/ActionDetailModal";
 import ImageDetailModal from "./components/ImageDetailModal";
 import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
-import { AiWorkflowsTab } from "./components/AiWorkflowsTab";
+import { AiTab } from "./components/AiTab";
+import { LibraryTab } from "./components/LibraryTab";
 import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
-import { ContextList } from "./components/contexts";
+import { Sidebar } from "./components/navigation";
+import { AiBuilderTab, AiBuilderProvider } from "./components/AiBuilderTab";
+import { ScriptBuilderTab } from "./components/ScriptBuilderTab";
+import { ActiveTab } from "./components/ActiveTab";
+import { HistoryTab } from "./components/HistoryTab";
+import { ExecuteTab } from "./components/ExecuteTab";
+// Monitor/Observe components
+import { ExecutionSummaryTab } from "./components/ai-workflows/ExecutionSummaryTab";
+import { ExecutionReport } from "./components/findings";
+import { IssuesPanel } from "./components/IssuesPanel";
+import { VerificationTab } from "./components/verification";
+import { StatisticsTab } from "./components/statistics";
+import { DiscoverySyncPanel } from "./components/discoveries";
+// Run-specific components
+import { RunSelectionProvider } from "./contexts/RunSelectionContext";
+import { RunDashboard } from "./components/run-dashboard/RunDashboard";
+import { GeneralLogsTab } from "./components/GeneralLogsTab";
+import { RunActionsTab } from "./components/run-logs/RunActionsTab";
+import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitionTab";
+import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
+// Configure components
+import { ExternalLogsTab } from "./components/ExternalLogsTab";
+import { CategoryManager } from "./components/findings/CategoryManager";
 
 // Styles
 import "./index.css";
 
-type MainTab =
+type LogSubTab = "general" | "image" | "actions";
+
+// Valid main tab IDs for the sidebar navigation
+type MainTabId =
   | "run"
+  | "active"
+  | "history"
+  // Observe group - new structure
+  | "general-logs"
+  | "run-dashboard"
+  | "run-actions"
+  | "run-image"
+  | "run-summary"
+  | "run-findings"
+  | "run-issues"
+  | "run-verification"
+  | "run-ai-output"
+  | "run-statistics"
+  | "run-ai-data"
+  | "discoveries"
+  // Legacy tab IDs for migration
+  | "ai"
   | "logs"
+  | "monitor-summary"
+  | "monitor-findings"
+  | "monitor-issues"
+  | "monitor-learnings"
+  | "monitor-verification"
+  | "monitor-statistics"
+  | "monitor-discoveries"
+  | "library"
+  | "workflow-builder"
+  | "script-builder"
   | "capture"
-  | "dataset"
-  | "ai-workflows"
-  | "contexts"
-  | "scheduler"
+  | "config-log-sources"
+  | "config-findings"
+  | "tasks"
   | "settings"
   | "help";
-type LogSubTab = "general" | "image" | "actions" | "rag";
+
+const VALID_TAB_IDS: MainTabId[] = [
+  "run",
+  "active",
+  "history",
+  // New observe tabs
+  "general-logs",
+  "run-dashboard",
+  "run-actions",
+  "run-image",
+  "run-summary",
+  "run-findings",
+  "run-issues",
+  "run-verification",
+  "run-ai-output",
+  "run-statistics",
+  "run-ai-data",
+  "discoveries",
+  // Legacy (for migration)
+  "ai",
+  "logs",
+  "monitor-summary",
+  "monitor-findings",
+  "monitor-issues",
+  "monitor-learnings",
+  "monitor-verification",
+  "monitor-statistics",
+  "monitor-discoveries",
+  "library",
+  "workflow-builder",
+  "script-builder",
+  "capture",
+  "config-log-sources",
+  "config-findings",
+  "tasks",
+  "settings",
+  "help",
+];
 
 const MAIN_TAB_STORAGE_KEY = "qontinui-main-active-tab";
+const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
+
+/**
+ * Maps old tab IDs to new tab IDs for localStorage migration
+ */
+function migrateTabId(stored: string | null): MainTabId {
+  if (!stored) return "run";
+
+  // Map old tab names to new ones
+  const migrations: Record<string, MainTabId> = {
+    "ai-workflows": "run-ai-output",
+    "ai-builder": "workflow-builder",
+    builder: "workflow-builder",
+    prompts: "library",
+    scripts: "script-builder",
+    contexts: "library",
+    scheduler: "tasks",
+    dataset: "capture", // Dataset is now part of capture
+    extract: "capture",
+    // Old observe tab migrations to new structure
+    logs: "general-logs",
+    ai: "run-ai-output",
+    "monitor-summary": "run-summary",
+    "monitor-findings": "run-findings",
+    "monitor-issues": "run-issues",
+    "monitor-learnings": "run-summary", // Learnings removed, map to summary
+    "monitor-verification": "run-verification",
+    "monitor-statistics": "run-statistics",
+    "monitor-discoveries": "discoveries",
+    // Legacy monitor tab migrations
+    monitor: "run-summary",
+    issues: "run-issues",
+    learnings: "run-summary",
+    verification: "run-verification",
+    statistics: "run-statistics",
+    // Configure tab migrations
+    "log-sources": "config-log-sources",
+    "log-locations": "config-log-sources",
+  };
+
+  if (stored in migrations) {
+    return migrations[stored];
+  }
+
+  // Check if it's already a valid new tab ID
+  if (VALID_TAB_IDS.includes(stored as MainTabId)) {
+    return stored as MainTabId;
+  }
+
+  return "run";
+}
 
 /**
  * Main app content (inside providers)
@@ -94,33 +233,46 @@ function AppContent() {
   const execution = useExecution();
 
   // Main tab state
-  const [activeMainTab, setActiveMainTab] = useState<MainTab>(() => {
+  const [activeTab, setActiveTab] = useState<MainTabId>(() => {
     const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
-    // Map old tab names to new ones
-    if (stored === "ai-builder" || stored === "prompts" || stored === "scripts") {
-      return "ai-workflows";
+    return migrateTabId(stored);
+  });
+
+  // Script ID to edit (when navigating from Library to Script Builder)
+  const [editScriptId, setEditScriptId] = useState<string | null>(null);
+
+  // Workflow ID to edit (when navigating from Library to Workflow Builder)
+  const [editWorkflowId, setEditWorkflowId] = useState<string | null>(null);
+
+  // Handle editing a script from Library
+  const handleEditScript = useCallback((scriptId: string) => {
+    setEditScriptId(scriptId);
+    setActiveTab("script-builder");
+  }, []);
+
+  // Handle editing a workflow from Library
+  const handleEditWorkflow = useCallback((workflowId: string) => {
+    setEditWorkflowId(workflowId);
+    setActiveTab("workflow-builder");
+  }, []);
+
+  // Clear script ID when navigating away from script builder
+  useEffect(() => {
+    if (activeTab !== "script-builder") {
+      setEditScriptId(null);
     }
-    if (
-      stored &&
-      [
-        "run",
-        "logs",
-        "capture",
-        "dataset",
-        "ai-workflows",
-        "contexts",
-        "scheduler",
-        "settings",
-        "help",
-      ].includes(stored)
-    ) {
-      return stored as MainTab;
+  }, [activeTab]);
+
+  // Clear workflow ID when navigating away from workflow builder
+  useEffect(() => {
+    if (activeTab !== "workflow-builder") {
+      setEditWorkflowId(null);
     }
-    // Migration: extract tab was removed, redirect to capture
-    if (stored === "extract") {
-      return "capture";
-    }
-    return "run";
+  }, [activeTab]);
+
+  // Sidebar collapsed state
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === "true";
   });
 
   // Log sub-tab state
@@ -128,8 +280,8 @@ function AppContent() {
 
   // Persist main tab
   useEffect(() => {
-    localStorage.setItem(MAIN_TAB_STORAGE_KEY, activeMainTab);
-  }, [activeMainTab]);
+    localStorage.setItem(MAIN_TAB_STORAGE_KEY, activeTab);
+  }, [activeTab]);
 
   // Logs from LogManager
   const {
@@ -172,15 +324,9 @@ function AppContent() {
   // Project logs (external logs from target application)
   const projectLogs = useProjectLogs();
 
-  // RAG processing state
-  const ragProcessing = useRagProcessing();
-
   // Background activities aggregation
   // Note: Extraction tracking handled internally via executor events
   const { activities: backgroundActivities } = useBackgroundActivities({
-    ragStatus: ragProcessing.state.status,
-    ragProgress: ragProcessing.state.percent,
-    ragProjectName: ragProcessing.state.projectName,
     isExtracting: false,
     extractionUrl: undefined,
     extractionProgress: undefined,
@@ -215,46 +361,6 @@ function AppContent() {
     }
   }, [projectSelection.selectedProjectId, projectSelection.selectedProjectName]);
 
-  // Update RAG processing state when config is loaded
-  useEffect(() => {
-    if (execution.config && execution.configLoaded) {
-      const states = execution.config.states || [];
-      // Check if any stateImages have patterns (embeddings can be useful for all)
-      let hasStateImagesWithPatterns = false;
-      for (const state of states) {
-        const stateImages = state.stateImages || [];
-        for (const stateImage of stateImages) {
-          const patterns = stateImage.patterns || [];
-          if (patterns.length > 0) {
-            hasStateImagesWithPatterns = true;
-            break;
-          }
-        }
-        if (hasStateImagesWithPatterns) break;
-      }
-
-      // Use config name as project ID (from filename)
-      const projectId = execution.config.name || "unknown";
-      const projectName = execution.config.name || "Unnamed Project";
-
-      console.log(
-        "[APP] Config loaded, updating RAG state:",
-        projectId,
-        "hasStateImagesWithPatterns:",
-        hasStateImagesWithPatterns,
-      );
-      // Pass the full config so it can be saved to RAG storage if needed
-      ragProcessing.setProject(
-        projectId,
-        projectName,
-        hasStateImagesWithPatterns,
-        execution.config,
-      );
-    } else if (!execution.configLoaded) {
-      ragProcessing.setProject(null, null, false);
-    }
-  }, [execution.config, execution.configLoaded]);
-
   // Setup event handlers on mount (ONCE only)
   useEffect(() => {
     console.log("[APP] Setting up event handlers");
@@ -269,19 +375,19 @@ function AppContent() {
 
   // Refresh action log when switching to Actions sub-tab
   useEffect(() => {
-    if (activeMainTab === "logs" && activeLogSubTab === "actions") {
+    if (activeTab === "logs" && activeLogSubTab === "actions") {
       console.log("[TAB_SWITCH] Switched to Actions tab, refreshing action log");
       refreshActionLog();
     }
-  }, [activeMainTab, activeLogSubTab, refreshActionLog]);
+  }, [activeTab, activeLogSubTab, refreshActionLog]);
 
   // Event handlers
-  const handleWorkflowSelect = (workflowId: string) => {
+  const _handleWorkflowSelect = (workflowId: string) => {
     execution.selectWorkflowWithPersistence(workflowId);
     uiState.setShowWorkflowDropdown(false);
   };
 
-  const handleMonitorSelectionChange = (indices: number[]) => {
+  const _handleMonitorSelectionChange = (indices: number[]) => {
     // Use multi-monitor selection with persistence
     if (indices.length > 0) {
       execution.selectMonitorsWithPersistence(indices);
@@ -300,10 +406,6 @@ function AppContent() {
         break;
       case "actions":
         success = await copyLogs("actions", { actionLogs: actionLogViewData?.actions });
-        break;
-      // RAG tab doesn't have copyable log content
-      case "rag":
-        // No-op for this tab
         break;
     }
 
@@ -360,105 +462,200 @@ function AppContent() {
 
   console.log("[APP] Rendering main app (authenticated)");
 
-  const mainTabs = [
-    { id: "run" as const, label: "Run", icon: Play },
-    { id: "logs" as const, label: "Logs", icon: ScrollText },
-    { id: "capture" as const, label: "Capture", icon: Camera },
-    { id: "dataset" as const, label: "Dataset", icon: Package },
-    { id: "ai-workflows" as const, label: "AI Workflows", icon: Sparkles },
-    { id: "contexts" as const, label: "Contexts", icon: BookOpen },
-    { id: "scheduler" as const, label: "Scheduler", icon: Calendar },
-    { id: "settings" as const, label: "Settings", icon: SettingsIcon },
-    { id: "help" as const, label: "Help", icon: HelpCircle },
-  ];
+  /**
+   * Renders the content for the currently active tab
+   */
+  const renderTabContent = () => {
+    switch (activeTab) {
+      case "run":
+        return <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />;
 
-  return (
-    <div className="h-screen bg-background grid-dots flex flex-col overflow-hidden">
-      {/* Status Bar - Sticky */}
-      <StatusIndicator
-        pythonStatus={execution.pythonStatus}
-        configLoaded={execution.configLoaded}
-        executionActive={execution.executionActive}
-        backgroundActivities={backgroundActivities}
-      />
+      case "active":
+        return (
+          <ActiveTab
+            imageLogs={imageLogs}
+            aiOutputLines={aiOutputLogs}
+            actionLogData={actionLogViewData}
+            onClearAiOutput={clearAiOutputLogs}
+            onActionRowClick={modalState.openActionModal}
+            onImageRowClick={modalState.openImageModal}
+          />
+        );
 
-      {/* Main Content with Tabs */}
-      <Tabs.Root
-        value={activeMainTab}
-        onValueChange={(value) => setActiveMainTab(value as MainTab)}
-        className="flex-1 flex flex-col container mx-auto min-h-0"
-      >
-        {/* Main Tab Navigation - Sticky */}
-        <Tabs.List className="flex border-b border-border bg-card/30 px-4 flex-shrink-0">
-          {mainTabs.map((tab) => {
-            const Icon = tab.icon;
-            return (
-              <Tabs.Trigger
-                key={tab.id}
-                value={tab.id}
-                className={`
-                  flex items-center gap-2 px-6 py-4 text-sm font-medium
-                  border-b-2 transition-colors
-                  data-[state=active]:border-primary data-[state=active]:text-primary
-                  data-[state=inactive]:border-transparent data-[state=inactive]:text-muted-foreground
-                  data-[state=inactive]:hover:text-foreground data-[state=inactive]:hover:bg-muted/30
-                `}
-              >
-                <Icon className="w-4 h-4" />
-                {tab.label}
-              </Tabs.Trigger>
-            );
-          })}
-        </Tabs.List>
+      case "history":
+        return (
+          <HistoryTab
+            onNavigateToRun={() => setActiveTab("run")}
+            onNavigateToAi={() => setActiveTab("ai")}
+          />
+        );
 
-        {/* Tab Content */}
-        <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-          {/* Run Tab */}
-          <Tabs.Content
-            value="run"
-            className="flex-1 outline-none p-6 overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <div className="space-y-6">
-              {/* Control Panels Grid */}
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {/* Configuration Panel */}
-                <ConfigurationPanel
-                  config={execution.config}
-                  onLoadConfiguration={execution.loadConfiguration}
-                  onLoadLastConfiguration={execution.loadLastConfiguration}
-                  onLog={addLog}
-                />
+      // ========== NEW OBSERVE TABS ==========
+      case "general-logs":
+        return (
+          <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
+            <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
+              <GeneralLogsTab
+                logs={logs}
+                filteredLogs={filteredLogs}
+                logLevel={logLevel}
+                onLogLevelChange={setLogLevel}
+                showLogFilter={uiState.showLogFilter}
+                onToggleLogFilter={uiState.setShowLogFilter}
+                logCount={logCount}
+                onClearGeneralLogs={clearGeneralLogs}
+                onCopyLogs={handleCopyLogs}
+                copySuccess={uiState.copySuccess}
+              />
+            </div>
+          </div>
+        );
 
-                {/* Execution Control Panel */}
-                <ExecutionControlPanel
-                  workflows={execution.workflows}
-                  selectedWorkflow={execution.selectedWorkflow}
-                  configLoaded={execution.configLoaded}
-                  showWorkflowDropdown={uiState.showWorkflowDropdown}
-                  onWorkflowDropdownToggle={uiState.setShowWorkflowDropdown}
-                  onWorkflowSelect={handleWorkflowSelect}
-                  selectedMonitors={execution.selectedMonitors}
-                  onMonitorSelectionChange={handleMonitorSelectionChange}
-                  autoMinimize={execution.autoMinimize}
-                  onAutoMinimizeChange={execution.setAutoMinimize}
-                  executionActive={execution.executionActive}
-                  onStartExecution={execution.startExecution}
-                  onStopExecution={execution.stopExecution}
-                  // Initial states management
-                  states={execution.config?.states}
-                  resolvedInitialStates={execution.resolvedInitialStates}
-                  initialStatesOverride={execution.initialStatesOverride}
-                  onInitialStatesOverrideChange={execution.setInitialStatesOverride}
+      case "run-dashboard":
+        return (
+          <RunSelectionProvider>
+            <RunDashboard onNavigate={(tabId) => setActiveTab(tabId as MainTabId)} />
+          </RunSelectionProvider>
+        );
+
+      case "run-actions":
+        return (
+          <RunSelectionProvider>
+            <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
+              <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
+                <RunActionsTab
+                  actionLogData={actionLogViewData}
+                  actionLogLoading={actionLogLoading}
+                  actionLogError={actionLogError}
+                  onActionRowClick={modalState.openActionModal}
+                  actionCount={actionLogViewData?.visible_count || 0}
                 />
               </div>
             </div>
-          </Tabs.Content>
+          </RunSelectionProvider>
+        );
 
-          {/* Logs Tab */}
-          <Tabs.Content
-            value="logs"
-            className="flex-1 flex flex-col outline-none overflow-hidden p-4 data-[state=inactive]:hidden"
-          >
+      case "run-image":
+        return (
+          <RunSelectionProvider>
+            <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
+              <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
+                <RunImageRecognitionTab
+                  imageLogs={imageLogs}
+                  onImageRowClick={modalState.openImageModal}
+                  imageLogCount={imageLogCount}
+                />
+              </div>
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "run-summary":
+        return (
+          <RunSelectionProvider>
+            <div className="h-full overflow-hidden">
+              <ExecutionSummaryTab />
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "run-findings":
+        return (
+          <RunSelectionProvider>
+            <div className="h-full overflow-hidden">
+              <ExecutionReport />
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "run-issues":
+        return (
+          <RunSelectionProvider>
+            <div className="h-full overflow-y-auto p-4">
+              <IssuesPanel />
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "run-verification":
+        return (
+          <RunSelectionProvider>
+            <div className="h-full overflow-hidden">
+              <VerificationTab />
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "run-ai-output":
+        return (
+          <RunSelectionProvider>
+            <AiTab
+              aiOutputLines={aiOutputLogs}
+              onClearAiOutput={clearAiOutputLogs}
+              onAddAiOutputLine={(line) =>
+                addAiOutputLog(
+                  line.line,
+                  line.source,
+                  line.actionId,
+                  line.sessionId,
+                  line.sessionName,
+                )
+              }
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </RunSelectionProvider>
+        );
+
+      case "run-statistics":
+        return (
+          <RunSelectionProvider>
+            <div className="h-full overflow-hidden">
+              <StatisticsTab
+                configId={execution.config?.path ?? null}
+                configName={execution.config?.name}
+              />
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "run-ai-data":
+        return (
+          <RunSelectionProvider>
+            <div className="h-full overflow-hidden">
+              <AiDataViewerTab />
+            </div>
+          </RunSelectionProvider>
+        );
+
+      case "discoveries":
+        return (
+          <div className="h-full overflow-y-auto p-4">
+            <DiscoverySyncPanel />
+          </div>
+        );
+
+      // ========== LEGACY TABS (for backward compatibility) ==========
+      case "ai":
+        return (
+          <AiTab
+            aiOutputLines={aiOutputLogs}
+            onClearAiOutput={clearAiOutputLogs}
+            onAddAiOutputLine={(line) =>
+              addAiOutputLog(
+                line.line,
+                line.source,
+                line.actionId,
+                line.sessionId,
+                line.sessionName,
+              )
+            }
+            onNavigateToLibrary={() => setActiveTab("library")}
+          />
+        );
+
+      case "logs":
+        return (
+          <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
             <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
               <LogsTab
                 logs={logs}
@@ -473,14 +670,9 @@ function AppContent() {
                 actionLogLoading={actionLogLoading}
                 actionLogError={actionLogError}
                 onActionRowClick={modalState.openActionModal}
-                ragState={ragProcessing.state}
-                onStartRagProcessing={ragProcessing.startProcessing}
-                onClearRagLogs={ragProcessing.clearLogs}
-                canStartRagProcessing={ragProcessing.configHasRagImages && execution.configLoaded}
                 logCount={logCount}
                 imageLogCount={imageLogCount}
                 actionCount={actionLogViewData?.visible_count || 0}
-                ragLogCount={ragProcessing.state.logs.length}
                 onClearGeneralLogs={clearGeneralLogs}
                 onClearImageLogs={clearImageLogs}
                 onClearActionLogs={clearActionLogs}
@@ -491,108 +683,196 @@ function AppContent() {
                 onSubTabChange={setActiveLogSubTab}
               />
             </div>
-          </Tabs.Content>
+          </div>
+        );
 
-          {/* Capture Tab */}
-          <Tabs.Content
-            value="capture"
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
+      case "library":
+        return (
+          <LibraryTab
+            onLog={addLog}
+            onNavigateToActive={() => setActiveTab("active")}
+            onNavigateToBuilder={() => setActiveTab("workflow-builder")}
+            onNavigateToScriptBuilder={() => setActiveTab("script-builder")}
+            onEditScript={handleEditScript}
+            onEditWorkflow={handleEditWorkflow}
+            aiOutputLines={aiOutputLogs}
+          />
+        );
+
+      case "workflow-builder":
+        return (
+          <div className="h-full overflow-y-auto">
+            <AiBuilderProvider
+              projectLogs={projectLogs}
+              onNavigateToLogLocations={() => setActiveTab("logs")}
+              onNavigateToAiOutput={() => setActiveTab("ai")}
+              editWorkflowId={editWorkflowId}
+            >
+              <AiBuilderTab
+                projectLogs={projectLogs}
+                onNavigateToLogLocations={() => setActiveTab("logs")}
+                onNavigateToAiOutput={() => setActiveTab("ai")}
+                editWorkflowId={editWorkflowId}
+              />
+            </AiBuilderProvider>
+          </div>
+        );
+
+      case "script-builder":
+        return (
+          <div className="h-full overflow-y-auto">
+            <ScriptBuilderTab
+              onLog={addLog}
+              editScriptId={editScriptId}
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </div>
+        );
+
+      // ========== MONITOR TABS ==========
+      case "monitor-summary":
+        return (
+          <div className="h-full overflow-hidden">
+            <ExecutionSummaryTab />
+          </div>
+        );
+
+      case "monitor-findings":
+        return (
+          <div className="h-full overflow-hidden">
+            <ExecutionReport />
+          </div>
+        );
+
+      case "monitor-issues":
+        return (
+          <div className="h-full overflow-y-auto p-4">
+            <IssuesPanel />
+          </div>
+        );
+
+      // monitor-learnings removed - functionality moved to Summary/Findings/Issues
+
+      case "monitor-verification":
+        return (
+          <div className="h-full overflow-hidden">
+            <VerificationTab />
+          </div>
+        );
+
+      case "monitor-statistics":
+        return (
+          <div className="h-full overflow-hidden">
+            <StatisticsTab
+              configId={execution.config?.path ?? null}
+              configName={execution.config?.name}
+            />
+          </div>
+        );
+
+      case "monitor-discoveries":
+        return (
+          <div className="h-full overflow-y-auto p-4">
+            <DiscoverySyncPanel />
+          </div>
+        );
+
+      // ========== CONFIGURE TABS ==========
+      case "config-log-sources":
+        return (
+          <div className="h-full overflow-y-auto p-4">
+            <ExternalLogsTab
+              config={projectLogs.config}
+              sources={projectLogs.logsState.sources}
+              loading={projectLogs.logsState.loading}
+              error={projectLogs.logsState.error}
+              lastRefresh={projectLogs.logsState.lastRefresh}
+              onRefresh={projectLogs.refreshLogs}
+              onConfigureSources={() => setShowLogSourceManager(true)}
+            />
+          </div>
+        );
+
+      case "config-findings":
+        return (
+          <div className="h-full overflow-y-auto">
+            <CategoryManager onLog={addLog} />
+          </div>
+        );
+
+      case "capture":
+        return (
+          <div className="h-full overflow-y-auto">
             <CaptureTab
               onLog={addLog}
               projects={projectSelection.projects}
               selectedProjectId={projectSelection.selectedProjectId}
               selectedProjectName={projectSelection.selectedProjectName}
             />
-          </Tabs.Content>
+          </div>
+        );
 
-          {/* Dataset Tab */}
-          <Tabs.Content
-            value="dataset"
-            className="flex-1 outline-none overflow-y-auto data-[state=inactive]:hidden"
-          >
-            <DatasetPackager />
-          </Tabs.Content>
+      case "tasks":
+        return <SchedulerTab />;
 
-          {/* AI Workflows Tab */}
-          <Tabs.Content
-            value="ai-workflows"
-            forceMount
-            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <AiWorkflowsTab
-              projectLogs={projectLogs}
-              aiOutputLines={aiOutputLogs}
-              onClearAiOutput={clearAiOutputLogs}
-              onAddAiOutputLine={(line) =>
-                addAiOutputLog(
-                  line.line,
-                  line.source,
-                  line.actionId,
-                  line.sessionId,
-                  line.sessionName,
-                )
-              }
+      case "settings":
+        return (
+          <div className="h-full overflow-hidden">
+            <Settings
               onLog={addLog}
-              onConfigureLogLocations={() => setShowLogSourceManager(true)}
+              onDebugModeChange={async (enabled) => {
+                try {
+                  await invoke("set_debug_settings", {
+                    settings: {
+                      enable_image_debug: enabled,
+                      top_matches_count: 5,
+                    },
+                  });
+                  addLog("info", `Image debug mode ${enabled ? "enabled" : "disabled"}`);
+                } catch (error) {
+                  addLog("error", `Failed to set debug mode: ${error}`);
+                }
+              }}
+              projects={projectSelection.projects}
+              selectedProjectId={projectSelection.selectedProjectId}
+              onProjectSelect={projectSelection.setSelectedProject}
+              onLoadProjects={projectSelection.loadProjects}
+              webSocketState={webSocket}
             />
-          </Tabs.Content>
+          </div>
+        );
 
-          {/* Contexts Tab */}
-          <Tabs.Content
-            value="contexts"
-            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <ContextList onLog={addLog} />
-          </Tabs.Content>
+      case "help":
+        return <HelpTab />;
 
-          {/* Scheduler Tab */}
-          <Tabs.Content
-            value="scheduler"
-            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <SchedulerTab />
-          </Tabs.Content>
+      default:
+        return null;
+    }
+  };
 
-          {/* Settings Tab */}
-          <Tabs.Content
-            value="settings"
-            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <div className="h-full">
-              <Settings
-                onLog={addLog}
-                onDebugModeChange={async (enabled) => {
-                  try {
-                    await invoke("set_debug_settings", {
-                      settings: {
-                        enable_image_debug: enabled,
-                        top_matches_count: 5,
-                      },
-                    });
-                    addLog("info", `Image debug mode ${enabled ? "enabled" : "disabled"}`);
-                  } catch (error) {
-                    addLog("error", `Failed to set debug mode: ${error}`);
-                  }
-                }}
-                projects={projectSelection.projects}
-                selectedProjectId={projectSelection.selectedProjectId}
-                onProjectSelect={projectSelection.setSelectedProject}
-                onLoadProjects={projectSelection.loadProjects}
-                webSocketState={webSocket}
-              />
-            </div>
-          </Tabs.Content>
+  return (
+    <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
+      {/* Status Bar - Sticky Top */}
+      <StatusIndicator
+        pythonStatus={execution.pythonStatus}
+        configLoaded={execution.configLoaded}
+        executionActive={execution.executionActive}
+        backgroundActivities={backgroundActivities}
+      />
 
-          {/* Help Tab */}
-          <Tabs.Content
-            value="help"
-            className="flex-1 outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <HelpTab />
-          </Tabs.Content>
-        </div>
-      </Tabs.Root>
+      {/* Main Content: Sidebar + Content Area */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Sidebar Navigation */}
+        <Sidebar
+          activeTab={activeTab}
+          onTabChange={(tab) => setActiveTab(tab as MainTabId)}
+          collapsed={sidebarCollapsed}
+          onCollapsedChange={setSidebarCollapsed}
+        />
+
+        {/* Content Area */}
+        <main className="flex-1 overflow-hidden">{renderTabContent()}</main>
+      </div>
 
       {/* Action Detail Modal */}
       <ActionDetailModal

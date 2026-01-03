@@ -73,6 +73,7 @@ use tracing::{debug, error, info, warn};
 use regex::Regex;
 
 use crate::action_service::UnifiedActionService;
+use crate::commands::project_logs;
 use crate::commands::rag::{send_embeddings_to_web, RAGState};
 use crate::commands::AppState;
 use crate::config::ConfigLoader;
@@ -80,11 +81,13 @@ use crate::config_storage::{ConfigMetadata, ConfigStorage, StoredConfig};
 use crate::context;
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
+use crate::mcp::types::{GoToStateRequest, GoToStateResult};
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
 use crate::session::SessionManager;
 use crate::settings;
 use crate::task_monitor::TaskMonitor;
+use crate::tiered_info::{self, RunDetails};
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
 use tauri::{Emitter, Manager};
@@ -189,6 +192,107 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
     }
 }
 
+/// Structured finding output instructions with few-shot examples.
+/// This is injected into prompts so the AI outputs findings in a parseable format.
+const FINDING_INSTRUCTIONS: &str = r#"
+---
+
+## MANDATORY: Structured Finding Output Format
+
+**YOU MUST USE THIS FORMAT for ALL issues, bugs, fixes, and observations you discover.**
+
+The qontinui-runner parses these markers to display findings in the Monitor tab. If you don't use this format, your findings will NOT be tracked.
+
+### Format
+
+```
+[FINDING:category:severity]
+Title: Brief descriptive title
+Description: What was found and why it matters
+File: path/to/file.ext (if applicable)
+Line: 42 (if applicable)
+Resolution: What you did to fix it (if fixed)
+[/FINDING]
+```
+
+### Categories
+- `code_bug` - Code bugs (auto-fixable)
+- `security` - Security vulnerabilities (auto-fixable)
+- `test_issue` - Test problems (auto-fixable)
+- `documentation` - Doc issues (auto-fixable)
+- `todo` - TODOs needing user input
+- `enhancement` - Improvements needing user input
+- `performance` - Performance issues needing user input
+- `config_issue` - Config problems (manual fix)
+- `already_fixed` - Fixed in this/previous session
+- `warning` - Things to be aware of
+
+### Severity Levels
+- `critical` - System-breaking, security vulnerabilities, data loss
+- `high` - Major functionality broken
+- `medium` - Should address soon
+- `low` - Minor issues
+- `info` - Informational
+
+### Few-Shot Examples
+
+**Example 1: Bug you fixed**
+```
+[FINDING:code_bug:high]
+Title: Null pointer exception in user authentication
+Description: The login handler didn't check if user was null before accessing properties, causing crashes for deleted users.
+File: src/auth/login.ts
+Line: 45
+Resolution: Added null check before accessing user.email property
+[/FINDING]
+```
+
+**Example 2: Security issue you fixed**
+```
+[FINDING:security:critical]
+Title: SQL injection vulnerability in search endpoint
+Description: User input was directly interpolated into SQL query without sanitization.
+File: src/api/search.py
+Line: 89
+Resolution: Replaced string interpolation with parameterized query
+[/FINDING]
+```
+
+**Example 3: Type error you fixed**
+```
+[FINDING:code_bug:medium]
+Title: Type mismatch in API response handler
+Description: Function expected string but received number from JSON parse.
+File: src/handlers/response.ts
+Line: 23
+Resolution: Added type coercion and validation
+[/FINDING]
+```
+
+**Example 4: Issue needing user input**
+```
+[FINDING:enhancement:medium:needs_input]
+Title: Caching strategy decision needed
+Description: Multiple valid caching approaches are possible for this endpoint.
+Question: Which caching strategy should we use?
+Options: Redis (distributed) | In-memory (simple) | Hybrid
+File: src/api/cache.ts
+[/FINDING]
+```
+
+**Example 5: Warning (informational)**
+```
+[FINDING:warning:info]
+Title: Deprecated API usage detected
+Description: Using deprecated fetch API that will be removed in v3.0
+File: src/utils/http.ts
+Line: 12
+[/FINDING]
+```
+
+**OUTPUT FINDINGS AS YOU WORK.** Don't save them all for the end. Each time you find or fix something, output a [FINDING:...] block immediately.
+"#;
+
 /// Run a Claude CLI session inline (as a child process) and wait for completion.
 /// Returns the session output when complete.
 ///
@@ -197,6 +301,9 @@ fn extract_text_from_stream_json(json_line: &str) -> Option<String> {
 ///
 /// If `finding_ctx` is provided, the function will parse AI output for [FINDING:...] markers
 /// and store detected findings in the database, emitting events for each finding.
+///
+/// If `pid_tracker` is provided, the child process PID will be stored there so it can be
+/// killed by the stop_ai_analysis endpoint.
 fn run_claude_session_inline(
     working_dir: &str,
     prompt: &str,
@@ -205,6 +312,7 @@ fn run_claude_session_inline(
     timeout_seconds: u64,
     session_ctx: Option<AiOutputSessionContext>,
     finding_ctx: Option<FindingContext>,
+    pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
 ) -> Result<(bool, String), String> {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -259,6 +367,28 @@ fn run_claude_session_inline(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn Claude CLI: {}", e))?;
+
+    // Store child PID for stop functionality
+    let child_pid = child.id();
+    if let Some(ref tracker) = pid_tracker {
+        if let Ok(mut pids) = tracker.lock() {
+            pids.push(child_pid);
+            info!(
+                "Registered AI process PID {} for session {}",
+                child_pid, session_id
+            );
+        }
+    }
+
+    // Helper to remove PID from tracker when we're done
+    let remove_pid = |tracker: &Option<Arc<std::sync::Mutex<Vec<u32>>>>| {
+        if let Some(ref t) = tracker {
+            if let Ok(mut pids) = t.lock() {
+                pids.retain(|&p| p != child_pid);
+                info!("Unregistered AI process PID {}", child_pid);
+            }
+        }
+    };
 
     // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
@@ -607,6 +737,9 @@ fn run_claude_session_inline(
         detected_findings.len()
     );
 
+    // Remove PID from tracker now that session is complete
+    remove_pid(&pid_tracker);
+
     Ok((success, all_output))
 }
 
@@ -628,6 +761,8 @@ pub struct ApiState {
     pub config_storage: Arc<tokio::sync::Mutex<ConfigStorage>>,
     /// Unified action service for deterministic execution
     pub action_service: Arc<UnifiedActionService>,
+    /// Currently running AI process PIDs (for stopping)
+    pub current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>,
 }
 
 /// Response for API endpoints
@@ -657,6 +792,34 @@ fn api_error(message: impl Into<String>) -> ApiResponse<()> {
         data: None,
         error: Some(message.into()),
     }
+}
+
+/// Save the current config back to the original file
+/// This is used when project contexts are modified
+fn save_current_config_to_file(app_state: &Arc<crate::AppState>) -> Result<(), String> {
+    // Get the path to the current config file
+    let config_path = settings::get_last_config_path()
+        .ok_or_else(|| "No config file path available. Load a configuration first.".to_string())?;
+
+    // Get the current config
+    let config_lock = app_state
+        .current_config
+        .lock()
+        .map_err(|e| format!("Failed to lock config: {}", e))?;
+
+    let config = config_lock
+        .as_ref()
+        .ok_or_else(|| "No configuration loaded".to_string())?;
+
+    // Serialize and save
+    let json = serde_json::to_string_pretty(config)
+        .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+    std::fs::write(&config_path, json)
+        .map_err(|e| format!("Failed to write config file: {}", e))?;
+
+    info!("Saved config with contexts to: {}", config_path);
+    Ok(())
 }
 
 /// Status response
@@ -719,9 +882,9 @@ pub struct ExecuteActionResult {
     pub error: Option<String>,
 }
 
-/// Execution result
+/// Workflow execution result (for /workflow/run endpoint)
 #[derive(Debug, Serialize)]
-pub struct ExecutionResult {
+pub struct WorkflowExecutionResult {
     pub success: bool,
     pub workflow_name: String,
     pub error: Option<String>,
@@ -882,6 +1045,300 @@ async fn handle_ws_events(socket: WebSocket, state: Arc<ApiState>) {
 /// Health check endpoint
 async fn health() -> Json<ApiResponse<String>> {
     Json(ApiResponse::success("ok".to_string()))
+}
+
+// ============================================================================
+// Debug Endpoints
+// ============================================================================
+
+/// A parsed error entry from log files
+#[derive(Debug, Clone, Serialize)]
+struct DebugError {
+    /// Timestamp of the error
+    timestamp: String,
+    /// Service that generated the error (backend, frontend, api, runner)
+    service: String,
+    /// Log level (error, warning)
+    level: String,
+    /// Error message
+    message: String,
+    /// Optional stack trace or additional context
+    context: Option<String>,
+}
+
+/// Summary of errors by category
+#[derive(Debug, Clone, Serialize)]
+struct DebugErrorSummary {
+    /// Total errors found
+    total: usize,
+    /// Errors by service
+    by_service: std::collections::HashMap<String, usize>,
+    /// Errors by level
+    by_level: std::collections::HashMap<String, usize>,
+}
+
+/// Response from /debug/app/errors endpoint
+#[derive(Debug, Clone, Serialize)]
+struct DebugErrorsResponse {
+    /// Summary statistics
+    summary: DebugErrorSummary,
+    /// Individual errors (most recent first)
+    errors: Vec<DebugError>,
+}
+
+/// Query parameters for /debug/app/errors
+#[derive(Debug, Deserialize)]
+struct DebugErrorsQuery {
+    /// Maximum number of errors to return (default: 50)
+    limit: Option<usize>,
+    /// Filter by service (backend, frontend, api, runner)
+    service: Option<String>,
+    /// Filter by level (error, warning)
+    level: Option<String>,
+}
+
+/// Get application errors from dev-logs
+///
+/// Parses log files from .dev-logs/ and returns structured error information.
+async fn get_debug_errors(
+    axum::extract::Query(query): axum::extract::Query<DebugErrorsQuery>,
+) -> Json<ApiResponse<DebugErrorsResponse>> {
+    use std::io::{BufRead, BufReader};
+
+    let dev_logs_path =
+        std::path::PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
+
+    if !dev_logs_path.exists() {
+        return Json(ApiResponse::success(DebugErrorsResponse {
+            summary: DebugErrorSummary {
+                total: 0,
+                by_service: std::collections::HashMap::new(),
+                by_level: std::collections::HashMap::new(),
+            },
+            errors: vec![],
+        }));
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    let mut all_errors: Vec<DebugError> = Vec::new();
+
+    // Log files to scan with their service names
+    let log_files = [
+        ("backend.log", "backend"),
+        ("frontend.log", "frontend"),
+        ("qontinui-api.log", "api"),
+        ("runner-tauri.log", "runner"),
+        ("runner-actions.jsonl", "runner-actions"),
+    ];
+
+    // Regex patterns for error detection
+    let error_patterns = [
+        // Python/FastAPI errors
+        (r"(?i)(error|exception|traceback|failed)", "error"),
+        // TypeScript/Next.js errors
+        (r"(?i)(ERROR|error:|\[error\])", "error"),
+        // Warnings
+        (r"(?i)(warning|warn|\[warn\])", "warning"),
+    ];
+
+    for (filename, service) in &log_files {
+        // Apply service filter if specified
+        if let Some(ref svc_filter) = query.service {
+            if !service.eq_ignore_ascii_case(svc_filter) {
+                continue;
+            }
+        }
+
+        let file_path = dev_logs_path.join(filename);
+        if !file_path.exists() {
+            continue;
+        }
+
+        if let Ok(file) = std::fs::File::open(&file_path) {
+            let reader = BufReader::new(file);
+            let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+
+            // Process from end (most recent) to beginning
+            let mut i = lines.len();
+            while i > 0 {
+                i -= 1;
+                let line = &lines[i];
+
+                // Determine log level
+                let mut level = None;
+                for (pattern, lvl) in &error_patterns {
+                    if let Ok(re) = Regex::new(pattern) {
+                        if re.is_match(line) {
+                            level = Some(*lvl);
+                            break;
+                        }
+                    }
+                }
+
+                if let Some(lvl) = level {
+                    // Apply level filter if specified
+                    if let Some(ref lvl_filter) = query.level {
+                        if !lvl.eq_ignore_ascii_case(lvl_filter) {
+                            continue;
+                        }
+                    }
+
+                    // Extract timestamp if present (various formats)
+                    let timestamp = if let Ok(ts_re) =
+                        Regex::new(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})")
+                    {
+                        ts_re
+                            .captures(line)
+                            .and_then(|c| c.get(1))
+                            .map(|m| m.as_str().to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    // Collect context (surrounding lines for stack traces)
+                    let mut context_lines = Vec::new();
+                    let mut j = i + 1;
+                    while j < lines.len() && j < i + 10 {
+                        let ctx_line = &lines[j];
+                        // Stop at next log entry (has timestamp or is empty)
+                        if ctx_line.is_empty()
+                            || Regex::new(r"^\d{4}-\d{2}-\d{2}")
+                                .map(|re| re.is_match(ctx_line))
+                                .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        context_lines.push(ctx_line.clone());
+                        j += 1;
+                    }
+
+                    let context = if context_lines.is_empty() {
+                        None
+                    } else {
+                        Some(context_lines.join("\n"))
+                    };
+
+                    all_errors.push(DebugError {
+                        timestamp,
+                        service: service.to_string(),
+                        level: lvl.to_string(),
+                        message: line.clone(),
+                        context,
+                    });
+                }
+            }
+        }
+    }
+
+    // Sort by timestamp (most recent first)
+    all_errors.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // Build summary before truncating
+    let mut by_service: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut by_level: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for err in &all_errors {
+        *by_service.entry(err.service.clone()).or_insert(0) += 1;
+        *by_level.entry(err.level.clone()).or_insert(0) += 1;
+    }
+
+    let total = all_errors.len();
+
+    // Truncate to limit
+    all_errors.truncate(limit);
+
+    Json(ApiResponse::success(DebugErrorsResponse {
+        summary: DebugErrorSummary {
+            total,
+            by_service,
+            by_level,
+        },
+        errors: all_errors,
+    }))
+}
+
+/// Get findings summary from database
+///
+/// Returns a summary of issues detected in previous sessions.
+/// Note: Findings are stored per-task-run. This endpoint returns findings
+/// from the most recent task runs.
+async fn get_findings_summary() -> Json<ApiResponse<serde_json::Value>> {
+    // Get the database path using the same pattern as context.rs
+    let app_data_dir = match dirs::config_dir() {
+        Some(config_dir) => config_dir.join("com.qontinui.runner"),
+        None => {
+            return Json(ApiResponse::success(serde_json::json!({
+                "total_findings": 0,
+                "code_related_findings": 0,
+                "by_severity": {},
+                "findings": [],
+                "error": "Could not find config directory"
+            })));
+        }
+    };
+    let db_path = app_data_dir.join("qontinui-runner.db");
+
+    let db = match rusqlite::Connection::open(&db_path) {
+        Ok(conn) => conn,
+        Err(e) => {
+            return Json(ApiResponse::success(serde_json::json!({
+                "total_findings": 0,
+                "code_related_findings": 0,
+                "by_severity": {},
+                "findings": [],
+                "error": format!("Failed to open database: {}", e)
+            })));
+        }
+    };
+
+    // Get recent task run IDs
+    let task_run_ids: Vec<String> =
+        match db.prepare("SELECT id FROM task_runs ORDER BY created_at DESC LIMIT 5") {
+            Ok(mut stmt) => stmt
+                .query_map([], |row| row.get(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
+
+    let mut all_findings = Vec::new();
+    for task_run_id in &task_run_ids {
+        if let Ok(findings) = finding_storage::get_findings_for_task(&db, task_run_id) {
+            all_findings.extend(findings);
+        }
+    }
+
+    let total = all_findings.len();
+
+    // Count by severity
+    let mut by_severity: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut code_related = 0;
+
+    for finding in &all_findings {
+        *by_severity
+            .entry(finding.severity.as_str().to_string())
+            .or_insert(0) += 1;
+        if finding
+            .code_context
+            .as_ref()
+            .and_then(|c| c.file.as_ref())
+            .is_some()
+        {
+            code_related += 1;
+        }
+    }
+
+    let response = serde_json::json!({
+        "total_findings": total,
+        "code_related_findings": code_related,
+        "by_severity": by_severity,
+        "findings": all_findings.iter().take(20).collect::<Vec<_>>()
+    });
+
+    Json(ApiResponse::success(response))
 }
 
 /// Launch Chrome with remote debugging enabled
@@ -1362,7 +1819,7 @@ async fn load_config(
 async fn run_workflow(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunWorkflowRequest>,
-) -> Result<Json<ApiResponse<ExecutionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<WorkflowExecutionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
         "MCP API: Running workflow: {} (timeout: {}s)",
         request.workflow_name, request.timeout_seconds
@@ -1382,6 +1839,7 @@ async fn run_workflow(
             None, // No additional config
             request.monitor_index,
             request.timeout_seconds,
+            None, // No initial state override from MCP API
         )
         .await
     {
@@ -1390,7 +1848,7 @@ async fn run_workflow(
                 "MCP API: Workflow completed via UnifiedActionService: success={}, error={:?}",
                 result.success, result.error
             );
-            Ok(Json(ApiResponse::success(ExecutionResult {
+            Ok(Json(ApiResponse::success(WorkflowExecutionResult {
                 success: result.success,
                 workflow_name: result.workflow_name,
                 error: result.error,
@@ -1421,6 +1879,76 @@ async fn run_workflow(
             }
         }
     }
+}
+
+// ============================================================================
+// Execute Steps Endpoint - Unified Step Execution
+// ============================================================================
+
+/// Request to execute a list of steps
+#[derive(Debug, Deserialize)]
+struct ExecuteStepsRequest {
+    /// Steps to execute
+    steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    /// Optional execution ID (generated if not provided)
+    #[serde(default)]
+    execution_id: Option<String>,
+    /// Log sources to capture during execution
+    #[serde(default)]
+    log_sources: Vec<crate::step_executor::LogSourceConfig>,
+}
+
+/// Execute a list of steps and return results
+///
+/// This is the unified execution endpoint used by:
+/// - Run page (single workflow step)
+/// - AI Builder (multi-step before AI session)
+/// - MCP API (direct step execution)
+///
+/// Running a single workflow from the Run page is just:
+/// `{ "steps": [{ "type": "workflow", "name": "MyWorkflow" }] }`
+async fn execute_steps(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ExecuteStepsRequest>,
+) -> Result<
+    Json<ApiResponse<crate::step_executor::ExecutionResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    let execution_id = request.execution_id.unwrap_or_else(|| {
+        format!(
+            "exec-{}-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S"),
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("0000")
+        )
+    });
+
+    info!(
+        "MCP API: Executing {} steps (execution_id: {})",
+        request.steps.len(),
+        execution_id
+    );
+
+    // Create step executor
+    let executor = crate::step_executor::StepExecutor::new(
+        state.app_state.clone(),
+        state.config_storage.clone(),
+    );
+
+    // Execute all steps with log source capture
+    let result = executor
+        .execute_steps_with_log_sources(&request.steps, &execution_id, &request.log_sources)
+        .await;
+
+    info!(
+        "MCP API: Execution complete - {} of {} steps succeeded",
+        result.successful_steps, result.total_steps
+    );
+
+    Ok(Json(ApiResponse::success(result)))
 }
 
 /// Response for load-last-config endpoint
@@ -1675,6 +2203,76 @@ async fn execute_action(
         }
         Err(e) => {
             error!("MCP API: Failed to execute action: {}", e);
+            match e {
+                crate::action_service::ActionError::ExecutorNotRunning => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("Python executor not running")),
+                )),
+                crate::action_service::ActionError::ExecutorNotInitialized => Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error("Python executor not initialized")),
+                )),
+                _ => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(e.to_string())),
+                )),
+            }
+        }
+    }
+}
+
+// ============================================================================
+// State Navigation API Endpoint
+// ============================================================================
+
+/// Navigate to a target state using pathfinding
+///
+/// This endpoint uses the state machine to find and execute the path
+/// from the current state to the target state.
+async fn go_to_state(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<GoToStateRequest>,
+) -> Result<Json<ApiResponse<GoToStateResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Navigating to state: {} (timeout: {}s)",
+        request.state_id, request.timeout_seconds
+    );
+
+    // Use UnifiedActionService for deterministic execution
+    let action_service = state.action_service.clone();
+    let state_id = request.state_id.clone();
+
+    match action_service
+        .go_to_state(
+            &request.state_id,
+            None, // No additional config
+            request.monitor_index,
+            request.timeout_seconds,
+        )
+        .await
+    {
+        Ok(result) => {
+            let nav_result = GoToStateResult {
+                success: result.success,
+                state_id: state_id.clone(),
+                error: result.error,
+            };
+
+            if nav_result.success {
+                info!(
+                    "MCP API: Successfully navigated to state {} via UnifiedActionService",
+                    nav_result.state_id
+                );
+            } else {
+                warn!(
+                    "MCP API: Failed to navigate to state {}: {:?}",
+                    nav_result.state_id, nav_result.error
+                );
+            }
+            Ok(Json(ApiResponse::success(nav_result)))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to navigate to state: {}", e);
             match e {
                 crate::action_service::ActionError::ExecutorNotRunning => Err((
                     StatusCode::BAD_REQUEST,
@@ -2763,6 +3361,12 @@ pub struct CreatePromptRequest {
     /// Maximum number of sessions (null = unlimited)
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    /// AI provider (e.g., "anthropic", "openai")
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// AI model to use
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Request to update an existing prompt
@@ -2781,6 +3385,12 @@ pub struct UpdatePromptRequest {
     /// Maximum number of sessions (null = unlimited)
     #[serde(default)]
     pub max_sessions: Option<Option<u32>>,
+    /// AI provider (e.g., "anthropic", "openai")
+    #[serde(default)]
+    pub provider: Option<Option<String>>,
+    /// AI model to use
+    #[serde(default)]
+    pub model: Option<Option<String>>,
 }
 
 /// Request to run a prompt
@@ -2884,6 +3494,16 @@ pub struct CreateAiWorkflowRequest {
     pub category: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub context_ids: Vec<String>,
+    #[serde(default)]
+    pub disabled_context_ids: Vec<String>,
+    #[serde(default = "default_auto_include_contexts")]
+    pub auto_include_contexts: bool,
+}
+
+fn default_auto_include_contexts() -> bool {
+    true
 }
 
 fn default_ai_workflow_max_iterations() -> u32 {
@@ -2909,6 +3529,12 @@ pub struct UpdateAiWorkflowRequest {
     pub category: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub context_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub disabled_context_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub auto_include_contexts: Option<bool>,
 }
 
 // ============================================================================
@@ -3122,13 +3748,63 @@ fn write_ai_debug_log(message: &str) {
 /// Stop the currently running AI analysis
 ///
 /// This endpoint stops all running tasks by:
-/// 1. Getting running task runs from the database
-/// 2. Stopping monitoring for each task
-/// 3. Marking tasks as stopped in the database
+/// 1. Killing all tracked AI process PIDs (the actual Claude CLI processes)
+/// 2. Getting running task runs from the database
+/// 3. Stopping monitoring for each task
+/// 4. Marking tasks as stopped in the database
 async fn stop_ai_analysis(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("MCP API: Stop AI analysis requested");
+
+    // First, kill all tracked AI processes immediately
+    // This is the key fix - previously we only stopped monitoring, not the actual processes
+    let pids_to_kill: Vec<u32> = {
+        let mut pids = state.current_ai_pids.lock().unwrap();
+        let pids_copy = pids.clone();
+        pids.clear(); // Clear the tracker
+        pids_copy
+    };
+
+    let mut killed_count = 0;
+    for pid in &pids_to_kill {
+        info!("MCP API: Killing AI process PID {}", pid);
+        // Use taskkill with /T to kill the entire process tree (cmd.exe spawns node.exe for claude)
+        // /F forces termination, /T terminates child processes
+        let result = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("MCP API: Successfully killed process tree for PID {}", pid);
+                    killed_count += 1;
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!(
+                        "MCP API: taskkill for PID {} returned error: {}",
+                        pid, stderr
+                    );
+                    // Process may have already exited, which is fine
+                    killed_count += 1;
+                }
+            }
+            Err(e) => {
+                error!("MCP API: Failed to execute taskkill for PID {}: {}", pid, e);
+            }
+        }
+    }
+
+    if !pids_to_kill.is_empty() {
+        emit_ai_output(
+            &state.app_handle,
+            &format!("⛔ Killed {} AI process(es)", killed_count),
+            "status",
+            None,
+            None,
+        );
+    }
 
     // Get running tasks from the database
     let db = match CheckpointDb::new() {
@@ -3153,7 +3829,7 @@ async fn stop_ai_analysis(
         }
     };
 
-    if running_tasks.is_empty() {
+    if running_tasks.is_empty() && pids_to_kill.is_empty() {
         info!("MCP API: No running tasks to stop");
         return Ok(Json(ApiResponse::success(())));
     }
@@ -3177,7 +3853,11 @@ async fn stop_ai_analysis(
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
-        &format!("Stopped {} running task(s)", running_tasks.len()),
+        &format!(
+            "Stopped {} running task(s), killed {} process(es)",
+            running_tasks.len(),
+            killed_count
+        ),
         "status",
         None,
         None,
@@ -3513,6 +4193,8 @@ async fn create_prompt(
         request.category,
         request.tags,
         request.max_sessions,
+        request.provider,
+        request.model,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -3533,6 +4215,8 @@ async fn update_prompt(
         request.category,
         request.tags,
         request.max_sessions,
+        request.provider,
+        request.model,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
@@ -3781,6 +4465,50 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
 
     enhanced_prompt = format!("{}{}", runner_context, enhanced_prompt);
 
+    // Inject Multi-Step Task Guide context (user override takes precedence)
+    let multi_step_guide = context::get_multi_step_guide();
+    let multi_step_section = format!(
+        "## Multi-Session Task Context\n\n{}\n\n---\n\n",
+        context::format_single_context(&multi_step_guide)
+    );
+    enhanced_prompt = format!("{}{}", multi_step_section, enhanced_prompt);
+
+    // Inject configured log sources from active profile if available
+    // This tells the AI where to find logs for debugging
+    if let Ok(configs) = project_logs::list_project_configs_internal() {
+        let all_sources: Vec<_> = configs
+            .iter()
+            .flat_map(|c| {
+                // Get sources from active profile (or legacy fallback)
+                let profile_name = c
+                    .get_active_profile()
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("Default");
+                c.get_active_log_sources()
+                    .iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| format!("- **{}** ({}): `{}`", s.name, profile_name, s.path))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        if !all_sources.is_empty() {
+            let log_sources_section = format!(
+                r#"## Configured Log Sources
+
+The following log files have been configured for monitoring. Use these paths to check for errors:
+
+{}
+
+---
+
+"#,
+                all_sources.join("\n")
+            );
+            enhanced_prompt = format!("{}{}", log_sources_section, enhanced_prompt);
+        }
+    }
+
     // Add GUI automation context if config was auto-loaded
     if let Some((config_path, workflow_id, monitor_index)) = &config_info {
         let workflow_info = workflow_id
@@ -3840,64 +4568,7 @@ If your task requires running visual automation, use the Runner API to execute w
     }
 
     // Add structured finding output instructions
-    // This enables the Monitor tab to parse and display findings categorized by type
-    enhanced_prompt = format!(
-        r#"{}
-
----
-
-## Structured Finding Output Format
-
-When you identify issues, bugs, or items requiring attention, report them using this format so they can be tracked in the Monitor tab:
-
-### Basic Finding (for issues you can auto-fix)
-```
-[FINDING:category_id:severity]
-Title: Brief title describing the issue
-Description: Detailed description of what's wrong and why
-File: path/to/file.ts (if applicable)
-Line: 42 (if applicable)
-Resolution: What was done to fix it (if already fixed)
-[/FINDING]
-```
-
-### Finding Requiring User Input
-```
-[FINDING:category_id:severity:needs_input]
-Title: Brief title describing the issue
-Description: Detailed description of the situation
-Question: Specific question for the user
-Options: Option A | Option B | Option C
-File: path/to/file.ts (if applicable)
-[/FINDING]
-```
-
-### Available Categories
-- `code_bug`: Code bugs that can be auto-fixed
-- `security`: Security vulnerabilities (auto-fix)
-- `test_issue`: Test code problems (auto-fix)
-- `documentation`: Documentation issues (auto-fix)
-- `todo`: Tasks needing user decisions (needs input)
-- `enhancement`: Improvement suggestions (needs input)
-- `performance`: Performance issues (needs input)
-- `config_issue`: Configuration problems (manual)
-- `runtime_issue`: Operational issues (manual)
-- `data_migration`: Migration tasks (manual)
-- `already_fixed`: Issues resolved in previous sessions (informational)
-- `expected_behavior`: Intentional design (informational)
-- `warning`: Things to be aware of (informational)
-
-### Severity Levels
-- `critical`: System-breaking, security vulnerabilities, data loss
-- `high`: Major functionality issues
-- `medium`: Notable issues to address soon
-- `low`: Minor issues
-- `info`: Informational notes
-
-Use this format for any bugs, issues, or notable items you discover during analysis.
-"#,
-        enhanced_prompt
-    );
+    enhanced_prompt = format!("{}{}", enhanced_prompt, FINDING_INSTRUCTIONS);
 
     info!(
         "MCP API: Running prompt '{}' (session: {}, max_sessions: {:?}, images: {})",
@@ -3921,6 +4592,8 @@ Use this format for any bugs, issues, or notable items you discover during analy
         &prompt_name,
         &enhanced_prompt,
         max_sessions,
+        None,
+        None,
         None,
     )
     .map_err(|e| {
@@ -4177,6 +4850,9 @@ async fn create_ai_workflow(
         request.capture_input_validation,
         request.category,
         request.tags,
+        request.context_ids,
+        request.disabled_context_ids,
+        request.auto_include_contexts,
     ) {
         Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -4199,6 +4875,9 @@ async fn update_ai_workflow(
         request.capture_input_validation,
         request.category,
         request.tags,
+        request.context_ids,
+        request.disabled_context_ids,
+        request.auto_include_contexts,
     ) {
         Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
@@ -4842,7 +5521,9 @@ fn collect_images_for_analysis(
 // Unified Session API Handlers
 // ============================================================================
 
+use crate::iteration_bundle::{self, IterationBundle, RelevantLogSources};
 use crate::session::{Session, SessionConfig, SessionStatus};
+use crate::step_executor::{ExecutionResult, ExecutionStepConfig, LogSourceConfig, StepExecutor};
 
 /// Request to start a new unified session
 #[derive(Debug, Deserialize)]
@@ -4863,6 +5544,14 @@ struct StartSessionRequest {
     #[serde(default = "default_session_timeout")]
     timeout_seconds: u64,
 
+    /// Execution steps to run BEFORE spawning AI (deterministic)
+    #[serde(default)]
+    execution_steps: Vec<ExecutionStepConfig>,
+
+    /// Log sources to capture during execution steps
+    #[serde(default)]
+    log_sources: Vec<LogSourceConfig>,
+
     // Multi-session workflow configuration
     /// Path to external checkpoint file for cross-session workflows
     #[serde(default)]
@@ -4873,6 +5562,26 @@ struct StartSessionRequest {
     /// Workflow is complete when phase_field reaches this value
     #[serde(default)]
     completion_value: Option<u32>,
+
+    // Context injection
+    /// Context IDs to explicitly include in the prompt
+    #[serde(default)]
+    context_ids: Vec<String>,
+    /// Whether to auto-detect and include relevant contexts
+    #[serde(default)]
+    auto_include_contexts: bool,
+
+    // AI provider override
+    /// AI provider override (e.g., "claude_cli", "gemini_api")
+    #[serde(default)]
+    provider: Option<String>,
+    /// AI model override (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash")
+    #[serde(default)]
+    model: Option<String>,
+
+    /// Whether to capture input for validation (comparing reported vs actual positions)
+    #[serde(default)]
+    capture_input_validation: bool,
 }
 
 fn default_phase_field() -> String {
@@ -4920,6 +5629,18 @@ async fn start_session(
     let session_name = request.name.clone();
     let prompt_for_task_run = request.prompt.clone();
 
+    // Serialize execution steps for storage (used for re-execution on resume)
+    let execution_steps_json = if !request.execution_steps.is_empty() {
+        serde_json::to_string(&request.execution_steps).ok()
+    } else {
+        None
+    };
+    let log_sources_json = if !request.log_sources.is_empty() {
+        serde_json::to_string(&request.log_sources).ok()
+    } else {
+        None
+    };
+
     // Multi-session workflow config
     let workflow_checkpoint_path = request.checkpoint_path.clone();
     let workflow_phase_field = request.phase_field.clone();
@@ -4946,8 +5667,183 @@ async fn start_session(
         }
     }
 
+    // Execute deterministic steps BEFORE spawning AI session
+    // This runs workflows, actions, screenshots, etc. and collects results
+    // Uses the unified StepExecutor module (same code path as /execute-steps endpoint)
+    let execution_result = if !request.execution_steps.is_empty() {
+        info!(
+            "Executing {} deterministic steps before AI session",
+            request.execution_steps.len()
+        );
+        // Use a temporary session ID for screenshot naming
+        let temp_session_id = format!(
+            "pre-{}-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S"),
+            uuid::Uuid::new_v4()
+                .to_string()
+                .split('-')
+                .next()
+                .unwrap_or("0000")
+        );
+        let executor = StepExecutor::new(state.app_state.clone(), state.config_storage.clone());
+        executor
+            .execute_steps_with_log_sources(
+                &request.execution_steps,
+                &temp_session_id,
+                &request.log_sources,
+            )
+            .await
+    } else {
+        ExecutionResult {
+            success: true,
+            total_steps: 0,
+            successful_steps: 0,
+            failed_steps: 0,
+            total_duration_ms: 0,
+            steps: Vec::new(),
+            captured_logs: None,
+            captured_runner_logs: None,
+        }
+    };
+
+    // Generate execution summary using iteration bundle
+    // This provides structured, filtered data with step-linked screenshots
+    let execution_summary = if !execution_result.steps.is_empty() {
+        // Determine which logs are relevant based on step types
+        let relevant_logs = RelevantLogSources::from_steps(&request.execution_steps);
+
+        // New session starts at iteration 1
+        let iteration = 1u32;
+
+        // Use session name as temporary ID (actual ID will be assigned when session starts)
+        let temp_task_id = session_name.clone();
+
+        // Create the iteration bundle
+        let timestamp_now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let mut bundle = IterationBundle::new(
+            iteration,
+            temp_task_id,
+            timestamp_now.clone(),
+            timestamp_now,
+            &execution_result,
+            &relevant_logs,
+        );
+
+        // Add application logs if captured
+        if let Some(ref captured) = execution_result.captured_logs {
+            bundle.add_application_logs(&captured.sources, &request.log_sources);
+        }
+
+        // Add runner logs if captured (GUI automation events)
+        if let Some(ref runner_logs) = execution_result.captured_runner_logs {
+            bundle.add_gui_automation_logs(
+                runner_logs.actions.clone(),
+                runner_logs.image_recognition.clone(),
+            );
+
+            // Add input validation data if enabled
+            if request.capture_input_validation {
+                let input_validation = iteration_bundle::collect_input_validation_from_actions(
+                    &runner_logs.actions,
+                    &session_name,
+                );
+                bundle.add_input_validation_logs(input_validation);
+            }
+        }
+
+        // Render to markdown
+        bundle.to_markdown()
+    } else {
+        String::new()
+    };
+
+    // Inject contexts into the prompt if requested
+    let final_prompt = if !request.context_ids.is_empty() || request.auto_include_contexts {
+        // Extract action types from loaded config for auto-detection
+        let action_types: Vec<String> = {
+            let config_lock = state.app_state.current_config.lock().unwrap();
+            if let Some(ref config) = *config_lock {
+                config
+                    .workflows
+                    .iter()
+                    .flat_map(|w| {
+                        w.get("actions")
+                            .and_then(|a| a.as_array())
+                            .map(|actions| {
+                                actions
+                                    .iter()
+                                    .filter_map(|action| {
+                                        action
+                                            .get("type")
+                                            .and_then(|t| t.as_str())
+                                            .map(String::from)
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        };
+
+        let recent_errors: Vec<String> = Vec::new();
+
+        let (enhanced_prompt, used_context_ids) = context::inject_contexts(
+            &request.prompt,
+            &request.context_ids,
+            request.auto_include_contexts,
+            &request.prompt, // Use prompt for auto-detection matching
+            &action_types,
+            &recent_errors,
+        );
+
+        if !used_context_ids.is_empty() {
+            info!(
+                "Session start: Injected {} contexts into prompt: {:?}",
+                used_context_ids.len(),
+                used_context_ids
+            );
+        }
+
+        enhanced_prompt
+    } else {
+        request.prompt.clone()
+    };
+
+    // Append execution summary to prompt if steps were executed
+    // If no steps were configured, add a warning so the AI knows
+    let final_prompt_with_results = if !execution_summary.is_empty() {
+        format!("{}\n{}", final_prompt, execution_summary)
+    } else if request.execution_steps.is_empty() {
+        // No execution steps were configured - this may be intentional or a bug
+        format!(
+            "{}\n\n\
+            ## ⚠️ No Pre-Execution Steps Configured\n\n\
+            This task was started WITHOUT execution steps. This means:\n\
+            - No GUI automation, screenshots, or tests were run\n\
+            - There is no Iteration Bundle with pre-execution results\n\n\
+            If this task SHOULD have pre-execution steps (e.g., clicking buttons, \
+            capturing screenshots, running Playwright tests), the UI that started \
+            this task needs to include the `execution_steps` parameter.\n\n\
+            If this is intentional (e.g., a pure code analysis task), ignore this warning.\n",
+            final_prompt
+        )
+    } else {
+        // Steps were configured but produced no summary (execution failed?)
+        format!(
+            "{}\n\n\
+            ## ⚠️ Pre-Execution Steps Produced No Results\n\n\
+            Execution steps were configured but produced no Iteration Bundle. \
+            This may indicate the steps failed or returned empty output.\n\
+            Check the runner logs at `.dev-logs/runner-*.jsonl` for details.\n",
+            final_prompt
+        )
+    };
+
     let config = SessionConfig {
-        prompt: request.prompt,
+        prompt: final_prompt_with_results,
         continuation_prompt: request.continuation_prompt,
         total_phases: request.total_phases,
         uses_gui: request.uses_gui,
@@ -4956,6 +5852,8 @@ async fn start_session(
         name: request.name,
         description: String::new(),
         custom_config: serde_json::json!({}),
+        provider: request.provider,
+        model: request.model,
     };
 
     match state.session.start_session(config).await {
@@ -4964,6 +5862,7 @@ async fn start_session(
 
             // Create task_run record for auto-continue tracking
             // This is critical - without this, auto-continue won't work
+            // Store execution_steps_json and log_sources_json so they can be re-executed on resume
             let task_run_id = session.id.clone();
             if let Err(e) = state.app_state.checkpoint_db.create_task_run(
                 &task_run_id,
@@ -4971,6 +5870,8 @@ async fn start_session(
                 &prompt_for_task_run,
                 None, // max_sessions - None means unlimited
                 None, // auto_continue - defaults to true
+                execution_steps_json.clone(),
+                log_sources_json.clone(),
             ) {
                 warn!(
                     "Failed to create task_run for session {}: {}",
@@ -5043,6 +5944,20 @@ async fn start_session(
                     None, // No task_run_id - use session_id
                 )
                 .await;
+
+                // Safety net: ensure database status is updated when session loop exits
+                // The session loop should handle this, but we add a fallback in case of
+                // early returns or errors that don't update the status
+                if let Ok(db) = CheckpointDb::new() {
+                    if let Ok(Some(task)) = db.get_task_run(&session_id) {
+                        if task.status == "running" {
+                            info!("Session '{}' exited but status still 'running', marking as complete", session_name);
+                            if let Err(e) = db.complete_task_run(&session_id) {
+                                warn!("Failed to mark session {} as complete: {}", session_id, e);
+                            }
+                        }
+                    }
+                }
 
                 info!("Session '{}' completed", session_name);
             });
@@ -5449,7 +6364,8 @@ async fn force_continue_session(
                 prompt.push_str("\n\n");
             }
 
-            prompt.push_str("Continue the task from where you left off. When complete, print [TASK_COMPLETE].");
+            prompt.push_str(FINDING_INSTRUCTIONS);
+            prompt.push_str("\nContinue the task from where you left off. When complete, print [TASK_COMPLETE].");
             prompt
         });
 
@@ -5470,6 +6386,8 @@ async fn force_continue_session(
             name: session_name.clone(),
             description: format!("Force continued session #{}", task.sessions_count + 1),
             custom_config: serde_json::json!({}),
+            provider: None, // Use default provider for continued sessions
+            model: None,
         };
 
         // Get task_id for context grouping
@@ -5592,6 +6510,8 @@ async fn force_continue_simple(
         name: "Force Continue".to_string(),
         description: "Manually continued session".to_string(),
         custom_config: serde_json::json!({}),
+        provider: None, // Use default provider for force continue
+        model: None,
     };
 
     match state.session.start_session(config).await {
@@ -5828,6 +6748,98 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
             task.sessions_count + 1
         );
 
+        // =====================================================================
+        // Re-execute deterministic steps BEFORE resuming AI session
+        // =====================================================================
+        // Parse and re-execute execution_steps_json if present
+        // This ensures the AI sees fresh results from workflows/actions/screenshots
+        let execution_summary = if let Some(ref steps_json) = task.execution_steps_json {
+            match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
+                Ok(execution_steps) if !execution_steps.is_empty() => {
+                    info!(
+                        "Re-executing {} deterministic steps for resumed task",
+                        execution_steps.len()
+                    );
+
+                    // Parse log sources if present
+                    let log_sources: Vec<LogSourceConfig> = task
+                        .log_sources_json
+                        .as_ref()
+                        .and_then(|json| serde_json::from_str(json).ok())
+                        .unwrap_or_default();
+
+                    // Create a temp session ID for screenshot naming
+                    let temp_session_id = format!(
+                        "resume-{}-{}",
+                        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+                        uuid::Uuid::new_v4()
+                            .to_string()
+                            .split('-')
+                            .next()
+                            .unwrap_or("0000")
+                    );
+
+                    // Execute steps using StepExecutor
+                    let executor =
+                        StepExecutor::new(state.app_state.clone(), state.config_storage.clone());
+                    let execution_result = executor
+                        .execute_steps_with_log_sources(
+                            &execution_steps,
+                            &temp_session_id,
+                            &log_sources,
+                        )
+                        .await;
+
+                    // Generate execution summary using IterationBundle
+                    if !execution_result.steps.is_empty() {
+                        let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
+                        let iteration = task.sessions_count + 1;
+                        let timestamp_now =
+                            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+                        let mut bundle = IterationBundle::new(
+                            iteration,
+                            task.id.clone(),
+                            timestamp_now.clone(),
+                            timestamp_now,
+                            &execution_result,
+                            &relevant_logs,
+                        );
+
+                        // Add application logs if captured
+                        if let Some(ref captured) = execution_result.captured_logs {
+                            bundle.add_application_logs(&captured.sources, &log_sources);
+                        }
+
+                        // Add runner logs if captured
+                        if let Some(ref runner_logs) = execution_result.captured_runner_logs {
+                            bundle.add_gui_automation_logs(
+                                runner_logs.actions.clone(),
+                                runner_logs.image_recognition.clone(),
+                            );
+                        }
+
+                        bundle.to_markdown()
+                    } else {
+                        String::new()
+                    }
+                }
+                Ok(_) => {
+                    // Empty steps array
+                    String::new()
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to parse execution_steps_json for task {}: {}",
+                        task.id, e
+                    );
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+
         // Build continuation prompt with output context
         // The AI reads this to understand where to continue from
         let output_context = if task.output_log.len() > 4000 {
@@ -5850,15 +6862,55 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
             });
 
         // Build continuation prompt including findings context
+        // Check if task has execution steps configured (even if summary is empty due to failure)
+        let has_execution_steps = task.execution_steps_json.as_ref().map_or(false, |json| {
+            serde_json::from_str::<Vec<serde_json::Value>>(json)
+                .map_or(false, |steps| !steps.is_empty())
+        });
+
+        // Build appropriate pre-execution message based on:
+        // 1. Whether steps are configured (has_execution_steps)
+        // 2. Whether execution produced actual results (execution_summary not empty)
+        let pre_execution_message = if has_execution_steps && !execution_summary.is_empty() {
+            // Steps configured AND produced results - tell AI to look at them
+            "\
+            **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
+            The Pre-Execution Results section below shows fresh results from this iteration.\n\n\
+            Read the previous output below to understand context and continue from where the last session left off.\n\n"
+                .to_string()
+        } else if has_execution_steps {
+            // Steps configured but no results (execution failed or produced empty output)
+            "\
+            **NOTE:** Pre-execution steps were configured but produced no results. \
+            This may indicate execution failed or steps returned empty output. \
+            Check the runner logs for details.\n\n\
+            Read the previous output below to understand context and continue from where the last session left off.\n\n"
+                .to_string()
+        } else {
+            // No steps configured at all - execution_steps_json is NULL
+            // This is a BUG - the task was created without execution steps!
+            "\
+            **⚠️ WARNING: No execution steps configured (execution_steps_json is NULL)**\n\n\
+            This task has NO pre-execution steps. This likely means:\n\
+            - The workflow was started from a UI component that doesn't pass execution_steps\n\
+            - Or the task was created before the execution_steps fix was applied\n\n\
+            **Impact:** No GUI automation, screenshots, or tests were run. You won't have an Iteration Bundle.\n\n\
+            **What to do:** Check the task configuration. If this task SHOULD have pre-execution steps, \
+            the UI code that started this task needs to include the `execution_steps` parameter.\n\n\
+            Read the previous output below to understand context and continue from where the last session left off.\n\n"
+                .to_string()
+        };
+
         let mut continuation_prompt = format!(
             "{}\n\n\
-            ## Resume After Runner Restart (Session #{})\n\n\
-            This session is resuming after a runner restart. \
-            Read the previous output below to understand context and continue from where the last session left off.\n\n\
+            ## Session #{} - Continuation\n\n\
+            Pre-execution steps were re-run before this session started.\n\n\
+            {}\
             ### Previous Session Output\n\
             ```\n{}\n```\n\n",
             task.prompt,
             task.sessions_count + 1,
+            pre_execution_message,
             output_context
         );
 
@@ -5868,7 +6920,15 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
             continuation_prompt.push_str("\n\n");
         }
 
-        continuation_prompt.push_str("Continue the task. When complete, print [TASK_COMPLETE].\n");
+        // Include pre-execution results if steps were re-executed
+        if !execution_summary.is_empty() {
+            continuation_prompt.push_str(&execution_summary);
+            continuation_prompt.push_str("\n\n");
+        }
+
+        continuation_prompt.push_str(FINDING_INSTRUCTIONS);
+        continuation_prompt
+            .push_str("\nContinue the task. When complete, print [TASK_COMPLETE].\n");
 
         // Create session config
         let session_config = SessionConfig {
@@ -5884,6 +6944,8 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                 task.sessions_count + 1
             ),
             custom_config: serde_json::json!({}),
+            provider: None, // Use default provider for resumed sessions
+            model: None,
         };
 
         // Create session context for AI output events so frontend can display the task name
@@ -6015,6 +7077,26 @@ async fn run_unified_session_loop(
 
     loop {
         phase += 1;
+
+        // Check if task was stopped BEFORE starting a new phase
+        // This prevents multi-step tasks from restarting after the Stop button is clicked
+        if let Ok(Some(task)) = state.app_state.checkpoint_db.get_task_run(&db_task_id) {
+            if task.status == "stopped" || !task.auto_continue {
+                info!(
+                    "Task {} was stopped or auto_continue disabled, exiting session loop (status={}, auto_continue={})",
+                    db_task_id, task.status, task.auto_continue
+                );
+                emit_ai_output(
+                    &app_handle,
+                    &format!("🛑 Session {} stopped by user", session_id),
+                    "status",
+                    Some(&session_id),
+                    Some(&session_ctx),
+                );
+                return;
+            }
+        }
+
         let phase_session_id = if phase == 1 {
             format!("session-{}", &session_id[..8.min(session_id.len())])
         } else {
@@ -6075,6 +7157,9 @@ async fn run_unified_session_loop(
             session_num: phase,
         });
 
+        // Clone PID tracker for the blocking task
+        let pid_tracker = state.current_ai_pids.clone();
+
         let result = tokio::task::spawn_blocking(move || {
             run_claude_session_inline(
                 &workspace,
@@ -6084,6 +7169,7 @@ async fn run_unified_session_loop(
                 timeout_secs,
                 ctx_for_claude,
                 finding_ctx_for_claude,
+                Some(pid_tracker),
             )
         })
         .await;
@@ -6568,6 +7654,8 @@ async fn create_task_run(
             &req.prompt,
             req.max_sessions,
             req.auto_continue,
+            None, // execution_steps_json
+            None, // log_sources_json
         )
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
@@ -6722,6 +7810,109 @@ async fn set_task_auto_continue(
 
 // ============================================================================
 // End Task Run HTTP API Handlers
+// ============================================================================
+
+// ============================================================================
+// Automation Run HTTP API Handlers (for MCP/AI access)
+// ============================================================================
+
+/// Query params for listing automation runs.
+#[derive(Debug, Deserialize)]
+struct ListAutomationRunsQuery {
+    /// Config ID to filter by (optional)
+    config_id: Option<String>,
+    /// Maximum number of runs to return (default: 20)
+    limit: Option<u32>,
+}
+
+/// List recent automation runs.
+async fn list_automation_runs(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<ListAutomationRunsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let conn = state
+        .app_state
+        .checkpoint_db
+        .connection()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let limit = query.limit.unwrap_or(20);
+
+    // If config_id is provided, filter by it. Otherwise get all recent runs.
+    let runs = if let Some(config_id) = &query.config_id {
+        tiered_info::get_recent_runs(&conn, config_id, limit)
+    } else {
+        // Get runs across all configs - use a broader query
+        get_all_recent_runs(&conn, limit)
+    };
+
+    match runs {
+        Ok(runs) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": runs
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))),
+    }
+}
+
+/// Helper to get recent runs across all configs.
+fn get_all_recent_runs(conn: &rusqlite::Connection, limit: u32) -> Result<Vec<RunDetails>, String> {
+    use rusqlite::params;
+
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT id, config_id, workflow_name, started_at, ended_at, duration_ms,
+                   status, success, error_type, error_message,
+                   actions_summary, states_visited, transitions_executed, template_matches, anomalies
+            FROM run_details
+            ORDER BY started_at DESC
+            LIMIT ?1
+            "#,
+        )
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let runs = stmt
+        .query_map(params![limit], tiered_info::row_to_run_details)
+        .map_err(|e| format!("Failed to query runs: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(runs)
+}
+
+/// Get a specific automation run by ID.
+async fn get_automation_run(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let conn = state
+        .app_state
+        .checkpoint_db
+        .connection()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    match tiered_info::get_run_details(&conn, &id) {
+        Ok(Some(run)) => Ok(Json(serde_json::json!({
+            "success": true,
+            "data": run
+        }))),
+        Ok(None) => Ok(Json(serde_json::json!({
+            "success": false,
+            "error": format!("Run not found: {}", id)
+        }))),
+        Err(e) => Ok(Json(serde_json::json!({
+            "success": false,
+            "error": e
+        }))),
+    }
+}
+
+// ============================================================================
+// End Automation Run HTTP API Handlers
 // ============================================================================
 
 // ============================================================================
@@ -7198,6 +8389,812 @@ async fn get_verification_prompt(
 // End AI Verification Agent HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// AI Context HTTP API Handlers
+// ============================================================================
+
+/// Request body for creating a context
+#[derive(Debug, Deserialize)]
+struct CreateContextRequest {
+    name: String,
+    content: String,
+    category: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(rename = "autoInclude")]
+    auto_include: Option<context::ContextAutoInclude>,
+}
+
+/// Request body for updating a context
+#[derive(Debug, Deserialize)]
+struct UpdateContextRequest {
+    name: Option<String>,
+    content: Option<String>,
+    category: Option<Option<String>>,
+    tags: Option<Vec<String>>,
+    #[serde(rename = "autoInclude")]
+    auto_include: Option<Option<context::ContextAutoInclude>>,
+}
+
+/// Request body for duplicating a context
+#[derive(Debug, Deserialize)]
+struct DuplicateContextRequest {
+    #[serde(rename = "targetScope")]
+    target_scope: String,
+}
+
+/// Convert Context to ContextWithMetadata
+fn context_to_with_metadata(
+    ctx: context::Context,
+    scope: context::ContextScope,
+    library: &context::UserContextLibrary,
+) -> context::ContextWithMetadata {
+    let metadata = library.metadata.iter().find(|m| m.context_id == ctx.id);
+
+    context::ContextWithMetadata {
+        context: ctx,
+        scope,
+        enabled: metadata.map(|m| m.enabled).unwrap_or(true),
+        use_count: metadata.map(|m| m.use_count).unwrap_or(0),
+        last_used_at: metadata.and_then(|m| m.last_used_at.clone()),
+        web_sync_status: metadata.and_then(|m| m.web_sync_status.clone()),
+    }
+}
+
+/// GET /contexts - List all contexts from all scopes
+async fn list_all_contexts(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<context::ContextWithMetadata>>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    let library = context::load_user_context_library();
+    let mut all_contexts: Vec<context::ContextWithMetadata> = Vec::new();
+
+    // Add project contexts from loaded config (if any)
+    if let Ok(config_lock) = state.app_state.current_config.lock() {
+        if let Some(ref config) = *config_lock {
+            for ctx in context::get_project_contexts_from_config(&config.contexts) {
+                all_contexts.push(context_to_with_metadata(
+                    ctx,
+                    context::ContextScope::Project,
+                    &library,
+                ));
+            }
+        }
+    }
+
+    // Add user contexts
+    for ctx in context::get_all_user_contexts() {
+        all_contexts.push(context_to_with_metadata(
+            ctx,
+            context::ContextScope::User,
+            &library,
+        ));
+    }
+
+    // Add builtin contexts
+    for ctx in context::get_builtin_contexts() {
+        all_contexts.push(context_to_with_metadata(
+            ctx,
+            context::ContextScope::Builtin,
+            &library,
+        ));
+    }
+
+    Ok(Json(ApiResponse::success(all_contexts)))
+}
+
+/// GET /contexts/categories - List all unique categories
+async fn list_context_categories(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let mut categories = context::get_user_context_categories();
+
+    // Add categories from project contexts
+    if let Ok(config_lock) = state.app_state.current_config.lock() {
+        if let Some(ref config) = *config_lock {
+            for ctx in context::get_project_contexts_from_config(&config.contexts) {
+                if let Some(cat) = ctx.category {
+                    if !categories.contains(&cat) {
+                        categories.push(cat);
+                    }
+                }
+            }
+        }
+    }
+
+    // Add categories from builtin contexts
+    for ctx in context::get_builtin_contexts() {
+        if let Some(cat) = ctx.category {
+            if !categories.contains(&cat) {
+                categories.push(cat);
+            }
+        }
+    }
+
+    categories.sort();
+    categories.dedup();
+
+    Ok(Json(ApiResponse::success(categories)))
+}
+
+/// GET /contexts/tags - List all unique tags
+async fn list_context_tags(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let library = context::load_user_context_library();
+    let mut tags: Vec<String> = Vec::new();
+
+    // Collect tags from user contexts
+    for ctx in &library.contexts {
+        for tag in &ctx.tags {
+            if !tags.contains(tag) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+
+    // Collect tags from project contexts
+    if let Ok(config_lock) = state.app_state.current_config.lock() {
+        if let Some(ref config) = *config_lock {
+            for ctx in context::get_project_contexts_from_config(&config.contexts) {
+                for tag in ctx.tags {
+                    if !tags.contains(&tag) {
+                        tags.push(tag);
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect tags from builtin contexts
+    for ctx in context::get_builtin_contexts() {
+        for tag in ctx.tags {
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+    }
+
+    tags.sort();
+
+    Ok(Json(ApiResponse::success(tags)))
+}
+
+/// POST /contexts/{scope} - Create a new context
+async fn create_context_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(scope): axum::extract::Path<String>,
+    Json(req): Json<CreateContextRequest>,
+) -> Result<Json<ApiResponse<context::ContextWithMetadata>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scope.as_str() {
+        "project" => {
+            // Project contexts are stored in the loaded config
+            let ctx = {
+                let mut config_lock = state.app_state.current_config.lock().map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to lock config: {}", e))),
+                    )
+                })?;
+
+                let config = config_lock.as_mut().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(api_error(
+                            "No project loaded. Please load a project configuration first.",
+                        )),
+                    )
+                })?;
+
+                // Create the context
+                let ctx = context::create_project_context(
+                    req.name,
+                    req.content,
+                    req.category,
+                    req.tags,
+                    req.auto_include,
+                );
+
+                // Add to config
+                context::add_project_context_to_config(&mut config.contexts, ctx.clone()).map_err(
+                    |e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(api_error(format!("Failed to add context to config: {}", e))),
+                        )
+                    },
+                )?;
+
+                ctx
+            }; // config_lock dropped here
+
+            // Save the config to the file
+            if let Err(e) = save_current_config_to_file(&state.app_state) {
+                warn!(
+                    "Failed to save config after creating project context: {}",
+                    e
+                );
+            }
+
+            // Mark as pending sync to qontinui-web
+            if let Err(e) =
+                context::set_web_sync_status(&ctx.id, Some(context::WebSyncStatus::Pending))
+            {
+                warn!("Failed to set pending sync status for context: {}", e);
+            }
+
+            let library = context::load_user_context_library();
+            Ok(Json(ApiResponse::success(context_to_with_metadata(
+                ctx,
+                context::ContextScope::Project,
+                &library,
+            ))))
+        }
+        "user" => {
+            // User contexts are stored in the user library
+            match context::create_user_context(
+                req.name,
+                req.content,
+                req.category,
+                req.tags,
+                req.auto_include,
+            ) {
+                Ok(ctx) => {
+                    let library = context::load_user_context_library();
+                    Ok(Json(ApiResponse::success(context_to_with_metadata(
+                        ctx,
+                        context::ContextScope::User,
+                        &library,
+                    ))))
+                }
+                Err(e) => Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to create context: {}", e))),
+                )),
+            }
+        }
+        "builtin" => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("Cannot create builtin contexts")),
+        )),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Invalid scope: {}", scope))),
+        )),
+    }
+}
+
+/// PUT /contexts/{scope}/{id} - Update a context
+async fn update_context_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((scope, id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<UpdateContextRequest>,
+) -> Result<Json<ApiResponse<context::ContextWithMetadata>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scope.as_str() {
+        "project" => {
+            // Project contexts are stored in the loaded config
+            let updated_ctx = {
+                let mut config_lock = state.app_state.current_config.lock().map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to lock config: {}", e))),
+                    )
+                })?;
+
+                let config = config_lock.as_mut().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(api_error(
+                            "No project loaded. Please load a project configuration first.",
+                        )),
+                    )
+                })?;
+
+                // Get the existing context
+                let existing = context::get_project_context_from_config(&config.contexts, &id)
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(api_error(format!("Context not found: {}", id))),
+                        )
+                    })?;
+
+                // Create updated context
+                let updated_ctx = context::Context {
+                    id: existing.id,
+                    name: req.name.unwrap_or(existing.name),
+                    content: req.content.unwrap_or(existing.content),
+                    category: req.category.unwrap_or(existing.category),
+                    tags: req.tags.unwrap_or(existing.tags),
+                    auto_include: req.auto_include.unwrap_or(existing.auto_include),
+                    created_at: existing.created_at,
+                    modified_at: chrono::Utc::now().to_rfc3339(),
+                };
+
+                // Update in config
+                context::update_project_context_in_config(
+                    &mut config.contexts,
+                    updated_ctx.clone(),
+                )
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to update context: {}", e))),
+                    )
+                })?;
+
+                updated_ctx
+            }; // config_lock dropped here
+
+            // Save the config to the file
+            if let Err(e) = save_current_config_to_file(&state.app_state) {
+                warn!(
+                    "Failed to save config after updating project context: {}",
+                    e
+                );
+            }
+
+            let library = context::load_user_context_library();
+            Ok(Json(ApiResponse::success(context_to_with_metadata(
+                updated_ctx,
+                context::ContextScope::Project,
+                &library,
+            ))))
+        }
+        "user" => {
+            // User contexts are stored in the user library
+            match context::update_user_context(
+                &id,
+                req.name,
+                req.content,
+                req.category,
+                req.tags,
+                req.auto_include,
+            ) {
+                Ok(ctx) => {
+                    let library = context::load_user_context_library();
+                    Ok(Json(ApiResponse::success(context_to_with_metadata(
+                        ctx,
+                        context::ContextScope::User,
+                        &library,
+                    ))))
+                }
+                Err(e) => Err((
+                    StatusCode::NOT_FOUND,
+                    Json(api_error(format!("Context not found: {}", e))),
+                )),
+            }
+        }
+        "builtin" => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("Cannot update builtin contexts")),
+        )),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Invalid scope: {}", scope))),
+        )),
+    }
+}
+
+/// DELETE /contexts/{scope}/{id} - Delete a context
+async fn delete_context_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((scope, id)): axum::extract::Path<(String, String)>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match scope.as_str() {
+        "project" => {
+            // Project contexts are stored in the loaded config
+            {
+                let mut config_lock = state.app_state.current_config.lock().map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to lock config: {}", e))),
+                    )
+                })?;
+
+                let config = config_lock.as_mut().ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(api_error(
+                            "No project loaded. Please load a project configuration first.",
+                        )),
+                    )
+                })?;
+
+                context::delete_project_context_from_config(&mut config.contexts, &id).map_err(
+                    |e| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(api_error(format!("Context not found: {}", e))),
+                        )
+                    },
+                )?;
+            } // config_lock dropped here
+
+            // Save the config to the file
+            if let Err(e) = save_current_config_to_file(&state.app_state) {
+                warn!(
+                    "Failed to save config after deleting project context: {}",
+                    e
+                );
+            }
+
+            Ok(Json(ApiResponse::success(())))
+        }
+        "user" => match context::delete_user_context(&id) {
+            Ok(()) => Ok(Json(ApiResponse::success(()))),
+            Err(e) => Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Context not found: {}", e))),
+            )),
+        },
+        "builtin" => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error("Cannot delete builtin contexts")),
+        )),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Invalid scope: {}", scope))),
+        )),
+    }
+}
+
+/// POST /contexts/{scope}/{id}/duplicate - Duplicate a context
+async fn duplicate_context_handler(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path((scope, id)): axum::extract::Path<(String, String)>,
+    Json(req): Json<DuplicateContextRequest>,
+) -> Result<Json<ApiResponse<context::ContextWithMetadata>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // Find the source context from the appropriate scope
+    let source_ctx = match scope.as_str() {
+        "builtin" => context::get_builtin_contexts()
+            .into_iter()
+            .find(|c| c.id == id),
+        "project" => {
+            // Try to find in project contexts
+            let config_lock = state.app_state.current_config.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to lock config: {}", e))),
+                )
+            })?;
+
+            if let Some(ref config) = *config_lock {
+                context::get_project_context_from_config(&config.contexts, &id)
+            } else {
+                None
+            }
+        }
+        "user" | _ => context::get_user_context(&id),
+    };
+
+    let Some(source) = source_ctx else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Context not found: {}", id))),
+        ));
+    };
+
+    // Create copy based on target scope
+    let library = context::load_user_context_library();
+
+    if req.target_scope == "project" {
+        // Create copy in project config
+        let ctx = {
+            let mut config_lock = state.app_state.current_config.lock().map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to lock config: {}", e))),
+                )
+            })?;
+
+            let config = config_lock.as_mut().ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(api_error(
+                        "No project loaded. Please load a project configuration first.",
+                    )),
+                )
+            })?;
+
+            let ctx = context::create_project_context(
+                format!("{} (Copy)", source.name),
+                source.content.clone(),
+                source.category.clone(),
+                source.tags.clone(),
+                source.auto_include.clone(),
+            );
+
+            context::add_project_context_to_config(&mut config.contexts, ctx.clone()).map_err(
+                |e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!("Failed to add context to config: {}", e))),
+                    )
+                },
+            )?;
+
+            ctx
+        }; // config_lock dropped here
+
+        // Save the config to the file
+        if let Err(e) = save_current_config_to_file(&state.app_state) {
+            warn!(
+                "Failed to save config after duplicating to project context: {}",
+                e
+            );
+        }
+
+        Ok(Json(ApiResponse::success(context_to_with_metadata(
+            ctx,
+            context::ContextScope::Project,
+            &library,
+        ))))
+    } else {
+        // Create copy in user library
+        match context::create_user_context(
+            format!("{} (Copy)", source.name),
+            source.content.clone(),
+            source.category.clone(),
+            source.tags.clone(),
+            source.auto_include.clone(),
+        ) {
+            Ok(ctx) => Ok(Json(ApiResponse::success(context_to_with_metadata(
+                ctx,
+                context::ContextScope::User,
+                &library,
+            )))),
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to duplicate context: {}", e))),
+            )),
+        }
+    }
+}
+
+/// POST /contexts/metadata/{id}/enable - Enable a context
+async fn enable_context_handler(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match context::set_context_enabled(&id, true) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to enable context: {}", e))),
+        )),
+    }
+}
+
+/// POST /contexts/metadata/{id}/disable - Disable a context
+async fn disable_context_handler(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match context::set_context_enabled(&id, false) {
+        Ok(()) => Ok(Json(ApiResponse::success(()))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to disable context: {}", e))),
+        )),
+    }
+}
+
+/// POST /contexts/:id/approve-sync - Approve syncing a project context to qontinui-web
+async fn approve_context_sync(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Approving context sync for: {}", id);
+
+    // Get the context from the loaded config
+    let ctx = {
+        let config_lock = state.app_state.current_config.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to lock config: {}", e))),
+            )
+        })?;
+
+        let config = config_lock.as_ref().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "No project loaded. Please load a project configuration first.",
+                )),
+            )
+        })?;
+
+        context::get_project_context_from_config(&config.contexts, &id).ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Context not found: {}", id))),
+            )
+        })?
+    };
+
+    // Get the project ID from the loaded config
+    let project_id = {
+        let config_lock = state.app_state.current_config.lock().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to lock config: {}", e))),
+            )
+        })?;
+
+        let config = config_lock.as_ref().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error("No project loaded")),
+            )
+        })?;
+
+        config.metadata.project_id.clone().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(api_error(
+                    "No project ID found in configuration. Cannot sync to qontinui-web.",
+                )),
+            )
+        })?
+    };
+
+    // Sync to qontinui-web
+    match sync_context_to_web(&project_id, &ctx).await {
+        Ok(_) => {
+            // Mark as synced
+            if let Err(e) = context::set_web_sync_status(&id, Some(context::WebSyncStatus::Synced))
+            {
+                warn!("Failed to update sync status: {}", e);
+            }
+
+            info!("Successfully synced context {} to qontinui-web", id);
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "synced": true,
+                "contextId": id,
+                "projectId": project_id
+            }))))
+        }
+        Err(e) => {
+            error!("Failed to sync context to qontinui-web: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to sync to qontinui-web: {}", e))),
+            ))
+        }
+    }
+}
+
+/// POST /contexts/:id/dismiss-sync - Dismiss syncing a project context
+async fn dismiss_context_sync(
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Dismissing context sync for: {}", id);
+
+    match context::set_web_sync_status(&id, Some(context::WebSyncStatus::Dismissed)) {
+        Ok(()) => {
+            info!("Dismissed sync for context: {}", id);
+            Ok(Json(ApiResponse::success(())))
+        }
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to dismiss sync: {}", e))),
+        )),
+    }
+}
+
+/// Sync a context to qontinui-web by updating the project configuration
+async fn sync_context_to_web(project_id: &str, ctx: &context::Context) -> Result<(), String> {
+    use crate::auth::AuthManager;
+
+    let auth_manager = AuthManager::new();
+
+    // Check if authenticated
+    if !auth_manager.has_tokens() {
+        return Err("Not authenticated. Please log in to qontinui-web first.".to_string());
+    }
+
+    let access_token = auth_manager
+        .get_access_token()
+        .map_err(|e| format!("Failed to get access token: {}", e))?;
+
+    // Get the API base URL
+    let api_url = std::env::var("QONTINUI_API_URL").unwrap_or_else(|_| {
+        if cfg!(debug_assertions) {
+            "http://localhost:8000".to_string()
+        } else {
+            "https://qontinui-prod-py.eba-km2u4s23.eu-central-1.elasticbeanstalk.com".to_string()
+        }
+    });
+
+    let client = reqwest::Client::new();
+
+    // First, get the current project configuration
+    let get_response = client
+        .get(format!("{}/api/v1/projects/{}", api_url, project_id))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Network error fetching project: {}", e))?;
+
+    if !get_response.status().is_success() {
+        let status = get_response.status();
+        let error_text = get_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to fetch project ({}): {}",
+            status, error_text
+        ));
+    }
+
+    let project: serde_json::Value = get_response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse project response: {}", e))?;
+
+    // Get the current configuration and contexts
+    let mut configuration = project
+        .get("configuration")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
+
+    let mut contexts: Vec<serde_json::Value> = configuration
+        .get("contexts")
+        .and_then(|c| c.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Check if context already exists (by ID)
+    let existing_index = contexts
+        .iter()
+        .position(|c| c.get("id").and_then(|id| id.as_str()) == Some(&ctx.id));
+
+    // Convert our context to JSON
+    let ctx_json =
+        serde_json::to_value(ctx).map_err(|e| format!("Failed to serialize context: {}", e))?;
+
+    if let Some(idx) = existing_index {
+        // Update existing context
+        contexts[idx] = ctx_json;
+        info!(
+            "Updated existing context {} in qontinui-web project",
+            ctx.id
+        );
+    } else {
+        // Add new context
+        contexts.push(ctx_json);
+        info!("Added new context {} to qontinui-web project", ctx.id);
+    }
+
+    // Update the configuration
+    configuration["contexts"] = serde_json::Value::Array(contexts);
+
+    // PUT the updated project
+    let update_body = serde_json::json!({
+        "configuration": configuration
+    });
+
+    let put_response = client
+        .put(format!("{}/api/v1/projects/{}", api_url, project_id))
+        .bearer_auth(&access_token)
+        .json(&update_body)
+        .send()
+        .await
+        .map_err(|e| format!("Network error updating project: {}", e))?;
+
+    if !put_response.status().is_success() {
+        let status = put_response.status();
+        let error_text = put_response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to update project ({}): {}",
+            status, error_text
+        ));
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// End AI Context HTTP API Handlers
+// ============================================================================
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -7248,6 +9245,7 @@ pub fn create_router(
         current_config_id: std::sync::Mutex::new(None),
         config_storage,
         action_service,
+        current_ai_pids: Arc::new(std::sync::Mutex::new(Vec::new())),
     });
 
     // Restore persisted session state on startup
@@ -7319,15 +9317,21 @@ pub fn create_router(
         // WebSocket endpoint for live execution event streaming
         .route("/ws/events", get(ws_events_handler))
         .route("/health", get(health))
+        // Debug endpoints for AI sessions
+        .route("/debug/app/errors", get(get_debug_errors))
+        .route("/findings/summary", get(get_findings_summary))
         .route("/launch-debug-chrome", post(launch_debug_chrome))
         .route("/status", get(get_status))
         .route("/monitors", get(get_monitors))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))
         .route("/run-workflow", post(run_workflow))
+        .route("/execute-steps", post(execute_steps))
         .route("/stop-execution", post(stop_execution))
         .route("/execute-action", post(execute_action))
         .route("/capture-screenshot", post(capture_screenshot_step))
+        // State navigation route
+        .route("/go-to-state", post(go_to_state))
         // Web extraction routes
         .route("/extraction/start", post(start_web_extraction))
         .route("/extraction/stop", post(stop_web_extraction))
@@ -7445,6 +9449,9 @@ pub fn create_router(
             "/task-runs/:id/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
+        // Automation Run routes (for MCP/AI access to run_details)
+        .route("/runs", get(list_automation_runs))
+        .route("/runs/:id", get(get_automation_run))
         // Config Storage routes
         .route("/configs", get(list_configs).post(import_config))
         .route(
@@ -7461,6 +9468,30 @@ pub fn create_router(
         .route("/verification/history", get(get_verification_history))
         .route("/verification/:run_id", get(get_verification_report))
         .route("/verification/:run_id/prompt", get(get_verification_prompt))
+        // AI Context routes
+        .route("/contexts", get(list_all_contexts))
+        .route("/contexts/categories", get(list_context_categories))
+        .route("/contexts/tags", get(list_context_tags))
+        .route("/contexts/:scope", post(create_context_handler))
+        .route(
+            "/contexts/:scope/:id",
+            put(update_context_handler).delete(delete_context_handler),
+        )
+        .route(
+            "/contexts/:scope/:id/duplicate",
+            post(duplicate_context_handler),
+        )
+        .route(
+            "/contexts/metadata/:id/enable",
+            post(enable_context_handler),
+        )
+        .route(
+            "/contexts/metadata/:id/disable",
+            post(disable_context_handler),
+        )
+        // Context sync approval routes (for syncing project contexts to qontinui-web)
+        .route("/contexts/:id/approve-sync", post(approve_context_sync))
+        .route("/contexts/:id/dismiss-sync", post(dismiss_context_sync))
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

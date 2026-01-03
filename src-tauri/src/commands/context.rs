@@ -74,6 +74,7 @@ fn get_all_contexts_combined() -> Vec<ContextWithMetadata> {
             enabled: metadata.map(|m| m.enabled).unwrap_or(true),
             use_count: metadata.map(|m| m.use_count).unwrap_or(0),
             last_used_at: metadata.and_then(|m| m.last_used_at.clone()),
+            web_sync_status: None, // User-scope contexts don't sync to web
         });
     }
 
@@ -85,6 +86,7 @@ fn get_all_contexts_combined() -> Vec<ContextWithMetadata> {
             enabled: true,
             use_count: 0,
             last_used_at: None,
+            web_sync_status: None, // Builtin contexts don't sync to web
         });
     }
 
@@ -431,6 +433,7 @@ pub fn get_builtin_contexts_cmd() -> Result<CommandResponse, String> {
             enabled: true,
             use_count: 0,
             last_used_at: None,
+            web_sync_status: None, // Builtin contexts don't sync to web
         })
         .collect();
 

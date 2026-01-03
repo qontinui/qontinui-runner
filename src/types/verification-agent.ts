@@ -188,3 +188,81 @@ export function getDefaultVerificationConfig(configPath: string): VerificationTa
     stop_on_first_failure: false,
   };
 }
+
+/**
+ * A saved verification configuration that can be reused
+ */
+export interface SavedVerification {
+  /** Unique identifier (UUID v4) */
+  id: string;
+
+  /** User-friendly name for this verification */
+  name: string;
+
+  /** Optional description */
+  description?: string;
+
+  /** The configuration settings */
+  config: Omit<VerificationTaskConfig, "config_path">;
+
+  /** Tags for organization */
+  tags: string[];
+
+  /** Creation timestamp (ISO 8601) */
+  created_at: string;
+
+  /** Last modification timestamp (ISO 8601) */
+  modified_at: string;
+
+  /** Last run timestamp (ISO 8601) */
+  last_run_at?: string;
+
+  /** Number of times this verification has been run */
+  run_count: number;
+}
+
+/**
+ * Request to create a new saved verification
+ */
+export interface CreateSavedVerificationRequest {
+  name: string;
+  description?: string;
+  config: Omit<VerificationTaskConfig, "config_path">;
+  tags?: string[];
+}
+
+/**
+ * Request to update a saved verification
+ */
+export interface UpdateSavedVerificationRequest {
+  name?: string;
+  description?: string;
+  config?: Omit<VerificationTaskConfig, "config_path">;
+  tags?: string[];
+}
+
+/**
+ * Get default saved verification configuration
+ */
+export function getDefaultSavedVerification(): Omit<
+  SavedVerification,
+  "id" | "created_at" | "modified_at"
+> {
+  return {
+    name: "",
+    description: "",
+    config: {
+      strategy: "smoke_test",
+      max_states: 0,
+      max_duration_seconds: 0,
+      target_state_ids: [],
+      target_transition_ids: [],
+      capture_screenshots: true,
+      capture_transition_screenshots: false,
+      state_delay_ms: 500,
+      stop_on_first_failure: false,
+    },
+    tags: [],
+    run_count: 0,
+  };
+}

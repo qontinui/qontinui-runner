@@ -7,18 +7,17 @@
 
 import { useRef } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { FileText, Image, Zap, Database } from "lucide-react";
+import { FileText, Image, Zap } from "lucide-react";
 import { GeneralLogTab } from "./GeneralLogTab";
 import ImageLogTable from "./ImageLogTable";
 import ActionLogTable from "./ActionLogTable";
-import { RagLogTab, type RagProcessingState } from "./RagLogTab";
 import { LogTabActions } from "./LogTabActions";
 import { useAutoScroll } from "../hooks";
 import type { LogEntry, ImageRecognitionEntry } from "../managers/LogManager";
 import type { ActionLogEntry } from "../types/displayProfile";
 import type { LogLevel } from "../hooks/useLogFilter";
 
-type LogSubTab = "general" | "image" | "actions" | "rag";
+type LogSubTab = "general" | "image" | "actions";
 
 interface LogsTabProps {
   // General logs
@@ -42,17 +41,10 @@ interface LogsTabProps {
   actionLogError: string | null;
   onActionRowClick: (action: ActionLogEntry) => void;
 
-  // RAG processing
-  ragState: RagProcessingState;
-  onStartRagProcessing: () => void;
-  onClearRagLogs: () => void;
-  canStartRagProcessing: boolean;
-
   // Log counts
   logCount: number;
   imageLogCount: number;
   actionCount: number;
-  ragLogCount: number;
 
   // Clear/copy actions
   onClearGeneralLogs: () => void;
@@ -80,14 +72,9 @@ export function LogsTab({
   actionLogLoading,
   actionLogError,
   onActionRowClick,
-  ragState,
-  onStartRagProcessing,
-  onClearRagLogs,
-  canStartRagProcessing,
   logCount,
   imageLogCount,
   actionCount,
-  ragLogCount,
   onClearGeneralLogs,
   onClearImageLogs,
   onClearActionLogs,
@@ -109,7 +96,6 @@ export function LogsTab({
     { id: "general" as const, label: "General", icon: FileText, count: logCount },
     { id: "image" as const, label: "Image Recognition", icon: Image, count: imageLogCount },
     { id: "actions" as const, label: "Actions", icon: Zap, count: actionCount },
-    { id: "rag" as const, label: "RAG", icon: Database, count: ragLogCount },
   ];
 
   return (
@@ -167,7 +153,7 @@ export function LogsTab({
       <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
         <Tabs.Content
           value="general"
-          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
+          className="flex-1 flex flex-col p-4 outline-none min-h-0 data-[state=inactive]:hidden"
         >
           <GeneralLogTab logs={filteredLogs} containerRef={logViewerRef} />
         </Tabs.Content>
@@ -192,18 +178,6 @@ export function LogsTab({
           {!actionLogLoading && !actionLogError && actionLogData && (
             <ActionLogTable actions={actionLogData.actions} onRowClick={onActionRowClick} />
           )}
-        </Tabs.Content>
-
-        <Tabs.Content
-          value="rag"
-          className="flex-1 p-4 outline-none overflow-auto data-[state=inactive]:hidden"
-        >
-          <RagLogTab
-            state={ragState}
-            onStartProcessing={onStartRagProcessing}
-            onClearLogs={onClearRagLogs}
-            canStartProcessing={canStartRagProcessing}
-          />
         </Tabs.Content>
       </div>
     </Tabs.Root>

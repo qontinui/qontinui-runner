@@ -9,6 +9,7 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useExecution, useAutoContinue } from "../../contexts";
 import type { UseProjectLogsReturn } from "../../hooks/useProjectLogs";
+import { convertSourcesToRust } from "../../hooks/project-logs/types";
 import type {
   ExecutionStep,
   SavedAiWorkflow,
@@ -43,11 +44,15 @@ import {
 interface UseAiBuilderStateProps {
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
+  onNavigateToAiOutput?: () => void;
+  editWorkflowId?: string | null;
 }
 
 export function useAiBuilderState({
   projectLogs,
   onNavigateToLogLocations,
+  onNavigateToAiOutput,
+  editWorkflowId,
 }: UseAiBuilderStateProps) {
   const execution = useExecution();
 
@@ -183,6 +188,15 @@ export function useAiBuilderState({
   // Resumable workflow state
   const [resumableWorkflow, setResumableWorkflow] = useState<ResumableWorkflow | null>(null);
   const [isResuming, setIsResuming] = useState(false);
+
+  // Context selection state - tracks which contexts are selected for the prompt
+  const [manuallyAddedContextIds, setManuallyAddedContextIds] = useState<Set<string>>(new Set());
+  const [disabledContextIds, setDisabledContextIds] = useState<Set<string>>(new Set());
+  const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
+
+  // AI Provider override - allows using different AI providers (e.g., Gemini for fast tasks)
+  const [aiProvider, setAiProvider] = useState<string>("");
+  const [aiModel, setAiModel] = useState<string>("");
 
   // Auto-continue settings
   const {
@@ -653,146 +667,58 @@ export function useAiBuilderState({
   }, []);
 
   // Generate execution instructions
+  // NOTE: Execution steps (workflow, action, state, screenshot, playwright) are now
+  // executed DETERMINISTICALLY by the runner before the AI session starts.
+  // This function only includes prompt steps (text instructions for the AI to follow)
+  // and a note about the pre-executed steps.
   const generateExecutionInstructions = useCallback(() => {
     if (executionSteps.length === 0) {
-      return "No steps configured. Skip to log analysis.";
+      return "No execution steps configured. Proceed directly to log analysis.";
     }
-    return executionSteps
-      .map((step, index) => {
-        const stepNum = index + 1;
-        if (step.type === "workflow") {
-          let instruction = `### Step ${stepNum}: Run Workflow "${step.name}"
 
-Execute the workflow using the MCP tool:
-\`\`\`
-mcp__qontinui__run_workflow with workflow_name="${step.name}", timeout_seconds=300
-\`\`\``;
-          if (step.takeScreenshot) {
-            instruction += `
+    // Separate deterministic steps from prompt steps
+    const deterministicSteps = executionSteps.filter((s) => s.type !== "prompt");
+    const promptSteps = executionSteps.filter((s) => s.type === "prompt");
 
-After the workflow completes, capture a screenshot:
-\`\`\`powershell
-$body = @{ delay_seconds = ${step.screenshotDelay || 0}; task_id = "{{SESSION_ID}}"; step_index = ${stepNum} } | ConvertTo-Json
-$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
-($response.Content | ConvertFrom-Json).data.screenshot_path
-\`\`\`${step.screenshotDelay && step.screenshotDelay > 0 ? `\n(Wait ${step.screenshotDelay}s before capture for UI to settle.)` : ""}`;
-          }
-          return instruction;
-        } else if (step.type === "playwright") {
-          let instruction = `### Step ${stepNum}: Run Playwright Test "${step.name}"
+    let instructions = "";
 
-**Script ID:** \`${step.playwrightScriptId}\`
-**Target URL:** ${step.playwrightTargetUrl || "(not specified)"}
+    // Note about deterministic steps (their results will be appended by the backend)
+    if (deterministicSteps.length > 0) {
+      instructions += `**Pre-Executed Steps:** The runner has already executed ${deterministicSteps.length} automation step(s) before this session started. The results are shown in the "Pre-Execution Results" section above.\n\n`;
+    }
 
-**EXECUTE NOW** - Run this Playwright test via the runner API:
-\`\`\`powershell
-$response = Invoke-WebRequest -Uri "http://localhost:9876/playwright/scripts/${step.playwrightScriptId}/run" -Method POST -ContentType "application/json" -Body '{}' -UseBasicParsing
-$response.Content | ConvertFrom-Json | ConvertTo-Json -Depth 10
-\`\`\``;
-          if (step.takeScreenshot) {
-            instruction += `
+    // Include prompt step instructions (these are text for the AI to follow)
+    if (promptSteps.length > 0) {
+      const promptInstructions = promptSteps
+        .map((step, index) => {
+          const stepNum = index + 1;
+          return `### Prompt Step ${stepNum}: ${step.name}
 
-After the test completes, capture an additional screenshot:
-\`\`\`powershell
-$body = @{ delay_seconds = ${step.screenshotDelay || 0}; task_id = "{{SESSION_ID}}"; step_index = ${stepNum} } | ConvertTo-Json
-$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
-($response.Content | ConvertFrom-Json).data.screenshot_path
-\`\`\``;
-          }
-          return instruction;
-        } else if (step.type === "prompt") {
-          return `### Step ${stepNum}: Follow Prompt Instructions "${step.name}"
-
-**Instructions from Prompt Library:**
+**Instructions to follow:**
 
 ${step.promptContent || "(No content)"}
 
 ---
-*Execute the instructions above before proceeding to the next step.*`;
-        } else if (step.type === "action" && step.actionType === "click") {
-          let instruction = `### Step ${stepNum}: Click on Image "${step.targetImageName}"
-
-Execute click action via the runner API:
-\`\`\`powershell
-$body = '{"action_type": "click", "image_id": "${step.targetImageId}"}'
-$response = Invoke-WebRequest -Uri "http://localhost:9876/execute-action" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
-$response.Content | ConvertFrom-Json
-\`\`\``;
-          if (step.takeScreenshot) {
-            instruction += `
-
-After the action completes, capture a screenshot:
-\`\`\`powershell
-$body = @{ delay_seconds = ${step.screenshotDelay || 0}; task_id = "{{SESSION_ID}}"; step_index = ${stepNum} } | ConvertTo-Json
-$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
-($response.Content | ConvertFrom-Json).data.screenshot_path
-\`\`\``;
-          }
-          return instruction;
-        } else if (step.type === "screenshot") {
-          const monitorParam = step.screenshotMonitor === "all" ? "null" : step.screenshotMonitor;
-          const monitorDesc =
-            step.screenshotMonitor === "all" ? "all monitors" : `monitor ${step.screenshotMonitor}`;
-          return `### Step ${stepNum}: Capture Screenshot
-
-**Action:** Take screenshot of ${monitorDesc}${step.screenshotDelay && step.screenshotDelay > 0 ? ` (after ${step.screenshotDelay}s delay)` : ""}
-
-Execute via the runner API:
-\`\`\`powershell
-$body = @{
-    monitor = ${monitorParam}
-    delay_seconds = ${step.screenshotDelay || 0}
-    task_id = "{{SESSION_ID}}"
-    step_index = ${stepNum}
-} | ConvertTo-Json
-$response = Invoke-WebRequest -Uri "http://localhost:9876/capture-screenshot" -Method POST -ContentType "application/json" -Body $body -UseBasicParsing
-$result = $response.Content | ConvertFrom-Json
-Write-Host "Screenshot saved: $($result.data.screenshot_path)"
-\`\`\``;
-        } else {
-          return `### Step ${stepNum}: Navigate to State "${step.name}"
-
-Navigate to the state using the MCP tool:
-\`\`\`
-mcp__qontinui__go_to_state with state_names=["${step.name}"], take_screenshot=${step.takeScreenshot}
-\`\`\``;
-        }
-      })
-      .join("\n\n");
-  }, [executionSteps]);
-
-  // Generate log check commands
-  const generateLogCheckCommands = useCallback(() => {
-    const enabledLogSources = (projectLogs.config?.logSources || []).filter((s) => s.enabled);
-    if (enabledLogSources.length > 0) {
-      return enabledLogSources
-        .map(
-          (s) =>
-            `# ${s.name}\nGet-Content "${s.path.replace(/\\/g, "\\\\")}" -Tail ${s.tailLines || 200} | Select-String -Pattern "error|exception|failed" -CaseSensitive:$false | Select-Object -Last 30`,
-        )
+*Follow the instructions above before proceeding.*`;
+        })
         .join("\n\n");
+
+      instructions += promptInstructions;
     }
-    return "# No project logs configured - configure in the Logs tab";
-  }, [projectLogs.config?.logSources]);
+
+    if (!instructions) {
+      instructions =
+        "All execution steps were handled by the runner. Proceed to analyze the results and logs.";
+    }
+
+    return instructions;
+  }, [executionSteps]);
 
   // Generate developer mode prompt
   const generateDeveloperPrompt = useCallback(
     (sessionId: string) => {
       const goalStr = goal.trim() || "Verify automation works correctly";
-      const devLogsEscaped = workspacePaths?.dev_logs_path_escaped || "{{DEV_LOGS_ESCAPED}}";
       const workspaceEscaped = workspacePaths?.workspace_root_escaped || "{{WORKSPACE_ESCAPED}}";
-
-      let logMonitoringSection = "";
-      const enabledLogSources = (projectLogs.config?.logSources || []).filter((s) => s.enabled);
-
-      if (enabledLogSources.length > 0) {
-        logMonitoringSection = `**Log Monitoring:** Enabled (${enabledLogSources.length} sources from Project Logs)
-**Log Sources:**
-${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
-      } else {
-        logMonitoringSection =
-          "**Log Monitoring:** Disabled (only runner logs will be checked)\nConfigure log sources in the Logs tab to enable application log monitoring.";
-      }
 
       return getDeveloperPromptTemplate()
         .replace("{{SESSION_ID}}", sessionId)
@@ -804,20 +730,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
         .replace("{{STEP_COUNT}}", String(executionSteps.length))
         .replace("{{EXECUTION_STEPS}}", generateExecutionInstructions())
         .replace("{{GOAL}}", goalStr)
-        .replace("{{LOG_MONITORING_SECTION}}", logMonitoringSection)
-        .replace("{{LOG_CHECK_COMMANDS}}", generateLogCheckCommands())
-        .replace(/\{\{DEV_LOGS_ESCAPED\}\}/g, devLogsEscaped)
         .replace(/\{\{WORKSPACE_ESCAPED\}\}/g, workspaceEscaped);
     },
-    [
-      goal,
-      workspacePaths,
-      projectLogs.config?.logSources,
-      maxIterations,
-      executionSteps.length,
-      generateExecutionInstructions,
-      generateLogCheckCommands,
-    ],
+    [goal, workspacePaths, maxIterations, executionSteps.length, generateExecutionInstructions],
   );
 
   // Generate prompt for preview
@@ -843,6 +758,10 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     setGoal(workflow.goal);
     setMaxIterations(workflow.max_iterations);
     setCaptureInputValidation(workflow.capture_input_validation);
+    // Restore context state
+    setManuallyAddedContextIds(new Set(workflow.context_ids || []));
+    setDisabledContextIds(new Set(workflow.disabled_context_ids || []));
+    setAutoIncludeContexts(workflow.auto_include_contexts ?? true);
     setShowWorkflowsPanel(false);
     setCurrentWorkflowId(workflow.id);
     setCurrentWorkflowName(workflow.name);
@@ -851,12 +770,45 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     setTimeout(() => setLastResult(null), 3000);
   }, []);
 
+  // Load workflow by ID (when navigating from Library)
+  useEffect(() => {
+    if (!editWorkflowId) return;
+
+    const loadWorkflowById = async () => {
+      try {
+        const response = await fetch(`http://localhost:9876/ai-workflows/${editWorkflowId}`);
+        const result = await response.json();
+        if (result.success && result.data) {
+          loadAiWorkflow(result.data);
+        } else {
+          setLastResult({
+            success: false,
+            message: `Failed to load workflow: ${result.error || "Not found"}`,
+          });
+          setTimeout(() => setLastResult(null), 3000);
+        }
+      } catch (error) {
+        setLastResult({
+          success: false,
+          message: `Error loading workflow: ${error instanceof Error ? error.message : String(error)}`,
+        });
+        setTimeout(() => setLastResult(null), 3000);
+      }
+    };
+
+    loadWorkflowById();
+  }, [editWorkflowId, loadAiWorkflow]);
+
   // Reset to new workflow
   const resetToNewWorkflow = useCallback(() => {
     setExecutionSteps([]);
     setGoal("");
     setMaxIterations(5);
     setCaptureInputValidation(false);
+    // Reset context state to defaults
+    setManuallyAddedContextIds(new Set());
+    setDisabledContextIds(new Set());
+    setAutoIncludeContexts(true);
     setCurrentWorkflowId(null);
     setCurrentWorkflowName("");
     setHasUnsavedChanges(false);
@@ -918,6 +870,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           capture_input_validation: captureInputValidation,
           category: "",
           tags: [],
+          context_ids: Array.from(manuallyAddedContextIds),
+          disabled_context_ids: Array.from(disabledContextIds),
+          auto_include_contexts: autoIncludeContexts,
         }),
       });
 
@@ -945,6 +900,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     goal,
     maxIterations,
     captureInputValidation,
+    manuallyAddedContextIds,
+    disabledContextIds,
+    autoIncludeContexts,
     fetchSavedAiWorkflows,
   ]);
 
@@ -980,6 +938,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           capture_input_validation: captureInputValidation,
           category: "",
           tags: [],
+          context_ids: Array.from(manuallyAddedContextIds),
+          disabled_context_ids: Array.from(disabledContextIds),
+          auto_include_contexts: autoIncludeContexts,
         }),
       });
 
@@ -1013,6 +974,9 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
     goal,
     maxIterations,
     captureInputValidation,
+    manuallyAddedContextIds,
+    disabledContextIds,
+    autoIncludeContexts,
     fetchSavedAiWorkflows,
   ]);
 
@@ -1037,17 +1001,95 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       };
       setHistory((prev) => [historyEntry, ...prev]);
 
+      // Compute context IDs to pass to the backend
+      // Include manually added contexts, exclude disabled ones
+      const contextIdsToSend = Array.from(manuallyAddedContextIds).filter(
+        (id) => !disabledContextIds.has(id),
+      );
+
+      // Auto-add Input Validation Guide context when capture is enabled
+      if (captureInputValidation && !contextIdsToSend.includes("builtin-input-validation")) {
+        contextIdsToSend.push("builtin-input-validation");
+      }
+
+      console.log("[AI_BUILDER] Context IDs to send:", contextIdsToSend);
+      console.log("[AI_BUILDER] Auto-include contexts:", autoIncludeContexts);
+
+      // Generate a sensible task name - prefer workflow name, then extract 2 largest words from first sentence
+      const getTaskName = (): string => {
+        if (currentWorkflowName) return currentWorkflowName;
+        const goalText = goal.trim();
+        if (!goalText) return "AI Builder Session";
+
+        // Get first sentence (split on . ! ? or take whole text if no sentence-ending punctuation)
+        const firstSentence = goalText.split(/[.!?]/)[0].trim();
+
+        // Extract words (alphanumeric sequences, including hyphenated words)
+        const words = firstSentence.match(/[\w-]+/g) || [];
+        if (words.length === 0) return "AI Builder Session";
+        if (words.length === 1) return words[0];
+
+        // Sort by length descending and take the 2 largest
+        const sortedByLength = [...words].sort((a, b) => b.length - a.length);
+        const largest = sortedByLength[0];
+        const secondLargest = sortedByLength[1];
+
+        return `${largest} ${secondLargest}`;
+      };
+
+      // Determine if this session uses GUI (has any execution steps that need GUI)
+      const guiStepTypes = ["workflow", "state", "action", "screenshot"];
+      const usesGui = executionSteps.some((step) => guiStepTypes.includes(step.type));
+
+      // Convert ExecutionStep[] to ExecutionStepConfig[] for deterministic execution
+      // The backend will execute these steps BEFORE spawning the AI session
+      const executionStepsConfig = executionSteps.map((step) => ({
+        type: step.type,
+        name: step.name,
+        actionType: step.actionType || null,
+        targetImageId: step.targetImageId || null,
+        targetImageName: step.targetImageName || null,
+        monitorIndex: null, // TODO: Could add monitor selection per step
+        takeScreenshot: step.takeScreenshot,
+        screenshotDelay: step.screenshotDelay || 0,
+        screenshotMonitor: step.screenshotMonitor ?? null,
+        playwrightScriptId: step.playwrightScriptId || null,
+        promptContent: step.promptContent || null,
+      }));
+
       console.log("[AI_BUILDER] Starting session via unified sessions API...");
+      console.log(
+        "[AI_BUILDER] AI Provider:",
+        aiProvider || "default",
+        "Model:",
+        aiModel || "default",
+      );
+      console.log(
+        "[AI_BUILDER] Execution steps for deterministic execution:",
+        executionStepsConfig.length,
+      );
       const response = await fetch("http://localhost:9876/sessions/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: currentWorkflowName || goal.trim() || "AI Builder Session",
+          name: getTaskName(),
           prompt: prompt,
           continuation_prompt: null,
           total_phases: maxIterations,
-          uses_gui: false,
+          uses_gui: usesGui,
           timeout_seconds: 1800,
+          // Execution steps for deterministic execution before AI spawns
+          execution_steps: executionStepsConfig,
+          // Log sources to capture during execution (user-defined)
+          log_sources: projectLogs.config?.logSources
+            ? convertSourcesToRust(projectLogs.config.logSources.filter((s) => s.enabled))
+            : [],
+          // Context injection parameters
+          context_ids: contextIdsToSend,
+          auto_include_contexts: autoIncludeContexts,
+          // AI provider override
+          provider: aiProvider || null,
+          model: aiModel || null,
         }),
       });
       const result = await response.json();
@@ -1061,6 +1103,8 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
           message: `AI Builder session ${session.id} started!`,
         });
         setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
+        // Navigate to AI Output page after successful start
+        onNavigateToAiOutput?.();
       } else {
         throw new Error(result.error || "Failed to start AI Builder session");
       }
@@ -1078,7 +1122,21 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       });
       setIsRunning(false);
     }
-  }, [generateDeveloperPrompt, executionSteps, goal, maxIterations, currentWorkflowName]);
+  }, [
+    generateDeveloperPrompt,
+    executionSteps,
+    goal,
+    maxIterations,
+    currentWorkflowName,
+    manuallyAddedContextIds,
+    disabledContextIds,
+    autoIncludeContexts,
+    captureInputValidation,
+    aiProvider,
+    aiModel,
+    projectLogs,
+    onNavigateToAiOutput,
+  ]);
 
   // Stop the current session
   const stopSession = useCallback(async () => {
@@ -1277,5 +1335,38 @@ ${enabledLogSources.map((s) => `- ${s.name}: ${s.path}`).join("\n")}`;
       setHasUnsavedChanges(true);
     },
     hasGuiSteps,
+
+    // Context Selection (for prompt composition)
+    manuallyAddedContextIds,
+    disabledContextIds,
+    autoIncludeContexts,
+    setAutoIncludeContexts,
+    addContext: (contextId: string) => {
+      setManuallyAddedContextIds((prev) => new Set([...prev, contextId]));
+    },
+    removeContext: (contextId: string) => {
+      setManuallyAddedContextIds((prev) => {
+        const next = new Set(prev);
+        next.delete(contextId);
+        return next;
+      });
+    },
+    toggleContextDisabled: (contextId: string) => {
+      setDisabledContextIds((prev) => {
+        const next = new Set(prev);
+        if (next.has(contextId)) {
+          next.delete(contextId);
+        } else {
+          next.add(contextId);
+        }
+        return next;
+      });
+    },
+
+    // AI Provider Override
+    aiProvider,
+    setAiProvider,
+    aiModel,
+    setAiModel,
   };
 }

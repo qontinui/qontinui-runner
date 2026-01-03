@@ -189,6 +189,8 @@ pub async fn create_task_run(
             &req.prompt,
             req.max_sessions,
             req.auto_continue,
+            None, // execution_steps_json
+            None, // log_sources_json
         )
         .map(Json)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))

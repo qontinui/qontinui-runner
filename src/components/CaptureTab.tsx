@@ -20,8 +20,12 @@ import {
   Loader2,
   Cloud,
   HardDrive,
+  Package,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import type { Project } from "../types/auth";
+import { DatasetWizardDialog } from "./DatasetWizardDialog";
 
 interface MonitorInfo {
   index: number;
@@ -76,6 +80,12 @@ export function CaptureTab({
   const [captureToWebSuccess, setCaptureToWebSuccess] = useState(false);
   const [captureToWebError, setCaptureToWebError] = useState<string | null>(null);
   const [selectedCaptureMonitor, setSelectedCaptureMonitor] = useState<number>(0);
+
+  // Section collapse state
+  const [localSectionExpanded, setLocalSectionExpanded] = useState(false);
+
+  // Dataset wizard dialog state
+  const [datasetWizardOpen, setDatasetWizardOpen] = useState(false);
 
   useEffect(() => {
     loadMonitors();
@@ -319,15 +329,27 @@ export function CaptureTab({
   return (
     <div className="space-y-6 p-6 overflow-y-auto max-h-[calc(100vh-200px)]">
       {/* Header */}
-      <div className="flex items-center gap-3">
-        <Camera className="w-6 h-6 text-primary" />
-        <div>
-          <h2 className="text-xl font-semibold">Screenshot Capture</h2>
-          <p className="text-sm text-muted-foreground">
-            Capture screenshots for building automation configurations
-          </p>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <Camera className="w-6 h-6 text-primary" />
+          <div>
+            <h2 className="text-xl font-semibold">Capture</h2>
+            <p className="text-sm text-muted-foreground">
+              Capture screenshots for building automation configurations
+            </p>
+          </div>
         </div>
+        <button
+          onClick={() => setDatasetWizardOpen(true)}
+          className="px-4 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md font-medium transition-colors flex items-center gap-2"
+        >
+          <Package className="w-4 h-4" />
+          Package Dataset
+        </button>
       </div>
+
+      {/* Dataset Wizard Dialog */}
+      <DatasetWizardDialog open={datasetWizardOpen} onOpenChange={setDatasetWizardOpen} />
 
       {/* Capture to Web Section */}
       <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">
@@ -439,275 +461,295 @@ export function CaptureTab({
       </div>
 
       {/* Capture to Local Section */}
-      <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <HardDrive className="w-5 h-5 text-primary" />
-          <h3 className="font-semibold text-lg">Capture to Local Folder</h3>
-        </div>
-
-        {captureError && (
-          <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
-            <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-            <span className="text-red-400 text-sm">{captureError}</span>
+      <div className="bg-card rounded-lg border border-border/50">
+        {/* Collapsible Header */}
+        <button
+          onClick={() => setLocalSectionExpanded(!localSectionExpanded)}
+          className="w-full p-6 flex items-center justify-between hover:bg-muted/50 transition-colors rounded-lg"
+        >
+          <div className="flex items-center gap-3">
+            <HardDrive className="w-5 h-5 text-primary" />
+            <h3 className="font-semibold text-lg">Capture to Local Folder</h3>
           </div>
-        )}
+          {localSectionExpanded ? (
+            <ChevronUp className="w-5 h-5 text-muted-foreground" />
+          ) : (
+            <ChevronDown className="w-5 h-5 text-muted-foreground" />
+          )}
+        </button>
 
-        {captureSaveSuccess && (
-          <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
-            <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
-            <span className="text-green-400 text-sm">Capture settings saved!</span>
-          </div>
-        )}
+        {/* Collapsible Content */}
+        {localSectionExpanded && (
+          <div className="px-6 pb-6 space-y-4">
+            {captureError && (
+              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
+                <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+                <span className="text-red-400 text-sm">{captureError}</span>
+              </div>
+            )}
 
-        {/* Enable Toggle */}
-        <div className="space-y-2">
-          <label className="flex items-center justify-between cursor-pointer">
-            <div className="space-y-1">
-              <div className="font-medium">Enable Screenshot Capture</div>
-              <div className="text-sm text-muted-foreground">
-                Automatically capture screenshots on clicks for the configuration builder
+            {captureSaveSuccess && (
+              <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
+                <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
+                <span className="text-green-400 text-sm">Capture settings saved!</span>
+              </div>
+            )}
+
+            {/* Enable Toggle */}
+            <div className="space-y-2">
+              <label className="flex items-center justify-between cursor-pointer">
+                <div className="space-y-1">
+                  <div className="font-medium">Enable Screenshot Capture</div>
+                  <div className="text-sm text-muted-foreground">
+                    Automatically capture screenshots on clicks for the configuration builder
+                  </div>
+                </div>
+                <button
+                  onClick={handleToggleCapture}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                    captureSettings.enabled ? "bg-primary" : "bg-muted"
+                  }`}
+                >
+                  <span
+                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                      captureSettings.enabled ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
+                </button>
+              </label>
+            </div>
+
+            {/* Manual Click Capture */}
+            <div className="space-y-3">
+              <div>
+                <div className="font-medium mb-1">Manual Click Capture</div>
+                <div className="text-sm text-muted-foreground">
+                  Capture screenshots when you physically click on the screen
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                {!manualCaptureRunning ? (
+                  <button
+                    onClick={handleStartManualCapture}
+                    disabled={!captureSettings.enabled || !captureSettings.outputFolder}
+                    className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white rounded transition-colors"
+                    title={
+                      !captureSettings.enabled
+                        ? "Enable capture tool first"
+                        : !captureSettings.outputFolder
+                          ? "Set output folder first"
+                          : "Start capturing screenshots on mouse clicks"
+                    }
+                  >
+                    Start Manual Capture
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleStopManualCapture}
+                    className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
+                  >
+                    Stop Manual Capture
+                  </button>
+                )}
+
+                {manualCaptureRunning && (
+                  <span className="flex items-center gap-2 text-green-600 font-medium">
+                    <span className="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
+                    Listening for clicks...
+                  </span>
+                )}
               </div>
             </div>
-            <button
-              onClick={handleToggleCapture}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                captureSettings.enabled ? "bg-primary" : "bg-muted"
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  captureSettings.enabled ? "translate-x-6" : "translate-x-1"
-                }`}
-              />
-            </button>
-          </label>
-        </div>
 
-        {/* Manual Click Capture */}
-        <div className="space-y-3">
-          <div>
-            <div className="font-medium mb-1">Manual Click Capture</div>
-            <div className="text-sm text-muted-foreground">
-              Capture screenshots when you physically click on the screen
+            {/* Output Folder */}
+            <div className="space-y-2">
+              <label className="block">
+                <div className="font-medium mb-1">Output Folder</div>
+                <div className="text-sm text-muted-foreground mb-3">
+                  Screenshots will be saved to this folder
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={captureSettings.outputFolder}
+                    onChange={(e) =>
+                      setCaptureSettings((prev) => ({ ...prev, outputFolder: e.target.value }))
+                    }
+                    placeholder="/path/to/screenshots"
+                    className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
+                  />
+                  <button
+                    onClick={handleFolderSelect}
+                    className="px-3 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors flex items-center gap-2"
+                  >
+                    <FolderOpen className="w-4 h-4" />
+                    Browse
+                  </button>
+                </div>
+              </label>
             </div>
-          </div>
 
-          <div className="flex items-center gap-3">
-            {!manualCaptureRunning ? (
-              <button
-                onClick={handleStartManualCapture}
-                disabled={!captureSettings.enabled || !captureSettings.outputFolder}
-                className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white rounded transition-colors"
-                title={
-                  !captureSettings.enabled
-                    ? "Enable capture tool first"
-                    : !captureSettings.outputFolder
-                      ? "Set output folder first"
-                      : "Start capturing screenshots on mouse clicks"
-                }
-              >
-                Start Manual Capture
-              </button>
-            ) : (
-              <button
-                onClick={handleStopManualCapture}
-                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
-              >
-                Stop Manual Capture
-              </button>
-            )}
-
-            {manualCaptureRunning && (
-              <span className="flex items-center gap-2 text-green-600 font-medium">
-                <span className="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
-                Listening for clicks...
-              </span>
-            )}
-          </div>
-        </div>
-
-        {/* Output Folder */}
-        <div className="space-y-2">
-          <label className="block">
-            <div className="font-medium mb-1">Output Folder</div>
-            <div className="text-sm text-muted-foreground mb-3">
-              Screenshots will be saved to this folder
+            {/* Base Image Name */}
+            <div className="space-y-2">
+              <label className="block">
+                <div className="font-medium mb-1">Base Image Name</div>
+                <div className="text-sm text-muted-foreground mb-3">
+                  Base name for screenshot files (will be numbered automatically)
+                </div>
+                <input
+                  type="text"
+                  value={captureSettings.baseImageName}
+                  onChange={(e) =>
+                    setCaptureSettings((prev) => ({ ...prev, baseImageName: e.target.value }))
+                  }
+                  placeholder="screenshot"
+                  className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                />
+              </label>
             </div>
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={captureSettings.outputFolder}
-                onChange={(e) =>
-                  setCaptureSettings((prev) => ({ ...prev, outputFolder: e.target.value }))
-                }
-                placeholder="/path/to/screenshots"
-                className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
-              />
-              <button
-                onClick={handleFolderSelect}
-                className="px-3 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors flex items-center gap-2"
-              >
-                <FolderOpen className="w-4 h-4" />
-                Browse
-              </button>
-            </div>
-          </label>
-        </div>
 
-        {/* Base Image Name */}
-        <div className="space-y-2">
-          <label className="block">
-            <div className="font-medium mb-1">Base Image Name</div>
-            <div className="text-sm text-muted-foreground mb-3">
-              Base name for screenshot files (will be numbered automatically)
-            </div>
-            <input
-              type="text"
-              value={captureSettings.baseImageName}
-              onChange={(e) =>
-                setCaptureSettings((prev) => ({ ...prev, baseImageName: e.target.value }))
-              }
-              placeholder="screenshot"
-              className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
-            />
-          </label>
-        </div>
-
-        {/* Screen Selection */}
-        <div className="space-y-2">
-          <div className="font-medium mb-1 flex items-center gap-2">
-            <Monitor className="w-4 h-4" />
-            Screen Selection
-          </div>
-          <div className="text-sm text-muted-foreground mb-3">Choose which screens to capture</div>
-          <div className="flex flex-wrap gap-3">
-            {monitors.length > 0 ? (
-              <>
-                {monitors.map((monitor) => {
-                  const isSelected =
-                    captureSettings.screens.type === "specific" &&
-                    captureSettings.screens.indices?.includes(monitor.index);
-                  return (
+            {/* Screen Selection */}
+            <div className="space-y-2">
+              <div className="font-medium mb-1 flex items-center gap-2">
+                <Monitor className="w-4 h-4" />
+                Screen Selection
+              </div>
+              <div className="text-sm text-muted-foreground mb-3">
+                Choose which screens to capture
+              </div>
+              <div className="flex flex-wrap gap-3">
+                {monitors.length > 0 ? (
+                  <>
+                    {monitors.map((monitor) => {
+                      const isSelected =
+                        captureSettings.screens.type === "specific" &&
+                        captureSettings.screens.indices?.includes(monitor.index);
+                      return (
+                        <label
+                          key={monitor.index}
+                          className={`flex flex-col items-center gap-1 cursor-pointer p-3 rounded-lg border transition-colors min-w-[100px] ${
+                            isSelected
+                              ? "bg-primary/20 border-primary"
+                              : "bg-input border-border/50 hover:border-primary/50"
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            checked={isSelected}
+                            onChange={() => handleScreenSelectionChange("specific", monitor.index)}
+                            className="sr-only"
+                          />
+                          <div className="flex items-center gap-2">
+                            <Monitor className="w-5 h-5" />
+                            <span className="font-medium">
+                              #{monitor.index}
+                              {monitor.is_primary && (
+                                <span className="text-primary ml-1">(primary)</span>
+                              )}
+                            </span>
+                          </div>
+                          <span className="text-xs text-muted-foreground">
+                            {monitor.width}x{monitor.height}
+                          </span>
+                        </label>
+                      );
+                    })}
                     <label
-                      key={monitor.index}
-                      className={`flex flex-col items-center gap-1 cursor-pointer p-3 rounded-lg border transition-colors min-w-[100px] ${
-                        isSelected
+                      className={`flex flex-col items-center justify-center gap-1 cursor-pointer p-3 rounded-lg border transition-colors min-w-[100px] ${
+                        captureSettings.screens.type === "all"
                           ? "bg-primary/20 border-primary"
                           : "bg-input border-border/50 hover:border-primary/50"
                       }`}
                     >
                       <input
                         type="radio"
-                        checked={isSelected}
-                        onChange={() => handleScreenSelectionChange("specific", monitor.index)}
+                        checked={captureSettings.screens.type === "all"}
+                        onChange={() => handleScreenSelectionChange("all")}
                         className="sr-only"
                       />
                       <div className="flex items-center gap-2">
                         <Monitor className="w-5 h-5" />
-                        <span className="font-medium">
-                          #{monitor.index}
-                          {monitor.is_primary && (
-                            <span className="text-primary ml-1">(primary)</span>
-                          )}
-                        </span>
+                        <span className="font-medium">All</span>
                       </div>
                       <span className="text-xs text-muted-foreground">
-                        {monitor.width}x{monitor.height}
+                        {monitors.length} screens
                       </span>
                     </label>
-                  );
-                })}
-                <label
-                  className={`flex flex-col items-center justify-center gap-1 cursor-pointer p-3 rounded-lg border transition-colors min-w-[100px] ${
-                    captureSettings.screens.type === "all"
-                      ? "bg-primary/20 border-primary"
-                      : "bg-input border-border/50 hover:border-primary/50"
-                  }`}
-                >
-                  <input
-                    type="radio"
-                    checked={captureSettings.screens.type === "all"}
-                    onChange={() => handleScreenSelectionChange("all")}
-                    className="sr-only"
-                  />
-                  <div className="flex items-center gap-2">
-                    <Monitor className="w-5 h-5" />
-                    <span className="font-medium">All</span>
-                  </div>
-                  <span className="text-xs text-muted-foreground">{monitors.length} screens</span>
-                </label>
-              </>
-            ) : (
-              <div className="text-sm text-muted-foreground">Loading monitors...</div>
-            )}
-          </div>
-        </div>
-
-        {/* Capture Timings */}
-        <div className="space-y-2">
-          <div className="font-medium mb-1 flex items-center justify-between">
-            <span>Capture Timings (milliseconds)</span>
-            <button
-              onClick={handleAddTiming}
-              className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors flex items-center gap-1 text-sm"
-            >
-              <Plus className="w-3 h-3" />
-              Add Timing
-            </button>
-          </div>
-          <div className="text-sm text-muted-foreground mb-3">
-            Delay after click before taking screenshot (0 = immediate)
-          </div>
-          <div className="space-y-2">
-            {captureSettings.captureTimings.map((timing, index) => (
-              <div key={index} className="flex items-center gap-2">
-                <input
-                  type="number"
-                  min="0"
-                  step="100"
-                  value={timing}
-                  onChange={(e) => handleTimingChange(index, parseInt(e.target.value) || 0)}
-                  className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
-                />
-                <span className="text-sm text-muted-foreground">ms</span>
-                {captureSettings.captureTimings.length > 1 && (
-                  <button
-                    onClick={() => handleRemoveTiming(index)}
-                    className="px-2 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-md transition-colors"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
+                  </>
+                ) : (
+                  <div className="text-sm text-muted-foreground">Loading monitors...</div>
                 )}
               </div>
-            ))}
-          </div>
-        </div>
+            </div>
 
-        {/* Save Button */}
-        <div className="flex justify-end pt-4 border-t border-border/50">
-          <button
-            onClick={saveCaptureSettings}
-            disabled={captureSaving}
-            className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-          >
-            {captureSaving ? (
-              <>
-                <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                Saving...
-              </>
-            ) : captureSaveSuccess ? (
-              <>
-                <Check className="w-4 h-4" />
-                Saved!
-              </>
-            ) : (
-              <>
-                <Camera className="w-4 h-4" />
-                Save Capture Settings
-              </>
-            )}
-          </button>
-        </div>
+            {/* Capture Timings */}
+            <div className="space-y-2">
+              <div className="font-medium mb-1 flex items-center justify-between">
+                <span>Capture Timings (milliseconds)</span>
+                <button
+                  onClick={handleAddTiming}
+                  className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors flex items-center gap-1 text-sm"
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Timing
+                </button>
+              </div>
+              <div className="text-sm text-muted-foreground mb-3">
+                Delay after click before taking screenshot (0 = immediate)
+              </div>
+              <div className="space-y-2">
+                {captureSettings.captureTimings.map((timing, index) => (
+                  <div key={index} className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min="0"
+                      step="100"
+                      value={timing}
+                      onChange={(e) => handleTimingChange(index, parseInt(e.target.value) || 0)}
+                      className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
+                    />
+                    <span className="text-sm text-muted-foreground">ms</span>
+                    {captureSettings.captureTimings.length > 1 && (
+                      <button
+                        onClick={() => handleRemoveTiming(index)}
+                        className="px-2 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-md transition-colors"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Save Button */}
+            <div className="flex justify-end pt-4 border-t border-border/50">
+              <button
+                onClick={saveCaptureSettings}
+                disabled={captureSaving}
+                className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {captureSaving ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                    Saving...
+                  </>
+                ) : captureSaveSuccess ? (
+                  <>
+                    <Check className="w-4 h-4" />
+                    Saved!
+                  </>
+                ) : (
+                  <>
+                    <Camera className="w-4 h-4" />
+                    Save Capture Settings
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

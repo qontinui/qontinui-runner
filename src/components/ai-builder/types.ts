@@ -75,6 +75,12 @@ export interface SavedAiWorkflow {
   capture_input_validation: boolean;
   category: string;
   tags: string[];
+  /** Manually added context IDs */
+  context_ids: string[];
+  /** Disabled context IDs (excluded from auto-include) */
+  disabled_context_ids: string[];
+  /** Whether to auto-include contexts based on task mentions (default: true) */
+  auto_include_contexts: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -174,6 +180,7 @@ export interface ResultMessage {
 export interface AiBuilderTabProps {
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
+  editWorkflowId?: string | null;
 }
 
 /** Shared context for AI Builder state */

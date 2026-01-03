@@ -274,7 +274,7 @@ class TestResultsService:
         response.raise_for_status()
 
         data = response.json()
-        run_id = data["run_id"]
+        run_id: str = data["run_id"]
         logger.info(f"Created test run: {run_id}")
         return run_id
 

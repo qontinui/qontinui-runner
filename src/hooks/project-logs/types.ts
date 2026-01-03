@@ -6,13 +6,14 @@
 
 import type {
   LogSource,
+  LogSourceProfile,
   ProjectLogConfig,
   LogSourceContent,
   ProjectLogsState,
 } from "../../types/projectLogs";
 
 // Re-export domain types for convenience
-export type { LogSource, ProjectLogConfig, LogSourceContent, ProjectLogsState };
+export type { LogSource, LogSourceProfile, ProjectLogConfig, LogSourceContent, ProjectLogsState };
 
 /**
  * Response type from Tauri commands
@@ -34,11 +35,25 @@ export interface ProjectDirectories {
 }
 
 /**
+ * Raw log source profile format from backend (snake_case)
+ */
+export interface RawLogSourceProfile {
+  id: string;
+  name: string;
+  description?: string;
+  log_sources: RawLogSource[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
  * Raw backend config format (snake_case)
  */
 export interface RawBackendConfig {
   project_id: string;
   project_name: string;
+  profiles?: RawLogSourceProfile[];
+  active_profile_id?: string;
   log_sources?: RawLogSource[];
   log_directory: string;
   screenshot_directory: string;
@@ -159,22 +174,45 @@ export interface UseProjectLogsReturn {
 }
 
 /**
+ * Convert raw log source to TypeScript format
+ */
+function convertRawSourceToTypescript(s: RawLogSource): LogSource {
+  return {
+    id: s.id,
+    name: s.name,
+    type: s.type,
+    path: s.path,
+    pattern: s.pattern,
+    tailLines: s.tail_lines,
+    enabled: s.enabled,
+    color: s.color,
+  };
+}
+
+/**
+ * Convert raw profile to TypeScript format
+ */
+function convertRawProfileToTypescript(p: RawLogSourceProfile): LogSourceProfile {
+  return {
+    id: p.id,
+    name: p.name,
+    description: p.description,
+    logSources: p.log_sources.map(convertRawSourceToTypescript),
+    createdAt: p.created_at,
+    updatedAt: p.updated_at,
+  };
+}
+
+/**
  * Convert backend snake_case config to TypeScript camelCase
  */
 export function convertRawConfigToTypescript(raw: RawBackendConfig): ProjectLogConfig {
   return {
     projectId: raw.project_id,
     projectName: raw.project_name,
-    logSources: (raw.log_sources || []).map((s) => ({
-      id: s.id,
-      name: s.name,
-      type: s.type,
-      path: s.path,
-      pattern: s.pattern,
-      tailLines: s.tail_lines,
-      enabled: s.enabled,
-      color: s.color,
-    })),
+    profiles: (raw.profiles || []).map(convertRawProfileToTypescript),
+    activeProfileId: raw.active_profile_id,
+    logSources: (raw.log_sources || []).map(convertRawSourceToTypescript),
     logDirectory: raw.log_directory,
     screenshotDirectory: raw.screenshot_directory,
     aiOutputDirectory: raw.ai_output_directory,

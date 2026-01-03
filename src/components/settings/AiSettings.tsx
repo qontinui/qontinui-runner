@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Bot, Check, X, Play, Eye, EyeOff, Zap, Terminal, Video } from "lucide-react";
+import { Bot, Check, X, Play, Eye, EyeOff, Zap, Terminal, Video, Sparkles } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type {
   AiSettings as AiSettingsType,
   AiProvider,
   CliExecutionMode,
+  GeminiAuthMethod,
   AiConnectionTestResult,
   LogFunction,
 } from "./types";
@@ -34,6 +35,17 @@ const DEFAULT_AI_SETTINGS: AiSettingsType = {
     model: "claude-sonnet-4-20250514",
     max_tokens: 4096,
   },
+  gemini_cli: {
+    execution_mode: "auto",
+    timeout_seconds: 600,
+    auth_method: "oauth",
+    model: "gemini-3-flash",
+  },
+  gemini_api: {
+    model: "gemini-3-flash",
+    max_output_tokens: 8192,
+    temperature: 0.7,
+  },
   auto_refine_video_after_iterations: 3,
 };
 
@@ -47,6 +59,16 @@ const PROVIDER_OPTIONS: { value: AiProvider; label: string; description: string 
     value: "claude_api",
     label: "Claude API",
     description: "Direct API access with per-token billing",
+  },
+  {
+    value: "gemini_cli",
+    label: "Gemini CLI",
+    description: "Google's Gemini CLI with OAuth or API key - free tier available",
+  },
+  {
+    value: "gemini_api",
+    label: "Gemini API",
+    description: "Direct Gemini API access with per-token billing",
   },
 ];
 
@@ -80,6 +102,27 @@ const MODEL_OPTIONS = [
   { value: "claude-3-opus-20240229", label: "Claude 3 Opus" },
 ];
 
+const GEMINI_MODEL_OPTIONS = [
+  { value: "gemini-3-flash", label: "Gemini 3 Flash (Fast/Cheap)" },
+  { value: "gemini-3-pro", label: "Gemini 3 Pro" },
+  { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+  { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+];
+
+const GEMINI_AUTH_OPTIONS: { value: GeminiAuthMethod; label: string; description: string }[] = [
+  {
+    value: "oauth",
+    label: "OAuth (Google Account)",
+    description: "Login with your Google account - 60 req/min, 1000 req/day free",
+  },
+  {
+    value: "api_key",
+    label: "API Key",
+    description: "Use a Gemini API key - 100 req/day free tier",
+  },
+];
+
 export function AiSettings({ onLog }: AiSettingsProps) {
   const [settings, setSettings] = useState<AiSettingsType>(DEFAULT_AI_SETTINGS);
   const [loading, setLoading] = useState(true);
@@ -87,11 +130,17 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // API key state
+  // Claude API key state
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [hasApiKey, setHasApiKey] = useState(false);
   const [savingApiKey, setSavingApiKey] = useState(false);
+
+  // Gemini API key state
+  const [geminiApiKey, setGeminiApiKey] = useState("");
+  const [showGeminiApiKey, setShowGeminiApiKey] = useState(false);
+  const [hasGeminiApiKey, setHasGeminiApiKey] = useState(false);
+  const [savingGeminiApiKey, setSavingGeminiApiKey] = useState(false);
 
   // Connection test state
   const [testing, setTesting] = useState(false);
@@ -100,6 +149,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   useEffect(() => {
     loadSettings();
     checkApiKey();
+    checkGeminiApiKey();
   }, []);
 
   const loadSettings = async () => {
@@ -125,6 +175,26 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
             max_tokens:
               result.data.claude_api?.max_tokens || DEFAULT_AI_SETTINGS.claude_api.max_tokens,
+          },
+          gemini_cli: {
+            execution_mode:
+              result.data.gemini_cli?.execution_mode ||
+              DEFAULT_AI_SETTINGS.gemini_cli!.execution_mode,
+            custom_path: result.data.gemini_cli?.custom_path,
+            timeout_seconds:
+              result.data.gemini_cli?.timeout_seconds ||
+              DEFAULT_AI_SETTINGS.gemini_cli!.timeout_seconds,
+            auth_method:
+              result.data.gemini_cli?.auth_method || DEFAULT_AI_SETTINGS.gemini_cli!.auth_method,
+            model: result.data.gemini_cli?.model || DEFAULT_AI_SETTINGS.gemini_cli!.model,
+          },
+          gemini_api: {
+            model: result.data.gemini_api?.model || DEFAULT_AI_SETTINGS.gemini_api!.model,
+            max_output_tokens:
+              result.data.gemini_api?.max_output_tokens ||
+              DEFAULT_AI_SETTINGS.gemini_api!.max_output_tokens,
+            temperature:
+              result.data.gemini_api?.temperature ?? DEFAULT_AI_SETTINGS.gemini_api!.temperature,
           },
           auto_refine_video_after_iterations:
             result.data.auto_refine_video_after_iterations ??
@@ -154,12 +224,26 @@ export function AiSettings({ onLog }: AiSettingsProps) {
     }
   };
 
+  const checkGeminiApiKey = async () => {
+    try {
+      const result = await invoke<TauriResult<HasApiKeyData>>("has_ai_api_key", {
+        provider: "gemini_api",
+      });
+      if (result && result.success && result.data) {
+        setHasGeminiApiKey(result.data.has_key || false);
+      }
+    } catch (err) {
+      console.error("Failed to check Gemini API key:", err);
+    }
+  };
+
   const saveSettings = async () => {
     try {
       setSaving(true);
       setError(null);
       setSaveSuccess(false);
 
+      // Save Claude/general settings
       const result = await invoke<TauriResult<null>>("save_ai_settings", {
         provider: settings.provider,
         executionMode: settings.claude_cli.execution_mode,
@@ -170,14 +254,33 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
       });
 
-      if (result && result.success) {
+      if (!result || !result.success) {
+        const errorMsg = result?.message || "Unknown error";
+        setError(errorMsg);
+        onLog("error", `Failed to save AI settings: ${errorMsg}`);
+        return;
+      }
+
+      // Also save Gemini settings
+      const geminiResult = await invoke<TauriResult<null>>("save_gemini_settings", {
+        cliExecutionMode: settings.gemini_cli?.execution_mode || "auto",
+        cliCustomPath: settings.gemini_cli?.custom_path || null,
+        cliTimeoutSeconds: settings.gemini_cli?.timeout_seconds || 600,
+        cliAuthMethod: settings.gemini_cli?.auth_method || "oauth",
+        cliModel: settings.gemini_cli?.model || "gemini-3-flash",
+        apiModel: settings.gemini_api?.model || "gemini-3-flash",
+        apiMaxOutputTokens: settings.gemini_api?.max_output_tokens || 8192,
+        apiTemperature: settings.gemini_api?.temperature ?? 0.7,
+      });
+
+      if (geminiResult && geminiResult.success) {
         setSaveSuccess(true);
         onLog("success", "AI settings saved successfully");
         setTimeout(() => setSaveSuccess(false), 3000);
       } else {
-        const errorMsg = result?.message || "Unknown error";
+        const errorMsg = geminiResult?.message || "Unknown error";
         setError(errorMsg);
-        onLog("error", `Failed to save AI settings: ${errorMsg}`);
+        onLog("error", `Failed to save Gemini settings: ${errorMsg}`);
       }
     } catch (err) {
       console.error("Failed to save AI settings:", err);
@@ -239,6 +342,60 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       console.error("Failed to delete API key:", err);
       setError(`Failed to delete API key: ${err}`);
       onLog("error", `Failed to delete API key: ${err}`);
+    }
+  };
+
+  const saveGeminiApiKey = async () => {
+    if (!geminiApiKey.trim()) {
+      onLog("warning", "Please enter a Gemini API key");
+      return;
+    }
+
+    try {
+      setSavingGeminiApiKey(true);
+      setError(null);
+
+      const result = await invoke<TauriResult<null>>("save_ai_api_key_command", {
+        provider: "gemini_api",
+        apiKey: geminiApiKey.trim(),
+      });
+
+      if (result && result.success) {
+        setHasGeminiApiKey(true);
+        setGeminiApiKey(""); // Clear the input after saving
+        onLog("success", "Gemini API key saved securely");
+      } else {
+        const errorMsg = result?.message || "Unknown error";
+        setError(errorMsg);
+        onLog("error", `Failed to save Gemini API key: ${errorMsg}`);
+      }
+    } catch (err) {
+      console.error("Failed to save Gemini API key:", err);
+      setError(`Failed to save Gemini API key: ${err}`);
+      onLog("error", `Failed to save Gemini API key: ${err}`);
+    } finally {
+      setSavingGeminiApiKey(false);
+    }
+  };
+
+  const deleteGeminiApiKey = async () => {
+    try {
+      const result = await invoke<TauriResult<null>>("delete_ai_api_key_command", {
+        provider: "gemini_api",
+      });
+
+      if (result && result.success) {
+        setHasGeminiApiKey(false);
+        onLog("info", "Gemini API key deleted");
+      } else {
+        const errorMsg = result?.message || "Unknown error";
+        setError(errorMsg);
+        onLog("error", `Failed to delete Gemini API key: ${errorMsg}`);
+      }
+    } catch (err) {
+      console.error("Failed to delete Gemini API key:", err);
+      setError(`Failed to delete Gemini API key: ${err}`);
+      onLog("error", `Failed to delete Gemini API key: ${err}`);
     }
   };
 
@@ -540,6 +697,280 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         </div>
       )}
 
+      {/* Gemini CLI Settings */}
+      {settings.provider === "gemini_cli" && (
+        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+          <h4 className="font-semibold text-lg flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-primary" />
+            Gemini CLI Settings
+          </h4>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="block font-medium">Authentication Method</label>
+              <div className="space-y-3">
+                {GEMINI_AUTH_OPTIONS.map((option) => (
+                  <label
+                    key={option.value}
+                    className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                      settings.gemini_cli?.auth_method === option.value
+                        ? "border-primary bg-primary/5"
+                        : "border-border/50 hover:border-primary/50"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="gemini_auth"
+                      value={option.value}
+                      checked={settings.gemini_cli?.auth_method === option.value}
+                      onChange={() =>
+                        setSettings((prev) => ({
+                          ...prev,
+                          gemini_cli: {
+                            ...prev.gemini_cli!,
+                            auth_method: option.value,
+                          },
+                        }))
+                      }
+                      className="mt-1 accent-primary"
+                    />
+                    <div className="space-y-1">
+                      <div className="font-medium text-sm">{option.label}</div>
+                      <div className="text-xs text-muted-foreground">{option.description}</div>
+                    </div>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block font-medium">Model</label>
+              <select
+                value={settings.gemini_cli?.model || "gemini-3-flash"}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    gemini_cli: {
+                      ...prev.gemini_cli!,
+                      model: e.target.value,
+                    },
+                  }))
+                }
+                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+              >
+                {GEMINI_MODEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block font-medium">Execution Mode</label>
+              <select
+                value={settings.gemini_cli?.execution_mode || "auto"}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    gemini_cli: {
+                      ...prev.gemini_cli!,
+                      execution_mode: e.target.value as CliExecutionMode,
+                    },
+                  }))
+                }
+                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+              >
+                {EXECUTION_MODE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block font-medium">Timeout (seconds)</label>
+              <input
+                type="number"
+                min="60"
+                max="3600"
+                value={settings.gemini_cli?.timeout_seconds || 600}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    gemini_cli: {
+                      ...prev.gemini_cli!,
+                      timeout_seconds: Math.max(
+                        60,
+                        Math.min(3600, parseInt(e.target.value) || 600),
+                      ),
+                    },
+                  }))
+                }
+                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+              />
+            </div>
+
+            <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+              <div className="text-sm text-blue-400">
+                <strong>Tip:</strong> Install Gemini CLI with:{" "}
+                <code className="bg-blue-500/20 px-1 rounded">
+                  npm install -g @google/gemini-cli
+                </code>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Gemini API Settings */}
+      {settings.provider === "gemini_api" && (
+        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+          <h4 className="font-semibold text-lg flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-primary" />
+            Gemini API Settings
+          </h4>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="block font-medium">API Key</label>
+              {hasGeminiApiKey ? (
+                <div className="flex items-center gap-2">
+                  <div className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md text-muted-foreground">
+                    Gemini API key configured securely
+                  </div>
+                  <button
+                    onClick={deleteGeminiApiKey}
+                    className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors"
+                  >
+                    Delete
+                  </button>
+                </div>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <div className="relative flex-1">
+                    <input
+                      type={showGeminiApiKey ? "text" : "password"}
+                      value={geminiApiKey}
+                      onChange={(e) => setGeminiApiKey(e.target.value)}
+                      placeholder="AIza..."
+                      className="w-full px-3 py-2 pr-10 bg-input border border-border/50 rounded-md"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowGeminiApiKey(!showGeminiApiKey)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    >
+                      {showGeminiApiKey ? (
+                        <EyeOff className="w-4 h-4" />
+                      ) : (
+                        <Eye className="w-4 h-4" />
+                      )}
+                    </button>
+                  </div>
+                  <button
+                    onClick={saveGeminiApiKey}
+                    disabled={savingGeminiApiKey || !geminiApiKey.trim()}
+                    className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50"
+                  >
+                    {savingGeminiApiKey ? "Saving..." : "Save Key"}
+                  </button>
+                </div>
+              )}
+              <p className="text-sm text-muted-foreground">
+                Get your API key from{" "}
+                <a
+                  href="https://aistudio.google.com/app/apikey"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-primary hover:underline"
+                >
+                  Google AI Studio
+                </a>
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block font-medium">Model</label>
+              <select
+                value={settings.gemini_api?.model || "gemini-3-flash"}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    gemini_api: {
+                      ...prev.gemini_api!,
+                      model: e.target.value,
+                    },
+                  }))
+                }
+                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+              >
+                {GEMINI_MODEL_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="space-y-2">
+              <label className="block font-medium">Max Output Tokens</label>
+              <input
+                type="number"
+                min="256"
+                max="32768"
+                value={settings.gemini_api?.max_output_tokens || 8192}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    gemini_api: {
+                      ...prev.gemini_api!,
+                      max_output_tokens: Math.max(
+                        256,
+                        Math.min(32768, parseInt(e.target.value) || 8192),
+                      ),
+                    },
+                  }))
+                }
+                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="block font-medium">Temperature</label>
+              <input
+                type="number"
+                min="0"
+                max="2"
+                step="0.1"
+                value={settings.gemini_api?.temperature ?? 0.7}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    gemini_api: {
+                      ...prev.gemini_api!,
+                      temperature: Math.max(0, Math.min(2, parseFloat(e.target.value) || 0.7)),
+                    },
+                  }))
+                }
+                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+              />
+              <p className="text-sm text-muted-foreground">
+                Controls randomness (0 = deterministic, 2 = very creative).
+              </p>
+            </div>
+
+            <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+              <div className="text-sm text-green-400">
+                <strong>Cost Savings:</strong> Gemini Flash is significantly cheaper than Claude for
+                simple tasks like linting and formatting.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Auto-Refine Defaults */}
       <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
         <h4 className="font-semibold text-lg flex items-center gap-2">
@@ -590,7 +1021,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
         <button
           onClick={testConnection}
-          disabled={testing || (settings.provider === "claude_api" && !hasApiKey)}
+          disabled={
+            testing ||
+            (settings.provider === "claude_api" && !hasApiKey) ||
+            (settings.provider === "gemini_api" && !hasGeminiApiKey)
+          }
           className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 flex items-center gap-2"
         >
           {testing ? (

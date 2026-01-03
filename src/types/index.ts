@@ -188,9 +188,12 @@ export type {
   VerificationResult,
   VerificationHistoryItem,
   VerificationPlan,
+  SavedVerification,
+  CreateSavedVerificationRequest,
+  UpdateSavedVerificationRequest,
 } from "./verification-agent";
 
-export { getDefaultVerificationConfig } from "./verification-agent";
+export { getDefaultVerificationConfig, getDefaultSavedVerification } from "./verification-agent";
 
 // Statistics types (Tiered Information Model for dashboard)
 export type {

@@ -40,8 +40,6 @@ export type { ProjectSelectionState } from "./useProjectSelection";
 export { useProjectLogs } from "./project-logs";
 export type { UseProjectLogsReturn } from "./project-logs";
 
-export { useRagProcessing } from "./useRagProcessing";
-
 export { useInitialStatesOverride } from "./useInitialStatesOverride";
 export type { UseInitialStatesOverrideReturn } from "./useInitialStatesOverride";
 

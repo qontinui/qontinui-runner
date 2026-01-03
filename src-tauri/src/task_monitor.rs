@@ -318,10 +318,13 @@ impl TaskMonitor {
         Ok((content, file_size))
     }
 
-    /// Check if a task's output contains [TASK_COMPLETE]
+    /// Check if a task's output contains [TASK_COMPLETE] on its own line
+    /// This prevents false positives like "I should NOT output [TASK_COMPLETE] yet"
     #[allow(dead_code)]
     pub fn check_for_completion(output: &str) -> bool {
-        output.contains(TASK_COMPLETE_MARKER)
+        output
+            .lines()
+            .any(|line| line.trim() == TASK_COMPLETE_MARKER)
     }
 
     /// Check if output contains context warning patterns
@@ -417,13 +420,25 @@ mod tests {
 
     #[test]
     fn test_check_for_completion() {
-        assert!(TaskMonitor::check_for_completion(
+        // Marker must be on its own line (not embedded in text)
+        // This prevents false positives like "I should NOT output [TASK_COMPLETE] yet"
+        assert!(!TaskMonitor::check_for_completion(
             "Some output [TASK_COMPLETE] more text"
-        ));
+        )); // Marker embedded in line - should NOT match
+        assert!(!TaskMonitor::check_for_completion(
+            "I should NOT output [TASK_COMPLETE] yet"
+        )); // The bug that triggered this fix
         assert!(TaskMonitor::check_for_completion("[TASK_COMPLETE]"));
         assert!(TaskMonitor::check_for_completion(
             "Done!\n[TASK_COMPLETE]\n"
-        ));
+        )); // On its own line - should match
+        assert!(TaskMonitor::check_for_completion(
+            "Some work done\n[TASK_COMPLETE]"
+        )); // On its own line at end - should match
+        assert!(TaskMonitor::check_for_completion(
+            "[TASK_COMPLETE]\nMore text after"
+        )); // On its own line at start - should match
+        assert!(TaskMonitor::check_for_completion("  [TASK_COMPLETE]  ")); // With whitespace padding - should match (trimmed)
         assert!(!TaskMonitor::check_for_completion(
             "Some output without marker"
         ));

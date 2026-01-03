@@ -92,8 +92,9 @@ export interface UpdateInfo {
 export type UpdateStatus = "idle" | "checking" | "downloading" | "installing" | "error";
 
 // AI Settings Types
-export type AiProvider = "claude_cli" | "claude_api";
+export type AiProvider = "claude_cli" | "claude_api" | "gemini_cli" | "gemini_api";
 export type CliExecutionMode = "auto" | "windows_native" | "wsl" | "native";
+export type GeminiAuthMethod = "oauth" | "api_key";
 
 export interface ClaudeCliSettings {
   execution_mode: CliExecutionMode;
@@ -106,10 +107,26 @@ export interface ClaudeApiSettings {
   max_tokens: number;
 }
 
+export interface GeminiCliSettings {
+  execution_mode: CliExecutionMode;
+  custom_path?: string;
+  timeout_seconds: number;
+  auth_method: GeminiAuthMethod;
+  model: string;
+}
+
+export interface GeminiApiSettings {
+  model: string;
+  max_output_tokens: number;
+  temperature: number;
+}
+
 export interface AiSettings {
   provider: AiProvider;
   claude_cli: ClaudeCliSettings;
   claude_api: ClaudeApiSettings;
+  gemini_cli?: GeminiCliSettings;
+  gemini_api?: GeminiApiSettings;
   /** Default iteration threshold for including video in auto-refine (0 = never) */
   auto_refine_video_after_iterations: number;
 }

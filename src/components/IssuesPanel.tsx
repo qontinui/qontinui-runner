@@ -22,6 +22,7 @@ import {
   Trash2,
   Bot,
   Loader2,
+  Activity,
 } from "lucide-react";
 import {
   SEVERITY_CONFIG,
@@ -32,6 +33,7 @@ import {
 import { useIssues, useAiTaskPolling } from "../hooks";
 import type { UnifiedStatus } from "../services/UnifiedReportService";
 import { issueTracker } from "../services/IssueTracker";
+import { useRunSelectionOptional } from "../contexts/RunSelectionContext";
 
 // Component is self-contained with expand/collapse functionality
 type IssuesPanelProps = Record<string, never>;
@@ -136,6 +138,23 @@ export function IssuesPanel(_props: IssuesPanelProps) {
 
   const [expandedIssues, setExpandedIssues] = useState<Set<string>>(new Set());
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+
+  // Use RunSelectionContext if available
+  const runSelection = useRunSelectionOptional();
+  const selectedRun = runSelection?.selectedRun;
+
+  // No run selected state (when context is present but no run selected)
+  if (runSelection && !selectedRun) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
+        <Activity className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-medium">No Run Selected</p>
+        <p className="text-sm mt-2 text-center max-w-md">
+          Select a run from the Run Dashboard to view issues.
+        </p>
+      </div>
+    );
+  }
 
   const toggleExpanded = useCallback((issueId: string) => {
     setExpandedIssues((prev) => {

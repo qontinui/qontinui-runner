@@ -691,6 +691,8 @@ mod tests {
             category: String::new(),
             tags: vec![],
             max_sessions: Some(5),
+            provider: None,
+            model: None,
             created_at: String::new(),
             modified_at: String::new(),
         };
@@ -712,6 +714,8 @@ mod tests {
             category: String::new(),
             tags: vec![],
             max_sessions: None,
+            provider: None,
+            model: None,
             created_at: String::new(),
             modified_at: String::new(),
         };

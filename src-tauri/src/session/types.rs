@@ -69,6 +69,14 @@ pub struct SessionConfig {
     /// Custom configuration data
     #[serde(default)]
     pub custom_config: serde_json::Value,
+
+    /// AI provider override (e.g., "claude_cli", "gemini_api")
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// AI model override (e.g., "claude-sonnet-4-20250514", "gemini-2.0-flash")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Default for SessionConfig {
@@ -83,6 +91,8 @@ impl Default for SessionConfig {
             name: "Unnamed Session".to_string(),
             description: String::new(),
             custom_config: serde_json::json!({}),
+            provider: None,
+            model: None,
         }
     }
 }

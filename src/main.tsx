@@ -1,11 +1,22 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import ErrorBoundary from "./ErrorBoundary";
 import "./index.css";
 
 // Add debugging
 console.log("Main.tsx loaded");
+
+// Create a client for react-query
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60, // 1 minute
+      retry: 1,
+    },
+  },
+});
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {
@@ -15,9 +26,11 @@ if (!rootElement) {
   console.log("Root element found, rendering app...");
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
-      <ErrorBoundary>
-        <App />
-      </ErrorBoundary>
+      <QueryClientProvider client={queryClient}>
+        <ErrorBoundary>
+          <App />
+        </ErrorBoundary>
+      </QueryClientProvider>
     </React.StrictMode>,
   );
 }

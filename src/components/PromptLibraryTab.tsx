@@ -38,9 +38,50 @@ interface SavedPrompt {
   tags: string[];
   /** Optional limit on number of sessions (null = unlimited). Sessions continue until [TASK_COMPLETE] is found. */
   max_sessions: number | null;
+  /** Optional AI provider override (e.g., "gemini_api", "claude_cli") */
+  provider?: string | null;
+  /** Optional AI model override (e.g., "gemini-3-flash") */
+  model?: string | null;
   created_at: string;
   modified_at: string;
 }
+
+// Provider options for the UI
+const PROVIDER_OPTIONS = [
+  { value: "", label: "Use Default (from Settings)" },
+  { value: "claude_cli", label: "Claude CLI" },
+  { value: "claude_api", label: "Claude API" },
+  { value: "gemini_cli", label: "Gemini CLI" },
+  { value: "gemini_api", label: "Gemini API" },
+];
+
+// Model options per provider
+const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
+  claude_cli: [
+    { value: "", label: "Default" },
+    { value: "claude-sonnet-4", label: "Claude Sonnet 4" },
+    { value: "claude-opus-4", label: "Claude Opus 4" },
+  ],
+  claude_api: [
+    { value: "", label: "Default" },
+    { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+    { value: "claude-opus-4-20250514", label: "Claude Opus 4" },
+  ],
+  gemini_cli: [
+    { value: "", label: "Default" },
+    { value: "gemini-3-flash", label: "Gemini 3 Flash (Fast/Cheap)" },
+    { value: "gemini-3-pro", label: "Gemini 3 Pro" },
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  ],
+  gemini_api: [
+    { value: "", label: "Default" },
+    { value: "gemini-3-flash", label: "Gemini 3 Flash (Fast/Cheap)" },
+    { value: "gemini-3-pro", label: "Gemini 3 Pro" },
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  ],
+};
 
 // Types for unified sessions
 interface SessionCheckpoint {
@@ -198,6 +239,18 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     return saved?.formMaxSessions;
   });
 
+  // Optional provider override
+  const [formProvider, setFormProvider] = useState<string>(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formProvider ?? "";
+  });
+
+  // Optional model override
+  const [formModel, setFormModel] = useState<string>(() => {
+    const saved = loadPersistedCreateForm();
+    return saved?.formModel ?? "";
+  });
+
   // Running state
   const [runningPromptId, setRunningPromptId] = useState<string | null>(null);
 
@@ -240,13 +293,25 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
         formCategory,
         formTags,
         formMaxSessions,
+        formProvider,
+        formModel,
       };
       localStorage.setItem(CREATE_FORM_STORAGE_KEY, JSON.stringify(formState));
     } else {
       // Clear persisted state when not creating
       localStorage.removeItem(CREATE_FORM_STORAGE_KEY);
     }
-  }, [isCreating, formName, formDescription, formContent, formCategory, formTags, formMaxSessions]);
+  }, [
+    isCreating,
+    formName,
+    formDescription,
+    formContent,
+    formCategory,
+    formTags,
+    formMaxSessions,
+    formProvider,
+    formModel,
+  ]);
 
   const loadPrompts = useCallback(async () => {
     setLoading(true);
@@ -313,6 +378,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             .map((t) => t.trim())
             .filter((t) => t),
           max_sessions: formMaxSessions ?? null,
+          provider: formProvider || null,
+          model: formModel || null,
         }),
       });
       const result = await response.json();
@@ -348,6 +415,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             .map((t) => t.trim())
             .filter((t) => t),
           max_sessions: formMaxSessions ?? null,
+          provider: formProvider || null,
+          model: formModel || null,
         }),
       });
       const result = await response.json();
@@ -577,6 +646,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     setFormCategory("");
     setFormTags("");
     setFormMaxSessions(undefined);
+    setFormProvider("");
+    setFormModel("");
   };
 
   // Start editing a prompt/task
@@ -588,6 +659,8 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
     setFormCategory(prompt.category);
     setFormTags(prompt.tags.join(", "));
     setFormMaxSessions(prompt.max_sessions ?? undefined);
+    setFormProvider(prompt.provider ?? "");
+    setFormModel(prompt.model ?? "");
     setIsCreating(false);
   };
 
@@ -797,6 +870,54 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
             </p>
           </div>
 
+          {/* AI Provider Override (Optional) */}
+          <div className="border border-border rounded-lg p-4 space-y-4">
+            <div className="flex items-center gap-2">
+              <Sparkles className="w-4 h-4 text-primary" />
+              <label className="text-sm font-medium">AI Provider Override (optional)</label>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs text-muted-foreground mb-1">Provider</label>
+                <select
+                  value={formProvider}
+                  onChange={(e) => {
+                    setFormProvider(e.target.value);
+                    setFormModel(""); // Reset model when provider changes
+                  }}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                >
+                  {PROVIDER_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {formProvider && MODELS_BY_PROVIDER[formProvider] && (
+                <div>
+                  <label className="block text-xs text-muted-foreground mb-1">Model</label>
+                  <select
+                    value={formModel}
+                    onChange={(e) => setFormModel(e.target.value)}
+                    className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50 text-sm"
+                  >
+                    {MODELS_BY_PROVIDER[formProvider].map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Override the default AI provider for this task. Use Gemini Flash for fast,
+              cost-effective tasks like linting. Leave empty to use the provider configured in
+              Settings.
+            </p>
+          </div>
+
           <div className="flex justify-end gap-2">
             <button
               onClick={() => {
@@ -924,6 +1045,13 @@ function TaskCard({
             {task.max_sessions && (
               <span className="px-2 py-0.5 text-xs bg-blue-500/10 text-blue-500 rounded-full">
                 Max {task.max_sessions} sessions
+              </span>
+            )}
+            {task.provider && (
+              <span className="px-2 py-0.5 text-xs bg-purple-500/10 text-purple-500 rounded-full flex items-center gap-1">
+                <Sparkles className="w-3 h-3" />
+                {task.provider.replace("_", " ")}
+                {task.model && ` / ${task.model}`}
               </span>
             )}
           </div>

@@ -591,11 +591,18 @@ class QontinuiExecutor:
         Returns:
             Dict with 'success' key
         """
+        import asyncio
+
         if not self.gui_automation:
             return {"success": False, "error": "GUI automation not initialized"}
 
         try:
-            success = self.gui_automation.execute_workflow(workflow_id, transition_context)
+            # Run async workflow in sync context
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                self.gui_automation.execute_workflow(workflow_id, transition_context), loop
+            )
+            success = future.result(timeout=600)  # 10 minute timeout for workflows
             return {"success": success}
         except Exception as e:
             self.event_manager.emit_log("error", f"Workflow execution failed: {e}")
@@ -807,8 +814,14 @@ class QontinuiExecutor:
                 else:
                     self.executor_core.state_executor.initialize()
 
-            # Execute workflow
-            success = self.gui_automation.execute_workflow(workflow_id)
+            # Execute workflow (async method called from sync context)
+            import asyncio
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                self.gui_automation.execute_workflow(workflow_id), loop
+            )
+            success = future.result(timeout=600)  # 10 minute timeout for workflows
 
             self.event_manager.emit_event(
                 EventType.EXECUTION_COMPLETED,
@@ -906,34 +919,47 @@ class QontinuiExecutor:
             # Emit workflow_started
             self.event_manager.emit_tree_event("workflow_started", nav_node, None)
 
-            # Navigate
-            result = navigation_api.open_state(target_state_id)
+            # IMPORTANT: Set is_running=True so navigation workflows can execute actions
+            # Without this, the gui_automation._execute_workflow_internal method will skip
+            # all actions because it checks `if not self.is_running: break`
+            was_running = self.is_running
+            self.is_running = True
+            self.gui_automation.set_running(True)
 
-            # Update node status
-            success = result.get("success", False) if isinstance(result, dict) else result
-            nav_node.status = "completed" if success else "failed"
-            if not success:
-                nav_node.error = (
-                    result.get("error", "Navigation failed")
-                    if isinstance(result, dict)
-                    else "Navigation failed"
+            # Navigate
+            try:
+                result = navigation_api.open_state(target_state_id)
+
+                # Update node status
+                success = result.get("success", False) if isinstance(result, dict) else result
+                nav_node.status = "completed" if success else "failed"
+                if not success:
+                    nav_node.error = (
+                        result.get("error", "Navigation failed")
+                        if isinstance(result, dict)
+                        else "Navigation failed"
+                    )
+
+                # Emit completion
+                self.event_manager.emit_tree_event(
+                    "workflow_completed" if success else "workflow_failed", nav_node, None
                 )
 
-            # Emit completion
-            self.event_manager.emit_tree_event(
-                "workflow_completed" if success else "workflow_failed", nav_node, None
-            )
-
-            return {
-                "success": success,
-                "target_state": target_state_id,
-                "active_states": (
-                    self.executor_core.state_executor.get_active_states()
-                    if self.executor_core.state_executor
-                    else []
-                ),
-                "path": result.get("path", []) if isinstance(result, dict) else [],
-            }
+                return {
+                    "success": success,
+                    "target_state": target_state_id,
+                    "active_states": (
+                        self.executor_core.state_executor.get_active_states()
+                        if self.executor_core.state_executor
+                        else []
+                    ),
+                    "path": result.get("path", []) if isinstance(result, dict) else [],
+                }
+            finally:
+                # Restore is_running state after navigation
+                if not was_running:
+                    self.is_running = False
+                    self.gui_automation.set_running(False)
         except Exception as e:
             logger.error(f"Failed to navigate to state {target_state_id}: {e}")
 
@@ -1130,12 +1156,18 @@ class QontinuiExecutor:
             }
 
             try:
+                import asyncio
+
                 # Set monitor if provided
                 if self.executor_core.state_executor and monitor_index is not None:
                     self.executor_core.state_executor.set_monitor(monitor_index)
 
-                # Execute the action
-                success = self.gui_automation.execute_action(action_data)
+                # Execute the action (async method called from sync context)
+                loop = self._get_or_create_async_loop()
+                future = asyncio.run_coroutine_threadsafe(
+                    self.gui_automation.execute_action(action_data), loop
+                )
+                success = future.result(timeout=120)  # 2 minute timeout for single actions
 
                 self.event_manager.emit_log(
                     "info" if success else "warning",
@@ -1303,7 +1335,9 @@ class QontinuiExecutor:
             return {"success": True}
 
         elif cmd_type == "navigate_to_state":
-            return self.navigate_to_state(params.get("state_id"))
+            # Support both "target_state_id" (from Rust action_service) and "state_id" (legacy)
+            state_id = params.get("target_state_id") or params.get("state_id")
+            return self.navigate_to_state(state_id)
 
         # Web extraction commands
         elif cmd_type == "start_web_extraction":
@@ -1986,14 +2020,21 @@ class QontinuiExecutor:
                 dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs" / "verification"
                 verification_service.set_screenshot_directory(dev_logs_dir)
 
-            # Detect states
+            # Detect states (async method called from sync context)
+            import asyncio
+
             state_ids = params.get("state_ids", [])
             monitor_index = params.get("monitor_index")
 
-            result = verification_service.detect_current_states(
-                state_ids=state_ids,
-                monitor_index=monitor_index,
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                verification_service.detect_current_states(
+                    state_ids=state_ids,
+                    monitor_index=monitor_index,
+                ),
+                loop,
             )
+            result = future.result(timeout=120)  # 2 minute timeout
 
             self.event_manager.emit_log(
                 "info",
@@ -2081,16 +2122,23 @@ class QontinuiExecutor:
                 config=self.config,
             )
 
-            # Verify elements
+            # Verify elements (async method called from sync context)
+            import asyncio
+
             expected_elements = params.get("expected_elements", [])
             unexpected_elements = params.get("unexpected_elements", [])
             monitor_index = params.get("monitor_index")
 
-            result = verification_service.verify_elements(
-                expected_elements=expected_elements,
-                unexpected_elements=unexpected_elements,
-                monitor_index=monitor_index,
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                verification_service.verify_elements(
+                    expected_elements=expected_elements,
+                    unexpected_elements=unexpected_elements,
+                    monitor_index=monitor_index,
+                ),
+                loop,
             )
+            result = future.result(timeout=120)  # 2 minute timeout
 
             self.event_manager.emit_log(
                 "info",

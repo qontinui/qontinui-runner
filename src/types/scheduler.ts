@@ -38,6 +38,62 @@ export interface ScheduleInterval {
 export type ScheduleExpression = ScheduleOnce | ScheduleCron | ScheduleInterval;
 
 // ============================================================================
+// Schedule Conditions
+// ============================================================================
+
+/**
+ * Condition that requires the runner to be idle
+ */
+export interface IdleCondition {
+  enabled: boolean;
+}
+
+/**
+ * A single repository to monitor for inactivity
+ */
+export interface RepositoryWatch {
+  /** Path to the repository directory */
+  path: string;
+  /** Minutes of inactivity required before condition is met */
+  inactive_minutes: number;
+}
+
+/**
+ * Condition that requires repositories to have no file modifications
+ */
+export interface RepositoryInactiveCondition {
+  enabled: boolean;
+  /** List of repositories to watch (ALL must be inactive for condition to be met) */
+  repositories: RepositoryWatch[];
+}
+
+/**
+ * Conditions that must ALL be met before task execution
+ */
+export interface ScheduleConditions {
+  /** Require runner to be idle (not executing workflows or AI tasks) */
+  require_idle?: IdleCondition;
+  /** Require repository file inactivity */
+  require_repo_inactive?: RepositoryInactiveCondition;
+  /** Maximum time to wait for conditions (minutes). Undefined = wait indefinitely */
+  timeout_minutes?: number;
+}
+
+/**
+ * Status of condition checking for a deferred task
+ */
+export interface ConditionStatus {
+  /** Time when conditions started being checked (ISO 8601) */
+  waiting_since: string;
+  /** Current idle condition status */
+  idle_met?: boolean;
+  /** Current repo inactive status per repository: [path, is_inactive] */
+  repo_inactive_met?: Array<[string, boolean]>;
+  /** Whether timeout has been exceeded */
+  timed_out: boolean;
+}
+
+// ============================================================================
 // Task Type Definitions
 // ============================================================================
 
@@ -152,6 +208,10 @@ export interface ScheduledTask {
   last_run?: TaskExecutionRecord;
   /** Next scheduled run time (computed) */
   next_run?: string;
+  /** Optional conditions that must be met before execution */
+  conditions?: ScheduleConditions;
+  /** Status when task is waiting for conditions to be met */
+  condition_status?: ConditionStatus;
 }
 
 // ============================================================================
@@ -210,6 +270,7 @@ export interface CreateScheduledTaskRequest {
   skip_if_completed?: boolean;
   auto_fix_on_failure?: boolean;
   success_criteria?: string;
+  conditions?: ScheduleConditions;
 }
 
 /**
@@ -224,6 +285,7 @@ export interface UpdateScheduledTaskRequest {
   skip_if_completed?: boolean;
   auto_fix_on_failure?: boolean;
   success_criteria?: string | null;
+  conditions?: ScheduleConditions | null;
 }
 
 // ============================================================================
@@ -363,4 +425,78 @@ export function getTimeUntilNextRun(task: ScheduledTask): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Check if a task is currently waiting for conditions
+ */
+export function isWaitingForConditions(task: ScheduledTask): boolean {
+  return task.condition_status !== undefined && task.condition_status !== null;
+}
+
+/**
+ * Check if a task has any enabled conditions
+ */
+export function hasConditions(task: ScheduledTask): boolean {
+  if (!task.conditions) return false;
+
+  const idleEnabled = task.conditions.require_idle?.enabled ?? false;
+  const repoEnabled =
+    task.conditions.require_repo_inactive?.enabled === true &&
+    (task.conditions.require_repo_inactive?.repositories?.length ?? 0) > 0;
+
+  return idleEnabled || repoEnabled;
+}
+
+/**
+ * Get a human-readable description of conditions
+ */
+export function describeConditions(conditions: ScheduleConditions): string {
+  const parts: string[] = [];
+
+  if (conditions.require_idle?.enabled) {
+    parts.push("Wait for idle");
+  }
+
+  if (conditions.require_repo_inactive?.enabled) {
+    const repos = conditions.require_repo_inactive.repositories;
+    if (repos.length === 1) {
+      parts.push(`Wait for repo inactive (${repos[0].inactive_minutes}min)`);
+    } else if (repos.length > 1) {
+      parts.push(`Wait for ${repos.length} repos inactive`);
+    }
+  }
+
+  if (conditions.timeout_minutes) {
+    parts.push(`timeout: ${conditions.timeout_minutes}min`);
+  }
+
+  return parts.length > 0 ? parts.join(", ") : "No conditions";
+}
+
+/**
+ * Get condition status display text
+ */
+export function getConditionStatusText(status: ConditionStatus): string {
+  if (status.timed_out) {
+    return "Timed out";
+  }
+
+  const parts: string[] = [];
+
+  if (status.idle_met !== undefined) {
+    parts.push(status.idle_met ? "Idle" : "Waiting for idle");
+  }
+
+  if (status.repo_inactive_met) {
+    const inactive = status.repo_inactive_met.filter(([, met]) => met).length;
+    const total = status.repo_inactive_met.length;
+    if (inactive === total) {
+      parts.push("Repos inactive");
+    } else {
+      parts.push(`Repos: ${inactive}/${total} inactive`);
+    }
+  }
+
+  return parts.length > 0 ? parts.join(", ") : "Checking conditions...";
 }

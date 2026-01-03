@@ -1,0 +1,343 @@
+/**
+ * RunSelector Component
+ *
+ * A dropdown component for selecting runs from recent run history.
+ * Shows run status, workflow name, timestamp, and duration.
+ */
+
+import { useState, useRef, useEffect } from "react";
+import {
+  ChevronDown,
+  CheckCircle,
+  XCircle,
+  Clock,
+  AlertCircle,
+  Loader2,
+  Activity,
+  Timer,
+  Trash2,
+} from "lucide-react";
+import { useRunSelection } from "../../contexts/RunSelectionContext";
+import type { RunDetails, RunStatus } from "../../types/statistics";
+
+interface RunSelectorProps {
+  /** Additional class name */
+  className?: string;
+  /** Whether to show the "View Current" option during execution */
+  showCurrentOption?: boolean;
+}
+
+// Status icon and color mapping
+const statusConfig: Record<
+  RunStatus,
+  { icon: typeof CheckCircle; color: string; bgColor: string; label: string }
+> = {
+  running: {
+    icon: Loader2,
+    color: "text-blue-400",
+    bgColor: "bg-blue-500/10",
+    label: "Running",
+  },
+  completed: {
+    icon: CheckCircle,
+    color: "text-green-400",
+    bgColor: "bg-green-500/10",
+    label: "Completed",
+  },
+  failed: {
+    icon: XCircle,
+    color: "text-red-400",
+    bgColor: "bg-red-500/10",
+    label: "Failed",
+  },
+  timeout: {
+    icon: Timer,
+    color: "text-orange-400",
+    bgColor: "bg-orange-500/10",
+    label: "Timeout",
+  },
+  cancelled: {
+    icon: AlertCircle,
+    color: "text-slate-400",
+    bgColor: "bg-slate-500/10",
+    label: "Cancelled",
+  },
+};
+
+/**
+ * Format duration from milliseconds to human-readable string
+ */
+function formatDuration(ms: number | undefined): string {
+  if (!ms) return "-";
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m`;
+  } else if (minutes > 0) {
+    return `${minutes}m ${seconds % 60}s`;
+  } else {
+    return `${seconds}s`;
+  }
+}
+
+/**
+ * Format timestamp to relative or absolute time
+ */
+function formatTimestamp(timestamp: string): string {
+  const date = new Date(timestamp);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMinutes = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMinutes / 60);
+  const diffDays = Math.floor(diffHours / 24);
+
+  if (diffMinutes < 1) return "Just now";
+  if (diffMinutes < 60) return `${diffMinutes}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+
+  return date.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+  });
+}
+
+/**
+ * Single run item in the dropdown
+ */
+function RunItem({
+  run,
+  isSelected,
+  onClick,
+}: {
+  run: RunDetails;
+  isSelected: boolean;
+  onClick: () => void;
+}) {
+  const config = statusConfig[run.status];
+  const StatusIcon = config.icon;
+  const isRunning = run.status === "running";
+
+  return (
+    <button
+      onClick={onClick}
+      className={`
+        w-full flex items-center gap-3 px-3 py-2 text-left transition-colors
+        ${isSelected ? "bg-primary/10" : "hover:bg-muted/50"}
+      `}
+    >
+      {/* Status Icon */}
+      <div className={`p-1 rounded ${config.bgColor}`}>
+        <StatusIcon className={`w-4 h-4 ${config.color} ${isRunning ? "animate-spin" : ""}`} />
+      </div>
+
+      {/* Run Info */}
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium truncate">
+            {run.workflow_name || "Unknown Workflow"}
+          </span>
+          {isRunning && (
+            <span className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">
+              In Progress
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{formatTimestamp(run.started_at)}</span>
+          {run.duration_ms && (
+            <>
+              <span>·</span>
+              <span>{formatDuration(run.duration_ms)}</span>
+            </>
+          )}
+          {run.actions_summary && (
+            <>
+              <span>·</span>
+              <span>{run.actions_summary.total} actions</span>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Selection Indicator */}
+      {isSelected && <CheckCircle className="w-4 h-4 text-primary flex-shrink-0" />}
+    </button>
+  );
+}
+
+export function RunSelector({ className = "", showCurrentOption = true }: RunSelectorProps) {
+  const {
+    selectedRunId,
+    selectedRun,
+    setSelectedRunId,
+    recentRuns,
+    isLoadingRuns,
+    configId,
+    clearSelection,
+    hasRunInProgress,
+  } = useRunSelection();
+
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  // No config loaded state
+  if (!configId) {
+    return (
+      <div
+        className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
+      >
+        <Activity className="w-4 h-4" />
+        <span className="text-sm">Load a workflow config to view runs</span>
+      </div>
+    );
+  }
+
+  // Loading state
+  if (isLoadingRuns && recentRuns.length === 0) {
+    return (
+      <div
+        className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
+      >
+        <Loader2 className="w-4 h-4 animate-spin" />
+        <span className="text-sm">Loading runs...</span>
+      </div>
+    );
+  }
+
+  // No runs state
+  if (recentRuns.length === 0) {
+    return (
+      <div
+        className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
+      >
+        <Clock className="w-4 h-4" />
+        <span className="text-sm">No runs yet. Execute a workflow to see data.</span>
+      </div>
+    );
+  }
+
+  // Get display info for selected run
+  const displayRun = selectedRun || recentRuns.find((r) => r.id === selectedRunId);
+  const config = displayRun ? statusConfig[displayRun.status] : null;
+  const StatusIcon = config?.icon || Activity;
+
+  return (
+    <div ref={dropdownRef} className={`relative ${className}`}>
+      {/* Dropdown Trigger */}
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className={`
+          w-full flex items-center gap-3 px-3 py-2 bg-card border border-border rounded-lg
+          hover:bg-muted/30 transition-colors
+          ${isOpen ? "ring-2 ring-primary ring-offset-2 ring-offset-background" : ""}
+        `}
+      >
+        {/* Selected Run Icon */}
+        {displayRun && config ? (
+          <div className={`p-1 rounded ${config.bgColor}`}>
+            <StatusIcon
+              className={`w-4 h-4 ${config.color} ${displayRun.status === "running" ? "animate-spin" : ""}`}
+            />
+          </div>
+        ) : (
+          <div className="p-1 rounded bg-muted">
+            <Activity className="w-4 h-4 text-muted-foreground" />
+          </div>
+        )}
+
+        {/* Selected Run Info */}
+        <div className="flex-1 min-w-0 text-left">
+          {displayRun ? (
+            <>
+              <div className="text-sm font-medium truncate">
+                {displayRun.workflow_name || "Unknown Workflow"}
+              </div>
+              <div className="text-xs text-muted-foreground">
+                {formatTimestamp(displayRun.started_at)}
+                {displayRun.duration_ms && ` · ${formatDuration(displayRun.duration_ms)}`}
+              </div>
+            </>
+          ) : (
+            <span className="text-sm text-muted-foreground">Select a run</span>
+          )}
+        </div>
+
+        {/* Dropdown Arrow */}
+        <ChevronDown
+          className={`w-4 h-4 text-muted-foreground transition-transform ${isOpen ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {/* Dropdown Menu */}
+      {isOpen && (
+        <div className="absolute z-50 mt-1 w-full bg-popover border border-border rounded-lg shadow-lg overflow-hidden">
+          {/* Current Run Option */}
+          {showCurrentOption && hasRunInProgress && (
+            <>
+              <button
+                onClick={() => {
+                  const runningRun = recentRuns.find((r) => r.status === "running");
+                  if (runningRun) {
+                    setSelectedRunId(runningRun.id);
+                  }
+                  setIsOpen(false);
+                }}
+                className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/50 border-b border-border"
+              >
+                <div className="p-1 rounded bg-blue-500/10">
+                  <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                </div>
+                <span className="text-sm font-medium text-blue-400">Current Run (In Progress)</span>
+              </button>
+            </>
+          )}
+
+          {/* Run List */}
+          <div className="max-h-64 overflow-y-auto">
+            {recentRuns.map((run) => (
+              <RunItem
+                key={run.id}
+                run={run}
+                isSelected={run.id === selectedRunId}
+                onClick={() => {
+                  setSelectedRunId(run.id);
+                  setIsOpen(false);
+                }}
+              />
+            ))}
+          </div>
+
+          {/* Clear Selection Option */}
+          {selectedRunId && (
+            <button
+              onClick={() => {
+                clearSelection();
+                setIsOpen(false);
+              }}
+              className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/50 border-t border-border text-muted-foreground"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span className="text-sm">Clear Selection</span>
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default RunSelector;

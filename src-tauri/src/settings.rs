@@ -16,6 +16,8 @@ pub enum AiProvider {
     #[default]
     ClaudeCli, // Claude Code CLI (subscription-based, recommended)
     ClaudeApi, // Claude API (per-token billing)
+    GeminiCli, // Gemini CLI (OAuth or API key auth)
+    GeminiApi, // Gemini API (direct HTTP calls)
 }
 
 /// CLI execution mode for Claude Code
@@ -64,12 +66,66 @@ impl Default for ClaudeApiSettings {
     }
 }
 
+/// Authentication method for Gemini CLI
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GeminiAuthMethod {
+    #[default]
+    OAuth, // Google Account OAuth (60 req/min, 1000 req/day free)
+    ApiKey, // API Key via GEMINI_API_KEY env var (100 req/day free)
+}
+
+/// Settings for Gemini CLI execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiCliSettings {
+    pub execution_mode: CliExecutionMode,
+    pub custom_path: Option<String>, // Custom path to gemini executable
+    pub timeout_seconds: u64,
+    pub auth_method: GeminiAuthMethod,
+    pub model: String, // Model to use (e.g., "gemini-2.5-flash")
+}
+
+impl Default for GeminiCliSettings {
+    fn default() -> Self {
+        Self {
+            execution_mode: CliExecutionMode::Auto,
+            custom_path: None,
+            timeout_seconds: 600,
+            auth_method: GeminiAuthMethod::OAuth,
+            model: "gemini-3-flash".to_string(),
+        }
+    }
+}
+
+/// Settings for Gemini API (direct HTTP calls)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeminiApiSettings {
+    pub model: String,
+    pub max_output_tokens: u32,
+    pub temperature: f32,
+    // Note: API key stored separately in OS keychain
+}
+
+impl Default for GeminiApiSettings {
+    fn default() -> Self {
+        Self {
+            model: "gemini-3-flash".to_string(),
+            max_output_tokens: 8192,
+            temperature: 0.7,
+        }
+    }
+}
+
 /// Complete AI settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiSettings {
     pub provider: AiProvider,
     pub claude_cli: ClaudeCliSettings,
     pub claude_api: ClaudeApiSettings,
+    #[serde(default)]
+    pub gemini_cli: GeminiCliSettings,
+    #[serde(default)]
+    pub gemini_api: GeminiApiSettings,
     /// Default iteration threshold for including video in auto-refine (0 = never)
     #[serde(default = "default_auto_refine_video_after_iterations")]
     pub auto_refine_video_after_iterations: u32,
@@ -85,6 +141,8 @@ impl Default for AiSettings {
             provider: AiProvider::default(),
             claude_cli: ClaudeCliSettings::default(),
             claude_api: ClaudeApiSettings::default(),
+            gemini_cli: GeminiCliSettings::default(),
+            gemini_api: GeminiApiSettings::default(),
             auto_refine_video_after_iterations: default_auto_refine_video_after_iterations(),
         }
     }

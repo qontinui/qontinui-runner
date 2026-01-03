@@ -3,12 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   TestTube,
   Plus,
-  Search,
   Play,
-  Trash2,
-  Copy,
-  Tag,
-  FolderOpen,
   Save,
   X,
   Loader2,
@@ -17,12 +12,8 @@ import {
   Code,
   FileText,
   Globe,
-  Clock,
   CheckCircle,
-  XCircle,
-  Monitor,
   ChevronDown,
-  ChevronUp,
   Sparkles,
   RefreshCw,
   Info,
@@ -43,6 +34,10 @@ type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
 interface ScriptBuilderTabProps {
   onLog: (level: LogLevel, message: string) => void;
+  /** Optional script ID to load for editing (from Library navigation) */
+  editScriptId?: string | null;
+  /** Callback when user wants to go back to library */
+  onNavigateToLibrary?: () => void;
 }
 
 const API_BASE = "http://localhost:9876";
@@ -58,12 +53,16 @@ test('example test', async ({ page }) => {
 });
 `;
 
-export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
+export function ScriptBuilderTab({
+  onLog,
+  editScriptId,
+  onNavigateToLibrary,
+}: ScriptBuilderTabProps) {
   // State
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [_loading, setLoading] = useState(false);
+  const [searchQuery, _setSearchQuery] = useState("");
+  const [selectedCategory, _setSelectedCategory] = useState<string | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
 
   // Storage key for persisting create form state
@@ -153,7 +152,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
 
   // Execution state
   const [_executingScriptId, setExecutingScriptId] = useState<string | null>(null);
-  const [executionState, setExecutionState] = useState<ScriptExecutionState>("idle");
+  const [_executionState, setExecutionState] = useState<ScriptExecutionState>("idle");
   const [executionResult, setExecutionResult] = useState<PlaywrightResult | null>(null);
 
   // AI generation state
@@ -163,17 +162,17 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   const [refinementPrompt, setRefinementPrompt] = useState("");
 
   // Auto-refinement loop state
-  const [isAutoRefining, setIsAutoRefining] = useState(false);
-  const [autoRefineIteration, setAutoRefineIteration] = useState(0);
+  const [_isAutoRefining, setIsAutoRefining] = useState(false);
+  const [_autoRefineIteration, setAutoRefineIteration] = useState(0);
   const [autoRefineMaxIterations, setAutoRefineMaxIterations] = useState(() => {
     const saved = localStorage.getItem("qontinui-autorefine-max-iterations");
     return saved !== null ? parseInt(saved, 10) : 10;
   });
-  const [autoRefineLog, setAutoRefineLog] = useState<string[]>([]);
+  const [_autoRefineLog, setAutoRefineLog] = useState<string[]>([]);
   const autoRefineAbortRef = useRef(false);
 
   // Cumulative stats across all auto-refine iterations
-  const [autoRefineCumulativeStats, setAutoRefineCumulativeStats] = useState({
+  const [_autoRefineCumulativeStats, setAutoRefineCumulativeStats] = useState({
     totalRuns: 0,
     totalPassed: 0,
     totalFailed: 0,
@@ -183,7 +182,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
 
   // User hint for auto-refine - gets included in next AI call
   const [autoRefineUserHint, setAutoRefineUserHint] = useState("");
-  const [hintQueued, setHintQueued] = useState(false);
+  const [_hintQueued, setHintQueued] = useState(false);
 
   // Visual context settings for auto-refine (persisted to localStorage)
   const [includeScreenshot, setIncludeScreenshot] = useState(() => {
@@ -300,7 +299,7 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   ]);
 
   // Description regeneration state
-  const [isRegeneratingDescription, setIsRegeneratingDescription] = useState(false);
+  const [_isRegeneratingDescription, setIsRegeneratingDescription] = useState(false);
   const [descriptionPreview, setDescriptionPreview] = useState<string | null>(null);
   const [showDescriptionPreview, setShowDescriptionPreview] = useState(false);
 
@@ -453,22 +452,59 @@ export function ScriptBuilderTab({ onLog }: ScriptBuilderTabProps) {
   }, [formAiInstructions, editingScript]);
 
   // Expanded sections in execution result
-  const [expandedSpecs, setExpandedSpecs] = useState<Set<number>>(new Set());
+  const [_expandedSpecs, _setExpandedSpecs] = useState<Set<number>>(new Set());
 
   // Show screenshot in execution result
-  const [showScreenshot, setShowScreenshot] = useState(true);
-  const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
-  const [screenshotLoading, setScreenshotLoading] = useState(false);
-  const [screenshotError, setScreenshotError] = useState<string | null>(null);
+  const [_showScreenshot, _setShowScreenshot] = useState(true);
+  const [_screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
+  const [_screenshotLoading, setScreenshotLoading] = useState(false);
+  const [_screenshotError, setScreenshotError] = useState<string | null>(null);
 
   // Expanded script for viewing details
-  const [expandedScriptId, setExpandedScriptId] = useState<string | null>(null);
+  const [_expandedScriptId, setExpandedScriptId] = useState<string | null>(null);
 
   // Load scripts on mount
   useEffect(() => {
     loadScripts();
     loadCategories();
   }, []);
+
+  // Load script for editing when editScriptId is provided
+  useEffect(() => {
+    if (editScriptId) {
+      const loadScriptForEditing = async () => {
+        try {
+          const response = await fetch(`${API_BASE}/playwright/scripts/${editScriptId}`);
+          const result = await response.json();
+          if (result.success && result.data) {
+            const script = result.data;
+            setEditingScript(script);
+            setIsCreating(true);
+            setFormName(script.name || "");
+            setFormDescription(script.description || "");
+            setFormAiInstructions(script.ai_instructions || "");
+            setFormTargetUrl(script.target_url || "");
+            setFormScriptContent(script.script_content || DEFAULT_SCRIPT_CONTENT);
+            setFormCategory(script.category || "");
+            setFormTags(script.tags?.join(", ") || "");
+            setFormTimeoutSeconds(script.timeout_seconds || 60);
+            setFormDisplayMode(script.display_mode || "headless");
+            setFormBrowser(script.browser || "chromium");
+            setFormWorkflowObjective(script.workflow_objective || "");
+            setFormSuccessCriteria(script.success_criteria || []);
+            setFormIsWorkflowAutomation(script.is_workflow_automation || false);
+            setViewMode(script.description ? "natural_language" : "code");
+            onLog("info", `Loaded script for editing: ${script.name}`);
+          } else {
+            onLog("error", `Failed to load script: ${result.error || "Script not found"}`);
+          }
+        } catch (error) {
+          onLog("error", `Failed to load script: ${error}`);
+        }
+      };
+      loadScriptForEditing();
+    }
+  }, [editScriptId]);
 
   // Load screenshot when execution result changes
   useEffect(() => {
@@ -701,7 +737,7 @@ test('${formName || "test"}', async ({ page }) => {
     }
   };
 
-  const deleteScript = async (id: string) => {
+  const _deleteScript = async (id: string) => {
     if (!confirm("Are you sure you want to delete this script?")) return;
     try {
       const response = await fetch(`${API_BASE}/playwright/scripts/${id}`, {
@@ -719,7 +755,7 @@ test('${formName || "test"}', async ({ page }) => {
     }
   };
 
-  const duplicateScript = async (id: string) => {
+  const _duplicateScript = async (id: string) => {
     try {
       const response = await fetch(`${API_BASE}/playwright/scripts/${id}/duplicate`, {
         method: "POST",
@@ -1047,7 +1083,7 @@ Be thorough - check each action, assertion, and behavior mentioned in the descri
   };
 
   // Refine script based on test results
-  const refineScript = async () => {
+  const _refineScript = async () => {
     if (!refinementPrompt.trim() && !executionResult?.error) {
       onLog("warning", "Please describe how to improve the script");
       return;
@@ -1668,7 +1704,7 @@ import { test, expect } from '@playwright/test';
   };
 
   // Stop auto-refinement loop
-  const stopAutoRefine = async () => {
+  const _stopAutoRefine = async () => {
     autoRefineAbortRef.current = true;
     setIsAutoRefining(false);
     setIsGenerating(false);
@@ -1739,7 +1775,7 @@ import { test, expect } from '@playwright/test';
   };
 
   // Regenerate description from code using AI
-  const regenerateDescriptionFromCode = async () => {
+  const _regenerateDescriptionFromCode = async () => {
     if (!formScriptContent || !formScriptContent.includes("test(")) {
       onLog("warning", "No valid script content to analyze");
       return;
@@ -1849,7 +1885,7 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     setViewMode("natural_language");
   };
 
-  const startEditing = (script: PlaywrightScript) => {
+  const _startEditing = (script: PlaywrightScript) => {
     descriptionChangedByUser.current = false; // Reset flag when loading a script
     nameChangedByUser.current = false; // Reset flag when loading a script
     aiInstructionsChangedByUser.current = false; // Reset flag when loading a script
@@ -1871,14 +1907,14 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     setIsCreating(false);
   };
 
-  const startCreating = () => {
+  const _startCreating = () => {
     resetForm();
     setEditingScript(null);
     setIsCreating(true);
   };
 
   // Filter scripts
-  const filteredScripts = scripts.filter((s) => {
+  const _filteredScripts = scripts.filter((s) => {
     const matchesSearch =
       !searchQuery ||
       s.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -1891,16 +1927,47 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     return matchesSearch && matchesCategory;
   });
 
+  // Always show the form (either creating new or editing)
+  // If not explicitly creating/editing, start with a new script form
+  useEffect(() => {
+    if (!editScriptId && !isCreating && !editingScript) {
+      setIsCreating(true);
+    }
+  }, []);
+
   return (
     <div className="p-6 space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
+          {onNavigateToLibrary && (
+            <button
+              onClick={onNavigateToLibrary}
+              className="p-2 hover:bg-muted rounded-lg transition-colors"
+              title="Back to Library"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          )}
           <TestTube className="w-6 h-6 text-green-500" />
-          <h2 className="text-xl font-semibold">Playwright Script Builder</h2>
-          <span className="text-sm text-muted-foreground">({scripts.length} scripts)</span>
+          <h2 className="text-xl font-semibold">
+            {editingScript ? `Editing: ${editingScript.name}` : "New Playwright Script"}
+          </h2>
         </div>
         <div className="flex items-center gap-2">
+          {editingScript && (
+            <button
+              onClick={() => {
+                setEditingScript(null);
+                resetForm();
+                setIsCreating(true);
+              }}
+              className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
+            >
+              <Plus className="w-4 h-4" />
+              New Script
+            </button>
+          )}
           <button
             onClick={importScripts}
             className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
@@ -1915,44 +1982,11 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             <Download className="w-4 h-4" />
             Export
           </button>
-          <button
-            onClick={startCreating}
-            className="btn-primary flex items-center gap-2 px-3 py-2 text-sm"
-          >
-            <Plus className="w-4 h-4" />
-            New Script
-          </button>
         </div>
       </div>
 
-      {/* Search and Filter */}
-      <div className="flex items-center gap-4">
-        <div className="relative flex-1">
-          <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-          <input
-            type="text"
-            placeholder="Search scripts..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-10 pr-4 py-2 bg-card border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-          />
-        </div>
-        <select
-          value={selectedCategory || ""}
-          onChange={(e) => setSelectedCategory(e.target.value || null)}
-          className="px-4 py-2 bg-card border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/50"
-        >
-          <option value="">All Categories</option>
-          {categories.map((cat) => (
-            <option key={cat} value={cat}>
-              {cat}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Create New Script Form (only for new scripts) */}
-      {isCreating && (
+      {/* Script Builder Form - Always visible */}
+      {(isCreating || editingScript) && (
         <div className="card p-6 space-y-4 border-2 border-green-500/30">
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold flex items-center gap-2">
@@ -2472,941 +2506,6 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
               </button>
             </div>
           </div>
-        </div>
-      )}
-
-      {/* Script List */}
-      {loading ? (
-        <div className="flex items-center justify-center py-12">
-          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-        </div>
-      ) : filteredScripts.length === 0 ? (
-        <div className="text-center py-12 text-muted-foreground">
-          <TestTube className="w-12 h-12 mx-auto mb-3 opacity-50" />
-          <p>{searchQuery || selectedCategory ? "No matching scripts found" : "No scripts yet"}</p>
-          <p className="text-sm">Create a new script to get started</p>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {filteredScripts.map((script) => (
-            <div key={script.id} className="card p-4 hover:border-border/80 transition-colors">
-              <div className="flex items-start justify-between">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2">
-                    <h3 className="font-medium">{script.name}</h3>
-                    {script.last_result && (
-                      <span
-                        className={`px-2 py-0.5 text-xs rounded ${
-                          script.last_result.passed
-                            ? "bg-green-500/20 text-green-500"
-                            : "bg-red-500/20 text-red-500"
-                        }`}
-                      >
-                        {script.last_result.passed ? "Passed" : "Failed"}
-                      </span>
-                    )}
-                    {script.category && (
-                      <span className="px-2 py-0.5 text-xs bg-card rounded flex items-center gap-1">
-                        <FolderOpen className="w-3 h-3" />
-                        {script.category}
-                      </span>
-                    )}
-                  </div>
-                  {script.description && (
-                    <p className="text-sm text-muted-foreground mt-1 line-clamp-2">
-                      {script.description}
-                    </p>
-                  )}
-                  <div className="flex items-center gap-4 mt-2 text-xs text-muted-foreground">
-                    {script.target_url && (
-                      <span className="flex items-center gap-1">
-                        <Globe className="w-3 h-3" />
-                        {script.target_url}
-                      </span>
-                    )}
-                    <span className="flex items-center gap-1">
-                      <Monitor className="w-3 h-3" />
-                      {script.browser}
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <Clock className="w-3 h-3" />
-                      {script.timeout_seconds}s
-                    </span>
-                    {script.tags.length > 0 && (
-                      <span className="flex items-center gap-1">
-                        <Tag className="w-3 h-3" />
-                        {script.tags.join(", ")}
-                      </span>
-                    )}
-                  </div>
-                </div>
-                <div className="flex items-center gap-1">
-                  <button
-                    onClick={() => duplicateScript(script.id)}
-                    className="p-2 hover:bg-card rounded"
-                    title="Duplicate"
-                  >
-                    <Copy className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={() => deleteScript(script.id)}
-                    className="p-2 hover:bg-card rounded text-red-500"
-                    title="Delete"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (expandedScriptId === script.id) {
-                        setExpandedScriptId(null);
-                        setEditingScript(null);
-                        resetForm();
-                      } else {
-                        setExpandedScriptId(script.id);
-                        startEditing(script);
-                      }
-                    }}
-                    className="p-2 hover:bg-card rounded"
-                    title={expandedScriptId === script.id ? "Collapse" : "Expand & Edit"}
-                  >
-                    {expandedScriptId === script.id ? (
-                      <ChevronUp className="w-4 h-4" />
-                    ) : (
-                      <ChevronDown className="w-4 h-4" />
-                    )}
-                  </button>
-                </div>
-              </div>
-
-              {/* Expanded edit form */}
-              {expandedScriptId === script.id && editingScript?.id === script.id && (
-                <div className="mt-4 pt-4 border-t border-border space-y-4">
-                  {/* View Mode Toggle */}
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center bg-card border border-border rounded-lg p-1">
-                      <button
-                        onClick={() => setViewMode("natural_language")}
-                        className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
-                          viewMode === "natural_language"
-                            ? "bg-green-500/20 text-green-500"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        <FileText className="w-4 h-4" />
-                        Description
-                      </button>
-                      <button
-                        onClick={() => setViewMode("code")}
-                        className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
-                          viewMode === "code"
-                            ? "bg-green-500/20 text-green-500"
-                            : "text-muted-foreground hover:text-foreground"
-                        }`}
-                      >
-                        <Code className="w-4 h-4" />
-                        Code
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Name *</label>
-                      <input
-                        type="text"
-                        value={formName}
-                        onChange={(e) => {
-                          nameChangedByUser.current = true;
-                          setFormName(e.target.value);
-                        }}
-                        placeholder="Login Flow Test"
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Target URL</label>
-                      <div className="relative">
-                        <Globe className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                        <input
-                          type="text"
-                          value={formTargetUrl}
-                          onChange={(e) => setFormTargetUrl(e.target.value)}
-                          placeholder="http://localhost:3000"
-                          className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                        />
-                      </div>
-                    </div>
-                  </div>
-
-                  {viewMode === "natural_language" ? (
-                    <div>
-                      <div className="flex items-center justify-between mb-1">
-                        <label className="block text-sm font-medium">
-                          Description (Natural Language)
-                        </label>
-                        <div className="flex items-center gap-2">
-                          <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
-                          <button
-                            onClick={generateScript}
-                            disabled={isGenerating || !formDescription.trim()}
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                          >
-                            {isGenerating ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                                Generating...
-                              </>
-                            ) : (
-                              <>
-                                <Sparkles className="w-4 h-4" />
-                                Generate Script
-                              </>
-                            )}
-                          </button>
-                        </div>
-                      </div>
-                      <div className="relative">
-                        <textarea
-                          ref={descriptionTextareaRef}
-                          value={formDescription}
-                          onChange={(e) => {
-                            descriptionChangedByUser.current = true;
-                            setFormDescription(e.target.value);
-                          }}
-                          onKeyDown={scriptletMention.handleKeyDown}
-                          onInput={scriptletMention.handleInput}
-                          placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)"
-                          rows={4}
-                          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                        />
-                        {/* @-mention popup for scriptlet insertion */}
-                        {scriptletMention.isActive && (
-                          <ScriptletSelector
-                            mode="popup"
-                            onSelect={scriptletMention.handleSelect}
-                            onClose={scriptletMention.handleClose}
-                            searchQuery={scriptletMention.searchQuery}
-                            position={scriptletMention.position}
-                          />
-                        )}
-                      </div>
-
-                      {/* AI Instructions (optional) */}
-                      <div className="mt-3">
-                        <label className="block text-sm font-medium mb-1 flex items-center gap-2">
-                          <Sparkles className="w-3 h-3 text-purple-500" />
-                          AI Instructions (Optional)
-                        </label>
-                        <textarea
-                          value={formAiInstructions}
-                          onChange={(e) => {
-                            setFormAiInstructions(e.target.value);
-                            aiInstructionsChangedByUser.current = true;
-                          }}
-                          placeholder="Additional context for the AI (e.g., 'Feature is broken - capture state for debugging')"
-                          rows={2}
-                          className="w-full px-3 py-2 bg-purple-500/5 border border-purple-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
-                        />
-                      </div>
-                    </div>
-                  ) : (
-                    <div>
-                      <div className="flex items-center justify-between mb-1">
-                        <label className="block text-sm font-medium">
-                          Script Content (.spec.ts) *
-                        </label>
-                        {formDescription.trim() && (
-                          <button
-                            onClick={generateScript}
-                            disabled={isGenerating}
-                            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-card border border-border rounded-lg hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                            title="Regenerate script from description"
-                          >
-                            {isGenerating ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin" />
-                                Regenerating...
-                              </>
-                            ) : (
-                              <>
-                                <RefreshCw className="w-4 h-4" />
-                                Regenerate
-                              </>
-                            )}
-                          </button>
-                        )}
-                      </div>
-                      <textarea
-                        value={formScriptContent}
-                        onChange={(e) => setFormScriptContent(e.target.value)}
-                        rows={10}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
-                        spellCheck={false}
-                      />
-                    </div>
-                  )}
-
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Category</label>
-                      <input
-                        type="text"
-                        value={formCategory}
-                        onChange={(e) => setFormCategory(e.target.value)}
-                        placeholder="E2E, Smoke, Regression"
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                        list="category-suggestions-inline"
-                      />
-                      <datalist id="category-suggestions-inline">
-                        {categories.map((cat) => (
-                          <option key={cat} value={cat} />
-                        ))}
-                      </datalist>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium mb-1">
-                        Tags (comma-separated)
-                      </label>
-                      <input
-                        type="text"
-                        value={formTags}
-                        onChange={(e) => setFormTags(e.target.value)}
-                        placeholder="login, auth, smoke"
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                      />
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Timeout (seconds)</label>
-                      <input
-                        type="number"
-                        value={formTimeoutSeconds}
-                        onChange={(e) => setFormTimeoutSeconds(parseInt(e.target.value) || 60)}
-                        min={10}
-                        max={600}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Browser</label>
-                      <select
-                        value={formBrowser}
-                        onChange={(e) => setFormBrowser(e.target.value as typeof formBrowser)}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                      >
-                        <option value="chromium">Chromium</option>
-                        <option value="firefox">Firefox</option>
-                        <option value="webkit">WebKit</option>
-                      </select>
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Display Mode</label>
-                      <select
-                        value={formDisplayMode}
-                        onChange={(e) => setFormDisplayMode(e.target.value as DisplayMode)}
-                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                      >
-                        <option value="headless">Headless (No UI)</option>
-                        <option value="headed">Headed (New Window)</option>
-                        <option value="connect_existing">Open Browser (CDP)</option>
-                      </select>
-                      {formDisplayMode === "connect_existing" && (
-                        <div className="mt-1 space-y-1">
-                          <div className="flex items-center gap-1">
-                            <p className="text-xs text-amber-500">
-                              Requires Chrome with --remote-debugging-port=9222
-                            </p>
-                            <div className="relative group">
-                              <Info className="w-3.5 h-3.5 text-amber-500 cursor-help" />
-                              <div className="absolute right-0 bottom-full mb-2 hidden group-hover:block z-50 w-80">
-                                <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-xs">
-                                  <p className="font-medium mb-2">
-                                    How to start Chrome with debugging:
-                                  </p>
-                                  <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
-                                    <li>Close all Chrome windows first</li>
-                                    <li>Click the button below to restart Chrome with debugging</li>
-                                  </ol>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              if (
-                                !confirm(
-                                  "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
-                                )
-                              ) {
-                                return;
-                              }
-                              try {
-                                onLog("info", "Closing Chrome and relaunching with debug port...");
-                                const response = await fetch(`${API_BASE}/launch-debug-chrome`, {
-                                  method: "POST",
-                                });
-                                const result = await response.json();
-                                if (result.success) {
-                                  onLog("success", "Chrome launched with debugging enabled.");
-                                } else {
-                                  onLog("error", `Failed to launch Chrome: ${result.error}`);
-                                }
-                              } catch (error) {
-                                onLog("error", `Failed to launch Chrome: ${error}`);
-                              }
-                            }}
-                            className="text-xs px-2 py-1 bg-amber-500/20 text-amber-500 rounded hover:bg-amber-500/30 transition-colors"
-                          >
-                            Restart Chrome with Debug Port
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Auto-refinement progress */}
-                  {isAutoRefining && (
-                    <div className="p-4 bg-purple-500/10 border-2 border-purple-500/30 rounded-lg">
-                      <div className="flex items-center justify-between mb-3">
-                        <div className="flex items-center gap-2">
-                          <Loader2 className="w-5 h-5 animate-spin text-purple-500" />
-                          <span className="text-lg font-medium text-purple-500">
-                            Auto-Refining: Iteration {autoRefineIteration}/{autoRefineMaxIterations}
-                          </span>
-                        </div>
-                        <button
-                          onClick={stopAutoRefine}
-                          className="px-3 py-1.5 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
-                        >
-                          Stop
-                        </button>
-                      </div>
-                      {autoRefineLog.length > 0 && (
-                        <div className="bg-background rounded-lg p-3 max-h-40 overflow-y-auto">
-                          {autoRefineLog.map((line, i) => (
-                            <div key={i} className="text-sm text-muted-foreground font-mono">
-                              {line}
-                            </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Cumulative stats across all iterations */}
-                      {autoRefineCumulativeStats.totalRuns > 0 && (
-                        <div className="mt-3">
-                          <div className="text-xs text-muted-foreground mb-2">
-                            Cumulative Stats (All {autoRefineCumulativeStats.totalRuns} Runs)
-                          </div>
-                          <div className="grid grid-cols-4 gap-2">
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-lg font-bold text-green-500">
-                                {autoRefineCumulativeStats.totalPassed}
-                              </div>
-                              <div className="text-xs text-muted-foreground">Total Passed</div>
-                            </div>
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-lg font-bold text-red-500">
-                                {autoRefineCumulativeStats.totalFailed}
-                              </div>
-                              <div className="text-xs text-muted-foreground">Total Failed</div>
-                            </div>
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-lg font-bold text-muted-foreground">
-                                {autoRefineCumulativeStats.totalSkipped}
-                              </div>
-                              <div className="text-xs text-muted-foreground">Total Skipped</div>
-                            </div>
-                            <div className="text-center p-2 bg-background rounded-lg">
-                              <div className="text-lg font-bold">
-                                {(autoRefineCumulativeStats.totalDurationMs / 1000).toFixed(1)}s
-                              </div>
-                              <div className="text-xs text-muted-foreground">Total Time</div>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {/* User hint input for guiding AI during auto-refine */}
-                      <div className="mt-3">
-                        <label className="text-xs text-muted-foreground block mb-1">
-                          Add hint for next AI iteration (optional) - Press Enter to queue
-                        </label>
-                        <div className="flex gap-2">
-                          <input
-                            type="text"
-                            value={autoRefineUserHint}
-                            onChange={(e) => {
-                              setAutoRefineUserHint(e.target.value);
-                              setHintQueued(false);
-                            }}
-                            placeholder="e.g., The button is actually called 'Submit' not 'Send'"
-                            className={`flex-1 px-3 py-2 bg-background border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 ${
-                              hintQueued ? "border-green-500" : "border-border"
-                            }`}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && autoRefineUserHint.trim()) {
-                                e.preventDefault();
-                                setHintQueued(true);
-                                setAutoRefineLog((prev) => [
-                                  ...prev,
-                                  `[HINT QUEUED] ${autoRefineUserHint.trim()}`,
-                                ]);
-                              }
-                            }}
-                          />
-                          <button
-                            onClick={() => {
-                              if (autoRefineUserHint.trim()) {
-                                setHintQueued(true);
-                                setAutoRefineLog((prev) => [
-                                  ...prev,
-                                  `[HINT QUEUED] ${autoRefineUserHint.trim()}`,
-                                ]);
-                              }
-                            }}
-                            disabled={!autoRefineUserHint.trim()}
-                            className="px-3 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-muted disabled:text-muted-foreground text-white rounded-lg text-sm"
-                          >
-                            Queue
-                          </button>
-                          {hintQueued && (
-                            <span className="text-xs text-green-400 self-center whitespace-nowrap flex items-center gap-1">
-                              <CheckCircle className="w-3 h-3" />
-                              Queued for next iteration
-                            </span>
-                          )}
-                          {!hintQueued && autoRefineUserHint.trim() && (
-                            <span className="text-xs text-purple-400 self-center whitespace-nowrap">
-                              Press Enter or Queue
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Execution Result */}
-                  {(executionState === "running" || executionResult) &&
-                    editingScript?.id === script.id && (
-                      <div
-                        className={`p-4 rounded-lg border-2 ${
-                          executionState === "running"
-                            ? "border-blue-500/50 bg-blue-500/5"
-                            : executionResult?.passed
-                              ? "border-green-500/50 bg-green-500/5"
-                              : "border-red-500/50 bg-red-500/5"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between mb-3">
-                          <h4 className="font-medium flex items-center gap-2">
-                            {executionState === "running" ? (
-                              <>
-                                <Loader2 className="w-4 h-4 animate-spin text-blue-500" />
-                                Running Test...
-                              </>
-                            ) : executionResult?.passed ? (
-                              <>
-                                <CheckCircle className="w-4 h-4 text-green-500" />
-                                Test Passed
-                              </>
-                            ) : (
-                              <>
-                                <XCircle className="w-4 h-4 text-red-500" />
-                                Test Failed
-                              </>
-                            )}
-                          </h4>
-                          {executionResult && (
-                            <button
-                              onClick={() => {
-                                setExecutionResult(null);
-                                setExpandedSpecs(new Set());
-                              }}
-                              className="p-1 hover:bg-card rounded"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
-                          )}
-                        </div>
-
-                        {executionResult && (
-                          <>
-                            <div className="grid grid-cols-4 gap-3 mb-3">
-                              <div className="text-center p-2 bg-background rounded-lg">
-                                <div className="text-xl font-bold text-green-500">
-                                  {executionResult.tests_passed}
-                                </div>
-                                <div className="text-xs text-muted-foreground">Passed</div>
-                              </div>
-                              <div className="text-center p-2 bg-background rounded-lg">
-                                <div className="text-xl font-bold text-red-500">
-                                  {executionResult.tests_failed}
-                                </div>
-                                <div className="text-xs text-muted-foreground">Failed</div>
-                              </div>
-                              <div className="text-center p-2 bg-background rounded-lg">
-                                <div className="text-xl font-bold text-muted-foreground">
-                                  {executionResult.tests_skipped}
-                                </div>
-                                <div className="text-xs text-muted-foreground">Skipped</div>
-                              </div>
-                              <div className="text-center p-2 bg-background rounded-lg">
-                                <div className="text-xl font-bold">
-                                  {(executionResult.duration_ms / 1000).toFixed(1)}s
-                                </div>
-                                <div className="text-xs text-muted-foreground">Duration</div>
-                              </div>
-                            </div>
-
-                            {executionResult.structured_output?.specs &&
-                              executionResult.structured_output.specs.length > 0 && (
-                                <div className="mb-3 space-y-2">
-                                  <div className="text-sm font-medium mb-2">Test Results</div>
-                                  {executionResult.structured_output.specs.map((spec, index) => (
-                                    <div
-                                      key={index}
-                                      className={`border rounded-lg overflow-hidden ${
-                                        spec.status === "expected"
-                                          ? "border-green-500/30 bg-green-500/5"
-                                          : "border-red-500/30 bg-red-500/5"
-                                      }`}
-                                    >
-                                      <button
-                                        onClick={() => {
-                                          const newExpanded = new Set(expandedSpecs);
-                                          if (newExpanded.has(index)) {
-                                            newExpanded.delete(index);
-                                          } else {
-                                            newExpanded.add(index);
-                                          }
-                                          setExpandedSpecs(newExpanded);
-                                        }}
-                                        className="w-full px-3 py-2 flex items-center justify-between text-left hover:bg-black/5"
-                                      >
-                                        <div className="flex items-center gap-2">
-                                          {spec.status === "expected" ? (
-                                            <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0" />
-                                          ) : (
-                                            <XCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
-                                          )}
-                                          <span className="text-sm font-medium truncate">
-                                            {spec.title}
-                                          </span>
-                                        </div>
-                                        <div className="flex items-center gap-2">
-                                          <span className="text-xs text-muted-foreground">
-                                            {(spec.duration_ms / 1000).toFixed(1)}s
-                                          </span>
-                                          {spec.error &&
-                                            (expandedSpecs.has(index) ? (
-                                              <ChevronUp className="w-4 h-4" />
-                                            ) : (
-                                              <ChevronDown className="w-4 h-4" />
-                                            ))}
-                                        </div>
-                                      </button>
-                                      {spec.error && expandedSpecs.has(index) && (
-                                        <div className="px-3 py-2 border-t border-red-500/20 bg-red-500/5">
-                                          <pre className="text-xs text-red-400 whitespace-pre-wrap font-mono max-h-48 overflow-auto">
-                                            {spec.error}
-                                          </pre>
-                                        </div>
-                                      )}
-                                    </div>
-                                  ))}
-                                </div>
-                              )}
-
-                            {executionResult.error &&
-                              (!executionResult.structured_output?.specs ||
-                                executionResult.structured_output.specs.length === 0) && (
-                                <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-3 mb-3">
-                                  <div className="text-sm font-medium text-red-500 mb-1">Error</div>
-                                  <pre className="text-xs text-red-400 whitespace-pre-wrap font-mono max-h-48 overflow-auto">
-                                    {executionResult.error}
-                                  </pre>
-                                </div>
-                              )}
-
-                            {/* Screenshot Display */}
-                            {executionResult.screenshots &&
-                              executionResult.screenshots.length > 0 && (
-                                <div className="mb-3">
-                                  <button
-                                    onClick={() => setShowScreenshot(!showScreenshot)}
-                                    className="flex items-center gap-2 text-sm font-medium mb-2 hover:text-primary transition-colors"
-                                  >
-                                    <ImageIcon className="w-4 h-4" />
-                                    Last Screenshot ({executionResult.screenshots.length} total)
-                                    {showScreenshot ? (
-                                      <ChevronUp className="w-4 h-4" />
-                                    ) : (
-                                      <ChevronDown className="w-4 h-4" />
-                                    )}
-                                  </button>
-                                  {showScreenshot && (
-                                    <div className="border border-border rounded-lg overflow-hidden bg-background">
-                                      <div className="relative min-h-[100px]">
-                                        {screenshotLoading ? (
-                                          <div className="flex items-center justify-center p-8">
-                                            <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-                                          </div>
-                                        ) : screenshotError ? (
-                                          <div className="p-4 text-center text-muted-foreground text-sm">
-                                            <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                                            Failed to load screenshot
-                                            <div className="text-xs mt-1 text-red-400">
-                                              {screenshotError}
-                                            </div>
-                                          </div>
-                                        ) : screenshotDataUrl ? (
-                                          <img
-                                            src={screenshotDataUrl}
-                                            alt="Last test screenshot"
-                                            className="w-full h-auto max-h-96 object-contain"
-                                          />
-                                        ) : (
-                                          <div className="p-4 text-center text-muted-foreground text-sm">
-                                            <ImageIcon className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                                            No screenshot available
-                                          </div>
-                                        )}
-                                      </div>
-                                      <div className="px-3 py-2 bg-muted/30 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
-                                        <span
-                                          className="truncate flex-1 mr-2"
-                                          title={
-                                            executionResult.screenshots[
-                                              executionResult.screenshots.length - 1
-                                            ]
-                                          }
-                                        >
-                                          {executionResult.screenshots[
-                                            executionResult.screenshots.length - 1
-                                          ]
-                                            .split(/[/\\]/)
-                                            .pop()}
-                                        </span>
-                                        <button
-                                          onClick={async () => {
-                                            const path =
-                                              executionResult.screenshots[
-                                                executionResult.screenshots.length - 1
-                                              ];
-                                            await navigator.clipboard.writeText(path);
-                                            onLog("info", "Screenshot path copied to clipboard");
-                                          }}
-                                          className="flex items-center gap-1 px-2 py-1 hover:bg-muted rounded transition-colors"
-                                          title="Copy path to clipboard"
-                                        >
-                                          <Copy className="w-3 h-3" />
-                                          Copy Path
-                                        </button>
-                                      </div>
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-
-                            {/* Manual Refinement */}
-                            {!executionResult.passed && !isAutoRefining && (
-                              <div className="border-t border-border pt-3 mt-3">
-                                <div className="text-sm font-medium mb-2 flex items-center gap-1 text-foreground">
-                                  <Sparkles className="w-4 h-4 text-purple-500" />
-                                  Manual Refinement
-                                </div>
-                                <div className="flex gap-2">
-                                  <input
-                                    type="text"
-                                    value={refinementPrompt}
-                                    onChange={(e) => setRefinementPrompt(e.target.value)}
-                                    placeholder="Optional: describe how to fix the test"
-                                    className="flex-1 px-3 py-2 bg-background border border-border rounded-lg text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Enter" && !isGenerating) {
-                                        refineScript();
-                                      }
-                                    }}
-                                  />
-                                  <button
-                                    onClick={refineScript}
-                                    disabled={isGenerating}
-                                    className="flex items-center gap-2 px-3 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-sm"
-                                  >
-                                    {isGenerating ? (
-                                      <>
-                                        <Loader2 className="w-4 h-4 animate-spin" />
-                                        Refining...
-                                      </>
-                                    ) : (
-                                      <>
-                                        <RefreshCw className="w-4 h-4" />
-                                        Refine Once
-                                      </>
-                                    )}
-                                  </button>
-                                </div>
-                              </div>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    )}
-
-                  {/* Action buttons */}
-                  <div className="flex justify-between gap-2 pt-2">
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => saveAndRunScript(script.id)}
-                        disabled={
-                          executionState === "running" ||
-                          isAutoRefining ||
-                          !formName ||
-                          !formScriptContent
-                        }
-                        className="flex items-center gap-2 px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                        title="Save changes and run this test"
-                      >
-                        {executionState === "running" && !isAutoRefining ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Running...
-                          </>
-                        ) : (
-                          <>
-                            <Play className="w-4 h-4" />
-                            Run Test
-                          </>
-                        )}
-                      </button>
-                      <button
-                        onClick={runAutoRefinementLoop}
-                        disabled={executionState === "running" || isAutoRefining || isGenerating}
-                        className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                        title="Run test, refine with AI on failure, repeat until pass"
-                      >
-                        {isAutoRefining ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            Auto-Refining...
-                          </>
-                        ) : (
-                          <>
-                            <Sparkles className="w-4 h-4" />
-                            Auto-Refine Until Pass
-                          </>
-                        )}
-                      </button>
-                      {isAutoRefining && (
-                        <button
-                          onClick={stopAutoRefine}
-                          className="flex items-center gap-2 px-3 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition-colors"
-                        >
-                          <X className="w-4 h-4" />
-                          Stop
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Visual Context Settings for Auto-Refine */}
-                    <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground">
-                      <div className="flex items-center gap-2">
-                        <ImageIcon className="w-4 h-4" />
-                        <span>Visual Context:</span>
-                      </div>
-                      <label className="flex items-center gap-1.5 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={includeScreenshot}
-                          onChange={(e) => setIncludeScreenshot(e.target.checked)}
-                          className="rounded border-border"
-                        />
-                        <span>Screenshot</span>
-                      </label>
-                      <label className="flex items-center gap-1.5 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={includeTraceData}
-                          onChange={(e) => setIncludeTraceData(e.target.checked)}
-                          className="rounded border-border"
-                        />
-                        <span>Trace</span>
-                      </label>
-                      <label
-                        className="flex items-center gap-1.5 cursor-pointer"
-                        title="Video uses significantly more tokens. Only recommended for complex failures."
-                      >
-                        <input
-                          type="checkbox"
-                          checked={includeVideo}
-                          onChange={(e) => setIncludeVideo(e.target.checked)}
-                          className="rounded border-border"
-                        />
-                        <span>Video after</span>
-                        <input
-                          type="number"
-                          min={1}
-                          max={10}
-                          value={includeVideoAfterIterations}
-                          onChange={(e) =>
-                            setIncludeVideoAfterIterations(
-                              Math.max(1, parseInt(e.target.value) || 3),
-                            )
-                          }
-                          disabled={!includeVideo}
-                          className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
-                        />
-                        <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
-                        <span title="Video uses significantly more tokens. Enables after N failed iterations.">
-                          <Info className="w-3.5 h-3.5 text-muted-foreground" />
-                        </span>
-                      </label>
-                      <label className="flex items-center gap-1.5 cursor-pointer">
-                        <span>Max iterations:</span>
-                        <input
-                          type="number"
-                          min={1}
-                          max={50}
-                          value={autoRefineMaxIterations}
-                          onChange={(e) =>
-                            setAutoRefineMaxIterations(
-                              Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
-                            )
-                          }
-                          className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
-                        />
-                      </label>
-                    </div>
-
-                    {/* Regenerate description from code button */}
-                    <button
-                      onClick={regenerateDescriptionFromCode}
-                      disabled={
-                        isRegeneratingDescription || isAutoRefining || executionState === "running"
-                      }
-                      className="flex items-center gap-2 px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      title="Use AI to analyze the code and replace the description with what the code actually does"
-                    >
-                      {isRegeneratingDescription ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Analyzing Code...
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles className="w-4 h-4" />
-                          Describe Code
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
         </div>
       )}
 

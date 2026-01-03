@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Module contains planned features not yet fully integrated
+
 //! Discovery Push mechanism for qontinui-runner.
 //!
 //! This module enables the runner to detect patterns from automation runs

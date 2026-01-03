@@ -35,6 +35,29 @@ export interface LogSource {
 }
 
 /**
+ * A named profile containing a set of log sources
+ */
+export interface LogSourceProfile {
+  /** Unique identifier for this profile */
+  id: string;
+
+  /** Human-readable name (e.g., "Qontinui Development", "Backend Only") */
+  name: string;
+
+  /** Description of what this profile is for */
+  description?: string;
+
+  /** Log sources in this profile */
+  logSources: LogSource[];
+
+  /** When this profile was created */
+  createdAt?: string;
+
+  /** When this profile was last modified */
+  updatedAt?: string;
+}
+
+/**
  * Project-specific log configuration
  */
 export interface ProjectLogConfig {
@@ -44,7 +67,13 @@ export interface ProjectLogConfig {
   /** Human-readable project name */
   projectName: string;
 
-  /** External log sources for this project */
+  /** Log source profiles (named configurations) */
+  profiles: LogSourceProfile[];
+
+  /** ID of the currently active profile */
+  activeProfileId?: string;
+
+  /** Legacy: External log sources (migrated to profiles on load) */
   logSources: LogSource[];
 
   /** Directory where runner stores its own logs for this project */
@@ -363,6 +392,32 @@ export function createLogSource(partial: Partial<LogSource> = {}): LogSource {
 }
 
 /**
+ * Generate a unique ID for a profile
+ */
+export function generateProfileId(): string {
+  return `profile-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+}
+
+/**
+ * Create a new log source profile with default values
+ */
+export function createLogSourceProfile(
+  name: string,
+  logSources: LogSource[] = [],
+  description?: string,
+): LogSourceProfile {
+  const now = new Date().toISOString();
+  return {
+    id: generateProfileId(),
+    name,
+    description,
+    logSources,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+/**
  * Create a new project log config with default values
  */
 export function createProjectLogConfig(
@@ -373,10 +428,35 @@ export function createProjectLogConfig(
   return {
     projectId,
     projectName,
+    profiles: [],
+    activeProfileId: undefined,
     logSources: [],
     logDirectory: `${baseDir}/logs`,
     screenshotDirectory: `${baseDir}/screenshots`,
     aiOutputDirectory: `${baseDir}/ai-output`,
     updatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Get the active profile from a config, or undefined if none
+ */
+export function getActiveProfile(config: ProjectLogConfig): LogSourceProfile | undefined {
+  if (config.activeProfileId) {
+    return config.profiles.find((p) => p.id === config.activeProfileId);
+  }
+  // Return first profile if no active set
+  return config.profiles[0];
+}
+
+/**
+ * Get the active log sources from a config (from profile or legacy)
+ */
+export function getActiveLogSources(config: ProjectLogConfig): LogSource[] {
+  const activeProfile = getActiveProfile(config);
+  if (activeProfile) {
+    return activeProfile.logSources;
+  }
+  // Legacy fallback
+  return config.logSources;
 }

@@ -6,7 +6,6 @@ import {
   X,
   Tag,
   FolderKanban,
-  Database,
   Globe,
   Bot,
   Cloud,
@@ -38,8 +37,6 @@ interface StatusIndicatorProps {
 // Helper to get icon for activity type
 const getActivityIcon = (type: ActivityType) => {
   switch (type) {
-    case "rag":
-      return Database;
     case "extraction":
       return Globe;
     case "ai":
@@ -54,8 +51,6 @@ const getActivityIcon = (type: ActivityType) => {
 // Helper to get color for activity type
 const getActivityColor = (type: ActivityType) => {
   switch (type) {
-    case "rag":
-      return "text-purple-500";
     case "extraction":
       return "text-blue-500";
     case "ai":

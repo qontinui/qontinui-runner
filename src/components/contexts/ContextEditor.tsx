@@ -60,7 +60,7 @@ export function ContextEditor({
   onClose,
   context,
   mode,
-  createScope = "project",
+  createScope = "user",
   categories,
   tags: existingTags,
   onSave,
@@ -243,7 +243,18 @@ export function ContextEditor({
             <BookOpen className="w-5 h-5 text-primary" />
             <h3 className="text-lg font-semibold">{title}</h3>
             {mode === "create" && (
-              <span className="px-2 py-0.5 text-xs bg-primary/20 text-primary rounded">
+              <span
+                className={`px-2 py-0.5 text-xs rounded ${
+                  createScope === "project"
+                    ? "bg-blue-500/20 text-blue-400"
+                    : "bg-purple-500/20 text-purple-400"
+                }`}
+                title={
+                  createScope === "project"
+                    ? "Will be saved with the loaded config file"
+                    : "Will be saved locally, available across all projects"
+                }
+              >
                 {createScope === "project" ? "Project Scope" : "User Scope"}
               </span>
             )}

@@ -19,6 +19,11 @@ use crate::task_monitor::TaskMonitor;
 pub const MCP_API_PORT: u16 = 9876;
 
 /// Shared state for the API server
+///
+/// NOTE: The authoritative definition is in mcp_api.rs - this is kept for reference.
+/// See mcp_api.rs for the full struct with all fields including:
+/// - action_service: Arc<UnifiedActionService>
+/// - current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>
 pub struct ApiState {
     pub app_state: Arc<AppState>,
     pub rag_state: Arc<RAGState>,

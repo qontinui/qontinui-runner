@@ -1,20 +1,17 @@
 /**
  * VerificationTab.tsx
  *
- * Main verification tab that manages navigation between:
- * - VerificationPanel (run new verification)
- * - VerificationHistory (view past runs)
- * - VerificationReport (view specific report)
+ * Verification history tab - shows past verification runs.
+ * To create and run new verifications, use the Library > Verifications section.
  */
 
 import { useState, useCallback } from "react";
-import * as Tabs from "@radix-ui/react-tabs";
-import { Play, History } from "lucide-react";
-import { VerificationPanel } from "./VerificationPanel";
+import { Activity } from "lucide-react";
 import { VerificationHistory } from "./VerificationHistory";
 import { VerificationReport } from "./VerificationReport";
+import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 
-type VerificationView = "run" | "history" | "report";
+type VerificationView = "history" | "report";
 
 interface VerificationTabProps {
   /** Optional callback when AI prompt should be shown */
@@ -22,8 +19,25 @@ interface VerificationTabProps {
 }
 
 export function VerificationTab({ onShowAiPrompt }: VerificationTabProps) {
-  const [activeView, setActiveView] = useState<VerificationView>("run");
+  const [activeView, setActiveView] = useState<VerificationView>("history");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+
+  // Use RunSelectionContext if available
+  const runSelection = useRunSelectionOptional();
+  const selectedRun = runSelection?.selectedRun;
+
+  // No run selected state (when context is present but no run selected)
+  if (runSelection && !selectedRun) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
+        <Activity className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-medium">No Run Selected</p>
+        <p className="text-sm mt-2 text-center max-w-md">
+          Select a run from the Run Dashboard to view verification history.
+        </p>
+      </div>
+    );
+  }
 
   // Handle viewing a specific report
   const handleViewReport = useCallback((runId: string) => {
@@ -48,50 +62,10 @@ export function VerificationTab({ onShowAiPrompt }: VerificationTabProps) {
     );
   }
 
-  const tabTriggerClass = `
-    flex items-center gap-2 px-4 py-2.5 text-sm font-medium
-    border-b-2 transition-colors
-    data-[state=active]:border-primary data-[state=active]:text-primary
-    data-[state=inactive]:border-transparent data-[state=inactive]:text-muted-foreground
-    data-[state=inactive]:hover:text-foreground data-[state=inactive]:hover:bg-muted/30
-  `;
-
+  // Show history view directly
   return (
     <div className="h-full flex flex-col overflow-hidden">
-      <Tabs.Root
-        value={activeView}
-        onValueChange={(v) => setActiveView(v as VerificationView)}
-        className="flex-1 flex flex-col min-h-0"
-      >
-        {/* Tab Navigation */}
-        <Tabs.List className="flex border-b border-border bg-muted/20 px-4 flex-shrink-0">
-          <Tabs.Trigger value="run" className={tabTriggerClass}>
-            <Play className="w-4 h-4" />
-            Run Verification
-          </Tabs.Trigger>
-          <Tabs.Trigger value="history" className={tabTriggerClass}>
-            <History className="w-4 h-4" />
-            History
-          </Tabs.Trigger>
-        </Tabs.List>
-
-        {/* Tab Content */}
-        <div className="flex-1 min-h-0 overflow-hidden">
-          <Tabs.Content
-            value="run"
-            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <VerificationPanel onViewReport={handleViewReport} />
-          </Tabs.Content>
-
-          <Tabs.Content
-            value="history"
-            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <VerificationHistory onSelectRun={handleViewReport} />
-          </Tabs.Content>
-        </div>
-      </Tabs.Root>
+      <VerificationHistory onSelectRun={handleViewReport} />
     </div>
   );
 }

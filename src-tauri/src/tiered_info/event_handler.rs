@@ -222,8 +222,15 @@ impl RunRecordingHandler {
                 // Track action for the actions summary
                 // The transition recording already handles the action detail
             }
-            "workflow_completed" | "workflow_failed" => {
-                // These are handled by on_workflow_completed/on_workflow_failed
+            "workflow_completed" => {
+                self.on_workflow_completed().await;
+            }
+            "workflow_failed" => {
+                let error = node
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("Unknown error");
+                self.on_workflow_failed(error).await;
             }
             _ => {
                 debug!("Unhandled tree event type: {}", event_type);

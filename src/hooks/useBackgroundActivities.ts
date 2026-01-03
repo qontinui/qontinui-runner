@@ -2,7 +2,7 @@
  * useBackgroundActivities.ts
  *
  * Hook for tracking all background activities in the application.
- * Aggregates RAG processing, web extraction, AI tasks, and data transmission states
+ * Aggregates web extraction, AI tasks, and data transmission states
  * into a unified interface for display in the status bar.
  *
  * Only returns active activities - no notifications for inactivity.
@@ -11,7 +11,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { listen, UnlistenFn } from "@tauri-apps/api/event";
 
-export type ActivityType = "rag" | "extraction" | "ai" | "sync";
+export type ActivityType = "extraction" | "ai" | "sync";
 
 export interface BackgroundActivity {
   id: string;
@@ -23,11 +23,6 @@ export interface BackgroundActivity {
 }
 
 interface UseBackgroundActivitiesProps {
-  // RAG processing state (passed as props for initial state)
-  ragStatus: "idle" | "processing" | "completed" | "failed";
-  ragProgress?: number;
-  ragProjectName?: string | null;
-
   // Web extraction state
   isExtracting: boolean;
   extractionUrl?: string;
@@ -42,30 +37,10 @@ interface UseBackgroundActivitiesReturn {
   activityCount: number;
 }
 
-// RAG event status enum values (must match @qontinui/schemas/rag)
-const RAG_STATUS = {
-  IN_PROGRESS: "in_progress",
-  COMPLETED: "completed",
-  FAILED: "failed",
-} as const;
-
-interface RagProgressEvent {
-  project_id: string;
-  status: string;
-  message: string;
-  percent?: number;
-  elements_processed?: number;
-  total_elements?: number;
-  error?: string;
-}
-
 /**
  * Hook to track and aggregate all background activities
  */
 export function useBackgroundActivities({
-  ragStatus: propRagStatus,
-  ragProgress: propRagProgress,
-  ragProjectName,
   isExtracting,
   extractionUrl,
   extractionProgress,
@@ -81,14 +56,6 @@ export function useBackgroundActivities({
     startedAt: Date;
   } | null>(null);
 
-  // Track RAG processing via events (more reliable than props)
-  const [ragState, setRagState] = useState<{
-    isProcessing: boolean;
-    progress?: number;
-    projectName?: string;
-    startedAt?: Date;
-  }>({ isProcessing: false });
-
   // Track web extraction via events (more reliable than props)
   const [extractionState, setExtractionState] = useState<{
     isExtracting: boolean;
@@ -98,64 +65,6 @@ export function useBackgroundActivities({
     pagesExtracted?: number;
     startedAt?: Date;
   }>({ isExtracting: false });
-
-  // Listen for RAG progress events directly
-  useEffect(() => {
-    let unlistenProgress: UnlistenFn | null = null;
-    let unlistenCompletion: UnlistenFn | null = null;
-
-    const setupListeners = async () => {
-      // Listen for RAG progress events
-      unlistenProgress = await listen<RagProgressEvent>("rag-progress", (event) => {
-        const payload = event.payload;
-
-        if (payload.status === RAG_STATUS.IN_PROGRESS) {
-          setRagState({
-            isProcessing: true,
-            progress: payload.percent,
-            projectName: payload.project_id,
-            startedAt: new Date(),
-          });
-        } else if (
-          payload.status === RAG_STATUS.COMPLETED ||
-          payload.status === RAG_STATUS.FAILED
-        ) {
-          setRagState({ isProcessing: false });
-        }
-      });
-
-      // Listen for RAG completion events
-      unlistenCompletion = await listen("rag-completion", () => {
-        setRagState({ isProcessing: false });
-      });
-    };
-
-    setupListeners();
-
-    return () => {
-      unlistenProgress?.();
-      unlistenCompletion?.();
-    };
-  }, []);
-
-  // Sync RAG with props if they indicate processing (fallback)
-  useEffect(() => {
-    if (propRagStatus === "processing" && !ragState.isProcessing) {
-      setRagState({
-        isProcessing: true,
-        progress: propRagProgress,
-        projectName: ragProjectName || undefined,
-        startedAt: new Date(),
-      });
-    } else if (
-      propRagStatus !== "processing" &&
-      propRagStatus !== "idle" &&
-      ragState.isProcessing
-    ) {
-      // completed or failed from props
-      setRagState({ isProcessing: false });
-    }
-  }, [propRagStatus, propRagProgress, ragProjectName, ragState.isProcessing]);
 
   // Sync extraction with props if they indicate extracting (fallback)
   useEffect(() => {
@@ -292,18 +201,6 @@ export function useBackgroundActivities({
   const activities = useMemo(() => {
     const result: BackgroundActivity[] = [];
 
-    // RAG Processing - use internal state (more reliable)
-    if (ragState.isProcessing) {
-      result.push({
-        id: "rag-processing",
-        type: "rag",
-        label: "RAG Processing",
-        progress: ragState.progress,
-        detail: ragState.projectName || ragProjectName || undefined,
-        startedAt: ragState.startedAt || new Date(),
-      });
-    }
-
     // Web Extraction - use internal state (more reliable)
     if (extractionState.isExtracting) {
       let progress: number | undefined;
@@ -358,15 +255,7 @@ export function useBackgroundActivities({
     }
 
     return result;
-  }, [
-    ragState,
-    ragProjectName,
-    extractionState,
-    extractionUrl,
-    extractionProgress,
-    activeAiSessions,
-    activeSync,
-  ]);
+  }, [extractionState, extractionUrl, extractionProgress, activeAiSessions, activeSync]);
 
   // Clear stale AI sessions after 10 minutes of no updates
   const clearStaleAiSessions = useCallback(() => {

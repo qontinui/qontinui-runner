@@ -1,20 +1,75 @@
 /**
  * AddStepDropdown.tsx
  *
- * Dropdown menu for adding new execution steps.
+ * Hierarchical dropdown menu for adding new execution steps.
+ * Shows categories that expand to reveal submenus with available items.
  */
 
+import { useState } from "react";
 import {
   AlertTriangle,
   Camera,
+  ChevronRight,
   FileText,
   FolderOpen,
   MousePointer2,
   Target,
   TestTube,
   Workflow,
+  ArrowLeft,
 } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+
+type CategoryId = "workflows" | "states" | "playwright" | "prompts" | "actions" | "capture" | null;
+
+interface CategoryConfig {
+  id: CategoryId;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+  color: string;
+  requiresConfig: boolean;
+  alwaysShow?: boolean;
+}
+
+const CATEGORIES: CategoryConfig[] = [
+  {
+    id: "workflows",
+    label: "Workflows",
+    icon: Workflow,
+    color: "text-purple-500",
+    requiresConfig: true,
+  },
+  { id: "states", label: "States", icon: Target, color: "text-primary", requiresConfig: true },
+  {
+    id: "playwright",
+    label: "Playwright Tests",
+    icon: TestTube,
+    color: "text-green-500",
+    requiresConfig: false,
+  },
+  {
+    id: "prompts",
+    label: "Prompts",
+    icon: FileText,
+    color: "text-amber-500",
+    requiresConfig: false,
+  },
+  {
+    id: "actions",
+    label: "Click Actions",
+    icon: MousePointer2,
+    color: "text-blue-500",
+    requiresConfig: true,
+  },
+  {
+    id: "capture",
+    label: "Capture",
+    icon: Camera,
+    color: "text-cyan-500",
+    requiresConfig: false,
+    alwaysShow: true,
+  },
+];
 
 export function AddStepDropdown() {
   const {
@@ -31,9 +86,40 @@ export function AddStepDropdown() {
     setShowAddDropdown,
   } = useAiBuilder();
 
-  return (
-    <div className="absolute right-0 z-20 w-64 mt-1 bg-card border border-border rounded-md shadow-lg max-h-80 overflow-y-auto">
-      {/* No config loaded message */}
+  // Track which category submenu is open
+  const [activeCategory, setActiveCategory] = useState<CategoryId>(null);
+
+  // Get count for each category
+  const getCategoryCount = (categoryId: CategoryId): number => {
+    switch (categoryId) {
+      case "workflows":
+        return workflows.length;
+      case "states":
+        return states.length;
+      case "playwright":
+        return playwrightScripts.length;
+      case "prompts":
+        return savedPrompts.length;
+      case "actions":
+        return images.length;
+      case "capture":
+        return 1; // Always has screenshot
+      default:
+        return 0;
+    }
+  };
+
+  // Check if category should be shown
+  const shouldShowCategory = (category: CategoryConfig): boolean => {
+    if (category.alwaysShow) return true;
+    if (category.requiresConfig && !configLoaded) return false;
+    return getCategoryCount(category.id) > 0;
+  };
+
+  // Render the main category menu
+  const renderCategoryMenu = () => (
+    <div className="py-1">
+      {/* No config loaded warning */}
       {!configLoaded && (
         <div className="px-3 py-3 border-b border-border">
           <div className="flex items-center gap-2 text-amber-500 mb-2">
@@ -41,8 +127,7 @@ export function AddStepDropdown() {
             <span className="text-sm font-medium">No Config Loaded</span>
           </div>
           <p className="text-xs text-muted-foreground mb-2">
-            Qontinui automation workflows, states, and click actions are only available when a
-            configuration is loaded.
+            Workflows, states, and click actions require a loaded configuration.
           </p>
           <button
             onClick={() => {
@@ -57,151 +142,170 @@ export function AddStepDropdown() {
         </div>
       )}
 
-      {/* Workflows section */}
-      {workflows.length > 0 && (
-        <>
-          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-            <Workflow className="w-3 h-3" />
-            Workflows
-          </div>
-          {workflows.map((workflow) => (
+      {/* Category buttons */}
+      {CATEGORIES.filter(shouldShowCategory).map((category) => {
+        const Icon = category.icon;
+        const count = getCategoryCount(category.id);
+
+        return (
+          <button
+            key={category.id}
+            onClick={() => setActiveCategory(category.id)}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-muted/50 transition-colors group"
+          >
+            <Icon className={`w-4 h-4 ${category.color}`} />
+            <span className="flex-1 font-medium">{category.label}</span>
+            <span className="text-xs text-muted-foreground">{count}</span>
+            <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-foreground transition-colors" />
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  // Render submenu for a category
+  const renderSubmenu = () => {
+    const category = CATEGORIES.find((c) => c.id === activeCategory);
+    if (!category) return null;
+
+    const Icon = category.icon;
+
+    return (
+      <div className="py-1">
+        {/* Back button / header */}
+        <button
+          onClick={() => setActiveCategory(null)}
+          className="w-full flex items-center gap-2 px-3 py-2 text-sm font-medium border-b border-border hover:bg-muted/30 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4" />
+          <Icon className={`w-4 h-4 ${category.color}`} />
+          <span>{category.label}</span>
+        </button>
+
+        {/* Submenu items */}
+        <div className="max-h-64 overflow-y-auto">
+          {activeCategory === "workflows" &&
+            workflows.map((workflow) => (
+              <button
+                key={workflow.id}
+                onClick={() => {
+                  addStep("workflow", workflow.name);
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <Workflow className="w-4 h-4 text-purple-500" />
+                <span className="truncate">{workflow.name}</span>
+              </button>
+            ))}
+
+          {activeCategory === "states" &&
+            states.map((state) => (
+              <button
+                key={state.name}
+                onClick={() => {
+                  addStep("state", state.name);
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <Target className="w-4 h-4 text-primary" />
+                <span className="truncate flex-1">{state.name}</span>
+                {state.images.length > 0 && (
+                  <span className="text-xs text-muted-foreground">{state.images.length} img</span>
+                )}
+              </button>
+            ))}
+
+          {activeCategory === "playwright" &&
+            playwrightScripts.map((script) => (
+              <button
+                key={script.id}
+                onClick={() => {
+                  addStep(
+                    "playwright",
+                    script.name,
+                    script.id,
+                    script.script_content,
+                    script.target_url,
+                  );
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <TestTube className="w-4 h-4 text-green-500" />
+                <span className="truncate flex-1">{script.name}</span>
+                {script.target_url && (
+                  <span className="text-xs text-muted-foreground truncate max-w-24">
+                    {script.target_url}
+                  </span>
+                )}
+              </button>
+            ))}
+
+          {activeCategory === "prompts" &&
+            savedPrompts.map((prompt) => (
+              <button
+                key={prompt.id}
+                onClick={() => {
+                  addStep(
+                    "prompt",
+                    prompt.name,
+                    undefined,
+                    undefined,
+                    undefined,
+                    prompt.id,
+                    prompt.content,
+                  );
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <FileText className="w-4 h-4 text-amber-500" />
+                <span className="truncate flex-1">{prompt.name}</span>
+                {prompt.category && (
+                  <span className="text-xs text-muted-foreground">{prompt.category}</span>
+                )}
+              </button>
+            ))}
+
+          {activeCategory === "actions" &&
+            images.map((image) => (
+              <button
+                key={`${image.stateName}-${image.id}`}
+                onClick={() => {
+                  addActionStep("click", image.id, image.name);
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <MousePointer2 className="w-4 h-4 text-blue-500" />
+                <span className="truncate flex-1">{image.name}</span>
+                <span className="text-xs text-muted-foreground">{image.stateName}</span>
+              </button>
+            ))}
+
+          {activeCategory === "capture" && (
             <button
-              key={workflow.id}
-              onClick={() => addStep("workflow", workflow.name)}
+              onClick={() => {
+                addScreenshotStep();
+                setShowAddDropdown(false);
+              }}
               className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
             >
-              <Workflow className="w-4 h-4 text-purple-500" />
-              <span>{workflow.name}</span>
+              <Camera className="w-4 h-4 text-cyan-500" />
+              <span className="flex-1">Screenshot</span>
+              <span className="text-xs text-muted-foreground">for AI analysis</span>
             </button>
-          ))}
-        </>
-      )}
-
-      {/* States section */}
-      {states.length > 0 && (
-        <>
-          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-            <Target className="w-3 h-3" />
-            States
-          </div>
-          {states.map((state) => (
-            <button
-              key={state.name}
-              onClick={() => addStep("state", state.name)}
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-            >
-              <Target className="w-4 h-4 text-primary" />
-              <span>{state.name}</span>
-              {state.images.length > 0 && (
-                <span className="text-xs text-muted-foreground ml-auto">
-                  {state.images.length} img
-                </span>
-              )}
-            </button>
-          ))}
-        </>
-      )}
-
-      {/* Playwright Scripts section */}
-      {playwrightScripts.length > 0 && (
-        <>
-          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-            <TestTube className="w-3 h-3" />
-            Playwright Tests
-          </div>
-          {playwrightScripts.map((script) => (
-            <button
-              key={script.id}
-              onClick={() =>
-                addStep(
-                  "playwright",
-                  script.name,
-                  script.id,
-                  script.script_content,
-                  script.target_url,
-                )
-              }
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-            >
-              <TestTube className="w-4 h-4 text-green-500" />
-              <span>{script.name}</span>
-              {script.target_url && (
-                <span className="text-xs text-muted-foreground ml-auto truncate max-w-20">
-                  {script.target_url}
-                </span>
-              )}
-            </button>
-          ))}
-        </>
-      )}
-
-      {/* Prompts section */}
-      {savedPrompts.length > 0 && (
-        <>
-          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-            <FileText className="w-3 h-3" />
-            Prompts
-          </div>
-          {savedPrompts.map((prompt) => (
-            <button
-              key={prompt.id}
-              onClick={() =>
-                addStep(
-                  "prompt",
-                  prompt.name,
-                  undefined,
-                  undefined,
-                  undefined,
-                  prompt.id,
-                  prompt.content,
-                )
-              }
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-            >
-              <FileText className="w-4 h-4 text-amber-500" />
-              <span className="truncate">{prompt.name}</span>
-              {prompt.category && (
-                <span className="text-xs text-muted-foreground ml-auto">{prompt.category}</span>
-              )}
-            </button>
-          ))}
-        </>
-      )}
-
-      {/* Click Image section */}
-      {images.length > 0 && (
-        <>
-          <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-            <MousePointer2 className="w-3 h-3" />
-            Click Image
-          </div>
-          {images.map((image) => (
-            <button
-              key={`${image.stateName}-${image.id}`}
-              onClick={() => addActionStep("click", image.id, image.name)}
-              className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-            >
-              <MousePointer2 className="w-4 h-4 text-blue-500" />
-              <span className="truncate">{image.name}</span>
-              <span className="text-xs text-muted-foreground ml-auto">{image.stateName}</span>
-            </button>
-          ))}
-        </>
-      )}
-
-      {/* Capture section */}
-      <div className="px-3 py-2 text-xs font-semibold text-muted-foreground bg-muted/30 border-b border-border flex items-center gap-2">
-        <Camera className="w-3 h-3" />
-        Capture
+          )}
+        </div>
       </div>
-      <button
-        onClick={() => addScreenshotStep()}
-        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
-      >
-        <Camera className="w-4 h-4 text-cyan-500" />
-        <span>Screenshot</span>
-        <span className="text-xs text-muted-foreground ml-auto">for AI analysis</span>
-      </button>
+    );
+  };
+
+  return (
+    <div className="absolute right-0 z-20 w-72 mt-1 bg-card border border-border rounded-lg shadow-lg overflow-hidden">
+      {activeCategory === null ? renderCategoryMenu() : renderSubmenu()}
     </div>
   );
 }

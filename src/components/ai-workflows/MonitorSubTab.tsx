@@ -14,39 +14,18 @@
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import {
-  AlertTriangle,
-  Lightbulb,
-  FileText,
-  ClipboardList,
-  FileSearch,
-  BarChart3,
-  Cloud,
-} from "lucide-react";
+import { AlertTriangle, FileText, ClipboardList, FileSearch, BarChart3, Cloud } from "lucide-react";
 import { IssuesPanel } from "../IssuesPanel";
-import { LearningsSubTab } from "./LearningsSubTab";
 import { ExecutionSummaryTab } from "./ExecutionSummaryTab";
 import { ExecutionReport } from "../findings";
 import { VerificationTab } from "../verification";
 import { StatisticsTab } from "../statistics";
 import { DiscoverySyncPanel } from "../discoveries";
 import { useExecution } from "../../contexts/ExecutionContext";
-import type { AiOutputLine } from "../AiOutputTab";
 
-interface MonitorSubTabProps {
-  aiOutputLines: AiOutputLine[];
-}
+type MonitorTab = "summary" | "findings" | "issues" | "verification" | "statistics" | "discoveries";
 
-type MonitorTab =
-  | "summary"
-  | "findings"
-  | "issues"
-  | "learnings"
-  | "verification"
-  | "statistics"
-  | "discoveries";
-
-export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
+export function MonitorSubTab() {
   const [activeTab, setActiveTab] = useState<MonitorTab>("summary");
   const { config } = useExecution();
 
@@ -83,10 +62,6 @@ export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
             <AlertTriangle className="w-4 h-4" />
             Issues
           </Tabs.Trigger>
-          <Tabs.Trigger value="learnings" className={tabTriggerClass}>
-            <Lightbulb className="w-4 h-4" />
-            Learnings
-          </Tabs.Trigger>
           <Tabs.Trigger value="verification" className={tabTriggerClass}>
             <FileSearch className="w-4 h-4" />
             Verification
@@ -122,13 +97,6 @@ export function MonitorSubTab({ aiOutputLines }: MonitorSubTabProps) {
             className="h-full outline-none overflow-y-auto p-4 data-[state=inactive]:hidden"
           >
             <IssuesPanel />
-          </Tabs.Content>
-
-          <Tabs.Content
-            value="learnings"
-            className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
-          >
-            <LearningsSubTab aiOutputLines={aiOutputLines} />
           </Tabs.Content>
 
           <Tabs.Content

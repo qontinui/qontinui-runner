@@ -10,7 +10,7 @@
  */
 
 import { useState } from "react";
-import { BarChart3, AlertTriangle, RefreshCw } from "lucide-react";
+import { BarChart3, AlertTriangle, RefreshCw, Activity } from "lucide-react";
 import { useConfigStatistics, useFlakyItems, useRecentRuns } from "../../hooks/useStatistics";
 import { ConfigHealthPanel } from "./ConfigHealthPanel";
 import { FlakyItemsList } from "./FlakyItemsList";
@@ -18,6 +18,7 @@ import { RunHistoryPanel } from "./RunHistoryPanel";
 import { ErrorPatternsPanel } from "./ErrorPatternsPanel";
 import { RunDetailsPanel } from "./RunDetailsPanel";
 import type { RunDetails } from "../../types/statistics";
+import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 
 interface StatisticsTabProps {
   configId: string | null;
@@ -26,11 +27,31 @@ interface StatisticsTabProps {
 
 export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
   const [selectedRun, setSelectedRun] = useState<RunDetails | null>(null);
-  const { data: stats, isLoading, error, refetch } = useConfigStatistics(configId);
-  const { data: flakyItems } = useFlakyItems(configId);
-  const { data: recentRuns } = useRecentRuns(configId, 50);
 
-  if (!configId) {
+  // Use RunSelectionContext if available - use selected run's config_id if present
+  const runSelection = useRunSelectionOptional();
+  const selectedRunFromContext = runSelection?.selectedRun;
+  const effectiveConfigId = selectedRunFromContext?.config_id || configId;
+  const effectiveConfigName = selectedRunFromContext?.workflow_name || configName;
+
+  const { data: stats, isLoading, error, refetch } = useConfigStatistics(effectiveConfigId);
+  const { data: flakyItems } = useFlakyItems(effectiveConfigId);
+  const { data: recentRuns } = useRecentRuns(effectiveConfigId, 50);
+
+  // No run selected state (when context is present but no run selected)
+  if (runSelection && !selectedRunFromContext) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
+        <Activity className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-medium">No Run Selected</p>
+        <p className="text-sm mt-2 text-center max-w-md">
+          Select a run from the Run Dashboard to view statistics for that configuration.
+        </p>
+      </div>
+    );
+  }
+
+  if (!effectiveConfigId) {
     return (
       <div className="h-full flex items-center justify-center text-muted-foreground">
         <div className="text-center">
@@ -71,7 +92,9 @@ export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">Statistics</h2>
-            <p className="text-sm text-muted-foreground">{configName || configId}</p>
+            <p className="text-sm text-muted-foreground">
+              {effectiveConfigName || effectiveConfigId}
+            </p>
           </div>
           <button
             onClick={() => refetch()}

@@ -17,14 +17,23 @@ interface AiBuilderProviderProps {
   children: ReactNode;
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
+  onNavigateToAiOutput?: () => void;
+  editWorkflowId?: string | null;
 }
 
 export function AiBuilderProvider({
   children,
   projectLogs,
   onNavigateToLogLocations,
+  onNavigateToAiOutput,
+  editWorkflowId,
 }: AiBuilderProviderProps) {
-  const state = useAiBuilderState({ projectLogs, onNavigateToLogLocations });
+  const state = useAiBuilderState({
+    projectLogs,
+    onNavigateToLogLocations,
+    onNavigateToAiOutput,
+    editWorkflowId,
+  });
 
   return <AiBuilderContext.Provider value={state}>{children}</AiBuilderContext.Provider>;
 }

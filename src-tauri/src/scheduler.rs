@@ -39,6 +39,90 @@ impl Default for ScheduleExpression {
 }
 
 // ============================================================================
+// Schedule Conditions
+// ============================================================================
+
+/// Condition that requires the runner to be idle (not executing workflows or AI tasks)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdleCondition {
+    pub enabled: bool,
+}
+
+impl Default for IdleCondition {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+/// A single repository to monitor for inactivity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryWatch {
+    /// Path to the repository directory
+    pub path: String,
+    /// Minutes of inactivity required before condition is met
+    pub inactive_minutes: u32,
+}
+
+/// Condition that requires repositories to have no file modifications for a period
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepositoryInactiveCondition {
+    pub enabled: bool,
+    /// List of repositories to watch (ALL must be inactive for condition to be met)
+    #[serde(default)]
+    pub repositories: Vec<RepositoryWatch>,
+}
+
+impl Default for RepositoryInactiveCondition {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repositories: Vec::new(),
+        }
+    }
+}
+
+/// Conditions that must ALL be met before task execution
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScheduleConditions {
+    /// Require runner to be idle (not executing workflows or AI tasks)
+    #[serde(default)]
+    pub require_idle: Option<IdleCondition>,
+    /// Require repository file inactivity
+    #[serde(default)]
+    pub require_repo_inactive: Option<RepositoryInactiveCondition>,
+    /// Maximum time to wait for conditions (minutes). None = wait indefinitely
+    #[serde(default)]
+    pub timeout_minutes: Option<u32>,
+}
+
+/// Status of condition checking for a deferred task
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConditionStatus {
+    /// Time when conditions started being checked (ISO 8601)
+    pub waiting_since: String,
+    /// Current idle condition status (None if not checked, Some(true) if idle, Some(false) if busy)
+    #[serde(default)]
+    pub idle_met: Option<bool>,
+    /// Current repo inactive status per repository: (path, is_inactive)
+    #[serde(default)]
+    pub repo_inactive_met: Option<Vec<(String, bool)>>,
+    /// Whether timeout has been exceeded
+    #[serde(default)]
+    pub timed_out: bool,
+}
+
+impl Default for ConditionStatus {
+    fn default() -> Self {
+        Self {
+            waiting_since: chrono::Utc::now().to_rfc3339(),
+            idle_met: None,
+            repo_inactive_met: None,
+            timed_out: false,
+        }
+    }
+}
+
+// ============================================================================
 // Task Type Definitions
 // ============================================================================
 
@@ -216,6 +300,12 @@ pub struct ScheduledTask {
     /// Next scheduled run time (computed)
     #[serde(default)]
     pub next_run: Option<String>,
+    /// Optional conditions that must be met before execution
+    #[serde(default)]
+    pub conditions: Option<ScheduleConditions>,
+    /// Status when task is waiting for conditions to be met
+    #[serde(default)]
+    pub condition_status: Option<ConditionStatus>,
 }
 
 impl ScheduledTask {
@@ -241,7 +331,34 @@ impl ScheduledTask {
             modified_at: now,
             last_run: None,
             next_run: None,
+            conditions: None,
+            condition_status: None,
         }
+    }
+
+    /// Check if task has conditions that need to be evaluated
+    pub fn has_conditions(&self) -> bool {
+        match &self.conditions {
+            Some(cond) => {
+                let idle_enabled = cond
+                    .require_idle
+                    .as_ref()
+                    .map(|c| c.enabled)
+                    .unwrap_or(false);
+                let repo_enabled = cond
+                    .require_repo_inactive
+                    .as_ref()
+                    .map(|c| c.enabled && !c.repositories.is_empty())
+                    .unwrap_or(false);
+                idle_enabled || repo_enabled
+            }
+            None => false,
+        }
+    }
+
+    /// Check if task is currently waiting for conditions
+    pub fn is_waiting_for_conditions(&self) -> bool {
+        self.condition_status.is_some()
     }
 
     /// Check if task should be skipped (completed and skip_if_completed is true)
@@ -441,6 +558,7 @@ pub fn get_task(id: &str) -> Option<ScheduledTask> {
 }
 
 /// Create a new scheduled task
+#[allow(clippy::too_many_arguments)]
 pub fn create_task(
     name: String,
     description: Option<String>,
@@ -449,6 +567,7 @@ pub fn create_task(
     skip_if_completed: bool,
     auto_fix_on_failure: bool,
     success_criteria: Option<String>,
+    conditions: Option<ScheduleConditions>,
 ) -> Result<ScheduledTask, String> {
     let mut state = load_scheduler_state();
 
@@ -456,6 +575,7 @@ pub fn create_task(
     scheduled_task.skip_if_completed = skip_if_completed;
     scheduled_task.auto_fix_on_failure = auto_fix_on_failure;
     scheduled_task.success_criteria = success_criteria;
+    scheduled_task.conditions = conditions;
 
     let created = scheduled_task.clone();
     state.tasks.push(scheduled_task);
@@ -477,6 +597,7 @@ pub fn update_task(
     skip_if_completed: Option<bool>,
     auto_fix_on_failure: Option<bool>,
     success_criteria: Option<Option<String>>,
+    conditions: Option<Option<ScheduleConditions>>,
 ) -> Result<ScheduledTask, String> {
     let mut state = load_scheduler_state();
 
@@ -509,6 +630,11 @@ pub fn update_task(
     }
     if let Some(success_criteria) = success_criteria {
         scheduled_task.success_criteria = success_criteria;
+    }
+    if let Some(conditions) = conditions {
+        scheduled_task.conditions = conditions;
+        // Clear condition_status when conditions change
+        scheduled_task.condition_status = None;
     }
 
     scheduled_task.touch();
@@ -570,6 +696,32 @@ pub fn get_task_history(task_id: &str) -> Vec<TaskExecutionRecord> {
         .get(task_id)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Update the condition status for a task
+pub fn update_task_condition_status(task_id: &str, status: ConditionStatus) -> Result<(), String> {
+    let mut state = load_scheduler_state();
+
+    if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
+        task.condition_status = Some(status);
+        task.touch();
+    }
+
+    save_scheduler_state(&state)?;
+    Ok(())
+}
+
+/// Clear the condition status for a task (after execution or timeout)
+pub fn clear_task_condition_status(task_id: &str) -> Result<(), String> {
+    let mut state = load_scheduler_state();
+
+    if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id) {
+        task.condition_status = None;
+        task.touch();
+    }
+
+    save_scheduler_state(&state)?;
+    Ok(())
 }
 
 /// Get scheduler settings

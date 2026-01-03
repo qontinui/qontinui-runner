@@ -163,6 +163,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     output_log TEXT DEFAULT '',  -- Accumulated output with [SESSION_START:N] markers
     error_message TEXT,
     auto_continue BOOLEAN NOT NULL DEFAULT 1,  -- Per-run auto-continue setting (1=true, 0=false)
+    execution_steps_json TEXT,  -- JSON array of ExecutionStepConfig for re-execution on resume
+    log_sources_json TEXT,  -- JSON array of LogSourceConfig for log capture during execution
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT

@@ -311,6 +311,7 @@ impl UnifiedActionService {
     /// * `config` - Optional additional configuration parameters
     /// * `monitor_index` - Optional monitor index (defaults to 0)
     /// * `timeout_seconds` - Maximum time to wait for completion
+    /// * `initial_state_ids` - Optional override for initial active states
     ///
     /// # Returns
     /// `WorkflowResult` with success/failure information
@@ -320,11 +321,12 @@ impl UnifiedActionService {
         config: Option<&serde_json::Value>,
         monitor_index: Option<i32>,
         timeout_seconds: u64,
+        initial_state_ids: Option<&[String]>,
     ) -> Result<WorkflowResult, ActionError> {
         let start = std::time::Instant::now();
         info!(
-            "Running workflow: {} (monitor: {:?}, timeout: {}s)",
-            workflow_name, monitor_index, timeout_seconds
+            "Running workflow: {} (monitor: {:?}, timeout: {}s, initial_states: {:?})",
+            workflow_name, monitor_index, timeout_seconds, initial_state_ids
         );
 
         let timeout_duration = Duration::from_secs(timeout_seconds);
@@ -369,6 +371,16 @@ impl UnifiedActionService {
             "workflow".to_string(),
             serde_json::json!(workflow_name_clone.clone()),
         );
+
+        // Add initial state IDs if provided (overrides default initial states)
+        if let Some(state_ids) = initial_state_ids {
+            if !state_ids.is_empty() {
+                params.insert(
+                    "initial_state_ids".to_string(),
+                    serde_json::json!(state_ids),
+                );
+            }
+        }
 
         // Merge additional config if provided
         if let Some(extra_config) = config {
@@ -493,7 +505,11 @@ impl UnifiedActionService {
                     return Err(ActionError::ExecutorNotRunning);
                 }
 
-                match bridge.send_command_and_wait("go_to_state", Some(params), timeout_duration) {
+                match bridge.send_command_and_wait(
+                    "navigate_to_state",
+                    Some(params),
+                    timeout_duration,
+                ) {
                     Ok(response) => {
                         if response.success {
                             Ok(StateResult {
@@ -627,35 +643,62 @@ impl UnifiedActionService {
         // Generate filename and save
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f");
         let filename = format!("screenshot_{}.png", timestamp);
-        let screenshots_dir = std::path::Path::new(".dev-logs/screenshots");
-        std::fs::create_dir_all(screenshots_dir).map_err(|e| {
+        let screenshots_dir = std::path::PathBuf::from(
+            r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\screenshots",
+        );
+        std::fs::create_dir_all(&screenshots_dir).map_err(|e| {
             ActionError::Internal(format!("Failed to create screenshots dir: {}", e))
         })?;
 
         let screenshot_path = screenshots_dir.join(&filename);
-        let absolute_path = std::fs::canonicalize(&screenshot_path)
-            .ok()
-            .map(|p| p.to_string_lossy().to_string());
 
-        // Save the image data if available
-        if let Some(image_data) = json_response.get("image").and_then(|v| v.as_str()) {
+        // Save the image data if available (qontinui-api returns "screenshot_base64")
+        let screenshot_saved = if let Some(image_data) = json_response
+            .get("screenshot_base64")
+            .and_then(|v| v.as_str())
+        {
             use base64::Engine;
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(image_data)
                 .map_err(|e| ActionError::Internal(format!("Failed to decode image: {}", e)))?;
             std::fs::write(&screenshot_path, decoded)
                 .map_err(|e| ActionError::Internal(format!("Failed to save screenshot: {}", e)))?;
-        }
+            info!("Screenshot saved to: {}", screenshot_path.to_string_lossy());
+            true
+        } else {
+            // Log available keys for debugging
+            let keys: Vec<&str> = json_response
+                .as_object()
+                .map(|obj| obj.keys().map(|k| k.as_str()).collect())
+                .unwrap_or_default();
+            warn!(
+                "No screenshot_base64 in API response. Available keys: {:?}",
+                keys
+            );
+            false
+        };
 
-        Ok(ScreenshotResult {
-            success: true,
-            screenshot_path: Some(format!(".dev-logs/screenshots/{}", filename)),
-            absolute_path,
-            width,
-            height,
-            monitor: monitor_index,
-            error: None,
-        })
+        if screenshot_saved {
+            Ok(ScreenshotResult {
+                success: true,
+                screenshot_path: Some(format!(".dev-logs/screenshots/{}", filename)),
+                absolute_path: Some(screenshot_path.to_string_lossy().to_string()),
+                width,
+                height,
+                monitor: monitor_index,
+                error: None,
+            })
+        } else {
+            Ok(ScreenshotResult {
+                success: false,
+                screenshot_path: None,
+                absolute_path: None,
+                width,
+                height,
+                monitor: monitor_index,
+                error: Some("API did not return screenshot_base64".to_string()),
+            })
+        }
     }
 }
 

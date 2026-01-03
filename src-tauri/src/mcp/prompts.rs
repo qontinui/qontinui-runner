@@ -53,6 +53,12 @@ pub struct CreatePromptRequest {
     pub tags: Vec<String>,
     #[serde(default)]
     pub max_sessions: Option<u32>,
+    /// AI provider override (e.g., "gemini_api", "claude_cli")
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// AI model override (e.g., "gemini-3-flash")
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 pub async fn create_prompt(
@@ -65,6 +71,8 @@ pub async fn create_prompt(
         request.category,
         request.tags,
         request.max_sessions,
+        request.provider,
+        request.model,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -79,6 +87,10 @@ pub struct UpdatePromptRequest {
     pub category: Option<String>,
     pub tags: Option<Vec<String>>,
     pub max_sessions: Option<Option<u32>>,
+    /// AI provider override (e.g., "gemini_api", "claude_cli")
+    pub provider: Option<Option<String>>,
+    /// AI model override (e.g., "gemini-3-flash")
+    pub model: Option<Option<String>>,
 }
 
 pub async fn update_prompt(
@@ -93,6 +105,8 @@ pub async fn update_prompt(
         request.category,
         request.tags,
         request.max_sessions,
+        request.provider,
+        request.model,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),

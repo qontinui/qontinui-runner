@@ -5,7 +5,7 @@
  * Focuses on code-related findings (bugs, security, performance)
  * and excludes automation/test infrastructure issues.
  *
- * Shows per-run summaries with run history.
+ * Uses RunSelectionContext when available to filter to the selected run.
  */
 
 import { useState, useMemo, useEffect } from "react";
@@ -23,14 +23,15 @@ import {
   ChevronRight,
   ExternalLink,
   Loader2,
-  History,
   Timer,
   XCircle,
   AlertOctagon,
+  Activity,
+  ClipboardList,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "../../types/findings";
 import { findingsTracker, getVisibleCategories } from "../../services";
-import type { SessionHistoryEntry } from "../../services/FindingsTracker";
+import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 
 // Categories to include in the summary (code-focused)
 const CODE_FOCUSED_CATEGORIES = [
@@ -65,7 +66,7 @@ const statusIcons: Record<string, React.ComponentType<{ className?: string }>> =
   completed: CheckCircle,
   failed: XCircle,
   timeout: Timer,
-  context_limit: AlertOctagon,
+  cancelled: AlertOctagon,
   running: Loader2,
 };
 
@@ -73,24 +74,24 @@ const statusColors: Record<string, string> = {
   completed: "text-green-400 bg-green-500/10",
   failed: "text-red-400 bg-red-500/10",
   timeout: "text-amber-400 bg-amber-500/10",
-  context_limit: "text-orange-400 bg-orange-500/10",
+  cancelled: "text-slate-400 bg-slate-500/10",
   running: "text-blue-400 bg-blue-500/10",
 };
 
 export function ExecutionSummaryTab() {
   const [findings, setFindings] = useState<Finding[]>([]);
-  const [sessionHistory, setSessionHistory] = useState<SessionHistoryEntry[]>([]);
-  const [selectedSession, setSelectedSession] = useState<SessionHistoryEntry | null>(null);
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
     new Set(["code_bug", "security"]),
   );
-  const [showHistory, setShowHistory] = useState(false);
 
-  // Load session history and subscribe to updates
+  // Use RunSelectionContext if available
+  const runSelection = useRunSelectionOptional();
+  const selectedRun = runSelection?.selectedRun;
+
+  // Load findings and subscribe to updates
   useEffect(() => {
-    // Load history from disk on mount
     findingsTracker.loadFromDisk().then(() => {
-      setSessionHistory(findingsTracker.getSessionHistory());
+      setFindings(findingsTracker.getAllFindings());
     });
 
     const unsubscribe = findingsTracker.subscribe((event) => {
@@ -104,12 +105,8 @@ export function ExecutionSummaryTab() {
         event.type === "findings_cleared"
       ) {
         setFindings(findingsTracker.getAllFindings());
-        setSessionHistory(findingsTracker.getSessionHistory());
       }
     });
-
-    // Initialize with current state
-    setFindings(findingsTracker.getAllFindings());
 
     return unsubscribe;
   }, []);
@@ -119,13 +116,10 @@ export function ExecutionSummaryTab() {
     return allFindings.filter((f) => CODE_FOCUSED_CATEGORIES.includes(f.categoryId));
   };
 
-  // Get the findings to display (either from selected session or current)
+  // Get the findings to display
   const displayFindings = useMemo(() => {
-    if (selectedSession) {
-      return filterCodeFocusedFindings(selectedSession.findings);
-    }
     return filterCodeFocusedFindings(findings);
-  }, [selectedSession, findings]);
+  }, [findings]);
 
   // Group findings by category
   const findingsByCategory = useMemo(() => {
@@ -173,7 +167,8 @@ export function ExecutionSummaryTab() {
     });
   };
 
-  const formatDuration = (ms: number) => {
+  const formatDuration = (ms: number | undefined) => {
+    if (!ms) return "-";
     const seconds = Math.floor(ms / 1000);
     const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
@@ -187,27 +182,29 @@ export function ExecutionSummaryTab() {
     }
   };
 
-  const formatDate = (timestamp: number) => {
-    const date = new Date(timestamp);
-    const now = new Date();
-    const isToday = date.toDateString() === now.toDateString();
-
-    if (isToday) {
-      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-    }
-    return date.toLocaleDateString([], { month: "short", day: "numeric" });
-  };
+  // No run selected state (when context is present but no run selected)
+  if (runSelection && !selectedRun) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
+        <Activity className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-medium">No Run Selected</p>
+        <p className="text-sm mt-2 text-center max-w-md">
+          Select a run from the Run Dashboard to view the summary.
+        </p>
+      </div>
+    );
+  }
 
   // Get current report info
   const currentReport = findingsTracker.getCurrentReport();
   const isRunning = currentReport?.status === "running";
 
   // Empty state
-  if (displayFindings.length === 0 && sessionHistory.length === 0 && !isRunning) {
+  if (displayFindings.length === 0 && !isRunning) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center text-muted-foreground p-8">
         <FileText className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium">No Execution Summary Yet</p>
+        <p className="text-lg font-medium">No Summary Data Yet</p>
         <p className="text-sm mt-2 text-center max-w-md">
           Run an AI workflow to see a summary of code findings.
           <br />
@@ -222,24 +219,21 @@ export function ExecutionSummaryTab() {
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
       <div className="flex-shrink-0 border-b border-border p-4 space-y-3">
-        {/* Title and History Toggle */}
+        {/* Run Info Header */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-primary/10 rounded-lg">
-              <FileText className="w-5 h-5 text-primary" />
+              <ClipboardList className="w-5 h-5 text-primary" />
             </div>
             <div>
               <h2 className="font-semibold text-foreground">
-                {selectedSession ? selectedSession.promptName : "Current Run"}
+                {selectedRun ? selectedRun.workflow_name || "Run Summary" : "Current Session"}
               </h2>
-              {selectedSession ? (
+              {selectedRun ? (
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Clock className="w-3 h-3" />
-                  {new Date(selectedSession.startedAt).toLocaleString()}
-                  <span>({formatDuration(selectedSession.duration)})</span>
-                  <span className="px-1.5 py-0.5 bg-muted rounded">
-                    {selectedSession.phases} step{selectedSession.phases !== 1 ? "s" : ""}
-                  </span>
+                  {new Date(selectedRun.started_at).toLocaleString()}
+                  <span>({formatDuration(selectedRun.duration_ms)})</span>
                 </div>
               ) : isRunning ? (
                 <div className="flex items-center gap-2 text-xs text-blue-400">
@@ -255,55 +249,48 @@ export function ExecutionSummaryTab() {
               )}
             </div>
           </div>
-
-          {/* Run Controls */}
-          <div className="flex items-center gap-2">
-            {selectedSession && (
-              <button
-                onClick={() => setSelectedSession(null)}
-                className="px-3 py-1.5 text-sm bg-primary/10 text-primary rounded-lg hover:bg-primary/20 transition-colors"
-              >
-                View Current
-              </button>
-            )}
-            <button
-              onClick={() => setShowHistory(!showHistory)}
-              className={`flex items-center gap-2 px-3 py-1.5 text-sm rounded-lg transition-colors ${
-                showHistory
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-muted/50 hover:bg-muted text-foreground"
-              }`}
-            >
-              <History className="w-4 h-4" />
-              History ({sessionHistory.length})
-            </button>
-          </div>
         </div>
 
         {/* Run Status Badge */}
-        {selectedSession && (
+        {selectedRun && (
           <div className="flex items-center gap-2">
             {(() => {
-              const StatusIcon = statusIcons[selectedSession.status] || AlertCircle;
-              const color =
-                statusColors[selectedSession.status] || "text-slate-400 bg-slate-500/10";
+              const StatusIcon = statusIcons[selectedRun.status] || AlertCircle;
+              const color = statusColors[selectedRun.status] || "text-slate-400 bg-slate-500/10";
               return (
                 <span className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded ${color}`}>
-                  <StatusIcon className="w-3 h-3" />
-                  {selectedSession.status === "context_limit"
-                    ? "Context Limit"
-                    : selectedSession.status.charAt(0).toUpperCase() +
-                      selectedSession.status.slice(1)}
+                  <StatusIcon
+                    className={`w-3 h-3 ${selectedRun.status === "running" ? "animate-spin" : ""}`}
+                  />
+                  {selectedRun.status.charAt(0).toUpperCase() + selectedRun.status.slice(1)}
                 </span>
               );
             })()}
+            {selectedRun.actions_summary && (
+              <span className="text-xs text-muted-foreground px-2 py-1 bg-muted/30 rounded">
+                {selectedRun.actions_summary.total} actions
+                {selectedRun.actions_summary.failed > 0 && (
+                  <span className="text-red-400 ml-1">
+                    ({selectedRun.actions_summary.failed} failed)
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Error message if run failed */}
+        {selectedRun?.status === "failed" && selectedRun.error_message && (
+          <div className="p-2 bg-red-500/10 border border-red-500/20 rounded text-sm">
+            <span className="font-medium text-red-400">Error: </span>
+            <span className="text-red-300">{selectedRun.error_message}</span>
           </div>
         )}
 
         {/* Summary Stats */}
         <div className="flex items-center gap-3 text-sm flex-wrap">
           <div className="flex items-center gap-2 px-3 py-1.5 bg-muted/30 rounded-lg">
-            <span className="text-muted-foreground">Total:</span>
+            <span className="text-muted-foreground">Total Findings:</span>
             <span className="font-semibold">{summary.total}</span>
           </div>
           {summary.resolved > 0 && (
@@ -330,58 +317,6 @@ export function ExecutionSummaryTab() {
           )}
         </div>
       </div>
-
-      {/* Run History Panel (collapsible) */}
-      {showHistory && sessionHistory.length > 0 && (
-        <div className="flex-shrink-0 border-b border-border bg-muted/20 p-3 max-h-48 overflow-y-auto">
-          <div className="space-y-2">
-            {sessionHistory.map((session) => {
-              const StatusIcon = statusIcons[session.status] || AlertCircle;
-              const color = statusColors[session.status] || "text-slate-400";
-              const codeFindingsCount = filterCodeFocusedFindings(session.findings).length;
-
-              return (
-                <button
-                  key={session.id}
-                  onClick={() => {
-                    setSelectedSession(session);
-                    setShowHistory(false);
-                  }}
-                  className={`w-full flex items-center justify-between p-2 rounded-lg transition-colors ${
-                    selectedSession?.id === session.id
-                      ? "bg-primary/10 border border-primary/30"
-                      : "bg-background hover:bg-muted/50"
-                  }`}
-                >
-                  <div className="flex items-center gap-3">
-                    <StatusIcon className={`w-4 h-4 ${color}`} />
-                    <div className="text-left">
-                      <div className="text-sm font-medium truncate max-w-[200px]">
-                        {session.promptName}
-                      </div>
-                      <div className="text-xs text-muted-foreground">
-                        {formatDate(session.startedAt)} · {formatDuration(session.duration)}
-                      </div>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 text-xs">
-                    <span className="text-muted-foreground">
-                      {codeFindingsCount} finding{codeFindingsCount !== 1 ? "s" : ""}
-                    </span>
-                    <span
-                      className={`px-1.5 py-0.5 rounded ${
-                        session.summary.resolved > 0 ? "bg-green-500/10 text-green-400" : ""
-                      }`}
-                    >
-                      {session.summary.resolved} fixed
-                    </span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
 
       {/* Findings by Category */}
       <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
@@ -479,11 +414,11 @@ export function ExecutionSummaryTab() {
         {displayFindings.length > 0 && (
           <p className="text-xs text-muted-foreground text-center mt-4">
             This summary shows code-related findings only.
-            {findings.length - displayFindings.length > 0 && !selectedSession && (
+            {findings.length - displayFindings.length > 0 && (
               <span>
                 {" "}
                 {findings.length - displayFindings.length} automation/infrastructure findings are
-                hidden (view in All Findings tab).
+                hidden (view in Findings tab).
               </span>
             )}
           </p>
