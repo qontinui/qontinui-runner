@@ -571,13 +571,13 @@ impl VerificationTask {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Determine status based on actual detection results
-        let all_expected_found = expected_checks.iter().all(|c| c.found);
-        let no_unexpected = !unexpected_checks.iter().any(|c| c.found);
+        let all_expected_found = expected_checks.is_empty() || expected_checks.iter().all(|c| c.found);
+        let no_unexpected = unexpected_checks.iter().all(|c| !c.found);
 
         let status = if error_message.is_some() {
             VerificationStatus::Failed
-        } else if detection_confidence >= 0.5 {
-            VerificationStatus::Passed // Confidence threshold for passing state verification
+        } else if detection_confidence >= 0.5 && all_expected_found && no_unexpected {
+            VerificationStatus::Passed
         } else {
             VerificationStatus::Failed
         };

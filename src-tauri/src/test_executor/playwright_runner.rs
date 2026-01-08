@@ -282,7 +282,7 @@ pub fn execute_playwright_test(test_def: &TestDefinition) -> TestExecutionResult
                 warn!("Playwright stderr: {}", stderr);
             }
 
-            let (tests_passed, tests_failed, tests_skipped, error_msg) =
+            let (tests_passed, tests_failed, _tests_skipped, error_msg) =
                 parse_playwright_output(&stdout);
 
             let passed = tests_failed == 0 && output.status.success();

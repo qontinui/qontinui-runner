@@ -212,7 +212,7 @@ pub fn create_findings_for_failures(
     task_run_id: &str,
     session_num: i32,
     tests_result: &TriggerTestsResult,
-    config_id: &str,
+    _config_id: &str,
 ) {
     for exec_result in &tests_result.results {
         if matches!(exec_result.status, TestStatus::Passed) {

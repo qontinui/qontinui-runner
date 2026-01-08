@@ -89,7 +89,7 @@ pub fn execute_repo_test(test_def: &TestDefinition) -> TestExecutionResult {
             };
 
             let passed = exit_code == 0;
-            let status = if passed {
+            let _status = if passed {
                 TestStatus::Passed
             } else {
                 TestStatus::Failed
@@ -382,7 +382,7 @@ fn parse_pytest_text(stdout: &str, _stderr: &str) -> ParsedTestResults {
 }
 
 /// Parse Jest JSON output
-fn parse_jest_json(stdout: &str, stderr: &str, working_dir: &str) -> ParsedTestResults {
+fn parse_jest_json(stdout: &str, _stderr: &str, _working_dir: &str) -> ParsedTestResults {
     let mut summary = TestSuiteSummary::default();
     let mut tests = Vec::new();
 
@@ -526,7 +526,7 @@ fn parse_cargo_test(stdout: &str, stderr: &str) -> ParsedTestResults {
     let combined = format!("{}\n{}", stdout, stderr);
     let mut current_failure: Option<(String, String)> = None;
     let mut in_failure_block = false;
-    let failure_content = String::new();
+    let _failure_content = String::new();
 
     for line in combined.lines() {
         if line.starts_with("---- ") && line.ends_with(" ----") {
@@ -578,7 +578,7 @@ fn parse_cargo_test(stdout: &str, stderr: &str) -> ParsedTestResults {
 }
 
 /// Parse go test JSON output
-fn parse_go_test(stdout: &str, stderr: &str) -> ParsedTestResults {
+fn parse_go_test(stdout: &str, _stderr: &str) -> ParsedTestResults {
     let mut summary = TestSuiteSummary::default();
     let mut tests = Vec::new();
 
