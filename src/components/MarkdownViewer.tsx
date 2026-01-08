@@ -66,7 +66,6 @@ export function MarkdownViewer({ content, className, isAnimated = false }: Markd
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw]}
         components={{
-          // @ts-expect-error - rehype-raw passes non-standard props for custom attributes
           div: ({ className, ...props }: Record<string, unknown>) => {
             // Check for our special finding data attributes
             const categoryId = props["data-finding-category"] as string | undefined;
