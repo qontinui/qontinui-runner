@@ -2,8 +2,8 @@
  * ExecutionSummaryTab.tsx
  *
  * Shows a comprehensive summary of AI execution runs.
- * Focuses on code-related findings (bugs, security, performance)
- * and excludes automation/test infrastructure issues.
+ * - AI-generated paragraph summary and goal achievement status at the top
+ * - Code-related findings (bugs, security, performance) below
  *
  * Uses RunSelectionContext when available to filter to the selected run.
  */
@@ -23,15 +23,19 @@ import {
   ChevronRight,
   ExternalLink,
   Loader2,
-  Timer,
   XCircle,
-  AlertOctagon,
+  StopCircle,
   Activity,
   ClipboardList,
+  Users,
+  Target,
+  AlertTriangle,
+  Sparkles,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "../../types/findings";
 import { findingsTracker, getVisibleCategories } from "../../services";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
+import type { TaskRunStatus } from "../../types/aiData";
 
 // Categories to include in the summary (code-focused)
 const CODE_FOCUSED_CATEGORIES = [
@@ -62,21 +66,29 @@ const categoryIcons: Record<string, React.ComponentType<{ className?: string }>>
   warning: AlertCircle,
 };
 
-const statusIcons: Record<string, React.ComponentType<{ className?: string }>> = {
-  completed: CheckCircle,
+const statusIcons: Record<TaskRunStatus, React.ComponentType<{ className?: string }>> = {
+  complete: CheckCircle,
   failed: XCircle,
-  timeout: Timer,
-  cancelled: AlertOctagon,
+  stopped: StopCircle,
   running: Loader2,
 };
 
-const statusColors: Record<string, string> = {
-  completed: "text-green-400 bg-green-500/10",
+const statusColors: Record<TaskRunStatus, string> = {
+  complete: "text-green-400 bg-green-500/10",
   failed: "text-red-400 bg-red-500/10",
-  timeout: "text-amber-400 bg-amber-500/10",
-  cancelled: "text-slate-400 bg-slate-500/10",
+  stopped: "text-slate-400 bg-slate-500/10",
   running: "text-blue-400 bg-blue-500/10",
 };
+
+/**
+ * Calculate duration from created_at and completed_at timestamps
+ */
+function calculateDuration(createdAt: string, completedAt?: string): number | undefined {
+  if (!completedAt) return undefined;
+  const start = new Date(createdAt).getTime();
+  const end = new Date(completedAt).getTime();
+  return end - start;
+}
 
 export function ExecutionSummaryTab() {
   const [findings, setFindings] = useState<Finding[]>([]);
@@ -199,6 +211,11 @@ export function ExecutionSummaryTab() {
   const currentReport = findingsTracker.getCurrentReport();
   const isRunning = currentReport?.status === "running";
 
+  // Calculate duration for selected run
+  const duration = selectedRun
+    ? calculateDuration(selectedRun.created_at, selectedRun.completed_at)
+    : undefined;
+
   // Empty state
   if (displayFindings.length === 0 && !isRunning) {
     return (
@@ -227,13 +244,13 @@ export function ExecutionSummaryTab() {
             </div>
             <div>
               <h2 className="font-semibold text-foreground">
-                {selectedRun ? selectedRun.workflow_name || "Run Summary" : "Current Session"}
+                {selectedRun ? selectedRun.task_name || "Run Summary" : "Current Session"}
               </h2>
               {selectedRun ? (
                 <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <Clock className="w-3 h-3" />
-                  {new Date(selectedRun.started_at).toLocaleString()}
-                  <span>({formatDuration(selectedRun.duration_ms)})</span>
+                  {new Date(selectedRun.created_at).toLocaleString()}
+                  <span>({formatDuration(duration)})</span>
                 </div>
               ) : isRunning ? (
                 <div className="flex items-center gap-2 text-xs text-blue-400">
@@ -266,14 +283,23 @@ export function ExecutionSummaryTab() {
                 </span>
               );
             })()}
-            {selectedRun.actions_summary && (
-              <span className="text-xs text-muted-foreground px-2 py-1 bg-muted/30 rounded">
-                {selectedRun.actions_summary.total} actions
-                {selectedRun.actions_summary.failed > 0 && (
-                  <span className="text-red-400 ml-1">
-                    ({selectedRun.actions_summary.failed} failed)
-                  </span>
-                )}
+            {selectedRun.sessions_count > 0 && (
+              <span className="flex items-center gap-1.5 text-xs text-muted-foreground px-2 py-1 bg-muted/30 rounded">
+                <Users className="w-3 h-3" />
+                {selectedRun.sessions_count} session{selectedRun.sessions_count !== 1 ? "s" : ""}
+              </span>
+            )}
+            {/* Goal Achievement Badge */}
+            {selectedRun.goal_achieved !== undefined && selectedRun.goal_achieved !== null && (
+              <span
+                className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded ${
+                  selectedRun.goal_achieved
+                    ? "text-green-400 bg-green-500/10"
+                    : "text-amber-400 bg-amber-500/10"
+                }`}
+              >
+                <Target className="w-3 h-3" />
+                {selectedRun.goal_achieved ? "Goal Achieved" : "Goal Not Achieved"}
               </span>
             )}
           </div>
@@ -286,11 +312,55 @@ export function ExecutionSummaryTab() {
             <span className="text-red-300">{selectedRun.error_message}</span>
           </div>
         )}
+      </div>
 
-        {/* Summary Stats */}
+      {/* AI Summary Section */}
+      {selectedRun?.ai_summary && (
+        <div className="flex-shrink-0 border-b border-border p-4 space-y-3 bg-muted/20">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-primary" />
+            <h3 className="font-medium text-foreground">AI Summary</h3>
+            {selectedRun.summary_generated_at && (
+              <span className="text-xs text-muted-foreground">
+                Generated {new Date(selectedRun.summary_generated_at).toLocaleString()}
+              </span>
+            )}
+          </div>
+          <p className="text-sm text-foreground/90 whitespace-pre-wrap leading-relaxed">
+            {selectedRun.ai_summary}
+          </p>
+          {selectedRun.remaining_work && !selectedRun.goal_achieved && (
+            <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/20 rounded">
+              <div className="flex items-center gap-2 mb-1">
+                <AlertTriangle className="w-4 h-4 text-amber-400" />
+                <span className="font-medium text-amber-400 text-sm">Remaining Work</span>
+              </div>
+              <p className="text-sm text-amber-300/90 whitespace-pre-wrap">
+                {selectedRun.remaining_work}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Summary waiting indicator (when run complete but summary not generated) */}
+      {selectedRun &&
+        selectedRun.status !== "running" &&
+        !selectedRun.ai_summary &&
+        selectedRun.status === "complete" && (
+          <div className="flex-shrink-0 border-b border-border p-4 bg-muted/20">
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <Loader2 className="w-4 h-4 animate-spin" />
+              <span className="text-sm">Generating AI summary...</span>
+            </div>
+          </div>
+        )}
+
+      {/* Findings Summary Stats */}
+      <div className="flex-shrink-0 border-b border-border p-4">
         <div className="flex items-center gap-3 text-sm flex-wrap">
           <div className="flex items-center gap-2 px-3 py-1.5 bg-muted/30 rounded-lg">
-            <span className="text-muted-foreground">Total Findings:</span>
+            <span className="text-muted-foreground">Code Findings:</span>
             <span className="font-semibold">{summary.total}</span>
           </div>
           {summary.resolved > 0 && (

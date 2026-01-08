@@ -78,35 +78,35 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
         icon={<SettingsIcon className="w-6 h-6" />}
       />
 
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg mb-4">Application</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Application</h4>
 
         <div className="space-y-2">
-          <label className="flex items-center justify-between cursor-pointer">
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
             <div className="space-y-1">
-              <div className="font-medium">Auto-load Last Configuration on Startup</div>
-              <div className="text-sm text-muted-foreground">
+              <div className="text-sm font-medium">Auto-load Last Configuration on Startup</div>
+              <div className="text-xs text-muted-foreground">
                 Automatically load the last used configuration file and workflow when the
                 application starts
               </div>
             </div>
             <button
               onClick={handleToggleAutoLoad}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 appSettings.auto_load_last_config ? "bg-primary" : "bg-muted"
               }`}
             >
               <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  appSettings.auto_load_last_config ? "translate-x-6" : "translate-x-1"
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  appSettings.auto_load_last_config ? "translate-x-4" : "translate-x-1"
                 }`}
               />
             </button>
           </label>
         </div>
 
-        <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
-          <div className="text-sm text-muted-foreground">
+        <div className="p-3 bg-primary/5 rounded-lg">
+          <div className="text-xs text-muted-foreground">
             <strong className="text-foreground">Tip:</strong> When enabled, the runner will
             automatically load your last configuration and selected workflow, saving time when you
             restart the application.

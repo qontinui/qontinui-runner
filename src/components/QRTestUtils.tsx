@@ -90,9 +90,9 @@ export function QRTestGenerator() {
 
       {/* Generated QR Code */}
       <div className="flex flex-col items-center gap-4 p-6 bg-white rounded-lg">
-        <div className="text-sm font-medium text-gray-800">Scan this QR Code</div>
+        <div className="text-sm font-medium text-foreground">Scan this QR Code</div>
         <QRCodeSVG value={jsonString} size={256} level="H" />
-        <div className="text-xs text-gray-500 text-center max-w-md break-all">{jsonString}</div>
+        <div className="text-xs text-text-muted text-center max-w-md break-all">{jsonString}</div>
       </div>
 
       {/* Instructions */}

@@ -114,23 +114,23 @@ export function AuthConnectionSettings({
 
       {/* User Info */}
       {auth.authStatus?.user && (
-        <div className="bg-card rounded-lg border border-border/50 p-4 flex items-center justify-between">
+        <div className="rounded-lg bg-card/50 p-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center">
-              <User className="w-5 h-5 text-primary" />
+            <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center">
+              <User className="w-4 h-4 text-primary" />
             </div>
             <div>
-              <div className="font-medium">{auth.authStatus.user.email}</div>
+              <div className="text-sm font-medium">{auth.authStatus.user.email}</div>
               {auth.authStatus.user.name && (
-                <div className="text-sm text-muted-foreground">{auth.authStatus.user.name}</div>
+                <div className="text-xs text-muted-foreground">{auth.authStatus.user.name}</div>
               )}
             </div>
           </div>
           <button
             onClick={handleLogout}
-            className="flex items-center gap-2 px-4 py-2 bg-destructive/10 hover:bg-destructive/20 text-destructive rounded-md transition-colors"
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive text-xs rounded-md transition-colors"
           >
-            <LogOut className="w-4 h-4" />
+            <LogOut className="w-3.5 h-3.5" />
             Sign Out
           </button>
         </div>
@@ -138,23 +138,23 @@ export function AuthConnectionSettings({
 
       {/* Error message */}
       {error && (
-        <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
-          <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-          <span className="text-red-400 text-sm">{error}</span>
+        <div className="p-3 bg-red-500/10 rounded-lg flex items-start gap-2">
+          <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+          <span className="text-red-400 text-xs">{error}</span>
         </div>
       )}
 
       {/* Runner Name */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <Tag className="w-5 h-5 text-primary" />
-          <h4 className="font-semibold text-lg">Runner Identity</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="flex items-center gap-2">
+          <Tag className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Runner Identity</h4>
         </div>
 
         <div className="space-y-2">
           <label className="block">
-            <div className="font-medium mb-1">Runner Name</div>
-            <div className="text-sm text-muted-foreground mb-3">
+            <div className="text-sm font-medium mb-1">Runner Name</div>
+            <div className="text-xs text-muted-foreground mb-2">
               Give this runner a name to identify it on qontinui.io (e.g., "My Laptop", "Work
               Desktop")
             </div>
@@ -163,7 +163,7 @@ export function AuthConnectionSettings({
               value={runnerName}
               onChange={(e) => handleRunnerNameChange(e.target.value)}
               placeholder="My Runner"
-              className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
             />
           </label>
         </div>
@@ -171,15 +171,15 @@ export function AuthConnectionSettings({
 
       {/* Project Selection */}
       {projects.length > 0 && (
-        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-          <div className="flex items-center gap-3">
-            <Cloud className="w-5 h-5 text-primary" />
-            <h4 className="font-semibold text-lg">Select Project</h4>
+        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+          <div className="flex items-center gap-2">
+            <Cloud className="w-4 h-4 text-primary" />
+            <h4 className="font-medium text-sm">Select Project</h4>
           </div>
 
           <div className="space-y-2">
-            <div className="font-medium mb-1">Project</div>
-            <div className="text-sm text-muted-foreground mb-3">
+            <div className="text-sm font-medium mb-1">Project</div>
+            <div className="text-xs text-muted-foreground mb-2">
               Choose which project this runner should connect to. This selection is used across all
               features that require a project.
             </div>
@@ -187,8 +187,8 @@ export function AuthConnectionSettings({
               <button
                 type="button"
                 onClick={() => !connected && setShowProjectDropdown(!showProjectDropdown)}
-                className={`w-full px-3 py-2 bg-input border border-border/50 rounded-md flex items-center justify-between gap-2 text-left transition-colors ${
-                  connected ? "opacity-60 cursor-default" : "hover:border-border cursor-pointer"
+                className={`w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md flex items-center justify-between gap-2 text-left transition-colors ${
+                  connected ? "opacity-60 cursor-default" : "hover:bg-muted cursor-pointer"
                 }`}
               >
                 <span className={selectedProjectId ? "" : "text-muted-foreground"}>
@@ -199,13 +199,13 @@ export function AuthConnectionSettings({
                 </span>
                 {!connected && (
                   <ChevronDown
-                    className={`w-4 h-4 flex-shrink-0 transition-transform ${showProjectDropdown ? "rotate-180" : ""}`}
+                    className={`w-3.5 h-3.5 flex-shrink-0 transition-transform ${showProjectDropdown ? "rotate-180" : ""}`}
                   />
                 )}
               </button>
 
               {showProjectDropdown && !connected && (
-                <div className="absolute z-20 w-full mt-1 bg-card border border-border rounded-lg shadow-lg max-h-60 overflow-y-auto">
+                <div className="absolute z-20 w-full mt-1 bg-card/95 backdrop-blur rounded-lg shadow-lg max-h-60 overflow-y-auto">
                   {projects.map((project) => (
                     <button
                       key={project.id}
@@ -214,11 +214,11 @@ export function AuthConnectionSettings({
                         onProjectSelect(project.id);
                         setShowProjectDropdown(false);
                       }}
-                      className="w-full px-3 py-2 text-left hover:bg-muted/50 transition-colors flex items-center justify-between gap-2 first:rounded-t-lg last:rounded-b-lg"
+                      className="w-full px-3 py-2 text-sm text-left hover:bg-muted/50 transition-colors flex items-center justify-between gap-2 first:rounded-t-lg last:rounded-b-lg"
                     >
                       <span>{project.name}</span>
                       {selectedProjectId === project.id && (
-                        <Check className="w-4 h-4 text-primary" />
+                        <Check className="w-3.5 h-3.5 text-primary" />
                       )}
                     </button>
                   ))}
@@ -226,7 +226,7 @@ export function AuthConnectionSettings({
               )}
             </div>
             {connected && (
-              <div className="text-sm text-muted-foreground mt-2">
+              <div className="text-xs text-muted-foreground mt-2">
                 Disconnect to change projects.
               </div>
             )}
@@ -235,54 +235,54 @@ export function AuthConnectionSettings({
       )}
 
       {/* Connection Controls */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <Wifi className="w-5 h-5 text-primary" />
-          <h4 className="font-semibold text-lg">Connection Status</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="flex items-center gap-2">
+          <Wifi className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Connection Status</h4>
           {connected && (
-            <span className="flex items-center gap-2 text-green-600 text-sm">
-              <span className="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
+            <span className="flex items-center gap-1.5 text-green-400 text-xs">
+              <span className="inline-block w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>
               Connected
             </span>
           )}
         </div>
 
         {connectionInfo && (
-          <div className="space-y-2 text-sm">
+          <div className="space-y-1.5 text-xs p-3 bg-muted/30 rounded-lg">
             <div className="flex justify-between">
               <span className="text-muted-foreground">Device ID:</span>
               <span className="font-mono">{connectionInfo.device_id.slice(0, 8)}...</span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">WebSocket URL:</span>
-              <span className="font-mono text-xs">
+              <span className="font-mono text-[10px]">
                 {connectionInfo.websocket_url.slice(0, 40)}...
               </span>
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">WebSocket:</span>
-              <span className={connected ? "text-green-500" : "text-orange-500"}>
+              <span className={connected ? "text-green-400" : "text-orange-400"}>
                 {connected ? "Connected" : "Disconnected"}
               </span>
             </div>
           </div>
         )}
 
-        <div className="flex gap-3 pt-4 border-t border-border/50">
+        <div className="flex gap-2 pt-3">
           {!connected ? (
             <button
               onClick={connect}
               disabled={connecting || !connectionInfo || !selectedProjectId}
-              className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              className="px-4 py-1.5 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
             >
               {connecting ? (
                 <>
-                  <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                  <div className="w-3.5 h-3.5 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
                   Connecting...
                 </>
               ) : (
                 <>
-                  <Wifi className="w-4 h-4" />
+                  <Wifi className="w-3.5 h-3.5" />
                   Connect
                 </>
               )}
@@ -290,7 +290,7 @@ export function AuthConnectionSettings({
           ) : (
             <button
               onClick={disconnect}
-              className="px-4 py-2 bg-destructive text-destructive-foreground rounded-md hover:bg-destructive/90 transition-colors"
+              className="px-3 py-1.5 bg-destructive text-destructive-foreground rounded-md text-sm hover:bg-destructive/90 transition-colors"
             >
               Disconnect
             </button>
@@ -298,16 +298,16 @@ export function AuthConnectionSettings({
         </div>
 
         {!selectedProjectId && projects.length > 0 && (
-          <div className="p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg">
-            <div className="text-sm text-orange-300">
+          <div className="p-2.5 bg-orange-500/10 rounded-lg">
+            <div className="text-xs text-orange-400">
               Please select a project before connecting.
             </div>
           </div>
         )}
 
         {projects.length === 0 && (
-          <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
-            <div className="text-sm text-blue-300">
+          <div className="p-2.5 bg-blue-500/10 rounded-lg">
+            <div className="text-xs text-blue-400">
               No projects found. Create a project on qontinui.io first.
             </div>
           </div>

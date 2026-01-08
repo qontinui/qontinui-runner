@@ -1,0 +1,268 @@
+/**
+ * Test Execution Panel
+ *
+ * Bottom panel for running tests and viewing results.
+ */
+
+import { useState } from "react";
+import {
+  Play,
+  CheckCircle2,
+  XCircle,
+  Clock,
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  Terminal,
+  Image,
+  Loader2,
+} from "lucide-react";
+import { useTestBuilder } from "./TestBuilderContext";
+
+export function TestExecutionPanel() {
+  const { selectedTest, state, executeTest } = useTestBuilder();
+  const [isExpanded, setIsExpanded] = useState(true);
+
+  // Handle running the test
+  const handleRunTest = async () => {
+    if (!selectedTest) return;
+    await executeTest(selectedTest.id);
+  };
+
+  // Get status icon
+  const getStatusIcon = () => {
+    if (state.isExecuting) {
+      return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />;
+    }
+    if (!state.lastResult) {
+      return <Clock className="w-5 h-5 text-muted-foreground" />;
+    }
+    switch (state.lastResult.status) {
+      case "passed":
+        return <CheckCircle2 className="w-5 h-5 text-green-500" />;
+      case "failed":
+        return <XCircle className="w-5 h-5 text-red-500" />;
+      case "error":
+        return <AlertTriangle className="w-5 h-5 text-red-500" />;
+      case "timeout":
+        return <Clock className="w-5 h-5 text-yellow-500" />;
+      default:
+        return <Clock className="w-5 h-5 text-muted-foreground" />;
+    }
+  };
+
+  // Get status text
+  const getStatusText = () => {
+    if (state.isExecuting) {
+      return "Running...";
+    }
+    if (!state.lastResult) {
+      return "Ready";
+    }
+    switch (state.lastResult.status) {
+      case "passed":
+        return "Passed";
+      case "failed":
+        return "Failed";
+      case "error":
+        return "Error";
+      case "timeout":
+        return "Timeout";
+      default:
+        return state.lastResult.status;
+    }
+  };
+
+  // Get status color
+  const getStatusColor = () => {
+    if (state.isExecuting) {
+      return "text-blue-500";
+    }
+    if (!state.lastResult) {
+      return "text-muted-foreground";
+    }
+    switch (state.lastResult.status) {
+      case "passed":
+        return "text-green-500";
+      case "failed":
+      case "error":
+        return "text-red-500";
+      case "timeout":
+        return "text-yellow-500";
+      default:
+        return "text-muted-foreground";
+    }
+  };
+
+  return (
+    <div className="bg-card border-t border-border/50">
+      {/* Collapsible header */}
+      <div
+        className="flex items-center justify-between px-4 py-2 cursor-pointer hover:bg-muted/20 transition-colors"
+        onClick={() => setIsExpanded(!isExpanded)}
+      >
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-muted-foreground" />
+            <span className="text-sm font-medium">Execution</span>
+          </div>
+
+          {/* Status indicator */}
+          <div className="flex items-center gap-2">
+            {getStatusIcon()}
+            <span className={`text-sm font-medium ${getStatusColor()}`}>{getStatusText()}</span>
+          </div>
+
+          {/* Duration */}
+          {state.lastResult && (
+            <span className="text-xs text-muted-foreground">{state.lastResult.duration_ms}ms</span>
+          )}
+
+          {/* Assertions */}
+          {state.lastResult && (
+            <span className="text-xs text-muted-foreground">
+              {state.lastResult.assertions_passed}/
+              {state.lastResult.assertions_passed + state.lastResult.assertions_failed} assertions
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Run button */}
+          <button
+            className={`
+              px-3 py-1.5 text-sm font-medium rounded-md flex items-center gap-1.5
+              transition-colors
+              ${
+                selectedTest && !state.isExecuting
+                  ? "bg-green-600 text-white hover:bg-green-700"
+                  : "bg-muted text-muted-foreground cursor-not-allowed"
+              }
+            `}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleRunTest();
+            }}
+            disabled={!selectedTest || state.isExecuting}
+          >
+            {state.isExecuting ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Play className="w-4 h-4" />
+            )}
+            Run Test
+          </button>
+
+          {/* Expand/collapse */}
+          {isExpanded ? (
+            <ChevronDown className="w-4 h-4 text-muted-foreground" />
+          ) : (
+            <ChevronUp className="w-4 h-4 text-muted-foreground" />
+          )}
+        </div>
+      </div>
+
+      {/* Expanded content */}
+      {isExpanded && (
+        <div className="border-t border-border/50 max-h-64 overflow-y-auto">
+          {!selectedTest ? (
+            <div className="p-8 text-center text-muted-foreground text-sm">
+              Select a test to run
+            </div>
+          ) : !state.lastResult && !state.isExecuting ? (
+            <div className="p-8 text-center text-muted-foreground text-sm">
+              Click "Run Test" to execute the selected test
+            </div>
+          ) : state.isExecuting ? (
+            <div className="p-8 text-center">
+              <Loader2 className="w-8 h-8 animate-spin text-primary mx-auto mb-2" />
+              <p className="text-sm text-muted-foreground">Running test...</p>
+            </div>
+          ) : state.lastResult ? (
+            <div className="p-4 space-y-4">
+              {/* Error message */}
+              {state.lastResult.error && (
+                <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-md">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+                    <div>
+                      <p className="text-sm font-medium text-red-500">Error</p>
+                      <pre className="text-xs text-red-400 mt-1 whitespace-pre-wrap font-mono">
+                        {state.lastResult.error}
+                      </pre>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Output */}
+              {state.lastResult.output && (
+                <div>
+                  <h4 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+                    <Terminal className="w-3 h-3" />
+                    Output
+                  </h4>
+                  <pre className="text-xs bg-muted/30 p-3 rounded-md overflow-x-auto font-mono max-h-32 overflow-y-auto">
+                    {state.lastResult.output}
+                  </pre>
+                </div>
+              )}
+
+              {/* Screenshots */}
+              {state.lastResult.screenshots.length > 0 && (
+                <div>
+                  <h4 className="text-xs font-medium text-muted-foreground mb-2 flex items-center gap-1">
+                    <Image className="w-3 h-3" />
+                    Screenshots ({state.lastResult.screenshots.length})
+                  </h4>
+                  <div className="flex gap-2 flex-wrap">
+                    {state.lastResult.screenshots.map((screenshot, i) => (
+                      <div
+                        key={i}
+                        className="w-24 h-16 bg-muted rounded-md overflow-hidden cursor-pointer hover:ring-2 hover:ring-primary/50"
+                        onClick={() => {
+                          // TODO: Open screenshot modal
+                          console.log("Open screenshot:", screenshot);
+                        }}
+                      >
+                        <img
+                          src={`file://${screenshot}`}
+                          alt={`Screenshot ${i + 1}`}
+                          className="w-full h-full object-cover"
+                          onError={(e) => {
+                            (e.target as HTMLImageElement).style.display = "none";
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Structured output */}
+              {state.lastResult.structured_output && (
+                <div>
+                  <h4 className="text-xs font-medium text-muted-foreground mb-2">
+                    Structured Output
+                  </h4>
+                  <pre className="text-xs bg-muted/30 p-3 rounded-md overflow-x-auto font-mono max-h-32 overflow-y-auto">
+                    {JSON.stringify(state.lastResult.structured_output, null, 2)}
+                  </pre>
+                </div>
+              )}
+            </div>
+          ) : null}
+
+          {/* Error from context */}
+          {state.error && (
+            <div className="p-4 border-t border-border/50">
+              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-md">
+                <p className="text-sm text-red-500">{state.error}</p>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

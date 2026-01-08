@@ -236,3 +236,24 @@ export type {
 } from "./discoveries";
 
 export { getDiscoveryTypeLabel, getDiscoveryTypeColor, formatConfidence } from "./discoveries";
+
+// GUI Workflow types (deterministic action sequences)
+export type {
+  GuiActionType,
+  GuiWorkflowStep,
+  SavedGuiWorkflow,
+  CreateGuiWorkflowRequest,
+  UpdateGuiWorkflowRequest,
+  GuiWorkflowStepResult,
+  GuiWorkflowRunResult,
+} from "./gui-workflow";
+
+export {
+  getDefaultGuiWorkflowStep,
+  getDefaultStepName,
+  getDefaultGuiWorkflow,
+  getActionTypeIcon,
+  getActionTypeLabel,
+  validateGuiWorkflowStep,
+  validateGuiWorkflow,
+} from "./gui-workflow";

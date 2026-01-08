@@ -15,12 +15,22 @@ import {
   MousePointer2,
   Target,
   TestTube,
+  ClipboardCheck,
   Workflow,
   ArrowLeft,
 } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
 
-type CategoryId = "workflows" | "states" | "playwright" | "prompts" | "actions" | "capture" | null;
+type CategoryId =
+  | "workflows"
+  | "gui-workflows"
+  | "states"
+  | "playwright"
+  | "prompts"
+  | "actions"
+  | "capture"
+  | "tests"
+  | null;
 
 interface CategoryConfig {
   id: CategoryId;
@@ -38,6 +48,13 @@ const CATEGORIES: CategoryConfig[] = [
     icon: Workflow,
     color: "text-purple-500",
     requiresConfig: true,
+  },
+  {
+    id: "gui-workflows",
+    label: "GUI Workflows",
+    icon: MousePointer2,
+    color: "text-orange-500",
+    requiresConfig: false,
   },
   { id: "states", label: "States", icon: Target, color: "text-primary", requiresConfig: true },
   {
@@ -69,6 +86,13 @@ const CATEGORIES: CategoryConfig[] = [
     requiresConfig: false,
     alwaysShow: true,
   },
+  {
+    id: "tests",
+    label: "Verification Tests",
+    icon: ClipboardCheck,
+    color: "text-emerald-500",
+    requiresConfig: false,
+  },
 ];
 
 export function AddStepDropdown() {
@@ -78,11 +102,15 @@ export function AddStepDropdown() {
     workflows,
     playwrightScripts,
     savedPrompts,
+    guiWorkflows,
+    verificationTests,
     configLoaded,
     loadConfiguration,
     addStep,
     addActionStep,
+    addGuiWorkflowStep,
     addScreenshotStep,
+    addTestStep,
     setShowAddDropdown,
   } = useAiBuilder();
 
@@ -94,6 +122,8 @@ export function AddStepDropdown() {
     switch (categoryId) {
       case "workflows":
         return workflows.length;
+      case "gui-workflows":
+        return guiWorkflows.length;
       case "states":
         return states.length;
       case "playwright":
@@ -104,6 +134,8 @@ export function AddStepDropdown() {
         return images.length;
       case "capture":
         return 1; // Always has screenshot
+      case "tests":
+        return verificationTests.length;
       default:
         return 0;
     }
@@ -196,6 +228,22 @@ export function AddStepDropdown() {
               >
                 <Workflow className="w-4 h-4 text-purple-500" />
                 <span className="truncate">{workflow.name}</span>
+              </button>
+            ))}
+
+          {activeCategory === "gui-workflows" &&
+            guiWorkflows.map((workflow) => (
+              <button
+                key={workflow.id}
+                onClick={() => {
+                  addGuiWorkflowStep(workflow.id, workflow.name);
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <MousePointer2 className="w-4 h-4 text-orange-500" />
+                <span className="truncate flex-1">{workflow.name}</span>
+                <span className="text-xs text-muted-foreground">{workflow.stepCount} steps</span>
               </button>
             ))}
 
@@ -298,6 +346,27 @@ export function AddStepDropdown() {
               <span className="text-xs text-muted-foreground">for AI analysis</span>
             </button>
           )}
+
+          {activeCategory === "tests" &&
+            verificationTests.map((test) => (
+              <button
+                key={test.id}
+                onClick={() => {
+                  addTestStep(test.id, test.name, test.test_type, test.is_critical);
+                  setShowAddDropdown(false);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
+              >
+                <ClipboardCheck className="w-4 h-4 text-emerald-500" />
+                <span className="truncate flex-1">{test.name}</span>
+                {test.is_critical && (
+                  <span className="text-xs text-amber-500 font-medium">Critical</span>
+                )}
+                {test.category && (
+                  <span className="text-xs text-muted-foreground">{test.category}</span>
+                )}
+              </button>
+            ))}
         </div>
       </div>
     );

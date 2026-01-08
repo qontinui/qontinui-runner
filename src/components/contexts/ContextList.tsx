@@ -376,7 +376,7 @@ export function ContextList({ onLog }: ContextListProps) {
           {groupedContexts.builtin.length > 0 && (
             <div>
               <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
-                <BookOpen className="w-4 h-4 text-gray-400" />
+                <BookOpen className="w-4 h-4 text-text-muted" />
                 Built-in Contexts ({groupedContexts.builtin.length})
               </h3>
               <div className="space-y-2">

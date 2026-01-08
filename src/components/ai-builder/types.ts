@@ -45,10 +45,36 @@ export interface SavedPromptInfo {
   category: string;
 }
 
+/** GUI Workflow info for the dropdown */
+export interface GuiWorkflowInfo {
+  id: string;
+  name: string;
+  description: string;
+  stepCount: number;
+}
+
+/** Verification Test info for the dropdown */
+export interface VerificationTestInfo {
+  id: string;
+  name: string;
+  description: string;
+  test_type: "playwright_cdp" | "qontinui_vision" | "python_script" | "repository_test";
+  category?: string;
+  is_critical: boolean;
+}
+
 /** A single step in the execution sequence */
 export interface ExecutionStep {
   id: string;
-  type: "workflow" | "state" | "playwright" | "prompt" | "action" | "screenshot";
+  type:
+    | "workflow"
+    | "state"
+    | "playwright"
+    | "prompt"
+    | "action"
+    | "screenshot"
+    | "gui_workflow"
+    | "test";
   name: string;
   takeScreenshot: boolean;
   screenshotDelay?: number;
@@ -61,6 +87,12 @@ export interface ExecutionStep {
   targetImageId?: string;
   targetImageName?: string;
   screenshotMonitor?: number | "all";
+  guiWorkflowId?: string;
+  guiWorkflowName?: string;
+  /** Test step fields */
+  testId?: string;
+  testType?: "playwright_cdp" | "qontinui_vision" | "python_script" | "repository_test";
+  testIsCritical?: boolean;
 }
 
 /** Saved AI Workflow from the AI Workflows library */
@@ -202,7 +234,9 @@ export interface AiBuilderContextValue {
     imageId: string,
     imageName: string,
   ) => void;
+  addGuiWorkflowStep: (workflowId: string, workflowName: string) => void;
   addScreenshotStep: () => void;
+  addTestStep: (testId: string, testName: string, testType: string, isCritical: boolean) => void;
   removeStep: (stepId: string) => void;
   toggleStepScreenshot: (stepId: string) => void;
   updateScreenshotDelay: (stepId: string, delay: number) => void;
@@ -286,6 +320,8 @@ export interface AiBuilderContextValue {
   workflows: WorkflowInfo[];
   playwrightScripts: PlaywrightScriptInfo[];
   savedPrompts: SavedPromptInfo[];
+  guiWorkflows: GuiWorkflowInfo[];
+  verificationTests: VerificationTestInfo[];
   workspacePaths: WorkspacePaths | null;
 
   // External Props

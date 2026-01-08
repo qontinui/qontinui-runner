@@ -2,7 +2,7 @@
  * RunSelectionContext
  *
  * Provides shared run selection state across all run-specific pages in the Observe menu.
- * Uses the config from ExecutionContext to fetch runs and maintains selection state.
+ * Uses TaskRuns (AI sessions) from the task_runs table, not automation runs.
  */
 
 import {
@@ -13,10 +13,11 @@ import {
   useEffect,
   useCallback,
   useMemo,
+  useRef,
 } from "react";
 import { useExecution } from "./ExecutionContext";
-import { useRecentRuns, useRunDetails } from "../hooks/useStatistics";
-import type { RunDetails } from "../types/statistics";
+import { useTaskRuns, useTaskRun } from "../hooks/useAiData";
+import type { TaskRun } from "../types/aiData";
 
 // Store context in window to survive HMR
 declare global {
@@ -25,22 +26,22 @@ declare global {
   }
 }
 
-const STORAGE_KEY = "qontinui-selected-run-id";
+const STORAGE_KEY = "qontinui-selected-task-run-id";
 
 interface RunSelectionContextValue {
   /** Currently selected run ID */
   selectedRunId: string | null;
   /** Full details of the selected run */
-  selectedRun: RunDetails | null;
+  selectedRun: TaskRun | null;
   /** Set the selected run by ID */
   setSelectedRunId: (id: string | null) => void;
-  /** List of recent runs for the current config */
-  recentRuns: RunDetails[];
+  /** List of recent task runs */
+  recentRuns: TaskRun[];
   /** Whether runs are being loaded */
   isLoadingRuns: boolean;
   /** Whether the selected run details are being loaded */
   isLoadingDetails: boolean;
-  /** Config ID from ExecutionContext */
+  /** Config ID from ExecutionContext (for reference) */
   configId: string | null;
   /** Clear selection */
   clearSelection: () => void;
@@ -65,50 +66,68 @@ interface RunSelectionProviderProps {
 export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
   const { config, executionActive } = useExecution();
 
-  // Get configId from loaded config - use same logic as Rust backend:
-  // config.metadata.name if not empty, otherwise path
+  // Get configId from loaded config (for reference, not used for filtering)
   const configId = config?.name && config.name.length > 0 ? config.name : (config?.path ?? null);
 
-  // Load saved selection from localStorage (scoped to config)
+  // Load saved selection from localStorage (global, not config-scoped)
   const [selectedRunId, setSelectedRunIdState] = useState<string | null>(() => {
-    if (!configId) return null;
     try {
-      const stored = localStorage.getItem(`${STORAGE_KEY}-${configId}`);
+      const stored = localStorage.getItem(STORAGE_KEY);
       return stored ? JSON.parse(stored) : null;
     } catch {
       return null;
     }
   });
 
-  // Fetch recent runs for the config
-  const { data: recentRuns = [], isLoading: isLoadingRuns } = useRecentRuns(configId, 50);
+  // Fetch recent task runs (not filtered by config)
+  const { data: recentRuns = [], isLoading: isLoadingRuns } = useTaskRuns(50);
 
-  // Fetch details for the selected run
-  const { data: selectedRun, isLoading: isLoadingDetails } = useRunDetails(selectedRunId);
+  // Fetch details for the selected task run
+  const { data: selectedRun, isLoading: isLoadingDetails } = useTaskRun(selectedRunId);
 
   // Check if there's a run in progress
   const hasRunInProgress = useMemo(() => {
     return recentRuns.some((run) => run.status === "running") || executionActive;
   }, [recentRuns, executionActive]);
 
-  // Persist selection to localStorage
-  const setSelectedRunId = useCallback(
-    (id: string | null) => {
-      setSelectedRunIdState(id);
-      if (configId) {
-        try {
-          if (id) {
-            localStorage.setItem(`${STORAGE_KEY}-${configId}`, JSON.stringify(id));
-          } else {
-            localStorage.removeItem(`${STORAGE_KEY}-${configId}`);
-          }
-        } catch {
-          // Ignore storage errors
-        }
+  // Track previously known run IDs to detect new runs
+  const prevRunIdsRef = useRef<Set<string>>(new Set());
+
+  // Auto-select new running runs when execution starts
+  useEffect(() => {
+    if (recentRuns.length === 0) return;
+
+    const currentIds = new Set(recentRuns.map((r) => r.id));
+    const runningRun = recentRuns.find((r) => r.status === "running");
+
+    // If there's a running run that wasn't in previous list, auto-select it
+    if (runningRun && !prevRunIdsRef.current.has(runningRun.id)) {
+      setSelectedRunIdState(runningRun.id);
+      // Also persist to localStorage
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(runningRun.id));
+      } catch {
+        // Ignore storage errors
       }
-    },
-    [configId],
-  );
+    }
+
+    // Update the ref with current IDs
+    prevRunIdsRef.current = currentIds;
+  }, [recentRuns]);
+
+  // Persist selection to localStorage
+  const setSelectedRunId = useCallback((id: string | null) => {
+    setSelectedRunIdState(id);
+    try {
+      if (id) {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(id));
+      } else {
+        localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
 
   // Clear selection
   const clearSelection = useCallback(() => {
@@ -122,43 +141,12 @@ export function RunSelectionProvider({ children }: RunSelectionProviderProps) {
     }
   }, [recentRuns, setSelectedRunId]);
 
-  // When config changes, try to restore saved selection or auto-select most recent
+  // Auto-select most recent if no selection and runs available
   useEffect(() => {
-    if (!configId) {
-      setSelectedRunIdState(null);
-      return;
-    }
-
-    // Try to restore saved selection
-    try {
-      const stored = localStorage.getItem(`${STORAGE_KEY}-${configId}`);
-      if (stored) {
-        const savedId = JSON.parse(stored);
-        // Verify the saved run still exists in recent runs (once loaded)
-        if (recentRuns.length > 0) {
-          const runExists = recentRuns.some((run) => run.id === savedId);
-          if (runExists) {
-            setSelectedRunIdState(savedId);
-            return;
-          }
-        } else if (!isLoadingRuns) {
-          // Runs loaded but empty, clear invalid selection
-          setSelectedRunIdState(null);
-          return;
-        }
-        // Keep the saved ID while runs are loading
-        setSelectedRunIdState(savedId);
-        return;
-      }
-    } catch {
-      // Ignore parse errors
-    }
-
-    // No saved selection - auto-select most recent if available
-    if (recentRuns.length > 0 && !selectedRunId) {
+    if (!selectedRunId && recentRuns.length > 0 && !isLoadingRuns) {
       setSelectedRunIdState(recentRuns[0].id);
     }
-  }, [configId, recentRuns, isLoadingRuns, selectedRunId]);
+  }, [recentRuns, isLoadingRuns, selectedRunId]);
 
   // Validate selection when runs are loaded
   useEffect(() => {

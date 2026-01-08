@@ -20,6 +20,7 @@
 //! - `storage` - Local disk storage management
 //! - `video` - Video recording operations
 //! - `websocket` - WebSocket connectivity for remote monitoring
+//! - `interaction` - Interaction recording (video + input capture) for State Machine creation
 //!
 //! # Shared Types
 //!
@@ -52,14 +53,18 @@ pub mod execution;
 pub mod execution_reporting;
 pub mod extraction;
 pub mod findings;
+pub mod interaction;
 pub mod issues;
 pub mod logging;
 pub mod playwright_settings;
 pub mod project_logs;
 pub mod rag;
 pub mod screenshot;
+pub mod screenshots;
 pub mod state_machine;
 pub mod storage;
+pub mod task_sync; // renamed from ai_task_reporting
+pub mod testing;
 pub mod tiered_info;
 pub mod verification;
 pub mod video;

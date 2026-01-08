@@ -1,11 +1,8 @@
 /**
- * useUnifiedReport Hook
+ * useFindings Hook
  *
- * React hook for accessing the UnifiedReportService.
- * Provides reactive state updates when findings/issues change.
- *
- * This hook makes it easy for UI components to migrate from
- * using issueTracker/findingsTracker directly to the unified API.
+ * React hook for accessing the FindingsTracker.
+ * Provides reactive state updates when findings change.
  *
  * @example
  * ```tsx
@@ -17,7 +14,7 @@
  *     resolveItem,
  *     updateItemStatus,
  *     clearSession,
- *   } = useUnifiedReport();
+ *   } = useFindings();
  *
  *   return (
  *     <div>
@@ -38,36 +35,47 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import {
-  unifiedReportService,
-  type UnifiedReportItem,
-  type UnifiedReportSummary,
-  type UnifiedStatus,
-} from "../services/UnifiedReportService";
-import type { SessionContext } from "../services/SessionManager";
+import { findingsTracker } from "../services/FindingsTracker";
+import { sessionManager, type SessionContext } from "../services/SessionManager";
+import type { Finding, FindingStatus, FindingSeverity } from "../types/findings";
+
+/** Status types for findings */
+export type FindingStatusFilter =
+  | "detected"
+  | "in_progress"
+  | "needs_input"
+  | "resolved"
+  | "wont_fix"
+  | "deferred";
 
 export interface UseUnifiedReportOptions {
-  /** Filter to only show findings */
-  findingsOnly?: boolean;
-  /** Filter to only show issues */
-  issuesOnly?: boolean;
   /** Filter by status */
-  statusFilter?: UnifiedStatus | UnifiedStatus[];
+  statusFilter?: FindingStatusFilter | FindingStatusFilter[];
   /** Filter by severity */
-  severityFilter?: string | string[];
+  severityFilter?: FindingSeverity | FindingSeverity[];
   /** Only show actionable items */
   actionableOnly?: boolean;
   /** Only show items needing input */
   needsInputOnly?: boolean;
 }
 
+export interface FindingsSummary {
+  sessionId: string;
+  total: number;
+  byStatus: Record<FindingStatus, number>;
+  bySeverity: Record<FindingSeverity, number>;
+  actionable: number;
+  needsInput: number;
+  resolved: number;
+}
+
 export interface UseUnifiedReportResult {
   /** Current session context */
   session: SessionContext | null;
-  /** All items (findings + issues) for the current session */
-  items: UnifiedReportItem[];
+  /** All findings for the current session */
+  items: Finding[];
   /** Summary statistics */
-  summary: UnifiedReportSummary;
+  summary: FindingsSummary;
   /** Total count */
   count: number;
   /** Unresolved count */
@@ -78,39 +86,71 @@ export interface UseUnifiedReportResult {
   hasActionable: boolean;
   /** Whether any items need user input */
   hasNeedsInput: boolean;
-  /** Resolve an item */
+  /** Resolve a finding */
   resolveItem: (id: string, resolution: string) => boolean;
-  /** Update an item's status */
-  updateItemStatus: (id: string, status: UnifiedStatus) => boolean;
-  /** Provide user response for an item needing input */
+  /** Update a finding's status */
+  updateItemStatus: (id: string, status: FindingStatus) => boolean;
+  /** Provide user response for a finding needing input */
   provideUserResponse: (id: string, response: string) => boolean;
-  /** Clear all items for the session */
+  /** Clear all findings for the session */
   clearSession: () => void;
   /** Force refresh the data */
   refresh: () => void;
 }
 
 /**
- * Hook for accessing unified report data reactively
+ * Calculate summary statistics from findings
+ */
+function calculateSummary(findings: Finding[], sessionId: string): FindingsSummary {
+  const summary: FindingsSummary = {
+    sessionId,
+    total: findings.length,
+    byStatus: {
+      detected: 0,
+      in_progress: 0,
+      needs_input: 0,
+      resolved: 0,
+      wont_fix: 0,
+      deferred: 0,
+    },
+    bySeverity: {
+      critical: 0,
+      high: 0,
+      medium: 0,
+      low: 0,
+      info: 0,
+    },
+    actionable: 0,
+    needsInput: 0,
+    resolved: 0,
+  };
+
+  for (const finding of findings) {
+    summary.byStatus[finding.status]++;
+    summary.bySeverity[finding.severity]++;
+    if (finding.actionable && finding.status !== "resolved" && finding.status !== "wont_fix") {
+      summary.actionable++;
+    }
+    if (finding.status === "needs_input") {
+      summary.needsInput++;
+    }
+    if (finding.status === "resolved") {
+      summary.resolved++;
+    }
+  }
+
+  return summary;
+}
+
+/**
+ * Hook for accessing findings data reactively
  */
 export function useUnifiedReport(options: UseUnifiedReportOptions = {}): UseUnifiedReportResult {
-  const {
-    findingsOnly = false,
-    issuesOnly = false,
-    statusFilter,
-    severityFilter,
-    actionableOnly = false,
-    needsInputOnly = false,
-  } = options;
+  const { statusFilter, severityFilter, actionableOnly = false, needsInputOnly = false } = options;
 
   // State
-  const [items, setItems] = useState<UnifiedReportItem[]>([]);
-  const [summary, setSummary] = useState<UnifiedReportSummary>(
-    unifiedReportService.getSessionSummary(),
-  );
-  const [session, setSession] = useState<SessionContext | null>(
-    unifiedReportService.getCurrentSession(),
-  );
+  const [items, setItems] = useState<Finding[]>([]);
+  const [session, setSession] = useState<SessionContext | null>(sessionManager.getCurrentSession());
   const [refreshCounter, setRefreshCounter] = useState(0);
 
   // Refresh function
@@ -120,14 +160,7 @@ export function useUnifiedReport(options: UseUnifiedReportOptions = {}): UseUnif
 
   // Load and filter items
   useEffect(() => {
-    let allItems = unifiedReportService.getSessionItems();
-
-    // Apply type filter
-    if (findingsOnly) {
-      allItems = allItems.filter((item) => item.type === "finding");
-    } else if (issuesOnly) {
-      allItems = allItems.filter((item) => item.type === "issue");
-    }
+    let allItems = findingsTracker.getSessionFindings();
 
     // Apply status filter
     if (statusFilter) {
@@ -148,30 +181,26 @@ export function useUnifiedReport(options: UseUnifiedReportOptions = {}): UseUnif
 
     // Apply needs input filter
     if (needsInputOnly) {
-      allItems = allItems.filter((item) => item.needsInput);
+      allItems = allItems.filter((item) => item.status === "needs_input");
     }
 
     setItems(allItems);
-    setSummary(unifiedReportService.getSessionSummary());
-    setSession(unifiedReportService.getCurrentSession());
-  }, [
-    refreshCounter,
-    findingsOnly,
-    issuesOnly,
-    statusFilter,
-    severityFilter,
-    actionableOnly,
-    needsInputOnly,
-  ]);
+    setSession(sessionManager.getCurrentSession());
+  }, [refreshCounter, statusFilter, severityFilter, actionableOnly, needsInputOnly]);
 
-  // Subscribe to changes
+  // Subscribe to findings changes
   useEffect(() => {
-    const unsubscribe = unifiedReportService.subscribe((event) => {
-      // Update session on session change
-      if (event.type === "session_changed") {
-        setSession(event.session || null);
-      }
-      // Refresh on any item change
+    const unsubscribe = findingsTracker.subscribe(() => {
+      refresh();
+    });
+
+    return unsubscribe;
+  }, [refresh]);
+
+  // Subscribe to session changes
+  useEffect(() => {
+    const unsubscribe = sessionManager.subscribe((newSession) => {
+      setSession(newSession);
       refresh();
     });
 
@@ -179,30 +208,34 @@ export function useUnifiedReport(options: UseUnifiedReportOptions = {}): UseUnif
   }, [refresh]);
 
   // Computed values
+  const sessionId = session?.id || "";
+  const summary = calculateSummary(items, sessionId);
   const count = items.length;
-  const unresolvedCount = items.filter((item) => item.actionable).length;
+  const unresolvedCount = items.filter(
+    (item) => item.actionable && item.status !== "resolved" && item.status !== "wont_fix",
+  ).length;
   const hasItems = count > 0;
   const hasActionable = unresolvedCount > 0;
-  const hasNeedsInput = items.some((item) => item.needsInput);
+  const hasNeedsInput = items.some((item) => item.status === "needs_input");
 
   // Action callbacks
   const resolveItem = useCallback((id: string, resolution: string): boolean => {
-    const result = unifiedReportService.resolveItem(id, resolution);
-    return result;
+    const result = findingsTracker.resolveFinding(id, resolution);
+    return result !== null;
   }, []);
 
-  const updateItemStatus = useCallback((id: string, status: UnifiedStatus): boolean => {
-    const result = unifiedReportService.updateItemStatus(id, status);
-    return result;
+  const updateItemStatus = useCallback((id: string, status: FindingStatus): boolean => {
+    const result = findingsTracker.updateFindingStatus(id, status);
+    return result !== null;
   }, []);
 
   const provideUserResponse = useCallback((id: string, response: string): boolean => {
-    const result = unifiedReportService.provideUserResponse(id, response);
-    return result;
+    const result = findingsTracker.provideUserResponse(id, response);
+    return result !== null;
   }, []);
 
   const clearSession = useCallback(() => {
-    unifiedReportService.clearSession();
+    findingsTracker.clearSession();
   }, []);
 
   return {
@@ -223,19 +256,8 @@ export function useUnifiedReport(options: UseUnifiedReportOptions = {}): UseUnif
 }
 
 /**
- * Hook for accessing only findings
+ * Hook for accessing findings (alias for useUnifiedReport)
  */
-export function useFindings(
-  options: Omit<UseUnifiedReportOptions, "findingsOnly" | "issuesOnly"> = {},
-): UseUnifiedReportResult {
-  return useUnifiedReport({ ...options, findingsOnly: true });
-}
-
-/**
- * Hook for accessing only issues
- */
-export function useIssues(
-  options: Omit<UseUnifiedReportOptions, "findingsOnly" | "issuesOnly"> = {},
-): UseUnifiedReportResult {
-  return useUnifiedReport({ ...options, issuesOnly: true });
+export function useFindings(options: UseUnifiedReportOptions = {}): UseUnifiedReportResult {
+  return useUnifiedReport(options);
 }

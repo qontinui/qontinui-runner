@@ -18,6 +18,9 @@ import {
   Bot,
   Trash2,
   Activity,
+  ToggleLeft,
+  ToggleRight,
+  Wrench,
 } from "lucide-react";
 import type { ExecutionReport as ExecutionReportType, Finding } from "../../types/findings";
 import { findingsTracker, getVisibleCategories } from "../../services";
@@ -45,7 +48,7 @@ const statusLabels: Record<
   completed: { label: "Completed", color: "text-green-400", icon: CheckCircle },
   paused_for_input: { label: "Needs Input", color: "text-purple-400", icon: AlertCircle },
   failed: { label: "Failed", color: "text-red-400", icon: AlertCircle },
-  cancelled: { label: "Cancelled", color: "text-gray-400", icon: AlertCircle },
+  cancelled: { label: "Cancelled", color: "text-text-muted", icon: AlertCircle },
 };
 
 type FilterMode = "all" | "actionable" | "needs_input" | "resolved";
@@ -63,6 +66,8 @@ export function ExecutionReport({
   const [processingFindingId, setProcessingFindingId] = useState<string | null>(null);
   const [liveFindings, setLiveFindings] = useState<Finding[]>([]);
   const [isAnalyzingAll, setIsAnalyzingAll] = useState(false);
+  const [autoFixEnabled, setAutoFixEnabled] = useState(false);
+  const [autoFixLoading, setAutoFixLoading] = useState(false);
 
   // Use RunSelectionContext if available
   const runSelection = useRunSelectionOptional();
@@ -99,6 +104,44 @@ export function ExecutionReport({
 
     return unsubscribe;
   }, []);
+
+  // Load auto-fix setting on mount
+  useEffect(() => {
+    const loadAutoFixSetting = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/session/auto-fix");
+        const result = await response.json();
+        if (result.success) {
+          setAutoFixEnabled(result.data?.enabled ?? false);
+        }
+      } catch (error) {
+        console.error("Failed to load auto-fix setting:", error);
+      }
+    };
+    loadAutoFixSetting();
+  }, []);
+
+  // Toggle auto-fix setting
+  const toggleAutoFix = useCallback(async () => {
+    if (autoFixLoading) return;
+
+    setAutoFixLoading(true);
+    try {
+      const response = await fetch("http://localhost:9876/session/auto-fix", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: !autoFixEnabled }),
+      });
+      const result = await response.json();
+      if (result.success) {
+        setAutoFixEnabled(result.data?.enabled ?? !autoFixEnabled);
+      }
+    } catch (error) {
+      console.error("Failed to toggle auto-fix setting:", error);
+    } finally {
+      setAutoFixLoading(false);
+    }
+  }, [autoFixEnabled, autoFixLoading]);
 
   // Use report findings if available, otherwise use live findings
   const findings = report?.findings || liveFindings;
@@ -419,6 +462,32 @@ Work through ALL findings systematically. Fix each one and report your resolutio
 
           {/* Action Buttons */}
           <div className="flex items-center gap-2">
+            {/* Auto-Fix Toggle */}
+            <button
+              onClick={toggleAutoFix}
+              disabled={autoFixLoading}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
+                autoFixEnabled
+                  ? "bg-blue-500/20 text-blue-400 hover:bg-blue-500/30"
+                  : "bg-muted/50 text-muted-foreground hover:bg-muted"
+              } ${autoFixLoading ? "opacity-50" : ""}`}
+              title={
+                autoFixEnabled
+                  ? "Auto-fix enabled: AI will automatically fix issues"
+                  : "Auto-fix disabled"
+              }
+            >
+              <Wrench className="w-4 h-4" />
+              {autoFixLoading ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : autoFixEnabled ? (
+                <ToggleRight className="w-4 h-4" />
+              ) : (
+                <ToggleLeft className="w-4 h-4" />
+              )}
+              <span>Auto-Fix</span>
+            </button>
+
             {/* Analyze & Fix All Button */}
             {summary.autoFixable > 0 && (
               <button

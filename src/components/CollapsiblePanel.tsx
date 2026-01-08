@@ -1,5 +1,5 @@
 import { useState, useEffect, ReactNode } from "react";
-import { ChevronDown, ChevronUp } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 
 interface CollapsiblePanelProps {
   title: string;
@@ -26,7 +26,7 @@ const CollapsiblePanel = ({
   onToggle,
   storageKey,
   colorClass = "text-primary",
-  borderColorClass = "border-primary/50",
+  borderColorClass: _borderColorClass = "border-primary/50",
   collapsible = true,
   headerExtra,
 }: CollapsiblePanelProps) => {
@@ -70,47 +70,33 @@ const CollapsiblePanel = ({
   const showContent = !collapsible || !isCollapsed;
 
   return (
-    <div
-      className={`bg-card rounded-lg border border-border/50 hover:${borderColorClass} transition-all duration-300 ${
-        !showContent ? "p-0" : "p-6"
-      }`}
-    >
+    <div className="panel">
       {/* Header */}
       {collapsible ? (
-        <div className={`w-full flex items-center justify-between ${isCollapsed ? "p-4" : "pb-4"}`}>
-          <button
-            onClick={handleToggle}
-            className="flex items-center gap-2 hover:opacity-80 transition-opacity flex-1"
-            aria-expanded={!isCollapsed}
-            aria-controls={`panel-content-${title.replace(/\s+/g, "-").toLowerCase()}`}
-          >
-            <div className={`flex items-center gap-2 ${colorClass}`}>
-              {icon}
-              <h2 className="text-lg font-semibold">{title}</h2>
-            </div>
-          </button>
+        <button
+          onClick={handleToggle}
+          className="panel-header-btn"
+          aria-expanded={!isCollapsed}
+          aria-controls={`panel-content-${title.replace(/\s+/g, "-").toLowerCase()}`}
+        >
+          <div className="panel-title">
+            <span className={colorClass}>{icon}</span>
+            <span>{title}</span>
+          </div>
           <div className="flex items-center gap-2">
             {headerExtra}
-            <button
-              onClick={handleToggle}
-              className="flex items-center gap-2 hover:opacity-80 transition-opacity"
-            >
-              <span className="text-sm text-muted-foreground">
-                {isCollapsed ? "Expand" : "Collapse"}
-              </span>
-              {isCollapsed ? (
-                <ChevronDown className="w-5 h-5" />
-              ) : (
-                <ChevronUp className="w-5 h-5" />
-              )}
-            </button>
+            <ChevronDown
+              className={`w-4 h-4 text-muted-foreground transition-transform ${
+                !isCollapsed ? "rotate-180" : ""
+              }`}
+            />
           </div>
-        </div>
+        </button>
       ) : (
-        <div className={`flex items-center justify-between pb-4`}>
-          <div className={`flex items-center gap-2 ${colorClass}`}>
-            {icon}
-            <h2 className="text-lg font-semibold">{title}</h2>
+        <div className="panel-header">
+          <div className="panel-title">
+            <span className={colorClass}>{icon}</span>
+            <span>{title}</span>
           </div>
           {headerExtra}
         </div>
@@ -120,7 +106,7 @@ const CollapsiblePanel = ({
       {showContent && (
         <div
           id={`panel-content-${title.replace(/\s+/g, "-").toLowerCase()}`}
-          className="space-y-4 animate-slideDown"
+          className="panel-content space-y-3"
         >
           {children}
         </div>

@@ -13,7 +13,6 @@ import { logManager } from "../index";
 import type { HandlerSetupFunction } from "./types";
 import type { AiOutputStreamEventPayload } from "../../types/eventPayloads";
 import { findingsTracker } from "../../services/FindingsTracker";
-import { issueTracker } from "../../services/IssueTracker";
 import { sessionManager } from "../../services/SessionManager";
 import { tauriFindingsListener } from "../../services/TauriFindingsListener";
 
@@ -95,28 +94,16 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
 
       logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName);
 
-      // Process AI output for findings and issues detection
+      // Process AI output for findings detection
       // Only process AI responses (not user prompts or hints)
       //
-      // MIGRATION STATUS (2024):
-      // - PRIMARY: Rust backend now parses [FINDING:...] markers and stores in SQLite
-      //   Findings are received via TauriFindingsListener Tauri events
-      // - LEGACY: IssueTracker still parses [ISSUE:DETECTED/RESOLVED] for backward compat
-      // - FALLBACK: FindingsTracker local parsing kept temporarily for safety
+      // FindingsTracker handles:
+      // - [FINDING:category:severity] markers
+      // - [VERIFICATION:PENDING/COMPLETED/FAILED] markers
+      // - [RUNNER:RESTART] markers
       //
-      // UI components use UnifiedReportService which aggregates findings.
-      //
-      // NEXT STEPS to complete migration:
-      // 1. Remove findingsTracker.processLine() call (Rust handles this)
-      // 2. Remove issueTracker.processLine() once all prompts use [FINDING:...]
-      // 3. Simplify UnifiedReportService to use only FindingsTracker
+      // Rust backend also parses findings and sends via TauriFindingsListener events.
       if (source === "claude" || source === "ai") {
-        // Legacy IssueTracker - still needed for [ISSUE:DETECTED] markers
-        issueTracker.processLine(line);
-
-        // FindingsTracker local parsing - kept as fallback during migration
-        // Primary source is now Rust backend via TauriFindingsListener events
-        // TODO: Remove this once Rust integration is verified stable
         findingsTracker.processLine(line);
       }
     }),

@@ -1,119 +1,105 @@
 /**
  * CaptureTab.tsx
  *
- * Dedicated tab for screenshot capture operations.
- * Contains tools for capturing screenshots to local folders or web projects.
+ * Dedicated tab for interaction recording - capturing user mouse and keyboard
+ * input along with screen video for creating State Machines from user interactions.
+ *
+ * This complements Web Extraction (for websites) by enabling State Machine creation
+ * from non-web or mixed environments.
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  Check,
-  X,
-  Camera,
+  Video,
+  Square,
+  Play,
+  MousePointer2,
+  Keyboard,
+  Timer,
   FolderOpen,
-  Monitor,
-  Plus,
-  Trash2,
-  Upload,
+  Settings2,
+  CheckCircle,
+  AlertCircle,
   Loader2,
-  Cloud,
-  HardDrive,
-  Package,
-  ChevronDown,
-  ChevronUp,
+  Info,
 } from "lucide-react";
-import type { Project } from "../types/auth";
-import { DatasetWizardDialog } from "./DatasetWizardDialog";
 
-interface MonitorInfo {
-  index: number;
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  scale: number;
-  is_primary: boolean;
-  name?: string;
-}
-
-interface ScreenshotCaptureSettings {
-  enabled: boolean;
-  manualClicksEnabled: boolean;
-  outputFolder: string;
-  baseImageName: string;
-  screens: { type: "all" | "primary" | "specific"; indices?: number[] };
-  captureTimings: number[];
+interface InteractionRecordingStatus {
+  is_recording: boolean;
+  session_id?: string;
+  duration?: number;
+  events_count?: number;
+  fps?: number;
 }
 
 interface CaptureTabProps {
   onLog: (level: "info" | "warning" | "error" | "debug" | "success", message: string) => void;
-  projects: Project[];
-  selectedProjectId: string | null;
-  selectedProjectName: string | null;
 }
 
-export function CaptureTab({
-  onLog,
-  projects,
-  selectedProjectId,
-  selectedProjectName,
-}: CaptureTabProps) {
-  // Local capture settings
-  const [captureSettings, setCaptureSettings] = useState<ScreenshotCaptureSettings>({
-    enabled: false,
-    manualClicksEnabled: false,
-    outputFolder: "",
-    baseImageName: "screenshot",
-    screens: { type: "primary" },
-    captureTimings: [0],
-  });
-  const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
-  const [captureSaving, setCaptureSaving] = useState(false);
-  const [captureSaveSuccess, setCaptureSaveSuccess] = useState(false);
-  const [captureError, setCaptureError] = useState<string | null>(null);
-  const [manualCaptureRunning, setManualCaptureRunning] = useState(false);
+export function CaptureTab({ onLog }: CaptureTabProps) {
+  // Recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [duration, setDuration] = useState(0);
+  const [eventsCount, setEventsCount] = useState(0);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isStopping, setIsStopping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastRecording, setLastRecording] = useState<{
+    sessionId: string;
+    duration: number;
+    eventsCount: number;
+    eventsFile?: string;
+  } | null>(null);
 
-  // Capture to Web state
-  const [isCapturingToWeb, setIsCapturingToWeb] = useState(false);
-  const [captureToWebSuccess, setCaptureToWebSuccess] = useState(false);
-  const [captureToWebError, setCaptureToWebError] = useState<string | null>(null);
-  const [selectedCaptureMonitor, setSelectedCaptureMonitor] = useState<number>(0);
+  // Settings
+  const [fps, setFps] = useState(30);
+  const [showSettings, setShowSettings] = useState(false);
 
-  // Section collapse state
-  const [localSectionExpanded, setLocalSectionExpanded] = useState(false);
+  // Timer ref for duration updates
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startTimeRef = useRef<number | null>(null);
 
-  // Dataset wizard dialog state
-  const [datasetWizardOpen, setDatasetWizardOpen] = useState(false);
-
-  useEffect(() => {
-    loadMonitors();
-  }, []);
-
-  // Auto-select primary screen when monitors load
-  useEffect(() => {
-    if (monitors.length > 0 && captureSettings.screens.type === "primary") {
-      const primary = monitors.find((m) => m.is_primary);
-      if (primary) {
-        setCaptureSettings((prev) => ({
-          ...prev,
-          screens: { type: "specific", indices: [primary.index] },
-        }));
-      }
-    }
-  }, [monitors]);
-
-  // Listen for manual capture status updates from Python
+  // Listen for recording events from Python executor
   useEffect(() => {
     let unlisten: (() => void) | undefined;
 
     listen(
       "executor-event",
-      (event: { payload?: { data?: { message?: string; manual_capture_running?: boolean } } }) => {
+      (event: {
+        payload?: {
+          data?: {
+            type?: string;
+            session_id?: string;
+            events_count?: number;
+            duration?: number;
+            events_file?: string;
+          };
+        };
+      }) => {
         const data = event.payload?.data;
-        if (data?.message === "capture_status_update") {
-          setManualCaptureRunning(data.manual_capture_running || false);
+        if (!data) return;
+
+        if (data.type === "interaction_recording_started") {
+          setIsRecording(true);
+          setSessionId(data.session_id || null);
+          setEventsCount(0);
+          startTimeRef.current = Date.now();
+          onLog("success", `Interaction recording started: ${data.session_id}`);
+        } else if (data.type === "interaction_recording_stopped") {
+          setIsRecording(false);
+          setLastRecording({
+            sessionId: data.session_id || "",
+            duration: data.duration || duration,
+            eventsCount: data.events_count || eventsCount,
+            eventsFile: data.events_file,
+          });
+          onLog(
+            "success",
+            `Recording stopped: ${data.events_count} events captured in ${(data.duration || 0).toFixed(1)}s`,
+          );
         }
       },
     ).then((fn) => {
@@ -123,633 +109,372 @@ export function CaptureTab({
     return () => {
       if (unlisten) unlisten();
     };
-  }, []);
+  }, [duration, eventsCount, onLog]);
 
-  const loadMonitors = async () => {
-    try {
-      const result = await invoke<{ success: boolean; data?: { monitors: MonitorInfo[] } }>(
-        "get_monitors",
-      );
-      if (result?.success && result.data?.monitors) {
-        // Sort monitors by x position (left to right)
-        const sortedMonitors = [...result.data.monitors].sort((a, b) => a.x - b.x);
-        setMonitors(sortedMonitors);
-        // Auto-select primary monitor for capture-to-web
-        const primary = sortedMonitors.find((m) => m.is_primary);
-        if (primary) {
-          setSelectedCaptureMonitor(primary.index);
-        }
-      }
-    } catch (err) {
-      console.error("Failed to load monitors:", err);
-    }
-  };
-
-  const handleCaptureAndUploadToWeb = async () => {
-    if (!selectedProjectId) {
-      setCaptureToWebError("Please select a project in Settings first");
-      return;
-    }
-
-    setIsCapturingToWeb(true);
-    setCaptureToWebError(null);
-    setCaptureToWebSuccess(false);
-
-    try {
-      const result = await invoke<{ success: boolean; error?: string }>(
-        "capture_and_upload_screenshot",
-        {
-          config: {
-            project_id: selectedProjectId,
-            monitor: selectedCaptureMonitor,
-          },
-        },
-      );
-
-      if (result?.success) {
-        setCaptureToWebSuccess(true);
-        onLog("success", `Screenshot uploaded to project successfully`);
-        setTimeout(() => setCaptureToWebSuccess(false), 3000);
-      } else {
-        const errorMsg = result?.error || "Unknown error";
-        setCaptureToWebError(errorMsg);
-        onLog("error", `Failed to capture and upload: ${errorMsg}`);
-      }
-    } catch (err) {
-      console.error("Failed to capture and upload:", err);
-      setCaptureToWebError(`Failed: ${err}`);
-      onLog("error", `Failed to capture and upload: ${err}`);
-    } finally {
-      setIsCapturingToWeb(false);
-    }
-  };
-
-  const handleToggleCapture = () => {
-    setCaptureSettings((prev) => ({
-      ...prev,
-      enabled: !prev.enabled,
-    }));
-  };
-
-  const handleFolderSelect = async () => {
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        title: "Select Output Folder",
-      });
-
-      if (selected && typeof selected === "string") {
-        setCaptureSettings((prev) => ({
-          ...prev,
-          outputFolder: selected,
-        }));
-      }
-    } catch (err) {
-      console.error("Failed to select folder:", err);
-      onLog("error", `Failed to select folder: ${err}`);
-    }
-  };
-
-  const handleScreenSelectionChange = (type: "all" | "primary" | "specific", index?: number) => {
-    if (type === "specific" && index !== undefined) {
-      setCaptureSettings((prev) => ({
-        ...prev,
-        screens: { type: "specific", indices: [index] },
-      }));
+  // Update duration while recording
+  useEffect(() => {
+    if (isRecording && startTimeRef.current) {
+      timerRef.current = setInterval(() => {
+        const elapsed = (Date.now() - (startTimeRef.current || Date.now())) / 1000;
+        setDuration(elapsed);
+      }, 100);
     } else {
-      setCaptureSettings((prev) => ({
-        ...prev,
-        screens: type === "specific" ? { type, indices: [] } : { type },
-      }));
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
     }
-  };
 
-  const handleAddTiming = () => {
-    setCaptureSettings((prev) => ({
-      ...prev,
-      captureTimings: [...prev.captureTimings, 0],
-    }));
-  };
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, [isRecording]);
 
-  const handleRemoveTiming = (index: number) => {
-    setCaptureSettings((prev) => ({
-      ...prev,
-      captureTimings: prev.captureTimings.filter((_, i) => i !== index),
-    }));
-  };
+  // Poll for status updates during recording
+  useEffect(() => {
+    if (!isRecording) return;
 
-  const handleTimingChange = (index: number, value: number) => {
-    setCaptureSettings((prev) => ({
-      ...prev,
-      captureTimings: prev.captureTimings.map((t, i) => (i === index ? Math.max(0, value) : t)),
-    }));
-  };
+    const pollStatus = async () => {
+      try {
+        const result = await invoke<{ success: boolean; data?: InteractionRecordingStatus }>(
+          "get_interaction_recording_status",
+        );
+        if (result?.success && result.data) {
+          if (result.data.events_count !== undefined) {
+            setEventsCount(result.data.events_count);
+          }
+        }
+      } catch {
+        // Ignore polling errors
+      }
+    };
 
-  const saveCaptureSettings = async () => {
+    const pollInterval = setInterval(pollStatus, 1000);
+    return () => clearInterval(pollInterval);
+  }, [isRecording]);
+
+  const handleStartRecording = async () => {
+    setError(null);
+    setIsStarting(true);
+
     try {
-      setCaptureSaving(true);
-      setCaptureError(null);
-      setCaptureSaveSuccess(false);
-
       const result = await invoke<{
         success: boolean;
         message?: string;
-        manual_capture_running?: boolean;
-      }>("update_capture_settings", { settings: captureSettings });
+        data?: { session_id?: string };
+      }>("start_interaction_recording", {
+        config: {
+          fps,
+        },
+      });
 
       if (result?.success) {
-        setCaptureSaveSuccess(true);
-        setManualCaptureRunning(result.manual_capture_running || false);
-        onLog("success", "Screenshot capture settings saved successfully");
-        setTimeout(() => setCaptureSaveSuccess(false), 3000);
+        setIsRecording(true);
+        setSessionId(result.data?.session_id || null);
+        setDuration(0);
+        setEventsCount(0);
+        startTimeRef.current = Date.now();
+        onLog("success", "Interaction recording started");
       } else {
-        const errorMsg = result?.message || "Unknown error";
-        setCaptureError(errorMsg);
-        onLog("error", `Failed to save capture settings: ${errorMsg}`);
+        const errorMsg = result?.message || "Failed to start recording";
+        setError(errorMsg);
+        onLog("error", errorMsg);
       }
     } catch (err) {
-      console.error("Failed to save capture settings:", err);
-      setCaptureError(`Failed to save settings: ${err}`);
-      onLog("error", `Failed to save capture settings: ${err}`);
+      const errorMsg = `Failed to start recording: ${err}`;
+      setError(errorMsg);
+      onLog("error", errorMsg);
     } finally {
-      setCaptureSaving(false);
+      setIsStarting(false);
     }
   };
 
-  const handleStartManualCapture = async () => {
+  const handleStopRecording = async () => {
+    setError(null);
+    setIsStopping(true);
+
     try {
       const result = await invoke<{
         success: boolean;
         message?: string;
-        manual_capture_running?: boolean;
-      }>("update_capture_settings", {
-        settings: { ...captureSettings, enabled: true, manualClicksEnabled: true },
-      });
+        data?: {
+          session_id?: string;
+          events_file?: string;
+          events_count?: number;
+          duration?: number;
+        };
+      }>("stop_interaction_recording");
 
       if (result?.success) {
-        setManualCaptureRunning(result.manual_capture_running || false);
-        setCaptureSettings((prev) => ({ ...prev, enabled: true, manualClicksEnabled: true }));
-        onLog("success", "Manual capture started");
+        setIsRecording(false);
+        setLastRecording({
+          sessionId: result.data?.session_id || sessionId || "",
+          duration: result.data?.duration || duration,
+          eventsCount: result.data?.events_count || eventsCount,
+          eventsFile: result.data?.events_file,
+        });
+        setSessionId(null);
+        onLog(
+          "success",
+          `Recording stopped: ${result.data?.events_count || eventsCount} events captured`,
+        );
       } else {
-        const errorMsg = result?.message || "Unknown error";
-        onLog("error", `Failed to start manual capture: ${errorMsg}`);
+        const errorMsg = result?.message || "Failed to stop recording";
+        setError(errorMsg);
+        onLog("error", errorMsg);
       }
     } catch (err) {
-      console.error("Failed to start manual capture:", err);
-      onLog("error", `Failed to start manual capture: ${err}`);
+      const errorMsg = `Failed to stop recording: ${err}`;
+      setError(errorMsg);
+      onLog("error", errorMsg);
+    } finally {
+      setIsStopping(false);
     }
   };
 
-  const handleStopManualCapture = async () => {
-    try {
-      const result = await invoke<{
-        success: boolean;
-        message?: string;
-        manual_capture_running?: boolean;
-      }>("update_capture_settings", {
-        settings: { ...captureSettings, manualClicksEnabled: false },
-      });
+  const formatDuration = (seconds: number): string => {
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    const ms = Math.floor((seconds % 1) * 10);
+    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}.${ms}`;
+  };
 
-      if (result?.success) {
-        setManualCaptureRunning(result.manual_capture_running || false);
-        setCaptureSettings((prev) => ({ ...prev, manualClicksEnabled: false }));
-        onLog("info", "Manual capture stopped");
-      } else {
-        const errorMsg = result?.message || "Unknown error";
-        onLog("error", `Failed to stop manual capture: ${errorMsg}`);
+  const openOutputFolder = async () => {
+    if (lastRecording?.eventsFile) {
+      try {
+        // Extract directory from file path
+        const dir = lastRecording.eventsFile.replace(/[/][^/]+$/, "");
+        await invoke("open_folder", { path: dir });
+      } catch (err) {
+        onLog("error", `Failed to open folder: ${err}`);
       }
-    } catch (err) {
-      console.error("Failed to stop manual capture:", err);
-      onLog("error", `Failed to stop manual capture: ${err}`);
     }
   };
 
   return (
-    <div className="space-y-6 p-6 overflow-y-auto max-h-[calc(100vh-200px)]">
+    <div className="h-full flex flex-col p-4 gap-4 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <Camera className="w-6 h-6 text-primary" />
-          <div>
-            <h2 className="text-xl font-semibold">Capture</h2>
-            <p className="text-sm text-muted-foreground">
-              Capture screenshots for building automation configurations
-            </p>
-          </div>
-        </div>
-        <button
-          onClick={() => setDatasetWizardOpen(true)}
-          className="px-4 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md font-medium transition-colors flex items-center gap-2"
-        >
-          <Package className="w-4 h-4" />
-          Package Dataset
-        </button>
-      </div>
-
-      {/* Dataset Wizard Dialog */}
-      <DatasetWizardDialog open={datasetWizardOpen} onOpenChange={setDatasetWizardOpen} />
-
-      {/* Capture to Web Section */}
-      <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <Cloud className="w-5 h-5 text-primary" />
-          <h3 className="font-semibold text-lg">Capture to Web Project</h3>
-        </div>
-
-        <p className="text-sm text-muted-foreground">
-          Take a screenshot and upload it directly to your qontinui-web project. Screenshots are
-          captured at physical resolution.
-        </p>
-
-        {captureToWebError && (
-          <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
-            <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-            <span className="text-red-400 text-sm">{captureToWebError}</span>
-          </div>
-        )}
-
-        {captureToWebSuccess && (
-          <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
-            <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
-            <span className="text-green-400 text-sm">Screenshot uploaded successfully!</span>
-          </div>
-        )}
-
-        <div className="space-y-4">
-          {/* Project Info */}
-          <div className="space-y-2">
-            <div className="font-medium">Target Project</div>
-            {selectedProjectId ? (
-              <div className="flex items-center gap-2 px-3 py-2 bg-input border border-border/50 rounded-md">
-                <Cloud className="w-4 h-4 text-primary" />
-                <span className="font-medium">
-                  {selectedProjectName ||
-                    projects.find((p) => p.id === selectedProjectId)?.name ||
-                    "Loading..."}
-                </span>
-              </div>
-            ) : (
-              <div className="text-sm text-orange-400 italic">
-                No project selected. Go to Settings → Connection to select a project.
-              </div>
-            )}
-          </div>
-
-          {/* Monitor Selection */}
-          <div className="space-y-2">
-            <div className="font-medium flex items-center gap-2">
-              <Monitor className="w-4 h-4" />
-              Capture Screen
+      <div className="flex-shrink-0 px-4 py-3 rounded-lg bg-muted/30">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div
+              className={`w-8 h-8 rounded-full flex items-center justify-center ${
+                isRecording ? "bg-red-500/20" : "bg-muted"
+              }`}
+            >
+              <Video
+                className={`w-4 h-4 ${isRecording ? "text-red-500" : "text-muted-foreground"}`}
+              />
             </div>
-            <div className="flex flex-wrap gap-3">
-              {monitors.length > 0 ? (
-                monitors.map((monitor, spatialIndex) => {
-                  // Display spatial position (1-indexed, left to right) instead of Windows enumeration index
-                  const displayNumber = spatialIndex + 1;
-                  return (
-                    <button
-                      key={monitor.index}
-                      onClick={() => setSelectedCaptureMonitor(monitor.index)}
-                      className={`flex flex-col items-center gap-1 p-3 rounded-lg border transition-colors min-w-[100px] ${
-                        selectedCaptureMonitor === monitor.index
-                          ? "bg-primary/20 border-primary text-primary"
-                          : "bg-input border-border/50 hover:border-primary/50"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2">
-                        <Monitor className="w-5 h-5" />
-                        <span className="font-medium">
-                          #{displayNumber}
-                          {monitor.is_primary && (
-                            <span className="text-primary ml-1">(primary)</span>
-                          )}
-                        </span>
-                      </div>
-                      <span className="text-xs text-muted-foreground">
-                        {monitor.width}x{monitor.height}
-                      </span>
-                    </button>
-                  );
-                })
-              ) : (
-                <div className="text-sm text-muted-foreground">Loading monitors...</div>
-              )}
+            <div>
+              <h3 className="font-semibold text-foreground text-sm">Interaction Recording</h3>
+              <p className="text-xs text-muted-foreground">
+                Capture mouse and keyboard input for State Machine creation
+              </p>
             </div>
           </div>
-
-          {/* Capture Button */}
           <button
-            onClick={handleCaptureAndUploadToWeb}
-            disabled={isCapturingToWeb || !selectedProjectId}
-            className="px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white rounded-md font-medium transition-colors flex items-center gap-2"
+            onClick={() => setShowSettings(!showSettings)}
+            className={`p-2 rounded-lg transition-colors ${
+              showSettings
+                ? "bg-primary/20 text-primary"
+                : "hover:bg-muted/50 text-muted-foreground"
+            }`}
           >
-            {isCapturingToWeb ? (
-              <>
-                <Loader2 className="w-5 h-5 animate-spin" />
-                Capturing & Uploading...
-              </>
-            ) : (
-              <>
-                <Upload className="w-5 h-5" />
-                Capture & Upload to Web
-              </>
-            )}
+            <Settings2 className="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      {/* Capture to Local Section */}
-      <div className="bg-card rounded-lg border border-border/50">
-        {/* Collapsible Header */}
-        <button
-          onClick={() => setLocalSectionExpanded(!localSectionExpanded)}
-          className="w-full p-6 flex items-center justify-between hover:bg-muted/50 transition-colors rounded-lg"
-        >
-          <div className="flex items-center gap-3">
-            <HardDrive className="w-5 h-5 text-primary" />
-            <h3 className="font-semibold text-lg">Capture to Local Folder</h3>
-          </div>
-          {localSectionExpanded ? (
-            <ChevronUp className="w-5 h-5 text-muted-foreground" />
-          ) : (
-            <ChevronDown className="w-5 h-5 text-muted-foreground" />
-          )}
-        </button>
-
-        {/* Collapsible Content */}
-        {localSectionExpanded && (
-          <div className="px-6 pb-6 space-y-4">
-            {captureError && (
-              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
-                <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-                <span className="text-red-400 text-sm">{captureError}</span>
-              </div>
-            )}
-
-            {captureSaveSuccess && (
-              <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
-                <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
-                <span className="text-green-400 text-sm">Capture settings saved!</span>
-              </div>
-            )}
-
-            {/* Enable Toggle */}
-            <div className="space-y-2">
-              <label className="flex items-center justify-between cursor-pointer">
-                <div className="space-y-1">
-                  <div className="font-medium">Enable Screenshot Capture</div>
-                  <div className="text-sm text-muted-foreground">
-                    Automatically capture screenshots on clicks for the configuration builder
-                  </div>
-                </div>
-                <button
-                  onClick={handleToggleCapture}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    captureSettings.enabled ? "bg-primary" : "bg-muted"
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      captureSettings.enabled ? "translate-x-6" : "translate-x-1"
-                    }`}
-                  />
-                </button>
-              </label>
-            </div>
-
-            {/* Manual Click Capture */}
-            <div className="space-y-3">
-              <div>
-                <div className="font-medium mb-1">Manual Click Capture</div>
-                <div className="text-sm text-muted-foreground">
-                  Capture screenshots when you physically click on the screen
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                {!manualCaptureRunning ? (
-                  <button
-                    onClick={handleStartManualCapture}
-                    disabled={!captureSettings.enabled || !captureSettings.outputFolder}
-                    className="px-4 py-2 bg-green-600 hover:bg-green-700 disabled:bg-gray-400 disabled:cursor-not-allowed text-white rounded transition-colors"
-                    title={
-                      !captureSettings.enabled
-                        ? "Enable capture tool first"
-                        : !captureSettings.outputFolder
-                          ? "Set output folder first"
-                          : "Start capturing screenshots on mouse clicks"
-                    }
-                  >
-                    Start Manual Capture
-                  </button>
-                ) : (
-                  <button
-                    onClick={handleStopManualCapture}
-                    className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded transition-colors"
-                  >
-                    Stop Manual Capture
-                  </button>
-                )}
-
-                {manualCaptureRunning && (
-                  <span className="flex items-center gap-2 text-green-600 font-medium">
-                    <span className="inline-block w-2 h-2 bg-green-600 rounded-full animate-pulse"></span>
-                    Listening for clicks...
-                  </span>
-                )}
-              </div>
-            </div>
-
-            {/* Output Folder */}
-            <div className="space-y-2">
-              <label className="block">
-                <div className="font-medium mb-1">Output Folder</div>
-                <div className="text-sm text-muted-foreground mb-3">
-                  Screenshots will be saved to this folder
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    value={captureSettings.outputFolder}
-                    onChange={(e) =>
-                      setCaptureSettings((prev) => ({ ...prev, outputFolder: e.target.value }))
-                    }
-                    placeholder="/path/to/screenshots"
-                    className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
-                  />
-                  <button
-                    onClick={handleFolderSelect}
-                    className="px-3 py-2 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors flex items-center gap-2"
-                  >
-                    <FolderOpen className="w-4 h-4" />
-                    Browse
-                  </button>
-                </div>
-              </label>
-            </div>
-
-            {/* Base Image Name */}
-            <div className="space-y-2">
-              <label className="block">
-                <div className="font-medium mb-1">Base Image Name</div>
-                <div className="text-sm text-muted-foreground mb-3">
-                  Base name for screenshot files (will be numbered automatically)
-                </div>
+      {/* Settings Panel (collapsible) */}
+      {showSettings && (
+        <div className="flex-shrink-0 px-4 py-3 rounded-lg bg-card/50 border border-border/50">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-medium text-muted-foreground">Video FPS</span>
+              <div className="flex items-center gap-2">
                 <input
-                  type="text"
-                  value={captureSettings.baseImageName}
-                  onChange={(e) =>
-                    setCaptureSettings((prev) => ({ ...prev, baseImageName: e.target.value }))
-                  }
-                  placeholder="screenshot"
-                  className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                  type="range"
+                  min="10"
+                  max="60"
+                  step="5"
+                  value={fps}
+                  onChange={(e) => setFps(parseInt(e.target.value))}
+                  className="w-24 h-1.5 bg-muted rounded-lg appearance-none cursor-pointer"
+                  disabled={isRecording}
                 />
-              </label>
-            </div>
-
-            {/* Screen Selection */}
-            <div className="space-y-2">
-              <div className="font-medium mb-1 flex items-center gap-2">
-                <Monitor className="w-4 h-4" />
-                Screen Selection
-              </div>
-              <div className="text-sm text-muted-foreground mb-3">
-                Choose which screens to capture
-              </div>
-              <div className="flex flex-wrap gap-3">
-                {monitors.length > 0 ? (
-                  <>
-                    {monitors.map((monitor) => {
-                      const isSelected =
-                        captureSettings.screens.type === "specific" &&
-                        captureSettings.screens.indices?.includes(monitor.index);
-                      return (
-                        <label
-                          key={monitor.index}
-                          className={`flex flex-col items-center gap-1 cursor-pointer p-3 rounded-lg border transition-colors min-w-[100px] ${
-                            isSelected
-                              ? "bg-primary/20 border-primary"
-                              : "bg-input border-border/50 hover:border-primary/50"
-                          }`}
-                        >
-                          <input
-                            type="radio"
-                            checked={isSelected}
-                            onChange={() => handleScreenSelectionChange("specific", monitor.index)}
-                            className="sr-only"
-                          />
-                          <div className="flex items-center gap-2">
-                            <Monitor className="w-5 h-5" />
-                            <span className="font-medium">
-                              #{monitor.index}
-                              {monitor.is_primary && (
-                                <span className="text-primary ml-1">(primary)</span>
-                              )}
-                            </span>
-                          </div>
-                          <span className="text-xs text-muted-foreground">
-                            {monitor.width}x{monitor.height}
-                          </span>
-                        </label>
-                      );
-                    })}
-                    <label
-                      className={`flex flex-col items-center justify-center gap-1 cursor-pointer p-3 rounded-lg border transition-colors min-w-[100px] ${
-                        captureSettings.screens.type === "all"
-                          ? "bg-primary/20 border-primary"
-                          : "bg-input border-border/50 hover:border-primary/50"
-                      }`}
-                    >
-                      <input
-                        type="radio"
-                        checked={captureSettings.screens.type === "all"}
-                        onChange={() => handleScreenSelectionChange("all")}
-                        className="sr-only"
-                      />
-                      <div className="flex items-center gap-2">
-                        <Monitor className="w-5 h-5" />
-                        <span className="font-medium">All</span>
-                      </div>
-                      <span className="text-xs text-muted-foreground">
-                        {monitors.length} screens
-                      </span>
-                    </label>
-                  </>
-                ) : (
-                  <div className="text-sm text-muted-foreground">Loading monitors...</div>
-                )}
+                <span className="text-xs w-8 text-right">{fps}</span>
               </div>
             </div>
+            <p className="text-[10px] text-muted-foreground">
+              Higher FPS gives smoother video but larger files. 30 FPS is recommended.
+            </p>
+          </div>
+        </div>
+      )}
 
-            {/* Capture Timings */}
-            <div className="space-y-2">
-              <div className="font-medium mb-1 flex items-center justify-between">
-                <span>Capture Timings (milliseconds)</span>
+      {/* Main Content */}
+      <div className="flex-1 flex flex-col min-h-0 rounded-lg bg-card/50 overflow-hidden">
+        {/* Recording Status */}
+        <div className="flex-shrink-0 p-4">
+          {error && (
+            <div className="mb-3 px-3 py-2 bg-red-500/10 rounded-lg flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <span className="text-red-400 text-xs">{error}</span>
+            </div>
+          )}
+
+          {isRecording ? (
+            <div className="space-y-4">
+              {/* Recording indicator */}
+              <div className="flex items-center justify-center gap-3">
+                <span className="relative flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                </span>
+                <span className="text-lg font-mono font-semibold text-red-500">
+                  {formatDuration(duration)}
+                </span>
+              </div>
+
+              {/* Stats */}
+              <div className="flex justify-center gap-6">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <MousePointer2 className="w-4 h-4" />
+                  <span className="text-sm">{eventsCount} events</span>
+                </div>
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Video className="w-4 h-4" />
+                  <span className="text-sm">{fps} FPS</span>
+                </div>
+              </div>
+
+              {/* Session ID */}
+              {sessionId && (
+                <div className="text-center text-xs text-muted-foreground">
+                  Session: {sessionId}
+                </div>
+              )}
+
+              {/* Stop Button */}
+              <div className="flex justify-center">
                 <button
-                  onClick={handleAddTiming}
-                  className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors flex items-center gap-1 text-sm"
+                  onClick={handleStopRecording}
+                  disabled={isStopping}
+                  className="flex items-center gap-2 px-6 py-3 bg-red-500 hover:bg-red-600 disabled:bg-red-500/50 text-white rounded-lg font-medium transition-colors"
                 >
-                  <Plus className="w-3 h-3" />
-                  Add Timing
+                  {isStopping ? (
+                    <>
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                      Stopping...
+                    </>
+                  ) : (
+                    <>
+                      <Square className="w-5 h-5" />
+                      Stop Recording
+                    </>
+                  )}
                 </button>
               </div>
-              <div className="text-sm text-muted-foreground mb-3">
-                Delay after click before taking screenshot (0 = immediate)
-              </div>
-              <div className="space-y-2">
-                {captureSettings.captureTimings.map((timing, index) => (
-                  <div key={index} className="flex items-center gap-2">
-                    <input
-                      type="number"
-                      min="0"
-                      step="100"
-                      value={timing}
-                      onChange={(e) => handleTimingChange(index, parseInt(e.target.value) || 0)}
-                      className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md"
-                    />
-                    <span className="text-sm text-muted-foreground">ms</span>
-                    {captureSettings.captureTimings.length > 1 && (
-                      <button
-                        onClick={() => handleRemoveTiming(index)}
-                        className="px-2 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-md transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    )}
-                  </div>
-                ))}
-              </div>
             </div>
+          ) : (
+            <div className="space-y-4">
+              {/* Start Recording */}
+              <div className="flex flex-col items-center gap-4">
+                <div className="text-center space-y-2">
+                  <div className="flex items-center justify-center gap-4 text-muted-foreground">
+                    <div className="flex items-center gap-1.5">
+                      <MousePointer2 className="w-4 h-4" />
+                      <span className="text-sm">Mouse</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Keyboard className="w-4 h-4" />
+                      <span className="text-sm">Keyboard</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <Video className="w-4 h-4" />
+                      <span className="text-sm">Video</span>
+                    </div>
+                  </div>
+                  <p className="text-xs text-muted-foreground max-w-sm">
+                    Record your interactions to create State Machines from complex workflows, drags,
+                    and multi-step processes.
+                  </p>
+                </div>
 
-            {/* Save Button */}
-            <div className="flex justify-end pt-4 border-t border-border/50">
-              <button
-                onClick={saveCaptureSettings}
-                disabled={captureSaving}
-                className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-              >
-                {captureSaving ? (
-                  <>
-                    <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-                    Saving...
-                  </>
-                ) : captureSaveSuccess ? (
-                  <>
-                    <Check className="w-4 h-4" />
-                    Saved!
-                  </>
-                ) : (
-                  <>
-                    <Camera className="w-4 h-4" />
-                    Save Capture Settings
-                  </>
-                )}
-              </button>
+                <button
+                  onClick={handleStartRecording}
+                  disabled={isStarting}
+                  className="flex items-center gap-2 px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-green-600/50 text-white rounded-lg font-medium transition-colors"
+                >
+                  {isStarting ? (
+                    <>
+                      <Loader2 className="w-5 h-5 animate-spin" />
+                      Starting...
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-5 h-5" />
+                      Start Recording
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Last Recording Info */}
+              {lastRecording && (
+                <div className="mt-6 p-3 rounded-lg bg-muted/30 space-y-2">
+                  <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                    <CheckCircle className="w-4 h-4 text-green-500" />
+                    Last Recording
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+                    <div className="flex items-center gap-1.5">
+                      <Timer className="w-3 h-3" />
+                      <span>{lastRecording.duration.toFixed(1)}s</span>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <MousePointer2 className="w-3 h-3" />
+                      <span>{lastRecording.eventsCount} events</span>
+                    </div>
+                  </div>
+                  {lastRecording.eventsFile && (
+                    <button
+                      onClick={openOutputFolder}
+                      className="flex items-center gap-1.5 text-xs text-primary hover:text-primary/80 transition-colors"
+                    >
+                      <FolderOpen className="w-3 h-3" />
+                      Open Output Folder
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Info Section */}
+        <div className="flex-shrink-0 mt-auto p-4 border-t border-border/30">
+          <div className="flex items-start gap-2 text-muted-foreground">
+            <Info className="w-4 h-4 shrink-0 mt-0.5" />
+            <div className="text-xs space-y-1">
+              <p>
+                <strong>Purpose:</strong> Create State Machines from desktop applications and mixed
+                environments (not just websites).
+              </p>
+              <p>
+                <strong>Output:</strong> Input events (JSONL) with timestamps for correlation with
+                video frames.
+              </p>
+              <p>
+                <strong>Use cases:</strong> Complex drag operations, multi-step workflows, desktop
+                app automation.
+              </p>
             </div>
           </div>
-        )}
+        </div>
       </div>
     </div>
   );

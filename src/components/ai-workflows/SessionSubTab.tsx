@@ -40,7 +40,7 @@ import {
 } from "lucide-react";
 import { AiOutputTab } from "../AiOutputTab";
 import type { AiOutputLine } from "../AiOutputTab";
-import { useIssues } from "../../hooks";
+import { useFindings } from "../../hooks";
 import { groupEntriesIntoLoops, type AiLoop } from "../../types/aiLoop";
 import { useAutoContinue } from "../../contexts";
 
@@ -143,9 +143,9 @@ export function SessionSubTab({
   const [deleteBeforeDate, setDeleteBeforeDate] = useState<string>("");
   const [isDeleting, setIsDeleting] = useState(false);
 
-  // Issues tracking - using unified report hook
-  const { items: sessionIssues } = useIssues();
-  const [showIssues, setShowIssues] = useState(true);
+  // Findings tracking
+  const { items: sessionFindings } = useFindings();
+  const [showFindings, setShowFindings] = useState(true);
 
   // Last result message
   const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -657,23 +657,23 @@ export function SessionSubTab({
     }
   }, [workflowSessions, selectedForDeletion.size]);
 
-  // Get issue summary
-  const issueSummary = useMemo(() => {
+  // Get findings summary
+  const findingsSummary = useMemo(() => {
     const summary = {
-      total: sessionIssues.length,
+      total: sessionFindings.length,
       detected: 0,
       inProgress: 0,
       resolved: 0,
       critical: 0,
     };
-    for (const issue of sessionIssues) {
-      if (issue.status === "detected") summary.detected++;
-      if (issue.status === "in_progress") summary.inProgress++;
-      if (issue.status === "resolved") summary.resolved++;
-      if (issue.severity === "critical") summary.critical++;
+    for (const finding of sessionFindings) {
+      if (finding.status === "detected") summary.detected++;
+      if (finding.status === "in_progress") summary.inProgress++;
+      if (finding.status === "resolved") summary.resolved++;
+      if (finding.severity === "critical") summary.critical++;
     }
     return summary;
-  }, [sessionIssues]);
+  }, [sessionFindings]);
 
   // Determine the status for the banner
   const statusInfo = useMemo(() => {
@@ -1177,31 +1177,31 @@ export function SessionSubTab({
             </div>
           </div>
 
-          {/* Issues Summary */}
+          {/* Findings Summary */}
           <div className="card">
             <button
-              onClick={() => setShowIssues(!showIssues)}
+              onClick={() => setShowFindings(!showFindings)}
               className="w-full flex items-center justify-between p-3 hover:bg-muted/50 transition-colors rounded-t-lg"
             >
               <div className="flex items-center gap-2">
-                {issueSummary.total > 0 ? (
+                {findingsSummary.total > 0 ? (
                   <AlertTriangle
-                    className={`w-4 h-4 ${issueSummary.critical > 0 ? "text-red-500" : "text-orange-500"}`}
+                    className={`w-4 h-4 ${findingsSummary.critical > 0 ? "text-red-500" : "text-orange-500"}`}
                   />
                 ) : (
                   <CheckCircle className="w-4 h-4 text-green-500" />
                 )}
                 <span className="text-sm font-medium">
-                  {issueSummary.total > 0 ? `${issueSummary.total} Issues` : "No Issues"}
+                  {findingsSummary.total > 0 ? `${findingsSummary.total} Findings` : "No Findings"}
                 </span>
               </div>
               <div className="flex items-center gap-2">
-                {issueSummary.detected > 0 && (
+                {findingsSummary.detected > 0 && (
                   <span className="text-xs px-1.5 py-0.5 bg-red-500/20 text-red-400 rounded">
-                    {issueSummary.detected} open
+                    {findingsSummary.detected} open
                   </span>
                 )}
-                {showIssues ? (
+                {showFindings ? (
                   <ChevronUp className="w-4 h-4" />
                 ) : (
                   <ChevronDown className="w-4 h-4" />
@@ -1209,31 +1209,33 @@ export function SessionSubTab({
               </div>
             </button>
 
-            {showIssues && issueSummary.total > 0 && (
+            {showFindings && findingsSummary.total > 0 && (
               <div className="px-3 pb-3 space-y-2 max-h-48 overflow-y-auto border-t border-border">
-                {sessionIssues.slice(0, 5).map((issue) => (
+                {sessionFindings.slice(0, 5).map((finding) => (
                   <div
-                    key={issue.id}
+                    key={finding.id}
                     className="flex items-start gap-2 text-xs py-2 border-b border-border/50 last:border-b-0"
                   >
-                    {issue.status === "resolved" ? (
+                    {finding.status === "resolved" ? (
                       <CheckCircle className="w-3 h-3 text-green-500 flex-shrink-0 mt-0.5" />
                     ) : (
                       <AlertTriangle
                         className={`w-3 h-3 flex-shrink-0 mt-0.5 ${
-                          issue.severity === "critical" ? "text-red-500" : "text-orange-500"
+                          finding.severity === "critical" ? "text-red-500" : "text-orange-500"
                         }`}
                       />
                     )}
                     <div className="flex-1 min-w-0">
-                      <p className="font-medium truncate">{issue.title}</p>
-                      {issue.file && <p className="text-muted-foreground truncate">{issue.file}</p>}
+                      <p className="font-medium truncate">{finding.title}</p>
+                      {finding.codeContext?.file && (
+                        <p className="text-muted-foreground truncate">{finding.codeContext.file}</p>
+                      )}
                     </div>
                   </div>
                 ))}
-                {sessionIssues.length > 5 && (
+                {sessionFindings.length > 5 && (
                   <p className="text-xs text-muted-foreground text-center pt-1">
-                    +{sessionIssues.length - 5} more
+                    +{sessionFindings.length - 5} more
                   </p>
                 )}
               </div>
@@ -1258,12 +1260,12 @@ export function SessionSubTab({
                 <span className="font-medium text-foreground">{filteredLoops.length}</span>
               </div>
               <div className="flex justify-between">
-                <span>Issues Found</span>
-                <span className="font-medium text-foreground">{issueSummary.total}</span>
+                <span>Findings</span>
+                <span className="font-medium text-foreground">{findingsSummary.total}</span>
               </div>
               <div className="flex justify-between">
                 <span>Resolved</span>
-                <span className="font-medium text-green-500">{issueSummary.resolved}</span>
+                <span className="font-medium text-green-500">{findingsSummary.resolved}</span>
               </div>
             </div>
           </div>

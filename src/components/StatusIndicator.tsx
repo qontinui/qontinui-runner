@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import type { BackgroundActivity, ActivityType } from "../hooks/useBackgroundActivities";
+import { getSeverityColors, getAccentColors } from "@/design-system";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
 const SELECTED_PROJECT_STORAGE_KEY = "qontinui-selected-project";
@@ -48,18 +49,14 @@ const getActivityIcon = (type: ActivityType) => {
   }
 };
 
-// Helper to get color for activity type
+// Helper to get color for activity type using design system
 const getActivityColor = (type: ActivityType) => {
-  switch (type) {
-    case "extraction":
-      return "text-blue-500";
-    case "ai":
-      return "text-amber-500";
-    case "sync":
-      return "text-green-500";
-    default:
-      return "text-gray-500";
-  }
+  const colorMap: Record<ActivityType, string> = {
+    extraction: "blue",
+    ai: "amber",
+    sync: "green",
+  };
+  return getAccentColors(colorMap[type] || "slate").text;
 };
 
 const StatusIndicator: React.FC<StatusIndicatorProps> = ({
@@ -125,19 +122,10 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
     };
   }, []);
 
-  const getSeverityColor = (severity: string) => {
-    switch (severity) {
-      case "info":
-        return "bg-blue-100 text-blue-800 border-blue-200";
-      case "warning":
-        return "bg-yellow-100 text-yellow-800 border-yellow-200";
-      case "error":
-        return "bg-red-100 text-red-800 border-red-200";
-      case "critical":
-        return "bg-red-200 text-red-900 border-red-300";
-      default:
-        return "bg-gray-100 text-gray-800 border-gray-200";
-    }
+  // Use design system for severity colors
+  const getErrorSeverityClasses = (severity: string) => {
+    const colors = getSeverityColors(severity);
+    return `${colors.bg} ${colors.text} ${colors.border}`;
   };
 
   const getSeverityIcon = (severity: string) => {
@@ -167,36 +155,36 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       )}
 
       {/* Status Bar */}
-      <div className="flex items-center gap-4 px-4 py-2 bg-gray-50 border-b border-gray-200">
+      <div className="flex items-center gap-4 px-4 py-2 bg-surface-raised border-b border-border-subtle">
         {/* Title */}
-        <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
+        <div className="flex items-center gap-2 pr-3 border-r border-border-default">
           <div
-            className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? "bg-green-500" : "bg-gray-400"}`}
+            className={`w-2 h-2 rounded-full ${pythonStatus === "running" ? getAccentColors("green").bgSolid : "bg-muted-foreground"}`}
           />
-          <span className="text-sm font-bold text-gray-800">Qontinui Runner</span>
+          <span className="text-sm font-bold text-foreground">Qontinui Runner</span>
         </div>
 
         {/* Runner Name */}
         {runnerName && (
-          <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
+          <div className="flex items-center gap-2 pr-3 border-r border-border-default">
             <Tag className="w-4 h-4 text-primary" />
-            <span className="text-sm font-medium text-gray-800">{runnerName}</span>
+            <span className="text-sm font-medium text-foreground">{runnerName}</span>
           </div>
         )}
 
         {/* Selected Project */}
         {projectName && (
-          <div className="flex items-center gap-2 pr-3 border-r border-gray-300">
-            <FolderKanban className="w-4 h-4 text-blue-500" />
-            <span className="text-sm font-medium text-gray-800">{projectName}</span>
+          <div className="flex items-center gap-2 pr-3 border-r border-border-default">
+            <FolderKanban className={`w-4 h-4 ${getAccentColors("blue").text}`} />
+            <span className="text-sm font-medium text-foreground">{projectName}</span>
           </div>
         )}
 
         <div className="flex items-center gap-2">
           <div
-            className={`w-2 h-2 rounded-full ${configLoaded ? "bg-green-500" : "bg-gray-400"}`}
+            className={`w-2 h-2 rounded-full ${configLoaded ? getAccentColors("green").bgSolid : "bg-muted-foreground"}`}
           />
-          <span className="text-sm text-gray-600">
+          <span className="text-sm text-text-muted">
             Config: {configLoaded ? "Loaded" : "Not Loaded"}
           </span>
         </div>
@@ -204,16 +192,18 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
         {/* Active Processes Section - Only shown when there is activity */}
         {(executionActive || backgroundActivities.length > 0) && (
           <>
-            <div className="h-4 w-px bg-gray-300" />
+            <div className="h-4 w-px bg-border-default" />
             <div className="flex items-center gap-3">
               {/* GUI Automation - Only shown when active */}
               {executionActive && (
                 <div
-                  className="flex items-center gap-1.5 px-2 py-0.5 bg-blue-100 rounded-full"
+                  className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full ${getAccentColors("blue").bg}`}
                   title="GUI Automation workflow is running"
                 >
-                  <Play className="w-3.5 h-3.5 text-blue-600 animate-pulse" />
-                  <span className="text-xs font-medium text-blue-700">GUI Automation</span>
+                  <Play className={`w-3.5 h-3.5 animate-pulse ${getAccentColors("blue").text}`} />
+                  <span className={`text-xs font-medium ${getAccentColors("blue").text}`}>
+                    GUI Automation
+                  </span>
                 </div>
               )}
 
@@ -224,13 +214,13 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
                 return (
                   <div
                     key={activity.id}
-                    className="flex items-center gap-1.5 px-2 py-0.5 bg-gray-100 rounded-full"
+                    className="flex items-center gap-1.5 px-2 py-0.5 bg-surface-raised rounded-full"
                     title={activity.detail || activity.label}
                   >
                     <Icon className={`w-3.5 h-3.5 ${colorClass} animate-pulse`} />
-                    <span className="text-xs font-medium text-gray-700">{activity.label}</span>
+                    <span className="text-xs font-medium text-foreground">{activity.label}</span>
                     {activity.progress !== undefined && (
-                      <span className="text-xs text-gray-500">{activity.progress}%</span>
+                      <span className="text-xs text-text-muted">{activity.progress}%</span>
                     )}
                   </div>
                 );
@@ -243,7 +233,7 @@ const StatusIndicator: React.FC<StatusIndicatorProps> = ({
       {/* Error Display */}
       {showError && error && (
         <div
-          className={`fixed top-20 right-4 max-w-md z-40 p-4 rounded-lg shadow-lg border ${getSeverityColor(error.severity)}`}
+          className={`fixed top-20 right-4 max-w-md z-40 p-4 rounded-lg shadow-lg border ${getErrorSeverityClasses(error.severity)}`}
         >
           <div className="flex items-start gap-3">
             <div className="flex-shrink-0 mt-0.5">{getSeverityIcon(error.severity)}</div>

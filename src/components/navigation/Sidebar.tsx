@@ -42,13 +42,13 @@ import {
   TestTube,
   Activity,
   History,
+  MousePointer2,
   // Observe icons
   LayoutDashboard,
   Zap,
   Image,
   ClipboardList,
   FileText,
-  AlertTriangle,
   FileSearch,
   BarChart3,
   Cloud,
@@ -56,6 +56,13 @@ import {
   FolderOpen,
   Tag,
   Database,
+  // Settings sub-page icons
+  User,
+  HardDrive,
+  Wrench,
+  Download,
+  Archive,
+  FlaskConical,
 } from "lucide-react";
 
 // ============================================================================
@@ -142,16 +149,16 @@ const NAVIGATION_GROUPS: NavigationGroup[] = [
         parentId: "run-dashboard",
       },
       {
-        id: "run-issues",
-        label: "Issues",
-        icon: AlertTriangle,
+        id: "run-verification",
+        label: "Verification",
+        icon: FileSearch,
         indent: true,
         parentId: "run-dashboard",
       },
       {
-        id: "run-verification",
-        label: "Verification",
-        icon: FileSearch,
+        id: "run-tests",
+        label: "Test Results",
+        icon: TestTube,
         indent: true,
         parentId: "run-dashboard",
       },
@@ -186,8 +193,10 @@ const NAVIGATION_GROUPS: NavigationGroup[] = [
     defaultExpanded: false,
     items: [
       { id: "library", label: "Library", icon: BookOpen },
-      { id: "workflow-builder", label: "Workflows", icon: Sparkles },
+      { id: "workflow-builder", label: "AI Workflows", icon: Sparkles },
+      { id: "gui-workflow-builder", label: "GUI Workflows", icon: MousePointer2 },
       { id: "script-builder", label: "Scripts", icon: TestTube },
+      { id: "test-builder", label: "Tests", icon: FlaskConical },
       { id: "capture", label: "Capture", icon: Camera },
     ],
   },
@@ -209,9 +218,41 @@ const NAVIGATION_GROUPS: NavigationGroup[] = [
   {
     id: "system",
     label: "SYSTEM",
-    defaultExpanded: false,
+    defaultExpanded: true,
     items: [
-      { id: "settings", label: "Settings", icon: Settings },
+      { id: "settings", label: "Settings", icon: Settings, hasChildren: true },
+      { id: "settings-account", label: "Account", icon: User, indent: true, parentId: "settings" },
+      { id: "settings-ai", label: "AI Providers", icon: Bot, indent: true, parentId: "settings" },
+      {
+        id: "settings-playwright",
+        label: "Playwright",
+        icon: FlaskConical,
+        indent: true,
+        parentId: "settings",
+      },
+      {
+        id: "settings-general",
+        label: "Preferences",
+        icon: Settings,
+        indent: true,
+        parentId: "settings",
+      },
+      {
+        id: "settings-storage",
+        label: "Storage",
+        icon: HardDrive,
+        indent: true,
+        parentId: "settings",
+      },
+      { id: "settings-backup", label: "Backup", icon: Archive, indent: true, parentId: "settings" },
+      { id: "settings-debug", label: "Debug", icon: Wrench, indent: true, parentId: "settings" },
+      {
+        id: "settings-updates",
+        label: "Updates",
+        icon: Download,
+        indent: true,
+        parentId: "settings",
+      },
       { id: "help", label: "Help", icon: HelpCircle },
     ],
   },
@@ -499,8 +540,8 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     } catch {
       // Ignore parse errors
     }
-    // Default: Run Dashboard is expanded
-    return { "run-dashboard": true };
+    // Default: Run Dashboard and Settings are expanded
+    return { "run-dashboard": true, settings: true };
   });
 
   // Track focused item for keyboard navigation

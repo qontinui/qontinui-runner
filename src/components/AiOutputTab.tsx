@@ -11,22 +11,12 @@
 
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import {
-  Brain,
-  MessageSquare,
-  Bot,
-  Loader2,
-  Send,
-  ChevronDown,
-  ChevronRight,
-  Square,
-  Copy,
-  Check,
-} from "lucide-react";
+import { Brain, MessageSquare, Bot, Loader2, Send, Square, Copy, Check } from "lucide-react";
 // Note: Issue and findings detection is now done in EventHandlers.ts to ensure
 // ALL lines are processed, not just filtered ones displayed in this component.
 import { groupEntriesIntoLoops /* type AiLoop */ } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
+import { MarkdownViewer } from "./MarkdownViewer";
 
 export interface AiOutputLine {
   id: string;
@@ -62,15 +52,20 @@ export function AiOutputTab({
 }: AiOutputTabProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const sessionListRef = useRef<HTMLDivElement>(null);
   const [isAiWorking, setIsAiWorking] = useState(false);
   const [promptInput, setPromptInput] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [selectedLoopId, setSelectedLoopId] = useState<string | null>(null);
-  const [showLoopSelector, setShowLoopSelector] = useState(false);
   const [copied, setCopied] = useState(false);
   const [hintQueued, setHintQueued] = useState(false);
   const [queuedHint, setQueuedHint] = useState("");
   const lastLineTimestampRef = useRef<number>(0);
+
+  // Drag-to-scroll state for session list
+  const [isDragging, setIsDragging] = useState(false);
+  const [startX, setStartX] = useState(0);
+  const [scrollLeft, setScrollLeft] = useState(0);
   // Group lines into AI loops and optionally filter by session IDs
   const loops = useMemo(() => {
     const allLoops = groupEntriesIntoLoops(lines);
@@ -348,7 +343,33 @@ export function AiOutputTab({
   // Select a loop
   const handleSelectLoop = useCallback((loopId: string) => {
     setSelectedLoopId(loopId);
-    setShowLoopSelector(false);
+  }, []);
+
+  // Drag-to-scroll handlers for session list
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    if (!sessionListRef.current) return;
+    setIsDragging(true);
+    setStartX(e.pageX - sessionListRef.current.offsetLeft);
+    setScrollLeft(sessionListRef.current.scrollLeft);
+  }, []);
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent) => {
+      if (!isDragging || !sessionListRef.current) return;
+      e.preventDefault();
+      const x = e.pageX - sessionListRef.current.offsetLeft;
+      const walk = (x - startX) * 1.5; // Scroll speed multiplier
+      sessionListRef.current.scrollLeft = scrollLeft - walk;
+    },
+    [isDragging, startX, scrollLeft],
+  );
+
+  const handleMouseUp = useCallback(() => {
+    setIsDragging(false);
+  }, []);
+
+  const handleMouseLeave = useCallback(() => {
+    setIsDragging(false);
   }, []);
 
   // Copy all text in current loop
@@ -414,113 +435,71 @@ export function AiOutputTab({
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
       {/* Fixed Header - doesn't scroll */}
-      <div className="flex-shrink-0 space-y-2 pb-2 border-b border-border mb-2 bg-background">
-        {/* Session selector and status row */}
-        <div className="flex items-center justify-between">
-          {/* Session Selector */}
-          <div className="relative">
-            <button
-              onClick={() => setShowLoopSelector(!showLoopSelector)}
-              className="flex items-center gap-2 px-3 py-1.5 bg-muted hover:bg-muted/80 rounded-lg text-sm font-medium transition-colors"
-            >
-              <Brain className="w-4 h-4" />
-              <span>{currentLoop ? currentLoop.label : "Select Session"}</span>
-              <span className="text-xs text-muted-foreground">({loops.length} total)</span>
-              <ChevronDown
-                className={`w-4 h-4 transition-transform ${showLoopSelector ? "rotate-180" : ""}`}
-              />
-            </button>
-
-            {/* Session dropdown - latest first */}
-            {showLoopSelector && (
-              <div className="absolute top-full left-0 mt-1 w-72 bg-popover border border-border rounded-lg shadow-lg z-50 max-h-64 overflow-y-auto">
-                {[...loops].reverse().map((loop, reversedIndex) => {
-                  // First item in reversed array (index 0) is the latest
-                  const isLatest = reversedIndex === 0;
-                  return (
-                    <button
-                      key={`${loop.id}-${reversedIndex}`}
-                      onClick={() => handleSelectLoop(loop.id)}
-                      className={`w-full flex items-start gap-2 px-3 py-2 text-left hover:bg-muted transition-colors ${
-                        loop.id === selectedLoopId ? "bg-muted" : ""
-                      }`}
-                    >
-                      <ChevronRight className="w-4 h-4 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium text-sm">{loop.label}</span>
-                          <span className="text-xs text-muted-foreground">
-                            {new Date(loop.startTime).toLocaleTimeString()}
-                          </span>
-                          {isLatest && (
-                            <span className="text-xs px-1.5 py-0.5 bg-primary/20 text-primary rounded">
-                              Latest
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-xs text-muted-foreground truncate">
-                          {loop.promptPreview}
-                        </p>
-                        <div className="flex items-center gap-2 mt-1 text-xs">
-                          <span>{loop.entries.length} messages</span>
-                        </div>
-                      </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
+      <div className="flex-shrink-0 space-y-2 pb-2 mb-2 bg-background">
+        {/* Session horizontal list and status row */}
+        <div className="flex items-center gap-3">
+          {/* Horizontal Session List - draggable */}
+          <div
+            ref={sessionListRef}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseLeave}
+            className={`flex-1 flex items-center gap-1.5 overflow-x-auto scrollbar-none ${
+              isDragging ? "cursor-grabbing select-none" : "cursor-grab"
+            }`}
+            style={{ scrollbarWidth: "none", msOverflowStyle: "none" }}
+          >
+            {/* Sessions displayed with latest on left */}
+            {[...loops].reverse().map((loop, reversedIndex) => {
+              const isLatest = reversedIndex === 0;
+              const isSelected = loop.id === selectedLoopId;
+              return (
+                <button
+                  key={`${loop.id}-${reversedIndex}`}
+                  onClick={() => !isDragging && handleSelectLoop(loop.id)}
+                  className={`flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
+                    isSelected
+                      ? "bg-purple-500/20 text-purple-400"
+                      : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  }`}
+                >
+                  <Brain className="w-3 h-3" />
+                  <span>{loop.label}</span>
+                  {isLatest && (
+                    <span className="px-1 py-0.5 text-[10px] bg-purple-500/30 text-purple-300 rounded">
+                      Latest
+                    </span>
+                  )}
+                </button>
+              );
+            })}
           </div>
 
           {/* Status and actions */}
-          <div className="flex items-center gap-3">
+          <div className="flex-shrink-0 flex items-center gap-2">
             {isAiWorking && (
               <>
-                <div className="flex items-center gap-1.5 px-2 py-0.5 bg-emerald-500/10 border border-emerald-500/30 rounded-full">
+                <div className="flex items-center gap-1.5 px-2 py-1 bg-emerald-500/10 rounded-lg">
                   <Loader2 className="w-3 h-3 text-emerald-400 animate-spin" />
-                  <span className="text-xs text-emerald-400 font-medium">
-                    AI Working
-                    <span className="inline-flex ml-0.5">
-                      <span className="animate-pulse">.</span>
-                      <span className="animate-pulse" style={{ animationDelay: "0.2s" }}>
-                        .
-                      </span>
-                      <span className="animate-pulse" style={{ animationDelay: "0.4s" }}>
-                        .
-                      </span>
-                    </span>
-                  </span>
+                  <span className="text-xs text-emerald-400 font-medium">Working</span>
                 </div>
                 <button
                   onClick={handleStopAi}
-                  className="flex items-center gap-1 px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded transition-colors"
+                  className="flex items-center gap-1 px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg transition-colors"
                   title="Stop AI analysis"
                 >
                   <Square className="w-3 h-3" />
-                  Stop
                 </button>
               </>
             )}
-            <span className="text-xs text-muted-foreground">
-              {currentLoop?.entries.length || 0} messages
-            </span>
             <button
               onClick={handleCopyLoop}
               disabled={!currentLoop}
-              className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+              className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground rounded-lg hover:bg-muted/50 transition-colors disabled:opacity-50"
               title="Copy all text in this session"
             >
-              {copied ? (
-                <>
-                  <Check className="w-3 h-3 text-green-500" />
-                  <span className="text-green-500">Copied</span>
-                </>
-              ) : (
-                <>
-                  <Copy className="w-3 h-3" />
-                  Copy
-                </>
-              )}
+              {copied ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
             </button>
           </div>
         </div>
@@ -551,7 +530,7 @@ export function AiOutputTab({
                     {new Date(entry.timestamp).toLocaleTimeString()}
                   </span>
                 </div>
-                <div className="text-foreground whitespace-pre-wrap break-words">{entry.line}</div>
+                <MarkdownViewer content={entry.line} />
               </div>
             );
           }
@@ -590,9 +569,7 @@ export function AiOutputTab({
                   </div>
                 )}
                 <div className="py-0.5 pl-6">
-                  <span className="text-foreground whitespace-pre-wrap break-words">
-                    {fullResponse}
-                  </span>
+                  <MarkdownViewer content={fullResponse} isAnimated />
                 </div>
               </div>
             );
@@ -611,7 +588,7 @@ export function AiOutputTab({
                   {new Date(entry.timestamp).toLocaleTimeString()}
                 </span>
               </div>
-              <div className="text-foreground whitespace-pre-wrap break-words">{entry.line}</div>
+              <MarkdownViewer content={entry.line} />
             </div>
           );
         })}

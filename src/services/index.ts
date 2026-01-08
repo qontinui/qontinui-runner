@@ -37,22 +37,9 @@ export { VideoRecordingService } from "./VideoRecordingService";
 // State Detection Services
 export { StateDetectionService } from "./StateDetectionService";
 
-// Issue Tracking Services
-export { IssueTracker, issueTracker } from "./IssueTracker";
-export type { IssueTrackerEventType, IssueTrackerEvent } from "./IssueTracker";
-
 // Session Management Services
 export { SessionManager, sessionManager } from "./SessionManager";
 export type { SessionContext, SessionStatus, SessionChangeListener } from "./SessionManager";
-
-// Issue Sync Services (runner → web backend)
-export {
-  syncIssuesToBackend,
-  syncSessionIssues,
-  syncSpecificIssues,
-  issueSyncService,
-} from "./IssueSyncService";
-export type { SyncIssuesResponse } from "./IssueSyncService";
 
 // Verification Services (AI self-healing)
 export { verificationService } from "./VerificationService";
@@ -108,17 +95,6 @@ export type {
 // Report Persistence Services (unified local + backend persistence)
 export { ReportPersistenceService, reportPersistenceService } from "./ReportPersistenceService";
 export type { BackendConfig, SyncResult, PendingSyncItem } from "./ReportPersistenceService";
-
-// Unified Report Service (aggregates findings + issues)
-export { UnifiedReportService, unifiedReportService } from "./UnifiedReportService";
-export type {
-  UnifiedReportItem,
-  UnifiedSeverity,
-  UnifiedStatus,
-  UnifiedReportSummary,
-  UnifiedReportEventType,
-  UnifiedReportEvent,
-} from "./UnifiedReportService";
 
 // Statistics Service (Tiered Information Model dashboard)
 export {

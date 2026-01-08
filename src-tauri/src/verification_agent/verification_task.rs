@@ -576,10 +576,8 @@ impl VerificationTask {
 
         let status = if error_message.is_some() {
             VerificationStatus::Failed
-        } else if all_expected_found && no_unexpected && detection_confidence >= 0.8 {
-            VerificationStatus::Passed
         } else if detection_confidence >= 0.5 {
-            VerificationStatus::Passed // Partial match is still passing
+            VerificationStatus::Passed // Confidence threshold for passing state verification
         } else {
             VerificationStatus::Failed
         };

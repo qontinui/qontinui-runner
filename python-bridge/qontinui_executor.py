@@ -86,6 +86,7 @@ from gui_automation import GUIAutomation  # noqa: E402
 from services.input_monitor_service import InputMonitorService  # noqa: E402
 from services.screenshot_service import ScreenshotService  # noqa: E402
 from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
+from services.vision_extraction_service import VisionExtractionService  # noqa: E402
 from services.web_extraction_service import WebExtractionService  # noqa: E402
 from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
@@ -188,11 +189,21 @@ class QontinuiExecutor:
         self.capture_input_for_validation = False
         self._input_capture_session_id: str | None = None
 
+        # Interaction Recording state (combined video + input capture for State Machine creation)
+        self._interaction_recording_active = False
+        self._interaction_session_id: str | None = None
+        self._interaction_start_time: float | None = None
+        self._interaction_video_path: str | None = None
+        self._interaction_fps: int = 30
+
         # GUIAutomation (initialized after config load)
         self.gui_automation = None
 
         # Web extraction service (lazy-loaded when needed)
         self._web_extraction_service = None
+
+        # Vision extraction service (lazy-loaded when needed)
+        self._vision_extraction_service = None
 
         # Dedicated event loop for async operations (avoids conflicts with WebSocket thread's loop)
         # Runs in a background thread to allow run_coroutine_threadsafe()
@@ -1349,6 +1360,10 @@ class QontinuiExecutor:
         elif cmd_type == "get_extraction_status":
             return self._handle_get_extraction_status()
 
+        # Vision extraction commands
+        elif cmd_type == "run_vision_extraction":
+            return self._handle_run_vision_extraction(params)
+
         # Remote workflow execution from web app
         elif cmd_type == "execute_workflow":
             return self._handle_execute_workflow(params)
@@ -1374,6 +1389,16 @@ class QontinuiExecutor:
         # Flakiness-aware execution commands
         elif cmd_type == "get_flakiness_options":
             return self._handle_get_flakiness_options(params)
+
+        # Interaction Recording commands (video + input capture for State Machine creation)
+        elif cmd_type == "start_interaction_recording":
+            return self._handle_start_interaction_recording(params)
+
+        elif cmd_type == "stop_interaction_recording":
+            return self._handle_stop_interaction_recording()
+
+        elif cmd_type == "get_interaction_recording_status":
+            return self._handle_get_interaction_recording_status()
 
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
@@ -1655,6 +1680,81 @@ class QontinuiExecutor:
                 websocket_handler=self.websocket_handler,
             )
         return self._web_extraction_service  # type: ignore[no-any-return]
+
+    def _get_vision_extraction_service(self) -> VisionExtractionService:
+        """Get or create the vision extraction service."""
+        if self._vision_extraction_service is None:
+            self._vision_extraction_service = VisionExtractionService(
+                event_manager=self.event_manager,
+            )
+        return self._vision_extraction_service  # type: ignore[no-any-return]
+
+    def _handle_run_vision_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Handle run vision extraction command.
+
+        Runs SAM3, Edge Detection, and/or OCR on a screenshot.
+
+        Args:
+            params: Extraction configuration with:
+                - screenshot: Base64-encoded image OR file path
+                - techniques: List of techniques ["edge", "sam3", "ocr"]
+                - Edge detection config: canny_low, canny_high, min_contour_area
+                - SAM3 config: points_per_side, pred_iou_thresh, stability_score_thresh
+                - OCR config: ocr_engine, ocr_languages, ocr_confidence_threshold
+                - Fusion config: iou_threshold
+
+        Returns:
+            Dict with extraction results.
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_run_vision_extraction called with {len(params.get('screenshot', ''))} char screenshot",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_vision_extraction_service()
+
+            # Run extraction (synchronous since VisionExtractionService.extract is sync)
+            config = params.get("config", params)  # Support both nested and flat config
+            result = service.extract(config)
+
+            if result.get("success"):
+                self.event_manager.emit_event(
+                    EventType.EXTRACTION_STARTED,
+                    {
+                        "extraction_id": result.get("extraction_id"),
+                        "technique": "vision",
+                        "techniques_run": result.get("techniques_run", []),
+                    },
+                )
+
+            print(
+                f"[info    ] EXECUTOR: vision_extraction result: success={result.get('success')}, "
+                f"edge={len(result.get('edge_results', []))}, "
+                f"sam3={len(result.get('sam3_results', []))}, "
+                f"ocr={len(result.get('ocr_results', []))}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return result
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to run vision extraction: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            print(
+                f"[error   ] EXECUTOR: Traceback: {traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to run vision extraction: {e}")
+            return {"success": False, "error": str(e)}
 
     def _start_async_loop(self):
         """Start the async event loop in a background thread."""
@@ -2345,6 +2445,195 @@ class QontinuiExecutor:
             "options": default_options,
             "is_flaky": False,
             "note": "Query Rust get_execution_options command for accurate flakiness data",
+        }
+
+    def _handle_start_interaction_recording(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Start interaction recording (video + input capture).
+
+        This combines video recording and input monitoring for capturing user
+        interactions to be used for State Machine creation.
+
+        Args:
+            params: Command parameters:
+                - session_id: Optional session ID (auto-generated if not provided)
+                - fps: Frames per second for video (default: 30)
+                - output_dir: Optional output directory (defaults to .dev-logs/interactions)
+
+        Returns:
+            Dictionary with:
+                - success: Whether recording started
+                - session_id: The session ID being used
+                - output_dir: Directory where files will be saved
+                - error: Error message (if failed)
+        """
+        import uuid
+        from pathlib import Path
+
+        if self._interaction_recording_active:
+            return {
+                "success": False,
+                "error": "Interaction recording already active",
+                "session_id": self._interaction_session_id,
+            }
+
+        try:
+            # Generate session ID if not provided
+            session_id = params.get("session_id") or f"interaction-{uuid.uuid4().hex[:8]}"
+            fps = params.get("fps", 30)
+            output_dir = params.get("output_dir")
+
+            # Set up output directory
+            if output_dir:
+                interactions_dir = Path(output_dir)
+            else:
+                dev_logs_dir = Path(__file__).parent.parent.parent / ".dev-logs"
+                interactions_dir = dev_logs_dir / "interactions"
+
+            interactions_dir.mkdir(parents=True, exist_ok=True)
+
+            # Initialize InputMonitorService if not already done
+            if self.input_monitor_service is None:
+                self.input_monitor_service = InputMonitorService(storage_dir=interactions_dir)
+                self.event_manager.emit_log(
+                    "info", f"InputMonitorService initialized: {interactions_dir}"
+                )
+
+            # Start input monitoring
+            self.input_monitor_service.start_monitoring(session_id=session_id, fps=fps)
+            self.event_manager.emit_log(
+                "info", f"Input monitoring started for session: {session_id}"
+            )
+
+            # Update state
+            self._interaction_recording_active = True
+            self._interaction_session_id = session_id
+            self._interaction_start_time = time.time()
+            self._interaction_fps = fps
+
+            # Emit recording started event
+            self.event_manager.emit_event(
+                "interaction_recording_started",
+                {
+                    "session_id": session_id,
+                    "fps": fps,
+                    "output_dir": str(interactions_dir),
+                },
+            )
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "output_dir": str(interactions_dir),
+                "fps": fps,
+            }
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to start interaction recording: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_interaction_recording(self) -> dict[str, Any]:
+        """Stop interaction recording and return file paths.
+
+        Returns:
+            Dictionary with:
+                - success: Whether recording stopped successfully
+                - session_id: The session ID
+                - events_file: Path to the input events JSONL file
+                - events_count: Number of input events captured
+                - duration: Recording duration in seconds
+                - error: Error message (if failed)
+        """
+        if not self._interaction_recording_active:
+            return {
+                "success": False,
+                "error": "No interaction recording active",
+            }
+
+        try:
+            session_id = self._interaction_session_id
+            start_time = self._interaction_start_time
+
+            # Stop input monitoring
+            events_file = None
+            events_count = 0
+            if self.input_monitor_service:
+                events_file = self.input_monitor_service.stop_monitoring()
+                events_count = len(self.input_monitor_service.get_events())
+
+            # Calculate duration
+            duration = time.time() - start_time if start_time else 0
+
+            # Reset state
+            self._interaction_recording_active = False
+            self._interaction_session_id = None
+            self._interaction_start_time = None
+
+            self.event_manager.emit_log(
+                "info",
+                f"Interaction recording stopped: {events_count} events captured, "
+                f"duration={duration:.1f}s, file={events_file}",
+            )
+
+            # Emit recording stopped event
+            self.event_manager.emit_event(
+                "interaction_recording_stopped",
+                {
+                    "session_id": session_id,
+                    "events_file": events_file,
+                    "events_count": events_count,
+                    "duration": duration,
+                },
+            )
+
+            return {
+                "success": True,
+                "session_id": session_id,
+                "events_file": events_file,
+                "events_count": events_count,
+                "duration": duration,
+            }
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to stop interaction recording: {e}")
+            import traceback
+
+            traceback.print_exc()
+            # Reset state even on error
+            self._interaction_recording_active = False
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_interaction_recording_status(self) -> dict[str, Any]:
+        """Get current interaction recording status.
+
+        Returns:
+            Dictionary with:
+                - success: Always True
+                - is_recording: Whether recording is active
+                - session_id: Current session ID (if recording)
+                - duration: Current recording duration in seconds (if recording)
+                - events_count: Number of events captured so far (if recording)
+        """
+        if not self._interaction_recording_active:
+            return {
+                "success": True,
+                "is_recording": False,
+            }
+
+        duration = time.time() - self._interaction_start_time if self._interaction_start_time else 0
+        events_count = 0
+        if self.input_monitor_service:
+            events_count = len(self.input_monitor_service.get_events())
+
+        return {
+            "success": True,
+            "is_recording": True,
+            "session_id": self._interaction_session_id,
+            "duration": duration,
+            "events_count": events_count,
+            "fps": self._interaction_fps,
         }
 
     def __del__(self):

@@ -23,6 +23,17 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  Zap,
+  Image,
+  ClipboardList,
+  FileText,
+  FileSearch,
+  Bot,
+  BarChart3,
+  Database,
+  TestTube,
+} from "lucide-react";
 
 // Contexts
 import {
@@ -67,19 +78,22 @@ import { SchedulerTab } from "./components/scheduler";
 import { Sidebar } from "./components/navigation";
 import { AiBuilderTab, AiBuilderProvider } from "./components/AiBuilderTab";
 import { ScriptBuilderTab } from "./components/ScriptBuilderTab";
-import { ActiveTab } from "./components/ActiveTab";
+import { GuiWorkflowBuilderTab } from "./components/gui-workflow-builder";
+import { TestBuilderTab } from "./components/test-builder";
+import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 // Monitor/Observe components
 import { ExecutionSummaryTab } from "./components/ai-workflows/ExecutionSummaryTab";
 import { ExecutionReport } from "./components/findings";
-import { IssuesPanel } from "./components/IssuesPanel";
 import { VerificationTab } from "./components/verification";
+import { TestResultsTab } from "./components/test-results";
 import { StatisticsTab } from "./components/statistics";
 import { DiscoverySyncPanel } from "./components/discoveries";
 // Run-specific components
 import { RunSelectionProvider } from "./contexts/RunSelectionContext";
 import { RunDashboard } from "./components/run-dashboard/RunDashboard";
+import { RunPageLayout } from "./components/run-dashboard/RunPageLayout";
 import { GeneralLogsTab } from "./components/GeneralLogsTab";
 import { RunActionsTab } from "./components/run-logs/RunActionsTab";
 import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitionTab";
@@ -105,8 +119,8 @@ type MainTabId =
   | "run-image"
   | "run-summary"
   | "run-findings"
-  | "run-issues"
   | "run-verification"
+  | "run-tests"
   | "run-ai-output"
   | "run-statistics"
   | "run-ai-data"
@@ -123,12 +137,22 @@ type MainTabId =
   | "monitor-discoveries"
   | "library"
   | "workflow-builder"
+  | "gui-workflow-builder"
   | "script-builder"
+  | "test-builder"
   | "capture"
   | "config-log-sources"
   | "config-findings"
   | "tasks"
   | "settings"
+  | "settings-account"
+  | "settings-ai"
+  | "settings-playwright"
+  | "settings-general"
+  | "settings-storage"
+  | "settings-backup"
+  | "settings-debug"
+  | "settings-updates"
   | "help";
 
 const VALID_TAB_IDS: MainTabId[] = [
@@ -142,8 +166,8 @@ const VALID_TAB_IDS: MainTabId[] = [
   "run-image",
   "run-summary",
   "run-findings",
-  "run-issues",
   "run-verification",
+  "run-tests",
   "run-ai-output",
   "run-statistics",
   "run-ai-data",
@@ -160,12 +184,22 @@ const VALID_TAB_IDS: MainTabId[] = [
   "monitor-discoveries",
   "library",
   "workflow-builder",
+  "gui-workflow-builder",
   "script-builder",
+  "test-builder",
   "capture",
   "config-log-sources",
   "config-findings",
   "tasks",
   "settings",
+  "settings-account",
+  "settings-ai",
+  "settings-playwright",
+  "settings-general",
+  "settings-storage",
+  "settings-backup",
+  "settings-debug",
+  "settings-updates",
   "help",
 ];
 
@@ -194,14 +228,15 @@ function migrateTabId(stored: string | null): MainTabId {
     ai: "run-ai-output",
     "monitor-summary": "run-summary",
     "monitor-findings": "run-findings",
-    "monitor-issues": "run-issues",
+    "monitor-issues": "run-findings", // Issues merged into Findings
     "monitor-learnings": "run-summary", // Learnings removed, map to summary
     "monitor-verification": "run-verification",
     "monitor-statistics": "run-statistics",
     "monitor-discoveries": "discoveries",
     // Legacy monitor tab migrations
     monitor: "run-summary",
-    issues: "run-issues",
+    issues: "run-findings", // Issues merged into Findings
+    "run-issues": "run-findings", // Issues merged into Findings
     learnings: "run-summary",
     verification: "run-verification",
     statistics: "run-statistics",
@@ -244,6 +279,9 @@ function AppContent() {
   // Workflow ID to edit (when navigating from Library to Workflow Builder)
   const [editWorkflowId, setEditWorkflowId] = useState<string | null>(null);
 
+  // GUI Workflow ID to edit (when navigating from Library to GUI Workflow Builder)
+  const [editGuiWorkflowId, setEditGuiWorkflowId] = useState<string | null>(null);
+
   // Handle editing a script from Library
   const handleEditScript = useCallback((scriptId: string) => {
     setEditScriptId(scriptId);
@@ -254,6 +292,12 @@ function AppContent() {
   const handleEditWorkflow = useCallback((workflowId: string) => {
     setEditWorkflowId(workflowId);
     setActiveTab("workflow-builder");
+  }, []);
+
+  // Handle editing a GUI workflow from Library
+  const handleEditGuiWorkflow = useCallback((workflowId: string) => {
+    setEditGuiWorkflowId(workflowId);
+    setActiveTab("gui-workflow-builder");
   }, []);
 
   // Clear script ID when navigating away from script builder
@@ -267,6 +311,13 @@ function AppContent() {
   useEffect(() => {
     if (activeTab !== "workflow-builder") {
       setEditWorkflowId(null);
+    }
+  }, [activeTab]);
+
+  // Clear GUI workflow ID when navigating away from GUI workflow builder
+  useEffect(() => {
+    if (activeTab !== "gui-workflow-builder") {
+      setEditGuiWorkflowId(null);
     }
   }, [activeTab]);
 
@@ -471,16 +522,7 @@ function AppContent() {
         return <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />;
 
       case "active":
-        return (
-          <ActiveTab
-            imageLogs={imageLogs}
-            aiOutputLines={aiOutputLogs}
-            actionLogData={actionLogViewData}
-            onClearAiOutput={clearAiOutputLogs}
-            onActionRowClick={modalState.openActionModal}
-            onImageRowClick={modalState.openImageModal}
-          />
-        );
+        return <ActiveDashboardPage onGoToExecute={() => setActiveTab("run")} />;
 
       case "history":
         return (
@@ -521,109 +563,131 @@ function AppContent() {
       case "run-actions":
         return (
           <RunSelectionProvider>
-            <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
-              <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
-                <RunActionsTab
-                  actionLogData={actionLogViewData}
-                  actionLogLoading={actionLogLoading}
-                  actionLogError={actionLogError}
-                  onActionRowClick={modalState.openActionModal}
-                  actionCount={actionLogViewData?.visible_count || 0}
-                />
+            <RunPageLayout
+              title="Actions"
+              icon={Zap}
+              badgeCount={actionLogViewData?.visible_count || 0}
+            >
+              <div className="h-full p-4 overflow-hidden">
+                <div className="h-full card overflow-hidden">
+                  <RunActionsTab
+                    actionLogData={actionLogViewData}
+                    actionLogLoading={actionLogLoading}
+                    actionLogError={actionLogError}
+                    onActionRowClick={modalState.openActionModal}
+                    actionCount={actionLogViewData?.visible_count || 0}
+                  />
+                </div>
               </div>
-            </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-image":
         return (
           <RunSelectionProvider>
-            <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
-              <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
-                <RunImageRecognitionTab
-                  imageLogs={imageLogs}
-                  onImageRowClick={modalState.openImageModal}
-                  imageLogCount={imageLogCount}
-                />
+            <RunPageLayout title="Image Recognition" icon={Image} badgeCount={imageLogCount}>
+              <div className="h-full p-4 overflow-hidden">
+                <div className="h-full card overflow-hidden">
+                  <RunImageRecognitionTab
+                    imageLogs={imageLogs}
+                    onImageRowClick={modalState.openImageModal}
+                    imageLogCount={imageLogCount}
+                  />
+                </div>
               </div>
-            </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-summary":
         return (
           <RunSelectionProvider>
-            <div className="h-full overflow-hidden">
-              <ExecutionSummaryTab />
-            </div>
+            <RunPageLayout title="Summary" icon={ClipboardList}>
+              <div className="h-full overflow-hidden">
+                <ExecutionSummaryTab />
+              </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-findings":
         return (
           <RunSelectionProvider>
-            <div className="h-full overflow-hidden">
-              <ExecutionReport />
-            </div>
-          </RunSelectionProvider>
-        );
-
-      case "run-issues":
-        return (
-          <RunSelectionProvider>
-            <div className="h-full overflow-y-auto p-4">
-              <IssuesPanel />
-            </div>
+            <RunPageLayout title="Findings" icon={FileText}>
+              <div className="h-full overflow-hidden">
+                <ExecutionReport />
+              </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-verification":
         return (
           <RunSelectionProvider>
-            <div className="h-full overflow-hidden">
-              <VerificationTab />
-            </div>
+            <RunPageLayout title="Verification" icon={FileSearch}>
+              <div className="h-full overflow-hidden">
+                <VerificationTab />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        );
+
+      case "run-tests":
+        return (
+          <RunSelectionProvider>
+            <RunPageLayout title="Test Results" icon={TestTube}>
+              <div className="h-full overflow-hidden">
+                <TestResultsTab />
+              </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-ai-output":
         return (
           <RunSelectionProvider>
-            <AiTab
-              aiOutputLines={aiOutputLogs}
-              onClearAiOutput={clearAiOutputLogs}
-              onAddAiOutputLine={(line) =>
-                addAiOutputLog(
-                  line.line,
-                  line.source,
-                  line.actionId,
-                  line.sessionId,
-                  line.sessionName,
-                )
-              }
-              onNavigateToLibrary={() => setActiveTab("library")}
-            />
+            <RunPageLayout title="AI Output" icon={Bot}>
+              <AiTab
+                aiOutputLines={aiOutputLogs}
+                onClearAiOutput={clearAiOutputLogs}
+                onAddAiOutputLine={(line) =>
+                  addAiOutputLog(
+                    line.line,
+                    line.source,
+                    line.actionId,
+                    line.sessionId,
+                    line.sessionName,
+                  )
+                }
+                onNavigateToLibrary={() => setActiveTab("library")}
+              />
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-statistics":
         return (
           <RunSelectionProvider>
-            <div className="h-full overflow-hidden">
-              <StatisticsTab
-                configId={execution.config?.path ?? null}
-                configName={execution.config?.name}
-              />
-            </div>
+            <RunPageLayout title="Statistics" icon={BarChart3}>
+              <div className="h-full overflow-hidden">
+                <StatisticsTab
+                  configId={execution.config?.path ?? null}
+                  configName={execution.config?.name}
+                />
+              </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
       case "run-ai-data":
         return (
           <RunSelectionProvider>
-            <div className="h-full overflow-hidden">
-              <AiDataViewerTab />
-            </div>
+            <RunPageLayout title="AI Data Viewer" icon={Database}>
+              <div className="h-full overflow-hidden">
+                <AiDataViewerTab />
+              </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
@@ -693,8 +757,10 @@ function AppContent() {
             onNavigateToActive={() => setActiveTab("active")}
             onNavigateToBuilder={() => setActiveTab("workflow-builder")}
             onNavigateToScriptBuilder={() => setActiveTab("script-builder")}
+            onNavigateToGuiWorkflowBuilder={() => setActiveTab("gui-workflow-builder")}
             onEditScript={handleEditScript}
             onEditWorkflow={handleEditWorkflow}
+            onEditGuiWorkflow={handleEditGuiWorkflow}
             aiOutputLines={aiOutputLogs}
           />
         );
@@ -718,14 +784,28 @@ function AppContent() {
           </div>
         );
 
+      case "gui-workflow-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <GuiWorkflowBuilderTab editWorkflowId={editGuiWorkflowId} />
+          </div>
+        );
+
       case "script-builder":
         return (
-          <div className="h-full overflow-y-auto">
+          <div className="h-full overflow-hidden">
             <ScriptBuilderTab
               onLog={addLog}
               editScriptId={editScriptId}
               onNavigateToLibrary={() => setActiveTab("library")}
             />
+          </div>
+        );
+
+      case "test-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <TestBuilderTab onLog={addLog} />
           </div>
         );
 
@@ -744,14 +824,7 @@ function AppContent() {
           </div>
         );
 
-      case "monitor-issues":
-        return (
-          <div className="h-full overflow-y-auto p-4">
-            <IssuesPanel />
-          </div>
-        );
-
-      // monitor-learnings removed - functionality moved to Summary/Findings/Issues
+      // monitor-issues removed - merged into Findings
 
       case "monitor-verification":
         return (
@@ -803,12 +876,7 @@ function AppContent() {
       case "capture":
         return (
           <div className="h-full overflow-y-auto">
-            <CaptureTab
-              onLog={addLog}
-              projects={projectSelection.projects}
-              selectedProjectId={projectSelection.selectedProjectId}
-              selectedProjectName={projectSelection.selectedProjectName}
-            />
+            <CaptureTab onLog={addLog} />
           </div>
         );
 
@@ -816,9 +884,32 @@ function AppContent() {
         return <SchedulerTab />;
 
       case "settings":
+      case "settings-account":
+      case "settings-ai":
+      case "settings-playwright":
+      case "settings-general":
+      case "settings-storage":
+      case "settings-backup":
+      case "settings-debug":
+      case "settings-updates": {
+        // Map main tab ID to settings sub-tab
+        const settingsTabMap: Record<string, string> = {
+          settings: "account",
+          "settings-account": "account",
+          "settings-ai": "ai",
+          "settings-playwright": "playwright",
+          "settings-general": "general",
+          "settings-storage": "storage",
+          "settings-backup": "backup",
+          "settings-debug": "advanced",
+          "settings-updates": "updates",
+        };
+        const defaultSettingsTab = settingsTabMap[activeTab] || "account";
+
         return (
           <div className="h-full overflow-hidden">
             <Settings
+              defaultTab={defaultSettingsTab}
               onLog={addLog}
               onDebugModeChange={async (enabled) => {
                 try {
@@ -841,6 +932,7 @@ function AppContent() {
             />
           </div>
         );
+      }
 
       case "help":
         return <HelpTab />;

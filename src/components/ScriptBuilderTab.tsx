@@ -1936,9 +1936,9 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
   }, []);
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="h-full flex flex-col p-4 gap-3 overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-shrink-0">
         <div className="flex items-center gap-3">
           {onNavigateToLibrary && (
             <button
@@ -1985,529 +1985,537 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
         </div>
       </div>
 
-      {/* Script Builder Form - Always visible */}
-      {(isCreating || editingScript) && (
-        <div className="card p-6 space-y-4 border-2 border-green-500/30">
-          <div className="flex items-center justify-between">
-            <h3 className="text-lg font-semibold flex items-center gap-2">
-              <TestTube className="w-5 h-5 text-green-500" />
-              Create New Script
-            </h3>
-            <div className="flex items-center gap-2">
-              {/* View Mode Toggle */}
-              <div className="flex items-center bg-card border border-border rounded-lg p-1">
+      {/* Scrollable Content */}
+      <div className="flex-1 overflow-y-auto scrollbar-dark">
+        {/* Script Builder Form - Always visible */}
+        {(isCreating || editingScript) && (
+          <div className="card p-4 space-y-4 border-2 border-green-500/30 min-h-min">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold flex items-center gap-2">
+                <TestTube className="w-5 h-5 text-green-500" />
+                Create New Script
+              </h3>
+              <div className="flex items-center gap-2">
+                {/* View Mode Toggle */}
+                <div className="flex items-center bg-card border border-border rounded-lg p-1">
+                  <button
+                    onClick={() => setViewMode("natural_language")}
+                    className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
+                      viewMode === "natural_language"
+                        ? "bg-green-500/20 text-green-500"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <FileText className="w-4 h-4" />
+                    Description
+                  </button>
+                  <button
+                    onClick={() => setViewMode("code")}
+                    className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
+                      viewMode === "code"
+                        ? "bg-green-500/20 text-green-500"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <Code className="w-4 h-4" />
+                    Code
+                  </button>
+                </div>
                 <button
-                  onClick={() => setViewMode("natural_language")}
-                  className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
-                    viewMode === "natural_language"
-                      ? "bg-green-500/20 text-green-500"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
+                  onClick={() => {
+                    setIsCreating(false);
+                    setEditingScript(null);
+                    resetForm();
+                  }}
+                  className="p-1 hover:bg-card rounded"
                 >
-                  <FileText className="w-4 h-4" />
-                  Description
-                </button>
-                <button
-                  onClick={() => setViewMode("code")}
-                  className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
-                    viewMode === "code"
-                      ? "bg-green-500/20 text-green-500"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <Code className="w-4 h-4" />
-                  Code
+                  <X className="w-5 h-5" />
                 </button>
               </div>
-              <button
-                onClick={() => {
-                  setIsCreating(false);
-                  setEditingScript(null);
-                  resetForm();
-                }}
-                className="p-1 hover:bg-card rounded"
-              >
-                <X className="w-5 h-5" />
-              </button>
             </div>
-          </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium mb-1">Name *</label>
-              <input
-                type="text"
-                value={formName}
-                onChange={(e) => setFormName(e.target.value)}
-                placeholder="Login Flow Test"
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Target URL</label>
-              <div className="relative">
-                <Globe className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Name *</label>
                 <input
                   type="text"
-                  value={formTargetUrl}
-                  onChange={(e) => setFormTargetUrl(e.target.value)}
-                  placeholder="http://localhost:3000"
-                  className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                />
-              </div>
-            </div>
-          </div>
-
-          {viewMode === "natural_language" ? (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="block text-sm font-medium">Description (Natural Language)</label>
-                <div className="flex items-center gap-2">
-                  <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
-                  <button
-                    onClick={generateScript}
-                    disabled={isGenerating || !formDescription.trim()}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                  >
-                    {isGenerating ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Generating...
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="w-4 h-4" />
-                        Generate Script
-                      </>
-                    )}
-                  </button>
-                </div>
-              </div>
-              <div className="relative">
-                <textarea
-                  ref={descriptionTextareaRef}
-                  value={formDescription}
-                  onChange={(e) => setFormDescription(e.target.value)}
-                  onKeyDown={scriptletMention.handleKeyDown}
-                  onInput={scriptletMention.handleInput}
-                  placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
-                  rows={6}
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
+                  placeholder="Login Flow Test"
                   className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
                 />
-                {/* @-mention popup for scriptlet insertion */}
-                {scriptletMention.isActive && (
-                  <ScriptletSelector
-                    mode="popup"
-                    onSelect={scriptletMention.handleSelect}
-                    onClose={scriptletMention.handleClose}
-                    searchQuery={scriptletMention.searchQuery}
-                    position={scriptletMention.position}
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Target URL</label>
+                <div className="relative">
+                  <Globe className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                  <input
+                    type="text"
+                    value={formTargetUrl}
+                    onChange={(e) => setFormTargetUrl(e.target.value)}
+                    placeholder="http://localhost:3000"
+                    className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
                   />
-                )}
+                </div>
               </div>
-              <p className="text-xs text-muted-foreground mt-1">
-                Describe what you want to test, then click "Generate Script" to create the
-                Playwright code.
-              </p>
+            </div>
 
-              {/* AI Instructions (optional) */}
-              <div className="mt-4">
-                <label className="block text-sm font-medium mb-1 flex items-center gap-2">
-                  <Sparkles className="w-4 h-4 text-purple-500" />
-                  AI Instructions (Optional)
-                </label>
-                <textarea
-                  value={formAiInstructions}
-                  onChange={(e) => setFormAiInstructions(e.target.value)}
-                  placeholder="Additional instructions for the AI that modify how the description is interpreted...&#10;&#10;Example: The feature is currently broken. Stop after capturing the screen and take a screenshot. Expect failure but capture the state for debugging."
-                  rows={3}
-                  className="w-full px-3 py-2 bg-purple-500/5 border border-purple-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
-                />
-                <p className="text-xs text-muted-foreground mt-1">
-                  Use this to give the AI additional context without changing the test description.
-                </p>
-              </div>
-
-              {/* Workflow Automation (optional - collapsible) */}
-              <details className="mt-4 border border-blue-500/30 rounded-lg p-3 bg-blue-500/5">
-                <summary className="cursor-pointer text-sm font-medium flex items-center gap-2 text-blue-600 dark:text-blue-400">
-                  <CheckSquare className="w-4 h-4" />
-                  Workflow Automation Settings (Optional)
-                </summary>
-                <div className="mt-3 space-y-3">
+            {viewMode === "natural_language" ? (
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-sm font-medium">
+                    Description (Natural Language)
+                  </label>
                   <div className="flex items-center gap-2">
-                    <input
-                      type="checkbox"
-                      id="is-workflow-automation"
-                      checked={formIsWorkflowAutomation}
-                      onChange={(e) => setFormIsWorkflowAutomation(e.target.checked)}
-                      className="w-4 h-4 rounded border-blue-500/50 text-blue-600 focus:ring-blue-500"
-                    />
-                    <label htmlFor="is-workflow-automation" className="text-sm">
-                      This is workflow automation (script success is expected, verify objective
-                      instead)
-                    </label>
+                    <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
+                    <button
+                      onClick={generateScript}
+                      disabled={isGenerating || !formDescription.trim()}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                    >
+                      {isGenerating ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Generating...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          Generate Script
+                        </>
+                      )}
+                    </button>
                   </div>
-
-                  <div>
-                    <label className="block text-sm font-medium mb-1">Workflow Objective</label>
-                    <textarea
-                      value={formWorkflowObjective}
-                      onChange={(e) => setFormWorkflowObjective(e.target.value)}
-                      placeholder="What should this workflow achieve?&#10;&#10;Example: Create a new state called 'test-state' and verify it appears in the state list"
-                      rows={2}
-                      className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                </div>
+                <div className="relative">
+                  <textarea
+                    ref={descriptionTextareaRef}
+                    value={formDescription}
+                    onChange={(e) => setFormDescription(e.target.value)}
+                    onKeyDown={scriptletMention.handleKeyDown}
+                    onInput={scriptletMention.handleInput}
+                    placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
+                    rows={6}
+                    className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                  />
+                  {/* @-mention popup for scriptlet insertion */}
+                  {scriptletMention.isActive && (
+                    <ScriptletSelector
+                      mode="popup"
+                      onSelect={scriptletMention.handleSelect}
+                      onClose={scriptletMention.handleClose}
+                      searchQuery={scriptletMention.searchQuery}
+                      position={scriptletMention.position}
                     />
-                  </div>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Describe what you want to test, then click "Generate Script" to create the
+                  Playwright code.
+                </p>
 
-                  <div>
-                    <label className="block text-sm font-medium mb-1">
-                      Success Criteria (one per line)
-                    </label>
-                    <textarea
-                      value={formSuccessCriteria.join("\n")}
-                      onChange={(e) =>
-                        setFormSuccessCriteria(
-                          e.target.value
-                            .split("\n")
-                            .map((s) => s.trim())
-                            .filter(Boolean),
-                        )
-                      }
-                      placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
-                      rows={3}
-                      className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
-                    />
-                  </div>
-
-                  <p className="text-xs text-muted-foreground">
-                    When enabled, script execution success is expected. After the script passes, AI
-                    will verify whether the workflow objective was actually achieved.
+                {/* AI Instructions (optional) */}
+                <div className="mt-4">
+                  <label className="block text-sm font-medium mb-1 flex items-center gap-2">
+                    <Sparkles className="w-4 h-4 text-purple-500" />
+                    AI Instructions (Optional)
+                  </label>
+                  <textarea
+                    value={formAiInstructions}
+                    onChange={(e) => setFormAiInstructions(e.target.value)}
+                    placeholder="Additional instructions for the AI that modify how the description is interpreted...&#10;&#10;Example: The feature is currently broken. Stop after capturing the screen and take a screenshot. Expect failure but capture the state for debugging."
+                    rows={3}
+                    className="w-full px-3 py-2 bg-purple-500/5 border border-purple-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
+                  />
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Use this to give the AI additional context without changing the test
+                    description.
                   </p>
                 </div>
-              </details>
-            </div>
-          ) : (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="block text-sm font-medium">Script Content (.spec.ts) *</label>
-                {formDescription.trim() && (
-                  <button
-                    onClick={generateScript}
-                    disabled={isGenerating}
-                    className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-card border border-border rounded-lg hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                    title="Regenerate script from description"
-                  >
-                    {isGenerating ? (
-                      <>
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                        Regenerating...
-                      </>
-                    ) : (
-                      <>
-                        <RefreshCw className="w-4 h-4" />
-                        Regenerate
-                      </>
-                    )}
-                  </button>
-                )}
+
+                {/* Workflow Automation (optional - collapsible) */}
+                <details className="mt-4 border border-blue-500/30 rounded-lg p-3 bg-blue-500/5">
+                  <summary className="cursor-pointer text-sm font-medium flex items-center gap-2 text-blue-600 dark:text-blue-400">
+                    <CheckSquare className="w-4 h-4" />
+                    Workflow Automation Settings (Optional)
+                  </summary>
+                  <div className="mt-3 space-y-3">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="checkbox"
+                        id="is-workflow-automation"
+                        checked={formIsWorkflowAutomation}
+                        onChange={(e) => setFormIsWorkflowAutomation(e.target.checked)}
+                        className="w-4 h-4 rounded border-blue-500/50 text-blue-600 focus:ring-blue-500"
+                      />
+                      <label htmlFor="is-workflow-automation" className="text-sm">
+                        This is workflow automation (script success is expected, verify objective
+                        instead)
+                      </label>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Workflow Objective</label>
+                      <textarea
+                        value={formWorkflowObjective}
+                        onChange={(e) => setFormWorkflowObjective(e.target.value)}
+                        placeholder="What should this workflow achieve?&#10;&#10;Example: Create a new state called 'test-state' and verify it appears in the state list"
+                        rows={2}
+                        className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-medium mb-1">
+                        Success Criteria (one per line)
+                      </label>
+                      <textarea
+                        value={formSuccessCriteria.join("\n")}
+                        onChange={(e) =>
+                          setFormSuccessCriteria(
+                            e.target.value
+                              .split("\n")
+                              .map((s) => s.trim())
+                              .filter(Boolean),
+                          )
+                        }
+                        placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
+                        rows={3}
+                        className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
+                      />
+                    </div>
+
+                    <p className="text-xs text-muted-foreground">
+                      When enabled, script execution success is expected. After the script passes,
+                      AI will verify whether the workflow objective was actually achieved.
+                    </p>
+                  </div>
+                </details>
               </div>
-              <textarea
-                value={formScriptContent}
-                onChange={(e) => setFormScriptContent(e.target.value)}
-                rows={12}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
-                spellCheck={false}
-              />
-
-              {/* Coverage validation status */}
-              {isValidatingCoverage && (
-                <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Validating script covers all requirements...
+            ) : (
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-sm font-medium">Script Content (.spec.ts) *</label>
+                  {formDescription.trim() && (
+                    <button
+                      onClick={generateScript}
+                      disabled={isGenerating}
+                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-card border border-border rounded-lg hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                      title="Regenerate script from description"
+                    >
+                      {isGenerating ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Regenerating...
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-4 h-4" />
+                          Regenerate
+                        </>
+                      )}
+                    </button>
+                  )}
                 </div>
-              )}
+                <textarea
+                  value={formScriptContent}
+                  onChange={(e) => setFormScriptContent(e.target.value)}
+                  rows={12}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
+                  spellCheck={false}
+                />
 
-              {/* Coverage warnings */}
-              {coverageWarnings.length > 0 && (
-                <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-                  <div className="flex items-start gap-2">
-                    <Info className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
-                    <div className="flex-1">
-                      <div className="text-sm font-medium text-amber-500 mb-1">
-                        Missing Requirements Detected
+                {/* Coverage validation status */}
+                {isValidatingCoverage && (
+                  <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Validating script covers all requirements...
+                  </div>
+                )}
+
+                {/* Coverage warnings */}
+                {coverageWarnings.length > 0 && (
+                  <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg">
+                    <div className="flex items-start gap-2">
+                      <Info className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
+                      <div className="flex-1">
+                        <div className="text-sm font-medium text-amber-500 mb-1">
+                          Missing Requirements Detected
+                        </div>
+                        <div className="text-sm text-amber-400/80 mb-2">
+                          The generated code may not implement all functionality from the
+                          description:
+                        </div>
+                        <ul className="text-sm text-amber-400/80 list-disc list-inside space-y-1">
+                          {coverageWarnings.map((warning, i) => (
+                            <li key={i}>{warning}</li>
+                          ))}
+                        </ul>
+                        <button
+                          onClick={() => {
+                            // Re-generate with emphasis on missing requirements
+                            const missingItems = coverageWarnings.join(", ");
+                            setFormAiInstructions(
+                              (prev) =>
+                                prev +
+                                (prev ? "\n\n" : "") +
+                                `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`,
+                            );
+                            setCoverageWarnings([]);
+                            generateScript();
+                          }}
+                          disabled={isGenerating}
+                          className="mt-2 px-3 py-1.5 text-sm bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg transition-colors disabled:opacity-50"
+                        >
+                          <RefreshCw className="w-3 h-3 inline mr-1.5" />
+                          Regenerate with missing requirements
+                        </button>
                       </div>
-                      <div className="text-sm text-amber-400/80 mb-2">
-                        The generated code may not implement all functionality from the description:
-                      </div>
-                      <ul className="text-sm text-amber-400/80 list-disc list-inside space-y-1">
-                        {coverageWarnings.map((warning, i) => (
-                          <li key={i}>{warning}</li>
-                        ))}
-                      </ul>
-                      <button
-                        onClick={() => {
-                          // Re-generate with emphasis on missing requirements
-                          const missingItems = coverageWarnings.join(", ");
-                          setFormAiInstructions(
-                            (prev) =>
-                              prev +
-                              (prev ? "\n\n" : "") +
-                              `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`,
-                          );
-                          setCoverageWarnings([]);
-                          generateScript();
-                        }}
-                        disabled={isGenerating}
-                        className="mt-2 px-3 py-1.5 text-sm bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg transition-colors disabled:opacity-50"
-                      >
-                        <RefreshCw className="w-3 h-3 inline mr-1.5" />
-                        Regenerate with missing requirements
-                      </button>
                     </div>
                   </div>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+              </div>
+            )}
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium mb-1">Category</label>
-              <input
-                type="text"
-                value={formCategory}
-                onChange={(e) => setFormCategory(e.target.value)}
-                placeholder="E2E, Smoke, Regression"
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                list="category-suggestions"
-              />
-              <datalist id="category-suggestions">
-                {categories.map((cat) => (
-                  <option key={cat} value={cat} />
-                ))}
-              </datalist>
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Category</label>
+                <input
+                  type="text"
+                  value={formCategory}
+                  onChange={(e) => setFormCategory(e.target.value)}
+                  placeholder="E2E, Smoke, Regression"
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                  list="category-suggestions"
+                />
+                <datalist id="category-suggestions">
+                  {categories.map((cat) => (
+                    <option key={cat} value={cat} />
+                  ))}
+                </datalist>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Tags (comma-separated)</label>
+                <input
+                  type="text"
+                  value={formTags}
+                  onChange={(e) => setFormTags(e.target.value)}
+                  placeholder="login, auth, smoke"
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                />
+              </div>
             </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Tags (comma-separated)</label>
-              <input
-                type="text"
-                value={formTags}
-                onChange={(e) => setFormTags(e.target.value)}
-                placeholder="login, auth, smoke"
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-              />
-            </div>
-          </div>
 
-          <div className="grid grid-cols-3 gap-4">
-            <div>
-              <label className="block text-sm font-medium mb-1">Timeout (seconds)</label>
-              <input
-                type="number"
-                value={formTimeoutSeconds}
-                onChange={(e) => setFormTimeoutSeconds(parseInt(e.target.value) || 60)}
-                min={10}
-                max={600}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Browser</label>
-              <select
-                value={formBrowser}
-                onChange={(e) => setFormBrowser(e.target.value as typeof formBrowser)}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-              >
-                <option value="chromium">Chromium</option>
-                <option value="firefox">Firefox</option>
-                <option value="webkit">WebKit</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1">Display Mode</label>
-              <select
-                value={formDisplayMode}
-                onChange={(e) => setFormDisplayMode(e.target.value as DisplayMode)}
-                className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-              >
-                <option value="headless">Headless (No UI)</option>
-                <option value="headed">Headed (New Window)</option>
-                <option value="connect_existing">Open Browser (CDP)</option>
-              </select>
-              {formDisplayMode === "connect_existing" && (
-                <div className="mt-1 space-y-1">
-                  <div className="flex items-center gap-1">
-                    <p className="text-xs text-amber-500">
-                      Requires Chrome started with: --remote-debugging-port=9222
-                    </p>
-                    <div className="relative group">
-                      <Info className="w-3.5 h-3.5 text-amber-500 cursor-help" />
-                      <div className="absolute right-0 bottom-full mb-2 hidden group-hover:block z-50 w-80">
-                        <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-xs">
-                          <p className="font-medium mb-2">How to start Chrome with debugging:</p>
-                          <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
-                            <li>Close all Chrome windows first</li>
-                            <li>Click the button below to restart Chrome with debugging, or:</li>
-                            <li>
-                              Create a shortcut with target:{" "}
-                              <code className="bg-muted px-1 rounded">
-                                chrome --remote-debugging-port=9222
-                              </code>
-                            </li>
-                          </ol>
+            <div className="grid grid-cols-3 gap-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Timeout (seconds)</label>
+                <input
+                  type="number"
+                  value={formTimeoutSeconds}
+                  onChange={(e) => setFormTimeoutSeconds(parseInt(e.target.value) || 60)}
+                  min={10}
+                  max={600}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Browser</label>
+                <select
+                  value={formBrowser}
+                  onChange={(e) => setFormBrowser(e.target.value as typeof formBrowser)}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                >
+                  <option value="chromium">Chromium</option>
+                  <option value="firefox">Firefox</option>
+                  <option value="webkit">WebKit</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Display Mode</label>
+                <select
+                  value={formDisplayMode}
+                  onChange={(e) => setFormDisplayMode(e.target.value as DisplayMode)}
+                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                >
+                  <option value="headless">Headless (No UI)</option>
+                  <option value="headed">Headed (New Window)</option>
+                  <option value="connect_existing">Open Browser (CDP)</option>
+                </select>
+                {formDisplayMode === "connect_existing" && (
+                  <div className="mt-1 space-y-1">
+                    <div className="flex items-center gap-1">
+                      <p className="text-xs text-amber-500">
+                        Requires Chrome started with: --remote-debugging-port=9222
+                      </p>
+                      <div className="relative group">
+                        <Info className="w-3.5 h-3.5 text-amber-500 cursor-help" />
+                        <div className="absolute right-0 bottom-full mb-2 hidden group-hover:block z-50 w-80">
+                          <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-xs">
+                            <p className="font-medium mb-2">How to start Chrome with debugging:</p>
+                            <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
+                              <li>Close all Chrome windows first</li>
+                              <li>Click the button below to restart Chrome with debugging, or:</li>
+                              <li>
+                                Create a shortcut with target:{" "}
+                                <code className="bg-muted px-1 rounded">
+                                  chrome --remote-debugging-port=9222
+                                </code>
+                              </li>
+                            </ol>
+                          </div>
                         </div>
                       </div>
                     </div>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      if (
-                        !confirm(
-                          "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
-                        )
-                      ) {
-                        return;
-                      }
-                      try {
-                        onLog("info", "Closing Chrome and relaunching with debug port...");
-                        const response = await fetch(`${API_BASE}/launch-debug-chrome`, {
-                          method: "POST",
-                        });
-                        const result = await response.json();
-                        if (result.success) {
-                          onLog(
-                            "success",
-                            "Chrome launched with debugging enabled. Navigate to your test page, then run the test.",
-                          );
-                        } else {
-                          onLog("error", `Failed to launch Chrome: ${result.error}`);
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        if (
+                          !confirm(
+                            "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
+                          )
+                        ) {
+                          return;
                         }
-                      } catch (error) {
-                        onLog("error", `Failed to launch Chrome: ${error}`);
-                      }
-                    }}
-                    className="text-xs px-2 py-1 bg-amber-500/20 text-amber-500 rounded hover:bg-amber-500/30 transition-colors"
-                  >
-                    Restart Chrome with Debug Port
-                  </button>
-                </div>
-              )}
+                        try {
+                          onLog("info", "Closing Chrome and relaunching with debug port...");
+                          const response = await fetch(`${API_BASE}/launch-debug-chrome`, {
+                            method: "POST",
+                          });
+                          const result = await response.json();
+                          if (result.success) {
+                            onLog(
+                              "success",
+                              "Chrome launched with debugging enabled. Navigate to your test page, then run the test.",
+                            );
+                          } else {
+                            onLog("error", `Failed to launch Chrome: ${result.error}`);
+                          }
+                        } catch (error) {
+                          onLog("error", `Failed to launch Chrome: ${error}`);
+                        }
+                      }}
+                      className="text-xs px-2 py-1 bg-amber-500/20 text-amber-500 rounded hover:bg-amber-500/30 transition-colors"
+                    >
+                      Restart Chrome with Debug Port
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
-          </div>
 
-          {/* Visual Context Settings for Auto-Refine (applies when using Save & Auto-Refine) */}
-          <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground py-3 border-t border-border">
-            <div className="flex items-center gap-2">
-              <ImageIcon className="w-4 h-4" />
-              <span>Auto-Refine Visual Context:</span>
-            </div>
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={includeScreenshot}
-                onChange={(e) => setIncludeScreenshot(e.target.checked)}
-                className="rounded border-border"
-              />
-              <span>Screenshot</span>
-            </label>
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={includeTraceData}
-                onChange={(e) => setIncludeTraceData(e.target.checked)}
-                className="rounded border-border"
-              />
-              <span>Trace</span>
-            </label>
-            <label
-              className="flex items-center gap-1.5 cursor-pointer"
-              title="Video uses significantly more tokens. Only recommended for complex failures."
-            >
-              <input
-                type="checkbox"
-                checked={includeVideo}
-                onChange={(e) => setIncludeVideo(e.target.checked)}
-                className="rounded border-border"
-              />
-              <span>Video after</span>
-              <input
-                type="number"
-                min={1}
-                max={10}
-                value={includeVideoAfterIterations}
-                onChange={(e) =>
-                  setIncludeVideoAfterIterations(Math.max(1, parseInt(e.target.value) || 3))
-                }
-                disabled={!includeVideo}
-                className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
-              />
-              <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
-              <span title="Video uses significantly more tokens. Enables after N failed iterations.">
-                <Info className="w-3.5 h-3.5 text-muted-foreground" />
-              </span>
-            </label>
-            <div className="border-l border-border pl-4 ml-2">
+            {/* Visual Context Settings for Auto-Refine (applies when using Save & Auto-Refine) */}
+            <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground py-3 border-t border-border">
+              <div className="flex items-center gap-2">
+                <ImageIcon className="w-4 h-4" />
+                <span>Auto-Refine Visual Context:</span>
+              </div>
               <label className="flex items-center gap-1.5 cursor-pointer">
-                <span>Max iterations:</span>
+                <input
+                  type="checkbox"
+                  checked={includeScreenshot}
+                  onChange={(e) => setIncludeScreenshot(e.target.checked)}
+                  className="rounded border-border"
+                />
+                <span>Screenshot</span>
+              </label>
+              <label className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={includeTraceData}
+                  onChange={(e) => setIncludeTraceData(e.target.checked)}
+                  className="rounded border-border"
+                />
+                <span>Trace</span>
+              </label>
+              <label
+                className="flex items-center gap-1.5 cursor-pointer"
+                title="Video uses significantly more tokens. Only recommended for complex failures."
+              >
+                <input
+                  type="checkbox"
+                  checked={includeVideo}
+                  onChange={(e) => setIncludeVideo(e.target.checked)}
+                  className="rounded border-border"
+                />
+                <span>Video after</span>
                 <input
                   type="number"
                   min={1}
-                  max={50}
-                  value={autoRefineMaxIterations}
+                  max={10}
+                  value={includeVideoAfterIterations}
                   onChange={(e) =>
-                    setAutoRefineMaxIterations(
-                      Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
-                    )
+                    setIncludeVideoAfterIterations(Math.max(1, parseInt(e.target.value) || 3))
                   }
-                  className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
+                  disabled={!includeVideo}
+                  className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
                 />
+                <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
+                <span title="Video uses significantly more tokens. Enables after N failed iterations.">
+                  <Info className="w-3.5 h-3.5 text-muted-foreground" />
+                </span>
               </label>
+              <div className="border-l border-border pl-4 ml-2">
+                <label className="flex items-center gap-1.5 cursor-pointer">
+                  <span>Max iterations:</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={autoRefineMaxIterations}
+                    onChange={(e) =>
+                      setAutoRefineMaxIterations(
+                        Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
+                      )
+                    }
+                    className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
+                  />
+                </label>
+              </div>
             </div>
-          </div>
 
-          <div className="flex justify-between items-center gap-2 pt-4 border-t border-border">
-            <button
-              onClick={() => {
-                setIsCreating(false);
-                resetForm();
-              }}
-              className="btn-secondary px-4 py-2"
-            >
-              Cancel
-            </button>
-            <div className="flex items-center gap-2">
+            <div className="flex justify-between items-center gap-2 pt-4 border-t border-border">
               <button
-                onClick={() => createScript()}
-                disabled={!formName || !formScriptContent}
-                className="btn-secondary px-4 py-2 flex items-center gap-2"
+                onClick={() => {
+                  setIsCreating(false);
+                  resetForm();
+                }}
+                className="btn-secondary px-4 py-2"
               >
-                <Save className="w-4 h-4" />
-                Save Only
+                Cancel
               </button>
-              <button
-                onClick={() => createScript({ runTest: true })}
-                disabled={!formName || !formScriptContent}
-                className="btn-primary px-4 py-2 flex items-center gap-2"
-                title="Save and run the test once"
-              >
-                <Play className="w-4 h-4" />
-                Save & Run
-              </button>
-              <button
-                onClick={() => createScript({ autoRefine: true })}
-                disabled={!formName || !formScriptContent}
-                className="flex items-center gap-2 px-4 py-2 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                title="Save, run test, and refine with AI until it passes"
-              >
-                <Sparkles className="w-4 h-4" />
-                Save & Auto-Refine
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => createScript()}
+                  disabled={!formName || !formScriptContent}
+                  className="btn-secondary px-4 py-2 flex items-center gap-2"
+                >
+                  <Save className="w-4 h-4" />
+                  Save Only
+                </button>
+                <button
+                  onClick={() => createScript({ runTest: true })}
+                  disabled={!formName || !formScriptContent}
+                  className="btn-primary px-4 py-2 flex items-center gap-2"
+                  title="Save and run the test once"
+                >
+                  <Play className="w-4 h-4" />
+                  Save & Run
+                </button>
+                <button
+                  onClick={() => createScript({ autoRefine: true })}
+                  disabled={!formName || !formScriptContent}
+                  className="flex items-center gap-2 px-4 py-2 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                  title="Save, run test, and refine with AI until it passes"
+                >
+                  <Sparkles className="w-4 h-4" />
+                  Save & Auto-Refine
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
+      {/* End scrollable content */}
 
       {/* Description Preview Modal */}
       {showDescriptionPreview && descriptionPreview && (

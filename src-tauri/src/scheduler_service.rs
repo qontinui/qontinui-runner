@@ -683,13 +683,12 @@ fn get_most_recent_modification(path: &str) -> Result<std::time::SystemTime, std
         .follow_links(false)
         .into_iter()
         .filter_entry(|e| !is_ignored_path(e.path()))
+        .flatten()
     {
-        if let Ok(entry) = entry {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > most_recent {
-                        most_recent = modified;
-                    }
+        if let Ok(metadata) = entry.metadata() {
+            if let Ok(modified) = metadata.modified() {
+                if modified > most_recent {
+                    most_recent = modified;
                 }
             }
         }

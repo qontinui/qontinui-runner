@@ -4,18 +4,16 @@
  * Monitoring view that combines:
  * - Summary panel (code-focused execution summary)
  * - Findings panel (all categorized findings from AI execution)
- * - Issues panel (legacy detected issues during AI execution)
- * - Learnings panel (AI pattern analysis from sessions)
  * - Verification panel (AI-driven state verification)
  * - Statistics panel (config health, flaky items, run history)
+ * - Discoveries panel (sync queue for discovered items)
  *
  * Uses tabs to organize the different monitoring areas.
  */
 
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
-import { AlertTriangle, FileText, ClipboardList, FileSearch, BarChart3, Cloud } from "lucide-react";
-import { IssuesPanel } from "../IssuesPanel";
+import { FileText, ClipboardList, FileSearch, BarChart3, Cloud } from "lucide-react";
 import { ExecutionSummaryTab } from "./ExecutionSummaryTab";
 import { ExecutionReport } from "../findings";
 import { VerificationTab } from "../verification";
@@ -23,7 +21,7 @@ import { StatisticsTab } from "../statistics";
 import { DiscoverySyncPanel } from "../discoveries";
 import { useExecution } from "../../contexts/ExecutionContext";
 
-type MonitorTab = "summary" | "findings" | "issues" | "verification" | "statistics" | "discoveries";
+type MonitorTab = "summary" | "findings" | "verification" | "statistics" | "discoveries";
 
 export function MonitorSubTab() {
   const [activeTab, setActiveTab] = useState<MonitorTab>("summary");
@@ -58,10 +56,6 @@ export function MonitorSubTab() {
             <FileText className="w-4 h-4" />
             All Findings
           </Tabs.Trigger>
-          <Tabs.Trigger value="issues" className={tabTriggerClass}>
-            <AlertTriangle className="w-4 h-4" />
-            Issues
-          </Tabs.Trigger>
           <Tabs.Trigger value="verification" className={tabTriggerClass}>
             <FileSearch className="w-4 h-4" />
             Verification
@@ -90,13 +84,6 @@ export function MonitorSubTab() {
             className="h-full outline-none overflow-hidden data-[state=inactive]:hidden"
           >
             <ExecutionReport />
-          </Tabs.Content>
-
-          <Tabs.Content
-            value="issues"
-            className="h-full outline-none overflow-y-auto p-4 data-[state=inactive]:hidden"
-          >
-            <IssuesPanel />
           </Tabs.Content>
 
           <Tabs.Content

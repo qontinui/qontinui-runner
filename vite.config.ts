@@ -28,6 +28,7 @@ export default defineConfig({
   },
   resolve: {
     alias: {
+      "@": path.resolve(__dirname, "./src"),
       "@qontinui/schemas": path.resolve(__dirname, "../qontinui-schemas/generated/typescript"),
     },
   },

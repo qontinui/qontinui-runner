@@ -215,13 +215,13 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       />
 
       {/* Create Backup Section */}
-      <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <Download className="w-5 h-5 text-primary" />
-          <h4 className="font-semibold text-lg">Create Backup</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="flex items-center gap-2">
+          <Download className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Create Backup</h4>
         </div>
 
-        <p className="text-sm text-muted-foreground">
+        <p className="text-xs text-muted-foreground">
           Download a backup file containing all your user data. This includes settings, prompts,
           Playwright scripts, and AI workflows.
         </p>
@@ -245,15 +245,15 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
         </button>
 
         {lastBackupResult && (
-          <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
-            <div className="flex items-center gap-2 text-green-600 mb-2">
-              <CheckCircle className="w-4 h-4" />
-              <span className="font-medium">Backup Created Successfully</span>
+          <div className="p-3 bg-green-500/10 rounded-lg">
+            <div className="flex items-center gap-2 text-green-400 mb-2">
+              <CheckCircle className="w-3.5 h-3.5" />
+              <span className="text-xs font-medium">Backup Created Successfully</span>
             </div>
-            <div className="text-sm text-muted-foreground">
+            <div className="text-xs text-muted-foreground">
               <p>Files backed up: {lastBackupResult.files_backed_up.join(", ")}</p>
               {lastBackupResult.errors.length > 0 && (
-                <p className="text-amber-600 mt-1">
+                <p className="text-amber-500 mt-1">
                   Warnings: {lastBackupResult.errors.join("; ")}
                 </p>
               )}
@@ -263,13 +263,13 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       </div>
 
       {/* Restore Section */}
-      <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <Upload className="w-5 h-5 text-primary" />
-          <h4 className="font-semibold text-lg">Restore from Backup</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="flex items-center gap-2">
+          <Upload className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Restore from Backup</h4>
         </div>
 
-        <p className="text-sm text-muted-foreground">
+        <p className="text-xs text-muted-foreground">
           Select a backup file to restore your data. This will overwrite your current settings,
           prompts, scripts, and workflows.
         </p>
@@ -290,7 +290,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
 
         {/* Backup Preview */}
         {previewManifest && (
-          <div className="p-4 bg-muted/50 border border-border rounded-lg space-y-4">
+          <div className="p-4 bg-muted/30 rounded-lg space-y-4">
             <div className="flex items-center justify-between">
               <h5 className="font-medium">Backup Preview</h5>
               <button
@@ -334,8 +334,8 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
               </ul>
             </div>
 
-            <div className="flex items-center gap-2 p-2 bg-amber-500/10 border border-amber-500/30 rounded text-amber-600 text-sm">
-              <AlertCircle className="w-4 h-4 shrink-0" />
+            <div className="flex items-center gap-2 p-2 bg-amber-500/10 rounded text-amber-500 text-xs">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
               <span>Restoring will overwrite your current data. This cannot be undone.</span>
             </div>
 
@@ -363,33 +363,31 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
         {lastRestoreResult && (
           <div
             className={`p-3 rounded-lg ${
-              lastRestoreResult.success
-                ? "bg-green-500/10 border border-green-500/30"
-                : "bg-amber-500/10 border border-amber-500/30"
+              lastRestoreResult.success ? "bg-green-500/10" : "bg-amber-500/10"
             }`}
           >
             <div
               className={`flex items-center gap-2 mb-2 ${
-                lastRestoreResult.success ? "text-green-600" : "text-amber-600"
+                lastRestoreResult.success ? "text-green-400" : "text-amber-500"
               }`}
             >
               {lastRestoreResult.success ? (
-                <CheckCircle className="w-4 h-4" />
+                <CheckCircle className="w-3.5 h-3.5" />
               ) : (
-                <AlertCircle className="w-4 h-4" />
+                <AlertCircle className="w-3.5 h-3.5" />
               )}
-              <span className="font-medium">
+              <span className="text-xs font-medium">
                 {lastRestoreResult.success ? "Restore Successful" : "Restore Completed with Errors"}
               </span>
             </div>
-            <div className="text-sm text-muted-foreground">
+            <div className="text-xs text-muted-foreground">
               <p>
                 Restored from backup v{lastRestoreResult.backup_version} (
                 {new Date(lastRestoreResult.backup_date).toLocaleString()})
               </p>
               <p className="mt-1">Files restored: {lastRestoreResult.files_restored.join(", ")}</p>
               {lastRestoreResult.errors.length > 0 && (
-                <p className="text-red-600 mt-1">Errors: {lastRestoreResult.errors.join("; ")}</p>
+                <p className="text-red-400 mt-1">Errors: {lastRestoreResult.errors.join("; ")}</p>
               )}
             </div>
           </div>
@@ -397,8 +395,8 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       </div>
 
       {/* Info Section */}
-      <div className="p-4 bg-primary/5 border border-primary/20 rounded-lg">
-        <div className="text-sm text-muted-foreground">
+      <div className="p-4 bg-primary/5 rounded-lg">
+        <div className="text-xs text-muted-foreground">
           <strong className="text-foreground">What's included in a backup:</strong>
           <ul className="list-disc list-inside mt-2 space-y-1">
             <li>Settings (debug options, AI settings, preferences)</li>
@@ -406,7 +404,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
             <li>Playwright Scripts (your automation test scripts)</li>
             <li>AI Workflows (your AI-assisted automation workflows)</li>
           </ul>
-          <p className="mt-3 text-xs">
+          <p className="mt-3 text-[10px]">
             Note: API keys stored in the system keychain are not included in backups for security
             reasons.
           </p>

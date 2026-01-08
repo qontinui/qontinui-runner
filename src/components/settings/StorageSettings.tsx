@@ -139,16 +139,16 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
         icon={<HardDrive className="w-6 h-6" />}
       />
 
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <div className="flex items-center gap-3">
-          <HardDrive className="w-5 h-5 text-primary" />
-          <h4 className="font-semibold text-lg">Local Storage</h4>
-          {storageLoading && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="flex items-center gap-2">
+          <HardDrive className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Local Storage</h4>
+          {storageLoading && <Loader2 className="w-3.5 h-3.5 animate-spin text-muted-foreground" />}
         </div>
 
         <div className="space-y-4">
           <div>
-            <div className="font-medium mb-2">Storage Usage</div>
+            <div className="text-xs font-medium mb-2">Storage Usage</div>
 
             {/* Screenshots */}
             <div className="space-y-2 mb-4">
@@ -197,8 +197,8 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
 
           {/* Storage Paths */}
           <div className="space-y-2">
-            <div className="font-medium">Storage Locations</div>
-            <div className="space-y-2 text-sm">
+            <div className="text-xs font-medium">Storage Locations</div>
+            <div className="space-y-2 text-xs">
               <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">Screenshots:</span>
                 <div className="flex items-center gap-2">
@@ -234,34 +234,34 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
 
           {/* Cleanup Actions */}
           <div className="space-y-2">
-            <div className="font-medium">Storage Cleanup</div>
+            <div className="text-xs font-medium">Storage Cleanup</div>
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => handleDeleteOldSessions("screenshots", 30)}
-                className="px-3 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 rounded-md transition-colors flex items-center gap-2 text-sm"
+                className="px-2.5 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 rounded-md transition-colors flex items-center gap-1.5 text-xs"
               >
-                <Trash2 className="w-4 h-4" />
+                <Trash2 className="w-3.5 h-3.5" />
                 Delete Screenshots (30+ days)
               </button>
               <button
                 onClick={() => handleDeleteOldSessions("videos", 30)}
-                className="px-3 py-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-600 rounded-md transition-colors flex items-center gap-2 text-sm"
+                className="px-2.5 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 rounded-md transition-colors flex items-center gap-1.5 text-xs"
               >
-                <Trash2 className="w-4 h-4" />
+                <Trash2 className="w-3.5 h-3.5" />
                 Delete Videos (30+ days)
               </button>
               <button
                 onClick={handleClearAllStorage}
-                className="px-3 py-2 bg-red-500/10 hover:bg-red-500/20 text-red-600 rounded-md transition-colors flex items-center gap-2 text-sm"
+                className="px-2.5 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-md transition-colors flex items-center gap-1.5 text-xs"
               >
-                <Trash className="w-4 h-4" />
+                <Trash className="w-3.5 h-3.5" />
                 Clear All Storage
               </button>
             </div>
           </div>
 
-          <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
-            <div className="text-sm text-muted-foreground">
+          <div className="p-3 bg-primary/5 rounded-lg">
+            <div className="text-xs text-muted-foreground">
               <strong className="text-foreground">Storage Info:</strong> Screenshots and videos are
               organized by session. Auto-cleanup removes oldest sessions when storage limits are
               reached. Files are stored locally on your machine at the paths shown above.

@@ -135,17 +135,53 @@ pub async fn get_debugging_context_prompt(
     }
 }
 
-/// Get run details (Tier 1 detailed data).
+/// Get automation run details from task_run_automation table.
 #[tauri::command]
 pub async fn get_run_details(
     state: State<'_, Arc<AppState>>,
     run_id: String,
 ) -> Result<TieredInfoResponse<RunDetails>, String> {
     let db = &state.checkpoint_db;
-    let conn = db.connection()?;
 
-    match tiered_info::get_run_details(&conn, &run_id) {
-        Ok(Some(run)) => Ok(TieredInfoResponse::ok(run)),
+    // Query from task_run_automation table (run_details table removed)
+    match db.get_task_run_automation_by_id(&run_id) {
+        Ok(Some(automation)) => {
+            // Convert TaskRunAutomation to RunDetails for backward compatibility
+            let run = RunDetails {
+                id: automation.id,
+                config_id: String::new(), // Would need to join with task_runs to get config_id
+                workflow_name: automation.workflow_name,
+                started_at: automation.started_at,
+                ended_at: automation.ended_at,
+                duration_ms: automation.duration_ms.map(|d| d as u64),
+                status: RunStatus::from_str(&automation.automation_status)
+                    .unwrap_or(RunStatus::Running),
+                success: automation.success,
+                error_type: automation.error_type,
+                error_message: automation.error_message,
+                actions_summary: automation
+                    .actions_summary
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                states_visited: automation
+                    .states_visited
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                transitions_executed: automation
+                    .transitions_executed
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                template_matches: automation
+                    .template_matches
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                anomalies: automation
+                    .anomalies
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
+                screenshots: Vec::new(),
+            };
+            Ok(TieredInfoResponse::ok(run))
+        }
         Ok(None) => Ok(TieredInfoResponse::err(format!(
             "Run details not found for {}",
             run_id
@@ -166,7 +202,7 @@ pub async fn get_recent_runs(
 
     let limit = limit.unwrap_or(10);
 
-    match tiered_info::get_recent_runs(&conn, &config_id, limit) {
+    match tiered_info::get_all_recent_runs(&conn, &config_id, limit) {
         Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -184,7 +220,7 @@ pub async fn get_failed_runs(
 
     let limit = limit.unwrap_or(5);
 
-    match tiered_info::get_failed_runs(&conn, &config_id, limit) {
+    match tiered_info::get_all_failed_runs(&conn, &config_id, limit) {
         Ok(runs) => Ok(TieredInfoResponse::ok(runs)),
         Err(e) => Ok(TieredInfoResponse::err(e)),
     }
@@ -272,10 +308,12 @@ pub async fn record_run(
             .collect();
     }
 
-    // Insert run details
-    if let Err(e) = tiered_info::insert_run_details(&conn, &run) {
-        return Ok(TieredInfoResponse::err(e));
-    }
+    // Note: The run_details table has been removed. Run recording now goes through TaskRecorder.
+    // This command now only updates statistics for backward compatibility.
+    // For full run recording, use the executor flow which creates task_runs + task_run_automation.
+    warn!(
+        "record_run command called directly - only updating statistics (use TaskRecorder for full recording)"
+    );
 
     // Update statistics
     if let Err(e) = tiered_info::update_statistics_after_run(&conn, &run) {
@@ -333,7 +371,8 @@ pub async fn record_run(
     Ok(TieredInfoResponse::ok(run.id))
 }
 
-/// Delete old runs to manage storage (keeps most recent N runs per config).
+/// Delete old automation records to manage storage (keeps most recent N per config).
+/// Note: This only cleans up task_run_automation records, not the parent task_runs.
 #[tauri::command]
 pub async fn cleanup_old_runs(
     state: State<'_, Arc<AppState>>,
@@ -345,9 +384,33 @@ pub async fn cleanup_old_runs(
 
     let keep_count = keep_count.unwrap_or(100);
 
-    match tiered_info::delete_old_runs(&conn, &config_id, keep_count) {
-        Ok(deleted) => Ok(TieredInfoResponse::ok(deleted)),
-        Err(e) => Ok(TieredInfoResponse::err(e)),
+    // Delete old task_run_automation records for tasks linked to this config
+    let result = conn.execute(
+        r#"
+        DELETE FROM task_run_automation
+        WHERE id IN (
+            SELECT tra.id FROM task_run_automation tra
+            INNER JOIN task_runs tr ON tra.task_run_id = tr.id
+            WHERE tr.config_id = ?1
+            ORDER BY tra.started_at DESC
+            LIMIT -1 OFFSET ?2
+        )
+        "#,
+        rusqlite::params![config_id, keep_count],
+    );
+
+    match result {
+        Ok(deleted) => {
+            info!(
+                "Cleaned up {} old automation records for config {}",
+                deleted, config_id
+            );
+            Ok(TieredInfoResponse::ok(deleted as u32))
+        }
+        Err(e) => Ok(TieredInfoResponse::err(format!(
+            "Failed to cleanup old runs: {}",
+            e
+        ))),
     }
 }
 

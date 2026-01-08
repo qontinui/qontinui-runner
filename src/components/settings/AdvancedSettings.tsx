@@ -155,50 +155,50 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       />
 
       {error && (
-        <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
-          <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-          <span className="text-red-400 text-sm">{error}</span>
+        <div className="p-3 bg-red-500/10 rounded-lg flex items-start gap-2">
+          <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+          <span className="text-red-400 text-xs">{error}</span>
         </div>
       )}
 
       {saveSuccess && (
-        <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
-          <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
-          <span className="text-green-400 text-sm">Settings saved successfully!</span>
+        <div className="p-3 bg-green-500/10 rounded-lg flex items-start gap-2">
+          <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
+          <span className="text-green-400 text-xs">Settings saved successfully!</span>
         </div>
       )}
 
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg mb-4">Debug</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Debug</h4>
 
         <div className="space-y-2">
-          <label className="flex items-center justify-between cursor-pointer">
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
             <div className="space-y-1">
-              <div className="font-medium">Enable Image Match Debug Mode</div>
-              <div className="text-sm text-muted-foreground">
+              <div className="text-sm font-medium">Enable Image Match Debug Mode</div>
+              <div className="text-xs text-muted-foreground">
                 Collect and display detailed match information in the Images tab, including top
                 match candidates, confidence scores, and failure diagnostics
               </div>
             </div>
             <button
               onClick={handleToggleDebug}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 settings.enable_image_debug ? "bg-primary" : "bg-muted"
               }`}
             >
               <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  settings.enable_image_debug ? "translate-x-6" : "translate-x-1"
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  settings.enable_image_debug ? "translate-x-4" : "translate-x-1"
                 }`}
               />
             </button>
           </label>
         </div>
 
-        <div className="space-y-2">
+        <div className="space-y-2 p-3 rounded-lg bg-muted/30">
           <label className="block">
-            <div className="font-medium mb-1">Top Matches to Display</div>
-            <div className="text-sm text-muted-foreground mb-3">
+            <div className="text-sm font-medium mb-1">Top Matches to Display</div>
+            <div className="text-xs text-muted-foreground mb-3">
               Number of top match candidates to show in debug information (1-10)
             </div>
             <div className="flex items-center gap-4">
@@ -216,14 +216,14 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
                 max="10"
                 value={settings.top_matches_count}
                 onChange={(e) => handleTopMatchesChange(parseInt(e.target.value))}
-                className="w-16 px-3 py-2 bg-input border border-border/50 rounded-md text-center"
+                className="w-14 px-2 py-1.5 bg-muted/50 rounded-md text-center text-sm outline-none focus:ring-1 focus:ring-primary/50"
               />
             </div>
           </label>
         </div>
 
-        <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
-          <div className="text-sm text-muted-foreground">
+        <div className="p-3 bg-primary/5 rounded-lg">
+          <div className="text-xs text-muted-foreground">
             <strong className="text-foreground">Note:</strong> Debug settings take effect on the
             next image recognition attempt. These settings control the level of detail shown in the
             Image Recognition Debug tab.
@@ -257,23 +257,23 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       </div>
 
       {/* Device Information Section */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <div className="flex items-center justify-between">
-          <h4 className="font-semibold text-lg flex items-center gap-2">
-            <Monitor className="w-5 h-5 text-primary" />
+          <h4 className="font-medium text-sm flex items-center gap-2">
+            <Monitor className="w-4 h-4 text-primary" />
             Device Information
           </h4>
           <button
             onClick={loadDeviceInfo}
             disabled={deviceInfoLoading}
-            className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors disabled:opacity-50"
+            className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors disabled:opacity-50"
             title="Refresh device info"
           >
-            <RefreshCw className={`w-4 h-4 ${deviceInfoLoading ? "animate-spin" : ""}`} />
+            <RefreshCw className={`w-3.5 h-3.5 ${deviceInfoLoading ? "animate-spin" : ""}`} />
           </button>
         </div>
 
-        <p className="text-sm text-muted-foreground">
+        <p className="text-xs text-muted-foreground">
           System information useful for debugging and support. Click to copy values.
         </p>
 
@@ -283,63 +283,63 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             <span>Loading device info...</span>
           </div>
         ) : deviceInfo ? (
-          <div className="space-y-3">
+          <div className="space-y-2">
             {/* Device ID */}
             <div className="space-y-1">
-              <label className="text-sm font-medium text-muted-foreground">Device ID</label>
+              <label className="text-xs font-medium text-muted-foreground">Device ID</label>
               <button
                 onClick={() => copyToClipboard(deviceInfo.device_id, "Device ID")}
-                className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors group"
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-muted/50 rounded-md hover:bg-muted transition-colors group"
               >
-                <span className="font-mono text-sm truncate">{deviceInfo.device_id}</span>
+                <span className="font-mono text-xs truncate">{deviceInfo.device_id}</span>
                 {copiedField === "Device ID" ? (
-                  <Check className="w-4 h-4 text-green-400 shrink-0 ml-2" />
+                  <Check className="w-3.5 h-3.5 text-green-400 shrink-0 ml-2" />
                 ) : (
-                  <Copy className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
+                  <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
                 )}
               </button>
             </div>
 
             {/* Device Name */}
             <div className="space-y-1">
-              <label className="text-sm font-medium text-muted-foreground">Device Name</label>
+              <label className="text-xs font-medium text-muted-foreground">Device Name</label>
               <button
                 onClick={() => copyToClipboard(deviceInfo.device_name, "Device Name")}
-                className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors group"
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-muted/50 rounded-md hover:bg-muted transition-colors group"
               >
-                <span className="text-sm truncate">{deviceInfo.device_name}</span>
+                <span className="text-xs truncate">{deviceInfo.device_name}</span>
                 {copiedField === "Device Name" ? (
-                  <Check className="w-4 h-4 text-green-400 shrink-0 ml-2" />
+                  <Check className="w-3.5 h-3.5 text-green-400 shrink-0 ml-2" />
                 ) : (
-                  <Copy className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
+                  <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
                 )}
               </button>
             </div>
 
             {/* Platform */}
             <div className="space-y-1">
-              <label className="text-sm font-medium text-muted-foreground">Platform</label>
+              <label className="text-xs font-medium text-muted-foreground">Platform</label>
               <button
                 onClick={() => copyToClipboard(deviceInfo.platform, "Platform")}
-                className="w-full flex items-center justify-between px-3 py-2 bg-input border border-border/50 rounded-md hover:border-primary/50 transition-colors group"
+                className="w-full flex items-center justify-between px-2.5 py-1.5 bg-muted/50 rounded-md hover:bg-muted transition-colors group"
               >
-                <span className="text-sm capitalize">{deviceInfo.platform}</span>
+                <span className="text-xs capitalize">{deviceInfo.platform}</span>
                 {copiedField === "Platform" ? (
-                  <Check className="w-4 h-4 text-green-400 shrink-0 ml-2" />
+                  <Check className="w-3.5 h-3.5 text-green-400 shrink-0 ml-2" />
                 ) : (
-                  <Copy className="w-4 h-4 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
+                  <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
                 )}
               </button>
             </div>
           </div>
         ) : (
-          <div className="text-sm text-muted-foreground italic">
+          <div className="text-xs text-muted-foreground italic">
             Unable to load device information.
           </div>
         )}
 
-        <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
-          <div className="text-sm text-muted-foreground">
+        <div className="p-3 bg-primary/5 rounded-lg">
+          <div className="text-xs text-muted-foreground">
             <strong className="text-foreground">Tip:</strong> Include your Device ID when reporting
             issues to help identify your runner in the system.
           </div>

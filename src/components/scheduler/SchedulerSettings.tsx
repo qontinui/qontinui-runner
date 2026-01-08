@@ -74,7 +74,7 @@ export function SchedulerSettings({
             <div className="flex items-center gap-2">
               <span className="text-muted-foreground">Status:</span>
               <span
-                className={`flex items-center gap-1 ${status.enabled ? "text-green-500" : "text-gray-500"}`}
+                className={`flex items-center gap-1 ${status.enabled ? "text-green-500" : "text-text-muted"}`}
               >
                 {status.enabled ? (
                   <>

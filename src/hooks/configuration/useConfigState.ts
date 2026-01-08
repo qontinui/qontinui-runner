@@ -15,7 +15,9 @@ interface UseConfigStateReturn {
   setConfigLoaded: (loaded: boolean) => void;
   workflows: Workflow[];
   setWorkflows: (workflows: Workflow[]) => void;
-  updateConfigAndWorkflows: (config: Config, workflows: Workflow[]) => void;
+  automationEnabledCategories: string[];
+  setAutomationEnabledCategories: (categories: string[]) => void;
+  updateConfigAndWorkflows: (config: Config, workflows: Workflow[], categories: string[]) => void;
 }
 
 /**
@@ -25,15 +27,20 @@ export function useConfigState(): UseConfigStateReturn {
   const [config, setConfig] = useState<Config | null>(null);
   const [configLoaded, setConfigLoaded] = useState(false);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
+  const [automationEnabledCategories, setAutomationEnabledCategories] = useState<string[]>([]);
 
   /**
-   * Update both config and workflows together, and mark as loaded
+   * Update config, workflows, and categories together, and mark as loaded
    */
-  const updateConfigAndWorkflows = useCallback((newConfig: Config, newWorkflows: Workflow[]) => {
-    setConfig(newConfig);
-    setWorkflows(newWorkflows);
-    setConfigLoaded(true);
-  }, []);
+  const updateConfigAndWorkflows = useCallback(
+    (newConfig: Config, newWorkflows: Workflow[], categories: string[]) => {
+      setConfig(newConfig);
+      setWorkflows(newWorkflows);
+      setAutomationEnabledCategories(categories);
+      setConfigLoaded(true);
+    },
+    [],
+  );
 
   return {
     config,
@@ -42,6 +49,8 @@ export function useConfigState(): UseConfigStateReturn {
     setConfigLoaded,
     workflows,
     setWorkflows,
+    automationEnabledCategories,
+    setAutomationEnabledCategories,
     updateConfigAndWorkflows,
   };
 }

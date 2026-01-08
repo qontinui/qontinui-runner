@@ -13,7 +13,11 @@ import { useConfigFiltering } from "./useConfigFiltering";
 
 interface UseConfigEventsOptions {
   onLog?: LogFunction;
-  onConfigLoaded?: (config: Config, workflows: Workflow[]) => void;
+  onConfigLoaded?: (
+    config: Config,
+    workflows: Workflow[],
+    automationEnabledCategories: string[],
+  ) => void;
 }
 
 /**
@@ -82,8 +86,8 @@ export function useConfigEvents(options: UseConfigEventsOptions = {}): void {
       console.log("[CONFIG] MCP API - Filtered automation workflows:", automationWorkflows.length);
       console.log("[CONFIG] MCP API - Automation-enabled categories:", automationEnabledCategories);
 
-      // Notify consumer of loaded config and workflows
-      onConfigLoaded?.(loadedConfig, automationWorkflows);
+      // Notify consumer of loaded config, workflows, and enabled categories
+      onConfigLoaded?.(loadedConfig, automationWorkflows, automationEnabledCategories);
       onLog?.("success", `Configuration loaded via MCP API: ${configPath}`);
     };
 

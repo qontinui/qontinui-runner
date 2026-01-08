@@ -55,6 +55,7 @@ interface ExecutionContextValue {
   // Workflow State
   workflows: Workflow[];
   setWorkflows: (workflows: Workflow[]) => void;
+  automationEnabledCategories: string[];
   selectedWorkflow: string;
   setSelectedWorkflow: (id: string) => void;
   selectWorkflowWithPersistence: (id: string) => Promise<void>;
@@ -162,6 +163,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
     setConfigLoaded,
     workflows,
     setWorkflows,
+    automationEnabledCategories,
     loadConfiguration,
     loadLastConfiguration,
   } = useConfiguration({
@@ -172,6 +174,10 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
     autoLoadOnMount: true,
     onLastConfigLoaded: handleLastConfigLoaded,
   });
+
+  // Debug: Log categories when they change
+  console.log("[EXEC_CONTEXT] automationEnabledCategories:", automationEnabledCategories);
+  console.log("[EXEC_CONTEXT] workflows:", workflows.length);
 
   // Workflow Selection Hook
   const { selectedWorkflow, setSelectedWorkflow, selectWorkflowWithPersistence } =
@@ -354,6 +360,7 @@ export function ExecutionProvider({ children, onLog }: ExecutionProviderProps) {
     // Workflows
     workflows,
     setWorkflows,
+    automationEnabledCategories,
     selectedWorkflow,
     setSelectedWorkflow,
     selectWorkflowWithPersistence,

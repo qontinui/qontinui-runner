@@ -16,7 +16,9 @@ mod display;
 mod error;
 mod executor;
 mod findings;
+mod gui_workflows;
 mod iteration_bundle;
+mod log_consolidation;
 mod logging;
 mod mcp;
 mod mcp_api;
@@ -32,6 +34,8 @@ mod settings;
 mod step_executor;
 mod storage;
 mod task_monitor;
+mod task_recorder;
+mod test_executor;
 mod tiered_info;
 mod verification_agent;
 mod video_recorder;
@@ -247,6 +251,10 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::video::start_video_recording,
             commands::video::stop_video_recording,
             commands::video::get_video_recording_status,
+            // Interaction recording commands (video + input capture for State Machine creation)
+            commands::interaction::start_interaction_recording,
+            commands::interaction::stop_interaction_recording,
+            commands::interaction::get_interaction_recording_status,
             // Storage commands
             commands::storage::save_screenshot_to_disk,
             commands::storage::save_video_to_disk,
@@ -398,7 +406,51 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_data::get_task_runs_for_viewer,
             commands::ai_data::get_task_run_for_viewer,
             commands::ai_data::read_jsonl_logs_for_viewer,
+            commands::ai_data::read_jsonl_logs_for_task_run,
+            commands::ai_data::get_consolidated_ai_output,
             commands::ai_data::get_jsonl_logs_summary,
+            commands::ai_data::reopen_task_run,
+            commands::ai_data::read_text_logs_for_viewer,
+            commands::ai_data::get_text_logs_summary,
+            commands::ai_data::get_screenshots_for_viewer,
+            commands::ai_data::get_loaded_config_for_viewer,
+            commands::ai_data::get_ai_prompts_for_viewer,
+            commands::ai_data::get_contexts_for_viewer,
+            // Task Sync commands (sync to qontinui-web)
+            commands::task_sync::sync_ai_task_created,
+            commands::task_sync::sync_ai_session_started,
+            commands::task_sync::sync_ai_session_ended,
+            commands::task_sync::sync_ai_findings,
+            commands::task_sync::sync_ai_task_completed,
+            commands::task_sync::full_sync_ai_task,
+            commands::task_sync::sync_all_pending_ai_tasks,
+            // Verification testing commands
+            commands::testing::execute_verification_test,
+            commands::testing::execute_verification_test_suite,
+            commands::testing::get_test_type_info,
+            commands::testing::validate_test_definition,
+            // Verification test database CRUD commands
+            commands::testing::list_verification_tests,
+            commands::testing::get_verification_test,
+            commands::testing::create_verification_test,
+            commands::testing::update_verification_test,
+            commands::testing::delete_verification_test,
+            // Verification test execution with database integration
+            commands::testing::execute_test_by_id,
+            commands::testing::execute_tests_by_ids,
+            // Test result commands
+            commands::testing::get_test_results,
+            commands::testing::get_task_run_test_results,
+            // Test association commands
+            commands::testing::create_test_association,
+            commands::testing::get_config_test_associations,
+            commands::testing::delete_test_association,
+            // Test import/export commands
+            commands::testing::export_tests_to_file,
+            commands::testing::export_all_tests_to_file,
+            commands::testing::import_tests_from_file,
+            // Screenshot listing commands
+            commands::screenshots::list_screenshots,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");

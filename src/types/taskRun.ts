@@ -11,6 +11,11 @@
 export type TaskRunStatus = "running" | "complete" | "failed" | "stopped";
 
 /**
+ * Type of task (for unified architecture)
+ */
+export type TaskType = "task" | "automation" | "scheduled";
+
+/**
  * Task run data structure from the backend
  */
 export interface TaskRun {
@@ -18,18 +23,34 @@ export interface TaskRun {
   id: string;
   /** Human-readable task name */
   task_name: string;
-  /** The original prompt/instructions */
-  prompt: string;
+  /** The original prompt/instructions (optional for pure automation tasks) */
+  prompt?: string | null;
+  /** Task type: 'task', 'automation', or 'scheduled' */
+  task_type: TaskType;
+  /** Config ID for automation-enabled tasks */
+  config_id?: string | null;
+  /** Workflow name being executed */
+  workflow_name?: string | null;
   /** Current status */
   status: TaskRunStatus;
   /** Number of Claude sessions spawned */
   sessions_count: number;
   /** Maximum sessions before giving up (null = unlimited) */
   max_sessions?: number | null;
+  /** Whether to auto-continue on session completion */
+  auto_continue: boolean;
   /** Accumulated output with session markers */
   output_log: string;
   /** Error message if failed */
   error_message?: string | null;
+  /** Post-completion summary (AI generated) */
+  summary?: string | null;
+  /** Whether the task goal was achieved */
+  goal_achieved?: boolean | null;
+  /** Remaining work description */
+  remaining_work?: string | null;
+  /** When the summary was generated */
+  summary_generated_at?: string | null;
   /** ISO 8601 creation timestamp */
   created_at: string;
   /** ISO 8601 last update timestamp */
@@ -90,6 +111,30 @@ export interface RunPromptRequest {
   max_video_frames?: number;
   /** Max trace screenshots to include */
   max_trace_screenshots?: number;
+}
+
+/**
+ * Request body for creating a task run directly (via /task-runs endpoint)
+ */
+export interface CreateTaskRunRequest {
+  /** Human-readable task name */
+  task_name: string;
+  /** The prompt/instructions (optional for pure automation tasks) */
+  prompt?: string;
+  /** Task type: 'task', 'automation', or 'scheduled' (defaults to 'task') */
+  task_type?: TaskType;
+  /** Config ID for automation-enabled tasks */
+  config_id?: string;
+  /** Workflow name being executed */
+  workflow_name?: string;
+  /** Maximum number of sessions before giving up */
+  max_sessions?: number;
+  /** Whether to auto-continue on session completion */
+  auto_continue?: boolean;
+  /** JSON-encoded execution steps */
+  execution_steps_json?: string;
+  /** JSON-encoded log sources */
+  log_sources_json?: string;
 }
 
 /**

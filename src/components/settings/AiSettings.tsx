@@ -445,31 +445,31 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       />
 
       {error && (
-        <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg flex items-start gap-2">
-          <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
-          <span className="text-red-400 text-sm">{error}</span>
+        <div className="p-3 bg-red-500/10 rounded-lg flex items-start gap-2">
+          <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+          <span className="text-red-400 text-xs">{error}</span>
         </div>
       )}
 
       {saveSuccess && (
-        <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
-          <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
-          <span className="text-green-400 text-sm">Settings saved successfully!</span>
+        <div className="p-3 bg-green-500/10 rounded-lg flex items-start gap-2">
+          <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
+          <span className="text-green-400 text-xs">Settings saved successfully!</span>
         </div>
       )}
 
       {/* Provider Selection */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg mb-4">Provider</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Provider</h4>
 
         <div className="space-y-3">
           {PROVIDER_OPTIONS.map((option) => (
             <label
               key={option.value}
-              className={`flex items-start gap-3 p-4 rounded-lg border cursor-pointer transition-colors ${
+              className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-colors ${
                 settings.provider === option.value
-                  ? "border-primary bg-primary/5"
-                  : "border-border/50 hover:border-primary/50"
+                  ? "bg-primary/10"
+                  : "bg-muted/30 hover:bg-muted/50"
               }`}
             >
               <input
@@ -481,8 +481,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 className="mt-1 accent-primary"
               />
               <div className="space-y-1">
-                <div className="font-medium">{option.label}</div>
-                <div className="text-sm text-muted-foreground">{option.description}</div>
+                <div className="font-medium text-sm">{option.label}</div>
+                <div className="text-xs text-muted-foreground">{option.description}</div>
               </div>
             </label>
           ))}
@@ -491,15 +491,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Claude CLI Settings */}
       {settings.provider === "claude_cli" && (
-        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-          <h4 className="font-semibold text-lg flex items-center gap-2">
-            <Terminal className="w-5 h-5 text-primary" />
+        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+          <h4 className="font-medium text-sm flex items-center gap-2">
+            <Terminal className="w-4 h-4 text-primary" />
             Claude Code CLI Settings
           </h4>
 
           <div className="space-y-4">
-            <div className="space-y-2">
-              <label className="block font-medium">Execution Mode</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Execution Mode</label>
               <select
                 value={settings.claude_cli.execution_mode}
                 onChange={(e) =>
@@ -511,7 +511,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {EXECUTION_MODE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -519,7 +519,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   </option>
                 ))}
               </select>
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 {
                   EXECUTION_MODE_OPTIONS.find((o) => o.value === settings.claude_cli.execution_mode)
                     ?.description
@@ -527,8 +527,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </p>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Custom Executable Path (Optional)</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Custom Executable Path (Optional)</label>
               <input
                 type="text"
                 value={settings.claude_cli.custom_path || ""}
@@ -542,15 +542,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 placeholder="Leave empty to use default (claude or claude.exe)"
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
               />
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 Specify a custom path to the Claude Code executable if it's not in your PATH.
               </p>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Timeout (seconds)</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Timeout (seconds)</label>
               <input
                 type="number"
                 min="60"
@@ -568,9 +568,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
               />
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 Maximum time to wait for Claude Code to respond (60-3600 seconds).
               </p>
             </div>
@@ -580,23 +580,23 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Claude API Settings */}
       {settings.provider === "claude_api" && (
-        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-          <h4 className="font-semibold text-lg flex items-center gap-2">
-            <Zap className="w-5 h-5 text-primary" />
+        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+          <h4 className="font-medium text-sm flex items-center gap-2">
+            <Zap className="w-4 h-4 text-primary" />
             Claude API Settings
           </h4>
 
           <div className="space-y-4">
-            <div className="space-y-2">
-              <label className="block font-medium">API Key</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">API Key</label>
               {hasApiKey ? (
                 <div className="flex items-center gap-2">
-                  <div className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md text-muted-foreground">
+                  <div className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm">
                     API key configured securely
                   </div>
                   <button
                     onClick={deleteApiKey}
-                    className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors"
+                    className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors text-xs"
                   >
                     Delete
                   </button>
@@ -609,26 +609,30 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       value={apiKey}
                       onChange={(e) => setApiKey(e.target.value)}
                       placeholder="sk-ant-..."
-                      className="w-full px-3 py-2 pr-10 bg-input border border-border/50 rounded-md"
+                      className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
                     />
                     <button
                       type="button"
                       onClick={() => setShowApiKey(!showApiKey)}
                       className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                     >
-                      {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      {showApiKey ? (
+                        <EyeOff className="w-3.5 h-3.5" />
+                      ) : (
+                        <Eye className="w-3.5 h-3.5" />
+                      )}
                     </button>
                   </div>
                   <button
                     onClick={saveApiKey}
                     disabled={savingApiKey || !apiKey.trim()}
-                    className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50"
+                    className="px-3 py-1.5 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 text-xs"
                   >
                     {savingApiKey ? "Saving..." : "Save Key"}
                   </button>
                 </div>
               )}
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 Your API key is stored securely in the OS keychain. Get your key from{" "}
                 <a
                   href="https://console.anthropic.com/settings/keys"
@@ -641,8 +645,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </p>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Model</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Model</label>
               <select
                 value={settings.claude_api.model}
                 onChange={(e) =>
@@ -654,7 +658,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -664,8 +668,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </select>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Max Tokens</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Max Tokens</label>
               <input
                 type="number"
                 min="256"
@@ -680,15 +684,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
               />
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 Maximum tokens in the response (256-32768).
               </p>
             </div>
 
-            <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
-              <div className="text-sm text-yellow-400">
+            <div className="p-3 bg-yellow-500/10 rounded-lg">
+              <div className="text-xs text-yellow-400">
                 <strong>Note:</strong> Using the Claude API incurs per-token costs. Consider using
                 Claude Code CLI with your subscription for unlimited usage.
               </div>
@@ -699,23 +703,23 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Gemini CLI Settings */}
       {settings.provider === "gemini_cli" && (
-        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-          <h4 className="font-semibold text-lg flex items-center gap-2">
-            <Sparkles className="w-5 h-5 text-primary" />
+        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+          <h4 className="font-medium text-sm flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-primary" />
             Gemini CLI Settings
           </h4>
 
           <div className="space-y-4">
-            <div className="space-y-2">
-              <label className="block font-medium">Authentication Method</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Authentication Method</label>
               <div className="space-y-3">
                 {GEMINI_AUTH_OPTIONS.map((option) => (
                   <label
                     key={option.value}
-                    className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                    className={`flex items-start gap-3 p-3 rounded-lg cursor-pointer transition-colors ${
                       settings.gemini_cli?.auth_method === option.value
-                        ? "border-primary bg-primary/5"
-                        : "border-border/50 hover:border-primary/50"
+                        ? "bg-primary/10"
+                        : "bg-muted/30 hover:bg-muted/50"
                     }`}
                   >
                     <input
@@ -743,8 +747,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </div>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Model</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Model</label>
               <select
                 value={settings.gemini_cli?.model || "gemini-3-flash"}
                 onChange={(e) =>
@@ -756,7 +760,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {GEMINI_MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -766,8 +770,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </select>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Execution Mode</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Execution Mode</label>
               <select
                 value={settings.gemini_cli?.execution_mode || "auto"}
                 onChange={(e) =>
@@ -779,7 +783,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {EXECUTION_MODE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -789,8 +793,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </select>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Timeout (seconds)</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Timeout (seconds)</label>
               <input
                 type="number"
                 min="60"
@@ -808,11 +812,11 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-32 px-3 py-2 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
               />
             </div>
 
-            <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+            <div className="p-3 bg-blue-500/10 rounded-lg">
               <div className="text-sm text-blue-400">
                 <strong>Tip:</strong> Install Gemini CLI with:{" "}
                 <code className="bg-blue-500/20 px-1 rounded">
@@ -826,23 +830,23 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Gemini API Settings */}
       {settings.provider === "gemini_api" && (
-        <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-          <h4 className="font-semibold text-lg flex items-center gap-2">
-            <Sparkles className="w-5 h-5 text-primary" />
+        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+          <h4 className="font-medium text-sm flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-primary" />
             Gemini API Settings
           </h4>
 
           <div className="space-y-4">
-            <div className="space-y-2">
-              <label className="block font-medium">API Key</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">API Key</label>
               {hasGeminiApiKey ? (
                 <div className="flex items-center gap-2">
-                  <div className="flex-1 px-3 py-2 bg-input border border-border/50 rounded-md text-muted-foreground">
+                  <div className="flex-1 px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-muted-foreground text-sm">
                     Gemini API key configured securely
                   </div>
                   <button
                     onClick={deleteGeminiApiKey}
-                    className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors"
+                    className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors text-xs"
                   >
                     Delete
                   </button>
@@ -855,7 +859,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       value={geminiApiKey}
                       onChange={(e) => setGeminiApiKey(e.target.value)}
                       placeholder="AIza..."
-                      className="w-full px-3 py-2 pr-10 bg-input border border-border/50 rounded-md"
+                      className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
                     />
                     <button
                       type="button"
@@ -863,22 +867,22 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                     >
                       {showGeminiApiKey ? (
-                        <EyeOff className="w-4 h-4" />
+                        <EyeOff className="w-3.5 h-3.5" />
                       ) : (
-                        <Eye className="w-4 h-4" />
+                        <Eye className="w-3.5 h-3.5" />
                       )}
                     </button>
                   </div>
                   <button
                     onClick={saveGeminiApiKey}
                     disabled={savingGeminiApiKey || !geminiApiKey.trim()}
-                    className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50"
+                    className="px-3 py-1.5 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 text-xs"
                   >
                     {savingGeminiApiKey ? "Saving..." : "Save Key"}
                   </button>
                 </div>
               )}
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 Get your API key from{" "}
                 <a
                   href="https://aistudio.google.com/app/apikey"
@@ -891,8 +895,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </p>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Model</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Model</label>
               <select
                 value={settings.gemini_api?.model || "gemini-3-flash"}
                 onChange={(e) =>
@@ -904,7 +908,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-full px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
               >
                 {GEMINI_MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -914,8 +918,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </select>
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Max Output Tokens</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Max Output Tokens</label>
               <input
                 type="number"
                 min="256"
@@ -933,12 +937,12 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
               />
             </div>
 
-            <div className="space-y-2">
-              <label className="block font-medium">Temperature</label>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium">Temperature</label>
               <input
                 type="number"
                 min="0"
@@ -954,15 +958,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     },
                   }))
                 }
-                className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+                className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
               />
-              <p className="text-sm text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground">
                 Controls randomness (0 = deterministic, 2 = very creative).
               </p>
             </div>
 
-            <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
-              <div className="text-sm text-green-400">
+            <div className="p-3 bg-green-500/10 rounded-lg">
+              <div className="text-xs text-green-400">
                 <strong>Cost Savings:</strong> Gemini Flash is significantly cheaper than Claude for
                 simple tasks like linting and formatting.
               </div>
@@ -972,15 +976,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       )}
 
       {/* Auto-Refine Defaults */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg flex items-center gap-2">
-          <Video className="w-5 h-5 text-primary" />
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm flex items-center gap-2">
+          <Video className="w-4 h-4 text-primary" />
           Auto-Refine Defaults
         </h4>
 
         <div className="space-y-4">
-          <div className="space-y-2">
-            <label className="block font-medium">Include Video After Iterations</label>
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium">Include Video After Iterations</label>
             <input
               type="number"
               min="0"
@@ -995,16 +999,16 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   ),
                 }))
               }
-              className="w-32 px-3 py-2 bg-input border border-border/50 rounded-md"
+              className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
             />
-            <p className="text-sm text-muted-foreground">
+            <p className="text-[10px] text-muted-foreground">
               Default number of failed iterations before including video frames in AI analysis. Set
               to 0 to never include video. This value is used as the default for new scripts.
             </p>
           </div>
 
-          <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
-            <div className="text-sm text-yellow-400">
+          <div className="p-3 bg-yellow-500/10 rounded-lg">
+            <div className="text-xs text-yellow-400">
               <strong>Note:</strong> Video frames use significantly more tokens than screenshots.
               Only recommended for complex failures where screenshots alone aren't sufficient.
             </div>
@@ -1013,9 +1017,9 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       </div>
 
       {/* Test Connection */}
-      <div className="space-y-4 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg">Test Connection</h4>
-        <p className="text-sm text-muted-foreground">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Test Connection</h4>
+        <p className="text-xs text-muted-foreground">
           Verify that your AI configuration is working correctly.
         </p>
 
@@ -1026,7 +1030,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             (settings.provider === "claude_api" && !hasApiKey) ||
             (settings.provider === "gemini_api" && !hasGeminiApiKey)
           }
-          className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 flex items-center gap-2"
+          className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 flex items-center gap-2 text-sm font-medium"
         >
           {testing ? (
             <>
@@ -1044,17 +1048,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         {testResult && (
           <div
             className={`p-3 rounded-lg flex items-start gap-2 ${
-              testResult.success
-                ? "bg-green-500/10 border border-green-500/30"
-                : "bg-red-500/10 border border-red-500/30"
+              testResult.success ? "bg-green-500/10" : "bg-red-500/10"
             }`}
           >
             {testResult.success ? (
-              <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
+              <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
             ) : (
-              <X className="w-5 h-5 text-red-400 shrink-0 mt-0.5" />
+              <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
             )}
-            <span className={testResult.success ? "text-green-400" : "text-red-400"}>
+            <span className={`text-xs ${testResult.success ? "text-green-400" : "text-red-400"}`}>
               {testResult.message}
             </span>
           </div>
@@ -1066,7 +1068,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         <button
           onClick={saveSettings}
           disabled={saving}
-          className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
         >
           {saving ? (
             <>

@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import type { Finding } from "../../types/findings";
 import { getCategoryById, getCategoryColorClasses } from "../../services/FindingCategories";
+import { getSeverityColors, getStatusColors, getAccentColors } from "@/design-system";
 
 // Map icon names to Lucide components
 const iconMap: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -59,21 +60,24 @@ interface FindingCardProps {
   isProcessing?: boolean;
 }
 
-const severityColors: Record<string, { bg: string; text: string; border: string }> = {
-  critical: { bg: "bg-red-500/20", text: "text-red-400", border: "border-red-500/30" },
-  high: { bg: "bg-orange-500/20", text: "text-orange-400", border: "border-orange-500/30" },
-  medium: { bg: "bg-yellow-500/20", text: "text-yellow-400", border: "border-yellow-500/30" },
-  low: { bg: "bg-blue-500/20", text: "text-blue-400", border: "border-blue-500/30" },
-  info: { bg: "bg-slate-500/20", text: "text-slate-400", border: "border-slate-500/30" },
+// Status badge labels - colors come from design system
+const statusLabels: Record<string, string> = {
+  detected: "New",
+  in_progress: "In Progress",
+  needs_input: "Needs Input",
+  resolved: "Resolved",
+  wont_fix: "Won't Fix",
+  deferred: "Deferred",
 };
 
-const statusBadges: Record<string, { label: string; color: string }> = {
-  detected: { label: "New", color: "bg-blue-500" },
-  in_progress: { label: "In Progress", color: "bg-amber-500" },
-  needs_input: { label: "Needs Input", color: "bg-purple-500" },
-  resolved: { label: "Resolved", color: "bg-green-500" },
-  wont_fix: { label: "Won't Fix", color: "bg-slate-500" },
-  deferred: { label: "Deferred", color: "bg-gray-500" },
+// Map finding status to design system status type
+const statusTypeMap: Record<string, string> = {
+  detected: "pending",
+  in_progress: "running",
+  needs_input: "warning",
+  resolved: "success",
+  wont_fix: "cancelled",
+  deferred: "paused",
 };
 
 export function FindingCard({
@@ -90,8 +94,9 @@ export function FindingCard({
 
   const category = getCategoryById(finding.categoryId);
   const categoryColors = getCategoryColorClasses(category?.color || "slate");
-  const severityColor = severityColors[finding.severity] || severityColors.info;
-  const statusBadge = statusBadges[finding.status] || statusBadges.detected;
+  const severityColor = getSeverityColors(finding.severity);
+  const statusColors = getStatusColors(statusTypeMap[finding.status] || "pending");
+  const statusLabel = statusLabels[finding.status] || "Unknown";
 
   const IconComponent = category ? iconMap[category.icon] || Info : Info;
 
@@ -129,9 +134,9 @@ export function FindingCard({
 
               {/* Status Badge */}
               <span
-                className={`px-1.5 py-0.5 rounded text-[10px] font-medium text-white ${statusBadge.color}`}
+                className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${statusColors.bg} ${statusColors.text}`}
               >
-                {statusBadge.label}
+                {statusLabel}
               </span>
 
               {/* Severity Badge */}
@@ -189,7 +194,7 @@ export function FindingCard({
             {needsInput && !showInputForm && (
               <button
                 onClick={() => setShowInputForm(true)}
-                className="flex items-center gap-1 px-2 py-1 text-xs bg-purple-500 text-white rounded hover:bg-purple-600 transition-colors"
+                className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors ${getAccentColors("purple").bgSolid} text-white hover:opacity-90`}
                 title="Provide input for this finding"
               >
                 <MessageSquare className="w-3 h-3" />
@@ -338,7 +343,7 @@ export function FindingCard({
                     setShowInputForm(false);
                   }
                 }}
-                className="flex-1 px-3 py-2 text-sm bg-green-500/20 text-green-400 border border-green-500/30 rounded hover:bg-green-500/30 transition-colors"
+                className={`flex-1 px-3 py-2 text-sm rounded transition-colors ${getAccentColors("green").bg} ${getAccentColors("green").text} border ${getAccentColors("green").border} hover:opacity-80`}
               >
                 Yes
               </button>
@@ -349,7 +354,7 @@ export function FindingCard({
                     setShowInputForm(false);
                   }
                 }}
-                className="flex-1 px-3 py-2 text-sm bg-red-500/20 text-red-400 border border-red-500/30 rounded hover:bg-red-500/30 transition-colors"
+                className={`flex-1 px-3 py-2 text-sm rounded transition-colors ${getAccentColors("red").bg} ${getAccentColors("red").text} border ${getAccentColors("red").border} hover:opacity-80`}
               >
                 No
               </button>

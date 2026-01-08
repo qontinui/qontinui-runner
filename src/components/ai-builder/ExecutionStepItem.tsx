@@ -38,6 +38,8 @@ export function ExecutionStepItem({ step, index, totalSteps }: ExecutionStepItem
     switch (step.type) {
       case "workflow":
         return "bg-purple-500/5 border-purple-500/20";
+      case "gui_workflow":
+        return "bg-orange-500/5 border-orange-500/20";
       case "playwright":
         return "bg-green-500/5 border-green-500/20";
       case "prompt":
@@ -55,6 +57,8 @@ export function ExecutionStepItem({ step, index, totalSteps }: ExecutionStepItem
     switch (step.type) {
       case "workflow":
         return <Workflow className="w-4 h-4 text-purple-500 flex-shrink-0" />;
+      case "gui_workflow":
+        return <MousePointer2 className="w-4 h-4 text-orange-500 flex-shrink-0" />;
       case "playwright":
         return <TestTube className="w-4 h-4 text-green-500 flex-shrink-0" />;
       case "prompt":

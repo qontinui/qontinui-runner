@@ -82,7 +82,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
           {status && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <span
-                className={`w-2 h-2 rounded-full ${status.enabled ? "bg-green-500" : "bg-gray-400"}`}
+                className={`w-2 h-2 rounded-full ${status.enabled ? "bg-green-500" : "bg-text-muted"}`}
               />
               <span>{status.enabled ? "Running" : "Paused"}</span>
               {status.running_tasks > 0 && (

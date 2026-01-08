@@ -6,12 +6,12 @@ interface SectionHeaderProps {
 
 export function SectionHeader({ title, description, icon }: SectionHeaderProps) {
   return (
-    <div className="mb-6">
-      <div className="flex items-center gap-3 mb-2">
-        {icon && <span className="text-primary">{icon}</span>}
-        <h3 className="text-xl font-semibold">{title}</h3>
+    <div className="mb-4">
+      <div className="flex items-center gap-2 mb-1">
+        {icon && <span className="text-primary/70 [&>svg]:w-5 [&>svg]:h-5">{icon}</span>}
+        <h3 className="text-base font-semibold">{title}</h3>
       </div>
-      <p className="text-sm text-muted-foreground">{description}</p>
+      <p className="text-xs text-muted-foreground">{description}</p>
     </div>
   );
 }

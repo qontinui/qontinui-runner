@@ -12,8 +12,6 @@
 import { logManager, windowManager, configManager } from "../index";
 import { APP_VERSION } from "../../lib/appInfo";
 import type { HandlerSetupFunction } from "./types";
-import { syncIssuesToBackend } from "../../services/IssueSyncService";
-import { issueTracker } from "../../services/IssueTracker";
 import { findingsTracker } from "../../services/FindingsTracker";
 import { executionReportingService } from "../../services/ExecutionReportingService";
 import { RunType, RunStatus } from "../../types/execution";
@@ -141,31 +139,6 @@ export const setupExecutionHandlers: HandlerSetupFunction = (context) => {
 
       // Restore window if it was auto-minimized
       windowManager.restoreIfMinimized();
-
-      // Sync any detected issues to the web backend
-      const issueCount = issueTracker.count;
-      if (issueCount > 0) {
-        console.log(`[EXECUTION_HANDLER] Syncing ${issueCount} issues to web backend`);
-        syncIssuesToBackend()
-          .then((result) => {
-            if (result.errors.length > 0) {
-              console.warn("[EXECUTION_HANDLER] Issue sync had errors:", result.errors);
-              logManager.addLog(
-                "warning",
-                `Issue sync completed with errors: ${result.errors.join(", ")}`,
-              );
-            } else if (result.synced > 0 || result.updated > 0) {
-              logManager.addLog(
-                "info",
-                `Synced ${result.synced} new, ${result.updated} updated issues to cloud`,
-              );
-            }
-          })
-          .catch((error) => {
-            console.error("[EXECUTION_HANDLER] Failed to sync issues:", error);
-            // Don't show error to user - sync is best-effort
-          });
-      }
 
       // Archive findings from the session to disk for persistence
       const findingsCount = findingsTracker.count;

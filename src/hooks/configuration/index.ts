@@ -68,6 +68,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
     setConfigLoaded,
     workflows,
     setWorkflows,
+    automationEnabledCategories,
     updateConfigAndWorkflows,
   } = useConfigState();
 
@@ -99,6 +100,7 @@ export function useConfiguration(options: UseConfigurationOptions = {}): UseConf
     setConfigLoaded,
     workflows,
     setWorkflows,
+    automationEnabledCategories,
     loadConfiguration,
     loadLastConfiguration,
     loadConfigFromPath,

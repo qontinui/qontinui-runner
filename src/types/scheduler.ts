@@ -380,7 +380,7 @@ export function getStatusColor(status: ScheduledTaskStatus): string {
     case "skipped":
       return "text-yellow-500";
     case "cancelled":
-      return "text-gray-500";
+      return "text-text-muted";
   }
 }
 

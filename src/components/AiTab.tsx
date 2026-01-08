@@ -39,7 +39,7 @@ import {
 } from "lucide-react";
 import { AiOutputTab } from "./AiOutputTab";
 import type { AiOutputLine } from "./AiOutputTab";
-import { useIssues, useUnifiedReport } from "../hooks";
+import { useFindings, useUnifiedReport } from "../hooks";
 import { groupEntriesIntoLoops, type AiLoop } from "../types/aiLoop";
 import { useAutoContinue } from "../contexts";
 import { useRunSelectionOptional } from "../contexts/RunSelectionContext";
@@ -106,19 +106,6 @@ export function AiTab({
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
 
-  // No run selected state (when context is present but no run selected)
-  if (runSelection && !selectedRun) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
-        <Bot className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium">No Run Selected</p>
-        <p className="text-sm mt-2 text-center max-w-md">
-          Select a run from the Run Dashboard to view AI output.
-        </p>
-      </div>
-    );
-  }
-
   // AI running state
   const [isRunning, setIsRunning] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
@@ -152,9 +139,9 @@ export function AiTab({
   const [deleteBeforeDate, setDeleteBeforeDate] = useState<string>("");
   const [isDeleting, setIsDeleting] = useState(false);
 
-  // Issues tracking
-  const { items: sessionIssues } = useIssues();
-  const { summary: reportSummary } = useUnifiedReport();
+  // Findings tracking
+  const { items: sessionFindings } = useFindings();
+  const { summary: _reportSummary } = useUnifiedReport();
 
   // Last result message
   const [lastResult, setLastResult] = useState<{ success: boolean; message: string } | null>(null);
@@ -680,23 +667,23 @@ export function AiTab({
     }
   }, [workflowSessions, selectedForDeletion.size]);
 
-  // Get issue summary
-  const issueSummary = useMemo(() => {
+  // Get findings summary
+  const findingsSummary = useMemo(() => {
     const summary = {
-      total: sessionIssues.length,
+      total: sessionFindings.length,
       detected: 0,
       inProgress: 0,
       resolved: 0,
       critical: 0,
     };
-    for (const issue of sessionIssues) {
-      if (issue.status === "detected") summary.detected++;
-      if (issue.status === "in_progress") summary.inProgress++;
-      if (issue.status === "resolved") summary.resolved++;
-      if (issue.severity === "critical") summary.critical++;
+    for (const finding of sessionFindings) {
+      if (finding.status === "detected") summary.detected++;
+      if (finding.status === "in_progress") summary.inProgress++;
+      if (finding.status === "resolved") summary.resolved++;
+      if (finding.severity === "critical") summary.critical++;
     }
     return summary;
-  }, [sessionIssues]);
+  }, [sessionFindings]);
 
   // Determine the status for the banner
   const statusInfo = useMemo(() => {
@@ -746,6 +733,20 @@ export function AiTab({
 
   // Toggle stats collapse
   const _toggleStats = () => setStatsCollapsed((prev) => !prev);
+
+  // No run selected state (when context is present but no run selected)
+  // NOTE: This check must come AFTER all hooks to satisfy React's rules of hooks
+  if (runSelection && !selectedRun) {
+    return (
+      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
+        <Bot className="w-12 h-12 mb-4 opacity-50" />
+        <p className="text-lg font-medium">No Run Selected</p>
+        <p className="text-sm mt-2 text-center max-w-md">
+          Select a run from the Run Dashboard to view AI output.
+        </p>
+      </div>
+    );
+  }
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
@@ -1124,27 +1125,21 @@ export function AiTab({
               <span className="text-muted-foreground">Convs:</span>
               <span className="font-medium">{filteredLoops.length}</span>
             </div>
-            {issueSummary.total > 0 ? (
+            {findingsSummary.total > 0 ? (
               <div className="flex items-center gap-1.5">
                 <AlertTriangle
-                  className={`w-3.5 h-3.5 ${issueSummary.critical > 0 ? "text-red-500" : "text-orange-500"}`}
+                  className={`w-3.5 h-3.5 ${findingsSummary.critical > 0 ? "text-red-500" : "text-orange-500"}`}
                 />
-                <span className="text-muted-foreground">Issues:</span>
-                <span className="font-medium">{issueSummary.total}</span>
-                {issueSummary.resolved > 0 && (
-                  <span className="text-green-500">({issueSummary.resolved} fixed)</span>
+                <span className="text-muted-foreground">Findings:</span>
+                <span className="font-medium">{findingsSummary.total}</span>
+                {findingsSummary.resolved > 0 && (
+                  <span className="text-green-500">({findingsSummary.resolved} fixed)</span>
                 )}
               </div>
             ) : (
               <div className="flex items-center gap-1.5">
                 <CheckCircle className="w-3.5 h-3.5 text-green-500" />
-                <span className="text-muted-foreground">No issues</span>
-              </div>
-            )}
-            {reportSummary && reportSummary.findings > 0 && (
-              <div className="flex items-center gap-1.5">
-                <span className="text-muted-foreground">Findings:</span>
-                <span className="font-medium">{reportSummary.findings}</span>
+                <span className="text-muted-foreground">No findings</span>
               </div>
             )}
           </div>

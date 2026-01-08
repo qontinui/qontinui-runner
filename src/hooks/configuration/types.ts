@@ -156,6 +156,7 @@ export interface UseConfigurationReturn {
   setConfigLoaded: (loaded: boolean) => void;
   workflows: Workflow[];
   setWorkflows: (workflows: Workflow[]) => void;
+  automationEnabledCategories: string[];
   loadConfiguration: () => Promise<void>;
   loadLastConfiguration: () => Promise<void>;
   loadConfigFromPath: (configPath: string, workflowIdToSelect?: string) => Promise<void>;

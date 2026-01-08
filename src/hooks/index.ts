@@ -7,6 +7,9 @@
 export { useActionLogView } from "./useActionLogView";
 export type { UseActionLogViewOptions, UseActionLogViewResult } from "./useActionLogView";
 
+export { useDashboardState } from "./useDashboardState";
+export type { UseDashboardStateOptions, UseDashboardStateReturn } from "./useDashboardState";
+
 export { useLogManager } from "./useLogManager";
 export type { UseLogManagerResult } from "./useLogManager";
 
@@ -57,8 +60,12 @@ export type { UseAiTaskPollingOptions, UseAiTaskPollingResult } from "./useAiTas
 export { useBackgroundActivities } from "./useBackgroundActivities";
 export type { BackgroundActivity, ActivityType } from "./useBackgroundActivities";
 
-export { useUnifiedReport, useFindings, useIssues } from "./useUnifiedReport";
-export type { UseUnifiedReportOptions, UseUnifiedReportResult } from "./useUnifiedReport";
+export { useUnifiedReport, useFindings } from "./useUnifiedReport";
+export type {
+  UseUnifiedReportOptions,
+  UseUnifiedReportResult,
+  FindingsSummary,
+} from "./useUnifiedReport";
 
 export { useVerificationAgent } from "./useVerificationAgent";
 export type { UseVerificationAgentReturn } from "./useVerificationAgent";

@@ -51,7 +51,7 @@ export function ConfigurationPanel({
         icon={<FileText className="w-4 h-4" />}
         collapsible={false}
       >
-        <div className="space-y-4">
+        <div className="space-y-3">
           {/* Configuration Load Menu */}
           <ConfigurationLoadMenu
             onLoadFromFile={onLoadConfiguration}
@@ -63,20 +63,18 @@ export function ConfigurationPanel({
             onClick={handleLoadLastConfig}
             disabled={isLoadingLastConfig}
             type="button"
-            className="w-full btn-secondary flex items-center justify-center gap-2 disabled:opacity-50"
+            className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg bg-muted/50 hover:bg-muted transition-colors disabled:opacity-50"
           >
-            <FileText className="w-4 h-4" />
+            <FileText className="w-3.5 h-3.5" />
             {isLoadingLastConfig ? "Loading..." : "Load Last Config"}
           </button>
 
           {config && (
-            <div className="space-y-2">
-              <div className="p-3 bg-accent/50 rounded-lg border border-border/50">
-                <p className="font-medium text-sm mb-2">{config.name}</p>
-                <div className="text-sm space-y-1">
-                  <p className="text-muted-foreground">States: {config.statesCount}</p>
-                  <p className="text-muted-foreground">Workflows: {config.workflowsCount}</p>
-                </div>
+            <div className="p-3 rounded-lg bg-blue-500/10">
+              <p className="font-medium text-sm text-blue-400 mb-1">{config.name}</p>
+              <div className="text-xs text-muted-foreground flex gap-3">
+                <span>States: {config.statesCount}</span>
+                <span>Workflows: {config.workflowsCount}</span>
               </div>
             </div>
           )}

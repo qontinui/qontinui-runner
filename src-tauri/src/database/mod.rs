@@ -77,34 +77,77 @@ pub struct SessionEvent {
     pub data: Option<serde_json::Value>,
 }
 
-/// Task run data structure for the simplified task model.
+/// Task run data structure for the unified task model.
+/// TaskRun is THE single concept for all runs (AI, automation, or mixed).
 /// Every task runs until [TASK_COMPLETE] is found in output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRun {
     pub id: String,
     pub task_name: String,
-    pub prompt: String,
-    pub status: String, // 'running', 'complete', 'failed', 'stopped'
+    /// Task prompt (NULL for pure automation tasks)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+
+    /// Task type: 'task' (default), 'automation', 'scheduled'
+    #[serde(default = "default_task_type")]
+    pub task_type: String,
+
+    /// Status: 'running', 'complete', 'failed', 'stopped'
+    pub status: String,
+
+    /// Number of AI sessions spawned
     pub sessions_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_sessions: Option<u32>,
-    pub output_log: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_message: Option<String>,
+
     /// Per-run auto-continue setting (defaults to true)
     #[serde(default = "default_auto_continue")]
     pub auto_continue: bool,
+
+    /// Accumulated output with [SESSION_START:N] markers
+    pub output_log: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+
     /// Execution steps JSON (for re-execution on resume)
-    /// Stores the deterministic steps to run before each AI session
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_steps_json: Option<String>,
     /// Log sources JSON (for capturing logs during execution)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_sources_json: Option<String>,
+
+    /// Config linkage (for automation-enabled tasks)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_id: Option<String>,
+    /// Workflow name being executed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+
+    /// AI-generated paragraph summary of the task run
+    /// Note: This is the canonical field. `ai_summary` is kept for backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Backward compatibility alias for summary
+    #[serde(skip_serializing_if = "Option::is_none", rename = "ai_summary")]
+    pub ai_summary: Option<String>,
+    /// Whether the stated goal was achieved (determined by AI after completion)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_achieved: Option<bool>,
+    /// What remains to be done if goal was not achieved
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_work: Option<String>,
+    /// Timestamp when the summary was generated
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_generated_at: Option<String>,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<String>,
+}
+
+fn default_task_type() -> String {
+    "task".to_string()
 }
 
 fn default_auto_continue() -> bool {
@@ -121,6 +164,341 @@ pub struct ConfigStorageEntry {
     pub source_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// TaskRunAutomation - Child record for automation metrics within a TaskRun.
+/// Stores automation execution data within a task run.
+/// Some runs have ONLY automation, some have ONLY AI, some have BOTH.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRunAutomation {
+    pub id: String,
+    pub task_run_id: String,
+
+    /// Workflow details
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+
+    /// Status: 'running', 'success', 'failed', 'timeout', 'cancelled'
+    pub automation_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+
+    /// Metrics (JSON strings for flexibility)
+    /// JSON {\"total\": N, \"success\": N, \"failed\": N, \"skipped\": N}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actions_summary: Option<String>,
+    /// JSON array of state names
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub states_visited: Option<String>,
+    /// JSON array of {from, to, action, success, duration_ms}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transitions_executed: Option<String>,
+    /// JSON array of {template, count, avg_confidence, failures}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_matches: Option<String>,
+    /// JSON array for anomaly detection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anomalies: Option<String>,
+
+    /// Iteration tracking (1-indexed)
+    pub iteration_number: u32,
+}
+
+/// Test type enum for verification tests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestType {
+    PlaywrightCdp,
+    QontinuiVision,
+    PythonScript,
+    RepositoryTest,
+}
+
+impl std::fmt::Display for TestType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TestType::PlaywrightCdp => write!(f, "playwright_cdp"),
+            TestType::QontinuiVision => write!(f, "qontinui_vision"),
+            TestType::PythonScript => write!(f, "python_script"),
+            TestType::RepositoryTest => write!(f, "repository_test"),
+        }
+    }
+}
+
+impl std::str::FromStr for TestType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "playwright_cdp" => Ok(TestType::PlaywrightCdp),
+            "qontinui_vision" => Ok(TestType::QontinuiVision),
+            "python_script" => Ok(TestType::PythonScript),
+            "repository_test" => Ok(TestType::RepositoryTest),
+            _ => Err(format!("Unknown test type: {}", s)),
+        }
+    }
+}
+
+/// Test result status enum.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TestResultStatus {
+    Pending,
+    Running,
+    Passed,
+    Failed,
+    Skipped,
+    Error,
+    Timeout,
+}
+
+impl std::fmt::Display for TestResultStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TestResultStatus::Pending => write!(f, "pending"),
+            TestResultStatus::Running => write!(f, "running"),
+            TestResultStatus::Passed => write!(f, "passed"),
+            TestResultStatus::Failed => write!(f, "failed"),
+            TestResultStatus::Skipped => write!(f, "skipped"),
+            TestResultStatus::Error => write!(f, "error"),
+            TestResultStatus::Timeout => write!(f, "timeout"),
+        }
+    }
+}
+
+impl std::str::FromStr for TestResultStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(TestResultStatus::Pending),
+            "running" => Ok(TestResultStatus::Running),
+            "passed" => Ok(TestResultStatus::Passed),
+            "failed" => Ok(TestResultStatus::Failed),
+            "skipped" => Ok(TestResultStatus::Skipped),
+            "error" => Ok(TestResultStatus::Error),
+            "timeout" => Ok(TestResultStatus::Timeout),
+            _ => Err(format!("Unknown test result status: {}", s)),
+        }
+    }
+}
+
+/// Trigger point for test associations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TriggerPoint {
+    BeforeWorkflow,
+    AfterWorkflow,
+    OnAction,
+    Manual,
+}
+
+impl std::fmt::Display for TriggerPoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriggerPoint::BeforeWorkflow => write!(f, "before_workflow"),
+            TriggerPoint::AfterWorkflow => write!(f, "after_workflow"),
+            TriggerPoint::OnAction => write!(f, "on_action"),
+            TriggerPoint::Manual => write!(f, "manual"),
+        }
+    }
+}
+
+impl std::str::FromStr for TriggerPoint {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "before_workflow" => Ok(TriggerPoint::BeforeWorkflow),
+            "after_workflow" => Ok(TriggerPoint::AfterWorkflow),
+            "on_action" => Ok(TriggerPoint::OnAction),
+            "manual" => Ok(TriggerPoint::Manual),
+            _ => Err(format!("Unknown trigger point: {}", s)),
+        }
+    }
+}
+
+/// Verification test definition stored in the runner's database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationTest {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Test type: playwright_cdp, qontinui_vision, python_script, repository_test
+    pub test_type: TestType,
+
+    /// Category for organization: visual, dom, network, data, log, layout, unit, integration, custom
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+
+    /// TypeScript code for playwright_cdp tests
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playwright_code: Option<String>,
+    /// JSON config for qontinui_vision tests
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_config: Option<serde_json::Value>,
+    /// Python code for python_script tests
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_code: Option<String>,
+    /// JSON config for repository_test (command, working_dir, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_test_config: Option<serde_json::Value>,
+
+    /// Natural language description for AI generation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_criteria: Option<String>,
+
+    /// Test configuration (timeout_seconds, cdp_port, env_vars, etc.)
+    #[serde(default)]
+    pub config: serde_json::Value,
+
+    pub timeout_seconds: u32,
+    pub is_critical: bool,
+    pub enabled: bool,
+
+    /// AI generation tracking
+    #[serde(default)]
+    pub ai_generated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_generation_prompt: Option<String>,
+
+    /// Tags for organization (JSON array stored as Vec)
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Source file path if imported
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exported_at: Option<String>,
+
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Test result from executing a verification test.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestResult {
+    pub id: String,
+    pub test_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
+
+    pub status: TestResultStatus,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+
+    /// Combined stdout/stderr output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// Parsed assertions, metrics, coverage as JSON
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
+
+    pub assertions_passed: u32,
+    pub assertions_failed: u32,
+
+    /// Screenshot paths as JSON array
+    #[serde(default)]
+    pub screenshots: Vec<String>,
+
+    /// AI analysis of the result
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_analysis: Option<String>,
+
+    pub created_at: String,
+}
+
+/// Association between tests and configs/workflows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TestAssociation {
+    pub id: String,
+    pub test_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
+
+    pub trigger_point: TriggerPoint,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_id: Option<String>,
+
+    pub execution_order: i32,
+    pub enabled: bool,
+
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Input for creating a new verification test.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateVerificationTestInput {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub test_type: TestType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playwright_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub python_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_test_config: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_criteria: Option<String>,
+    #[serde(default)]
+    pub config: serde_json::Value,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u32,
+    #[serde(default = "default_true")]
+    pub is_critical: bool,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub ai_generated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ai_generation_prompt: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_file: Option<String>,
+}
+
+fn default_timeout() -> u32 {
+    60
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Input for creating a test result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTestResultInput {
+    pub test_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<String>,
 }
 
 /// Completion marker that AI uses to signal task is done
@@ -507,6 +885,319 @@ impl CheckpointDb {
                 "#,
             )
             .map_err(|e| format!("Failed to migrate to version 9: {}", e))?;
+        }
+
+        // Migration to version 10: Add AI summary fields to task_runs
+        if (1..10).contains(&current_version) {
+            info!("Migrating database to version 10 (adding AI summary fields to task_runs)");
+            conn.execute_batch(
+                r#"
+                -- Add columns for AI-generated summary and goal achievement tracking
+                ALTER TABLE task_runs ADD COLUMN ai_summary TEXT;
+                ALTER TABLE task_runs ADD COLUMN goal_achieved BOOLEAN;
+                ALTER TABLE task_runs ADD COLUMN remaining_work TEXT;
+                ALTER TABLE task_runs ADD COLUMN summary_generated_at TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (10, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 10: {}", e))?;
+        }
+
+        // Migration to version 11: Unified TaskRun architecture
+        // - Add task_type, config_id, workflow_name to task_runs
+        // - Rename ai_summary -> summary (keeping ai_summary as alias via code)
+        // - Create task_run_automation table
+        if (1..11).contains(&current_version) {
+            info!("Migrating database to version 11 (unified TaskRun architecture)");
+
+            // Step 1: Add new columns to task_runs
+            // Note: SQLite doesn't support renaming columns in older versions, so we
+            // add a new 'summary' column and will handle ai_summary -> summary mapping in code
+            conn.execute_batch(
+                r#"
+                -- Add task_type column (default 'task' for existing runs)
+                ALTER TABLE task_runs ADD COLUMN task_type TEXT NOT NULL DEFAULT 'task';
+
+                -- Add config linkage columns
+                ALTER TABLE task_runs ADD COLUMN config_id TEXT;
+                ALTER TABLE task_runs ADD COLUMN workflow_name TEXT;
+
+                -- Add summary column (new name for ai_summary - existing ai_summary still works)
+                ALTER TABLE task_runs ADD COLUMN summary TEXT;
+
+                -- Create indexes for new columns
+                CREATE INDEX IF NOT EXISTS idx_task_runs_task_type ON task_runs(task_type);
+                CREATE INDEX IF NOT EXISTS idx_task_runs_config_id ON task_runs(config_id);
+                "#,
+            )
+            .map_err(|e| format!("Failed to add unified columns to task_runs: {}", e))?;
+
+            // Step 2: Copy ai_summary to summary for existing rows
+            conn.execute(
+                "UPDATE task_runs SET summary = ai_summary WHERE ai_summary IS NOT NULL AND summary IS NULL",
+                [],
+            )
+            .map_err(|e| format!("Failed to copy ai_summary to summary: {}", e))?;
+
+            // Step 3: Create task_run_automation table
+            conn.execute_batch(
+                r#"
+                -- Task Run Automation (child table for automation metrics)
+                CREATE TABLE IF NOT EXISTS task_run_automation (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    workflow_name TEXT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    duration_ms INTEGER,
+                    automation_status TEXT NOT NULL DEFAULT 'running',
+                    success BOOLEAN,
+                    error_type TEXT,
+                    error_message TEXT,
+                    actions_summary TEXT,
+                    states_visited TEXT,
+                    transitions_executed TEXT,
+                    template_matches TEXT,
+                    anomalies TEXT,
+                    iteration_number INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_task_run_automation_task_run_id ON task_run_automation(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_task_run_automation_started_at ON task_run_automation(started_at);
+                CREATE INDEX IF NOT EXISTS idx_task_run_automation_status ON task_run_automation(automation_status);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (11, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to create task_run_automation table: {}", e))?;
+
+            info!("Successfully migrated to version 11 (unified TaskRun architecture)");
+        }
+
+        // Migration to version 12: Migrate existing run_details to task_run_automation
+        // Creates parent task_runs rows for each run_details, then task_run_automation children
+        if (1..12).contains(&current_version) {
+            info!(
+                "Migrating database to version 12 (migrating run_details to task_run_automation)"
+            );
+
+            // Step 1: Create task_runs rows for each run_details that doesn't have one
+            // We use the run_details.id prefixed with 'tr-' as the task_run_id
+            conn.execute_batch(
+                r#"
+                -- Create task_runs for each run_details (pure automation tasks)
+                INSERT OR IGNORE INTO task_runs (
+                    id,
+                    task_name,
+                    prompt,
+                    task_type,
+                    status,
+                    sessions_count,
+                    auto_continue,
+                    output_log,
+                    config_id,
+                    workflow_name,
+                    created_at,
+                    updated_at,
+                    completed_at
+                )
+                SELECT
+                    'tr-' || rd.id,
+                    COALESCE(rd.workflow_name, 'Automation Run'),
+                    NULL,  -- No prompt for pure automation
+                    'automation',
+                    CASE
+                        WHEN rd.status = 'completed' AND rd.success = 1 THEN 'complete'
+                        WHEN rd.status = 'completed' AND rd.success = 0 THEN 'failed'
+                        WHEN rd.status = 'failed' THEN 'failed'
+                        WHEN rd.status = 'timeout' THEN 'failed'
+                        WHEN rd.status = 'cancelled' THEN 'stopped'
+                        ELSE 'complete'
+                    END,
+                    0,
+                    0,
+                    '',
+                    rd.config_id,
+                    rd.workflow_name,
+                    rd.started_at,
+                    COALESCE(rd.ended_at, rd.started_at),
+                    rd.ended_at
+                FROM run_details rd
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM task_runs tr WHERE tr.id = 'tr-' || rd.id
+                );
+                "#,
+            )
+            .map_err(|e| format!("Failed to create task_runs from run_details: {}", e))?;
+
+            // Step 2: Create task_run_automation rows from run_details
+            conn.execute_batch(
+                r#"
+                -- Create task_run_automation for each run_details
+                INSERT OR IGNORE INTO task_run_automation (
+                    id,
+                    task_run_id,
+                    workflow_name,
+                    started_at,
+                    ended_at,
+                    duration_ms,
+                    automation_status,
+                    success,
+                    error_type,
+                    error_message,
+                    actions_summary,
+                    states_visited,
+                    transitions_executed,
+                    template_matches,
+                    anomalies,
+                    iteration_number
+                )
+                SELECT
+                    'tra-' || rd.id,
+                    'tr-' || rd.id,
+                    rd.workflow_name,
+                    rd.started_at,
+                    rd.ended_at,
+                    rd.duration_ms,
+                    CASE
+                        WHEN rd.status = 'completed' AND rd.success = 1 THEN 'success'
+                        WHEN rd.status = 'completed' AND rd.success = 0 THEN 'failed'
+                        WHEN rd.status = 'failed' THEN 'failed'
+                        WHEN rd.status = 'timeout' THEN 'timeout'
+                        WHEN rd.status = 'cancelled' THEN 'cancelled'
+                        ELSE 'success'
+                    END,
+                    rd.success,
+                    rd.error_type,
+                    rd.error_message,
+                    rd.actions_summary,
+                    rd.states_visited,
+                    rd.transitions_executed,
+                    rd.template_matches,
+                    rd.anomalies,
+                    1
+                FROM run_details rd
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM task_run_automation tra WHERE tra.id = 'tra-' || rd.id
+                );
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (12, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to create task_run_automation from run_details: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 12 (run_details migrated to task_run_automation)"
+            );
+        }
+
+        // Migration to version 13: Drop deprecated run_details table
+        // All data was migrated to task_run_automation in version 12
+        if (1..13).contains(&current_version) {
+            info!("Migrating database to version 13 (removing deprecated run_details table)");
+
+            conn.execute_batch(
+                r#"
+                -- Drop the deprecated run_details table
+                DROP TABLE IF EXISTS run_details;
+
+                -- Update schema version
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (13, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to drop run_details table: {}", e))?;
+
+            info!("Successfully migrated to version 13 (run_details table removed)");
+        }
+
+        // Migration to version 14: Add verification test infrastructure
+        // Creates tables for test definitions, results, and associations
+        if (1..14).contains(&current_version) {
+            info!("Migrating database to version 14 (adding verification test infrastructure)");
+
+            conn.execute_batch(
+                r#"
+                -- Verification Tests (test definitions stored in runner)
+                CREATE TABLE IF NOT EXISTS verification_tests (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    test_type TEXT NOT NULL,
+                    category TEXT,
+                    playwright_code TEXT,
+                    vision_config TEXT,
+                    python_code TEXT,
+                    repo_test_config TEXT,
+                    success_criteria TEXT,
+                    config TEXT DEFAULT '{}',
+                    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+                    is_critical BOOLEAN NOT NULL DEFAULT 1,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    ai_generated BOOLEAN NOT NULL DEFAULT 0,
+                    ai_generation_prompt TEXT,
+                    tags TEXT DEFAULT '[]',
+                    source_file TEXT,
+                    last_exported_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_test_type ON verification_tests(test_type);
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_category ON verification_tests(category);
+                CREATE INDEX IF NOT EXISTS idx_verification_tests_enabled ON verification_tests(enabled);
+
+                -- Test Results (execution results linked to task runs)
+                CREATE TABLE IF NOT EXISTS test_results (
+                    id TEXT PRIMARY KEY,
+                    test_id TEXT NOT NULL,
+                    task_run_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    started_at TEXT,
+                    completed_at TEXT,
+                    duration_ms INTEGER,
+                    output TEXT,
+                    error_message TEXT,
+                    structured_output TEXT,
+                    assertions_passed INTEGER DEFAULT 0,
+                    assertions_failed INTEGER DEFAULT 0,
+                    screenshots TEXT DEFAULT '[]',
+                    ai_analysis TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (test_id) REFERENCES verification_tests(id) ON DELETE CASCADE,
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_test_results_test_id ON test_results(test_id);
+                CREATE INDEX IF NOT EXISTS idx_test_results_task_run_id ON test_results(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_test_results_status ON test_results(status);
+
+                -- Test Associations (link tests to configs/workflows)
+                CREATE TABLE IF NOT EXISTS test_associations (
+                    id TEXT PRIMARY KEY,
+                    test_id TEXT NOT NULL,
+                    config_id TEXT,
+                    workflow_name TEXT,
+                    trigger_point TEXT NOT NULL,
+                    action_id TEXT,
+                    execution_order INTEGER DEFAULT 0,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (test_id) REFERENCES verification_tests(id) ON DELETE CASCADE,
+                    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_test_associations_test_id ON test_associations(test_id);
+                CREATE INDEX IF NOT EXISTS idx_test_associations_config_id ON test_associations(config_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (14, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 14: {}", e))?;
+
+            info!("Successfully migrated to version 14 (verification test infrastructure added)");
         }
 
         Ok(())
@@ -906,7 +1597,36 @@ impl CheckpointDb {
         &self,
         id: &str,
         task_name: &str,
-        prompt: &str,
+        prompt: Option<&str>,
+        max_sessions: Option<u32>,
+        auto_continue: Option<bool>,
+        execution_steps_json: Option<String>,
+        log_sources_json: Option<String>,
+    ) -> Result<TaskRun, String> {
+        self.create_task_run_with_config(
+            id,
+            task_name,
+            prompt,
+            "task", // default task_type
+            None,   // no config_id
+            None,   // no workflow_name
+            max_sessions,
+            auto_continue,
+            execution_steps_json,
+            log_sources_json,
+        )
+    }
+
+    /// Create a new task run with full configuration options.
+    /// This is the unified entry point for creating any type of task run.
+    pub fn create_task_run_with_config(
+        &self,
+        id: &str,
+        task_name: &str,
+        prompt: Option<&str>,
+        task_type: &str,
+        config_id: Option<&str>,
+        workflow_name: Option<&str>,
         max_sessions: Option<u32>,
         auto_continue: Option<bool>,
         execution_steps_json: Option<String>,
@@ -918,17 +1638,32 @@ impl CheckpointDb {
 
         conn.execute(
             r#"
-            INSERT INTO task_runs (id, task_name, prompt, status, sessions_count, max_sessions, output_log, auto_continue, execution_steps_json, log_sources_json, created_at, updated_at)
-            VALUES (?1, ?2, ?3, 'running', 0, ?4, '', ?5, ?6, ?7, ?8, ?8)
+            INSERT INTO task_runs (id, task_name, prompt, task_type, status, sessions_count, max_sessions,
+                                   output_log, auto_continue, execution_steps_json, log_sources_json,
+                                   config_id, workflow_name, created_at, updated_at)
+            VALUES (?1, ?2, ?3, ?4, 'running', 0, ?5, '', ?6, ?7, ?8, ?9, ?10, ?11, ?11)
             "#,
-            params![id, task_name, prompt, max_sessions.map(|v| v as i64), auto_continue_val as i32, execution_steps_json, log_sources_json, now],
+            params![
+                id,
+                task_name,
+                prompt,
+                task_type,
+                max_sessions.map(|v| v as i64),
+                auto_continue_val as i32,
+                execution_steps_json,
+                log_sources_json,
+                config_id,
+                workflow_name,
+                now
+            ],
         )
         .map_err(|e| format!("Failed to create task run: {}", e))?;
 
         Ok(TaskRun {
             id: id.to_string(),
             task_name: task_name.to_string(),
-            prompt: prompt.to_string(),
+            prompt: prompt.map(|s| s.to_string()),
+            task_type: task_type.to_string(),
             status: "running".to_string(),
             sessions_count: 0,
             max_sessions,
@@ -937,6 +1672,13 @@ impl CheckpointDb {
             auto_continue: auto_continue_val,
             execution_steps_json,
             log_sources_json,
+            config_id: config_id.map(|s| s.to_string()),
+            workflow_name: workflow_name.map(|s| s.to_string()),
+            summary: None,
+            ai_summary: None,
+            goal_achieved: None,
+            remaining_work: None,
+            summary_generated_at: None,
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -948,10 +1690,13 @@ impl CheckpointDb {
     pub fn get_task_run(&self, id: &str) -> Result<Option<TaskRun>, String> {
         let conn = self.get_conn()?;
 
-        // First get the task_run metadata including execution_steps_json and log_sources_json
+        // Get the task_run metadata including all fields
         let result: SqliteResult<TaskRun> = conn.query_row(
             r#"
-            SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, execution_steps_json, log_sources_json, created_at, updated_at, completed_at
+            SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
+                   execution_steps_json, log_sources_json, config_id, workflow_name,
+                   COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
+                   summary_generated_at, created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
             "#,
@@ -961,17 +1706,25 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
                     prompt: row.get(2)?,
-                    status: row.get(3)?,
-                    sessions_count: row.get::<_, i64>(4)? as u32,
-                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    task_type: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "task".to_string()),
+                    status: row.get(4)?,
+                    sessions_count: row.get::<_, i64>(5)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
                     output_log: String::new(), // Will be filled from chunks
-                    error_message: row.get(6)?,
-                    auto_continue: row.get::<_, i32>(7)? != 0,
-                    execution_steps_json: row.get(8)?,
-                    log_sources_json: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                    completed_at: row.get(12)?,
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
+                    execution_steps_json: row.get(9)?,
+                    log_sources_json: row.get(10)?,
+                    config_id: row.get(11)?,
+                    workflow_name: row.get(12)?,
+                    summary: row.get(13)?,
+                    ai_summary: row.get(14)?,
+                    goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
+                    remaining_work: row.get(16)?,
+                    summary_generated_at: row.get(17)?,
+                    created_at: row.get(18)?,
+                    updated_at: row.get(19)?,
+                    completed_at: row.get(20)?,
                 })
             },
         );
@@ -1157,7 +1910,12 @@ impl CheckpointDb {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, execution_steps_json, log_sources_json, created_at, updated_at, completed_at
+                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue,
+                       execution_steps_json, log_sources_json,
+                       COALESCE(summary, ai_summary) as summary, ai_summary,
+                       goal_achieved, remaining_work, summary_generated_at,
+                       created_at, updated_at, completed_at,
+                       task_type, config_id, workflow_name
                 FROM task_runs
                 WHERE status = 'running'
                 ORDER BY updated_at DESC
@@ -1179,9 +1937,17 @@ impl CheckpointDb {
                     auto_continue: row.get::<_, i32>(7)? != 0,
                     execution_steps_json: row.get(8)?,
                     log_sources_json: row.get(9)?,
-                    created_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                    completed_at: row.get(12)?,
+                    summary: row.get(10)?,
+                    ai_summary: row.get(11)?,
+                    goal_achieved: row.get::<_, Option<i32>>(12)?.map(|v| v != 0),
+                    remaining_work: row.get(13)?,
+                    summary_generated_at: row.get(14)?,
+                    created_at: row.get(15)?,
+                    updated_at: row.get(16)?,
+                    completed_at: row.get(17)?,
+                    task_type: row.get(18)?,
+                    config_id: row.get(19)?,
+                    workflow_name: row.get(20)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -1199,7 +1965,9 @@ impl CheckpointDb {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, task_name, prompt, status, sessions_count, max_sessions, error_message, auto_continue, created_at, updated_at, completed_at
+                SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
+                       config_id, workflow_name, COALESCE(summary, ai_summary) as summary, ai_summary,
+                       goal_achieved, remaining_work, summary_generated_at, created_at, updated_at, completed_at
                 FROM task_runs
                 ORDER BY updated_at DESC
                 LIMIT ?1
@@ -1213,17 +1981,27 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     task_name: row.get(1)?,
                     prompt: row.get(2)?,
-                    status: row.get(3)?,
-                    sessions_count: row.get::<_, i64>(4)? as u32,
-                    max_sessions: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                    task_type: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "task".to_string()),
+                    status: row.get(4)?,
+                    sessions_count: row.get::<_, i64>(5)? as u32,
+                    max_sessions: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
                     output_log: String::new(), // Empty for performance - use get_full_task_output()
-                    error_message: row.get(6)?,
-                    auto_continue: row.get::<_, i32>(7)? != 0,
+                    error_message: row.get(7)?,
+                    auto_continue: row.get::<_, i32>(8)? != 0,
                     execution_steps_json: None,
                     log_sources_json: None,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                    completed_at: row.get(10)?,
+                    config_id: row.get(9)?,
+                    workflow_name: row.get(10)?,
+                    summary: row.get(11)?,
+                    ai_summary: row.get(12)?,
+                    goal_achieved: row.get::<_, Option<i32>>(13)?.map(|v| v != 0),
+                    remaining_work: row.get(14)?,
+                    summary_generated_at: row.get(15)?,
+                    created_at: row.get(16)?,
+                    updated_at: row.get(17)?,
+                    completed_at: row.get(18)?,
                 })
             })
             .map_err(|e| format!("Failed to execute query: {}", e))?
@@ -1344,6 +2122,369 @@ impl CheckpointDb {
         }
 
         Ok(())
+    }
+
+    /// Update the summary for a task run.
+    /// Called after task completion to store the summary, goal achievement status, and remaining work.
+    /// Note: Updates both 'summary' (new) and 'ai_summary' (legacy) columns for backward compatibility.
+    pub fn update_task_summary(
+        &self,
+        id: &str,
+        summary_text: &str,
+        goal_achieved: bool,
+        remaining_work: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let rows = conn
+            .execute(
+                r#"
+                UPDATE task_runs SET
+                    summary = ?1,
+                    ai_summary = ?1,
+                    goal_achieved = ?2,
+                    remaining_work = ?3,
+                    summary_generated_at = ?4,
+                    updated_at = ?4
+                WHERE id = ?5
+                "#,
+                params![summary_text, goal_achieved as i32, remaining_work, now, id],
+            )
+            .map_err(|e| format!("Failed to update task summary: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Task run not found: {}", id));
+        }
+
+        info!("Updated summary for task run {}", id);
+        Ok(())
+    }
+
+    /// Clear summary fields for a task run (used when reopening/continuing a run).
+    pub fn clear_task_summary(&self, id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                summary = NULL,
+                ai_summary = NULL,
+                goal_achieved = NULL,
+                remaining_work = NULL,
+                summary_generated_at = NULL,
+                updated_at = ?1
+            WHERE id = ?2
+            "#,
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to clear task summary: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Reopen a finished task run to add more iterations.
+    /// Changes status back to "running", increments max_sessions, clears summary.
+    pub fn reopen_task_run(&self, id: &str, additional_sessions: u32) -> Result<TaskRun, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // First, get the current task run to verify it exists and is finished
+        drop(conn); // Release connection before calling get_task_run
+        let task_run = self
+            .get_task_run(id)?
+            .ok_or_else(|| format!("Task run not found: {}", id))?;
+
+        // Verify the task is in a finished state
+        if task_run.status == "running" {
+            return Err("Task run is already running".to_string());
+        }
+
+        // Calculate new max_sessions
+        let current_max = task_run.max_sessions.unwrap_or(task_run.sessions_count);
+        let new_max = current_max + additional_sessions;
+
+        // Reopen the task run
+        let conn = self.get_conn()?;
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                status = 'running',
+                max_sessions = ?1,
+                auto_continue = 1,
+                ai_summary = NULL,
+                goal_achieved = NULL,
+                remaining_work = NULL,
+                summary_generated_at = NULL,
+                completed_at = NULL,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![new_max as i64, now, id],
+        )
+        .map_err(|e| format!("Failed to reopen task run: {}", e))?;
+
+        info!(
+            "Reopened task run {} with {} additional sessions (new max: {})",
+            id, additional_sessions, new_max
+        );
+
+        // Return the updated task run
+        drop(conn);
+        self.get_task_run(id)?
+            .ok_or_else(|| "Failed to retrieve updated task run".to_string())
+    }
+
+    // ========================================================================
+    // Task Run Automation Operations (child records for automation metrics)
+    // ========================================================================
+
+    /// Create a new task run automation record.
+    ///
+    /// This creates a child record linked to a parent task_run.
+    /// Use this when starting automation as part of a task.
+    pub fn create_task_run_automation(
+        &self,
+        task_run_id: &str,
+        workflow_name: Option<&str>,
+        iteration_number: u32,
+    ) -> Result<String, String> {
+        let conn = self.get_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO task_run_automation (id, task_run_id, workflow_name, started_at, automation_status, iteration_number)
+            VALUES (?1, ?2, ?3, ?4, 'running', ?5)
+            "#,
+            params![id, task_run_id, workflow_name, now, iteration_number as i64],
+        )
+        .map_err(|e| format!("Failed to create task run automation: {}", e))?;
+
+        Ok(id)
+    }
+
+    /// Complete a task run automation record with success.
+    pub fn complete_task_run_automation(
+        &self,
+        id: &str,
+        actions_summary: Option<&str>,
+        states_visited: Option<&str>,
+        transitions_executed: Option<&str>,
+        template_matches: Option<&str>,
+        anomalies: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // Get start time to calculate duration
+        let started_at: String = conn
+            .query_row(
+                "SELECT started_at FROM task_run_automation WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get automation start time: {}", e))?;
+
+        // Calculate duration
+        let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+            let end = Utc::now();
+            (end.signed_duration_since(start.with_timezone(&Utc))).num_milliseconds()
+        } else {
+            0
+        };
+
+        conn.execute(
+            r#"
+            UPDATE task_run_automation SET
+                automation_status = 'success',
+                success = 1,
+                ended_at = ?1,
+                duration_ms = ?2,
+                actions_summary = ?3,
+                states_visited = ?4,
+                transitions_executed = ?5,
+                template_matches = ?6,
+                anomalies = ?7
+            WHERE id = ?8
+            "#,
+            params![
+                now,
+                duration_ms,
+                actions_summary,
+                states_visited,
+                transitions_executed,
+                template_matches,
+                anomalies,
+                id
+            ],
+        )
+        .map_err(|e| format!("Failed to complete task run automation: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Fail a task run automation record.
+    pub fn fail_task_run_automation(
+        &self,
+        id: &str,
+        error_type: Option<&str>,
+        error_message: &str,
+        actions_summary: Option<&str>,
+        states_visited: Option<&str>,
+        transitions_executed: Option<&str>,
+        template_matches: Option<&str>,
+        anomalies: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // Get start time to calculate duration
+        let started_at: String = conn
+            .query_row(
+                "SELECT started_at FROM task_run_automation WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Failed to get automation start time: {}", e))?;
+
+        // Calculate duration
+        let duration_ms = if let Ok(start) = chrono::DateTime::parse_from_rfc3339(&started_at) {
+            let end = Utc::now();
+            (end.signed_duration_since(start.with_timezone(&Utc))).num_milliseconds()
+        } else {
+            0
+        };
+
+        conn.execute(
+            r#"
+            UPDATE task_run_automation SET
+                automation_status = 'failed',
+                success = 0,
+                ended_at = ?1,
+                duration_ms = ?2,
+                error_type = ?3,
+                error_message = ?4,
+                actions_summary = ?5,
+                states_visited = ?6,
+                transitions_executed = ?7,
+                template_matches = ?8,
+                anomalies = ?9
+            WHERE id = ?10
+            "#,
+            params![
+                now,
+                duration_ms,
+                error_type,
+                error_message,
+                actions_summary,
+                states_visited,
+                transitions_executed,
+                template_matches,
+                anomalies,
+                id
+            ],
+        )
+        .map_err(|e| format!("Failed to fail task run automation: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Get automation records for a task run.
+    pub fn get_task_run_automations(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<TaskRunAutomation>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                       automation_status, success, error_type, error_message,
+                       actions_summary, states_visited, transitions_executed,
+                       template_matches, anomalies, iteration_number
+                FROM task_run_automation
+                WHERE task_run_id = ?
+                ORDER BY iteration_number ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let automations = stmt
+            .query_map(params![task_run_id], |row| {
+                Ok(TaskRunAutomation {
+                    id: row.get(0)?,
+                    task_run_id: row.get(1)?,
+                    workflow_name: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    automation_status: row.get(6)?,
+                    success: row.get::<_, Option<i32>>(7)?.map(|v| v != 0),
+                    error_type: row.get(8)?,
+                    error_message: row.get(9)?,
+                    actions_summary: row.get(10)?,
+                    states_visited: row.get(11)?,
+                    transitions_executed: row.get(12)?,
+                    template_matches: row.get(13)?,
+                    anomalies: row.get(14)?,
+                    iteration_number: row.get::<_, i64>(15)? as u32,
+                })
+            })
+            .map_err(|e| format!("Failed to execute query: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(automations)
+    }
+
+    /// Get a single automation record by its own ID.
+    pub fn get_task_run_automation_by_id(
+        &self,
+        automation_id: &str,
+    ) -> Result<Option<TaskRunAutomation>, String> {
+        let conn = self.get_conn()?;
+
+        let result = conn.query_row(
+            r#"
+            SELECT id, task_run_id, workflow_name, started_at, ended_at, duration_ms,
+                   automation_status, success, error_type, error_message,
+                   actions_summary, states_visited, transitions_executed,
+                   template_matches, anomalies, iteration_number
+            FROM task_run_automation
+            WHERE id = ?
+            "#,
+            params![automation_id],
+            |row| {
+                Ok(TaskRunAutomation {
+                    id: row.get(0)?,
+                    task_run_id: row.get(1)?,
+                    workflow_name: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    automation_status: row.get(6)?,
+                    success: row.get::<_, Option<i32>>(7)?.map(|v| v != 0),
+                    error_type: row.get(8)?,
+                    error_message: row.get(9)?,
+                    actions_summary: row.get(10)?,
+                    states_visited: row.get(11)?,
+                    transitions_executed: row.get(12)?,
+                    template_matches: row.get(13)?,
+                    anomalies: row.get(14)?,
+                    iteration_number: row.get::<_, i64>(15)? as u32,
+                })
+            },
+        );
+
+        match result {
+            Ok(automation) => Ok(Some(automation)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get automation record: {}", e)),
+        }
     }
 
     // ========================================================================
@@ -1843,6 +2984,829 @@ impl CheckpointDb {
     ) -> Result<String, String> {
         let conn = self.get_conn()?;
         crate::findings::storage::format_findings_for_continuation_prompt(&conn, task_run_id)
+    }
+
+    // ========================================================================
+    // Verification Test Operations
+    // ========================================================================
+
+    /// Create a new verification test.
+    pub fn create_verification_test(
+        &self,
+        input: &CreateVerificationTestInput,
+    ) -> Result<VerificationTest, String> {
+        let conn = self.get_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        let tags_json = serde_json::to_string(&input.tags)
+            .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+        let vision_config_json = input
+            .vision_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Failed to serialize vision_config: {}", e))?;
+        let repo_test_config_json = input
+            .repo_test_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Failed to serialize repo_test_config: {}", e))?;
+        let config_json = serde_json::to_string(&input.config)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO verification_tests (
+                id, name, description, test_type, category,
+                playwright_code, vision_config, python_code, repo_test_config,
+                success_criteria, config, timeout_seconds, is_critical, enabled,
+                ai_generated, ai_generation_prompt, tags, source_file,
+                created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5,
+                ?6, ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18,
+                ?19, ?19
+            )
+            "#,
+            params![
+                id,
+                input.name,
+                input.description,
+                input.test_type.to_string(),
+                input.category,
+                input.playwright_code,
+                vision_config_json,
+                input.python_code,
+                repo_test_config_json,
+                input.success_criteria,
+                config_json,
+                input.timeout_seconds,
+                input.is_critical as i32,
+                input.enabled as i32,
+                input.ai_generated as i32,
+                input.ai_generation_prompt,
+                tags_json,
+                input.source_file,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create verification test: {}", e))?;
+
+        self.get_verification_test(&id)?
+            .ok_or_else(|| "Failed to retrieve created test".to_string())
+    }
+
+    /// Get a verification test by ID.
+    pub fn get_verification_test(&self, id: &str) -> Result<Option<VerificationTest>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<VerificationTest> = conn.query_row(
+            r#"
+            SELECT
+                id, name, description, test_type, category,
+                playwright_code, vision_config, python_code, repo_test_config,
+                success_criteria, config, timeout_seconds, is_critical, enabled,
+                ai_generated, ai_generation_prompt, tags, source_file, last_exported_at,
+                created_at, updated_at
+            FROM verification_tests
+            WHERE id = ?1
+            "#,
+            params![id],
+            |row| {
+                Ok(VerificationTest {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2).ok(),
+                    test_type: row
+                        .get::<_, String>(3)?
+                        .parse()
+                        .unwrap_or(TestType::PythonScript),
+                    category: row.get(4).ok(),
+                    playwright_code: row.get(5).ok(),
+                    vision_config: row
+                        .get::<_, Option<String>>(6)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    python_code: row.get(7).ok(),
+                    repo_test_config: row
+                        .get::<_, Option<String>>(8)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    success_criteria: row.get(9).ok(),
+                    config: row
+                        .get::<_, Option<String>>(10)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::json!({})),
+                    timeout_seconds: row.get::<_, i64>(11)? as u32,
+                    is_critical: row.get::<_, i32>(12)? != 0,
+                    enabled: row.get::<_, i32>(13)? != 0,
+                    ai_generated: row.get::<_, i32>(14)? != 0,
+                    ai_generation_prompt: row.get(15).ok(),
+                    tags: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    source_file: row.get(17).ok(),
+                    last_exported_at: row.get(18).ok(),
+                    created_at: row.get(19)?,
+                    updated_at: row.get(20)?,
+                })
+            },
+        );
+
+        match result {
+            Ok(test) => Ok(Some(test)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get verification test: {}", e)),
+        }
+    }
+
+    /// List all verification tests.
+    pub fn list_verification_tests(
+        &self,
+        enabled_only: bool,
+        test_type: Option<&TestType>,
+        category: Option<&str>,
+    ) -> Result<Vec<VerificationTest>, String> {
+        let conn = self.get_conn()?;
+
+        let mut sql = String::from(
+            r#"
+            SELECT
+                id, name, description, test_type, category,
+                playwright_code, vision_config, python_code, repo_test_config,
+                success_criteria, config, timeout_seconds, is_critical, enabled,
+                ai_generated, ai_generation_prompt, tags, source_file, last_exported_at,
+                created_at, updated_at
+            FROM verification_tests
+            WHERE 1=1
+            "#,
+        );
+
+        if enabled_only {
+            sql.push_str(" AND enabled = 1");
+        }
+        if test_type.is_some() {
+            sql.push_str(" AND test_type = ?1");
+        }
+        if category.is_some() {
+            sql.push_str(" AND category = ?2");
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        // Handle parameter binding based on which filters are set
+        let tests: Vec<VerificationTest> = if let Some(tt) = test_type {
+            if let Some(cat) = category {
+                stmt.query_map(params![tt.to_string(), cat], Self::row_to_verification_test)
+            } else {
+                stmt.query_map(params![tt.to_string()], Self::row_to_verification_test)
+            }
+        } else if let Some(cat) = category {
+            stmt.query_map(params![cat], Self::row_to_verification_test)
+        } else {
+            stmt.query_map([], Self::row_to_verification_test)
+        }
+        .map_err(|e| format!("Failed to query verification tests: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        Ok(tests)
+    }
+
+    /// Helper to map a row to VerificationTest.
+    fn row_to_verification_test(row: &rusqlite::Row) -> SqliteResult<VerificationTest> {
+        Ok(VerificationTest {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2).ok(),
+            test_type: row
+                .get::<_, String>(3)?
+                .parse()
+                .unwrap_or(TestType::PythonScript),
+            category: row.get(4).ok(),
+            playwright_code: row.get(5).ok(),
+            vision_config: row
+                .get::<_, Option<String>>(6)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            python_code: row.get(7).ok(),
+            repo_test_config: row
+                .get::<_, Option<String>>(8)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            success_criteria: row.get(9).ok(),
+            config: row
+                .get::<_, Option<String>>(10)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::json!({})),
+            timeout_seconds: row.get::<_, i64>(11)? as u32,
+            is_critical: row.get::<_, i32>(12)? != 0,
+            enabled: row.get::<_, i32>(13)? != 0,
+            ai_generated: row.get::<_, i32>(14)? != 0,
+            ai_generation_prompt: row.get(15).ok(),
+            tags: row
+                .get::<_, Option<String>>(16)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            source_file: row.get(17).ok(),
+            last_exported_at: row.get(18).ok(),
+            created_at: row.get(19)?,
+            updated_at: row.get(20)?,
+        })
+    }
+
+    /// Update a verification test.
+    pub fn update_verification_test(
+        &self,
+        id: &str,
+        input: &CreateVerificationTestInput,
+    ) -> Result<VerificationTest, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let tags_json = serde_json::to_string(&input.tags)
+            .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+        let vision_config_json = input
+            .vision_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Failed to serialize vision_config: {}", e))?;
+        let repo_test_config_json = input
+            .repo_test_config
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Failed to serialize repo_test_config: {}", e))?;
+        let config_json = serde_json::to_string(&input.config)
+            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+
+        let rows = conn
+            .execute(
+                r#"
+            UPDATE verification_tests SET
+                name = ?2,
+                description = ?3,
+                test_type = ?4,
+                category = ?5,
+                playwright_code = ?6,
+                vision_config = ?7,
+                python_code = ?8,
+                repo_test_config = ?9,
+                success_criteria = ?10,
+                config = ?11,
+                timeout_seconds = ?12,
+                is_critical = ?13,
+                enabled = ?14,
+                ai_generated = ?15,
+                ai_generation_prompt = ?16,
+                tags = ?17,
+                source_file = ?18,
+                updated_at = ?19
+            WHERE id = ?1
+            "#,
+                params![
+                    id,
+                    input.name,
+                    input.description,
+                    input.test_type.to_string(),
+                    input.category,
+                    input.playwright_code,
+                    vision_config_json,
+                    input.python_code,
+                    repo_test_config_json,
+                    input.success_criteria,
+                    config_json,
+                    input.timeout_seconds,
+                    input.is_critical as i32,
+                    input.enabled as i32,
+                    input.ai_generated as i32,
+                    input.ai_generation_prompt,
+                    tags_json,
+                    input.source_file,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to update verification test: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Verification test not found: {}", id));
+        }
+
+        self.get_verification_test(id)?
+            .ok_or_else(|| "Failed to retrieve updated test".to_string())
+    }
+
+    /// Delete a verification test.
+    pub fn delete_verification_test(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let rows = conn
+            .execute("DELETE FROM verification_tests WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete verification test: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    // ========================================================================
+    // Test Result Operations
+    // ========================================================================
+
+    /// Create a new test result.
+    pub fn create_test_result(&self, input: &CreateTestResultInput) -> Result<TestResult, String> {
+        let conn = self.get_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO test_results (
+                id, test_id, task_run_id, status, created_at
+            ) VALUES (?1, ?2, ?3, 'pending', ?4)
+            "#,
+            params![id, input.test_id, input.task_run_id, now],
+        )
+        .map_err(|e| format!("Failed to create test result: {}", e))?;
+
+        self.get_test_result(&id)?
+            .ok_or_else(|| "Failed to retrieve created test result".to_string())
+    }
+
+    /// Get a test result by ID.
+    pub fn get_test_result(&self, id: &str) -> Result<Option<TestResult>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<TestResult> = conn.query_row(
+            r#"
+            SELECT
+                id, test_id, task_run_id, status,
+                started_at, completed_at, duration_ms,
+                output, error_message, structured_output,
+                assertions_passed, assertions_failed,
+                screenshots, ai_analysis, created_at
+            FROM test_results
+            WHERE id = ?1
+            "#,
+            params![id],
+            Self::row_to_test_result,
+        );
+
+        match result {
+            Ok(result) => Ok(Some(result)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get test result: {}", e)),
+        }
+    }
+
+    /// Helper to map a row to TestResult.
+    fn row_to_test_result(row: &rusqlite::Row) -> SqliteResult<TestResult> {
+        Ok(TestResult {
+            id: row.get(0)?,
+            test_id: row.get(1)?,
+            task_run_id: row.get(2).ok(),
+            status: row
+                .get::<_, String>(3)?
+                .parse()
+                .unwrap_or(TestResultStatus::Pending),
+            started_at: row.get(4).ok(),
+            completed_at: row.get(5).ok(),
+            duration_ms: row.get(6).ok(),
+            output: row.get(7).ok(),
+            error_message: row.get(8).ok(),
+            structured_output: row
+                .get::<_, Option<String>>(9)?
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            assertions_passed: row.get::<_, i64>(10)? as u32,
+            assertions_failed: row.get::<_, i64>(11)? as u32,
+            screenshots: row
+                .get::<_, Option<String>>(12)?
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default(),
+            ai_analysis: row.get(13).ok(),
+            created_at: row.get(14)?,
+        })
+    }
+
+    /// Get test results for a test.
+    pub fn get_results_for_test(
+        &self,
+        test_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<TestResult>, String> {
+        let conn = self.get_conn()?;
+
+        let sql = format!(
+            r#"
+            SELECT
+                id, test_id, task_run_id, status,
+                started_at, completed_at, duration_ms,
+                output, error_message, structured_output,
+                assertions_passed, assertions_failed,
+                screenshots, ai_analysis, created_at
+            FROM test_results
+            WHERE test_id = ?1
+            ORDER BY created_at DESC
+            {}
+            "#,
+            limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default()
+        );
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let results: Vec<TestResult> = stmt
+            .query_map(params![test_id], Self::row_to_test_result)
+            .map_err(|e| format!("Failed to query test results: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Get test results for a task run.
+    pub fn get_results_for_task_run(&self, task_run_id: &str) -> Result<Vec<TestResult>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT
+                    id, test_id, task_run_id, status,
+                    started_at, completed_at, duration_ms,
+                    output, error_message, structured_output,
+                    assertions_passed, assertions_failed,
+                    screenshots, ai_analysis, created_at
+                FROM test_results
+                WHERE task_run_id = ?1
+                ORDER BY created_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let results: Vec<TestResult> = stmt
+            .query_map(params![task_run_id], Self::row_to_test_result)
+            .map_err(|e| format!("Failed to query test results: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    /// List test results with optional status filter.
+    pub fn list_test_results(
+        &self,
+        status: Option<&TestResultStatus>,
+        limit: u32,
+    ) -> Result<Vec<TestResult>, String> {
+        let conn = self.get_conn()?;
+
+        let (sql, params): (String, Vec<Box<dyn rusqlite::ToSql>>) = match status {
+            Some(s) => {
+                let status_str = s.to_string();
+                (
+                    format!(
+                        r#"
+                        SELECT
+                            id, test_id, task_run_id, status,
+                            started_at, completed_at, duration_ms,
+                            output, error_message, structured_output,
+                            assertions_passed, assertions_failed,
+                            screenshots, ai_analysis, created_at
+                        FROM test_results
+                        WHERE status = ?1
+                        ORDER BY created_at DESC
+                        LIMIT {}
+                        "#,
+                        limit
+                    ),
+                    vec![Box::new(status_str)],
+                )
+            }
+            None => (
+                format!(
+                    r#"
+                    SELECT
+                        id, test_id, task_run_id, status,
+                        started_at, completed_at, duration_ms,
+                        output, error_message, structured_output,
+                        assertions_passed, assertions_failed,
+                        screenshots, ai_analysis, created_at
+                    FROM test_results
+                    ORDER BY created_at DESC
+                    LIMIT {}
+                    "#,
+                    limit
+                ),
+                vec![],
+            ),
+        };
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let results: Vec<TestResult> = if params.is_empty() {
+            stmt.query_map([], Self::row_to_test_result)
+                .map_err(|e| format!("Failed to query test results: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            let params_refs: Vec<&dyn rusqlite::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            stmt.query_map(params_refs.as_slice(), Self::row_to_test_result)
+                .map_err(|e| format!("Failed to query test results: {}", e))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        Ok(results)
+    }
+
+    /// Update test result status and output.
+    pub fn update_test_result(
+        &self,
+        id: &str,
+        status: &TestResultStatus,
+        output: Option<&str>,
+        error_message: Option<&str>,
+        structured_output: Option<&serde_json::Value>,
+        assertions_passed: u32,
+        assertions_failed: u32,
+        screenshots: &[String],
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let structured_output_json = structured_output
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| format!("Failed to serialize structured_output: {}", e))?;
+        let screenshots_json = serde_json::to_string(screenshots)
+            .map_err(|e| format!("Failed to serialize screenshots: {}", e))?;
+
+        // Calculate duration if completing
+        let duration_sql = if matches!(
+            status,
+            TestResultStatus::Passed
+                | TestResultStatus::Failed
+                | TestResultStatus::Error
+                | TestResultStatus::Timeout
+                | TestResultStatus::Skipped
+        ) {
+            ", completed_at = ?9, duration_ms = CAST((julianday(?9) - julianday(started_at)) * 86400000 AS INTEGER)"
+        } else {
+            ""
+        };
+
+        let sql = format!(
+            r#"
+            UPDATE test_results SET
+                status = ?2,
+                output = COALESCE(?3, output),
+                error_message = COALESCE(?4, error_message),
+                structured_output = COALESCE(?5, structured_output),
+                assertions_passed = ?6,
+                assertions_failed = ?7,
+                screenshots = ?8
+                {}
+            WHERE id = ?1
+            "#,
+            duration_sql
+        );
+
+        conn.execute(
+            &sql,
+            params![
+                id,
+                status.to_string(),
+                output,
+                error_message,
+                structured_output_json,
+                assertions_passed,
+                assertions_failed,
+                screenshots_json,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to update test result: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Mark test result as started.
+    pub fn start_test_result(&self, id: &str) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE test_results SET
+                status = 'running',
+                started_at = ?2
+            WHERE id = ?1
+            "#,
+            params![id, now],
+        )
+        .map_err(|e| format!("Failed to start test result: {}", e))?;
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // Test Association Operations
+    // ========================================================================
+
+    /// Create a test association.
+    pub fn create_test_association(
+        &self,
+        test_id: &str,
+        config_id: Option<&str>,
+        workflow_name: Option<&str>,
+        trigger_point: &TriggerPoint,
+        action_id: Option<&str>,
+        execution_order: i32,
+    ) -> Result<TestAssociation, String> {
+        let conn = self.get_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT INTO test_associations (
+                id, test_id, config_id, workflow_name,
+                trigger_point, action_id, execution_order, enabled,
+                created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)
+            "#,
+            params![
+                id,
+                test_id,
+                config_id,
+                workflow_name,
+                trigger_point.to_string(),
+                action_id,
+                execution_order,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create test association: {}", e))?;
+
+        self.get_test_association(&id)?
+            .ok_or_else(|| "Failed to retrieve created association".to_string())
+    }
+
+    /// Get a test association by ID.
+    pub fn get_test_association(&self, id: &str) -> Result<Option<TestAssociation>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<TestAssociation> = conn.query_row(
+            r#"
+            SELECT
+                id, test_id, config_id, workflow_name,
+                trigger_point, action_id, execution_order, enabled,
+                created_at, updated_at
+            FROM test_associations
+            WHERE id = ?1
+            "#,
+            params![id],
+            Self::row_to_test_association,
+        );
+
+        match result {
+            Ok(assoc) => Ok(Some(assoc)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get test association: {}", e)),
+        }
+    }
+
+    /// Helper to map a row to TestAssociation.
+    fn row_to_test_association(row: &rusqlite::Row) -> SqliteResult<TestAssociation> {
+        Ok(TestAssociation {
+            id: row.get(0)?,
+            test_id: row.get(1)?,
+            config_id: row.get(2).ok(),
+            workflow_name: row.get(3).ok(),
+            trigger_point: row
+                .get::<_, String>(4)?
+                .parse()
+                .unwrap_or(TriggerPoint::Manual),
+            action_id: row.get(5).ok(),
+            execution_order: row.get(6)?,
+            enabled: row.get::<_, i32>(7)? != 0,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
+    /// Get test associations for a config.
+    pub fn get_associations_for_config(
+        &self,
+        config_id: &str,
+        trigger_point: Option<&TriggerPoint>,
+    ) -> Result<Vec<TestAssociation>, String> {
+        let conn = self.get_conn()?;
+
+        let sql = if trigger_point.is_some() {
+            r#"
+            SELECT
+                id, test_id, config_id, workflow_name,
+                trigger_point, action_id, execution_order, enabled,
+                created_at, updated_at
+            FROM test_associations
+            WHERE config_id = ?1 AND trigger_point = ?2 AND enabled = 1
+            ORDER BY execution_order ASC
+            "#
+        } else {
+            r#"
+            SELECT
+                id, test_id, config_id, workflow_name,
+                trigger_point, action_id, execution_order, enabled,
+                created_at, updated_at
+            FROM test_associations
+            WHERE config_id = ?1 AND enabled = 1
+            ORDER BY execution_order ASC
+            "#
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let associations: Vec<TestAssociation> = if let Some(tp) = trigger_point {
+            stmt.query_map(
+                params![config_id, tp.to_string()],
+                Self::row_to_test_association,
+            )
+        } else {
+            stmt.query_map(params![config_id], Self::row_to_test_association)
+        }
+        .map_err(|e| format!("Failed to query associations: {}", e))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+        Ok(associations)
+    }
+
+    /// Get test associations for a test.
+    pub fn get_associations_for_test(&self, test_id: &str) -> Result<Vec<TestAssociation>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT
+                    id, test_id, config_id, workflow_name,
+                    trigger_point, action_id, execution_order, enabled,
+                    created_at, updated_at
+                FROM test_associations
+                WHERE test_id = ?1
+                ORDER BY created_at DESC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let associations: Vec<TestAssociation> = stmt
+            .query_map(params![test_id], Self::row_to_test_association)
+            .map_err(|e| format!("Failed to query associations: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(associations)
+    }
+
+    /// Delete a test association.
+    pub fn delete_test_association(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let rows = conn
+            .execute("DELETE FROM test_associations WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete test association: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Enable or disable a test association.
+    pub fn set_test_association_enabled(&self, id: &str, enabled: bool) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE test_associations SET
+                enabled = ?2,
+                updated_at = ?3
+            WHERE id = ?1
+            "#,
+            params![id, enabled as i32, now],
+        )
+        .map_err(|e| format!("Failed to update test association: {}", e))?;
+
+        Ok(())
     }
 }
 

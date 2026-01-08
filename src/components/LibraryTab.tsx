@@ -43,6 +43,7 @@ import {
   Puzzle,
   Pencil,
   ShieldCheck,
+  MousePointer2,
 } from "lucide-react";
 import { useContexts } from "./contexts/hooks/useContexts";
 import { ContextCard } from "./contexts/ContextCard";
@@ -53,6 +54,7 @@ import type {
   UpdateContextRequest,
 } from "../types/context";
 import type { Scriptlet, SavedVerification, VerificationTaskConfig } from "../types";
+import type { SavedGuiWorkflow } from "../types/gui-workflow";
 import type { AiOutputLine } from "./AiOutputTab";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
@@ -61,6 +63,7 @@ type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 type LibraryCategory =
   | "tasks"
   | "workflows"
+  | "gui-workflows"
   | "scripts"
   | "scriptlets"
   | "contexts"
@@ -84,10 +87,17 @@ const CATEGORIES: CategoryConfig[] = [
   },
   {
     id: "workflows",
-    label: "Workflows",
+    label: "AI Workflows",
     icon: Sparkles,
     color: "text-green-500",
     description: "Multi-step AI workflows",
+  },
+  {
+    id: "gui-workflows",
+    label: "GUI Workflows",
+    icon: MousePointer2,
+    color: "text-orange-500",
+    description: "Sequential GUI automation",
   },
   {
     id: "scripts",
@@ -181,8 +191,10 @@ interface LibraryTabProps {
   onNavigateToActive: () => void;
   onNavigateToBuilder?: () => void;
   onNavigateToScriptBuilder?: () => void;
+  onNavigateToGuiWorkflowBuilder?: () => void;
   onEditScript?: (scriptId: string) => void;
   onEditWorkflow?: (workflowId: string) => void;
+  onEditGuiWorkflow?: (workflowId: string) => void;
   aiOutputLines?: AiOutputLine[];
 }
 
@@ -197,8 +209,10 @@ export function LibraryTab({
   onNavigateToActive,
   onNavigateToBuilder,
   onNavigateToScriptBuilder,
+  onNavigateToGuiWorkflowBuilder,
   onEditScript,
   onEditWorkflow,
+  onEditGuiWorkflow,
   aiOutputLines: _aiOutputLines = [],
 }: LibraryTabProps) {
   // Category and view state
@@ -214,6 +228,7 @@ export function LibraryTab({
   // Data state
   const [prompts, setPrompts] = useState<SavedPrompt[]>([]);
   const [workflows, setWorkflows] = useState<SavedAiWorkflow[]>([]);
+  const [guiWorkflows, setGuiWorkflows] = useState<SavedGuiWorkflow[]>([]);
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
   const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
   const [verifications, setVerifications] = useState<SavedVerification[]>([]);
@@ -326,26 +341,41 @@ export function LibraryTab({
     const fetchAll = async () => {
       setLoading(true);
       try {
-        const [promptsRes, workflowsRes, scriptsRes, scriptletsRes, verificationsRes] =
-          await Promise.all([
-            fetch(`${API_BASE}/prompts`),
-            fetch(`${API_BASE}/ai-workflows`),
-            fetch(`${API_BASE}/playwright/scripts`),
-            fetch(`${API_BASE}/scriptlets`),
-            fetch(`${API_BASE}/verifications`),
-          ]);
+        const [
+          promptsRes,
+          workflowsRes,
+          guiWorkflowsRes,
+          scriptsRes,
+          scriptletsRes,
+          verificationsRes,
+        ] = await Promise.all([
+          fetch(`${API_BASE}/prompts`),
+          fetch(`${API_BASE}/ai-workflows`),
+          fetch(`${API_BASE}/gui-workflows`),
+          fetch(`${API_BASE}/playwright/scripts`),
+          fetch(`${API_BASE}/scriptlets`),
+          fetch(`${API_BASE}/verifications`),
+        ]);
 
-        const [promptsData, workflowsData, scriptsData, scriptletsData, verificationsData] =
-          await Promise.all([
-            promptsRes.json(),
-            workflowsRes.json(),
-            scriptsRes.json(),
-            scriptletsRes.json(),
-            verificationsRes.json().catch(() => ({ success: false })),
-          ]);
+        const [
+          promptsData,
+          workflowsData,
+          guiWorkflowsData,
+          scriptsData,
+          scriptletsData,
+          verificationsData,
+        ] = await Promise.all([
+          promptsRes.json(),
+          workflowsRes.json(),
+          guiWorkflowsRes.json(),
+          scriptsRes.json(),
+          scriptletsRes.json(),
+          verificationsRes.json().catch(() => ({ success: false })),
+        ]);
 
         if (promptsData.success) setPrompts(promptsData.data || []);
         if (workflowsData.success) setWorkflows(workflowsData.data || []);
+        if (guiWorkflowsData.success) setGuiWorkflows(guiWorkflowsData.data || []);
         if (scriptsData.success) setScripts(scriptsData.data || []);
         if (scriptletsData.success) setScriptlets(scriptletsData.data || []);
         if (verificationsData.success) setVerifications(verificationsData.data || []);
@@ -407,6 +437,14 @@ export function LibraryTab({
           onNavigateToBuilder();
         } else {
           onLog("info", "Workflow Builder not available");
+        }
+        break;
+      case "gui-workflows":
+        // Navigate to GUI Workflow Builder tab
+        if (onNavigateToGuiWorkflowBuilder) {
+          onNavigateToGuiWorkflowBuilder();
+        } else {
+          onLog("info", "GUI Workflow Builder not available");
         }
         break;
       case "scripts":
@@ -595,6 +633,9 @@ export function LibraryTab({
       case "workflows":
         await deleteWorkflow(selectedItemId);
         break;
+      case "gui-workflows":
+        await deleteGuiWorkflow(selectedItemId);
+        break;
       case "scripts":
         await deleteScript(selectedItemId);
         break;
@@ -629,6 +670,11 @@ export function LibraryTab({
       case "workflows": {
         const workflow = workflows.find((w) => w.id === selectedItemId);
         if (workflow) runWorkflow(workflow);
+        break;
+      }
+      case "gui-workflows": {
+        const guiWorkflow = guiWorkflows.find((w) => w.id === selectedItemId);
+        if (guiWorkflow) runGuiWorkflow(guiWorkflow);
         break;
       }
       case "scripts": {
@@ -730,6 +776,40 @@ export function LibraryTab({
     [onLog, onNavigateToActive],
   );
 
+  const runGuiWorkflow = useCallback(
+    async (workflow: SavedGuiWorkflow) => {
+      setRunningId(workflow.id);
+      try {
+        const response = await fetch(`${API_BASE}/gui-workflows/${workflow.id}/run`, {
+          method: "POST",
+        });
+
+        const result = await response.json();
+        if (result.success) {
+          const data = result.data;
+          if (data.failed_steps === 0) {
+            onLog(
+              "success",
+              `Completed GUI workflow: ${workflow.name} (${data.successful_steps}/${data.total_steps} steps)`,
+            );
+          } else {
+            onLog(
+              "warning",
+              `GUI workflow completed with failures: ${data.failed_steps}/${data.total_steps} steps failed`,
+            );
+          }
+        } else {
+          throw new Error(result.error || "Failed to run GUI workflow");
+        }
+      } catch (error) {
+        onLog("error", `Failed to run GUI workflow: ${error}`);
+      } finally {
+        setRunningId(null);
+      }
+    },
+    [onLog],
+  );
+
   const runScript = useCallback(
     async (script: PlaywrightScript) => {
       setRunningId(script.id);
@@ -819,6 +899,23 @@ export function LibraryTab({
         }
       } catch (error) {
         onLog("error", `Failed to delete workflow: ${error}`);
+      }
+    },
+    [onLog],
+  );
+
+  const deleteGuiWorkflow = useCallback(
+    async (id: string) => {
+      if (!confirm("Delete this GUI workflow?")) return;
+      try {
+        const response = await fetch(`${API_BASE}/gui-workflows/${id}`, { method: "DELETE" });
+        const result = await response.json();
+        if (result.success) {
+          setGuiWorkflows((prev) => prev.filter((w) => w.id !== id));
+          onLog("info", "GUI workflow deleted");
+        }
+      } catch (error) {
+        onLog("error", `Failed to delete GUI workflow: ${error}`);
       }
     },
     [onLog],
@@ -943,6 +1040,9 @@ export function LibraryTab({
       case "workflows":
         workflows.forEach((w) => w.tags?.forEach((t) => tags.add(t)));
         break;
+      case "gui-workflows":
+        guiWorkflows.forEach((w) => w.tags?.forEach((t) => tags.add(t)));
+        break;
       case "scriptlets":
         scriptlets.forEach((s) => s.tags?.forEach((t) => tags.add(t)));
         break;
@@ -971,6 +1071,11 @@ export function LibraryTab({
 
   const filteredPrompts = filterItems(prompts, (p) => [p.name, p.description, p.category]);
   const filteredWorkflows = filterItems(workflows, (w) => [w.name, w.description, w.goal]);
+  const filteredGuiWorkflows = filterItems(guiWorkflows, (w) => [
+    w.name,
+    w.description,
+    w.category,
+  ]);
   const filteredScripts = filterItems(
     scripts.map((s) => ({ ...s, tags: [] })),
     (s) => [s.name, s.description, s.target_url],
@@ -1081,6 +1186,8 @@ export function LibraryTab({
         return filteredPrompts;
       case "workflows":
         return filteredWorkflows;
+      case "gui-workflows":
+        return filteredGuiWorkflows;
       case "scripts":
         return filteredScripts;
       case "scriptlets":
@@ -1254,6 +1361,85 @@ export function LibraryTab({
                 ))}
                 {workflow.tags.length > 3 && (
                   <span className="text-xs text-muted-foreground">+{workflow.tags.length - 3}</span>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      case "gui-workflows": {
+        const guiWorkflow = item as SavedGuiWorkflow;
+        return (
+          <div
+            key={guiWorkflow.id}
+            className={baseClasses}
+            onClick={() => {
+              setSelectedItemId(guiWorkflow.id);
+              setShowDetailPanel(true);
+            }}
+          >
+            <div className="flex items-start gap-3">
+              <MousePointer2 className="w-5 h-5 text-orange-500 flex-shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium truncate">{guiWorkflow.name}</span>
+                  <span className="text-xs bg-muted px-1.5 py-0.5 rounded">
+                    {guiWorkflow.steps.length} steps
+                  </span>
+                </div>
+                {guiWorkflow.description && (
+                  <p className="text-xs text-muted-foreground truncate mt-0.5">
+                    {guiWorkflow.description}
+                  </p>
+                )}
+                <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
+                  <Clock className="w-3 h-3" />
+                  {formatRelativeDate(guiWorkflow.modified_at)}
+                </div>
+              </div>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onEditGuiWorkflow?.(guiWorkflow.id);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Edit GUI workflow"
+                >
+                  <Pencil className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    runGuiWorkflow(guiWorkflow);
+                  }}
+                  disabled={runningId === guiWorkflow.id}
+                  className="p-1.5 bg-orange-500/10 text-orange-600 rounded hover:bg-orange-500/20 transition-colors disabled:opacity-50"
+                  title="Run GUI workflow"
+                >
+                  {runningId === guiWorkflow.id ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Play className="w-4 h-4" />
+                  )}
+                </button>
+              </div>
+            </div>
+            {guiWorkflow.tags && guiWorkflow.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-2">
+                {guiWorkflow.tags.slice(0, 3).map((tag) => (
+                  <span
+                    key={tag}
+                    className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded"
+                  >
+                    {tag}
+                  </span>
+                ))}
+                {guiWorkflow.tags.length > 3 && (
+                  <span className="text-xs text-muted-foreground">
+                    +{guiWorkflow.tags.length - 3}
+                  </span>
                 )}
               </div>
             )}
@@ -1612,6 +1798,90 @@ export function LibraryTab({
               </button>
               <button
                 onClick={() => deleteWorkflow(workflow.id)}
+                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      case "gui-workflows": {
+        const guiWorkflow = guiWorkflows.find((w) => w.id === selectedItemId);
+        if (!guiWorkflow) return null;
+        return (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold">{guiWorkflow.name}</h3>
+              <button
+                onClick={() => setShowDetailPanel(false)}
+                className="p-1 hover:bg-muted rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            {guiWorkflow.description && (
+              <p className="text-muted-foreground">{guiWorkflow.description}</p>
+            )}
+            {guiWorkflow.tags && guiWorkflow.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {guiWorkflow.tags.map((tag) => (
+                  <span key={tag} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div>
+              <h4 className="text-sm font-medium mb-2 flex items-center gap-2">
+                <List className="w-4 h-4" />
+                Steps ({guiWorkflow.steps.length})
+              </h4>
+              <div className="space-y-1">
+                {guiWorkflow.steps.map((step, index) => (
+                  <div
+                    key={step.id}
+                    className="flex items-center gap-2 text-sm bg-muted/50 px-3 py-2 rounded"
+                  >
+                    <span className="text-muted-foreground font-mono">{index + 1}.</span>
+                    <span
+                      className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium ${
+                        step.action_type === "click"
+                          ? "bg-orange-500/20 text-orange-600"
+                          : step.action_type === "type"
+                            ? "bg-blue-500/20 text-blue-600"
+                            : step.action_type === "hotkey"
+                              ? "bg-purple-500/20 text-purple-600"
+                              : "bg-green-500/20 text-green-600"
+                      }`}
+                    >
+                      {step.action_type}
+                    </span>
+                    <span className="flex-1 truncate">{step.name}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
+              <span>Created: {formatDate(guiWorkflow.created_at)}</span>
+              <span>Modified: {formatDate(guiWorkflow.modified_at)}</span>
+            </div>
+            <div className="flex items-center gap-2 pt-2">
+              <button
+                onClick={() => runGuiWorkflow(guiWorkflow)}
+                disabled={runningId === guiWorkflow.id}
+                className="flex-1 flex items-center justify-center gap-2 py-2 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors disabled:opacity-50"
+              >
+                {runningId === guiWorkflow.id ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Play className="w-4 h-4" />
+                )}
+                Run Workflow
+              </button>
+              <button
+                onClick={() => deleteGuiWorkflow(guiWorkflow.id)}
                 className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
               >
                 <Trash2 className="w-4 h-4" />

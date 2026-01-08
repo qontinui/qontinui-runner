@@ -1,4 +1,6 @@
 /** @type {import('tailwindcss').Config} */
+import { tailwindColors } from "@qontinui/design-tokens/tailwind";
+
 export default {
   darkMode: ["class"],
   content: ["./index.html", "./src/**/*.{js,ts,jsx,tsx}"],
@@ -45,6 +47,8 @@ export default {
           DEFAULT: "hsl(var(--card))",
           foreground: "hsl(var(--card-foreground))",
         },
+        // Design system colors from shared package
+        ...tailwindColors,
       },
       borderRadius: {
         lg: "var(--radius)",

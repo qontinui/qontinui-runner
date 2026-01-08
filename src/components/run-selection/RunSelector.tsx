@@ -1,8 +1,8 @@
 /**
  * RunSelector Component
  *
- * A dropdown component for selecting runs from recent run history.
- * Shows run status, workflow name, timestamp, and duration.
+ * A dropdown component for selecting task runs from recent run history.
+ * Shows run status, task name, timestamp, and session count.
  */
 
 import { useState, useRef, useEffect } from "react";
@@ -11,14 +11,13 @@ import {
   CheckCircle,
   XCircle,
   Clock,
-  AlertCircle,
   Loader2,
   Activity,
-  Timer,
+  StopCircle,
   Trash2,
 } from "lucide-react";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
-import type { RunDetails, RunStatus } from "../../types/statistics";
+import type { TaskRun, TaskRunStatus } from "../../types/aiData";
 
 interface RunSelectorProps {
   /** Additional class name */
@@ -27,9 +26,9 @@ interface RunSelectorProps {
   showCurrentOption?: boolean;
 }
 
-// Status icon and color mapping
+// Status icon and color mapping for TaskRun statuses
 const statusConfig: Record<
-  RunStatus,
+  TaskRunStatus,
   { icon: typeof CheckCircle; color: string; bgColor: string; label: string }
 > = {
   running: {
@@ -38,11 +37,11 @@ const statusConfig: Record<
     bgColor: "bg-blue-500/10",
     label: "Running",
   },
-  completed: {
+  complete: {
     icon: CheckCircle,
     color: "text-green-400",
     bgColor: "bg-green-500/10",
-    label: "Completed",
+    label: "Complete",
   },
   failed: {
     icon: XCircle,
@@ -50,19 +49,23 @@ const statusConfig: Record<
     bgColor: "bg-red-500/10",
     label: "Failed",
   },
-  timeout: {
-    icon: Timer,
-    color: "text-orange-400",
-    bgColor: "bg-orange-500/10",
-    label: "Timeout",
-  },
-  cancelled: {
-    icon: AlertCircle,
+  stopped: {
+    icon: StopCircle,
     color: "text-slate-400",
     bgColor: "bg-slate-500/10",
-    label: "Cancelled",
+    label: "Stopped",
   },
 };
+
+/**
+ * Calculate duration from created_at and completed_at timestamps
+ */
+function calculateDuration(createdAt: string, completedAt?: string): number | undefined {
+  if (!completedAt) return undefined;
+  const start = new Date(createdAt).getTime();
+  const end = new Date(completedAt).getTime();
+  return end - start;
+}
 
 /**
  * Format duration from milliseconds to human-readable string
@@ -112,13 +115,14 @@ function RunItem({
   isSelected,
   onClick,
 }: {
-  run: RunDetails;
+  run: TaskRun;
   isSelected: boolean;
   onClick: () => void;
 }) {
   const config = statusConfig[run.status];
   const StatusIcon = config.icon;
   const isRunning = run.status === "running";
+  const duration = calculateDuration(run.created_at, run.completed_at);
 
   return (
     <button
@@ -136,9 +140,7 @@ function RunItem({
       {/* Run Info */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium truncate">
-            {run.workflow_name || "Unknown Workflow"}
-          </span>
+          <span className="text-sm font-medium truncate">{run.task_name || "Unknown Task"}</span>
           {isRunning && (
             <span className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">
               In Progress
@@ -146,17 +148,19 @@ function RunItem({
           )}
         </div>
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{formatTimestamp(run.started_at)}</span>
-          {run.duration_ms && (
+          <span>{formatTimestamp(run.created_at)}</span>
+          {duration && (
             <>
               <span>·</span>
-              <span>{formatDuration(run.duration_ms)}</span>
+              <span>{formatDuration(duration)}</span>
             </>
           )}
-          {run.actions_summary && (
+          {run.sessions_count > 0 && (
             <>
               <span>·</span>
-              <span>{run.actions_summary.total} actions</span>
+              <span>
+                {run.sessions_count} session{run.sessions_count !== 1 ? "s" : ""}
+              </span>
             </>
           )}
         </div>
@@ -175,7 +179,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
     setSelectedRunId,
     recentRuns,
     isLoadingRuns,
-    configId,
     clearSelection,
     hasRunInProgress,
   } = useRunSelection();
@@ -193,18 +196,6 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
-
-  // No config loaded state
-  if (!configId) {
-    return (
-      <div
-        className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
-      >
-        <Activity className="w-4 h-4" />
-        <span className="text-sm">Load a workflow config to view runs</span>
-      </div>
-    );
-  }
 
   // Loading state
   if (isLoadingRuns && recentRuns.length === 0) {
@@ -225,7 +216,7 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
         className={`flex items-center gap-2 px-3 py-2 bg-muted/30 rounded-lg text-muted-foreground ${className}`}
       >
         <Clock className="w-4 h-4" />
-        <span className="text-sm">No runs yet. Execute a workflow to see data.</span>
+        <span className="text-sm">No runs yet. Start a task to see data.</span>
       </div>
     );
   }
@@ -234,6 +225,9 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
   const displayRun = selectedRun || recentRuns.find((r) => r.id === selectedRunId);
   const config = displayRun ? statusConfig[displayRun.status] : null;
   const StatusIcon = config?.icon || Activity;
+  const duration = displayRun
+    ? calculateDuration(displayRun.created_at, displayRun.completed_at)
+    : undefined;
 
   return (
     <div ref={dropdownRef} className={`relative ${className}`}>
@@ -264,11 +258,11 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
           {displayRun ? (
             <>
               <div className="text-sm font-medium truncate">
-                {displayRun.workflow_name || "Unknown Workflow"}
+                {displayRun.task_name || "Unknown Task"}
               </div>
               <div className="text-xs text-muted-foreground">
-                {formatTimestamp(displayRun.started_at)}
-                {displayRun.duration_ms && ` · ${formatDuration(displayRun.duration_ms)}`}
+                {formatTimestamp(displayRun.created_at)}
+                {duration && ` · ${formatDuration(duration)}`}
               </div>
             </>
           ) : (

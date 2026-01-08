@@ -71,6 +71,31 @@ pub struct TemplateMatchRecord {
     pub failures: u32,
 }
 
+/// Record of a screenshot capture action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotRecord {
+    /// Type of screenshot: "standalone" or "post_action"
+    pub screenshot_type: String,
+    /// Path to the captured screenshot file
+    pub file_path: String,
+    /// Monitor identifier (if specified)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<String>,
+    /// Delay in seconds before capture (for post-action screenshots)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay_seconds: Option<u32>,
+    /// Whether the capture was successful
+    pub success: bool,
+    /// Associated step/action name (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub associated_action: Option<String>,
+    /// Timestamp of capture
+    pub captured_at: String,
+    /// Error message if capture failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Type of anomaly detected during a run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -289,6 +314,9 @@ pub struct RunDetails {
     pub template_matches: Vec<TemplateMatchRecord>,
     #[serde(default)]
     pub anomalies: Vec<Anomaly>,
+    /// Screenshots captured during the run (standalone and post-action)
+    #[serde(default)]
+    pub screenshots: Vec<ScreenshotRecord>,
 }
 
 impl RunDetails {
@@ -310,6 +338,7 @@ impl RunDetails {
             transitions_executed: Vec::new(),
             template_matches: Vec::new(),
             anomalies: Vec::new(),
+            screenshots: Vec::new(),
         }
     }
 }

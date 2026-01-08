@@ -8,16 +8,20 @@
  * Features:
  * - GUI Automation Panel: Execution status, current state, recent logs
  * - AI Output Panel: Live AI output, task progress, Claude responses
- * - Always accessible - shows appropriate content based on what's running
- * - Remembers last known state for each panel
+ * - Summary stats, Findings, and Issues panels
+ * - Borderless design with subtle backgrounds
+ * - Collapsible sections with persistent state
  */
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import {
+  AlertTriangle,
   Bot,
+  CheckCircle,
   ChevronDown,
-  ChevronUp,
+  Clock,
   Image,
+  Lightbulb,
   Loader2,
   ScrollText,
   Sparkles,
@@ -30,10 +34,13 @@ import type { ImageRecognitionEntry } from "../managers";
 import ActionLogTable from "./ActionLogTable";
 import ImageLogTable from "./ImageLogTable";
 import type { ActionLogViewData, ActionLogEntry } from "../types/displayProfile";
+import { useUnifiedReport, useFindings } from "../hooks/useUnifiedReport";
+import { getSeverityColors } from "../design-system";
 
 // Storage keys for panel collapse states
-const STORAGE_KEY_GUI_COLLAPSED = "activeTab.guiPanelCollapsed";
-const STORAGE_KEY_AI_COLLAPSED = "activeTab.aiPanelCollapsed";
+const STORAGE_KEY_ACTIONS_COLLAPSED = "activeTab.actionsPanelCollapsed";
+const STORAGE_KEY_IMAGE_COLLAPSED = "activeTab.imagePanelCollapsed";
+const STORAGE_KEY_FINDINGS_COLLAPSED = "activeTab.findingsPanelCollapsed";
 
 interface ActiveTabProps {
   // Log data
@@ -65,12 +72,19 @@ export function ActiveTab({
 }: ActiveTabProps) {
   const execution = useExecution();
 
+  // Unified report hooks for summary and findings
+  const { summary } = useUnifiedReport();
+  const { items: findings } = useFindings();
+
   // Panel collapse states
-  const [guiPanelCollapsed, setGuiPanelCollapsed] = useState(() => {
-    return localStorage.getItem(STORAGE_KEY_GUI_COLLAPSED) === "true";
+  const [actionsCollapsed, setActionsCollapsed] = useState(() => {
+    return localStorage.getItem(STORAGE_KEY_ACTIONS_COLLAPSED) === "true";
   });
-  const [aiPanelCollapsed, setAiPanelCollapsed] = useState(() => {
-    return localStorage.getItem(STORAGE_KEY_AI_COLLAPSED) === "true";
+  const [imageCollapsed, setImageCollapsed] = useState(() => {
+    return localStorage.getItem(STORAGE_KEY_IMAGE_COLLAPSED) === "true";
+  });
+  const [findingsCollapsed, setFindingsCollapsed] = useState(() => {
+    return localStorage.getItem(STORAGE_KEY_FINDINGS_COLLAPSED) === "true";
   });
 
   // AI session state
@@ -79,12 +93,16 @@ export function ActiveTab({
 
   // Persist collapse states
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_GUI_COLLAPSED, String(guiPanelCollapsed));
-  }, [guiPanelCollapsed]);
+    localStorage.setItem(STORAGE_KEY_ACTIONS_COLLAPSED, String(actionsCollapsed));
+  }, [actionsCollapsed]);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY_AI_COLLAPSED, String(aiPanelCollapsed));
-  }, [aiPanelCollapsed]);
+    localStorage.setItem(STORAGE_KEY_IMAGE_COLLAPSED, String(imageCollapsed));
+  }, [imageCollapsed]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEY_FINDINGS_COLLAPSED, String(findingsCollapsed));
+  }, [findingsCollapsed]);
 
   // Poll for AI session status via HTTP API
   useEffect(() => {
@@ -192,23 +210,21 @@ export function ActiveTab({
   }, [isAiRunning, activeSessions, execution.executionActive, execution.selectedWorkflow]);
 
   return (
-    <div className="h-full flex flex-col p-4 gap-4 overflow-hidden">
-      {/* Status Banner */}
+    <div className="h-full flex flex-col p-4 gap-3 overflow-hidden">
+      {/* Status Banner - borderless with subtle background */}
       <div
         className={`flex-shrink-0 px-4 py-3 rounded-lg ${
-          statusInfo.status === "running"
-            ? "bg-emerald-500/10 border border-emerald-500/30"
-            : "bg-muted/30 border border-border"
+          statusInfo.status === "running" ? "bg-emerald-500/10" : "bg-muted/30"
         }`}
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             {statusInfo.status === "running" ? (
-              <div className="w-9 h-9 rounded-full bg-emerald-500/20 flex items-center justify-center">
+              <div className="w-8 h-8 rounded-full bg-emerald-500/20 flex items-center justify-center">
                 <Loader2 className="w-4 h-4 text-emerald-500 animate-spin" />
               </div>
             ) : (
-              <div className="w-9 h-9 rounded-full bg-muted flex items-center justify-center">
+              <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center">
                 <Sparkles className="w-4 h-4 text-muted-foreground" />
               </div>
             )}
@@ -232,29 +248,64 @@ export function ActiveTab({
         </div>
       </div>
 
+      {/* Summary Stats Row - inline badges without container */}
+      {summary.total > 0 && (
+        <div className="flex-shrink-0 flex flex-wrap items-center gap-2 px-1">
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50">
+            <span className="text-xs text-muted-foreground">Total</span>
+            <span className="text-sm font-semibold">{summary.total}</span>
+          </div>
+          {summary.resolved > 0 && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-green-500/10">
+              <CheckCircle className="w-3 h-3 text-green-500" />
+              <span className="text-sm font-semibold text-green-500">{summary.resolved}</span>
+            </div>
+          )}
+          {summary.actionable > 0 && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-yellow-500/10">
+              <Clock className="w-3 h-3 text-yellow-500" />
+              <span className="text-sm font-semibold text-yellow-500">{summary.actionable}</span>
+            </div>
+          )}
+          {summary.bySeverity.critical > 0 && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/10">
+              <AlertTriangle className="w-3 h-3 text-red-500" />
+              <span className="text-sm font-semibold text-red-500">
+                {summary.bySeverity.critical}
+              </span>
+            </div>
+          )}
+          {summary.bySeverity.high > 0 && (
+            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-orange-500/10">
+              <span className="text-sm font-semibold text-orange-500">
+                {summary.bySeverity.high} high
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Top panels: Actions and Image Recognition side by side */}
-      <div className="flex-shrink-0 grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* Actions Panel */}
-        <div className="card">
+      <div className="flex-shrink-0 grid grid-cols-1 lg:grid-cols-2 gap-3">
+        {/* Actions Panel - borderless */}
+        <div className="rounded-lg bg-card/50">
           <button
-            onClick={() => setGuiPanelCollapsed(!guiPanelCollapsed)}
-            className="w-full flex items-center justify-between p-3 hover:bg-muted/30 transition-colors"
+            onClick={() => setActionsCollapsed(!actionsCollapsed)}
+            className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors"
           >
             <div className="flex items-center gap-2">
-              <ScrollText className="w-4 h-4 text-green-500" />
-              <h2 className="font-medium text-sm">Actions</h2>
+              <ScrollText className="w-4 h-4 text-green-500/70" />
+              <span className="text-sm font-medium">Actions</span>
               <span className="text-xs text-muted-foreground">
                 ({actionLogData?.visible_count || 0})
               </span>
             </div>
-            {guiPanelCollapsed ? (
-              <ChevronDown className="w-4 h-4 text-muted-foreground" />
-            ) : (
-              <ChevronUp className="w-4 h-4 text-muted-foreground" />
-            )}
+            <ChevronDown
+              className={`w-4 h-4 text-muted-foreground transition-transform ${!actionsCollapsed && "rotate-180"}`}
+            />
           </button>
-          {!guiPanelCollapsed && (
-            <div className="border-t border-border/50 max-h-64 overflow-auto">
+          {!actionsCollapsed && (
+            <div className="max-h-48 overflow-auto px-1 pb-1">
               {actionLogData && actionLogData.actions.length > 0 ? (
                 <ActionLogTable
                   actions={actionLogData.actions}
@@ -262,7 +313,7 @@ export function ActiveTab({
                   workflowStartTime={actionLogData.workflow_start_time ?? undefined}
                 />
               ) : (
-                <div className="p-4 text-center text-muted-foreground text-sm">
+                <div className="py-3 text-center text-muted-foreground text-xs">
                   No actions recorded yet
                 </div>
               )}
@@ -270,29 +321,27 @@ export function ActiveTab({
           )}
         </div>
 
-        {/* Image Recognition Panel */}
-        <div className="card">
+        {/* Image Recognition Panel - borderless */}
+        <div className="rounded-lg bg-card/50">
           <button
-            onClick={() => setAiPanelCollapsed(!aiPanelCollapsed)}
-            className="w-full flex items-center justify-between p-3 hover:bg-muted/30 transition-colors"
+            onClick={() => setImageCollapsed(!imageCollapsed)}
+            className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors"
           >
             <div className="flex items-center gap-2">
-              <Image className="w-4 h-4 text-purple-500" />
-              <h2 className="font-medium text-sm">Image Recognition</h2>
+              <Image className="w-4 h-4 text-purple-500/70" />
+              <span className="text-sm font-medium">Image Recognition</span>
               <span className="text-xs text-muted-foreground">({imageLogs.length})</span>
             </div>
-            {aiPanelCollapsed ? (
-              <ChevronDown className="w-4 h-4 text-muted-foreground" />
-            ) : (
-              <ChevronUp className="w-4 h-4 text-muted-foreground" />
-            )}
+            <ChevronDown
+              className={`w-4 h-4 text-muted-foreground transition-transform ${!imageCollapsed && "rotate-180"}`}
+            />
           </button>
-          {!aiPanelCollapsed && (
-            <div className="border-t border-border/50 max-h-64 overflow-auto">
+          {!imageCollapsed && (
+            <div className="max-h-48 overflow-auto px-1 pb-1">
               {imageLogs.length > 0 ? (
                 <ImageLogTable imageLogs={imageLogs} onRowClick={onImageRowClick} />
               ) : (
-                <div className="p-4 text-center text-muted-foreground text-sm">
+                <div className="py-3 text-center text-muted-foreground text-xs">
                   No image recognition results yet
                 </div>
               )}
@@ -301,21 +350,68 @@ export function ActiveTab({
         </div>
       </div>
 
-      {/* AI Output - extends to bottom */}
-      <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
-        <div className="flex-shrink-0 flex items-center justify-between p-3 border-b border-border/50">
-          <div className="flex items-center gap-2">
-            <Bot className="w-4 h-4 text-purple-500" />
-            <h2 className="font-medium text-sm">AI Output</h2>
-            {isAiRunning && <Sparkles className="w-4 h-4 animate-pulse text-purple-500" />}
-          </div>
-          {activeSessions.length > 0 && (
-            <span className="text-xs text-muted-foreground">
-              {activeSessions.length} active session{activeSessions.length !== 1 ? "s" : ""}
-            </span>
+      {/* Findings and Issues side by side - borderless */}
+      <div className="flex-shrink-0 grid grid-cols-1 lg:grid-cols-2 gap-3">
+        {/* Findings Panel */}
+        <div className="rounded-lg bg-card/50">
+          <button
+            onClick={() => setFindingsCollapsed(!findingsCollapsed)}
+            className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors"
+          >
+            <div className="flex items-center gap-2">
+              <Lightbulb className="w-4 h-4 text-yellow-500/70" />
+              <span className="text-sm font-medium">Findings</span>
+              <span className="text-xs text-muted-foreground">({findings.length})</span>
+            </div>
+            <ChevronDown
+              className={`w-4 h-4 text-muted-foreground transition-transform ${!findingsCollapsed && "rotate-180"}`}
+            />
+          </button>
+          {!findingsCollapsed && (
+            <div className="max-h-40 overflow-auto px-2 pb-2">
+              {findings.length > 0 ? (
+                <div className="space-y-1">
+                  {findings.slice(0, 10).map((finding) => (
+                    <div
+                      key={finding.id}
+                      className="flex items-center gap-2 px-2 py-1.5 rounded bg-muted/30 text-xs"
+                    >
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${getSeverityColors(finding.severity).dot}`}
+                      />
+                      <span className="flex-1 truncate">{finding.title}</span>
+                      <span className="text-muted-foreground">{finding.categoryId}</span>
+                    </div>
+                  ))}
+                  {findings.length > 10 && (
+                    <div className="text-xs text-muted-foreground text-center py-1">
+                      +{findings.length - 10} more
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div className="py-3 text-center text-muted-foreground text-xs">
+                  No findings yet
+                </div>
+              )}
+            </div>
           )}
         </div>
-        <div className="flex-1 min-h-0 overflow-hidden">
+      </div>
+
+      {/* AI Output - extends to bottom, borderless */}
+      <div className="flex-1 flex flex-col min-h-0 rounded-lg bg-card/50 overflow-hidden">
+        <div className="flex-shrink-0 flex items-center justify-between px-3 py-2">
+          <div className="flex items-center gap-2">
+            <Bot className="w-4 h-4 text-purple-500/70" />
+            <span className="text-sm font-medium">AI Output</span>
+            {isAiRunning && <Sparkles className="w-3 h-3 animate-pulse text-purple-500" />}
+          </div>
+          {activeSessions.length > 0 && (
+            <span className="text-xs text-muted-foreground">{activeSessions.length} active</span>
+          )}
+        </div>
+        <div className="flex-1 min-h-0 overflow-auto scrollbar-dark">
           <AiOutputTab
             lines={aiOutputLines}
             onClear={onClearAiOutput}

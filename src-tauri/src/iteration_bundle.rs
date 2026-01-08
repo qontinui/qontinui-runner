@@ -532,7 +532,7 @@ fn read_captured_input_events() -> Vec<CapturedInputEvent> {
     if let Ok(entries) = std::fs::read_dir(dev_logs_dir) {
         let mut files: Vec<_> = entries
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "jsonl"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl"))
             .collect();
 
         // Sort by modification time (most recent first)
@@ -581,10 +581,10 @@ fn match_captured_to_reported(
     let mut best_match: Option<(CapturedInputEvent, f64)> = None;
     for event in captured_events {
         let time_diff = (event.timestamp - reported_time).abs();
-        if time_diff <= tolerance_seconds {
-            if best_match.is_none() || time_diff < best_match.as_ref().unwrap().1 {
-                best_match = Some((event.clone(), time_diff));
-            }
+        if time_diff <= tolerance_seconds
+            && (best_match.is_none() || time_diff < best_match.as_ref().unwrap().1)
+        {
+            best_match = Some((event.clone(), time_diff));
         }
     }
 

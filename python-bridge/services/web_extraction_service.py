@@ -9,6 +9,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import uuid
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,26 @@ try:
 except ImportError:
     HAS_OCR = False
     logger.warning("OCRNameGenerator not available - elements will use default names")
+
+# Import state machine builder for transforming extraction results
+try:
+    from qontinui.state_management.builders import build_state_machine_from_extraction
+
+    HAS_STATE_MACHINE_BUILDER = True
+except ImportError:
+    HAS_STATE_MACHINE_BUILDER = False
+    logger.warning(
+        "State machine builder not available - extraction results will not be transformed"
+    )
+
+# Import vision extraction from qontinui library
+try:
+    from qontinui.extraction.vision import UnifiedVisionExtractor
+
+    HAS_VISION_EXTRACTION = True
+except ImportError:
+    HAS_VISION_EXTRACTION = False
+    logger.warning("UnifiedVisionExtractor not available - vision extraction will be skipped")
 
 
 class WebExtractionService:
@@ -73,6 +94,9 @@ class WebExtractionService:
         # Store extraction results
         self._extraction_results: dict[str, Any] = {}  # extraction_id -> ExtractionResult
         self._composite_results: dict[str, dict] = {}  # composite_id -> composite structure
+
+        # Vision extraction (lazy initialized)
+        self._vision_extractor: UnifiedVisionExtractor | None = None
 
     async def start_extraction(self, config: dict[str, Any]) -> dict[str, Any]:
         """
@@ -423,6 +447,10 @@ class WebExtractionService:
                     serialized_states, serialized_transitions, serialized_elements
                 )
 
+                # Build and upload the state machine
+                # This transforms raw elements into a proper state machine using co-occurrence clustering
+                await self._build_and_upload_state_machine(serialized_elements)
+
                 # Update backend session to completed with stats
                 pages_extracted = (
                     result.runtime_extraction.pages_visited if result.runtime_extraction else 1
@@ -645,7 +673,7 @@ class WebExtractionService:
         Get a screenshot from an extraction.
 
         Args:
-            screenshot_id: ID of the screenshot.
+            screenshot_id: ID of the screenshot (can be just ID or full path for backwards compat).
             resolution: "thumbnail" or "full".
             extraction_id: Extraction ID (uses current if not specified).
 
@@ -655,6 +683,14 @@ class WebExtractionService:
         ext_id = extraction_id or self._current_extraction_id
         if not ext_id:
             return {"success": False, "error": "No extraction specified"}
+
+        # Handle both formats: just ID (e.g., "0001") or full path (backwards compat)
+        # If screenshot_id contains path separators, extract just the basename
+        if "\\" in screenshot_id or "/" in screenshot_id:
+            screenshot_id = os.path.basename(screenshot_id)
+        # Remove .png extension if present
+        if screenshot_id.endswith(".png"):
+            screenshot_id = screenshot_id[:-4]
 
         screenshots_dir = self.extractions_dir / ext_id / "screenshots"
         filepath = screenshots_dir / f"{screenshot_id}.png"
@@ -1108,6 +1144,7 @@ class WebExtractionService:
             "text": getattr(element, "text_content", None),
             "selector": getattr(element, "selector", None),
             "confidence": getattr(element, "confidence", 1.0),
+            "extraction_category": getattr(element, "extraction_category", ""),
         }
 
     def _sanitize_text_for_name(self, text: str) -> str:
@@ -1279,6 +1316,306 @@ class WebExtractionService:
 
         return elements
 
+    async def _run_vision_extraction(
+        self,
+        screenshot_path: Path,
+        screenshot_id: str,
+        source_url: str,
+    ) -> dict[str, Any] | None:
+        """
+        Run vision extraction (Edge, SAM3, OCR) on a screenshot using the qontinui library.
+
+        Args:
+            screenshot_path: Path to the screenshot image
+            screenshot_id: Unique ID for this screenshot
+            source_url: Source URL of the page
+
+        Returns:
+            Vision extraction results dict, or None if extraction failed
+        """
+        print(
+            f"[VISION_DEBUG] _run_vision_extraction called, HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}",
+            flush=True,
+        )
+        if not HAS_VISION_EXTRACTION:
+            print("[VISION_DEBUG] Vision extraction not available, returning None", flush=True)
+            logger.debug("Vision extraction not available")
+            return None
+
+        if not screenshot_path.exists():
+            print(f"[VISION_DEBUG] Screenshot not found: {screenshot_path}", flush=True)
+            logger.warning(f"Screenshot not found for vision extraction: {screenshot_path}")
+            return None
+
+        try:
+            print("[VISION_DEBUG] Screenshot exists, initializing extractor...", flush=True)
+            # Lazy initialize vision extractor
+            if self._vision_extractor is None:
+                print("[VISION_DEBUG] Creating UnifiedVisionExtractor...", flush=True)
+                self._vision_extractor = UnifiedVisionExtractor()
+                print("[VISION_DEBUG] UnifiedVisionExtractor created successfully", flush=True)
+
+            # Run vision extraction
+            print(f"[VISION_DEBUG] Running extract() on {screenshot_path}", flush=True)
+            logger.info(f"Running vision extraction on {screenshot_path}")
+            result = await self._vision_extractor.extract(
+                screenshot_path=screenshot_path,
+                screenshot_id=screenshot_id,
+                source_url=source_url,
+            )
+
+            # Convert result to serializable dict
+            vision_data = {
+                "extraction_id": result.extraction_id,
+                "duration_ms": result.duration_ms,
+                "techniques_run": [],
+                "edge_results": [],
+                "sam3_results": [],
+                "ocr_results": [],
+                "merged_candidates": [],
+                "edge_overlay": result.edge_overlay_image,
+                "sam3_overlay": result.sam3_mask_image,
+                "ocr_overlay": result.ocr_overlay_image,
+            }
+
+            # Serialize edge detection results
+            if result.edge_detection_results:
+                vision_data["techniques_run"].append("edge")
+                for edge in result.edge_detection_results:
+                    vision_data["edge_results"].append(
+                        {
+                            "id": edge.id,
+                            "bbox": {
+                                "x": edge.bbox.x,
+                                "y": edge.bbox.y,
+                                "width": edge.bbox.width,
+                                "height": edge.bbox.height,
+                            },
+                            "confidence": edge.confidence,
+                            "contour_area": edge.contour_area,
+                            "contour_perimeter": edge.contour_perimeter,
+                            "vertex_count": edge.vertex_count,
+                            "aspect_ratio": edge.aspect_ratio,
+                        }
+                    )
+
+            # Serialize SAM3 results
+            if result.sam3_segments:
+                vision_data["techniques_run"].append("sam3")
+                for seg in result.sam3_segments:
+                    vision_data["sam3_results"].append(
+                        {
+                            "id": seg.id,
+                            "bbox": {
+                                "x": seg.bbox.x,
+                                "y": seg.bbox.y,
+                                "width": seg.bbox.width,
+                                "height": seg.bbox.height,
+                            },
+                            "stability_score": seg.stability_score,
+                            "predicted_iou": seg.predicted_iou,
+                            "mask_area": seg.mask_area,
+                            "confidence": seg.confidence,
+                        }
+                    )
+
+            # Serialize OCR results
+            if result.ocr_results:
+                vision_data["techniques_run"].append("ocr")
+                for ocr in result.ocr_results:
+                    vision_data["ocr_results"].append(
+                        {
+                            "id": ocr.id,
+                            "bbox": {
+                                "x": ocr.bbox.x,
+                                "y": ocr.bbox.y,
+                                "width": ocr.bbox.width,
+                                "height": ocr.bbox.height,
+                            },
+                            "text": ocr.text,
+                            "confidence": ocr.confidence,
+                            "language": ocr.language,
+                        }
+                    )
+
+            # Serialize merged candidates
+            if result.candidates:
+                for candidate in result.candidates:
+                    vision_data["merged_candidates"].append(
+                        {
+                            "id": candidate.id,
+                            "bbox": {
+                                "x": candidate.bbox.x,
+                                "y": candidate.bbox.y,
+                                "width": candidate.bbox.width,
+                                "height": candidate.bbox.height,
+                            },
+                            "confidence": candidate.confidence,
+                            "category": candidate.category,
+                            "text": candidate.text,
+                            "detection_technique": candidate.detection_technique,
+                            "is_clickable": candidate.is_clickable,
+                        }
+                    )
+
+            print(
+                f"[VISION_DEBUG] Vision extraction complete: {len(vision_data['edge_results'])} edges, "
+                f"{len(vision_data['sam3_results'])} segments, "
+                f"{len(vision_data['ocr_results'])} text regions, "
+                f"{len(vision_data['merged_candidates'])} merged candidates",
+                flush=True,
+            )
+            logger.info(
+                f"Vision extraction complete: {len(vision_data['edge_results'])} edges, "
+                f"{len(vision_data['sam3_results'])} segments, "
+                f"{len(vision_data['ocr_results'])} text regions, "
+                f"{len(vision_data['merged_candidates'])} merged candidates"
+            )
+            return vision_data
+
+        except Exception as e:
+            print(f"[VISION_DEBUG] Vision extraction EXCEPTION: {e}", flush=True)
+            logger.warning(f"Vision extraction failed: {e}", exc_info=True)
+            return None
+
+    async def _build_and_upload_state_machine(
+        self,
+        serialized_elements: list[dict[str, Any]],
+    ) -> None:
+        """
+        Build the state machine from extraction results and upload to backend.
+
+        Transforms raw extraction states into the StateMachine format expected
+        by the frontend (states with stateImages, patterns, searchRegions).
+
+        For comprehensive extraction, creates individual stateImages for each
+        element within a state (e.g., header state contains logo, signin, docs images).
+
+        Args:
+            serialized_elements: List of serialized element dicts with id, name, bbox, etc.
+        """
+        if not self._backend_session_id or not self._backend_url:
+            logger.debug("No backend session configured, skipping state machine upload")
+            return
+
+        import httpx
+
+        try:
+            extraction_id = self._current_extraction_id
+            if not extraction_id or extraction_id not in self._extraction_results:
+                logger.warning("No extraction results available for state machine building")
+                return
+
+            result = self._extraction_results[extraction_id].get("result")
+            if not result or not result.states:
+                logger.warning("No states in extraction result")
+                return
+
+            # Use serialized_elements directly - ignore old state.element_ids
+            # This ensures we use the comprehensive extraction results
+            logger.info(
+                f"Building state machine with {len(serialized_elements)} elements "
+                f"(ignoring {len(result.states)} old states)"
+            )
+
+            # Create ONE state that contains ALL interactive elements as stateImages
+            state_images = []
+            for elem in serialized_elements:
+                elem_id = elem.get("id", "")
+                elem_bbox = elem.get("bbox", {"x": 0, "y": 0, "width": 100, "height": 30})
+                elem_name = (
+                    elem.get("name") or elem.get("text") or elem.get("element_type") or "Element"
+                )
+
+                # Truncate long names
+                if len(elem_name) > 30:
+                    elem_name = elem_name[:27] + "..."
+
+                state_image_id = f"stateimage-{elem_id}"
+                pattern_id = f"pattern-{elem_id}"
+
+                state_image = {
+                    "id": state_image_id,
+                    "name": elem_name,
+                    "patterns": [
+                        {
+                            "id": pattern_id,
+                            "name": elem_name,
+                            "searchRegions": [elem_bbox],
+                            "fixed": False,
+                        }
+                    ],
+                    "shared": False,
+                    "searchRegions": [elem_bbox],
+                    "extractionCategory": elem.get("extraction_category", ""),
+                }
+                state_images.append(state_image)
+                logger.debug(
+                    f"  Element: {elem_name} ({elem.get('extraction_category', 'unknown')})"
+                )
+
+            # Create a single state containing all elements
+            state_config = {
+                "id": "state-page-elements",
+                "name": "Page Elements",
+                "description": "Interactive elements extracted from the page",
+                "stateImages": state_images,
+                "regions": [],
+                "locations": [],
+                "strings": [],
+                "position": {"x": 0, "y": 0},
+                "initial": True,
+                "isFinal": False,
+            }
+            states_config = [state_config]
+
+            logger.info(f"Created state with {len(state_images)} stateImages")
+
+            # Transform transitions
+            transitions_config = []
+            for trans in result.transitions:
+                trans_config = {
+                    "id": trans.id,
+                    "type": trans.trigger_type or "click",
+                    "fromState": trans.from_state_id,
+                    "toState": trans.to_state_id,
+                    "workflows": [],
+                    "timeout": 30,
+                    "retryCount": 3,
+                }
+                transitions_config.append(trans_config)
+
+            logger.info(
+                f"Built state machine: {len(states_config)} states, "
+                f"{len(transitions_config)} transitions"
+            )
+
+            # Upload to backend
+            url = f"{self._backend_url}/api/v1/extractions/{self._backend_session_id}/state-machine"
+            payload = {
+                "states": states_config,
+                "transitions": transitions_config,
+            }
+
+            headers = {"Content-Type": "application/json"}
+            if self._backend_auth_token:
+                headers["Authorization"] = f"Bearer {self._backend_auth_token}"
+
+            async with httpx.AsyncClient() as client:
+                response = await client.put(url, json=payload, headers=headers, timeout=30.0)
+                if response.status_code == 200:
+                    logger.info(
+                        f"Successfully uploaded state machine: "
+                        f"{len(states_config)} states, {len(transitions_config)} transitions"
+                    )
+                else:
+                    logger.warning(
+                        f"Failed to upload state machine: {response.status_code} - {response.text}"
+                    )
+
+        except Exception as e:
+            logger.warning(f"Failed to build/upload state machine: {e}", exc_info=True)
+
     async def _update_backend_session(
         self,
         status: str,
@@ -1416,6 +1753,14 @@ class WebExtractionService:
             transitions: List of serialized transition dicts
             elements: List of serialized element dicts (ExtractedElement format)
         """
+        print(
+            f"[ANNOTATION_DEBUG] _save_annotations_to_backend called with {len(states)} states, {len(transitions)} transitions",
+            flush=True,
+        )
+        logger.info(
+            f"[ANNOTATION_DEBUG] _save_annotations_to_backend called with {len(states)} states, {len(transitions)} transitions"
+        )
+
         if not self._backend_session_id or not self._backend_url:
             logger.debug("No backend session configured, skipping annotation save")
             return
@@ -1423,6 +1768,7 @@ class WebExtractionService:
         import httpx
 
         elements = elements or []
+        logger.info(f"[ANNOTATION_DEBUG] elements count: {len(elements)}")
 
         # Group states by their screenshot_id (each screenshot is a separate annotation)
         states_by_screenshot: dict[str, list[dict[str, Any]]] = {}
@@ -1492,16 +1838,55 @@ class WebExtractionService:
                     # Get elements for this screenshot
                     screenshot_elements = elements_by_screenshot.get(screenshot_id, [])
 
-                    # Apply OCR to elements if we can find the screenshot
-                    if screenshot_elements and extraction_id:
+                    # Build screenshot path for OCR and vision extraction
+                    screenshot_path = None
+                    print(
+                        f"[VISION_DEBUG] extraction_id={extraction_id}, screenshot_id={screenshot_id}",
+                        flush=True,
+                    )
+                    logger.info(
+                        f"[VISION_DEBUG] extraction_id={extraction_id}, screenshot_id={screenshot_id}"
+                    )
+                    if extraction_id:
+                        print("[VISION_DEBUG] Building screenshot path...", flush=True)
                         screenshot_path = (
                             self.extractions_dir
                             / extraction_id
                             / "screenshots"
                             / f"{screenshot_id}.png"
                         )
+                        print(f"[VISION_DEBUG] screenshot_path={screenshot_path}", flush=True)
+                        try:
+                            exists = screenshot_path.exists()
+                            print(f"[VISION_DEBUG] screenshot exists={exists}", flush=True)
+                        except Exception as e:
+                            print(f"[VISION_DEBUG] exists() check failed: {e}", flush=True)
+                        logger.info(
+                            f"[VISION_DEBUG] screenshot_path={screenshot_path}, exists={screenshot_path.exists() if screenshot_path else 'N/A'}"
+                        )
+
+                    # Apply OCR to elements if we can find the screenshot
+                    if screenshot_elements and screenshot_path:
                         screenshot_elements = self._apply_ocr_to_elements(
                             screenshot_elements, screenshot_path
+                        )
+
+                    # Run vision extraction on the screenshot
+                    vision_results = None
+                    print(
+                        f"[VISION_DEBUG] HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}, screenshot_path set={screenshot_path is not None}",
+                        flush=True,
+                    )
+                    if screenshot_path:
+                        print("[VISION_DEBUG] Calling _run_vision_extraction...", flush=True)
+                        vision_results = await self._run_vision_extraction(
+                            screenshot_path=screenshot_path,
+                            screenshot_id=screenshot_id,
+                            source_url=source_url,
+                        )
+                        print(
+                            f"[VISION_DEBUG] Vision results: {vision_results is not None}, techniques={vision_results.get('techniques_run') if vision_results else None}",
+                            flush=True,
                         )
 
                     annotation_data = {
@@ -1509,6 +1894,7 @@ class WebExtractionService:
                         "source_url": source_url,
                         "elements": screenshot_elements,
                         "states": converted_states,
+                        "vision_results": vision_results,
                     }
 
                     url = f"{self._backend_url}/api/v1/extractions/{self._backend_session_id}/annotations"

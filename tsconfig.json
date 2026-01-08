@@ -18,6 +18,7 @@
     "types": ["vite/client"],
     "baseUrl": ".",
     "paths": {
+      "@/*": ["src/*"],
       "@qontinui/schemas/*": ["../qontinui-schemas/generated/typescript/*"]
     }
   },

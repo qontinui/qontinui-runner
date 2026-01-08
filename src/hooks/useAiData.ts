@@ -5,9 +5,22 @@
  * Provides data fetching with caching, refetching, and error handling.
  */
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { aiDataService } from "../services/ai-data-service";
-import type { TaskRun, JsonlLogsResult, JsonlLogsSummary, JsonlLogType } from "../types/aiData";
+import type {
+  TaskRun,
+  JsonlLogsResult,
+  JsonlLogsSummary,
+  JsonlLogType,
+  TextLogsResult,
+  TextLogsSummary,
+  TextLogType,
+  ScreenshotsResult,
+  LoadedConfigInfo,
+  AiPromptsResult,
+  ContextsResult,
+  ConsolidatedAiOutputResult,
+} from "../types/aiData";
 import type { RunDetails } from "../types/statistics";
 
 // Keys for react-query cache
@@ -19,6 +32,14 @@ export const aiDataKeys = {
   automationRun: (runId: string) => [...aiDataKeys.all, "automationRun", runId] as const,
   jsonlSummary: () => [...aiDataKeys.all, "jsonlSummary"] as const,
   jsonlLogs: (logType: JsonlLogType) => [...aiDataKeys.all, "jsonlLogs", logType] as const,
+  consolidatedAiOutput: (taskRunId: string) =>
+    [...aiDataKeys.all, "consolidatedAiOutput", taskRunId] as const,
+  textSummary: () => [...aiDataKeys.all, "textSummary"] as const,
+  textLogs: (logType: TextLogType) => [...aiDataKeys.all, "textLogs", logType] as const,
+  screenshots: () => [...aiDataKeys.all, "screenshots"] as const,
+  loadedConfig: () => [...aiDataKeys.all, "loadedConfig"] as const,
+  aiPrompts: (taskRunId: string) => [...aiDataKeys.all, "aiPrompts", taskRunId] as const,
+  contexts: () => [...aiDataKeys.all, "contexts"] as const,
 };
 
 /**
@@ -116,7 +137,7 @@ export function useJsonlLogsSummary() {
 }
 
 /**
- * Hook to read JSONL log entries
+ * Hook to read JSONL log entries (unfiltered)
  */
 export function useJsonlLogs(logType: JsonlLogType, limit?: number) {
   return useQuery({
@@ -130,5 +151,208 @@ export function useJsonlLogs(logType: JsonlLogType, limit?: number) {
     },
     staleTime: 5000,
     refetchInterval: 10000, // Refetch every 10 seconds
+  });
+}
+
+/**
+ * Hook to read JSONL log entries filtered by task run time range
+ */
+export function useJsonlLogsForTaskRun(logType: JsonlLogType, taskRunId: string | null) {
+  return useQuery({
+    queryKey: [...aiDataKeys.jsonlLogs(logType), "taskRun", taskRunId],
+    queryFn: async (): Promise<JsonlLogsResult | null> => {
+      if (!taskRunId) return null;
+      const response = await aiDataService.readJsonlLogsForTaskRun(logType, taskRunId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load logs");
+      }
+      return response.data;
+    },
+    enabled: !!taskRunId,
+    staleTime: 5000,
+    refetchInterval: 10000,
+  });
+}
+
+/**
+ * Hook to get consolidated AI output for a task run
+ * Groups consecutive log entries by source into readable chunks
+ */
+export function useConsolidatedAiOutput(taskRunId: string | null) {
+  return useQuery({
+    queryKey: aiDataKeys.consolidatedAiOutput(taskRunId ?? ""),
+    queryFn: async (): Promise<ConsolidatedAiOutputResult | null> => {
+      if (!taskRunId) return null;
+      const response = await aiDataService.getConsolidatedAiOutput(taskRunId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load consolidated AI output");
+      }
+      return response.data;
+    },
+    enabled: !!taskRunId,
+    staleTime: 5000,
+    refetchInterval: 10000,
+  });
+}
+
+/**
+ * Hook to reopen a finished task run with additional iterations
+ */
+export function useReopenTaskRun() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async ({
+      taskId,
+      additionalSessions,
+    }: {
+      taskId: string;
+      additionalSessions: number;
+    }): Promise<TaskRun> => {
+      const response = await aiDataService.reopenTaskRun(taskId, additionalSessions);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to reopen task run");
+      }
+      return response.data;
+    },
+    onSuccess: (updatedRun) => {
+      // Invalidate task runs list to refresh
+      queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRuns() });
+      // Update the specific task run in cache
+      queryClient.setQueryData(aiDataKeys.taskRun(updatedRun.id), updatedRun);
+    },
+  });
+}
+
+// =============================================================================
+// Text Logs (plain text, filtered by task run time range)
+// =============================================================================
+
+/**
+ * Hook to get text logs summary for a task run
+ */
+export function useTextLogsSummary(taskRunId: string | null) {
+  return useQuery({
+    queryKey: [...aiDataKeys.textSummary(), taskRunId],
+    queryFn: async (): Promise<TextLogsSummary | null> => {
+      if (!taskRunId) return null;
+      const response = await aiDataService.getTextLogsSummary(taskRunId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load text logs summary");
+      }
+      return response.data;
+    },
+    enabled: !!taskRunId,
+    staleTime: 5000, // 5 seconds
+    refetchInterval: 15000, // Refetch every 15 seconds
+  });
+}
+
+/**
+ * Hook to read text log content for a task run
+ */
+export function useTextLogs(logType: TextLogType, taskRunId: string | null) {
+  return useQuery({
+    queryKey: [...aiDataKeys.textLogs(logType), taskRunId],
+    queryFn: async (): Promise<TextLogsResult | null> => {
+      if (!taskRunId) return null;
+      const response = await aiDataService.readTextLogs(logType, taskRunId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load text logs");
+      }
+      return response.data;
+    },
+    enabled: !!taskRunId,
+    staleTime: 5000,
+    refetchInterval: 10000, // Refetch every 10 seconds
+  });
+}
+
+// =============================================================================
+// Screenshots
+// =============================================================================
+
+/**
+ * Hook to get screenshots (annotated and playwright)
+ */
+export function useScreenshots() {
+  return useQuery({
+    queryKey: aiDataKeys.screenshots(),
+    queryFn: async (): Promise<ScreenshotsResult | null> => {
+      const response = await aiDataService.getScreenshots();
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load screenshots");
+      }
+      return response.data;
+    },
+    staleTime: 5000,
+    refetchInterval: 15000, // Refetch every 15 seconds
+  });
+}
+
+// =============================================================================
+// Loaded Config
+// =============================================================================
+
+/**
+ * Hook to get the currently loaded workflow config
+ */
+export function useLoadedConfig() {
+  return useQuery({
+    queryKey: aiDataKeys.loadedConfig(),
+    queryFn: async (): Promise<LoadedConfigInfo | null> => {
+      const response = await aiDataService.getLoadedConfig();
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load config");
+      }
+      return response.data;
+    },
+    staleTime: 10000, // 10 seconds
+    refetchInterval: 30000, // Refetch every 30 seconds
+  });
+}
+
+// =============================================================================
+// AI Prompts
+// =============================================================================
+
+/**
+ * Hook to get AI prompts for a task run
+ */
+export function useAiPrompts(taskRunId: string | null) {
+  return useQuery({
+    queryKey: aiDataKeys.aiPrompts(taskRunId ?? ""),
+    queryFn: async (): Promise<AiPromptsResult | null> => {
+      if (!taskRunId) return null;
+      const response = await aiDataService.getAiPrompts(taskRunId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load AI prompts");
+      }
+      return response.data;
+    },
+    enabled: !!taskRunId,
+    staleTime: 10000,
+  });
+}
+
+// =============================================================================
+// Contexts
+// =============================================================================
+
+/**
+ * Hook to get all available contexts
+ */
+export function useContexts() {
+  return useQuery({
+    queryKey: aiDataKeys.contexts(),
+    queryFn: async (): Promise<ContextsResult | null> => {
+      const response = await aiDataService.getContexts();
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load contexts");
+      }
+      return response.data;
+    },
+    staleTime: 30000, // 30 seconds - contexts change less frequently
+    refetchInterval: 60000, // Refetch every 60 seconds
   });
 }

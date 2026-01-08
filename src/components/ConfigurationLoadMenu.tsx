@@ -21,44 +21,44 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
   return (
     <DropdownMenu.Root open={open} onOpenChange={setOpen}>
       <DropdownMenu.Trigger asChild>
-        <button className="w-full btn-primary flex items-center justify-center gap-2">
-          <FileText className="w-4 h-4" />
+        <button className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 transition-colors">
+          <FileText className="w-3.5 h-3.5" />
           Load Configuration
-          <ChevronDown className="w-4 h-4 ml-auto" />
+          <ChevronDown className="w-3.5 h-3.5 ml-auto" />
         </button>
       </DropdownMenu.Trigger>
 
       <DropdownMenu.Portal>
         <DropdownMenu.Content
-          className="min-w-[220px] bg-card border border-border rounded-lg shadow-xl p-1 animate-slideDown z-50"
+          className="min-w-[200px] bg-card/95 backdrop-blur rounded-lg shadow-xl p-1 animate-slideDown z-50"
           sideOffset={5}
           align="start"
         >
           {/* Load from File */}
           <DropdownMenu.Item
-            className="flex items-center gap-3 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-accent/20 hover:text-foreground transition-colors"
+            className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
             onSelect={() => {
               setOpen(false);
               onLoadFromFile();
             }}
           >
-            <FolderOpen className="w-4 h-4 text-primary" />
+            <FolderOpen className="w-3.5 h-3.5 text-blue-400" />
             <span className="flex-1">Load from File</span>
           </DropdownMenu.Item>
 
           {/* Separator */}
-          <DropdownMenu.Separator className="h-px bg-border my-1" />
+          <DropdownMenu.Separator className="h-px bg-border/50 my-1" />
 
           {/* Load RAG */}
           <DropdownMenu.Item
-            className="flex items-center gap-3 px-3 py-2 text-sm rounded-md cursor-pointer outline-none hover:bg-accent/20 hover:text-foreground transition-colors"
+            className="flex items-center gap-2 px-3 py-2 text-xs rounded-md cursor-pointer outline-none hover:bg-muted/50 transition-colors"
             onSelect={() => {
               setOpen(false);
               onLoadRAG();
             }}
           >
-            <Sparkles className="w-4 h-4 text-primary" />
-            <span className="flex-1">Load RAG</span>
+            <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+            <span className="flex-1">Load RAG Project</span>
           </DropdownMenu.Item>
         </DropdownMenu.Content>
       </DropdownMenu.Portal>

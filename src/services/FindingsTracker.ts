@@ -20,6 +20,13 @@ import type {
   CodeContext,
 } from "../types/findings";
 import { getCategoryById } from "./FindingCategories";
+import {
+  verificationService,
+  VerificationPendingMarker,
+  VerificationCompletedMarker,
+  VerificationFailedMarker,
+  RunnerRestartMarker,
+} from "./VerificationService";
 
 // Import from refactored modules
 import {
@@ -75,9 +82,13 @@ const OPTIONS_PATTERN = /^Options:\s*(.+)$/m;
 const RESOLUTION_PATTERN = /^Resolution:\s*(.+)$/m;
 
 /**
- * Legacy issue marker patterns (for backward compatibility)
+ * Verification and Runner marker patterns
+ * (These are not findings, but control flow markers)
  */
-const LEGACY_ISSUE_DETECTED_PATTERN = /\[ISSUE:DETECTED\]/;
+const VERIFICATION_PENDING_PATTERN = /\[VERIFICATION:PENDING\]\s*(\{[\s\S]*?\})/;
+const VERIFICATION_COMPLETED_PATTERN = /\[VERIFICATION:COMPLETED\]\s*(\{[\s\S]*?\})/;
+const VERIFICATION_FAILED_PATTERN = /\[VERIFICATION:FAILED\]\s*(\{[\s\S]*?\})/;
+const RUNNER_RESTART_PATTERN = /\[RUNNER:RESTART\]\s*(\{[\s\S]*?\})/;
 
 /**
  * Parse severity string to typed severity
@@ -270,20 +281,56 @@ export class FindingsTracker {
       return null;
     }
 
-    // Check for legacy [ISSUE:DETECTED] markers (backward compatibility)
-    if (LEGACY_ISSUE_DETECTED_PATTERN.test(line)) {
-      const contextAfterMarker = line.split("[ISSUE:DETECTED]")[1]?.trim() || "";
-      const cleanContext = contextAfterMarker.replace(/^\s*\{[\s\S]*$/, "").trim();
+    // Check for [VERIFICATION:PENDING] - AI wants to save verification state
+    const verificationPendingMatch = line.match(VERIFICATION_PENDING_PATTERN);
+    if (verificationPendingMatch) {
+      try {
+        const payload = JSON.parse(verificationPendingMatch[1]) as VerificationPendingMarker;
+        console.log("[FindingsTracker] Verification pending detected:", payload.reason);
+        verificationService.savePendingVerification(payload);
+      } catch (error) {
+        console.error("[FindingsTracker] Failed to parse VERIFICATION:PENDING:", error);
+      }
+      return null;
+    }
 
-      const parsed: ParsedFinding = {
-        categoryId: "code_bug",
-        severity: "medium",
-        title: cleanContext || "Issue detected",
-        description: line,
-        needsInput: false,
-      };
+    // Check for [VERIFICATION:COMPLETED] - AI confirms fix worked
+    const verificationCompletedMatch = line.match(VERIFICATION_COMPLETED_PATTERN);
+    if (verificationCompletedMatch) {
+      try {
+        const payload = JSON.parse(verificationCompletedMatch[1]) as VerificationCompletedMarker;
+        console.log("[FindingsTracker] Verification completed:", payload.message);
+        verificationService.handleVerificationCompleted(payload);
+      } catch (error) {
+        console.error("[FindingsTracker] Failed to parse VERIFICATION:COMPLETED:", error);
+      }
+      return null;
+    }
 
-      return this.addFinding(parsed);
+    // Check for [VERIFICATION:FAILED] - AI reports fix didn't work
+    const verificationFailedMatch = line.match(VERIFICATION_FAILED_PATTERN);
+    if (verificationFailedMatch) {
+      try {
+        const payload = JSON.parse(verificationFailedMatch[1]) as VerificationFailedMarker;
+        console.log("[FindingsTracker] Verification failed:", payload.message);
+        verificationService.handleVerificationFailed(payload);
+      } catch (error) {
+        console.error("[FindingsTracker] Failed to parse VERIFICATION:FAILED:", error);
+      }
+      return null;
+    }
+
+    // Check for [RUNNER:RESTART] - AI wants to restart the runner
+    const restartMatch = line.match(RUNNER_RESTART_PATTERN);
+    if (restartMatch) {
+      try {
+        const payload = JSON.parse(restartMatch[1]) as RunnerRestartMarker;
+        console.log("[FindingsTracker] Runner restart requested:", payload.reason);
+        verificationService.triggerRestart(payload);
+      } catch (error) {
+        console.error("[FindingsTracker] Failed to parse RUNNER:RESTART:", error);
+      }
+      return null;
     }
 
     return null;

@@ -21,7 +21,7 @@ export function SessionStatus() {
       case "complete":
         return "bg-blue-500/20 text-blue-500";
       case "stopped":
-        return "bg-gray-500/20 text-gray-500";
+        return "bg-surface-raised/50 text-text-muted";
       default:
         return "bg-yellow-500/20 text-yellow-500";
     }

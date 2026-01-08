@@ -62,7 +62,7 @@ const scopeConfig: Record<
   builtin: {
     icon: Package,
     label: "Built-in",
-    color: "bg-gray-500/20 text-gray-400 border-gray-500/30",
+    color: "bg-surface-raised/50 text-text-muted border-border-subtle",
   },
 };
 
@@ -206,7 +206,7 @@ export function ContextCard({
                 className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
                   context.enabled
                     ? "bg-green-500/20 text-green-400 border border-green-500/30"
-                    : "bg-gray-500/20 text-gray-400 border border-gray-500/30"
+                    : "bg-surface-raised/50 text-text-muted border border-border-subtle"
                 }`}
               >
                 {context.enabled ? "Enabled" : "Disabled"}
@@ -234,7 +234,7 @@ export function ContextCard({
               )}
               {context.scope === "project" && context.webSyncStatus === "dismissed" && (
                 <span
-                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-500/20 text-gray-400 border border-gray-500/30"
+                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-surface-raised/50 text-text-muted border border-border-subtle"
                   title="Local only (not synced to web)"
                 >
                   <CloudOff className="w-3 h-3 inline-block mr-0.5" />

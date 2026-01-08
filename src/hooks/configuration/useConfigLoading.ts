@@ -16,7 +16,11 @@ import { useConfigFiltering } from "./useConfigFiltering";
 interface UseConfigLoadingOptions {
   onLog?: LogFunction;
   onPythonStart?: () => Promise<boolean>;
-  onConfigLoaded?: (config: Config, workflows: Workflow[]) => void;
+  onConfigLoaded?: (
+    config: Config,
+    workflows: Workflow[],
+    automationEnabledCategories: string[],
+  ) => void;
 }
 
 interface UseConfigLoadingReturn {
@@ -59,8 +63,8 @@ export function useConfigLoading(options: UseConfigLoadingOptions = {}): UseConf
             categories,
           );
 
-          // Notify consumer of loaded config and workflows
-          onConfigLoaded?.(loadedConfig, automationWorkflows);
+          // Notify consumer of loaded config, workflows, and enabled categories
+          onConfigLoaded?.(loadedConfig, automationWorkflows, automationEnabledCategories);
 
           // Log filtering info
           onLog?.("success", `Configuration loaded: ${configPath}`);

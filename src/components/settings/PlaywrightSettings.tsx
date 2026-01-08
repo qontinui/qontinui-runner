@@ -96,18 +96,18 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       />
 
       {/* Authentication Credentials */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg mb-4">Test Authentication</h4>
-        <p className="text-sm text-muted-foreground mb-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Test Authentication</h4>
+        <p className="text-xs text-muted-foreground">
           These credentials are passed to Playwright tests as environment variables
           (PLAYWRIGHT_TEST_USERNAME and PLAYWRIGHT_TEST_PASSWORD). Tests can use them to
           authenticate before running.
         </p>
 
-        <div className="space-y-4">
+        <div className="space-y-3">
           {/* Username/Email */}
-          <div className="space-y-2">
-            <label htmlFor="test-username" className="text-sm font-medium">
+          <div className="space-y-1.5">
+            <label htmlFor="test-username" className="text-xs font-medium">
               Username or Email
             </label>
             <input
@@ -116,13 +116,13 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
               value={settings.test_username || ""}
               onChange={(e) => updateSetting("test_username", e.target.value || null)}
               placeholder="user@example.com"
-              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
             />
           </div>
 
           {/* Password */}
-          <div className="space-y-2">
-            <label htmlFor="test-password" className="text-sm font-medium">
+          <div className="space-y-1.5">
+            <label htmlFor="test-password" className="text-xs font-medium">
               Password
             </label>
             <div className="relative">
@@ -132,14 +132,18 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
                 value={settings.test_password || ""}
                 onChange={(e) => updateSetting("test_password", e.target.value || null)}
                 placeholder="Enter password"
-                className="w-full px-3 py-2 pr-10 border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                className="w-full px-2.5 py-1.5 pr-10 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
               />
               <button
                 type="button"
                 onClick={() => setShowPassword(!showPassword)}
                 className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-muted-foreground hover:text-foreground"
               >
-                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                {showPassword ? (
+                  <EyeOff className="w-3.5 h-3.5" />
+                ) : (
+                  <Eye className="w-3.5 h-3.5" />
+                )}
               </button>
             </div>
           </div>
@@ -147,12 +151,12 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       </div>
 
       {/* Environment Configuration */}
-      <div className="space-y-6 bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg mb-4">Environment</h4>
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Environment</h4>
 
         {/* Base URL */}
-        <div className="space-y-2">
-          <label htmlFor="base-url" className="text-sm font-medium">
+        <div className="space-y-1.5">
+          <label htmlFor="base-url" className="text-xs font-medium">
             Base URL (optional)
           </label>
           <input
@@ -161,31 +165,31 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
             value={settings.base_url || ""}
             onChange={(e) => updateSetting("base_url", e.target.value || null)}
             placeholder="http://localhost:3001"
-            className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+            className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
           />
-          <p className="text-xs text-muted-foreground">
+          <p className="text-[10px] text-muted-foreground">
             Passed as PLAYWRIGHT_BASE_URL. Leave empty to use the default from playwright.config.ts
           </p>
         </div>
 
         {/* Skip Web Server */}
-        <div className="space-y-2 mt-4">
-          <label className="flex items-center justify-between cursor-pointer">
+        <div className="space-y-2 mt-3">
+          <label className="flex items-center justify-between cursor-pointer p-3 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors">
             <div className="space-y-1">
-              <div className="font-medium">Skip Web Server Startup</div>
-              <div className="text-sm text-muted-foreground">
+              <div className="text-sm font-medium">Skip Web Server Startup</div>
+              <div className="text-xs text-muted-foreground">
                 Assume the web server is already running. Sets SKIP_WEB_SERVER=1
               </div>
             </div>
             <button
               onClick={() => updateSetting("skip_web_server", !settings.skip_web_server)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+              className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 settings.skip_web_server ? "bg-primary" : "bg-muted"
               }`}
             >
               <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  settings.skip_web_server ? "translate-x-6" : "translate-x-1"
+                className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                  settings.skip_web_server ? "translate-x-4" : "translate-x-1"
                 }`}
               />
             </button>
@@ -198,7 +202,7 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
         <button
           onClick={handleSave}
           disabled={!hasChanges || isSaving}
-          className={`px-4 py-2 rounded-md font-medium transition-colors ${
+          className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
             hasChanges && !isSaving
               ? "bg-primary text-primary-foreground hover:bg-primary/90"
               : "bg-muted text-muted-foreground cursor-not-allowed"
@@ -209,13 +213,18 @@ export function PlaywrightSettings({ onLog }: PlaywrightSettingsProps) {
       </div>
 
       {/* Info Box */}
-      <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
-        <div className="text-sm text-muted-foreground">
+      <div className="p-3 bg-primary/5 rounded-lg">
+        <div className="text-xs text-muted-foreground">
           <strong className="text-foreground">How it works:</strong> When Playwright tests run,
           these settings are passed as environment variables. Tests can read them using{" "}
-          <code className="bg-muted px-1 rounded">process.env.PLAYWRIGHT_TEST_USERNAME</code> and{" "}
-          <code className="bg-muted px-1 rounded">process.env.PLAYWRIGHT_TEST_PASSWORD</code>. The
-          auth.setup.ts file uses these to log in once and save the session for all tests.
+          <code className="bg-muted px-1 rounded text-[10px]">
+            process.env.PLAYWRIGHT_TEST_USERNAME
+          </code>{" "}
+          and{" "}
+          <code className="bg-muted px-1 rounded text-[10px]">
+            process.env.PLAYWRIGHT_TEST_PASSWORD
+          </code>
+          . The auth.setup.ts file uses these to log in once and save the session for all tests.
         </div>
       </div>
     </div>

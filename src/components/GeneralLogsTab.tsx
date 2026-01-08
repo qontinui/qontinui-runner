@@ -60,73 +60,73 @@ export function GeneralLogsTab({
   });
 
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      {/* Header */}
-      <div className="flex-shrink-0 bg-background flex items-center justify-between border-b border-border p-3">
-        <div className="flex items-center gap-2">
-          <FileText className="w-4 h-4 text-muted-foreground" />
-          <span className="text-sm font-medium">General Logs</span>
-          {logCount > 0 && (
-            <span className="px-1.5 py-0.5 text-xs rounded-full bg-muted text-muted-foreground">
-              {logCount}
-            </span>
-          )}
-        </div>
+    <div className="h-full flex flex-col overflow-hidden p-4">
+      <div className="flex-1 min-h-0 flex flex-col rounded-lg bg-card/50">
+        {/* Header */}
+        <div className="flex-shrink-0 flex items-center justify-between px-3 py-2">
+          <div className="flex items-center gap-2">
+            <FileText className="w-4 h-4 text-blue-400" />
+            <span className="text-sm font-medium">General Logs</span>
+            {logCount > 0 && <span className="badge badge-muted">{logCount}</span>}
+          </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-2">
-          {/* Log Level Filter */}
-          <button
-            onClick={() => onToggleLogFilter(!showLogFilter)}
-            className={`p-1.5 rounded hover:bg-accent transition-colors ${
-              showLogFilter ? "bg-accent text-accent-foreground" : "text-muted-foreground"
-            }`}
-            title="Toggle log filter"
-          >
-            <Filter className="w-4 h-4" />
-          </button>
-
-          {showLogFilter && (
-            <select
-              value={logLevel}
-              onChange={(e) => onLogLevelChange(e.target.value as LogLevel)}
-              className="text-xs bg-muted border border-border rounded px-2 py-1"
+          {/* Actions */}
+          <div className="flex items-center gap-1">
+            {/* Log Level Filter */}
+            <button
+              onClick={() => onToggleLogFilter(!showLogFilter)}
+              className={`p-1.5 rounded-md transition-colors ${
+                showLogFilter
+                  ? "bg-blue-500/20 text-blue-400"
+                  : "text-muted-foreground hover:bg-muted/50"
+              }`}
+              title="Toggle log filter"
             >
-              {LOG_LEVELS.map((level) => (
-                <option key={level} value={level}>
-                  {level.charAt(0).toUpperCase() + level.slice(1)}
-                </option>
-              ))}
-            </select>
-          )}
+              <Filter className="w-3.5 h-3.5" />
+            </button>
 
-          {/* Copy */}
-          <button
-            onClick={onCopyLogs}
-            className="p-1.5 rounded hover:bg-accent transition-colors text-muted-foreground"
-            title="Copy logs to clipboard"
-          >
-            {copySuccess ? (
-              <Check className="w-4 h-4 text-green-500" />
-            ) : (
-              <Copy className="w-4 h-4" />
+            {showLogFilter && (
+              <select
+                value={logLevel}
+                onChange={(e) => onLogLevelChange(e.target.value as LogLevel)}
+                className="text-xs bg-muted/50 rounded-md px-2 py-1 border-0 outline-none focus:ring-1 focus:ring-blue-500/50"
+              >
+                {LOG_LEVELS.map((level) => (
+                  <option key={level} value={level}>
+                    {level.charAt(0).toUpperCase() + level.slice(1)}
+                  </option>
+                ))}
+              </select>
             )}
-          </button>
 
-          {/* Clear */}
-          <button
-            onClick={onClearGeneralLogs}
-            className="p-1.5 rounded hover:bg-accent transition-colors text-muted-foreground"
-            title="Clear logs"
-          >
-            <Trash2 className="w-4 h-4" />
-          </button>
+            {/* Copy */}
+            <button
+              onClick={onCopyLogs}
+              className="p-1.5 rounded-md hover:bg-muted/50 transition-colors text-muted-foreground"
+              title="Copy logs to clipboard"
+            >
+              {copySuccess ? (
+                <Check className="w-3.5 h-3.5 text-green-500" />
+              ) : (
+                <Copy className="w-3.5 h-3.5" />
+              )}
+            </button>
+
+            {/* Clear */}
+            <button
+              onClick={onClearGeneralLogs}
+              className="p-1.5 rounded-md hover:bg-muted/50 transition-colors text-muted-foreground"
+              title="Clear logs"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
-      </div>
 
-      {/* Log Content */}
-      <div className="flex-1 min-h-0 overflow-hidden p-4">
-        <GeneralLogTab logs={filteredLogs} containerRef={logViewerRef} />
+        {/* Log Content */}
+        <div className="flex-1 min-h-0 overflow-hidden px-3 pb-3">
+          <GeneralLogTab logs={filteredLogs} containerRef={logViewerRef} />
+        </div>
       </div>
     </div>
   );

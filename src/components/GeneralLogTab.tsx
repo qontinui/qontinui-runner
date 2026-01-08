@@ -17,32 +17,33 @@ export function GeneralLogTab({ logs, containerRef }: GeneralLogTabProps) {
   return (
     <div
       ref={containerRef}
-      className="log-container font-mono text-sm space-y-1 flex-1 min-h-0 overflow-y-auto"
+      className="h-full font-mono text-xs space-y-0.5 overflow-y-auto scrollbar-dark rounded-md bg-muted/30 p-2"
     >
       {logs.length === 0 ? (
-        <div className="text-center text-muted-foreground py-8">
-          No logs yet. Start a workflow to see execution logs.
+        <div className="empty-state py-8">
+          <span className="text-sm">No logs yet</span>
+          <span className="text-xs mt-1">Start a workflow to see execution logs</span>
         </div>
       ) : (
         logs.map((log) => (
-          <div key={log.id} className="flex gap-2">
-            <span className="text-muted-foreground flex-shrink-0">[{log.timestamp}]</span>
+          <div key={log.id} className="flex gap-2 py-0.5 hover:bg-muted/30 px-1 rounded">
+            <span className="text-muted-foreground/70 flex-shrink-0">[{log.timestamp}]</span>
             <span
-              className={`flex-shrink-0 ${
+              className={`flex-shrink-0 font-medium ${
                 log.level === "error"
-                  ? "text-red-600"
+                  ? "text-red-400"
                   : log.level === "warning"
-                    ? "text-orange-600"
+                    ? "text-orange-400"
                     : log.level === "success"
-                      ? "text-green-600"
+                      ? "text-green-400"
                       : log.level === "debug"
-                        ? "text-blue-600"
-                        : "text-foreground"
+                        ? "text-blue-400"
+                        : "text-muted-foreground"
               }`}
             >
               [{log.level.toUpperCase()}]
             </span>
-            <span className="break-all">{log.message}</span>
+            <span className="break-all text-foreground/90">{log.message}</span>
           </div>
         ))
       )}

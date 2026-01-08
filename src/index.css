@@ -1,3 +1,5 @@
+@import "@qontinui/design-tokens/css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -37,6 +39,67 @@
 }
 
 @layer components {
+  /* ============================================
+   * Typography Scale
+   * Consistent text styles across the app
+   * ============================================ */
+
+  /* Headings */
+  .text-h1 {
+    @apply text-2xl font-bold leading-tight;
+  }
+  .text-h2 {
+    @apply text-xl font-semibold leading-tight;
+  }
+  .text-h3 {
+    @apply text-lg font-semibold leading-snug;
+  }
+  .text-h4 {
+    @apply text-base font-semibold leading-normal;
+  }
+
+  /* Body text */
+  .text-body {
+    @apply text-sm leading-normal;
+  }
+  .text-body-lg {
+    @apply text-base leading-relaxed;
+  }
+  .text-body-sm {
+    @apply text-xs leading-normal;
+  }
+
+  /* Labels and captions */
+  .text-label {
+    @apply text-sm font-medium leading-none;
+  }
+  .text-label-sm {
+    @apply text-xs font-medium leading-none;
+  }
+  .text-caption {
+    @apply text-xs text-muted-foreground leading-normal;
+  }
+
+  /* Code/monospace */
+  .text-code {
+    @apply text-sm font-mono leading-normal;
+  }
+  .text-code-sm {
+    @apply text-xs font-mono leading-normal;
+  }
+
+  /* Stats/numbers */
+  .text-stat {
+    @apply text-3xl font-bold tabular-nums leading-none;
+  }
+  .text-stat-sm {
+    @apply text-xl font-semibold tabular-nums leading-none;
+  }
+
+  /* ============================================
+   * Button System
+   * ============================================ */
+
   .btn-primary {
     @apply px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium transition-all hover:opacity-90 hover:shadow-lg disabled:opacity-50 disabled:cursor-not-allowed;
   }
@@ -60,24 +123,294 @@
   .log-container {
     @apply bg-card/50 border border-border/30 rounded-lg p-4;
   }
+
+  /* ============================================
+   * Borderless Panel System
+   * Modern, clean design with subtle backgrounds
+   * ============================================ */
+
+  /* Main panel container - borderless with subtle background */
+  .panel {
+    @apply rounded-lg bg-card/50;
+  }
+
+  /* Panel with hover interaction */
+  .panel-interactive {
+    @apply rounded-lg bg-card/50 hover:bg-card/70 transition-colors;
+  }
+
+  /* Panel header - compact, no border */
+  .panel-header {
+    @apply flex items-center justify-between px-3 py-2;
+  }
+
+  /* Panel header button (for collapsible panels) */
+  .panel-header-btn {
+    @apply w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors;
+  }
+
+  /* Panel title with icon */
+  .panel-title {
+    @apply flex items-center gap-2 text-sm font-medium;
+  }
+
+  /* Panel content area */
+  .panel-content {
+    @apply px-3 pb-3;
+  }
+
+  /* Panel content with max height and scroll */
+  .panel-content-scroll {
+    @apply max-h-48 overflow-auto px-2 pb-2 scrollbar-dark;
+  }
+
+  /* ============================================
+   * Item Card System
+   * For grid items like tasks, workflows, scripts
+   * ============================================ */
+
+  /* Item card - borderless with subtle hover */
+  .item-card {
+    @apply p-4 rounded-lg bg-muted/30 hover:bg-muted/50 transition-colors;
+  }
+
+  /* Item card with accent color on hover */
+  .item-card-accent {
+    @apply p-4 rounded-lg bg-muted/30 transition-all;
+  }
+
+  .item-card-accent:hover {
+    @apply bg-muted/50;
+  }
+
+  /* Item card header */
+  .item-card-header {
+    @apply flex items-start gap-3;
+  }
+
+  /* Item card icon */
+  .item-card-icon {
+    @apply w-5 h-5 flex-shrink-0 mt-0.5;
+  }
+
+  /* Item card content */
+  .item-card-content {
+    @apply flex-1 min-w-0;
+  }
+
+  /* Item card title */
+  .item-card-title {
+    @apply font-medium truncate;
+  }
+
+  /* Item card description */
+  .item-card-desc {
+    @apply text-sm text-muted-foreground line-clamp-2 mt-1;
+  }
+
+  /* Item card action button */
+  .item-card-action {
+    @apply flex-shrink-0 p-2 rounded-lg transition-colors disabled:opacity-50;
+  }
+
+  /* ============================================
+   * Tab/Pill Navigation System
+   * For horizontal navigation tabs
+   * ============================================ */
+
+  /* Tab container */
+  .tab-container {
+    @apply flex flex-wrap items-center gap-1.5;
+  }
+
+  /* Tab item - base state */
+  .tab-item {
+    @apply flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors;
+  }
+
+  /* Tab item - inactive state */
+  .tab-inactive {
+    @apply bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground;
+  }
+
+  /* Tab item - active state */
+  .tab-active {
+    @apply bg-purple-500/20 text-purple-400;
+  }
+
+  /* Tab item with color accent */
+  .tab-accent-blue {
+    @apply bg-blue-500/20 text-blue-400;
+  }
+  .tab-accent-green {
+    @apply bg-green-500/20 text-green-400;
+  }
+  .tab-accent-amber {
+    @apply bg-amber-500/20 text-amber-400;
+  }
+  .tab-accent-purple {
+    @apply bg-purple-500/20 text-purple-400;
+  }
+  .tab-accent-emerald {
+    @apply bg-emerald-500/20 text-emerald-400;
+  }
+  .tab-accent-red {
+    @apply bg-red-500/20 text-red-400;
+  }
+  .tab-accent-orange {
+    @apply bg-orange-500/20 text-orange-400;
+  }
+
+  /* ============================================
+   * Badge System
+   * For inline status indicators
+   * ============================================ */
+
+  /* Badge base */
+  .badge {
+    @apply inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium;
+  }
+
+  /* Badge variants */
+  .badge-muted {
+    @apply bg-muted/50 text-muted-foreground;
+  }
+  .badge-success {
+    @apply bg-green-500/10 text-green-500;
+  }
+  .badge-warning {
+    @apply bg-yellow-500/10 text-yellow-500;
+  }
+  .badge-danger {
+    @apply bg-red-500/10 text-red-500;
+  }
+  .badge-info {
+    @apply bg-blue-500/10 text-blue-400;
+  }
+  .badge-purple {
+    @apply bg-purple-500/10 text-purple-400;
+  }
+
+  /* ============================================
+   * Status Banner System
+   * For top-level status indicators
+   * ============================================ */
+
+  /* Status banner base */
+  .status-banner {
+    @apply px-4 py-3 rounded-lg;
+  }
+
+  /* Status banner - idle */
+  .status-idle {
+    @apply bg-muted/30;
+  }
+
+  /* Status banner - running */
+  .status-running {
+    @apply bg-emerald-500/10;
+  }
+
+  /* Status banner - error */
+  .status-error {
+    @apply bg-red-500/10;
+  }
+
+  /* ============================================
+   * Empty State
+   * For when there's no content to display
+   * ============================================ */
+
+  .empty-state {
+    @apply flex flex-col items-center justify-center py-12 text-muted-foreground;
+  }
+
+  .empty-state-icon {
+    @apply w-12 h-12 mb-4 opacity-50;
+  }
+
+  .empty-state-title {
+    @apply text-lg font-medium mb-2;
+  }
+
+  .empty-state-desc {
+    @apply text-sm;
+  }
 }
 
 @layer utilities {
+  /* ============================================
+   * Z-Index Scale
+   * Use these instead of arbitrary z-* values
+   * ============================================ */
+  .z-dropdown {
+    z-index: 10;
+  }
+  .z-sticky {
+    z-index: 20;
+  }
+  .z-sidebar {
+    z-index: 30;
+  }
+  .z-popover {
+    z-index: 40;
+  }
+  .z-modal-backdrop {
+    z-index: 50;
+  }
+  .z-modal {
+    z-index: 60;
+  }
+  .z-toast {
+    z-index: 70;
+  }
+  .z-tooltip {
+    z-index: 80;
+  }
+  .z-max {
+    z-index: 100;
+  }
+
+  /* ============================================
+   * Elevation (Shadow) Scale
+   * ============================================ */
+  .elevation-flat {
+    box-shadow: none;
+  }
+  .elevation-raised {
+    @apply shadow-sm;
+  }
+  .elevation-floating {
+    @apply shadow-md;
+  }
+  .elevation-overlay {
+    @apply shadow-lg;
+  }
+  .elevation-prominent {
+    @apply shadow-xl;
+  }
+
+  /* ============================================
+   * Pattern Backgrounds
+   * ============================================ */
   .grid-dots {
     background-image: radial-gradient(circle, rgba(255, 255, 255, 0.1) 1px, transparent 1px);
     background-size: 20px 20px;
   }
 
-  .glow-cyan {
-    box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);
+  .glow-cyan,
+  .glow-primary {
+    box-shadow: 0 0 12px var(--qontinui-glow-primary);
   }
 
-  .glow-purple {
-    box-shadow: 0 0 20px rgba(189, 0, 255, 0.3);
+  .glow-purple,
+  .glow-secondary {
+    box-shadow: 0 0 12px var(--qontinui-glow-secondary);
   }
 
-  .glow-green {
-    box-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+  .glow-green,
+  .glow-success {
+    box-shadow: 0 0 12px var(--qontinui-glow-success);
   }
 
   .pulse-glow {
@@ -86,10 +419,10 @@
 
   @keyframes pulse-glow {
     from {
-      box-shadow: 0 0 20px rgba(0, 217, 255, 0.3);
+      box-shadow: 0 0 12px var(--qontinui-glow-primary);
     }
     to {
-      box-shadow: 0 0 30px rgba(0, 217, 255, 0.6);
+      box-shadow: 0 0 20px var(--qontinui-glow-primary);
     }
   }
 
@@ -130,5 +463,39 @@
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
+  }
+
+  /* Dark themed scrollbar */
+  .scrollbar-dark {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  }
+
+  .scrollbar-dark::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  .scrollbar-dark::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scrollbar-dark::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+  }
+
+  .scrollbar-dark::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+  }
+
+  /* Hide scrollbar utility */
+  .scrollbar-none {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .scrollbar-none::-webkit-scrollbar {
+    display: none;
   }
 }

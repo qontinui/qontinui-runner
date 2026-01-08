@@ -43,15 +43,9 @@ impl Default for ScheduleExpression {
 // ============================================================================
 
 /// Condition that requires the runner to be idle (not executing workflows or AI tasks)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IdleCondition {
     pub enabled: bool,
-}
-
-impl Default for IdleCondition {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 /// A single repository to monitor for inactivity
@@ -64,21 +58,12 @@ pub struct RepositoryWatch {
 }
 
 /// Condition that requires repositories to have no file modifications for a period
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepositoryInactiveCondition {
     pub enabled: bool,
     /// List of repositories to watch (ALL must be inactive for condition to be met)
     #[serde(default)]
     pub repositories: Vec<RepositoryWatch>,
-}
-
-impl Default for RepositoryInactiveCondition {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            repositories: Vec::new(),
-        }
-    }
 }
 
 /// Conditions that must ALL be met before task execution

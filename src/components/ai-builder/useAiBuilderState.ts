@@ -24,6 +24,8 @@ import type {
   WorkflowInfo,
   PlaywrightScriptInfo,
   SavedPromptInfo,
+  GuiWorkflowInfo,
+  VerificationTestInfo,
 } from "./types";
 import { sessionToAiDeveloperState } from "./types";
 import {
@@ -126,6 +128,12 @@ export function useAiBuilderState({
 
   // Saved prompts from the prompt library
   const [savedPrompts, setSavedPrompts] = useState<SavedPromptInfo[]>([]);
+
+  // GUI Workflows from the GUI Workflows library
+  const [guiWorkflows, setGuiWorkflows] = useState<GuiWorkflowInfo[]>([]);
+
+  // Verification Tests from the Test Builder
+  const [verificationTests, setVerificationTests] = useState<VerificationTestInfo[]>([]);
 
   // Selected stored config ID - persisted to localStorage
   const [selectedConfigId, setSelectedConfigId] = useState<string | null>(() => {
@@ -371,6 +379,65 @@ export function useAiBuilderState({
     fetchSavedPrompts();
   }, []);
 
+  // Fetch GUI workflows for the dropdown
+  useEffect(() => {
+    const fetchGuiWorkflows = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/gui-workflows");
+        const result = await response.json();
+        if (result.success && result.data) {
+          setGuiWorkflows(
+            result.data.map(
+              (w: { id: string; name: string; description: string; steps: unknown[] }) => ({
+                id: w.id,
+                name: w.name,
+                description: w.description,
+                stepCount: w.steps?.length || 0,
+              }),
+            ),
+          );
+        }
+      } catch (error) {
+        console.error("Failed to fetch GUI workflows:", error);
+      }
+    };
+    fetchGuiWorkflows();
+  }, []);
+
+  // Fetch verification tests for the dropdown
+  useEffect(() => {
+    const fetchVerificationTests = async () => {
+      try {
+        const response = await fetch("http://localhost:9876/tests?enabled_only=true");
+        const result = await response.json();
+        if (result.success && result.data) {
+          setVerificationTests(
+            result.data.map(
+              (t: {
+                id: string;
+                name: string;
+                description: string;
+                test_type: string;
+                category?: string;
+                is_critical: boolean;
+              }) => ({
+                id: t.id,
+                name: t.name,
+                description: t.description || "",
+                test_type: t.test_type,
+                category: t.category,
+                is_critical: t.is_critical,
+              }),
+            ),
+          );
+        }
+      } catch (error) {
+        console.error("Failed to fetch verification tests:", error);
+      }
+    };
+    fetchVerificationTests();
+  }, []);
+
   // Check for resumable workflows on mount and periodically
   useEffect(() => {
     const checkResumableWorkflow = async () => {
@@ -599,6 +666,21 @@ export function useAiBuilderState({
     [],
   );
 
+  // Add a GUI workflow step
+  const addGuiWorkflowStep = useCallback((workflowId: string, workflowName: string) => {
+    const newStep: ExecutionStep = {
+      id: crypto.randomUUID(),
+      type: "gui_workflow",
+      name: `GUI Workflow: ${workflowName}`,
+      takeScreenshot: false,
+      guiWorkflowId: workflowId,
+      guiWorkflowName: workflowName,
+    };
+    setExecutionSteps((prev) => [...prev, newStep]);
+    setShowAddDropdown(false);
+    setHasUnsavedChanges(true);
+  }, []);
+
   // Add a screenshot step
   const addScreenshotStep = useCallback(() => {
     const newStep: ExecutionStep = {
@@ -613,6 +695,25 @@ export function useAiBuilderState({
     setShowAddDropdown(false);
     setHasUnsavedChanges(true);
   }, []);
+
+  // Add a verification test step
+  const addTestStep = useCallback(
+    (testId: string, testName: string, testType: string, isCritical: boolean) => {
+      const newStep: ExecutionStep = {
+        id: crypto.randomUUID(),
+        type: "test",
+        name: `Test: ${testName}`,
+        takeScreenshot: true, // Capture screenshot after test
+        testId,
+        testType: testType as ExecutionStep["testType"],
+        testIsCritical: isCritical,
+      };
+      setExecutionSteps((prev) => [...prev, newStep]);
+      setShowAddDropdown(false);
+      setHasUnsavedChanges(true);
+    },
+    [],
+  );
 
   // Update screenshot monitor for a step
   const updateScreenshotMonitor = useCallback((stepId: string, monitor: number | "all") => {
@@ -1218,7 +1319,9 @@ ${step.promptContent || "(No content)"}
     setExecutionSteps,
     addStep,
     addActionStep,
+    addGuiWorkflowStep,
     addScreenshotStep,
+    addTestStep,
     removeStep,
     toggleStepScreenshot,
     updateScreenshotDelay,
@@ -1318,6 +1421,8 @@ ${step.promptContent || "(No content)"}
     workflows,
     playwrightScripts,
     savedPrompts,
+    guiWorkflows,
+    verificationTests,
     workspacePaths,
 
     // External Props

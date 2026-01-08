@@ -86,6 +86,9 @@ pub struct JsonlLogsResult {
     pub count: usize,
     pub file_path: String,
     pub file_exists: bool,
+    pub task_run_id: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
 }
 
 /// Get the .dev-logs directory path.
@@ -152,6 +155,9 @@ pub async fn read_jsonl_logs_for_viewer(
                 count,
                 file_path: file_path_str,
                 file_exists,
+                task_run_id: None,
+                start_time: None,
+                end_time: None,
             }))
         }
         Err(e) => {
@@ -159,6 +165,335 @@ pub async fn read_jsonl_logs_for_viewer(
             Ok(AiDataResponse::err(e))
         }
     }
+}
+
+/// Parse timestamp from a JSONL entry.
+/// Supports various timestamp formats found in log entries.
+fn parse_jsonl_timestamp(entry: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let timestamp_value = entry
+        .get("timestamp")
+        .or_else(|| entry.get("time"))
+        .or_else(|| entry.get("ts"))?;
+
+    // Try numeric timestamp (epoch milliseconds)
+    if let Some(ms) = timestamp_value.as_i64() {
+        return DateTime::from_timestamp_millis(ms).map(|dt| dt.with_timezone(&Utc));
+    }
+
+    // Try numeric as u64
+    if let Some(ms) = timestamp_value.as_u64() {
+        return DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.with_timezone(&Utc));
+    }
+
+    // Try numeric as f64 (some systems use float timestamps)
+    if let Some(ms) = timestamp_value.as_f64() {
+        return DateTime::from_timestamp_millis(ms as i64).map(|dt| dt.with_timezone(&Utc));
+    }
+
+    // Try string formats
+    let timestamp_str = timestamp_value.as_str()?;
+
+    // Try RFC3339 format first (e.g., "2026-01-07T10:30:00Z")
+    if let Ok(dt) = DateTime::parse_from_rfc3339(timestamp_str) {
+        return Some(dt.with_timezone(&Utc));
+    }
+
+    // Try ISO format without timezone (e.g., "2026-01-07T10:30:00")
+    if let Ok(dt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S") {
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+
+    // Try simple format (e.g., "2026-01-07 10:30:00")
+    if let Ok(dt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S") {
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+
+    // Try milliseconds format
+    if let Ok(dt) = NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.3f") {
+        return Some(DateTime::from_naive_utc_and_offset(dt, Utc));
+    }
+
+    None
+}
+
+/// Read JSONL log file and return entries filtered by time range.
+fn read_jsonl_file_in_time_range(
+    path: &PathBuf,
+    start_time: DateTime<Utc>,
+    end_time: Option<DateTime<Utc>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let end = end_time.unwrap_or_else(Utc::now);
+
+    let entries: Vec<serde_json::Value> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|entry: &serde_json::Value| {
+            if let Some(ts) = parse_jsonl_timestamp(entry) {
+                ts >= start_time && ts <= end
+            } else {
+                // Include entries without parseable timestamps
+                true
+            }
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+/// Read JSONL logs filtered by task run time range.
+#[tauri::command]
+pub async fn read_jsonl_logs_for_task_run(
+    state: State<'_, Arc<AppState>>,
+    log_type: String,
+    task_run_id: String,
+) -> Result<AiDataResponse<JsonlLogsResult>, String> {
+    // Get the task run to get time range
+    let task_run = match state.checkpoint_db.get_task_run(&task_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return Ok(AiDataResponse::err(format!(
+                "Task run not found: {}",
+                task_run_id
+            )));
+        }
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+
+    // Parse task run times
+    let start_time = DateTime::parse_from_rfc3339(&task_run.created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("Failed to parse start time: {}", e))?;
+
+    let end_time = task_run
+        .completed_at
+        .as_ref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let dev_logs_dir = get_dev_logs_dir();
+
+    let filename = match log_type.as_str() {
+        "general" => "runner-general.jsonl",
+        "actions" => "runner-actions.jsonl",
+        "image-recognition" => "runner-image-recognition.jsonl",
+        "playwright" => "runner-playwright.jsonl",
+        "ai-output" => "ai-output.jsonl",
+        _ => {
+            return Ok(AiDataResponse::err(format!(
+                "Unknown log type: {}. Valid types: general, actions, image-recognition, playwright, ai-output",
+                log_type
+            )));
+        }
+    };
+
+    let file_path = dev_logs_dir.join(filename);
+    let file_exists = file_path.exists();
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    match read_jsonl_file_in_time_range(&file_path, start_time, end_time) {
+        Ok(entries) => {
+            let count = entries.len();
+            Ok(AiDataResponse::ok(JsonlLogsResult {
+                log_type,
+                entries,
+                count,
+                file_path: file_path_str,
+                file_exists,
+                task_run_id: Some(task_run_id),
+                start_time: Some(task_run.created_at),
+                end_time: task_run.completed_at,
+            }))
+        }
+        Err(e) => {
+            warn!("Failed to read JSONL logs: {}", e);
+            Ok(AiDataResponse::err(e))
+        }
+    }
+}
+
+// =============================================================================
+// Consolidated AI Output (grouped by source with readable format)
+// =============================================================================
+
+/// A chunk of consolidated AI output from a single source.
+#[derive(Debug, Serialize)]
+pub struct AiOutputChunk {
+    /// Source of the output (e.g., "claude", "prompt")
+    pub source: String,
+    /// Start time of this chunk (formatted as HH:MM:SS)
+    pub start_time: String,
+    /// End time of this chunk (formatted as HH:MM:SS), None if single entry
+    pub end_time: Option<String>,
+    /// Combined content from all entries in this chunk
+    pub content: String,
+    /// Number of raw entries that were consolidated
+    pub entry_count: usize,
+}
+
+/// Result of reading consolidated AI output.
+#[derive(Debug, Serialize)]
+pub struct ConsolidatedAiOutputResult {
+    pub chunks: Vec<AiOutputChunk>,
+    pub total_entries: usize,
+    pub task_run_id: String,
+    pub start_time: String,
+    pub end_time: Option<String>,
+}
+
+/// Read and consolidate AI output logs for a task run.
+/// Groups consecutive entries by source into readable chunks.
+#[tauri::command]
+pub async fn get_consolidated_ai_output(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<ConsolidatedAiOutputResult>, String> {
+    // Get the task run to get time range
+    let task_run = match state.checkpoint_db.get_task_run(&task_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return Ok(AiDataResponse::err(format!(
+                "Task run not found: {}",
+                task_run_id
+            )));
+        }
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+
+    // Parse task run times
+    let start_time = DateTime::parse_from_rfc3339(&task_run.created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("Failed to parse start time: {}", e))?;
+
+    let end_time = task_run
+        .completed_at
+        .as_ref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let dev_logs_dir = get_dev_logs_dir();
+    let file_path = dev_logs_dir.join("ai-output.jsonl");
+
+    if !file_path.exists() {
+        return Ok(AiDataResponse::ok(ConsolidatedAiOutputResult {
+            chunks: vec![],
+            total_entries: 0,
+            task_run_id,
+            start_time: task_run.created_at.clone(),
+            end_time: task_run.completed_at.clone(),
+        }));
+    }
+
+    // Read and filter entries
+    let content =
+        fs::read_to_string(&file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+
+    let end = end_time.unwrap_or_else(Utc::now);
+
+    // Parse entries with timestamp and source
+    struct ParsedEntry {
+        timestamp: DateTime<Utc>,
+        source: String,
+        line: String,
+    }
+
+    let mut entries: Vec<ParsedEntry> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|entry| {
+            let ts = parse_jsonl_timestamp(&entry)?;
+            if ts < start_time || ts > end {
+                return None;
+            }
+            let source = entry.get("source")?.as_str()?.to_string();
+            let line = entry.get("line")?.as_str()?.to_string();
+            Some(ParsedEntry {
+                timestamp: ts,
+                source,
+                line,
+            })
+        })
+        .collect();
+
+    let total_entries = entries.len();
+
+    // Sort by timestamp
+    entries.sort_by_key(|e| e.timestamp);
+
+    // Consolidate consecutive entries by source
+    let mut chunks: Vec<AiOutputChunk> = Vec::new();
+    let mut current_source: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut chunk_start: Option<DateTime<Utc>> = None;
+    let mut chunk_end: Option<DateTime<Utc>> = None;
+    let mut chunk_count: usize = 0;
+
+    for entry in entries {
+        if current_source.as_ref() == Some(&entry.source) {
+            // Same source, add to current chunk
+            current_lines.push(entry.line);
+            chunk_end = Some(entry.timestamp);
+            chunk_count += 1;
+        } else {
+            // Different source, finalize current chunk and start new one
+            if let Some(source) = current_source.take() {
+                if !current_lines.is_empty() {
+                    chunks.push(AiOutputChunk {
+                        source,
+                        start_time: chunk_start
+                            .map(|t| t.format("%H:%M:%S").to_string())
+                            .unwrap_or_default(),
+                        end_time: if chunk_count > 1 {
+                            chunk_end.map(|t| t.format("%H:%M:%S").to_string())
+                        } else {
+                            None
+                        },
+                        content: current_lines.join("\n"),
+                        entry_count: chunk_count,
+                    });
+                }
+            }
+            // Start new chunk
+            current_source = Some(entry.source);
+            current_lines = vec![entry.line];
+            chunk_start = Some(entry.timestamp);
+            chunk_end = Some(entry.timestamp);
+            chunk_count = 1;
+        }
+    }
+
+    // Don't forget the last chunk
+    if let Some(source) = current_source {
+        if !current_lines.is_empty() {
+            chunks.push(AiOutputChunk {
+                source,
+                start_time: chunk_start
+                    .map(|t| t.format("%H:%M:%S").to_string())
+                    .unwrap_or_default(),
+                end_time: if chunk_count > 1 {
+                    chunk_end.map(|t| t.format("%H:%M:%S").to_string())
+                } else {
+                    None
+                },
+                content: current_lines.join("\n"),
+                entry_count: chunk_count,
+            });
+        }
+    }
+
+    Ok(AiDataResponse::ok(ConsolidatedAiOutputResult {
+        chunks,
+        total_entries,
+        task_run_id,
+        start_time: task_run.created_at,
+        end_time: task_run.completed_at,
+    }))
 }
 
 /// Summary of all available JSONL logs.
@@ -207,4 +542,574 @@ pub async fn get_jsonl_logs_summary() -> Result<AiDataResponse<JsonlLogsSummary>
         playwright: get_file_info(&dev_logs_dir, "runner-playwright.jsonl"),
         ai_output: get_file_info(&dev_logs_dir, "ai-output.jsonl"),
     }))
+}
+
+/// Reopen a finished task run to add more iterations.
+/// This allows continuing a task that didn't achieve its goal.
+#[tauri::command]
+pub async fn reopen_task_run(
+    state: State<'_, Arc<AppState>>,
+    task_id: String,
+    additional_sessions: u32,
+) -> Result<AiDataResponse<TaskRun>, String> {
+    // Validate additional_sessions
+    if additional_sessions == 0 {
+        return Ok(AiDataResponse::err(
+            "additional_sessions must be greater than 0".to_string(),
+        ));
+    }
+    if additional_sessions > 100 {
+        return Ok(AiDataResponse::err(
+            "additional_sessions cannot exceed 100".to_string(),
+        ));
+    }
+
+    match state
+        .checkpoint_db
+        .reopen_task_run(&task_id, additional_sessions)
+    {
+        Ok(run) => Ok(AiDataResponse::ok(run)),
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
+}
+
+// =============================================================================
+// Text Log Files (plain text, not JSONL) - Filtered by Task Run
+// =============================================================================
+
+use chrono::{DateTime, NaiveDateTime, Utc};
+
+/// Result of reading text logs for a task run.
+#[derive(Debug, Serialize)]
+pub struct TextLogsResult {
+    pub log_type: String,
+    pub content: String,
+    pub line_count: usize,
+    pub file_path: String,
+    pub file_exists: bool,
+    pub task_run_id: Option<String>,
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+}
+
+/// Info about a single text log file for a task run.
+#[derive(Debug, Serialize)]
+pub struct TextLogFileInfo {
+    pub log_type: String,
+    pub file_path: String,
+    pub file_exists: bool,
+    pub line_count: usize,
+}
+
+/// Summary of all text log files for a task run.
+#[derive(Debug, Serialize)]
+pub struct TextLogsSummary {
+    pub task_run_id: String,
+    pub start_time: String,
+    pub end_time: Option<String>,
+    pub logs: Vec<TextLogFileInfo>,
+}
+
+/// Parse timestamp from a log line.
+/// Supports format: "2026-01-06 18:22:53" at the start of the line
+fn parse_log_timestamp(line: &str) -> Option<DateTime<Utc>> {
+    // Format: "2026-01-06 18:22:53 [info ..."
+    if line.len() < 19 {
+        return None;
+    }
+    let timestamp_str = &line[..19];
+    NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .map(|dt| DateTime::from_naive_utc_and_offset(dt, Utc))
+}
+
+/// Read log lines filtered by time range.
+fn read_logs_in_time_range(
+    path: &PathBuf,
+    start_time: DateTime<Utc>,
+    end_time: Option<DateTime<Utc>>,
+) -> Result<(String, usize), String> {
+    if !path.exists() {
+        return Ok((String::new(), 0));
+    }
+
+    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let end = end_time.unwrap_or_else(Utc::now);
+
+    let filtered_lines: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            if let Some(ts) = parse_log_timestamp(line) {
+                ts >= start_time && ts <= end
+            } else {
+                false // Skip lines without parseable timestamps
+            }
+        })
+        .collect();
+
+    let line_count = filtered_lines.len();
+    Ok((filtered_lines.join("\n"), line_count))
+}
+
+/// Count log lines in time range (for summary).
+fn count_logs_in_time_range(
+    path: &PathBuf,
+    start_time: DateTime<Utc>,
+    end_time: Option<DateTime<Utc>>,
+) -> usize {
+    if !path.exists() {
+        return 0;
+    }
+
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    let end = end_time.unwrap_or_else(Utc::now);
+
+    content
+        .lines()
+        .filter(|line| {
+            if let Some(ts) = parse_log_timestamp(line) {
+                ts >= start_time && ts <= end
+            } else {
+                false
+            }
+        })
+        .count()
+}
+
+/// Get the filename for a log type.
+fn get_log_filename(log_type: &str) -> Option<&'static str> {
+    match log_type {
+        "backend" => Some("backend.log"),
+        "backend-err" => Some("backend.err.log"),
+        "qontinui-api" => Some("qontinui-api.log"),
+        "qontinui-api-err" => Some("qontinui-api.err.log"),
+        _ => None,
+    }
+}
+
+/// Read text logs for a specific task run.
+#[tauri::command]
+pub async fn read_text_logs_for_viewer(
+    state: State<'_, Arc<AppState>>,
+    log_type: String,
+    task_run_id: String,
+) -> Result<AiDataResponse<TextLogsResult>, String> {
+    // Get the task run to get time range
+    let task_run = match state.checkpoint_db.get_task_run(&task_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return Ok(AiDataResponse::err(format!(
+                "Task run not found: {}",
+                task_run_id
+            )));
+        }
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+
+    // Parse task run times
+    let start_time = DateTime::parse_from_rfc3339(&task_run.created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("Failed to parse start time: {}", e))?;
+
+    let end_time = task_run
+        .completed_at
+        .as_ref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let dev_logs_dir = get_dev_logs_dir();
+
+    let filename = match get_log_filename(&log_type) {
+        Some(f) => f,
+        None => {
+            return Ok(AiDataResponse::err(format!(
+                "Unknown log type: {}. Valid types: backend, backend-err, qontinui-api, qontinui-api-err",
+                log_type
+            )));
+        }
+    };
+
+    let file_path = dev_logs_dir.join(filename);
+    let file_exists = file_path.exists();
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    match read_logs_in_time_range(&file_path, start_time, end_time) {
+        Ok((content, line_count)) => Ok(AiDataResponse::ok(TextLogsResult {
+            log_type,
+            content,
+            line_count,
+            file_path: file_path_str,
+            file_exists,
+            task_run_id: Some(task_run_id),
+            start_time: Some(task_run.created_at),
+            end_time: task_run.completed_at,
+        })),
+        Err(e) => {
+            warn!("Failed to read text logs: {}", e);
+            Ok(AiDataResponse::err(e))
+        }
+    }
+}
+
+/// Get summary of all text log files for a task run.
+#[tauri::command]
+pub async fn get_text_logs_summary(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<TextLogsSummary>, String> {
+    // Get the task run to get time range
+    let task_run = match state.checkpoint_db.get_task_run(&task_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return Ok(AiDataResponse::err(format!(
+                "Task run not found: {}",
+                task_run_id
+            )));
+        }
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+
+    // Parse task run times
+    let start_time = DateTime::parse_from_rfc3339(&task_run.created_at)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("Failed to parse start time: {}", e))?;
+
+    let end_time = task_run
+        .completed_at
+        .as_ref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|dt| dt.with_timezone(&Utc));
+
+    let dev_logs_dir = get_dev_logs_dir();
+
+    let log_types = ["backend", "backend-err", "qontinui-api", "qontinui-api-err"];
+    let mut logs = Vec::new();
+
+    for log_type in log_types {
+        if let Some(filename) = get_log_filename(log_type) {
+            let path = dev_logs_dir.join(filename);
+            let exists = path.exists();
+            let count = count_logs_in_time_range(&path, start_time, end_time);
+
+            logs.push(TextLogFileInfo {
+                log_type: log_type.to_string(),
+                file_path: path.to_string_lossy().to_string(),
+                file_exists: exists,
+                line_count: count,
+            });
+        }
+    }
+
+    Ok(AiDataResponse::ok(TextLogsSummary {
+        task_run_id,
+        start_time: task_run.created_at,
+        end_time: task_run.completed_at,
+        logs,
+    }))
+}
+
+// =============================================================================
+// Screenshots
+// =============================================================================
+
+/// Screenshot file info
+#[derive(Debug, Serialize)]
+pub struct ScreenshotInfo {
+    pub filename: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub modified: Option<String>,
+}
+
+/// Screenshots result
+#[derive(Debug, Serialize)]
+pub struct ScreenshotsResult {
+    pub annotated: Vec<ScreenshotInfo>,
+    pub playwright: Vec<ScreenshotInfo>,
+}
+
+fn list_screenshots_in_dir(dir: &PathBuf) -> Vec<ScreenshotInfo> {
+    if !dir.exists() {
+        return vec![];
+    }
+
+    let mut screenshots = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension() {
+                    if ext == "png" || ext == "jpg" || ext == "jpeg" {
+                        let metadata = fs::metadata(&path).ok();
+                        screenshots.push(ScreenshotInfo {
+                            filename: path
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string(),
+                            path: path.to_string_lossy().to_string(),
+                            size_bytes: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
+                            modified: metadata.and_then(|m| m.modified().ok()).map(|t| {
+                                let datetime: DateTime<Utc> = t.into();
+                                datetime.to_rfc3339()
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Sort by modified time, newest first
+    screenshots.sort_by(|a, b| b.modified.cmp(&a.modified));
+    screenshots
+}
+
+/// Get list of screenshots
+#[tauri::command]
+pub async fn get_screenshots_for_viewer() -> Result<AiDataResponse<ScreenshotsResult>, String> {
+    let dev_logs_dir = get_dev_logs_dir();
+
+    let annotated = list_screenshots_in_dir(&dev_logs_dir.join("screenshots"));
+    let playwright = list_screenshots_in_dir(&dev_logs_dir.join("playwright-screenshots"));
+
+    Ok(AiDataResponse::ok(ScreenshotsResult {
+        annotated,
+        playwright,
+    }))
+}
+
+// =============================================================================
+// Loaded Config
+// =============================================================================
+
+/// Loaded config info
+#[derive(Debug, Serialize)]
+pub struct LoadedConfigInfo {
+    pub config_content: Option<String>,
+    pub config_path: Option<String>,
+    pub config_format: Option<String>,
+    pub meta: Option<serde_json::Value>,
+}
+
+/// Get the currently loaded config
+#[tauri::command]
+pub async fn get_loaded_config_for_viewer() -> Result<AiDataResponse<LoadedConfigInfo>, String> {
+    let dev_logs_dir = get_dev_logs_dir();
+
+    // Try to read config file (JSON or YAML)
+    let json_path = dev_logs_dir.join("last-loaded-config.json");
+    let yaml_path = dev_logs_dir.join("last-loaded-config.yaml");
+    let meta_path = dev_logs_dir.join("last-loaded-config.meta.json");
+
+    let (config_content, config_path, config_format) = if json_path.exists() {
+        (
+            fs::read_to_string(&json_path).ok(),
+            Some(json_path.to_string_lossy().to_string()),
+            Some("json".to_string()),
+        )
+    } else if yaml_path.exists() {
+        (
+            fs::read_to_string(&yaml_path).ok(),
+            Some(yaml_path.to_string_lossy().to_string()),
+            Some("yaml".to_string()),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    let meta = if meta_path.exists() {
+        fs::read_to_string(&meta_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+
+    Ok(AiDataResponse::ok(LoadedConfigInfo {
+        config_content,
+        config_path,
+        config_format,
+        meta,
+    }))
+}
+
+// =============================================================================
+// AI Prompts (the actual prompts sent to Claude)
+// =============================================================================
+
+/// AI prompt info
+#[derive(Debug, Serialize)]
+pub struct AiPromptInfo {
+    pub prompt_file: String,
+    pub content: String,
+    pub iteration: Option<u32>,
+}
+
+/// AI prompts result for a task run
+#[derive(Debug, Serialize)]
+pub struct AiPromptsResult {
+    pub task_run_id: String,
+    pub prompts: Vec<AiPromptInfo>,
+}
+
+/// Get AI prompts for a task run
+#[tauri::command]
+pub async fn get_ai_prompts_for_viewer(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<AiPromptsResult>, String> {
+    // Get the task run to find associated prompt files
+    let task_run = match state.checkpoint_db.get_task_run(&task_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return Ok(AiDataResponse::err(format!(
+                "Task run not found: {}",
+                task_run_id
+            )));
+        }
+        Err(e) => return Ok(AiDataResponse::err(e)),
+    };
+
+    let dev_logs_dir = get_dev_logs_dir();
+    let mut prompts = Vec::new();
+
+    // Look for prompt files that match this task run
+    // Pattern: ai-developer-{id}-prompt.txt or ai-developer-{id}-iter{N}-prompt.txt
+    if let Ok(entries) = fs::read_dir(&dev_logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(filename) = path.file_name() {
+                    let filename_str = filename.to_string_lossy();
+
+                    // Check if this prompt file belongs to this task run
+                    // Task run IDs are like "mjklrc88zspgp" and files are like "ai-developer-mjklrc88zspgp-prompt.txt"
+                    if filename_str.contains(&task_run_id) && filename_str.ends_with("-prompt.txt")
+                    {
+                        if let Ok(content) = fs::read_to_string(&path) {
+                            // Determine iteration number
+                            let iteration = if filename_str.contains("-iter") {
+                                filename_str
+                                    .split("-iter")
+                                    .nth(1)
+                                    .and_then(|s| s.split('-').next())
+                                    .and_then(|s| s.parse().ok())
+                            } else {
+                                Some(1)
+                            };
+
+                            prompts.push(AiPromptInfo {
+                                prompt_file: filename_str.to_string(),
+                                content,
+                                iteration,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check if task run has an embedded prompt
+    if prompts.is_empty() {
+        if let Some(prompt) = &task_run.prompt {
+            if !prompt.is_empty() {
+                prompts.push(AiPromptInfo {
+                    prompt_file: "embedded".to_string(),
+                    content: prompt.clone(),
+                    iteration: Some(1),
+                });
+            }
+        }
+    }
+
+    // Sort by iteration
+    prompts.sort_by_key(|p| p.iteration);
+
+    Ok(AiDataResponse::ok(AiPromptsResult {
+        task_run_id,
+        prompts,
+    }))
+}
+
+// =============================================================================
+// Contexts (available context snippets)
+// =============================================================================
+
+use crate::context;
+
+/// Context info
+#[derive(Debug, Serialize)]
+pub struct ContextInfo {
+    pub id: String,
+    pub name: String,
+    pub context_type: String, // "builtin", "project", "user"
+    pub category: Option<String>,
+    pub tags: Vec<String>,
+    pub content: String,
+    pub enabled: bool,
+    pub auto_include: Option<serde_json::Value>,
+}
+
+/// Contexts result
+#[derive(Debug, Serialize)]
+pub struct ContextsResult {
+    pub contexts: Vec<ContextInfo>,
+}
+
+/// Get available contexts
+#[tauri::command]
+pub async fn get_contexts_for_viewer() -> Result<AiDataResponse<ContextsResult>, String> {
+    // Load user contexts
+    let library = context::load_user_context_library();
+    let mut contexts = Vec::new();
+
+    // Add user contexts
+    for ctx in &library.contexts {
+        let metadata = library.metadata.iter().find(|m| m.context_id == ctx.id);
+        contexts.push(ContextInfo {
+            id: ctx.id.clone(),
+            name: ctx.name.clone(),
+            context_type: "user".to_string(),
+            category: ctx.category.clone(),
+            tags: ctx.tags.clone(),
+            content: ctx.content.clone(),
+            enabled: metadata.map(|m| m.enabled).unwrap_or(true),
+            auto_include: ctx.auto_include.as_ref().map(|ai| {
+                serde_json::json!({
+                    "task_mentions": ai.task_mentions,
+                    "action_types": ai.action_types,
+                    "error_patterns": ai.error_patterns,
+                    "file_patterns": ai.file_patterns,
+                })
+            }),
+        });
+    }
+
+    // Add builtin contexts
+    for ctx in context::get_builtin_contexts() {
+        contexts.push(ContextInfo {
+            id: ctx.id.clone(),
+            name: ctx.name.clone(),
+            context_type: "builtin".to_string(),
+            category: ctx.category.clone(),
+            tags: ctx.tags.clone(),
+            content: ctx.content.clone(),
+            enabled: true,
+            auto_include: ctx.auto_include.as_ref().map(|ai| {
+                serde_json::json!({
+                    "task_mentions": ai.task_mentions,
+                    "action_types": ai.action_types,
+                    "error_patterns": ai.error_patterns,
+                    "file_patterns": ai.file_patterns,
+                })
+            }),
+        });
+    }
+
+    Ok(AiDataResponse::ok(ContextsResult { contexts }))
 }

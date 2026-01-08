@@ -7,6 +7,9 @@
  * - Run history with trend
  * - Error patterns
  * - Run details slide-out panel
+ *
+ * Note: This shows config-level automation statistics, not task run statistics.
+ * Task runs and automation runs are different data sources.
  */
 
 import { useState } from "react";
@@ -28,24 +31,27 @@ interface StatisticsTabProps {
 export function StatisticsTab({ configId, configName }: StatisticsTabProps) {
   const [selectedRun, setSelectedRun] = useState<RunDetails | null>(null);
 
-  // Use RunSelectionContext if available - use selected run's config_id if present
+  // Use RunSelectionContext to check if we're in a run selection context
+  // Note: TaskRuns don't have config_id, so we just use the prop configId
   const runSelection = useRunSelectionOptional();
-  const selectedRunFromContext = runSelection?.selectedRun;
-  const effectiveConfigId = selectedRunFromContext?.config_id || configId;
-  const effectiveConfigName = selectedRunFromContext?.workflow_name || configName;
+  const selectedTaskRun = runSelection?.selectedRun;
+
+  // Use the provided configId for statistics (not from TaskRun)
+  const effectiveConfigId = configId;
+  const effectiveConfigName = configName;
 
   const { data: stats, isLoading, error, refetch } = useConfigStatistics(effectiveConfigId);
   const { data: flakyItems } = useFlakyItems(effectiveConfigId);
   const { data: recentRuns } = useRecentRuns(effectiveConfigId, 50);
 
-  // No run selected state (when context is present but no run selected)
-  if (runSelection && !selectedRunFromContext) {
+  // No run selected state (when context is present but no task run selected)
+  if (runSelection && !selectedTaskRun) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
         <Activity className="w-12 h-12 mb-4 opacity-50" />
         <p className="text-lg font-medium">No Run Selected</p>
         <p className="text-sm mt-2 text-center max-w-md">
-          Select a run from the Run Dashboard to view statistics for that configuration.
+          Select a run from the Run Dashboard to view statistics.
         </p>
       </div>
     );

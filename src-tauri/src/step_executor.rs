@@ -12,6 +12,7 @@
 use crate::action_service::UnifiedActionService;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
+use crate::executor::file_logger::FileLogger;
 use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, ActionEvent, ImageRecognitionEvent,
     RelevantLogSources,
@@ -306,14 +307,45 @@ impl ExecutionResult {
 /// Step Executor - executes automation steps using UnifiedActionService
 pub struct StepExecutor {
     action_service: UnifiedActionService,
+    app_state: Arc<AppState>,
 }
 
 impl StepExecutor {
     /// Create a new StepExecutor
     pub fn new(app_state: Arc<AppState>, config_storage: Arc<TokioMutex<ConfigStorage>>) -> Self {
         Self {
-            action_service: UnifiedActionService::new(app_state, config_storage),
+            action_service: UnifiedActionService::new(app_state.clone(), config_storage),
+            app_state,
         }
+    }
+
+    /// Record a screenshot capture event to the RunRecordingHandler.
+    ///
+    /// This ensures screenshots captured directly by the step executor
+    /// (not through Python) are still recorded in the automation logs.
+    async fn record_screenshot_event(
+        &self,
+        screenshot_type: &str,
+        file_path: &str,
+        monitor: Option<i32>,
+        delay_seconds: Option<u32>,
+        success: bool,
+        associated_action: Option<String>,
+        error: Option<String>,
+    ) {
+        let monitor_str = monitor.map(|m| m.to_string());
+        self.app_state
+            .run_recording_handler
+            .on_screenshot_captured(
+                screenshot_type,
+                file_path,
+                monitor_str,
+                delay_seconds,
+                success,
+                associated_action,
+                error,
+            )
+            .await;
     }
 
     /// Execute a list of steps and return results
@@ -697,10 +729,112 @@ impl StepExecutor {
                     None
                 };
 
-                match self.action_service.capture_screenshot(monitor, delay).await {
+                // Get sequence number for tree events
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static SCREENSHOT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+                let sequence = SCREENSHOT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+                let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+                // Build action node for tree events
+                let action_node = serde_json::json!({
+                    "action_type": "SCREENSHOT",
+                    "action_id": format!("screenshot-{}", sequence),
+                    "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
+                    "delay_seconds": delay.unwrap_or(0.0),
+                });
+
+                // Emit action_started tree event
+                FileLogger::log_tree_event(
+                    "action_started",
+                    &action_node,
+                    &[],
+                    timestamp,
+                    sequence,
+                );
+
+                let result = self.action_service.capture_screenshot(monitor, delay).await;
+                let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+                match result {
                     // Use absolute_path instead of screenshot_path to avoid relative path resolution issues
-                    Ok(result) => (result.success, result.error, result.absolute_path),
-                    Err(e) => (false, Some(format!("Screenshot error: {}", e)), None),
+                    Ok(res) => {
+                        // Record screenshot event for automation logs
+                        let file_path = res.absolute_path.clone().unwrap_or_default();
+
+                        // Emit action_completed tree event
+                        let completed_node = serde_json::json!({
+                            "action_type": "SCREENSHOT",
+                            "action_id": format!("screenshot-{}", sequence),
+                            "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
+                            "delay_seconds": delay.unwrap_or(0.0),
+                            "success": res.success,
+                            "filename": &file_path,
+                        });
+                        FileLogger::log_tree_event(
+                            if res.success {
+                                "action_completed"
+                            } else {
+                                "action_failed"
+                            },
+                            &completed_node,
+                            &[],
+                            end_timestamp,
+                            sequence,
+                        );
+
+                        self.record_screenshot_event(
+                            "standalone",
+                            &file_path,
+                            monitor,
+                            if step.screenshot_delay > 0 {
+                                Some(step.screenshot_delay)
+                            } else {
+                                None
+                            },
+                            res.success,
+                            None,
+                            res.error.clone(),
+                        )
+                        .await;
+                        (res.success, res.error, res.absolute_path)
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Screenshot error: {}", e);
+
+                        // Emit action_failed tree event
+                        let failed_node = serde_json::json!({
+                            "action_type": "SCREENSHOT",
+                            "action_id": format!("screenshot-{}", sequence),
+                            "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
+                            "delay_seconds": delay.unwrap_or(0.0),
+                            "success": false,
+                            "error": &error_msg,
+                        });
+                        FileLogger::log_tree_event(
+                            "action_failed",
+                            &failed_node,
+                            &[],
+                            end_timestamp,
+                            sequence,
+                        );
+
+                        // Record failed screenshot event
+                        self.record_screenshot_event(
+                            "standalone",
+                            "",
+                            monitor,
+                            if step.screenshot_delay > 0 {
+                                Some(step.screenshot_delay)
+                            } else {
+                                None
+                            },
+                            false,
+                            None,
+                            Some(error_msg.clone()),
+                        )
+                        .await;
+                        (false, Some(error_msg), None)
+                    }
                 }
             }
             "playwright" => {
@@ -746,10 +880,51 @@ impl StepExecutor {
             _ => step.monitor_index,
         };
 
+        // Build associated action description
+        let associated_action = match step.step_type.as_str() {
+            "workflow" => step.name.clone().map(|n| format!("workflow:{}", n)),
+            "action" => step.action_type.clone().map(|t| format!("action:{}", t)),
+            "state" => step.name.clone().map(|n| format!("state:{}", n)),
+            _ => Some(format!("step:{}", step.step_type)),
+        };
+
         match self.action_service.capture_screenshot(monitor, None).await {
-            Ok(result) => result.absolute_path, // Use absolute path for step screenshots
+            Ok(result) => {
+                let file_path = result.absolute_path.clone().unwrap_or_default();
+                // Record post-action screenshot event
+                self.record_screenshot_event(
+                    "post_action",
+                    &file_path,
+                    monitor,
+                    if step.screenshot_delay > 0 {
+                        Some(step.screenshot_delay)
+                    } else {
+                        None
+                    },
+                    result.success,
+                    associated_action,
+                    result.error,
+                )
+                .await;
+                result.absolute_path // Use absolute path for step screenshots
+            }
             Err(e) => {
                 warn!("Failed to capture post-step screenshot: {}", e);
+                // Record failed post-action screenshot event
+                self.record_screenshot_event(
+                    "post_action",
+                    "",
+                    monitor,
+                    if step.screenshot_delay > 0 {
+                        Some(step.screenshot_delay)
+                    } else {
+                        None
+                    },
+                    false,
+                    associated_action,
+                    Some(format!("Screenshot error: {}", e)),
+                )
+                .await;
                 None
             }
         }

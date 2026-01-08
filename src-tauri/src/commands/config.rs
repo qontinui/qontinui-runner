@@ -55,7 +55,8 @@ pub fn load_configuration(
         "workflows": config.workflows.clone(),
         "states": config.states.clone(),
         "transitions": config.transitions.clone(),
-        "images": config.images.clone()
+        "images": config.images.clone(),
+        "categories": config.categories.clone()
     });
 
     // Extract config_id and project_id for run recording

@@ -96,15 +96,15 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
       />
 
       {/* Current Version Card */}
-      <div className="bg-card rounded-lg border border-border/50 p-6">
-        <h4 className="font-semibold text-lg mb-4">Current Version</h4>
+      <div className="rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm mb-3">Current Version</h4>
 
         <div className="flex items-center justify-between">
           <div className="space-y-1">
-            <div className="text-2xl font-bold text-primary">
+            <div className="text-xl font-bold text-primary">
               v{updateInfo?.current_version || "0.1.0"}
             </div>
-            <div className="text-sm text-muted-foreground">Last checked: {formatLastChecked()}</div>
+            <div className="text-xs text-muted-foreground">Last checked: {formatLastChecked()}</div>
           </div>
 
           <button
@@ -128,15 +128,15 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
 
       {/* Update Status Card */}
       {updateInfo && (
-        <div className="bg-card rounded-lg border border-border/50 p-6">
-          <h4 className="font-semibold text-lg mb-4">Update Status</h4>
+        <div className="rounded-lg bg-card/50 p-4">
+          <h4 className="font-medium text-sm mb-3">Update Status</h4>
 
           {updateInfo.development ? (
-            <div className="flex items-start gap-3 p-4 bg-muted/50 rounded-lg">
-              <Info className="w-5 h-5 text-muted-foreground mt-0.5 shrink-0" />
+            <div className="flex items-start gap-2 p-3 bg-muted/30 rounded-lg">
+              <Info className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
               <div>
-                <div className="font-medium">Development Mode</div>
-                <div className="text-sm text-muted-foreground">
+                <div className="text-sm font-medium">Development Mode</div>
+                <div className="text-xs text-muted-foreground">
                   Update checking is disabled in development builds. Build a release version to
                   enable automatic updates.
                 </div>
@@ -144,11 +144,11 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
             </div>
           ) : updateInfo.available ? (
             <div className="space-y-4">
-              <div className="flex items-start gap-3 p-4 bg-primary/10 border border-primary/20 rounded-lg">
-                <Download className="w-5 h-5 text-primary mt-0.5 shrink-0" />
+              <div className="flex items-start gap-2 p-3 bg-primary/10 rounded-lg">
+                <Download className="w-4 h-4 text-primary mt-0.5 shrink-0" />
                 <div className="flex-1">
-                  <div className="font-medium text-primary">Update Available</div>
-                  <div className="text-sm text-muted-foreground mt-1">
+                  <div className="text-sm font-medium text-primary">Update Available</div>
+                  <div className="text-xs text-muted-foreground mt-1">
                     Version <span className="font-semibold">{updateInfo.version}</span> is available
                     for download.
                   </div>
@@ -195,11 +195,11 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
               </p>
             </div>
           ) : (
-            <div className="flex items-start gap-3 p-4 bg-green-500/10 border border-green-500/20 rounded-lg">
-              <CheckCircle className="w-5 h-5 text-green-500 mt-0.5 shrink-0" />
+            <div className="flex items-start gap-2 p-3 bg-green-500/10 rounded-lg">
+              <CheckCircle className="w-4 h-4 text-green-400 mt-0.5 shrink-0" />
               <div>
-                <div className="font-medium text-green-500">Up to Date</div>
-                <div className="text-sm text-muted-foreground">
+                <div className="text-sm font-medium text-green-400">Up to Date</div>
+                <div className="text-xs text-muted-foreground">
                   You're running the latest version of Qontinui Runner.
                 </div>
               </div>
@@ -210,18 +210,18 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
 
       {/* Error Display */}
       {error && (
-        <div className="flex items-start gap-3 p-4 bg-destructive/10 border border-destructive/20 rounded-lg">
-          <AlertCircle className="w-5 h-5 text-destructive mt-0.5 shrink-0" />
+        <div className="flex items-start gap-2 p-3 bg-destructive/10 rounded-lg">
+          <AlertCircle className="w-4 h-4 text-destructive mt-0.5 shrink-0" />
           <div>
-            <div className="font-medium text-destructive">Update Error</div>
-            <div className="text-sm text-muted-foreground">{error}</div>
+            <div className="text-sm font-medium text-destructive">Update Error</div>
+            <div className="text-xs text-muted-foreground">{error}</div>
           </div>
         </div>
       )}
 
       {/* Info Box */}
-      <div className="p-3 bg-primary/5 border border-primary/20 rounded-lg">
-        <div className="text-sm text-muted-foreground">
+      <div className="p-3 bg-primary/5 rounded-lg">
+        <div className="text-xs text-muted-foreground">
           <strong className="text-foreground">Tip:</strong> Updates are checked automatically when
           this settings tab is opened. You can also manually check for updates using the button
           above.

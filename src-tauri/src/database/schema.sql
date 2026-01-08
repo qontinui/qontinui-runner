@@ -1,11 +1,16 @@
 -- SQLite Schema for qontinui-runner
--- Version: 8
+-- Version: 14
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
 --
--- Key concept: Every task runs until completion (marked by [TASK_COMPLETE]).
--- Sessions are internal implementation details - users only see task runs.
+-- Key concept: TaskRun is THE unified run concept for all execution.
+-- GUI automation is one aspect of a task, not a separate system.
+-- Every task runs until completion (marked by [TASK_COMPLETE]).
+--
+-- Version 12 migrated existing run_details to task_run_automation table.
+-- Version 13 removes the deprecated run_details table.
+-- Version 14 adds verification test infrastructure (verification_tests, test_results, test_associations).
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -150,28 +155,56 @@ CREATE TABLE IF NOT EXISTS ai_workflows (
     updated_at TEXT NOT NULL
 );
 
--- Task Runs (simplified task execution model)
+-- Task Runs (unified task execution model)
+-- TaskRun is THE single concept for all runs (AI, automation, or mixed).
+-- GUI automation is one aspect of task execution, not a separate system.
 -- Every task runs until [TASK_COMPLETE] marker is found in output.
--- Sessions are internal - output is accumulated in output_log with session markers.
 CREATE TABLE IF NOT EXISTS task_runs (
     id TEXT PRIMARY KEY,
     task_name TEXT NOT NULL,
-    prompt TEXT NOT NULL,  -- The task description/instructions
-    status TEXT NOT NULL DEFAULT 'running',  -- 'running', 'complete', 'failed', 'stopped'
+    prompt TEXT,  -- The task description/instructions (NULL for pure automation tasks)
+
+    -- Task type: 'task' (default), 'automation', 'scheduled'
+    task_type TEXT NOT NULL DEFAULT 'task',
+
+    -- Status: 'running', 'complete', 'failed', 'stopped'
+    status TEXT NOT NULL DEFAULT 'running',
+
+    -- Session tracking (for AI-enabled tasks)
     sessions_count INTEGER NOT NULL DEFAULT 0,  -- How many Claude sessions spawned
     max_sessions INTEGER,  -- NULL = unlimited, otherwise max before giving up
+    auto_continue BOOLEAN NOT NULL DEFAULT 1,  -- Per-run auto-continue setting
+
+    -- Output
     output_log TEXT DEFAULT '',  -- Accumulated output with [SESSION_START:N] markers
     error_message TEXT,
-    auto_continue BOOLEAN NOT NULL DEFAULT 1,  -- Per-run auto-continue setting (1=true, 0=false)
+
+    -- Execution configuration
     execution_steps_json TEXT,  -- JSON array of ExecutionStepConfig for re-execution on resume
     log_sources_json TEXT,  -- JSON array of LogSourceConfig for log capture during execution
+
+    -- Config linkage (for automation-enabled tasks)
+    config_id TEXT,  -- Foreign key to configs table (optional)
+    workflow_name TEXT,  -- Workflow name being executed
+
+    -- Summary (post-completion analysis)
+    summary TEXT,  -- AI-generated paragraph summary of the task run (was ai_summary)
+    goal_achieved BOOLEAN,  -- Whether the stated goal was achieved
+    remaining_work TEXT,  -- What remains to be done if goal was not achieved
+    summary_generated_at TEXT,  -- Timestamp when the summary was generated
+
+    -- Timestamps
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    completed_at TEXT
+    completed_at TEXT,
+
+    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_runs_status ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task_type ON task_runs(task_type);
+CREATE INDEX IF NOT EXISTS idx_task_runs_config_id ON task_runs(config_id);
 
 -- Task Run Output Chunks (for efficient O(1) appending)
 -- Instead of concatenating to output_log column (O(n)), we insert chunks (O(1))
@@ -235,6 +268,42 @@ CREATE INDEX IF NOT EXISTS idx_findings_status ON task_run_findings(status);
 CREATE INDEX IF NOT EXISTS idx_findings_signature ON task_run_findings(signature_hash);
 CREATE INDEX IF NOT EXISTS idx_findings_category ON task_run_findings(category);
 
+-- Task Run Automation (child table for automation metrics)
+-- Stores automation execution data within a task run.
+-- Some runs have ONLY automation, some have ONLY AI, some have BOTH.
+CREATE TABLE IF NOT EXISTS task_run_automation (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Workflow details
+    workflow_name TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    duration_ms INTEGER,
+
+    -- Status: 'running', 'success', 'failed', 'timeout', 'cancelled'
+    automation_status TEXT NOT NULL DEFAULT 'running',
+    success BOOLEAN,
+    error_type TEXT,
+    error_message TEXT,
+
+    -- Metrics (same as current run_details)
+    actions_summary TEXT,       -- JSON {"total": N, "success": N, "failed": N, "skipped": N}
+    states_visited TEXT,        -- JSON array of state names
+    transitions_executed TEXT,  -- JSON array of {from, to, action, success, duration_ms}
+    template_matches TEXT,      -- JSON array of {template, count, avg_confidence, failures}
+    anomalies TEXT,             -- JSON array for anomaly detection
+
+    -- Iteration tracking
+    iteration_number INTEGER NOT NULL DEFAULT 1,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_automation_task_run_id ON task_run_automation(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_automation_started_at ON task_run_automation(started_at);
+CREATE INDEX IF NOT EXISTS idx_task_run_automation_status ON task_run_automation(automation_status);
+
 -- Execution history (automation runs)
 CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY,
@@ -265,31 +334,6 @@ CREATE TABLE IF NOT EXISTS configs (
 
 CREATE INDEX IF NOT EXISTS idx_configs_name ON configs(name);
 CREATE INDEX IF NOT EXISTS idx_configs_updated_at ON configs(updated_at);
-
--- Run Details (Tier 1 - Detailed run data)
--- Stores comprehensive information about each automation run for debugging and analysis
-CREATE TABLE IF NOT EXISTS run_details (
-    id TEXT PRIMARY KEY,
-    config_id TEXT NOT NULL,
-    workflow_name TEXT,
-    started_at TEXT NOT NULL,
-    ended_at TEXT,
-    duration_ms INTEGER,
-    status TEXT NOT NULL,  -- 'running', 'completed', 'failed', 'timeout', 'cancelled'
-    success BOOLEAN,
-    error_type TEXT,
-    error_message TEXT,
-    actions_summary TEXT,  -- JSON {"total": N, "success": N, "failed": N, "skipped": N}
-    states_visited TEXT,   -- JSON array of state names
-    transitions_executed TEXT,  -- JSON array of {from, to, action, success, duration_ms}
-    template_matches TEXT, -- JSON array of {template, count, avg_confidence, failures}
-    anomalies TEXT,        -- JSON array for Tier 2 triggering
-    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_run_details_config_id ON run_details(config_id);
-CREATE INDEX IF NOT EXISTS idx_run_details_started_at ON run_details(started_at);
-CREATE INDEX IF NOT EXISTS idx_run_details_status ON run_details(status);
 
 -- Config Statistics (Tier 4 - Aggregated statistics per config)
 -- Stores computed statistics and patterns for AI debugging context
@@ -332,7 +376,117 @@ CREATE TABLE IF NOT EXISTS pending_discoveries (
 CREATE INDEX IF NOT EXISTS idx_pending_discoveries_created_at ON pending_discoveries(created_at);
 CREATE INDEX IF NOT EXISTS idx_pending_discoveries_attempt_count ON pending_discoveries(attempt_count);
 
+-- Verification Tests (test definitions stored in runner)
+-- Database-first storage with file import/export for version control
+CREATE TABLE IF NOT EXISTS verification_tests (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+
+    -- Test type: 'playwright_cdp', 'qontinui_vision', 'python_script', 'repository_test'
+    test_type TEXT NOT NULL,
+
+    -- Category for organization
+    category TEXT,  -- 'visual', 'dom', 'network', 'data', 'log', 'layout', 'unit', 'integration', 'custom'
+
+    -- Code/config storage (one of these based on test_type)
+    playwright_code TEXT,      -- TypeScript code for playwright_cdp
+    vision_config TEXT,        -- JSON config for qontinui_vision
+    python_code TEXT,          -- Python code for python_script
+    repo_test_config TEXT,     -- JSON config for repository_test
+
+    -- Natural language description for AI generation
+    success_criteria TEXT,
+
+    -- Test configuration (JSON)
+    config TEXT DEFAULT '{}',  -- timeout_seconds, cdp_port, env_vars, etc.
+
+    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+    is_critical BOOLEAN NOT NULL DEFAULT 1,  -- If true, failure fails the task
+    enabled BOOLEAN NOT NULL DEFAULT 1,
+
+    -- AI generation tracking
+    ai_generated BOOLEAN NOT NULL DEFAULT 0,
+    ai_generation_prompt TEXT,
+
+    -- Organization
+    tags TEXT DEFAULT '[]',  -- JSON array
+
+    -- File tracking (for import/export)
+    source_file TEXT,         -- Original file path if imported
+    last_exported_at TEXT,    -- Timestamp of last export
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_tests_test_type ON verification_tests(test_type);
+CREATE INDEX IF NOT EXISTS idx_verification_tests_category ON verification_tests(category);
+CREATE INDEX IF NOT EXISTS idx_verification_tests_enabled ON verification_tests(enabled);
+
+-- Test Results (execution results linked to task runs)
+CREATE TABLE IF NOT EXISTS test_results (
+    id TEXT PRIMARY KEY,
+    test_id TEXT NOT NULL,
+    task_run_id TEXT,  -- Links to task_runs table
+
+    -- Status: 'pending', 'running', 'passed', 'failed', 'skipped', 'error', 'timeout'
+    status TEXT NOT NULL DEFAULT 'pending',
+
+    started_at TEXT,
+    completed_at TEXT,
+    duration_ms INTEGER,
+
+    -- Output
+    output TEXT,              -- stdout/stderr combined
+    error_message TEXT,       -- Error message if failed
+    structured_output TEXT,   -- JSON: parsed assertions, metrics, coverage
+
+    -- Assertions summary
+    assertions_passed INTEGER DEFAULT 0,
+    assertions_failed INTEGER DEFAULT 0,
+
+    -- Screenshots (JSON array of paths)
+    screenshots TEXT DEFAULT '[]',
+
+    -- AI analysis
+    ai_analysis TEXT,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (test_id) REFERENCES verification_tests(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_results_test_id ON test_results(test_id);
+CREATE INDEX IF NOT EXISTS idx_test_results_task_run_id ON test_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_test_results_status ON test_results(status);
+
+-- Test Associations (link tests to configs/workflows)
+CREATE TABLE IF NOT EXISTS test_associations (
+    id TEXT PRIMARY KEY,
+    test_id TEXT NOT NULL,
+    config_id TEXT,           -- Links to configs table
+    workflow_name TEXT,       -- Workflow name within config
+
+    -- Trigger point
+    trigger_point TEXT NOT NULL,  -- 'before_workflow', 'after_workflow', 'on_action', 'manual'
+    action_id TEXT,               -- Specific action ID for 'on_action' trigger
+
+    execution_order INTEGER DEFAULT 0,
+    enabled BOOLEAN NOT NULL DEFAULT 1,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (test_id) REFERENCES verification_tests(id) ON DELETE CASCADE,
+    FOREIGN KEY (config_id) REFERENCES configs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_associations_test_id ON test_associations(test_id);
+CREATE INDEX IF NOT EXISTS idx_test_associations_config_id ON test_associations(config_id);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (8, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (14, datetime('now'));

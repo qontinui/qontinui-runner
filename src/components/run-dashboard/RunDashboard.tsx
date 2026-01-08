@@ -1,40 +1,44 @@
 /**
  * RunDashboard Component
  *
- * Central dashboard for viewing and selecting runs.
+ * Central dashboard for viewing and selecting task runs.
  * Shows run selector, status overview, and quick links to detail pages.
  */
 
+import { useState } from "react";
 import {
   CheckCircle,
   XCircle,
-  Timer,
-  AlertCircle,
   Loader2,
   Clock,
   Zap,
   Image,
   ClipboardList,
   FileText,
-  AlertTriangle,
   FileSearch,
   Bot,
   BarChart3,
   ArrowRight,
   Activity,
+  StopCircle,
+  Users,
+  Play,
+  Target,
+  TestTube,
 } from "lucide-react";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import { RunSelector } from "../run-selection/RunSelector";
-import type { RunStatus } from "../../types/statistics";
+import { useReopenTaskRun } from "../../hooks/useAiData";
+import type { TaskRunStatus } from "../../types/aiData";
 
 interface RunDashboardProps {
   /** Callback to navigate to a specific tab */
   onNavigate?: (tabId: string) => void;
 }
 
-// Status display configuration
+// Status display configuration for TaskRun statuses
 const statusConfig: Record<
-  RunStatus,
+  TaskRunStatus,
   { icon: typeof CheckCircle; color: string; bgColor: string; label: string }
 > = {
   running: {
@@ -43,11 +47,11 @@ const statusConfig: Record<
     bgColor: "bg-blue-500/10",
     label: "In Progress",
   },
-  completed: {
+  complete: {
     icon: CheckCircle,
     color: "text-green-400",
     bgColor: "bg-green-500/10",
-    label: "Completed",
+    label: "Complete",
   },
   failed: {
     icon: XCircle,
@@ -55,19 +59,23 @@ const statusConfig: Record<
     bgColor: "bg-red-500/10",
     label: "Failed",
   },
-  timeout: {
-    icon: Timer,
-    color: "text-orange-400",
-    bgColor: "bg-orange-500/10",
-    label: "Timeout",
-  },
-  cancelled: {
-    icon: AlertCircle,
+  stopped: {
+    icon: StopCircle,
     color: "text-slate-400",
     bgColor: "bg-slate-500/10",
-    label: "Cancelled",
+    label: "Stopped",
   },
 };
+
+/**
+ * Calculate duration from created_at and completed_at timestamps
+ */
+function calculateDuration(createdAt: string, completedAt?: string): number | undefined {
+  if (!completedAt) return undefined;
+  const start = new Date(createdAt).getTime();
+  const end = new Date(completedAt).getTime();
+  return end - start;
+}
 
 /**
  * Format duration from milliseconds to human-readable string
@@ -151,20 +159,22 @@ function QuickLinkCard({
 }
 
 export function RunDashboard({ onNavigate }: RunDashboardProps) {
-  const { selectedRun, configId, isLoadingRuns, recentRuns } = useRunSelection();
+  const { selectedRun, isLoadingRuns, recentRuns } = useRunSelection();
+  const [additionalSessions, setAdditionalSessions] = useState(3);
+  const reopenMutation = useReopenTaskRun();
 
-  // No config loaded
-  if (!configId) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
-        <Activity className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium">No Configuration Loaded</p>
-        <p className="text-sm mt-2 text-center max-w-md">
-          Load a workflow configuration to view run history and statistics.
-        </p>
-      </div>
-    );
-  }
+  const isFinished =
+    selectedRun?.status === "complete" ||
+    selectedRun?.status === "failed" ||
+    selectedRun?.status === "stopped";
+
+  const handleContinueRun = () => {
+    if (!selectedRun) return;
+    reopenMutation.mutate({
+      taskId: selectedRun.id,
+      additionalSessions,
+    });
+  };
 
   // Loading state
   if (isLoadingRuns && recentRuns.length === 0) {
@@ -181,9 +191,9 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground p-8">
         <Clock className="w-12 h-12 mb-4 opacity-50" />
-        <p className="text-lg font-medium">No Runs Yet</p>
+        <p className="text-lg font-medium">No Task Runs Yet</p>
         <p className="text-sm mt-2 text-center max-w-md">
-          Execute a workflow to see run data here. You can start a workflow from the Execute page.
+          Start a task to see run data here. Tasks can be started from the Active page.
         </p>
       </div>
     );
@@ -191,6 +201,9 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
 
   const statusInfo = selectedRun ? statusConfig[selectedRun.status] : null;
   const StatusIcon = statusInfo?.icon || Activity;
+  const duration = selectedRun
+    ? calculateDuration(selectedRun.created_at, selectedRun.completed_at)
+    : undefined;
 
   return (
     <div className="h-full overflow-y-auto p-6 space-y-6">
@@ -199,7 +212,7 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
         <div>
           <h1 className="text-xl font-semibold text-foreground">Run Dashboard</h1>
           <p className="text-sm text-muted-foreground mt-1">
-            Select a run to view detailed information across all pages
+            Select a task run to view detailed information across all pages
           </p>
         </div>
 
@@ -218,7 +231,7 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               icon={StatusIcon}
               label="Status"
               value={statusInfo?.label || "Unknown"}
-              subValue={selectedRun.workflow_name}
+              subValue={selectedRun.task_name}
               color={statusInfo?.color}
               bgColor={statusInfo?.bgColor}
             />
@@ -227,35 +240,36 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
             <StatCard
               icon={Clock}
               label="Duration"
-              value={formatDuration(selectedRun.duration_ms)}
+              value={formatDuration(duration)}
+              subValue={new Date(selectedRun.created_at).toLocaleString()}
+            />
+
+            {/* Sessions */}
+            <StatCard
+              icon={Users}
+              label="Sessions"
+              value={selectedRun.sessions_count}
               subValue={
-                selectedRun.started_at
-                  ? new Date(selectedRun.started_at).toLocaleString()
-                  : undefined
+                selectedRun.max_sessions
+                  ? `Max: ${selectedRun.max_sessions}`
+                  : selectedRun.auto_continue
+                    ? "Auto-continue enabled"
+                    : undefined
               }
             />
 
-            {/* Actions */}
+            {/* Output Length */}
             <StatCard
-              icon={Zap}
-              label="Actions"
-              value={selectedRun.actions_summary?.total ?? 0}
-              subValue={
-                selectedRun.actions_summary
-                  ? `${selectedRun.actions_summary.success} succeeded, ${selectedRun.actions_summary.failed} failed`
-                  : undefined
+              icon={FileText}
+              label="Output"
+              value={
+                selectedRun.output_log
+                  ? `${Math.round(selectedRun.output_log.length / 1024)}KB`
+                  : "0KB"
               }
-              color={selectedRun.actions_summary?.failed ? "text-orange-400" : "text-foreground"}
-            />
-
-            {/* States Visited */}
-            <StatCard
-              icon={Activity}
-              label="States Visited"
-              value={selectedRun.states_visited?.length ?? 0}
               subValue={
-                selectedRun.transitions_executed
-                  ? `${selectedRun.transitions_executed.length} transitions`
+                selectedRun.output_log
+                  ? `${selectedRun.output_log.split("\n").length} lines`
                   : undefined
               }
             />
@@ -266,9 +280,23 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
             <div className="p-4 rounded-lg border border-red-500/30 bg-red-500/10">
               <div className="flex items-center gap-2 text-red-400 mb-2">
                 <XCircle className="w-4 h-4" />
-                <span className="font-medium">{selectedRun.error_type || "Error"}</span>
+                <span className="font-medium">Error</span>
               </div>
               <p className="text-sm text-red-300">{selectedRun.error_message}</p>
+            </div>
+          )}
+
+          {/* Prompt Preview */}
+          {selectedRun.prompt && (
+            <div className="space-y-2">
+              <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+                Task Prompt
+              </h2>
+              <div className="p-4 rounded-lg border border-border bg-muted/30">
+                <p className="text-sm text-foreground whitespace-pre-wrap line-clamp-4">
+                  {selectedRun.prompt}
+                </p>
+              </div>
             </div>
           )}
 
@@ -281,13 +309,13 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               <QuickLinkCard
                 icon={Zap}
                 title="Actions"
-                description={`${selectedRun.actions_summary?.total ?? 0} actions executed`}
+                description="Action execution logs"
                 onClick={() => onNavigate?.("run-actions")}
               />
               <QuickLinkCard
                 icon={Image}
                 title="Image Recognition"
-                description={`${selectedRun.template_matches?.length ?? 0} template matches`}
+                description="Pattern matching results"
                 onClick={() => onNavigate?.("run-image")}
               />
               <QuickLinkCard
@@ -299,20 +327,20 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               <QuickLinkCard
                 icon={FileText}
                 title="Findings"
-                description="Code findings and issues detected"
+                description="All findings and issues detected"
                 onClick={() => onNavigate?.("run-findings")}
-              />
-              <QuickLinkCard
-                icon={AlertTriangle}
-                title="Issues"
-                description={`${selectedRun.anomalies?.length ?? 0} anomalies detected`}
-                onClick={() => onNavigate?.("run-issues")}
               />
               <QuickLinkCard
                 icon={FileSearch}
                 title="Verification"
                 description="Verification history"
                 onClick={() => onNavigate?.("run-verification")}
+              />
+              <QuickLinkCard
+                icon={TestTube}
+                title="Test Results"
+                description="Verification test execution"
+                onClick={() => onNavigate?.("run-tests")}
               />
               <QuickLinkCard
                 icon={Bot}
@@ -323,56 +351,80 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               <QuickLinkCard
                 icon={BarChart3}
                 title="Statistics"
-                description="Config-level performance stats"
+                description="Performance statistics"
                 onClick={() => onNavigate?.("run-statistics")}
               />
             </div>
           </div>
 
-          {/* Anomalies Preview (if any) */}
-          {selectedRun.anomalies && selectedRun.anomalies.length > 0 && (
-            <div className="space-y-3">
-              <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
-                Anomalies Detected ({selectedRun.anomalies.length})
-              </h2>
-              <div className="space-y-2">
-                {selectedRun.anomalies.slice(0, 3).map((anomaly, index) => (
-                  <div
-                    key={index}
-                    className={`p-3 rounded-lg border ${
-                      anomaly.severity === "high"
-                        ? "border-red-500/30 bg-red-500/5"
-                        : anomaly.severity === "medium"
-                          ? "border-orange-500/30 bg-orange-500/5"
-                          : "border-yellow-500/30 bg-yellow-500/5"
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span
-                        className={`text-xs font-medium px-1.5 py-0.5 rounded ${
-                          anomaly.severity === "high"
-                            ? "bg-red-500/20 text-red-400"
-                            : anomaly.severity === "medium"
-                              ? "bg-orange-500/20 text-orange-400"
-                              : "bg-yellow-500/20 text-yellow-400"
-                        }`}
-                      >
-                        {anomaly.severity.toUpperCase()}
-                      </span>
-                      <span className="text-sm font-medium text-foreground">
-                        {anomaly.anomaly_type.replace(/_/g, " ")}
-                      </span>
-                    </div>
-                    <p className="text-sm text-muted-foreground">{anomaly.description}</p>
+          {/* Continue Run Section - shown for finished runs */}
+          {isFinished && (
+            <div className="space-y-3 pt-4 border-t border-border">
+              <div className="flex items-center gap-2">
+                <Play className="w-4 h-4 text-muted-foreground" />
+                <h2 className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
+                  Continue This Run
+                </h2>
+              </div>
+              <div className="p-4 rounded-lg border border-border bg-card">
+                <div className="flex items-center gap-2 mb-2">
+                  {selectedRun?.goal_achieved === false && (
+                    <span className="flex items-center gap-1.5 px-2 py-1 text-xs rounded bg-amber-500/10 text-amber-400">
+                      <Target className="w-3 h-3" />
+                      Goal Not Achieved
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm text-muted-foreground mb-4">
+                  Add more iterations to continue working toward the goal. The new sessions will
+                  have access to all previous output and context.
+                </p>
+                <div className="flex items-center gap-3 flex-wrap">
+                  <div className="flex items-center gap-2">
+                    <label htmlFor="additionalSessions" className="text-sm text-muted-foreground">
+                      Additional sessions:
+                    </label>
+                    <input
+                      id="additionalSessions"
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={additionalSessions}
+                      onChange={(e) =>
+                        setAdditionalSessions(
+                          Math.max(1, Math.min(20, parseInt(e.target.value) || 1)),
+                        )
+                      }
+                      className="w-16 px-2 py-1 text-sm border border-border rounded bg-background text-foreground"
+                    />
                   </div>
-                ))}
-                {selectedRun.anomalies.length > 3 && (
                   <button
-                    onClick={() => onNavigate?.("run-issues")}
-                    className="text-sm text-primary hover:underline"
+                    onClick={handleContinueRun}
+                    disabled={reopenMutation.isPending}
+                    className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
-                    View all {selectedRun.anomalies.length} anomalies →
+                    {reopenMutation.isPending ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        <span>Reopening...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Play className="w-4 h-4" />
+                        <span>Continue Run</span>
+                      </>
+                    )}
                   </button>
+                </div>
+                {reopenMutation.isError && (
+                  <p className="mt-2 text-sm text-red-400">
+                    Error: {reopenMutation.error?.message || "Failed to reopen run"}
+                  </p>
+                )}
+                {reopenMutation.isSuccess && (
+                  <p className="mt-2 text-sm text-green-400">
+                    Run reopened successfully! It will continue automatically.
+                  </p>
                 )}
               </div>
             </div>

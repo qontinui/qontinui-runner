@@ -13,6 +13,14 @@ import type {
   JsonlLogsResult,
   JsonlLogsSummary,
   JsonlLogType,
+  TextLogsResult,
+  TextLogsSummary,
+  TextLogType,
+  ScreenshotsResult,
+  LoadedConfigInfo,
+  AiPromptsResult,
+  ContextsResult,
+  ConsolidatedAiOutputResult,
 } from "../types/aiData";
 import type { TieredInfoResponse, RunDetails } from "../types/statistics";
 
@@ -38,6 +46,19 @@ export const aiDataService = {
    */
   async getTaskRun(taskId: string): Promise<AiDataResponse<TaskRun>> {
     return invoke("get_task_run_for_viewer", { taskId });
+  },
+
+  /**
+   * Reopen a finished task run to add more iterations.
+   * This allows continuing a task that didn't achieve its goal.
+   * @param taskId - Task run ID
+   * @param additionalSessions - Number of additional sessions to add
+   */
+  async reopenTaskRun(
+    taskId: string,
+    additionalSessions: number,
+  ): Promise<AiDataResponse<TaskRun>> {
+    return invoke("reopen_task_run", { taskId, additionalSessions });
   },
 
   // ===========================================================================
@@ -85,5 +106,97 @@ export const aiDataService = {
     limit?: number,
   ): Promise<AiDataResponse<JsonlLogsResult>> {
     return invoke("read_jsonl_logs_for_viewer", { logType, limit });
+  },
+
+  /**
+   * Read JSONL log entries filtered by task run time range.
+   * @param logType - Type of log to read
+   * @param taskRunId - Task run ID to filter logs by
+   */
+  async readJsonlLogsForTaskRun(
+    logType: JsonlLogType,
+    taskRunId: string,
+  ): Promise<AiDataResponse<JsonlLogsResult>> {
+    return invoke("read_jsonl_logs_for_task_run", { logType, taskRunId });
+  },
+
+  /**
+   * Get consolidated AI output for a task run.
+   * Groups consecutive log entries by source into readable chunks.
+   * @param taskRunId - Task run ID to get output for
+   */
+  async getConsolidatedAiOutput(
+    taskRunId: string,
+  ): Promise<AiDataResponse<ConsolidatedAiOutputResult>> {
+    return invoke("get_consolidated_ai_output", { taskRunId });
+  },
+
+  // ===========================================================================
+  // Text Logs (plain text, filtered by task run time range)
+  // ===========================================================================
+
+  /**
+   * Get summary of all text log files for a task run.
+   * @param taskRunId - Task run ID to get logs for
+   */
+  async getTextLogsSummary(taskRunId: string): Promise<AiDataResponse<TextLogsSummary>> {
+    return invoke("get_text_logs_summary", { taskRunId });
+  },
+
+  /**
+   * Read text log content filtered by task run time range.
+   * @param logType - Type of log to read
+   * @param taskRunId - Task run ID to filter logs by
+   */
+  async readTextLogs(
+    logType: TextLogType,
+    taskRunId: string,
+  ): Promise<AiDataResponse<TextLogsResult>> {
+    return invoke("read_text_logs_for_viewer", { logType, taskRunId });
+  },
+
+  // ===========================================================================
+  // Screenshots (annotated and playwright)
+  // ===========================================================================
+
+  /**
+   * Get list of screenshots from .dev-logs/screenshots/ and playwright-screenshots/.
+   */
+  async getScreenshots(): Promise<AiDataResponse<ScreenshotsResult>> {
+    return invoke("get_screenshots_for_viewer");
+  },
+
+  // ===========================================================================
+  // Loaded Config
+  // ===========================================================================
+
+  /**
+   * Get the currently loaded workflow config.
+   */
+  async getLoadedConfig(): Promise<AiDataResponse<LoadedConfigInfo>> {
+    return invoke("get_loaded_config_for_viewer");
+  },
+
+  // ===========================================================================
+  // AI Prompts
+  // ===========================================================================
+
+  /**
+   * Get AI prompts for a task run.
+   * @param taskRunId - Task run ID to get prompts for
+   */
+  async getAiPrompts(taskRunId: string): Promise<AiDataResponse<AiPromptsResult>> {
+    return invoke("get_ai_prompts_for_viewer", { taskRunId });
+  },
+
+  // ===========================================================================
+  // Contexts
+  // ===========================================================================
+
+  /**
+   * Get all available contexts (user, builtin, project).
+   */
+  async getContexts(): Promise<AiDataResponse<ContextsResult>> {
+    return invoke("get_contexts_for_viewer");
   },
 };
