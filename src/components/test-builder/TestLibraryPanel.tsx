@@ -44,9 +44,10 @@ interface TestListItemProps {
   isSelected: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  onDuplicate: () => void;
 }
 
-function TestListItem({ test, isSelected, onSelect, onDelete }: TestListItemProps) {
+function TestListItem({ test, isSelected, onSelect, onDelete, onDuplicate }: TestListItemProps) {
   const [showMenu, setShowMenu] = useState(false);
   const Icon = testTypeIcons[test.test_type];
 
@@ -88,7 +89,7 @@ function TestListItem({ test, isSelected, onSelect, onDelete }: TestListItemProp
                 className="w-full px-3 py-1.5 text-sm text-left hover:bg-muted flex items-center gap-2"
                 onClick={(e) => {
                   e.stopPropagation();
-                  // TODO: Implement duplicate
+                  onDuplicate();
                   setShowMenu(false);
                 }}
               >
@@ -121,6 +122,7 @@ export function TestLibraryPanel() {
     selectTest,
     createTest,
     deleteTest,
+    duplicateTest,
     setSearchQuery,
     setFilterType,
     loadTests,
@@ -146,6 +148,10 @@ export function TestLibraryPanel() {
     if (window.confirm("Are you sure you want to delete this test?")) {
       await deleteTest(id);
     }
+  };
+
+  const handleDuplicateTest = async (id: string) => {
+    await duplicateTest(id);
   };
 
   // Group tests by type
@@ -259,6 +265,7 @@ export function TestLibraryPanel() {
                       isSelected={state.selectedTestId === test.id}
                       onSelect={() => selectTest(test.id)}
                       onDelete={() => handleDeleteTest(test.id)}
+                      onDuplicate={() => handleDuplicateTest(test.id)}
                     />
                   ))}
                 </div>
@@ -275,6 +282,7 @@ export function TestLibraryPanel() {
                 isSelected={state.selectedTestId === test.id}
                 onSelect={() => selectTest(test.id)}
                 onDelete={() => handleDeleteTest(test.id)}
+                onDuplicate={() => handleDuplicateTest(test.id)}
               />
             ))}
           </div>

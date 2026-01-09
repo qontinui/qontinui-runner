@@ -109,6 +109,7 @@ interface TestBuilderContextValue {
   createTest: (input: CreateTestInput) => Promise<VerificationTest | null>;
   updateTest: (id: string, input: CreateTestInput) => Promise<VerificationTest | null>;
   deleteTest: (id: string) => Promise<boolean>;
+  duplicateTest: (id: string) => Promise<VerificationTest | null>;
   executeTest: (id: string) => Promise<TestExecutionResult | null>;
   setSearchQuery: (query: string) => void;
   setFilterType: (filterType: TestType | "all") => void;
@@ -281,6 +282,61 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  // Duplicate a test
+  const duplicateTest = useCallback(
+    async (id: string): Promise<VerificationTest | null> => {
+      dispatch({ type: "SET_SAVING", saving: true });
+      dispatch({ type: "SET_ERROR", error: null });
+
+      try {
+        // Find the test to duplicate
+        const testToDuplicate = state.tests.find((t) => t.id === id);
+        if (!testToDuplicate) {
+          dispatch({ type: "SET_ERROR", error: "Test not found" });
+          return null;
+        }
+
+        // Create a new test with copied data and a new name
+        const duplicatedInput: CreateTestInput = {
+          name: `${testToDuplicate.name} (Copy)`,
+          description: testToDuplicate.description,
+          test_type: testToDuplicate.test_type,
+          category: testToDuplicate.category,
+          playwright_code: testToDuplicate.playwright_code,
+          vision_config: testToDuplicate.vision_config,
+          python_code: testToDuplicate.python_code,
+          repo_test_config: testToDuplicate.repo_test_config,
+          success_criteria: testToDuplicate.success_criteria,
+          config: testToDuplicate.config,
+          timeout_seconds: testToDuplicate.timeout_seconds,
+          is_critical: testToDuplicate.is_critical,
+          enabled: testToDuplicate.enabled,
+          tags: testToDuplicate.tags,
+        };
+
+        const response = await invoke<CommandResponse<VerificationTest>>(
+          "create_verification_test",
+          { input: duplicatedInput },
+        );
+
+        if (response.success && response.data) {
+          dispatch({ type: "ADD_TEST", test: response.data });
+          dispatch({ type: "SET_SELECTED_TEST", id: response.data.id });
+          return response.data;
+        } else {
+          dispatch({ type: "SET_ERROR", error: response.message || "Failed to duplicate test" });
+          return null;
+        }
+      } catch (err) {
+        dispatch({ type: "SET_ERROR", error: String(err) });
+        return null;
+      } finally {
+        dispatch({ type: "SET_SAVING", saving: false });
+      }
+    },
+    [state.tests],
+  );
+
   // Execute a test
   const executeTest = useCallback(async (id: string): Promise<TestExecutionResult | null> => {
     dispatch({ type: "SET_EXECUTING", executing: true });
@@ -342,6 +398,7 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
     createTest,
     updateTest,
     deleteTest,
+    duplicateTest,
     executeTest,
     setSearchQuery,
     setFilterType,
