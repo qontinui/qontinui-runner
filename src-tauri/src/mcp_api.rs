@@ -9289,7 +9289,7 @@ async fn execute_test_by_id(
 
 /// Execute multiple tests as a suite
 async fn execute_test_suite_handler(
-    State(state): State<Arc<ApiState>>,
+    State(_state): State<Arc<ApiState>>,
     Json(request): Json<ExecuteTestSuiteRequest>,
 ) -> Result<Json<ApiResponse<ExecuteTestSuiteResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
