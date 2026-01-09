@@ -22,6 +22,7 @@ import { useTestBuilder } from "./TestBuilderContext";
 export function TestExecutionPanel() {
   const { selectedTest, state, executeTest } = useTestBuilder();
   const [isExpanded, setIsExpanded] = useState(true);
+  const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
 
   // Handle running the test
   const handleRunTest = async () => {
@@ -220,10 +221,7 @@ export function TestExecutionPanel() {
                       <div
                         key={i}
                         className="w-24 h-16 bg-muted rounded-md overflow-hidden cursor-pointer hover:ring-2 hover:ring-primary/50"
-                        onClick={() => {
-                          // TODO: Open screenshot modal
-                          console.log("Open screenshot:", screenshot);
-                        }}
+                        onClick={() => setSelectedScreenshot(screenshot)}
                       >
                         <img
                           src={`file://${screenshot}`}
@@ -261,6 +259,29 @@ export function TestExecutionPanel() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Screenshot Modal */}
+      {selectedScreenshot && (
+        <div
+          className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-8"
+          onClick={() => setSelectedScreenshot(null)}
+        >
+          <div className="relative max-w-[90vw] max-h-[90vh]">
+            <img
+              src={`file://${selectedScreenshot}`}
+              alt="Screenshot"
+              className="max-w-full max-h-[90vh] object-contain rounded-lg shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            />
+            <button
+              className="absolute top-2 right-2 p-2 bg-black/50 hover:bg-black/70 rounded-full text-white"
+              onClick={() => setSelectedScreenshot(null)}
+            >
+              <XCircle className="w-6 h-6" />
+            </button>
+          </div>
         </div>
       )}
     </div>
