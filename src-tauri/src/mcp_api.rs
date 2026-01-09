@@ -3248,19 +3248,56 @@ async fn load_rag_project(
 
 /// Get RAG availability (ML models status)
 async fn get_rag_availability(
-    State(_state): State<Arc<ApiState>>,
+    State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!("MCP API: Checking RAG availability");
 
-    // TODO: Actually check ML model availability
-    // For now, return a placeholder response
+    // Check CLIP availability via embedding generator
+    // The embedding generator uses CLIP for image embeddings
+    let embedding_generator = state.rag_state.embedding_generator.lock().await;
+    let clip_available = !embedding_generator.is_degraded();
+    drop(embedding_generator);
+
+    // Check text/OCR availability via semantic search
+    // The semantic search uses text embeddings for search
+    let semantic_search = state.rag_state.semantic_search.lock().await;
+    let text_available = !semantic_search.is_degraded();
+    let ocr_available = text_available; // OCR is part of the same text pipeline
+    drop(semantic_search);
+
+    // Check SAM availability via Python bridge
+    // SAM3 runs via the Python executor's segment_screenshot command
+    let app_state = state.app_state.clone();
+    let sam_available = tokio::task::spawn_blocking(move || {
+        let bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref bridge) = *bridge_lock {
+            bridge.is_running()
+        } else {
+            false
+        }
+    })
+    .await
+    .unwrap_or(false);
+
+    // Overall availability: at least one model must be available
+    let available = clip_available || text_available || sam_available;
+
+    info!(
+        "MCP API: RAG availability - clip={}, text={}, ocr={}, sam={}, overall={}",
+        clip_available, text_available, ocr_available, sam_available, available
+    );
+
     Ok(Json(ApiResponse::success(serde_json::json!({
-        "available": true,
+        "available": available,
         "models": {
-            "clip": true,
-            "text": true,
-            "ocr": true,
-            "sam": false
+            "clip": clip_available,
+            "text": text_available,
+            "ocr": ocr_available,
+            "sam": sam_available
         }
     }))))
 }
