@@ -153,3 +153,50 @@ pub struct SearchUnifiedWorkflowsQuery {
     /// Filter by tag
     pub tag: Option<String>,
 }
+
+/// Manifest for exported workflow files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowExportManifest {
+    /// Export format version
+    pub version: String,
+    /// When the export was created
+    pub exported_at: String,
+    /// App version that created the export
+    pub app_version: String,
+    /// Type of content
+    pub content_type: String,
+}
+
+/// A single workflow export file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowExport {
+    /// Export manifest with version info
+    pub manifest: WorkflowExportManifest,
+    /// The workflow data
+    pub workflow: UnifiedWorkflow,
+}
+
+/// Request body for importing a workflow
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImportWorkflowRequest {
+    /// The exported workflow data
+    pub workflow: UnifiedWorkflow,
+    /// How to handle ID conflicts: "keep" (use original ID), "generate" (new ID), "overwrite" (replace existing)
+    #[serde(default = "default_conflict_strategy")]
+    pub conflict_strategy: String,
+}
+
+fn default_conflict_strategy() -> String {
+    "generate".to_string()
+}
+
+/// Result of importing a workflow
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportWorkflowResult {
+    /// The imported workflow
+    pub workflow: UnifiedWorkflow,
+    /// Whether an existing workflow was overwritten
+    pub overwritten: bool,
+    /// Original ID if it was changed
+    pub original_id: Option<String>,
+}

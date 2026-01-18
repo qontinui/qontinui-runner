@@ -1992,24 +1992,14 @@ impl StepExecutor {
 
                     info!("Executing repository test: {} in {}", command, working_dir);
 
-                    match self.execute_shell_command_step(&command, &working_dir).await {
-                        Ok((exit_code, stdout, stderr)) => {
-                            let success = exit_code == 0;
-                            let error = if success {
-                                None
-                            } else {
-                                let output = format!(
-                                    "Exit code: {}\nstdout: {}\nstderr: {}",
-                                    exit_code,
-                                    stdout.chars().take(500).collect::<String>(),
-                                    stderr.chars().take(500).collect::<String>()
-                                );
-                                Some(output)
-                            };
-                            (success, error, None)
-                        }
-                        Err(e) => (false, Some(format!("Repository test error: {}", e)), None),
-                    }
+                    // Create a temporary step config for the shell command execution
+                    let temp_step = ExecutionStepConfig {
+                        shell_command: Some(command.clone()),
+                        shell_command_working_directory: Some(working_dir),
+                        ..Default::default()
+                    };
+                    let timeout = step.timeout_seconds.unwrap_or(300);
+                    self.execute_shell_command_step(&temp_step, timeout).await
                 } else {
                     (
                         false,

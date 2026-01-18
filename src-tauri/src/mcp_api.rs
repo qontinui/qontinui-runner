@@ -14104,19 +14104,13 @@ async fn get_current_execution_steps(
     for event in events {
         // Parse the event data JSON to extract step information
         let data: Option<serde_json::Value> = event
-            .get("data")
-            .and_then(|d| d.as_str())
+            .data
+            .as_ref()
             .and_then(|s| serde_json::from_str(s).ok());
 
-        let event_type = event
-            .get("event_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let event_subtype = event
-            .get("event_subtype")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let message = event.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let event_type = event.event_type.as_str();
+        let event_subtype = event.event_subtype.as_deref().unwrap_or("");
+        let message = event.message.as_str();
 
         // Filter by step type if specified
         if let Some(ref filter_type) = query.step_type {
@@ -14135,11 +14129,7 @@ async fn get_current_execution_steps(
 
         // Create step execution data from event
         let step_data = StepExecutionData {
-            id: event
-                .get("id")
-                .and_then(|v| v.as_i64())
-                .map(|i| i.to_string())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            id: event.id.to_string(),
             step_type: data
                 .as_ref()
                 .and_then(|d| d.get("step_type"))
@@ -14159,16 +14149,17 @@ async fn get_current_execution_steps(
                 _ => "pending",
             }
             .to_string(),
-            start_time: event.get("timestamp").and_then(|v| {
-                v.as_str()
-                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                    .map(|dt| dt.timestamp_millis())
-            }),
+            start_time: chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                .ok()
+                .map(|dt| dt.timestamp_millis()),
             end_time: data
                 .as_ref()
                 .and_then(|d| d.get("end_time"))
                 .and_then(|v| v.as_i64()),
-            duration_ms: event.get("duration_ms").and_then(|v| v.as_i64()),
+            duration_ms: data
+                .as_ref()
+                .and_then(|d| d.get("duration_ms"))
+                .and_then(|v| v.as_i64()),
             error: data
                 .as_ref()
                 .and_then(|d| d.get("error"))
@@ -17076,6 +17067,168 @@ async fn duplicate_unified_workflow(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!(
                     "Failed to duplicate unified workflow: {}",
+                    e
+                ))),
+            ))
+        }
+    }
+}
+
+/// Export a single unified workflow as a standalone JSON file
+async fn export_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<
+    Json<ApiResponse<crate::unified_workflows::WorkflowExport>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    info!("Exporting unified workflow: {}", id);
+
+    match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+        Ok(Some(workflow)) => {
+            let export = crate::unified_workflows::WorkflowExport {
+                manifest: crate::unified_workflows::WorkflowExportManifest {
+                    version: "1.0.0".to_string(),
+                    exported_at: chrono::Utc::now().to_rfc3339(),
+                    app_version: env!("CARGO_PKG_VERSION").to_string(),
+                    content_type: "unified_workflow".to_string(),
+                },
+                workflow,
+            };
+            info!("Exported unified workflow: {}", id);
+            Ok(Json(ApiResponse::success(export)))
+        }
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Unified workflow not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to export unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to export unified workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Import a unified workflow from an export file
+async fn import_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<crate::unified_workflows::ImportWorkflowRequest>,
+) -> Result<
+    Json<ApiResponse<crate::unified_workflows::ImportWorkflowResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    info!(
+        "Importing unified workflow: {} (strategy: {})",
+        request.workflow.name, request.conflict_strategy
+    );
+
+    let mut workflow = request.workflow;
+    let original_id = workflow.id.clone();
+    let mut overwritten = false;
+
+    // Check if workflow with this ID already exists
+    let existing = state
+        .app_state
+        .checkpoint_db
+        .get_unified_workflow(&workflow.id)
+        .ok()
+        .flatten();
+
+    match request.conflict_strategy.as_str() {
+        "keep" => {
+            // Try to use the original ID, fail if it exists
+            if existing.is_some() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(api_error(format!(
+                        "Workflow with ID '{}' already exists. Use 'generate' or 'overwrite' strategy.",
+                        workflow.id
+                    ))),
+                ));
+            }
+        }
+        "overwrite" => {
+            // If exists, delete it first
+            if existing.is_some() {
+                if let Err(e) = state
+                    .app_state
+                    .checkpoint_db
+                    .delete_unified_workflow(&workflow.id)
+                {
+                    error!("Failed to delete existing workflow for overwrite: {}", e);
+                    return Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(api_error(format!(
+                            "Failed to delete existing workflow: {}",
+                            e
+                        ))),
+                    ));
+                }
+                overwritten = true;
+            }
+        }
+        "generate" | _ => {
+            // Always generate a new ID
+            workflow.id = uuid::Uuid::new_v4().to_string();
+        }
+    }
+
+    // Update timestamps
+    let now = chrono::Utc::now().to_rfc3339();
+    workflow.updated_at = now.clone();
+    if request.conflict_strategy != "overwrite" || !overwritten {
+        workflow.created_at = now;
+    }
+
+    // Create the workflow using the existing create function logic
+    let create_request = crate::unified_workflows::CreateUnifiedWorkflowRequest {
+        name: workflow.name.clone(),
+        description: workflow.description.clone(),
+        category: workflow.category.clone(),
+        tags: workflow.tags.clone(),
+        setup_steps: workflow.setup_steps.clone(),
+        verification_steps: workflow.verification_steps.clone(),
+        agentic_steps: workflow.agentic_steps.clone(),
+        completion_steps: workflow.completion_steps.clone(),
+        max_iterations: workflow.max_iterations,
+        provider: workflow.provider.clone(),
+        model: workflow.model.clone(),
+        skip_ai_summary: workflow.skip_ai_summary,
+        log_source_selection: workflow.log_source_selection.clone(),
+    };
+
+    // Use the database's create function but with our custom ID
+    match state
+        .app_state
+        .checkpoint_db
+        .create_unified_workflow_with_id(&workflow.id, &create_request)
+    {
+        Ok(created) => {
+            info!(
+                "Imported unified workflow: {} ({}) [overwritten: {}]",
+                created.name, created.id, overwritten
+            );
+            Ok(Json(ApiResponse::success(
+                crate::unified_workflows::ImportWorkflowResult {
+                    workflow: created,
+                    overwritten,
+                    original_id: if workflow.id != original_id {
+                        Some(original_id)
+                    } else {
+                        None
+                    },
+                },
+            )))
+        }
+        Err(e) => {
+            error!("Failed to import unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!(
+                    "Failed to import unified workflow: {}",
                     e
                 ))),
             ))
