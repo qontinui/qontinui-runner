@@ -14,3 +14,6 @@ export { WorkflowLibraryPicker } from "./WorkflowLibraryPicker";
 export { ApiLibraryPicker } from "./ApiLibraryPicker";
 export { PromptLibraryPicker } from "./PromptLibraryPicker";
 export { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
+export { PromptTemplateEditor } from "./PromptTemplateEditor";
+export { ContextManagement } from "./ContextManagement";
+export * from "./prompt-template-constants";

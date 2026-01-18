@@ -174,7 +174,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
       combined.push({
         id: run.id,
         type: "gui",
-        name: run.workflow_name || "GUI Workflow",
+        name: run.workflow_name || "Macro",
         startedAt: run.started_at,
         endedAt: run.ended_at,
         durationMs: run.duration_ms,

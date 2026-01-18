@@ -6,22 +6,22 @@
 
 import { useState, useEffect } from "react";
 import { X, AlertCircle, Check } from "lucide-react";
-import type { GuiWorkflowStep, GuiActionType } from "../../types/gui-workflow";
-import { validateGuiWorkflowStep } from "../../types/gui-workflow";
-import { useGuiBuilder } from "./GuiBuilderContext";
+import type { MacroStep, MacroActionType } from "../../types/macro";
+import { validateMacroStep } from "../../types/macro";
+import { useMacroBuilder } from "./MacroBuilderContext";
 
 interface StepEditorProps {
-  step: GuiWorkflowStep | null;
+  step: MacroStep | null;
   open: boolean;
   onClose: () => void;
 }
 
 export function StepEditor({ step, open, onClose }: StepEditorProps) {
-  const { updateStep, images, states, configLoaded } = useGuiBuilder();
+  const { updateStep, images, states, configLoaded } = useMacroBuilder();
 
   // Local form state
   const [name, setName] = useState("");
-  const [actionType, setActionType] = useState<GuiActionType>("click");
+  const [actionType, setActionType] = useState<MacroActionType>("click");
   const [targetImageIds, setTargetImageIds] = useState<string[]>([]);
   const [textInput, setTextInput] = useState("");
   const [hotkey, setHotkey] = useState("");
@@ -45,7 +45,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
   const handleSave = () => {
     if (!step) return;
 
-    const updates: Partial<GuiWorkflowStep> = {
+    const updates: Partial<MacroStep> = {
       name,
       action_type: actionType,
       pause_after_ms: pauseAfterMs ? parseInt(pauseAfterMs) : undefined,
@@ -86,7 +86,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
   };
 
   // Validation
-  const tempStep: GuiWorkflowStep = {
+  const tempStep: MacroStep = {
     id: step?.id || "",
     action_type: actionType,
     name,
@@ -95,7 +95,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
     hotkey,
     target_state_ids: targetStateIds,
   };
-  const validation = validateGuiWorkflowStep(tempStep);
+  const validation = validateMacroStep(tempStep);
 
   if (!open) return null;
 
@@ -136,7 +136,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
             <label className="block text-sm font-medium mb-1">Action Type</label>
             <select
               value={actionType}
-              onChange={(e) => setActionType(e.target.value as GuiActionType)}
+              onChange={(e) => setActionType(e.target.value as MacroActionType)}
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
             >
               <option value="click">Click</option>

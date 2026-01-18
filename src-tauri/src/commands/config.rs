@@ -301,6 +301,52 @@ pub fn save_auto_load_last_config(enabled: bool) -> Result<CommandResponse, Stri
     })
 }
 
+/// Get the include summary step by default setting.
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with enabled status
+/// * `Err(String)` - Error message if settings cannot be read
+#[tauri::command]
+pub fn get_include_summary_step_by_default() -> Result<CommandResponse, String> {
+    let enabled = settings::get_include_summary_step_by_default();
+
+    Ok(CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "enabled": enabled
+        })),
+    })
+}
+
+/// Save the include summary step by default setting.
+///
+/// # Arguments
+/// * `enabled` - Whether to include AI Summary step in new workflows by default
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success message
+/// * `Err(String)` - Error if settings cannot be saved
+#[tauri::command]
+pub fn save_include_summary_step_by_default(enabled: bool) -> Result<CommandResponse, String> {
+    info!(
+        "Saving include summary step by default setting: {}",
+        enabled
+    );
+
+    settings::save_include_summary_step_by_default(enabled)
+        .map_err(|e| format!("Failed to save include summary step setting: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some(format!(
+            "Include summary step by default {}",
+            if enabled { "enabled" } else { "disabled" }
+        )),
+        data: None,
+    })
+}
+
 /// Get workspace paths for portable operation.
 ///
 /// Returns paths that are dynamically determined based on the runner's location,

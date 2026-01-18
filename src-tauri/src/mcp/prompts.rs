@@ -1,6 +1,6 @@
 //! Prompt library handlers for MCP API
 //!
-//! Provides handlers for managing prompts, AI workflows, and scriptlets.
+//! Provides handlers for managing prompts and scriptlets.
 
 use axum::{
     extract::{Path, Query, State},
@@ -11,7 +11,6 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use super::types::{api_error, ApiResponse, ApiState};
-use crate::ai_workflows::{self, AiWorkflow};
 use crate::prompts::{self, SavedPrompt};
 use crate::scriptlets::{self, Scriptlet};
 
@@ -237,144 +236,6 @@ pub async fn run_prompt(
         "content": final_content,
         "started": true
     }))))
-}
-
-// ============================================================================
-// AI Workflow Library Handlers
-// ============================================================================
-
-pub async fn list_ai_workflows(
-) -> Result<Json<ApiResponse<Vec<AiWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let list = ai_workflows::list_workflows(None);
-    Ok(Json(ApiResponse::success(list)))
-}
-
-pub async fn get_ai_workflow(
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<AiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::get_workflow(&id) {
-        Some(workflow) => Ok(Json(ApiResponse::success(workflow))),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error("Workflow not found")),
-        )),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CreateWorkflowRequest {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    pub prompt: String,
-    #[serde(default)]
-    pub category: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub max_sessions: Option<u32>,
-    #[serde(default)]
-    pub execution_steps: Vec<ai_workflows::ExecutionStep>,
-}
-
-pub async fn create_ai_workflow(
-    Json(request): Json<CreateWorkflowRequest>,
-) -> Result<Json<ApiResponse<AiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::create_workflow(
-        request.name,
-        request.description,
-        request.prompt,
-        request.category,
-        request.tags,
-        request.max_sessions,
-        request.execution_steps,
-    ) {
-        Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateWorkflowRequest {
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub prompt: Option<String>,
-    pub category: Option<String>,
-    pub tags: Option<Vec<String>>,
-    pub max_sessions: Option<Option<u32>>,
-    pub execution_steps: Option<Vec<ai_workflows::ExecutionStep>>,
-}
-
-pub async fn update_ai_workflow(
-    Path(id): Path<String>,
-    Json(request): Json<UpdateWorkflowRequest>,
-) -> Result<Json<ApiResponse<AiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::update_workflow(
-        &id,
-        request.name,
-        request.description,
-        request.prompt,
-        request.category,
-        request.tags,
-        request.max_sessions,
-        request.execution_steps,
-    ) {
-        Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
-
-pub async fn delete_ai_workflow(
-    Path(id): Path<String>,
-) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::delete_workflow(&id) {
-        Ok(()) => Ok(Json(ApiResponse::success(()))),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
-    }
-}
-
-pub async fn search_ai_workflows(
-    Query(query): Query<SearchQuery>,
-) -> Result<Json<ApiResponse<Vec<AiWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let workflows = if let Some(q) = query.q {
-        ai_workflows::search_workflows(&q)
-    } else {
-        ai_workflows::list_workflows(None)
-    };
-
-    // Filter by category if provided
-    let workflows = if let Some(category) = query.category {
-        workflows
-            .into_iter()
-            .filter(|w| w.category == category)
-            .collect()
-    } else {
-        workflows
-    };
-
-    // Filter by tag if provided
-    let workflows = if let Some(tag) = query.tag {
-        workflows
-            .into_iter()
-            .filter(|w| w.tags.contains(&tag))
-            .collect()
-    } else {
-        workflows
-    };
-
-    Ok(Json(ApiResponse::success(workflows)))
-}
-
-pub async fn get_ai_workflow_categories(
-) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let categories = ai_workflows::get_categories();
-    Ok(Json(ApiResponse::success(categories)))
-}
-
-pub async fn get_ai_workflow_tags(
-) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let tags = ai_workflows::get_tags();
-    Ok(Json(ApiResponse::success(tags)))
 }
 
 // ============================================================================

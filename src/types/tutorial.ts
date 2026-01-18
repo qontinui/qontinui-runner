@@ -280,7 +280,7 @@ export type TutorialFocusPage =
   | "active"
   | "unified-workflow-builder"
   | "workflow-builder"
-  | "gui-workflow-builder"
+  | "macro-builder"
   | "script-builder"
   | "check-builder"
   | "library"

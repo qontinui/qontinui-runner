@@ -104,6 +104,10 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "isSetup", default)]
     pub is_setup: Option<bool>,
 
+    /// Workflow phase: "setup", "verification", "agentic", or "completion"
+    #[serde(default)]
+    pub phase: Option<String>,
+
     /// Whether to run this step on subsequent iterations (after the first).
     /// Default: true (all steps run on each iteration for fresh data)
     /// Users can toggle off individual steps if they only need to run once (e.g., one-time setup)
@@ -236,6 +240,13 @@ pub struct ExecutionStepConfig {
     /// Check: Whether to run auto-fix
     #[serde(alias = "checkAutoFix", alias = "auto_fix", default)]
     pub check_auto_fix: Option<bool>,
+
+    // ========================================================================
+    // Macro Step Fields
+    // ========================================================================
+    /// Macro: ID of the saved macro to execute
+    #[serde(alias = "macroId", alias = "macro_id")]
+    pub macro_id: Option<String>,
 }
 
 impl ExecutionStepConfig {
@@ -258,6 +269,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(300),
             initial_state_ids: None,
             is_setup: Some(true), // Workflow is setup by default
+            phase: None,
             run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
             test_id: None,
             test_type: None,
@@ -290,6 +302,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -312,6 +326,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(300),
             initial_state_ids: None,
             is_setup: Some(true), // Workflow is setup by default
+            phase: None,
             run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
             test_id: None,
             test_type: None,
@@ -344,6 +359,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -366,6 +383,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(false), // Screenshot is verification, not setup
+            phase: None,
             run_on_subsequent_iterations: Some(true), // Verification runs on all iterations
             test_id: None,
             test_type: None,
@@ -398,6 +416,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -424,6 +444,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(true), // AWAS discover is typically setup
+            phase: None,
             run_on_subsequent_iterations: Some(false), // Usually only discover once
             test_id: None,
             test_type: None,
@@ -456,6 +477,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -478,6 +501,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(false), // AWAS execute is typically an action step
+            phase: None,
             run_on_subsequent_iterations: Some(true),
             test_id: None,
             test_type: None,
@@ -510,6 +534,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -532,6 +558,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(true), // Check support is typically setup
+            phase: None,
             run_on_subsequent_iterations: Some(false),
             test_id: None,
             test_type: None,
@@ -564,6 +591,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -586,6 +615,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(false),
+            phase: None,
             run_on_subsequent_iterations: Some(true),
             test_id: None,
             test_type: None,
@@ -618,6 +648,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -640,6 +672,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(false),
+            phase: None,
             run_on_subsequent_iterations: Some(true),
             test_id: None,
             test_type: None,
@@ -672,6 +705,8 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         }
     }
 
@@ -702,6 +737,7 @@ impl ExecutionStepConfig {
             timeout_seconds: Some(30),
             initial_state_ids: None,
             is_setup: Some(false),
+            phase: None,
             run_on_subsequent_iterations: Some(true),
             test_id: None,
             test_type: None,
@@ -734,6 +770,65 @@ impl ExecutionStepConfig {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
+        }
+    }
+
+    /// Create a macro step (runs a saved macro by ID)
+    pub fn macro_step(macro_id: &str, name: Option<&str>) -> Self {
+        Self {
+            step_type: "macro".to_string(),
+            name: name.map(|n| n.to_string()),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(300),
+            initial_state_ids: None,
+            is_setup: Some(true), // Macro is setup by default
+            phase: None,
+            run_on_subsequent_iterations: Some(true),
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+            // Macro fields
+            macro_id: Some(macro_id.to_string()),
         }
     }
 
@@ -1353,6 +1448,7 @@ impl StepExecutor {
             ),
             initial_state_ids: None,
             is_setup: Some(false), // Combined step is treated as verification
+            phase: None,
             run_on_subsequent_iterations: Some(true), // Always runs
             test_id: None,
             test_type: None,
@@ -1385,6 +1481,8 @@ impl StepExecutor {
             check_command: None,
             check_working_directory: None,
             check_auto_fix: None,
+            // Macro fields
+            macro_id: None,
         })
     }
 
@@ -2460,6 +2558,20 @@ impl StepExecutor {
             // Check Step Type (code quality checks)
             // ================================================================
             "check" => self.execute_check_step(step, timeout).await,
+            // ================================================================
+            // Macro Step Type (runs a saved macro by ID)
+            // ================================================================
+            "macro" => {
+                if let Some(ref macro_id) = step.macro_id {
+                    self.execute_macro_step(macro_id, step.monitor_index).await
+                } else {
+                    (
+                        false,
+                        Some("No macro ID specified for macro step".to_string()),
+                        None,
+                    )
+                }
+            }
             _ => {
                 warn!("Unknown step type: {}", step.step_type);
                 (
@@ -4230,6 +4342,131 @@ impl StepExecutor {
         self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
 
         (final_success, error_msg, output_data)
+    }
+
+    // =========================================================================
+    // Macro Step Execution
+    // =========================================================================
+
+    /// Execute a saved macro by ID
+    async fn execute_macro_step(
+        &self,
+        macro_id: &str,
+        monitor_index: Option<i32>,
+    ) -> (bool, Option<String>, Option<String>) {
+        use crate::macros;
+
+        // Get the macro
+        let macro_item = match macros::get_macro(macro_id) {
+            Some(m) => m,
+            None => {
+                return (
+                    false,
+                    Some(format!("Macro not found: {}", macro_id)),
+                    None,
+                );
+            }
+        };
+
+        info!("Executing macro: {} ({})", macro_item.name, macro_id);
+
+        // Increment run count
+        if let Err(e) = macros::increment_run_count(macro_id) {
+            warn!("Failed to increment run count for macro {}: {}", macro_id, e);
+        }
+
+        let mut all_success = true;
+        let mut errors: Vec<String> = Vec::new();
+
+        // Execute each step
+        for (idx, step) in macro_item.steps.iter().enumerate() {
+            let step_monitor = step.monitor_index.or(monitor_index);
+
+            let result = match step.action_type.as_str() {
+                "click" | "double_click" | "right_click" => {
+                    if let Some(ref image_ids) = step.target_image_ids {
+                        if let Some(first_image_id) = image_ids.first() {
+                            self.action_service
+                                .execute_action(&step.action_type, first_image_id, None, step_monitor)
+                                .await
+                                .map(|r| r.success)
+                                .map_err(|e| format!("{:?}", e))
+                        } else {
+                            Err("No target image specified".to_string())
+                        }
+                    } else {
+                        Err("No target image IDs specified".to_string())
+                    }
+                }
+                "type" => {
+                    if let Some(ref text) = step.text_input {
+                        let config = json!({"text": text});
+                        self.action_service
+                            .execute_action("TYPE", "", Some(&config), step_monitor)
+                            .await
+                            .map(|r| r.success)
+                            .map_err(|e| format!("{:?}", e))
+                    } else {
+                        Err("No text specified for type action".to_string())
+                    }
+                }
+                "hotkey" => {
+                    if let Some(ref hotkey) = step.hotkey {
+                        let config = json!({"hotkey": hotkey});
+                        self.action_service
+                            .execute_action("HOTKEY", "", Some(&config), step_monitor)
+                            .await
+                            .map(|r| r.success)
+                            .map_err(|e| format!("{:?}", e))
+                    } else {
+                        Err("No hotkey specified".to_string())
+                    }
+                }
+                "go_to_state" => {
+                    if let Some(ref state_ids) = step.target_state_ids {
+                        if let Some(first_state_id) = state_ids.first() {
+                            let timeout = step.timeout_seconds.unwrap_or(60);
+                            self.action_service
+                                .go_to_state(first_state_id, None, step_monitor, timeout)
+                                .await
+                                .map(|r| r.success)
+                                .map_err(|e| format!("{:?}", e))
+                        } else {
+                            Err("No target state specified".to_string())
+                        }
+                    } else {
+                        Err("No target state IDs specified".to_string())
+                    }
+                }
+                _ => Err(format!("Unknown action type: {}", step.action_type)),
+            };
+
+            match result {
+                Ok(success) => {
+                    if !success {
+                        all_success = false;
+                        errors.push(format!("Step {} '{}' failed", idx + 1, step.name));
+                    }
+                }
+                Err(e) => {
+                    all_success = false;
+                    errors.push(format!("Step {} '{}': {}", idx + 1, step.name, e));
+                }
+            }
+
+            // Apply pause_after_ms if specified
+            if let Some(pause_ms) = step.pause_after_ms {
+                tokio::time::sleep(tokio::time::Duration::from_millis(pause_ms as u64)).await;
+            }
+        }
+
+        let error_msg = if errors.is_empty() {
+            None
+        } else {
+            Some(errors.join("; "))
+        };
+
+        (all_success, error_msg, None)
     }
 }
 

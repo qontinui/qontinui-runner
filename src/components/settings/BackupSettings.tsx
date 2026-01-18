@@ -43,7 +43,6 @@ interface ExportSummary {
   learning_patterns: number;
   settings: number;
   prompts: number;
-  ai_workflows: number;
   unified_workflows: number;
   verification_tests: number;
   task_hooks: number;
@@ -62,7 +61,6 @@ interface ComprehensiveExport {
   learning_patterns: unknown[];
   settings: unknown[];
   prompts: unknown[];
-  ai_workflows: unknown[];
   unified_workflows: unknown[];
   verification_tests: unknown[];
   task_hooks: unknown[];
@@ -79,7 +77,6 @@ interface ExportOptions {
   learning_patterns: boolean;
   settings: boolean;
   prompts: boolean;
-  ai_workflows: boolean;
   unified_workflows: boolean;
   verification_tests: boolean;
   task_hooks: boolean;
@@ -97,7 +94,6 @@ interface ImportOptions {
   learning_patterns: boolean;
   settings: boolean;
   prompts: boolean;
-  ai_workflows: boolean;
   unified_workflows: boolean;
   verification_tests: boolean;
   task_hooks: boolean;
@@ -139,7 +135,6 @@ const defaultExportOptions: ExportOptions = {
   learning_patterns: true,
   settings: true,
   prompts: true,
-  ai_workflows: true,
   unified_workflows: true,
   verification_tests: true,
   task_hooks: true,
@@ -157,7 +152,6 @@ const defaultImportOptions: ImportOptions = {
   learning_patterns: true,
   settings: true,
   prompts: true,
-  ai_workflows: true,
   unified_workflows: true,
   verification_tests: true,
   task_hooks: true,
@@ -175,7 +169,6 @@ const categoryLabels: Record<keyof ExportSummary, string> = {
   learning_patterns: "Learning Patterns",
   settings: "Settings",
   prompts: "Prompts",
-  ai_workflows: "AI Workflows",
   unified_workflows: "Unified Workflows",
   verification_tests: "Verification Tests",
   task_hooks: "Task Hooks",

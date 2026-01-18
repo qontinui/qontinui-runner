@@ -82,14 +82,6 @@ interface ActiveTaskInfo {
   maxSessions?: number | null;
 }
 
-interface WorkflowSession {
-  id: string;
-  name: string;
-  startTime: number;
-  endTime: number;
-  loopCount: number;
-  isActive: boolean;
-}
 
 export function AiTab({
   aiOutputLines,
@@ -186,112 +178,18 @@ export function AiTab({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Extract workflow sessions from loops
-  const workflowSessions = useMemo(() => {
-    const sessions: WorkflowSession[] = [];
-
-    const findBestLoopName = (loop: AiLoop): string | null => {
-      if (loop.sessionName && loop.sessionName !== "AI Response") {
-        return loop.sessionName;
-      }
-      if (loop.promptPreview && loop.promptPreview !== "AI Response") {
-        return loop.promptPreview;
-      }
-      for (const entry of loop.entries) {
-        if (entry.source === "prompt" && entry.line.trim()) {
-          const cleaned = entry.line.replace(/\n/g, " ").trim();
-          if (cleaned.length > 0) {
-            return cleaned.length > 50 ? cleaned.substring(0, 47) + "..." : cleaned;
-          }
-        }
-      }
-      return null;
-    };
-
-    interface TempSession {
-      id: string;
-      loops: AiLoop[];
-      startTime: number;
-      endTime: number;
-    }
-    const sessionMap = new Map<string, TempSession>();
-
-    for (const loop of loops) {
-      const sessionId = loop.sessionId || loop.id;
-
-      if (sessionMap.has(sessionId)) {
-        const session = sessionMap.get(sessionId)!;
-        session.loops.push(loop);
-        session.endTime = Math.max(session.endTime, loop.endTime);
-        session.startTime = Math.min(session.startTime, loop.startTime);
-      } else {
-        sessionMap.set(sessionId, {
-          id: sessionId,
-          loops: [loop],
-          startTime: loop.startTime,
-          endTime: loop.endTime,
-        });
-      }
-    }
-
-    for (const temp of sessionMap.values()) {
-      let bestName: string | null = null;
-
-      for (const loop of temp.loops) {
-        if (loop.sessionName && loop.sessionName !== "AI Response") {
-          bestName = loop.sessionName;
-          break;
-        }
-      }
-
-      if (!bestName) {
-        for (const loop of temp.loops) {
-          for (const entry of loop.entries) {
-            if (entry.sessionName && entry.sessionName !== "AI Response") {
-              bestName = entry.sessionName;
-              break;
-            }
-          }
-          if (bestName) break;
-        }
-      }
-
-      if (!bestName) {
-        for (const loop of temp.loops) {
-          const loopName = findBestLoopName(loop);
-          if (loopName) {
-            bestName = loopName;
-            break;
-          }
-        }
-      }
-
-      if (!bestName) {
-        bestName = "Untitled Run";
-      }
-
-      sessions.push({
-        id: temp.id,
-        name: bestName,
-        startTime: temp.startTime,
-        endTime: temp.endTime,
-        loopCount: temp.loops.length,
-        isActive: activeSessions.some((s) => s.id === temp.id),
-      });
-    }
-
-    return sessions.sort((a, b) => b.endTime - a.endTime);
-  }, [loops, activeSessions]);
-
-  // Group sessions by date
+  // Group AI sessions (loops) by date for the dropdown
   const sessionsByDate = useMemo(() => {
-    const groups: Map<string, WorkflowSession[]> = new Map();
+    const groups: Map<string, AiLoop[]> = new Map();
     const today = new Date();
     const yesterday = new Date(today);
     yesterday.setDate(yesterday.getDate() - 1);
 
-    for (const session of workflowSessions) {
-      const date = new Date(session.startTime);
+    // Sort loops by endTime descending (most recent first)
+    const sortedLoops = [...loops].sort((a, b) => b.endTime - a.endTime);
+
+    for (const loop of sortedLoops) {
+      const date = new Date(loop.startTime);
       let dateKey: string;
 
       if (date.toDateString() === today.toDateString()) {
@@ -305,44 +203,37 @@ export function AiTab({
       if (!groups.has(dateKey)) {
         groups.set(dateKey, []);
       }
-      groups.get(dateKey)!.push(session);
+      groups.get(dateKey)!.push(loop);
     }
 
     return groups;
-  }, [workflowSessions]);
+  }, [loops]);
 
-  // Get the selected session or default to the most recent
-  const currentSession = useMemo(() => {
+  // Get the selected AI session (loop) or default to the most recent
+  const currentLoop = useMemo(() => {
     // "All Sessions" explicitly selected - return null to show all
     if (selectedSessionId === ALL_SESSIONS) {
       return null;
     }
     // Initial state (null) - default to most recent session
-    if (!selectedSessionId && workflowSessions.length > 0) {
-      return workflowSessions[0];
+    if (!selectedSessionId && loops.length > 0) {
+      return loops[loops.length - 1]; // Most recent loop
     }
-    return workflowSessions.find((s) => s.id === selectedSessionId) || null;
-  }, [selectedSessionId, workflowSessions]);
-
-  // Filter loops by selected session
-  const filteredLoops = useMemo(() => {
-    if (!currentSession) return loops;
-    return loops.filter((loop) => loop.sessionId === currentSession.id);
-  }, [loops, currentSession]);
+    return loops.find((l) => l.id === selectedSessionId) || null;
+  }, [selectedSessionId, loops]);
 
   // Get filtered AI output lines based on selected session
   const filteredAiOutputLines = useMemo(() => {
-    if (!currentSession) return runFilteredAiOutputLines;
+    if (!currentLoop) return runFilteredAiOutputLines;
 
+    // Filter to only include entries from the selected loop
     const filteredEntryIds = new Set<string>();
-    for (const loop of filteredLoops) {
-      for (const entry of loop.entries) {
-        filteredEntryIds.add(entry.id);
-      }
+    for (const entry of currentLoop.entries) {
+      filteredEntryIds.add(entry.id);
     }
 
     return runFilteredAiOutputLines.filter((line) => filteredEntryIds.has(line.id));
-  }, [runFilteredAiOutputLines, currentSession, filteredLoops]);
+  }, [runFilteredAiOutputLines, currentLoop]);
 
   // Load auto-fix setting on mount
   useEffect(() => {
@@ -519,8 +410,9 @@ export function AiTab({
     setIsForceContinuing(true);
     try {
       const requestBody: { task_run_id?: string } = {};
-      if (currentSession) {
-        requestBody.task_run_id = currentSession.id;
+      // Use the task run ID from the current loop's sessionId
+      if (currentLoop?.sessionId) {
+        requestBody.task_run_id = currentLoop.sessionId;
       }
 
       const response = await fetch("http://localhost:9876/workflow/force-continue", {
@@ -532,7 +424,7 @@ export function AiTab({
 
       if (result.success) {
         setIsRunning(true);
-        const sessionInfo = currentSession ? ` "${currentSession.name}"` : "";
+        const sessionInfo = currentLoop ? ` "${currentLoop.label}"` : "";
         setLastResult({
           success: true,
           message: `Continuing${sessionInfo}. AI will resume with context from last output.`,
@@ -552,7 +444,7 @@ export function AiTab({
     } finally {
       setIsForceContinuing(false);
     }
-  }, [isForceContinuing, currentSession]);
+  }, [isForceContinuing, currentLoop]);
 
   // Handler to stop AI
   const handleStopAi = useCallback(async () => {
@@ -620,17 +512,17 @@ export function AiTab({
       const cutoffTimestamp = cutoffDate.getTime();
 
       const toSelect = new Set<string>();
-      for (const session of workflowSessions) {
-        if (session.endTime <= cutoffTimestamp) {
-          toSelect.add(session.id);
+      for (const loop of loops) {
+        if (loop.endTime <= cutoffTimestamp) {
+          toSelect.add(loop.id);
         }
       }
       setSelectedForDeletion(toSelect);
     },
-    [workflowSessions],
+    [loops],
   );
 
-  // Delete selected runs
+  // Delete selected sessions
   const handleDeleteRuns = useCallback(async () => {
     if (selectedForDeletion.size === 0) return;
 
@@ -651,7 +543,7 @@ export function AiTab({
         console.log(`Deleted ${checkpointResult.data?.deleted_count ?? 0} checkpoint files`);
       }
 
-      if (selectedForDeletion.size === workflowSessions.length) {
+      if (selectedForDeletion.size === loops.length) {
         await invoke("clear_ai_output_log");
         onClearAiOutput();
       } else {
@@ -659,23 +551,23 @@ export function AiTab({
         onClearAiOutput();
       }
     } catch (error) {
-      console.error("Failed to delete runs:", error);
+      console.error("Failed to delete sessions:", error);
     } finally {
       setSelectedForDeletion(new Set());
       setDeleteBeforeDate("");
       setIsManagingRuns(false);
       setIsDeleting(false);
     }
-  }, [selectedForDeletion, workflowSessions, onClearAiOutput]);
+  }, [selectedForDeletion, loops, onClearAiOutput]);
 
   // Select/deselect all sessions
   const handleSelectAll = useCallback(() => {
-    if (selectedForDeletion.size === workflowSessions.length) {
+    if (selectedForDeletion.size === loops.length) {
       setSelectedForDeletion(new Set());
     } else {
-      setSelectedForDeletion(new Set(workflowSessions.map((s) => s.id)));
+      setSelectedForDeletion(new Set(loops.map((l) => l.id)));
     }
-  }, [workflowSessions, selectedForDeletion.size]);
+  }, [loops, selectedForDeletion.size]);
 
   // Get findings summary
   const findingsSummary = useMemo(() => {
@@ -970,10 +862,27 @@ export function AiTab({
               className="flex items-center gap-2 px-3 py-1.5 bg-background border border-border rounded-lg hover:bg-muted/50 transition-colors min-w-[200px]"
             >
               <History className="w-4 h-4 text-primary" />
-              <span className="flex-1 text-left text-sm truncate">
-                {currentSession ? currentSession.name : "All Sessions"}
+              <span className="flex-1 text-left text-sm truncate flex items-center gap-1.5">
+                {currentLoop ? currentLoop.label : "All Sessions"}
+                {currentLoop?.phase && (
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded capitalize ${
+                      currentLoop.phase === "setup"
+                        ? "bg-blue-500/20 text-blue-400"
+                        : currentLoop.phase === "verification"
+                          ? "bg-amber-500/20 text-amber-400"
+                          : currentLoop.phase === "agentic"
+                            ? "bg-purple-500/20 text-purple-400"
+                            : currentLoop.phase === "completion"
+                              ? "bg-green-500/20 text-green-400"
+                              : "bg-muted text-muted-foreground"
+                    }`}
+                  >
+                    {currentLoop.phase}
+                  </span>
+                )}
               </span>
-              <span className="text-xs text-muted-foreground">({workflowSessions.length})</span>
+              <span className="text-xs text-muted-foreground">({loops.length})</span>
               <ChevronDown
                 className={`w-4 h-4 transition-transform ${sessionDropdownOpen ? "rotate-180" : ""}`}
               />
@@ -1024,9 +933,7 @@ export function AiTab({
                         className="flex items-center gap-1 px-2 py-1 text-xs bg-muted hover:bg-muted/80 rounded transition-colors"
                       >
                         <CheckSquare className="w-3 h-3" />
-                        {selectedForDeletion.size === workflowSessions.length
-                          ? "Deselect"
-                          : "Select All"}
+                        {selectedForDeletion.size === loops.length ? "Deselect" : "Select All"}
                       </button>
                       <button
                         onClick={(e) => {
@@ -1048,7 +955,7 @@ export function AiTab({
                 )}
 
                 {/* All Sessions Option */}
-                {!isManagingRuns && workflowSessions.length > 0 && (
+                {!isManagingRuns && loops.length > 0 && (
                   <button
                     onClick={() => {
                       handleSelectSession(ALL_SESSIONS);
@@ -1060,33 +967,33 @@ export function AiTab({
                   >
                     <Brain className="w-4 h-4 text-primary" />
                     <span className="flex-1">All Sessions</span>
-                    <span className="text-xs text-muted-foreground">{workflowSessions.length}</span>
+                    <span className="text-xs text-muted-foreground">{loops.length}</span>
                   </button>
                 )}
 
                 {/* Sessions grouped by date */}
-                {Array.from(sessionsByDate.entries()).map(([dateLabel, sessions]) => (
+                {Array.from(sessionsByDate.entries()).map(([dateLabel, dateLoops]) => (
                   <div key={dateLabel}>
                     <div className="px-3 py-1 text-xs font-medium text-muted-foreground bg-muted/30 sticky top-0">
                       {dateLabel}
                     </div>
-                    {sessions.map((session) => (
+                    {dateLoops.map((loop) => (
                       <div
-                        key={session.id}
+                        key={loop.id}
                         onClick={() => {
                           if (isManagingRuns) {
-                            handleToggleSessionSelection(session.id);
+                            handleToggleSessionSelection(loop.id);
                           } else {
-                            handleSelectSession(session.id);
+                            handleSelectSession(loop.id);
                             setSessionDropdownOpen(false);
                           }
                         }}
                         className={`flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted/50 transition-colors cursor-pointer ${
                           isManagingRuns
-                            ? selectedForDeletion.has(session.id)
+                            ? selectedForDeletion.has(loop.id)
                               ? getStatusColors("error").bg
                               : ""
-                            : selectedSessionId === session.id
+                            : selectedSessionId === loop.id
                               ? "bg-primary/10"
                               : ""
                         }`}
@@ -1094,8 +1001,8 @@ export function AiTab({
                         {isManagingRuns ? (
                           <input
                             type="checkbox"
-                            checked={selectedForDeletion.has(session.id)}
-                            onChange={() => handleToggleSessionSelection(session.id)}
+                            checked={selectedForDeletion.has(loop.id)}
+                            onChange={() => handleToggleSessionSelection(loop.id)}
                             onClick={(e) => e.stopPropagation()}
                             className="flex-shrink-0 accent-red-500"
                           />
@@ -1104,8 +1011,25 @@ export function AiTab({
                         )}
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-1.5">
-                            <span className="font-medium truncate">{session.name}</span>
-                            {session.isActive && (
+                            <span className="font-medium truncate">{loop.label}</span>
+                            {loop.phase && (
+                              <span
+                                className={`text-[10px] px-1.5 py-0.5 rounded flex-shrink-0 capitalize ${
+                                  loop.phase === "setup"
+                                    ? "bg-blue-500/20 text-blue-400"
+                                    : loop.phase === "verification"
+                                      ? "bg-amber-500/20 text-amber-400"
+                                      : loop.phase === "agentic"
+                                        ? "bg-purple-500/20 text-purple-400"
+                                        : loop.phase === "completion"
+                                          ? "bg-green-500/20 text-green-400"
+                                          : "bg-muted text-muted-foreground"
+                                }`}
+                              >
+                                {loop.phase}
+                              </span>
+                            )}
+                            {loop.isActive && (
                               <span
                                 className={`text-[10px] px-1 py-0.5 ${getStatusColors("running").bg} ${getStatusColors("running").text} rounded flex-shrink-0`}
                               >
@@ -1114,8 +1038,7 @@ export function AiTab({
                             )}
                           </div>
                           <div className="text-xs text-muted-foreground">
-                            {formatTime(session.startTime)} • {session.loopCount} conv
-                            {session.loopCount !== 1 ? "s" : ""}
+                            {formatTime(loop.startTime)} • {loop.promptPreview}
                           </div>
                         </div>
                       </div>
@@ -1123,7 +1046,7 @@ export function AiTab({
                   </div>
                 ))}
 
-                {workflowSessions.length === 0 && (
+                {loops.length === 0 && (
                   <div className="px-3 py-4 text-center text-sm text-muted-foreground">
                     No sessions yet
                   </div>
@@ -1141,8 +1064,8 @@ export function AiTab({
             </div>
             <div className="flex items-center gap-1.5">
               <Brain className="w-3.5 h-3.5 text-primary" />
-              <span className="text-muted-foreground">Convs:</span>
-              <span className="font-medium">{filteredLoops.length}</span>
+              <span className="text-muted-foreground">Sessions:</span>
+              <span className="font-medium">{currentLoop ? 1 : loops.length}</span>
             </div>
             {findingsSummary.total > 0 ? (
               <div className="flex items-center gap-1.5">

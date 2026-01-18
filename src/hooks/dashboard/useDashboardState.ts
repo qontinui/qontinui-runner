@@ -9,7 +9,13 @@ import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useDashboardLayout, type DashboardLayoutState } from "./useDashboardLayout";
 import { useTaskDetection } from "./useTaskDetection";
 import { usePhaseTracking } from "./usePhaseTracking";
-import type { ActivityType, ActivityState, TaskPhase } from "../../types/dashboard/activity-types";
+import { useOrchestratorState } from "./useOrchestratorState";
+import type {
+  ActivityType,
+  ActivityState,
+  TaskPhase,
+  WorkflowStage,
+} from "../../types/dashboard/activity-types";
 import type { TaskActivityInfo } from "../../types/dashboard/widget-registry";
 import {
   type OrchestratorAgent,
@@ -46,6 +52,16 @@ export interface DashboardState {
   isLoading: boolean;
   /** Current orchestrator agent (if using orchestrated workflow) */
   currentOrchestratorAgent: OrchestratorAgent;
+  /** Current workflow stage (for orchestrated workflows) */
+  workflowStage: WorkflowStage | null;
+  /** Display name for the workflow stage */
+  workflowStageDisplay: string | null;
+  /** Whether this is an orchestrated workflow */
+  isOrchestrated: boolean;
+  /** Current iteration number */
+  iteration: number;
+  /** Maximum iterations */
+  maxIterations: number;
 }
 
 /**
@@ -109,6 +125,9 @@ export function useDashboardState(): UseDashboardStateResult {
     hasVerification: taskInfo?.hasVerificationTests ?? false,
     hasAiWork: taskInfo?.hasPrompt ?? false,
   });
+
+  // Orchestrator state tracking (for workflow stage display)
+  const orchestratorState = useOrchestratorState(taskInfo?.taskId ?? null, isRunning);
 
   // Track last AI output timestamp to detect AI activity
   const lastAiTimestampRef = useRef<number>(0);
@@ -253,6 +272,11 @@ export function useDashboardState(): UseDashboardStateResult {
       error: combinedError,
       isLoading: taskLoading,
       currentOrchestratorAgent,
+      workflowStage: orchestratorState.workflowStage,
+      workflowStageDisplay: orchestratorState.workflowStageDisplay,
+      isOrchestrated: orchestratorState.isOrchestrated,
+      iteration: orchestratorState.iteration,
+      maxIterations: orchestratorState.maxIterations,
     }),
     [
       layout,
@@ -264,6 +288,11 @@ export function useDashboardState(): UseDashboardStateResult {
       combinedError,
       taskLoading,
       currentOrchestratorAgent,
+      orchestratorState.workflowStage,
+      orchestratorState.workflowStageDisplay,
+      orchestratorState.isOrchestrated,
+      orchestratorState.iteration,
+      orchestratorState.maxIterations,
     ],
   );
 

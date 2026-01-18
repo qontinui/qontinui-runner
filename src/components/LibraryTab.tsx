@@ -62,7 +62,7 @@ import type {
   ApiVariableExtraction,
   ApiAssertion,
 } from "../types";
-import type { SavedGuiWorkflow } from "../types/gui-workflow";
+import type { SavedMacro } from "../types/macro";
 import type { HttpMethod, ApiContentType, UnifiedWorkflow } from "../types/unified-workflow";
 import type { AiOutputLine } from "./AiOutputTab";
 import { getAccentColors, getStatusColors } from "@/design-system";
@@ -73,8 +73,7 @@ type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 type LibraryCategory =
   | "tasks"
   | "unified-workflows"
-  | "workflows"
-  | "gui-workflows"
+  | "macros"
   | "scripts"
   | "scriptlets"
   | "contexts"
@@ -116,15 +115,8 @@ const CATEGORIES: CategoryConfig[] = [
     description: "Phase-based automation workflows",
   },
   {
-    id: "workflows",
-    label: "AI Workflows (Legacy)",
-    icon: Sparkles,
-    accentColor: "green",
-    description: "Legacy multi-step AI workflows",
-  },
-  {
-    id: "gui-workflows",
-    label: "GUI Workflows",
+    id: "macros",
+    label: "Macros",
     icon: MousePointer2,
     accentColor: "orange",
     description: "Sequential GUI automation",
@@ -179,39 +171,6 @@ interface SavedPrompt {
   modified_at: string;
 }
 
-// AI Workflow types
-interface ExecutionStep {
-  id: string;
-  type: "workflow" | "state" | "playwright" | "prompt" | "action" | "screenshot";
-  name: string;
-  takeScreenshot: boolean;
-  screenshotDelay?: number;
-  screenshotMonitor?: number | "all" | null;
-  playwrightScriptId?: string;
-  playwrightScriptContent?: string;
-  playwrightTargetUrl?: string;
-  promptId?: string;
-  promptContent?: string;
-  actionType?: "click" | "double_click" | "right_click";
-  targetImageId?: string;
-  targetImageName?: string;
-}
-
-interface SavedAiWorkflow {
-  id: string;
-  name: string;
-  description: string;
-  steps: ExecutionStep[];
-  goal: string;
-  max_iterations: number;
-  persistent_session: boolean;
-  capture_input_validation: boolean;
-  category: string;
-  tags: string[];
-  created_at: string;
-  modified_at: string;
-}
-
 // Playwright Script types
 interface PlaywrightScript {
   id: string;
@@ -228,10 +187,10 @@ interface LibraryTabProps {
   onNavigateToActive: () => void;
   onNavigateToBuilder?: () => void;
   onNavigateToScriptBuilder?: () => void;
-  onNavigateToGuiWorkflowBuilder?: () => void;
+  onNavigateToMacroBuilder?: () => void;
   onEditScript?: (scriptId: string) => void;
   onEditWorkflow?: (workflowId: string) => void;
-  onEditGuiWorkflow?: (workflowId: string) => void;
+  onEditMacro?: (macroId: string) => void;
   aiOutputLines?: AiOutputLine[];
 }
 
@@ -246,10 +205,10 @@ export function LibraryTab({
   onNavigateToActive,
   onNavigateToBuilder,
   onNavigateToScriptBuilder,
-  onNavigateToGuiWorkflowBuilder,
+  onNavigateToMacroBuilder,
   onEditScript,
   onEditWorkflow,
-  onEditGuiWorkflow,
+  onEditMacro,
   aiOutputLines: _aiOutputLines = [],
 }: LibraryTabProps) {
   // Category and view state
@@ -264,8 +223,7 @@ export function LibraryTab({
 
   // Data state
   const [prompts, setPrompts] = useState<SavedPrompt[]>([]);
-  const [workflows, setWorkflows] = useState<SavedAiWorkflow[]>([]);
-  const [guiWorkflows, setGuiWorkflows] = useState<SavedGuiWorkflow[]>([]);
+  const [macros, setMacros] = useState<SavedMacro[]>([]);
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
   const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
   const [explorations, setExplorations] = useState<SavedExploration[]>([]);
@@ -406,8 +364,7 @@ export function LibraryTab({
       try {
         const [
           promptsRes,
-          workflowsRes,
-          guiWorkflowsRes,
+          macrosRes,
           scriptsRes,
           scriptletsRes,
           explorationsRes,
@@ -415,8 +372,7 @@ export function LibraryTab({
           unifiedWorkflowsRes,
         ] = await Promise.all([
           fetch(`${API_BASE}/prompts`),
-          fetch(`${API_BASE}/ai-workflows`),
-          fetch(`${API_BASE}/gui-workflows`),
+          fetch(`${API_BASE}/macros`),
           fetch(`${API_BASE}/playwright/scripts`),
           fetch(`${API_BASE}/scriptlets`),
           fetch(`${API_BASE}/saved-explorations`),
@@ -426,8 +382,7 @@ export function LibraryTab({
 
         const [
           promptsData,
-          workflowsData,
-          guiWorkflowsData,
+          macrosData,
           scriptsData,
           scriptletsData,
           explorationsData,
@@ -435,8 +390,7 @@ export function LibraryTab({
           unifiedWorkflowsData,
         ] = await Promise.all([
           promptsRes.json(),
-          workflowsRes.json(),
-          guiWorkflowsRes.json(),
+          macrosRes.json(),
           scriptsRes.json(),
           scriptletsRes.json(),
           explorationsRes.json().catch(() => ({ success: false })),
@@ -445,8 +399,7 @@ export function LibraryTab({
         ]);
 
         if (promptsData.success) setPrompts(promptsData.data || []);
-        if (workflowsData.success) setWorkflows(workflowsData.data || []);
-        if (guiWorkflowsData.success) setGuiWorkflows(guiWorkflowsData.data || []);
+        if (macrosData.success) setMacros(macrosData.data || []);
         if (scriptsData.success) setScripts(scriptsData.data || []);
         if (scriptletsData.success) setScriptlets(scriptletsData.data || []);
         if (explorationsData.success) setExplorations(explorationsData.data || []);
@@ -504,20 +457,12 @@ export function LibraryTab({
         });
         setShowTaskDialog(true);
         break;
-      case "workflows":
-        // Navigate to Workflow Builder tab
-        if (onNavigateToBuilder) {
-          onNavigateToBuilder();
+      case "macros":
+        // Navigate to Macro Builder tab
+        if (onNavigateToMacroBuilder) {
+          onNavigateToMacroBuilder();
         } else {
-          onLog("info", "Workflow Builder not available");
-        }
-        break;
-      case "gui-workflows":
-        // Navigate to GUI Workflow Builder tab
-        if (onNavigateToGuiWorkflowBuilder) {
-          onNavigateToGuiWorkflowBuilder();
-        } else {
-          onLog("info", "GUI Workflow Builder not available");
+          onLog("info", "Macro Builder not available");
         }
         break;
       case "scripts":
@@ -924,11 +869,8 @@ export function LibraryTab({
       case "tasks":
         await deletePrompt(selectedItemId);
         break;
-      case "workflows":
-        await deleteWorkflow(selectedItemId);
-        break;
-      case "gui-workflows":
-        await deleteGuiWorkflow(selectedItemId);
+      case "macros":
+        await deleteMacro(selectedItemId);
         break;
       case "scripts":
         await deleteScript(selectedItemId);
@@ -982,14 +924,9 @@ export function LibraryTab({
         if (prompt) runPrompt(prompt);
         break;
       }
-      case "workflows": {
-        const workflow = workflows.find((w) => w.id === selectedItemId);
-        if (workflow) runWorkflow(workflow);
-        break;
-      }
-      case "gui-workflows": {
-        const guiWorkflow = guiWorkflows.find((w) => w.id === selectedItemId);
-        if (guiWorkflow) runGuiWorkflow(guiWorkflow);
+      case "macros": {
+        const macro = macros.find((m) => m.id === selectedItemId);
+        if (macro) runMacro(macro);
         break;
       }
       case "scripts": {
@@ -1037,65 +974,11 @@ export function LibraryTab({
     [onLog, onNavigateToActive],
   );
 
-  const runWorkflow = useCallback(
-    async (workflow: SavedAiWorkflow) => {
-      setRunningId(workflow.id);
+  const runMacro = useCallback(
+    async (macro: SavedMacro) => {
+      setRunningId(macro.id);
       try {
-        const prompt = generateWorkflowPrompt(workflow);
-
-        // Determine if this session uses GUI (has any execution steps that need GUI)
-        const guiStepTypes = ["workflow", "state", "action", "screenshot"];
-        const usesGui = workflow.steps.some((step) => guiStepTypes.includes(step.type));
-
-        // Convert ExecutionStep[] to ExecutionStepConfig[] for deterministic execution
-        const executionStepsConfig = workflow.steps.map((step) => ({
-          type: step.type,
-          name: step.name,
-          actionType: step.actionType || null,
-          targetImageId: step.targetImageId || null,
-          targetImageName: step.targetImageName || null,
-          monitorIndex: null,
-          takeScreenshot: step.takeScreenshot,
-          screenshotDelay: step.screenshotDelay || 0,
-          screenshotMonitor: step.screenshotMonitor ?? null,
-          playwrightScriptId: step.playwrightScriptId || null,
-          promptContent: step.promptContent || null,
-        }));
-
-        const response = await fetch(`${API_BASE}/sessions/start`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            name: workflow.name,
-            prompt: prompt,
-            total_phases: workflow.max_iterations,
-            uses_gui: usesGui,
-            timeout_seconds: 1800,
-            execution_steps: executionStepsConfig,
-          }),
-        });
-
-        const result = await response.json();
-        if (result.success) {
-          onLog("success", `Started workflow: ${workflow.name}`);
-          onNavigateToActive();
-        } else {
-          throw new Error(result.error || "Failed to run workflow");
-        }
-      } catch (error) {
-        onLog("error", `Failed to run workflow: ${error}`);
-      } finally {
-        setRunningId(null);
-      }
-    },
-    [onLog, onNavigateToActive],
-  );
-
-  const runGuiWorkflow = useCallback(
-    async (workflow: SavedGuiWorkflow) => {
-      setRunningId(workflow.id);
-      try {
-        const response = await fetch(`${API_BASE}/gui-workflows/${workflow.id}/run`, {
+        const response = await fetch(`${API_BASE}/macros/${macro.id}/run`, {
           method: "POST",
         });
 
@@ -1105,19 +988,19 @@ export function LibraryTab({
           if (data.failed_steps === 0) {
             onLog(
               "success",
-              `Completed GUI workflow: ${workflow.name} (${data.successful_steps}/${data.total_steps} steps)`,
+              `Completed macro: ${macro.name} (${data.successful_steps}/${data.total_steps} steps)`,
             );
           } else {
             onLog(
               "warning",
-              `GUI workflow completed with failures: ${data.failed_steps}/${data.total_steps} steps failed`,
+              `Macro completed with failures: ${data.failed_steps}/${data.total_steps} steps failed`,
             );
           }
         } else {
-          throw new Error(result.error || "Failed to run GUI workflow");
+          throw new Error(result.error || "Failed to run macro");
         }
       } catch (error) {
-        onLog("error", `Failed to run GUI workflow: ${error}`);
+        onLog("error", `Failed to run macro: ${error}`);
       } finally {
         setRunningId(null);
       }
@@ -1202,35 +1085,18 @@ export function LibraryTab({
     [onLog],
   );
 
-  const deleteWorkflow = useCallback(
+  const deleteMacro = useCallback(
     async (id: string) => {
-      if (!confirm("Delete this workflow?")) return;
+      if (!confirm("Delete this macro?")) return;
       try {
-        const response = await fetch(`${API_BASE}/ai-workflows/${id}`, { method: "DELETE" });
+        const response = await fetch(`${API_BASE}/macros/${id}`, { method: "DELETE" });
         const result = await response.json();
         if (result.success) {
-          setWorkflows((prev) => prev.filter((w) => w.id !== id));
-          onLog("info", "Workflow deleted");
+          setMacros((prev) => prev.filter((m) => m.id !== id));
+          onLog("info", "Macro deleted");
         }
       } catch (error) {
-        onLog("error", `Failed to delete workflow: ${error}`);
-      }
-    },
-    [onLog],
-  );
-
-  const deleteGuiWorkflow = useCallback(
-    async (id: string) => {
-      if (!confirm("Delete this GUI workflow?")) return;
-      try {
-        const response = await fetch(`${API_BASE}/gui-workflows/${id}`, { method: "DELETE" });
-        const result = await response.json();
-        if (result.success) {
-          setGuiWorkflows((prev) => prev.filter((w) => w.id !== id));
-          onLog("info", "GUI workflow deleted");
-        }
-      } catch (error) {
-        onLog("error", `Failed to delete GUI workflow: ${error}`);
+        onLog("error", `Failed to delete macro: ${error}`);
       }
     },
     [onLog],
@@ -1281,10 +1147,6 @@ export function LibraryTab({
           endpoint = `${API_BASE}/prompts/${id}/duplicate`;
           _updateState = (prev: unknown[]) => [...prev];
           break;
-        case "workflows":
-          endpoint = `${API_BASE}/ai-workflows/${id}/duplicate`;
-          _updateState = (prev: unknown[]) => [...prev];
-          break;
         case "scripts":
           endpoint = `${API_BASE}/playwright/scripts/${id}/duplicate`;
           _updateState = (prev: unknown[]) => [...prev];
@@ -1305,9 +1167,6 @@ export function LibraryTab({
             case "tasks":
               setPrompts((prev) => [...prev, result.data]);
               break;
-            case "workflows":
-              setWorkflows((prev) => [...prev, result.data]);
-              break;
             case "scripts":
               setScripts((prev) => [...prev, result.data]);
               break;
@@ -1324,27 +1183,6 @@ export function LibraryTab({
     [selectedCategory, onLog],
   );
 
-  // Generate prompt from workflow
-  const generateWorkflowPrompt = (workflow: SavedAiWorkflow): string => {
-    const lines: string[] = [];
-    lines.push(`# AI Automation Task: ${workflow.name}`);
-    lines.push("");
-    lines.push(`## Goal`);
-    lines.push(workflow.goal || "(No goal specified)");
-    lines.push("");
-    lines.push(`## Execution Steps`);
-    workflow.steps.forEach((step, index) => {
-      lines.push(
-        `${index + 1}. [${step.type}] ${step.name}${step.takeScreenshot ? " (screenshot)" : ""}`,
-      );
-    });
-    lines.push("");
-    lines.push(`## Settings`);
-    lines.push(`- Max Iterations: ${workflow.max_iterations}`);
-    lines.push(`- Mode: ${workflow.persistent_session ? "Persistent Session" : "Standard"}`);
-    return lines.join("\n");
-  };
-
   // Get all unique tags for current category
   const getAllTags = (): string[] => {
     const tags = new Set<string>();
@@ -1352,11 +1190,8 @@ export function LibraryTab({
       case "tasks":
         prompts.forEach((p) => p.tags?.forEach((t) => tags.add(t)));
         break;
-      case "workflows":
-        workflows.forEach((w) => w.tags?.forEach((t) => tags.add(t)));
-        break;
-      case "gui-workflows":
-        guiWorkflows.forEach((w) => w.tags?.forEach((t) => tags.add(t)));
+      case "macros":
+        macros.forEach((m) => m.tags?.forEach((t) => tags.add(t)));
         break;
       case "scriptlets":
         scriptlets.forEach((s) => s.tags?.forEach((t) => tags.add(t)));
@@ -1391,11 +1226,10 @@ export function LibraryTab({
   };
 
   const filteredPrompts = filterItems(prompts, (p) => [p.name, p.description, p.category]);
-  const filteredWorkflows = filterItems(workflows, (w) => [w.name, w.description, w.goal]);
-  const filteredGuiWorkflows = filterItems(guiWorkflows, (w) => [
-    w.name,
-    w.description,
-    w.category,
+  const filteredMacros = filterItems(macros, (m) => [
+    m.name,
+    m.description,
+    m.category,
   ]);
   const filteredScripts = filterItems(
     scripts.map((s) => ({ ...s, tags: [] })),
@@ -1516,10 +1350,8 @@ export function LibraryTab({
     switch (selectedCategory) {
       case "tasks":
         return filteredPrompts;
-      case "workflows":
-        return filteredWorkflows;
-      case "gui-workflows":
-        return filteredGuiWorkflows;
+      case "macros":
+        return filteredMacros;
       case "scripts":
         return filteredScripts;
       case "scriptlets":
@@ -1642,93 +1474,14 @@ export function LibraryTab({
         );
       }
 
-      case "workflows": {
-        const workflow = item as SavedAiWorkflow;
+      case "macros": {
+        const macro = item as SavedMacro;
         return (
           <div
-            key={workflow.id}
+            key={macro.id}
             className={baseClasses}
             onClick={() => {
-              setSelectedItemId(workflow.id);
-              setShowDetailPanel(true);
-            }}
-          >
-            <div className="flex items-start gap-3">
-              <Sparkles
-                className={`w-5 h-5 ${getAccentColors("green").text} flex-shrink-0 mt-0.5`}
-              />
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2">
-                  <span className="font-medium truncate">{workflow.name}</span>
-                  <span className="text-xs bg-muted px-1.5 py-0.5 rounded">
-                    {workflow.steps.length} steps
-                  </span>
-                </div>
-                {workflow.description && (
-                  <p className="text-xs text-muted-foreground truncate mt-0.5">
-                    {workflow.description}
-                  </p>
-                )}
-                <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
-                  <Clock className="w-3 h-3" />
-                  {formatRelativeDate(workflow.modified_at)}
-                </div>
-              </div>
-              <div className="flex items-center gap-1 flex-shrink-0">
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onEditWorkflow?.(workflow.id);
-                  }}
-                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
-                  title="Edit workflow"
-                >
-                  <Pencil className="w-4 h-4" />
-                </button>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    runWorkflow(workflow);
-                  }}
-                  disabled={runningId === workflow.id}
-                  className={`p-1.5 ${getAccentColors("green").bg} ${getAccentColors("green").text} rounded hover:opacity-80 transition-colors disabled:opacity-50`}
-                  title="Run workflow"
-                >
-                  {runningId === workflow.id ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Play className="w-4 h-4" />
-                  )}
-                </button>
-              </div>
-            </div>
-            {workflow.tags && workflow.tags.length > 0 && (
-              <div className="flex flex-wrap gap-1 mt-2">
-                {workflow.tags.slice(0, 3).map((tag) => (
-                  <span
-                    key={tag}
-                    className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded"
-                  >
-                    {tag}
-                  </span>
-                ))}
-                {workflow.tags.length > 3 && (
-                  <span className="text-xs text-muted-foreground">+{workflow.tags.length - 3}</span>
-                )}
-              </div>
-            )}
-          </div>
-        );
-      }
-
-      case "gui-workflows": {
-        const guiWorkflow = item as SavedGuiWorkflow;
-        return (
-          <div
-            key={guiWorkflow.id}
-            className={baseClasses}
-            onClick={() => {
-              setSelectedItemId(guiWorkflow.id);
+              setSelectedItemId(macro.id);
               setShowDetailPanel(true);
             }}
           >
@@ -1738,42 +1491,42 @@ export function LibraryTab({
               />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="font-medium truncate">{guiWorkflow.name}</span>
+                  <span className="font-medium truncate">{macro.name}</span>
                   <span className="text-xs bg-muted px-1.5 py-0.5 rounded">
-                    {guiWorkflow.steps.length} steps
+                    {macro.steps.length} steps
                   </span>
                 </div>
-                {guiWorkflow.description && (
+                {macro.description && (
                   <p className="text-xs text-muted-foreground truncate mt-0.5">
-                    {guiWorkflow.description}
+                    {macro.description}
                   </p>
                 )}
                 <div className="flex items-center gap-2 mt-2 text-xs text-muted-foreground">
                   <Clock className="w-3 h-3" />
-                  {formatRelativeDate(guiWorkflow.modified_at)}
+                  {formatRelativeDate(macro.modified_at)}
                 </div>
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    onEditGuiWorkflow?.(guiWorkflow.id);
+                    onEditMacro?.(macro.id);
                   }}
                   className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
-                  title="Edit GUI workflow"
+                  title="Edit macro"
                 >
                   <Pencil className="w-4 h-4" />
                 </button>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    runGuiWorkflow(guiWorkflow);
+                    runMacro(macro);
                   }}
-                  disabled={runningId === guiWorkflow.id}
+                  disabled={runningId === macro.id}
                   className={`p-1.5 ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded hover:${getAccentColors("orange").bgSolid}/20 transition-colors disabled:opacity-50`}
-                  title="Run GUI workflow"
+                  title="Run macro"
                 >
-                  {runningId === guiWorkflow.id ? (
+                  {runningId === macro.id ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
                     <Play className="w-4 h-4" />
@@ -1781,9 +1534,9 @@ export function LibraryTab({
                 </button>
               </div>
             </div>
-            {guiWorkflow.tags && guiWorkflow.tags.length > 0 && (
+            {macro.tags && macro.tags.length > 0 && (
               <div className="flex flex-wrap gap-1 mt-2">
-                {guiWorkflow.tags.slice(0, 3).map((tag) => (
+                {macro.tags.slice(0, 3).map((tag) => (
                   <span
                     key={tag}
                     className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded"
@@ -1791,9 +1544,9 @@ export function LibraryTab({
                     {tag}
                   </span>
                 ))}
-                {guiWorkflow.tags.length > 3 && (
+                {macro.tags.length > 3 && (
                   <span className="text-xs text-muted-foreground">
-                    +{guiWorkflow.tags.length - 3}
+                    +{macro.tags.length - 3}
                   </span>
                 )}
               </div>
@@ -2290,13 +2043,13 @@ export function LibraryTab({
         );
       }
 
-      case "workflows": {
-        const workflow = workflows.find((w) => w.id === selectedItemId);
-        if (!workflow) return null;
+      case "macros": {
+        const macro = macros.find((m) => m.id === selectedItemId);
+        if (!macro) return null;
         return (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold">{workflow.name}</h3>
+              <h3 className="text-lg font-semibold">{macro.name}</h3>
               <button
                 onClick={() => setShowDetailPanel(false)}
                 className="p-1 hover:bg-muted rounded"
@@ -2304,18 +2057,12 @@ export function LibraryTab({
                 <X className="w-5 h-5" />
               </button>
             </div>
-            {workflow.description && (
-              <p className="text-muted-foreground">{workflow.description}</p>
+            {macro.description && (
+              <p className="text-muted-foreground">{macro.description}</p>
             )}
-            {workflow.goal && (
-              <div className="flex items-start gap-2">
-                <Target className="w-4 h-4 text-muted-foreground mt-0.5" />
-                <p className="text-sm">{workflow.goal}</p>
-              </div>
-            )}
-            {workflow.tags && workflow.tags.length > 0 && (
+            {macro.tags && macro.tags.length > 0 && (
               <div className="flex flex-wrap gap-1">
-                {workflow.tags.map((tag) => (
+                {macro.tags.map((tag) => (
                   <span key={tag} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
                     {tag}
                   </span>
@@ -2325,100 +2072,10 @@ export function LibraryTab({
             <div>
               <h4 className="text-sm font-medium mb-2 flex items-center gap-2">
                 <List className="w-4 h-4" />
-                Execution Steps ({workflow.steps.length})
+                Steps ({macro.steps.length})
               </h4>
               <div className="space-y-1">
-                {workflow.steps.map((step, index) => (
-                  <div
-                    key={step.id}
-                    className="flex items-center gap-2 text-sm bg-muted/50 px-3 py-2 rounded"
-                  >
-                    <span className="text-muted-foreground font-mono">{index + 1}.</span>
-                    <span
-                      className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium ${
-                        step.type === "workflow"
-                          ? `${getAccentColors("green").bg} ${getAccentColors("green").text}`
-                          : step.type === "playwright"
-                            ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
-                            : step.type === "prompt"
-                              ? `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
-                              : `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
-                      }`}
-                    >
-                      {step.type}
-                    </span>
-                    <span className="flex-1 truncate">{step.name}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-            <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
-              <span>Created: {formatDate(workflow.created_at)}</span>
-              <span>Modified: {formatDate(workflow.modified_at)}</span>
-            </div>
-            <div className="flex items-center gap-2 pt-2">
-              <button
-                onClick={() => runWorkflow(workflow)}
-                disabled={runningId === workflow.id}
-                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("green").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
-              >
-                {runningId === workflow.id ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Play className="w-4 h-4" />
-                )}
-                Run Workflow
-              </button>
-              <button
-                onClick={() => duplicateItem(workflow.id)}
-                className="p-2 border border-border rounded-lg hover:bg-muted transition-colors"
-              >
-                <Copy className="w-4 h-4" />
-              </button>
-              <button
-                onClick={() => deleteWorkflow(workflow.id)}
-                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        );
-      }
-
-      case "gui-workflows": {
-        const guiWorkflow = guiWorkflows.find((w) => w.id === selectedItemId);
-        if (!guiWorkflow) return null;
-        return (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold">{guiWorkflow.name}</h3>
-              <button
-                onClick={() => setShowDetailPanel(false)}
-                className="p-1 hover:bg-muted rounded"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-            {guiWorkflow.description && (
-              <p className="text-muted-foreground">{guiWorkflow.description}</p>
-            )}
-            {guiWorkflow.tags && guiWorkflow.tags.length > 0 && (
-              <div className="flex flex-wrap gap-1">
-                {guiWorkflow.tags.map((tag) => (
-                  <span key={tag} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
-                    {tag}
-                  </span>
-                ))}
-              </div>
-            )}
-            <div>
-              <h4 className="text-sm font-medium mb-2 flex items-center gap-2">
-                <List className="w-4 h-4" />
-                Steps ({guiWorkflow.steps.length})
-              </h4>
-              <div className="space-y-1">
-                {guiWorkflow.steps.map((step, index) => (
+                {macro.steps.map((step, index) => (
                   <div
                     key={step.id}
                     className="flex items-center gap-2 text-sm bg-muted/50 px-3 py-2 rounded"
@@ -2443,24 +2100,24 @@ export function LibraryTab({
               </div>
             </div>
             <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
-              <span>Created: {formatDate(guiWorkflow.created_at)}</span>
-              <span>Modified: {formatDate(guiWorkflow.modified_at)}</span>
+              <span>Created: {formatDate(macro.created_at)}</span>
+              <span>Modified: {formatDate(macro.modified_at)}</span>
             </div>
             <div className="flex items-center gap-2 pt-2">
               <button
-                onClick={() => runGuiWorkflow(guiWorkflow)}
-                disabled={runningId === guiWorkflow.id}
+                onClick={() => runMacro(macro)}
+                disabled={runningId === macro.id}
                 className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("orange").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
               >
-                {runningId === guiWorkflow.id ? (
+                {runningId === macro.id ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
                   <Play className="w-4 h-4" />
                 )}
-                Run Workflow
+                Run Macro
               </button>
               <button
-                onClick={() => deleteGuiWorkflow(guiWorkflow.id)}
+                onClick={() => deleteMacro(macro.id)}
                 className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
@@ -2945,21 +2602,19 @@ export function LibraryTab({
                 ? prompts.length
                 : category.id === "unified-workflows"
                   ? unifiedWorkflows.length
-                  : category.id === "workflows"
-                    ? workflows.length
-                    : category.id === "gui-workflows"
-                      ? guiWorkflows.length
-                      : category.id === "scripts"
-                        ? scripts.length
-                        : category.id === "scriptlets"
-                          ? scriptlets.length
-                          : category.id === "contexts"
-                            ? contexts.length
-                            : category.id === "state-explorer"
-                              ? explorations.length
-                              : category.id === "api-requests"
-                                ? savedApiRequests.length
-                                : 0;
+                  : category.id === "macros"
+                    ? macros.length
+                    : category.id === "scripts"
+                      ? scripts.length
+                      : category.id === "scriptlets"
+                        ? scriptlets.length
+                        : category.id === "contexts"
+                          ? contexts.length
+                          : category.id === "state-explorer"
+                            ? explorations.length
+                            : category.id === "api-requests"
+                              ? savedApiRequests.length
+                              : 0;
 
             return (
               <button

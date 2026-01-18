@@ -564,6 +564,9 @@ pub struct Settings {
     /// Auto-fix issues on session failure (triggers auto-fix when workflow/prompt fails)
     #[serde(default)]
     pub session_auto_fix_on_failure: bool,
+    /// Include AI Summary step in new workflows by default (default: true)
+    #[serde(default = "default_include_summary_step")]
+    pub include_summary_step_by_default: bool,
     #[serde(default)]
     pub debug: DebugSettings,
     #[serde(default)]
@@ -587,6 +590,10 @@ fn default_auto_load_last_config() -> bool {
 }
 
 fn default_auto_continue_ai_workflow() -> bool {
+    true
+}
+
+fn default_include_summary_step() -> bool {
     true
 }
 
@@ -801,6 +808,24 @@ pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
     info!("Saving session auto-fix on failure setting: {}", enabled);
     let mut settings = load_settings();
     settings.session_auto_fix_on_failure = enabled;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the include summary step by default setting
+pub fn get_include_summary_step_by_default() -> bool {
+    let settings = load_settings();
+    settings.include_summary_step_by_default
+}
+
+/// Save the include summary step by default setting
+pub fn save_include_summary_step_by_default(enabled: bool) -> Result<(), String> {
+    info!(
+        "Saving include summary step by default setting: {}",
+        enabled
+    );
+    let mut settings = load_settings();
+    settings.include_summary_step_by_default = enabled;
     save_settings(&settings)?;
     Ok(())
 }

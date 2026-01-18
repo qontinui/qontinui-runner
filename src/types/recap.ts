@@ -59,6 +59,29 @@ export interface RecapStats {
 }
 
 /**
+ * A stage in the recap timeline, grouping related steps.
+ * Stages represent the 4 workflow phases: setup, agentic, verification, completion.
+ */
+export interface StageRecap {
+  /** Stage identifier: "setup", "agentic", "verification", "completion" */
+  stage: "setup" | "agentic" | "verification" | "completion";
+  /** Display name: "Setup", "Agentic", "Verification", "Completion" */
+  display_name: string;
+  /** Status: "success", "failed", "running", "skipped", "pending" */
+  status: "success" | "failed" | "running" | "skipped" | "pending";
+  /** When this stage started (ISO 8601) */
+  started_at?: string;
+  /** When this stage ended (ISO 8601) */
+  ended_at?: string;
+  /** Duration in milliseconds */
+  duration_ms?: number;
+  /** Steps in this stage */
+  steps: RecapStep[];
+  /** Iteration number (for agentic/verification in loop) */
+  iteration?: number;
+}
+
+/**
  * Complete recap data for a task run.
  */
 export interface RecapData {
@@ -84,7 +107,10 @@ export interface RecapData {
   /** Whether the goal was achieved (from orchestrator) */
   goal_achieved?: boolean;
 
-  /** Steps overview (timeline) */
+  /** Steps grouped by stage (with timing from transition_history) */
+  stages: StageRecap[];
+
+  /** Steps overview (timeline) - flat list for backwards compatibility */
   steps: RecapStep[];
 
   /** Quick statistics */

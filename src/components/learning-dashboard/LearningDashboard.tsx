@@ -149,7 +149,7 @@ export function LearningDashboard() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Brain className="w-6 h-6 text-purple-500" />
-          <h1 className="text-xl font-bold text-white">Learning Insights</h1>
+          <h1 className="text-xl font-bold text-white">AI Task Analytics</h1>
           {/* Live indicator */}
           {isRealtimeConnected && (
             <div className="flex items-center gap-1 ml-2">
@@ -205,6 +205,12 @@ export function LearningDashboard() {
           </button>
         </div>
       </div>
+
+      {/* Explanatory description */}
+      <p className="text-sm text-gray-400">
+        Tracks patterns and performance from AI task executions. Data is recorded when unified workflows
+        and AI tasks complete, showing success rates, strategies, and learned insights over time.
+      </p>
 
       {/* Current Running Task Indicator */}
       {currentTask && (

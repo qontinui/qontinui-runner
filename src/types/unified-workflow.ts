@@ -394,6 +394,11 @@ export interface PromptStep extends BaseStep {
    * - false: Informative only, doesn't block completion
    */
   is_blocking?: boolean;
+  /**
+   * True for the auto-generated summary step (locked to last position in completion phase).
+   * Summary steps cannot be moved and are always executed last.
+   */
+  is_summary_step?: boolean;
 }
 
 /**
@@ -676,6 +681,24 @@ export interface UnifiedWorkflow {
    */
   log_source_selection?: LogSourceSelection;
 
+  // Context settings
+  /**
+   * Manually added context IDs.
+   * These contexts are explicitly selected for inclusion in the AI prompt.
+   */
+  context_ids?: string[];
+  /**
+   * Disabled context IDs.
+   * These contexts are excluded from auto-include even if they match triggers.
+   */
+  disabled_context_ids?: string[];
+  /**
+   * Whether to auto-include contexts based on task description triggers.
+   * When enabled, contexts with matching auto-include rules are automatically added.
+   * Default: true
+   */
+  auto_include_contexts?: boolean;
+
   // Summary settings
   /**
    * Skip the automatic AI summary generation at the end of workflow execution.
@@ -684,6 +707,16 @@ export interface UnifiedWorkflow {
    * Note: Deterministic summary (test results, screenshots, etc.) is always collected.
    */
   skip_ai_summary?: boolean;
+
+  // Prompt template settings
+  /**
+   * Custom developer prompt template for this workflow.
+   * When set, this template is used instead of the global default when running the workflow.
+   * The template supports variables like {{SESSION_ID}}, {{ITERATION}}, {{MAX_ITERATIONS}},
+   * {{GOAL}}, {{EXECUTION_STEPS}}, {{WORKSPACE_ESCAPED}}.
+   * Set to null/undefined to use the global template (which may itself be customized or default).
+   */
+  prompt_template?: string | null;
 
   // Metadata
   /** Category for organization */
@@ -1168,6 +1201,31 @@ export const PHASE_INFO: Record<
 };
 
 // =============================================================================
+// Summary Step Constants and Helpers
+// =============================================================================
+
+/**
+ * Default prompt content for the AI summary step.
+ * This step generates a summary of all tasks completed in the workflow.
+ */
+export const DEFAULT_SUMMARY_PROMPT = `Write a one-paragraph summary of all the tasks completed in this workflow. Include what was accomplished, whether the stated goal was achieved, any issues encountered and how they were resolved, and remaining work if the goal was not fully achieved. Be concise but comprehensive.`;
+
+/**
+ * Create a summary step for the completion phase.
+ * Summary steps are locked to the last position and cannot be moved.
+ */
+export function createSummaryStep(): PromptStep {
+  return {
+    id: crypto.randomUUID(),
+    type: "prompt",
+    phase: "completion",
+    name: "AI Summary",
+    content: DEFAULT_SUMMARY_PROMPT,
+    is_summary_step: true,
+  };
+}
+
+// =============================================================================
 // Utility Functions
 // =============================================================================
 
@@ -1326,32 +1384,44 @@ export function createDefaultStep(type: UnifiedStep["type"], phase: WorkflowPhas
 
 /**
  * Create a default empty workflow
+ *
+ * @param includeSummaryStep - Whether to include the AI Summary step in the completion phase.
+ *                             Defaults to true. The summary step is locked to last position.
  */
-export function createDefaultWorkflow(): Omit<
-  UnifiedWorkflow,
-  "id" | "created_at" | "modified_at"
-> {
+export function createDefaultWorkflow(
+  includeSummaryStep: boolean = true,
+): Omit<UnifiedWorkflow, "id" | "created_at" | "modified_at"> {
   return {
     name: "",
     description: "",
     setup_steps: [],
     verification_steps: [],
     agentic_steps: [],
-    completion_steps: [],
+    completion_steps: includeSummaryStep ? [createSummaryStep()] : [],
     category: "general",
     tags: [],
   };
 }
 
 /**
- * Check if a workflow is empty (has no steps)
+ * Check if a workflow is empty (has no user-added steps).
+ * A workflow with only a summary step is considered empty since it's the default state.
  */
 export function isWorkflowEmpty(workflow: UnifiedWorkflow): boolean {
+  const completionSteps = workflow.completion_steps ?? [];
+  // A workflow is empty if it has no setup/verification/agentic steps
+  // and completion only has the default summary step (or nothing)
+  const hasOnlySummaryStep =
+    completionSteps.length === 0 ||
+    (completionSteps.length === 1 &&
+      completionSteps[0].type === "prompt" &&
+      (completionSteps[0] as PromptStep).is_summary_step === true);
+
   return (
     workflow.setup_steps.length === 0 &&
     workflow.verification_steps.length === 0 &&
     workflow.agentic_steps.length === 0 &&
-    (workflow.completion_steps ?? []).length === 0
+    hasOnlySummaryStep
   );
 }
 

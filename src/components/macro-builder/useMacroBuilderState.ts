@@ -1,50 +1,50 @@
 /**
- * useGuiBuilderState Hook
+ * useMacroBuilderState Hook
  *
- * Core state management hook for the GUI Workflow Builder.
- * Handles workflow editing, saving, loading, and execution.
+ * Core state management hook for the Macro Builder.
+ * Handles macro editing, saving, loading, and execution.
  */
 
 import { useState, useCallback, useEffect, useMemo } from "react";
-import type { GuiActionType, GuiWorkflowStep, SavedGuiWorkflow } from "../../types/gui-workflow";
-import { getDefaultStepName } from "../../types/gui-workflow";
+import type { MacroActionType, MacroStep, SavedMacro } from "../../types/macro";
+import { getDefaultStepName } from "../../types/macro";
 import type {
-  GuiBuilderContextValue,
+  MacroBuilderContextValue,
   StateInfo,
   ImageInfo,
-  WorkflowFormState,
+  MacroFormState,
   ResultMessage,
 } from "./types";
 import { useExecution } from "../../contexts/ExecutionContext";
 
 const API_BASE = "http://localhost:9876";
 
-interface UseGuiBuilderStateProps {
-  editWorkflowId?: string | null;
+interface UseMacroBuilderStateProps {
+  editMacroId?: string | null;
 }
 
-export function useGuiBuilderState({
-  editWorkflowId,
-}: UseGuiBuilderStateProps): GuiBuilderContextValue {
+export function useMacroBuilderState({
+  editMacroId,
+}: UseMacroBuilderStateProps): MacroBuilderContextValue {
   // Execution context for config data
   const execution = useExecution();
 
-  // Workflow steps
-  const [steps, setSteps] = useState<GuiWorkflowStep[]>([]);
+  // Macro steps
+  const [steps, setSteps] = useState<MacroStep[]>([]);
 
-  // Current workflow state
-  const [currentWorkflowId, setCurrentWorkflowId] = useState<string | null>(null);
-  const [savedWorkflows, setSavedWorkflows] = useState<SavedGuiWorkflow[]>([]);
-  const [originalSteps, setOriginalSteps] = useState<GuiWorkflowStep[]>([]);
+  // Current macro state
+  const [currentMacroId, setCurrentMacroId] = useState<string | null>(null);
+  const [savedMacros, setSavedMacros] = useState<SavedMacro[]>([]);
+  const [originalSteps, setOriginalSteps] = useState<MacroStep[]>([]);
 
   // Form state
-  const [formState, setFormState] = useState<WorkflowFormState>({
+  const [formState, setFormState] = useState<MacroFormState>({
     name: "",
     description: "",
     category: "general",
     tags: [],
   });
-  const [originalFormState, setOriginalFormState] = useState<WorkflowFormState>({
+  const [originalFormState, setOriginalFormState] = useState<MacroFormState>({
     name: "",
     description: "",
     category: "general",
@@ -54,7 +54,7 @@ export function useGuiBuilderState({
   // UI state
   const [editingStepId, setEditingStepId] = useState<string | null>(null);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
-  const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
+  const [showMacrosPanel, setShowMacrosPanel] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [lastResult, setLastResult] = useState<ResultMessage | null>(null);
@@ -101,39 +101,39 @@ export function useGuiBuilderState({
     return false;
   }, [steps, originalSteps, formState, originalFormState]);
 
-  // Fetch all saved workflows
-  const refreshWorkflows = useCallback(async () => {
+  // Fetch all saved macros
+  const refreshMacros = useCallback(async () => {
     try {
-      const response = await fetch(`${API_BASE}/gui-workflows`);
+      const response = await fetch(`${API_BASE}/macros`);
       if (response.ok) {
         const data = await response.json();
         if (data.success && Array.isArray(data.data)) {
-          setSavedWorkflows(data.data);
+          setSavedMacros(data.data);
         }
       }
     } catch (error) {
-      console.error("Failed to fetch GUI workflows:", error);
+      console.error("Failed to fetch macros:", error);
     }
   }, []);
 
-  // Load workflows on mount
+  // Load macros on mount
   useEffect(() => {
-    refreshWorkflows();
-  }, [refreshWorkflows]);
+    refreshMacros();
+  }, [refreshMacros]);
 
-  // Load workflow for editing
+  // Load macro for editing
   useEffect(() => {
-    if (editWorkflowId) {
-      const workflow = savedWorkflows.find((w) => w.id === editWorkflowId);
-      if (workflow) {
-        loadWorkflow(workflow);
+    if (editMacroId) {
+      const macro = savedMacros.find((m) => m.id === editMacroId);
+      if (macro) {
+        loadMacro(macro);
       }
     }
-  }, [editWorkflowId, savedWorkflows]);
+  }, [editMacroId, savedMacros]);
 
   // Add a new step
-  const addStep = useCallback((actionType: GuiActionType) => {
-    const newStep: GuiWorkflowStep = {
+  const addStep = useCallback((actionType: MacroActionType) => {
+    const newStep: MacroStep = {
       id: crypto.randomUUID(),
       action_type: actionType,
       name: getDefaultStepName(actionType),
@@ -143,7 +143,7 @@ export function useGuiBuilderState({
   }, []);
 
   // Update a step
-  const updateStep = useCallback((stepId: string, updates: Partial<GuiWorkflowStep>) => {
+  const updateStep = useCallback((stepId: string, updates: Partial<MacroStep>) => {
     setSteps((prev) => prev.map((step) => (step.id === stepId ? { ...step, ...updates } : step)));
   }, []);
 
@@ -188,16 +188,16 @@ export function useGuiBuilderState({
     });
   }, []);
 
-  // Load a workflow
-  const loadWorkflow = useCallback((workflow: SavedGuiWorkflow) => {
-    setCurrentWorkflowId(workflow.id);
-    setSteps(workflow.steps);
-    setOriginalSteps(workflow.steps);
-    const newFormState: WorkflowFormState = {
-      name: workflow.name,
-      description: workflow.description,
-      category: workflow.category,
-      tags: workflow.tags,
+  // Load a macro
+  const loadMacro = useCallback((macro: SavedMacro) => {
+    setCurrentMacroId(macro.id);
+    setSteps(macro.steps);
+    setOriginalSteps(macro.steps);
+    const newFormState: MacroFormState = {
+      name: macro.name,
+      description: macro.description,
+      category: macro.category,
+      tags: macro.tags,
     };
     setFormState(newFormState);
     setOriginalFormState(newFormState);
@@ -205,35 +205,35 @@ export function useGuiBuilderState({
     setLastResult(null);
   }, []);
 
-  // Delete a workflow
-  const deleteWorkflow = useCallback(
-    async (workflowId: string) => {
+  // Delete a macro
+  const deleteMacro = useCallback(
+    async (macroId: string) => {
       try {
-        const response = await fetch(`${API_BASE}/gui-workflows/${workflowId}`, {
+        const response = await fetch(`${API_BASE}/macros/${macroId}`, {
           method: "DELETE",
         });
         if (response.ok) {
-          await refreshWorkflows();
-          if (currentWorkflowId === workflowId) {
-            handleNewWorkflow();
+          await refreshMacros();
+          if (currentMacroId === macroId) {
+            handleNewMacro();
           }
         } else {
-          throw new Error("Failed to delete workflow");
+          throw new Error("Failed to delete macro");
         }
       } catch (error) {
-        console.error("Failed to delete workflow:", error);
+        console.error("Failed to delete macro:", error);
         throw error;
       }
     },
-    [currentWorkflowId, refreshWorkflows],
+    [currentMacroId, refreshMacros],
   );
 
-  // Start a new workflow
-  const handleNewWorkflow = useCallback(() => {
-    setCurrentWorkflowId(null);
+  // Start a new macro
+  const handleNewMacro = useCallback(() => {
+    setCurrentMacroId(null);
     setSteps([]);
     setOriginalSteps([]);
-    const emptyFormState: WorkflowFormState = {
+    const emptyFormState: MacroFormState = {
       name: "",
       description: "",
       category: "general",
@@ -245,16 +245,16 @@ export function useGuiBuilderState({
     setLastResult(null);
   }, []);
 
-  // Save workflow (update existing)
-  const handleSaveWorkflow = useCallback(async () => {
-    if (!currentWorkflowId) {
+  // Save macro (update existing)
+  const handleSaveMacro = useCallback(async () => {
+    if (!currentMacroId) {
       setShowSaveDialog(true);
       return;
     }
 
     setIsSaving(true);
     try {
-      const response = await fetch(`${API_BASE}/gui-workflows/${currentWorkflowId}`, {
+      const response = await fetch(`${API_BASE}/macros/${currentMacroId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -271,30 +271,30 @@ export function useGuiBuilderState({
         if (data.success) {
           setOriginalSteps(steps);
           setOriginalFormState(formState);
-          await refreshWorkflows();
-          setLastResult({ success: true, message: "Workflow saved" });
+          await refreshMacros();
+          setLastResult({ success: true, message: "Macro saved" });
         }
       } else {
-        throw new Error("Failed to save workflow");
+        throw new Error("Failed to save macro");
       }
     } catch (error) {
-      console.error("Failed to save workflow:", error);
-      setLastResult({ success: false, message: "Failed to save workflow" });
+      console.error("Failed to save macro:", error);
+      setLastResult({ success: false, message: "Failed to save macro" });
     } finally {
       setIsSaving(false);
     }
-  }, [currentWorkflowId, formState, steps, refreshWorkflows]);
+  }, [currentMacroId, formState, steps, refreshMacros]);
 
-  // Save as new workflow
+  // Save as new macro
   const handleSaveAsNew = useCallback(async () => {
     if (!formState.name.trim()) {
-      setLastResult({ success: false, message: "Workflow name is required" });
+      setLastResult({ success: false, message: "Macro name is required" });
       return;
     }
 
     setIsSaving(true);
     try {
-      const response = await fetch(`${API_BASE}/gui-workflows`, {
+      const response = await fetch(`${API_BASE}/macros`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -309,37 +309,37 @@ export function useGuiBuilderState({
       if (response.ok) {
         const data = await response.json();
         if (data.success && data.data) {
-          setCurrentWorkflowId(data.data.id);
+          setCurrentMacroId(data.data.id);
           setOriginalSteps(steps);
           setOriginalFormState(formState);
-          await refreshWorkflows();
+          await refreshMacros();
           setShowSaveDialog(false);
-          setLastResult({ success: true, message: "Workflow created" });
+          setLastResult({ success: true, message: "Macro created" });
         }
       } else {
-        throw new Error("Failed to create workflow");
+        throw new Error("Failed to create macro");
       }
     } catch (error) {
-      console.error("Failed to create workflow:", error);
-      setLastResult({ success: false, message: "Failed to create workflow" });
+      console.error("Failed to create macro:", error);
+      setLastResult({ success: false, message: "Failed to create macro" });
     } finally {
       setIsSaving(false);
     }
-  }, [formState, steps, refreshWorkflows]);
+  }, [formState, steps, refreshMacros]);
 
-  // Run the current workflow
-  const runWorkflow = useCallback(async () => {
+  // Run the current macro
+  const runMacro = useCallback(async () => {
     if (steps.length === 0) {
       setLastResult({ success: false, message: "No steps to run" });
       return;
     }
 
     // If not saved, save first
-    if (!currentWorkflowId) {
+    if (!currentMacroId) {
       if (!formState.name.trim()) {
         setFormState((prev) => ({
           ...prev,
-          name: `Workflow ${new Date().toLocaleTimeString()}`,
+          name: `Macro ${new Date().toLocaleTimeString()}`,
         }));
       }
       await handleSaveAsNew();
@@ -351,7 +351,7 @@ export function useGuiBuilderState({
     setLastResult(null);
 
     try {
-      const response = await fetch(`${API_BASE}/gui-workflows/${currentWorkflowId}/run`, {
+      const response = await fetch(`${API_BASE}/macros/${currentMacroId}/run`, {
         method: "POST",
       });
 
@@ -372,18 +372,18 @@ export function useGuiBuilderState({
           }
         }
       } else {
-        throw new Error("Failed to run workflow");
+        throw new Error("Failed to run macro");
       }
     } catch (error) {
-      console.error("Failed to run workflow:", error);
-      setLastResult({ success: false, message: "Failed to run workflow" });
+      console.error("Failed to run macro:", error);
+      setLastResult({ success: false, message: "Failed to run macro" });
     } finally {
       setIsRunning(false);
     }
-  }, [currentWorkflowId, steps.length, formState.name, handleSaveAsNew]);
+  }, [currentMacroId, steps.length, formState.name, handleSaveAsNew]);
 
   return {
-    // Workflow Steps
+    // Macro Steps
     steps,
     setSteps,
     addStep,
@@ -393,14 +393,14 @@ export function useGuiBuilderState({
     moveStepDown,
     reorderSteps,
 
-    // Workflow Management
-    currentWorkflowId,
-    currentWorkflowName: formState.name,
+    // Macro Management
+    currentMacroId,
+    currentMacroName: formState.name,
     hasUnsavedChanges,
-    savedWorkflows,
-    loadWorkflow,
-    deleteWorkflow,
-    refreshWorkflows,
+    savedMacros,
+    loadMacro,
+    deleteMacro,
+    refreshMacros,
 
     // Form State
     formState,
@@ -414,12 +414,12 @@ export function useGuiBuilderState({
     showSaveDialog,
     setShowSaveDialog,
     isSaving,
-    handleSaveWorkflow,
+    handleSaveMacro,
     handleSaveAsNew,
 
-    // Workflows Panel
-    showWorkflowsPanel,
-    setShowWorkflowsPanel,
+    // Macros Panel
+    showMacrosPanel,
+    setShowMacrosPanel,
 
     // Config Data
     configLoaded: execution.configLoaded,
@@ -428,10 +428,10 @@ export function useGuiBuilderState({
 
     // Execution
     isRunning,
-    runWorkflow,
+    runMacro,
     lastResult,
 
     // Actions
-    handleNewWorkflow,
+    handleNewMacro,
   };
 }

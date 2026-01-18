@@ -1,9 +1,9 @@
-//! GUI Workflows Library
+//! Macros Library
 //!
-//! This module provides persistent storage for GUI Action Workflows that users can
-//! create, save, and run from the GUI Workflow Builder tab.
+//! This module provides persistent storage for Macros that users can
+//! create, save, and run from the Macro Builder tab.
 //!
-//! GUI Workflows are deterministic sequences of GUI actions:
+//! Macros are deterministic sequences of GUI actions:
 //! - Click (on StateImages)
 //! - Type (text input)
 //! - Hotkey (keyboard shortcuts)
@@ -15,15 +15,16 @@ use std::path::PathBuf;
 use tracing::{error, info};
 use uuid::Uuid;
 
-const GUI_WORKFLOWS_FILE: &str = "gui_workflows.json";
+const MACROS_FILE: &str = "macros.json";
+const LEGACY_GUI_WORKFLOWS_FILE: &str = "gui_workflows.json";
 
 // ============================================================================
 // Data Types
 // ============================================================================
 
-/// A single step in a GUI Action Workflow
+/// A single step in a Macro
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuiWorkflowStep {
+pub struct MacroStep {
     /// Unique identifier for this step
     pub id: String,
     /// Action type: "click", "double_click", "right_click", "type", "hotkey", "go_to_state"
@@ -71,7 +72,7 @@ pub struct GuiWorkflowStep {
     pub timeout_seconds: Option<u64>,
 }
 
-impl GuiWorkflowStep {
+impl MacroStep {
     /// Create a new click step
     pub fn click(
         name: String,
@@ -153,19 +154,19 @@ impl GuiWorkflowStep {
     }
 }
 
-/// A saved GUI Action Workflow
+/// A saved Macro
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GuiWorkflow {
+pub struct Macro {
     /// Unique identifier (UUID v4)
     pub id: String,
-    /// Display name for the workflow
+    /// Display name for the macro
     pub name: String,
-    /// Description of what this workflow does
+    /// Description of what this macro does
     #[serde(default)]
     pub description: String,
     /// The ordered list of steps
     #[serde(default)]
-    pub steps: Vec<GuiWorkflowStep>,
+    pub steps: Vec<MacroStep>,
     /// Category for organization
     #[serde(default)]
     pub category: String,
@@ -176,17 +177,17 @@ pub struct GuiWorkflow {
     pub created_at: String,
     /// ISO 8601 timestamp of last modification
     pub modified_at: String,
-    /// Number of times this workflow has been run
+    /// Number of times this macro has been run
     #[serde(default)]
     pub run_count: u32,
 }
 
-impl GuiWorkflow {
-    /// Create a new GUI workflow
+impl Macro {
+    /// Create a new Macro
     pub fn new(
         name: String,
         description: String,
-        steps: Vec<GuiWorkflowStep>,
+        steps: Vec<MacroStep>,
         category: String,
         tags: Vec<String>,
     ) -> Self {
@@ -209,9 +210,8 @@ impl GuiWorkflow {
 // Storage Functions
 // ============================================================================
 
-/// Get the path to the GUI workflows storage file
-fn get_storage_path() -> PathBuf {
-    // Store in the app's local data directory
+/// Get the base storage directory
+fn get_storage_dir() -> PathBuf {
     let base_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("qontinui-runner");
@@ -219,188 +219,229 @@ fn get_storage_path() -> PathBuf {
     // Create directory if it doesn't exist
     if !base_dir.exists() {
         if let Err(e) = fs::create_dir_all(&base_dir) {
-            error!("Failed to create GUI workflows storage directory: {}", e);
+            error!("Failed to create macros storage directory: {}", e);
         }
     }
 
-    base_dir.join(GUI_WORKFLOWS_FILE)
+    base_dir
 }
 
-/// Load all GUI workflows from storage
-pub fn load_workflows() -> Vec<GuiWorkflow> {
+/// Get the path to the macros storage file
+fn get_storage_path() -> PathBuf {
+    get_storage_dir().join(MACROS_FILE)
+}
+
+/// Get the path to the legacy GUI workflows file
+fn get_legacy_storage_path() -> PathBuf {
+    get_storage_dir().join(LEGACY_GUI_WORKFLOWS_FILE)
+}
+
+/// Migrate legacy gui_workflows.json to macros.json if needed
+fn migrate_legacy_file() {
+    let legacy_path = get_legacy_storage_path();
+    let new_path = get_storage_path();
+
+    // If new file already exists, no migration needed
+    if new_path.exists() {
+        return;
+    }
+
+    // If legacy file exists, rename it
+    if legacy_path.exists() {
+        info!(
+            "Migrating legacy GUI workflows file to macros: {:?} -> {:?}",
+            legacy_path, new_path
+        );
+        if let Err(e) = fs::rename(&legacy_path, &new_path) {
+            error!("Failed to migrate legacy GUI workflows file: {}", e);
+            // Try copy instead of rename as fallback
+            if let Ok(content) = fs::read_to_string(&legacy_path) {
+                if let Err(e) = fs::write(&new_path, content) {
+                    error!("Failed to copy legacy GUI workflows file: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Load all macros from storage
+pub fn load_macros() -> Vec<Macro> {
+    // Ensure legacy file is migrated
+    migrate_legacy_file();
+
     let path = get_storage_path();
 
     if !path.exists() {
-        info!("GUI workflows file does not exist, returning empty list");
+        info!("Macros file does not exist, returning empty list");
         return Vec::new();
     }
 
     match fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str(&content) {
-            Ok(workflows) => {
-                info!("Loaded GUI workflows from {:?}", path);
-                workflows
+            Ok(macros) => {
+                info!("Loaded macros from {:?}", path);
+                macros
             }
             Err(e) => {
-                error!("Failed to parse GUI workflows file: {}", e);
+                error!("Failed to parse macros file: {}", e);
                 Vec::new()
             }
         },
         Err(e) => {
-            error!("Failed to read GUI workflows file: {}", e);
+            error!("Failed to read macros file: {}", e);
             Vec::new()
         }
     }
 }
 
-/// Save all GUI workflows to storage
-fn save_workflows(workflows: &[GuiWorkflow]) -> Result<(), String> {
+/// Save all macros to storage
+fn save_macros(macros: &[Macro]) -> Result<(), String> {
     let path = get_storage_path();
 
-    let content = serde_json::to_string_pretty(workflows)
-        .map_err(|e| format!("Failed to serialize GUI workflows: {}", e))?;
+    let content = serde_json::to_string_pretty(macros)
+        .map_err(|e| format!("Failed to serialize macros: {}", e))?;
 
-    fs::write(&path, content).map_err(|e| format!("Failed to write GUI workflows file: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("Failed to write macros file: {}", e))?;
 
-    info!("Saved {} GUI workflows to {:?}", workflows.len(), path);
+    info!("Saved {} macros to {:?}", macros.len(), path);
     Ok(())
 }
 
-/// Create a new GUI workflow
-pub fn create_workflow(
+/// Create a new macro
+pub fn create_macro(
     name: String,
     description: String,
-    steps: Vec<GuiWorkflowStep>,
+    steps: Vec<MacroStep>,
     category: String,
     tags: Vec<String>,
-) -> Result<GuiWorkflow, String> {
-    let mut workflows = load_workflows();
+) -> Result<Macro, String> {
+    let mut macros = load_macros();
 
-    let workflow = GuiWorkflow::new(name, description, steps, category, tags);
+    let new_macro = Macro::new(name, description, steps, category, tags);
 
-    workflows.push(workflow.clone());
-    save_workflows(&workflows)?;
+    macros.push(new_macro.clone());
+    save_macros(&macros)?;
 
-    info!("Created GUI workflow: {} ({})", workflow.name, workflow.id);
-    Ok(workflow)
+    info!("Created macro: {} ({})", new_macro.name, new_macro.id);
+    Ok(new_macro)
 }
 
-/// Get a single GUI workflow by ID
-pub fn get_workflow(id: &str) -> Option<GuiWorkflow> {
-    let workflows = load_workflows();
-    workflows.into_iter().find(|w| w.id == id)
+/// Get a single macro by ID
+pub fn get_macro(id: &str) -> Option<Macro> {
+    let macros = load_macros();
+    macros.into_iter().find(|m| m.id == id)
 }
 
-/// Update an existing GUI workflow
-pub fn update_workflow(
+/// Update an existing macro
+pub fn update_macro(
     id: &str,
     name: Option<String>,
     description: Option<String>,
-    steps: Option<Vec<GuiWorkflowStep>>,
+    steps: Option<Vec<MacroStep>>,
     category: Option<String>,
     tags: Option<Vec<String>>,
-) -> Result<GuiWorkflow, String> {
-    let mut workflows = load_workflows();
+) -> Result<Macro, String> {
+    let mut macros = load_macros();
 
-    let workflow = workflows
+    let macro_item = macros
         .iter_mut()
-        .find(|w| w.id == id)
-        .ok_or_else(|| format!("GUI workflow not found: {}", id))?;
+        .find(|m| m.id == id)
+        .ok_or_else(|| format!("Macro not found: {}", id))?;
 
     if let Some(n) = name {
-        workflow.name = n;
+        macro_item.name = n;
     }
     if let Some(d) = description {
-        workflow.description = d;
+        macro_item.description = d;
     }
     if let Some(s) = steps {
-        workflow.steps = s;
+        macro_item.steps = s;
     }
     if let Some(cat) = category {
-        workflow.category = cat;
+        macro_item.category = cat;
     }
     if let Some(t) = tags {
-        workflow.tags = t;
+        macro_item.tags = t;
     }
 
-    workflow.modified_at = chrono::Utc::now().to_rfc3339();
+    macro_item.modified_at = chrono::Utc::now().to_rfc3339();
 
-    let updated = workflow.clone();
-    save_workflows(&workflows)?;
+    let updated = macro_item.clone();
+    save_macros(&macros)?;
 
-    info!("Updated GUI workflow: {} ({})", updated.name, updated.id);
+    info!("Updated macro: {} ({})", updated.name, updated.id);
     Ok(updated)
 }
 
-/// Increment the run count for a workflow
+/// Increment the run count for a macro
 pub fn increment_run_count(id: &str) -> Result<(), String> {
-    let mut workflows = load_workflows();
+    let mut macros = load_macros();
 
-    let workflow = workflows
+    let macro_item = macros
         .iter_mut()
-        .find(|w| w.id == id)
-        .ok_or_else(|| format!("GUI workflow not found: {}", id))?;
+        .find(|m| m.id == id)
+        .ok_or_else(|| format!("Macro not found: {}", id))?;
 
-    workflow.run_count += 1;
-    workflow.modified_at = chrono::Utc::now().to_rfc3339();
+    macro_item.run_count += 1;
+    macro_item.modified_at = chrono::Utc::now().to_rfc3339();
 
-    save_workflows(&workflows)?;
-    info!("Incremented run count for GUI workflow: {}", id);
+    save_macros(&macros)?;
+    info!("Incremented run count for macro: {}", id);
     Ok(())
 }
 
-/// Delete a GUI workflow by ID
-pub fn delete_workflow(id: &str) -> Result<(), String> {
-    let mut workflows = load_workflows();
-    let original_len = workflows.len();
+/// Delete a macro by ID
+pub fn delete_macro(id: &str) -> Result<(), String> {
+    let mut macros = load_macros();
+    let original_len = macros.len();
 
-    workflows.retain(|w| w.id != id);
+    macros.retain(|m| m.id != id);
 
-    if workflows.len() == original_len {
-        return Err(format!("GUI workflow not found: {}", id));
+    if macros.len() == original_len {
+        return Err(format!("Macro not found: {}", id));
     }
 
-    save_workflows(&workflows)?;
-    info!("Deleted GUI workflow: {}", id);
+    save_macros(&macros)?;
+    info!("Deleted macro: {}", id);
     Ok(())
 }
 
-/// List all GUI workflows, optionally filtered by category
-pub fn list_workflows(category: Option<&str>) -> Vec<GuiWorkflow> {
-    let workflows = load_workflows();
+/// List all macros, optionally filtered by category
+pub fn list_macros(category: Option<&str>) -> Vec<Macro> {
+    let macros = load_macros();
 
     match category {
-        Some(cat) => workflows
+        Some(cat) => macros
             .into_iter()
-            .filter(|w| w.category.eq_ignore_ascii_case(cat))
+            .filter(|m| m.category.eq_ignore_ascii_case(cat))
             .collect(),
-        None => workflows,
+        None => macros,
     }
 }
 
-/// Search GUI workflows by name, description, or tags
-pub fn search_workflows(query: &str) -> Vec<GuiWorkflow> {
-    let workflows = load_workflows();
+/// Search macros by name, description, or tags
+pub fn search_macros(query: &str) -> Vec<Macro> {
+    let macros = load_macros();
     let query_lower = query.to_lowercase();
 
-    workflows
+    macros
         .into_iter()
-        .filter(|w| {
-            w.name.to_lowercase().contains(&query_lower)
-                || w.description.to_lowercase().contains(&query_lower)
-                || w.tags
+        .filter(|m| {
+            m.name.to_lowercase().contains(&query_lower)
+                || m.description.to_lowercase().contains(&query_lower)
+                || m.tags
                     .iter()
                     .any(|t| t.to_lowercase().contains(&query_lower))
         })
         .collect()
 }
 
-/// Get all unique categories from saved workflows
+/// Get all unique categories from saved macros
 pub fn get_categories() -> Vec<String> {
-    let workflows = load_workflows();
-    let mut categories: Vec<String> = workflows
+    let macros = load_macros();
+    let mut categories: Vec<String> = macros
         .iter()
-        .map(|w| w.category.clone())
+        .map(|m| m.category.clone())
         .filter(|c| !c.is_empty())
         .collect();
 
@@ -409,10 +450,10 @@ pub fn get_categories() -> Vec<String> {
     categories
 }
 
-/// Get all unique tags from saved workflows
+/// Get all unique tags from saved macros
 pub fn get_tags() -> Vec<String> {
-    let workflows = load_workflows();
-    let mut tags: Vec<String> = workflows.iter().flat_map(|w| w.tags.clone()).collect();
+    let macros = load_macros();
+    let mut tags: Vec<String> = macros.iter().flat_map(|m| m.tags.clone()).collect();
 
     tags.sort();
     tags.dedup();
@@ -425,7 +466,7 @@ mod tests {
 
     #[test]
     fn test_create_click_step() {
-        let step = GuiWorkflowStep::click(
+        let step = MacroStep::click(
             "Click Login".to_string(),
             vec!["img-1".to_string()],
             vec!["Login Button".to_string()],
@@ -439,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_create_type_step() {
-        let step = GuiWorkflowStep::type_text("Type Username".to_string(), "testuser".to_string());
+        let step = MacroStep::type_text("Type Username".to_string(), "testuser".to_string());
 
         assert_eq!(step.action_type, "type");
         assert_eq!(step.text_input, Some("testuser".to_string()));
@@ -447,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_create_hotkey_step() {
-        let step = GuiWorkflowStep::hotkey("Copy".to_string(), "Ctrl+C".to_string());
+        let step = MacroStep::hotkey("Copy".to_string(), "Ctrl+C".to_string());
 
         assert_eq!(step.action_type, "hotkey");
         assert_eq!(step.hotkey, Some("Ctrl+C".to_string()));
@@ -455,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_create_go_to_state_step() {
-        let step = GuiWorkflowStep::go_to_state(
+        let step = MacroStep::go_to_state(
             "Go to Dashboard".to_string(),
             vec!["state-1".to_string()],
             vec!["Dashboard".to_string()],

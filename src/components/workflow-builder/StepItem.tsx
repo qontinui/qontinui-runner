@@ -34,8 +34,9 @@ import {
   List,
   Play,
   FileSearch,
+  Lock,
 } from "lucide-react";
-import type { UnifiedStep, WorkflowPhase } from "../../types";
+import type { UnifiedStep, WorkflowPhase, PromptStep } from "../../types";
 
 // Icon mapping for step types
 const STEP_ICONS: Record<string, React.ElementType> = {
@@ -117,6 +118,10 @@ export function StepItem({
   onDelete,
   onClick,
 }: StepItemProps) {
+  // Check if this is a summary step (locked to last position)
+  const isSummaryStep =
+    step.type === "prompt" && (step as PromptStep).is_summary_step === true;
+
   // Get the appropriate icon
   const getIcon = (): React.ElementType => {
     if (step.type === "gui_action") {
@@ -226,10 +231,13 @@ export function StepItem({
         cursor-pointer transition-all group
       `}
     >
-      {/* Drag Handle */}
-      <div className="text-zinc-600 group-hover:text-zinc-500 cursor-grab">
-        <GripVertical className="w-4 h-4" />
-      </div>
+      {/* Drag Handle - hidden for summary steps */}
+      {!isSummaryStep && (
+        <div className="text-zinc-600 group-hover:text-zinc-500 cursor-grab">
+          <GripVertical className="w-4 h-4" />
+        </div>
+      )}
+      {isSummaryStep && <div className="w-4" />}
 
       {/* Step Icon */}
       <div className={`p-1.5 rounded ${bgColor}`}>
@@ -240,6 +248,12 @@ export function StepItem({
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-zinc-200 truncate">{step.name}</span>
+          {isSummaryStep && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 flex items-center gap-1">
+              <Lock className="w-3 h-3" />
+              Locked
+            </span>
+          )}
           {step.type === "test" && step.is_critical && (
             <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">
               Critical
@@ -261,12 +275,12 @@ export function StepItem({
             e.stopPropagation();
             onMoveUp();
           }}
-          disabled={isFirst}
+          disabled={isFirst || isSummaryStep}
           className={`
             p-1 rounded hover:bg-zinc-700 transition-colors
-            ${isFirst ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
+            ${isFirst || isSummaryStep ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
           `}
-          title="Move up"
+          title={isSummaryStep ? "Summary step cannot be moved" : "Move up"}
         >
           <ChevronUp className="w-4 h-4" />
         </button>
@@ -275,12 +289,12 @@ export function StepItem({
             e.stopPropagation();
             onMoveDown();
           }}
-          disabled={isLast}
+          disabled={isLast || isSummaryStep}
           className={`
             p-1 rounded hover:bg-zinc-700 transition-colors
-            ${isLast ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
+            ${isLast || isSummaryStep ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
           `}
-          title="Move down"
+          title={isSummaryStep ? "Summary step cannot be moved" : "Move down"}
         >
           <ChevronDown className="w-4 h-4" />
         </button>

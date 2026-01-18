@@ -6780,100 +6780,34 @@ pub struct DuplicatePromptRequest {
 }
 
 // ============================================================================
-// AI Workflow Request/Response Types
+// Macro Request/Response Types
 // ============================================================================
 
-use crate::ai_workflows;
-use crate::gui_workflows;
+use crate::macros;
 
-/// Request to create a new AI workflow
+/// Request to create a new macro
 #[derive(Debug, Deserialize)]
-pub struct CreateAiWorkflowRequest {
+pub struct CreateMacroRequest {
     pub name: String,
     #[serde(default)]
     pub description: String,
     #[serde(default)]
-    pub steps: Vec<ai_workflows::ExecutionStep>,
-    #[serde(default)]
-    pub goal: String,
-    #[serde(default = "default_ai_workflow_max_iterations")]
-    pub max_iterations: u32,
-    #[serde(default)]
-    pub capture_input_validation: bool,
-    #[serde(default)]
-    pub category: String,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    #[serde(default)]
-    pub context_ids: Vec<String>,
-    #[serde(default)]
-    pub disabled_context_ids: Vec<String>,
-    #[serde(default = "default_auto_include_contexts")]
-    pub auto_include_contexts: bool,
-}
-
-fn default_auto_include_contexts() -> bool {
-    true
-}
-
-fn default_ai_workflow_max_iterations() -> u32 {
-    10
-}
-
-/// Request to update an existing AI workflow
-#[derive(Debug, Deserialize)]
-pub struct UpdateAiWorkflowRequest {
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub steps: Option<Vec<ai_workflows::ExecutionStep>>,
-    #[serde(default)]
-    pub goal: Option<String>,
-    #[serde(default)]
-    pub max_iterations: Option<u32>,
-    #[serde(default)]
-    pub capture_input_validation: Option<bool>,
-    #[serde(default)]
-    pub category: Option<String>,
-    #[serde(default)]
-    pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub context_ids: Option<Vec<String>>,
-    #[serde(default)]
-    pub disabled_context_ids: Option<Vec<String>>,
-    #[serde(default)]
-    pub auto_include_contexts: Option<bool>,
-}
-
-// ============================================================================
-// GUI Workflow Request/Response Types
-// ============================================================================
-
-/// Request to create a new GUI workflow
-#[derive(Debug, Deserialize)]
-pub struct CreateGuiWorkflowRequest {
-    pub name: String,
-    #[serde(default)]
-    pub description: String,
-    #[serde(default)]
-    pub steps: Vec<gui_workflows::GuiWorkflowStep>,
+    pub steps: Vec<macros::MacroStep>,
     #[serde(default)]
     pub category: String,
     #[serde(default)]
     pub tags: Vec<String>,
 }
 
-/// Request to update an existing GUI workflow
+/// Request to update an existing macro
 #[derive(Debug, Deserialize)]
-pub struct UpdateGuiWorkflowRequest {
+pub struct UpdateMacroRequest {
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
-    pub steps: Option<Vec<gui_workflows::GuiWorkflowStep>>,
+    pub steps: Option<Vec<macros::MacroStep>>,
     #[serde(default)]
     pub category: Option<String>,
     #[serde(default)]
@@ -6897,6 +6831,7 @@ pub struct AiOutputEvent {
     pub session_id: Option<String>, // Session ID for grouping output across continuations
     #[serde(rename = "sessionName")]
     pub session_name: Option<String>, // Human-readable session name
+    pub phase: Option<String>, // Workflow phase: setup, verification, agentic, or completion
 }
 
 /// Session context for AI output events
@@ -6904,6 +6839,7 @@ pub struct AiOutputEvent {
 pub struct AiOutputSessionContext {
     pub session_id: Option<String>,
     pub session_name: Option<String>,
+    pub phase: Option<String>, // Workflow phase: setup, verification, agentic, or completion
 }
 
 /// Context for finding detection during AI sessions.
@@ -7121,6 +7057,7 @@ pub fn emit_ai_output(
         action_id: action_id.map(|s| s.to_string()),
         session_id: session_ctx.and_then(|ctx| ctx.session_id.clone()),
         session_name: session_ctx.and_then(|ctx| ctx.session_name.clone()),
+        phase: session_ctx.and_then(|ctx| ctx.phase.clone()),
     };
 
     if let Err(e) = app_handle.emit("ai-output", &event) {
@@ -8171,6 +8108,7 @@ If your task requires running visual automation, use the Runner API to execute w
     let session_ctx = AiOutputSessionContext {
         session_id: Some(task_run_id.clone()),
         session_name: Some(prompt_name.clone()),
+        phase: None,
     };
 
     // Emit prompt to frontend (use original prompt content for display)
@@ -8324,6 +8262,7 @@ If your task requires running visual automation, use the Runner API to execute w
                         Some(AiOutputSessionContext {
                             session_id: Some(orchestrator_session_id.clone()),
                             session_name: Some(prompt_name.clone()),
+                            phase: None,
                         }),
                     );
 
@@ -8381,6 +8320,7 @@ If your task requires running visual automation, use the Runner API to execute w
             let session_ctx = AiOutputSessionContext {
                 session_id: Some(session_id_for_loop.clone()),
                 session_name: Some(session_name_for_loop.clone()),
+                phase: None,
             };
 
             // Run the unified session loop (which integrates with orchestrator)
@@ -8680,171 +8620,57 @@ async fn search_prompts(
 }
 
 // ============================================================================
-// AI Workflow Handlers
+// Macro Handlers
 // ============================================================================
 
-/// List all AI workflows
-async fn list_ai_workflows(
+/// List all macros
+async fn list_macros(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<Vec<ai_workflows::AiWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<Json<ApiResponse<Vec<macros::Macro>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let category = params.get("category").map(|s| s.as_str());
-    let workflows = ai_workflows::list_workflows(category);
-    Ok(Json(ApiResponse::success(workflows)))
+    let macro_list = macros::list_macros(category);
+    Ok(Json(ApiResponse::success(macro_list)))
 }
 
-/// Get a single AI workflow by ID
-async fn get_ai_workflow(
+/// Get a single macro by ID
+async fn get_macro(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<ai_workflows::AiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::get_workflow(&id) {
-        Some(workflow) => Ok(Json(ApiResponse::success(workflow))),
+) -> Result<Json<ApiResponse<macros::Macro>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match macros::get_macro(&id) {
+        Some(macro_item) => Ok(Json(ApiResponse::success(macro_item))),
         None => Err((
             StatusCode::NOT_FOUND,
-            Json(api_error(format!("AI workflow not found: {}", id))),
+            Json(api_error(format!("Macro not found: {}", id))),
         )),
     }
 }
 
-/// Create a new AI workflow
-async fn create_ai_workflow(
+/// Create a new macro
+async fn create_macro(
     State(_state): State<Arc<ApiState>>,
-    Json(request): Json<CreateAiWorkflowRequest>,
-) -> Result<Json<ApiResponse<ai_workflows::AiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::create_workflow(
+    Json(request): Json<CreateMacroRequest>,
+) -> Result<Json<ApiResponse<macros::Macro>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match macros::create_macro(
         request.name,
         request.description,
         request.steps,
-        request.goal,
-        request.max_iterations,
-        request.capture_input_validation,
         request.category,
         request.tags,
-        request.context_ids,
-        request.disabled_context_ids,
-        request.auto_include_contexts,
     ) {
-        Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
+        Ok(macro_item) => Ok(Json(ApiResponse::success(macro_item))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
-/// Update an existing AI workflow
-async fn update_ai_workflow(
+/// Update an existing macro
+async fn update_macro(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
-    Json(request): Json<UpdateAiWorkflowRequest>,
-) -> Result<Json<ApiResponse<ai_workflows::AiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::update_workflow(
-        &id,
-        request.name,
-        request.description,
-        request.steps,
-        request.goal,
-        request.max_iterations,
-        request.capture_input_validation,
-        request.category,
-        request.tags,
-        request.context_ids,
-        request.disabled_context_ids,
-        request.auto_include_contexts,
-    ) {
-        Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
-    }
-}
-
-/// Delete an AI workflow
-async fn delete_ai_workflow(
-    State(_state): State<Arc<ApiState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match ai_workflows::delete_workflow(&id) {
-        Ok(()) => Ok(Json(ApiResponse::success(()))),
-        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
-    }
-}
-
-/// Search AI workflows by query
-async fn search_ai_workflows(
-    State(_state): State<Arc<ApiState>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<Vec<ai_workflows::AiWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
-    let results = ai_workflows::search_workflows(query);
-    Ok(Json(ApiResponse::success(results)))
-}
-
-/// Get all AI workflow categories
-async fn get_ai_workflow_categories(
-    State(_state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let categories = ai_workflows::get_categories();
-    Ok(Json(ApiResponse::success(categories)))
-}
-
-/// Get all AI workflow tags
-async fn get_ai_workflow_tags(
-    State(_state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let tags = ai_workflows::get_tags();
-    Ok(Json(ApiResponse::success(tags)))
-}
-
-// ============================================================================
-// GUI Workflow Handlers
-// ============================================================================
-
-/// List all GUI workflows
-async fn list_gui_workflows(
-    State(_state): State<Arc<ApiState>>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<Vec<gui_workflows::GuiWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)>
-{
-    let category = params.get("category").map(|s| s.as_str());
-    let workflows = gui_workflows::list_workflows(category);
-    Ok(Json(ApiResponse::success(workflows)))
-}
-
-/// Get a single GUI workflow by ID
-async fn get_gui_workflow(
-    State(_state): State<Arc<ApiState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<Json<ApiResponse<gui_workflows::GuiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match gui_workflows::get_workflow(&id) {
-        Some(workflow) => Ok(Json(ApiResponse::success(workflow))),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(format!("GUI workflow not found: {}", id))),
-        )),
-    }
-}
-
-/// Create a new GUI workflow
-async fn create_gui_workflow(
-    State(_state): State<Arc<ApiState>>,
-    Json(request): Json<CreateGuiWorkflowRequest>,
-) -> Result<Json<ApiResponse<gui_workflows::GuiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match gui_workflows::create_workflow(
-        request.name,
-        request.description,
-        request.steps,
-        request.category,
-        request.tags,
-    ) {
-        Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
-    }
-}
-
-/// Update an existing GUI workflow
-async fn update_gui_workflow(
-    State(_state): State<Arc<ApiState>>,
-    axum::extract::Path(id): axum::extract::Path<String>,
-    Json(request): Json<UpdateGuiWorkflowRequest>,
-) -> Result<Json<ApiResponse<gui_workflows::GuiWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match gui_workflows::update_workflow(
+    Json(request): Json<UpdateMacroRequest>,
+) -> Result<Json<ApiResponse<macros::Macro>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match macros::update_macro(
         &id,
         request.name,
         request.description,
@@ -8852,72 +8678,67 @@ async fn update_gui_workflow(
         request.category,
         request.tags,
     ) {
-        Ok(workflow) => Ok(Json(ApiResponse::success(workflow))),
+        Ok(macro_item) => Ok(Json(ApiResponse::success(macro_item))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
 }
 
-/// Delete a GUI workflow
-async fn delete_gui_workflow(
+/// Delete a macro
+async fn delete_macro(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match gui_workflows::delete_workflow(&id) {
+    match macros::delete_macro(&id) {
         Ok(()) => Ok(Json(ApiResponse::success(()))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
 }
 
-/// Search GUI workflows by query
-async fn search_gui_workflows(
+/// Search macros by query
+async fn search_macros(
     State(_state): State<Arc<ApiState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<ApiResponse<Vec<gui_workflows::GuiWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)>
-{
+) -> Result<Json<ApiResponse<Vec<macros::Macro>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let query = params.get("q").map(|s| s.as_str()).unwrap_or("");
-    let results = gui_workflows::search_workflows(query);
+    let results = macros::search_macros(query);
     Ok(Json(ApiResponse::success(results)))
 }
 
-/// Get all GUI workflow categories
-async fn get_gui_workflow_categories(
+/// Get all macro categories
+async fn get_macro_categories(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let categories = gui_workflows::get_categories();
+    let categories = macros::get_categories();
     Ok(Json(ApiResponse::success(categories)))
 }
 
-/// Get all GUI workflow tags
-async fn get_gui_workflow_tags(
+/// Get all macro tags
+async fn get_macro_tags(
     State(_state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let tags = gui_workflows::get_tags();
+    let tags = macros::get_tags();
     Ok(Json(ApiResponse::success(tags)))
 }
 
-/// Run a GUI workflow by ID
-async fn run_gui_workflow(
+/// Run a macro by ID
+async fn run_macro(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Get the workflow
-    let workflow = match gui_workflows::get_workflow(&id) {
-        Some(w) => w,
+    // Get the macro
+    let macro_item = match macros::get_macro(&id) {
+        Some(m) => m,
         None => {
             return Err((
                 StatusCode::NOT_FOUND,
-                Json(api_error(format!("GUI workflow not found: {}", id))),
+                Json(api_error(format!("Macro not found: {}", id))),
             ));
         }
     };
 
     // Increment run count
-    if let Err(e) = gui_workflows::increment_run_count(&id) {
-        tracing::warn!(
-            "Failed to increment run count for GUI workflow {}: {}",
-            id,
-            e
-        );
+    if let Err(e) = macros::increment_run_count(&id) {
+        tracing::warn!("Failed to increment run count for macro {}: {}", id, e);
     }
 
     let start_time = std::time::Instant::now();
@@ -8928,7 +8749,7 @@ async fn run_gui_workflow(
     // Execute each step using the action service
     let action_service = state.action_service.clone();
 
-    for (idx, step) in workflow.steps.iter().enumerate() {
+    for (idx, step) in macro_item.steps.iter().enumerate() {
         let step_start = std::time::Instant::now();
         let mut step_success = false;
         let mut step_error: Option<String> = None;
@@ -9057,9 +8878,9 @@ async fn run_gui_workflow(
     let total_duration = start_time.elapsed().as_millis() as u64;
 
     Ok(Json(ApiResponse::success(serde_json::json!({
-        "workflow_id": id,
-        "workflow_name": workflow.name,
-        "total_steps": workflow.steps.len(),
+        "macro_id": id,
+        "macro_name": macro_item.name,
+        "total_steps": macro_item.steps.len(),
         "successful_steps": successful_steps,
         "failed_steps": failed_steps,
         "duration_ms": total_duration,
@@ -10515,6 +10336,7 @@ async fn start_session(
                 let session_ctx = AiOutputSessionContext {
                     session_id: Some(session_id.clone()),
                     session_name: Some(session_name.clone()),
+                    phase: None,
                 };
 
                 // Run the FIRST session with the original prompt (which already includes pre-execution results)
@@ -10794,6 +10616,7 @@ async fn start_session(
                     let session_ctx = AiOutputSessionContext {
                         session_id: Some(task_id.clone()),
                         session_name: Some(task.task_name.clone()),
+                        phase: None,
                     };
 
                     // Start the new session
@@ -11599,6 +11422,7 @@ async fn force_continue_session(
                 let run_ctx = AiOutputSessionContext {
                     session_id: Some(task_id),
                     session_name: Some(session_name),
+                    phase: None,
                 };
 
                 // Spawn the execution
@@ -12356,6 +12180,7 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
         let session_ctx = AiOutputSessionContext {
             session_id: Some(task.id.clone()),
             session_name: Some(task.task_name.clone()),
+            phase: None,
         };
 
         // Start the session
@@ -12687,6 +12512,7 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                         let session_ctx = AiOutputSessionContext {
                             session_id: Some(task_id.clone()),
                             session_name: Some(task.task_name.clone()),
+                            phase: None,
                         };
 
                         // Start the new session
@@ -12827,6 +12653,7 @@ async fn run_unified_session_loop(
     let session_ctx = run_ctx.unwrap_or_else(|| AiOutputSessionContext {
         session_id: Some(session_id.clone()),
         session_name: Some(config.name.clone()),
+        phase: None,
     });
 
     info!(
@@ -17277,6 +17104,10 @@ async fn import_unified_workflow(
         model: workflow.model.clone(),
         skip_ai_summary: workflow.skip_ai_summary,
         log_source_selection: workflow.log_source_selection.clone(),
+        context_ids: workflow.context_ids.clone(),
+        disabled_context_ids: workflow.disabled_context_ids.clone(),
+        auto_include_contexts: workflow.auto_include_contexts,
+        prompt_template: workflow.prompt_template.clone(),
     };
 
     // Use the database's create function but with our custom ID
@@ -17464,6 +17295,13 @@ async fn run_unified_workflow(
                 }
             }
 
+            // Fix prompt content mapping - "content" field maps to prompt_content for prompt steps
+            if config.step_type == "prompt" && config.prompt_content.is_none() {
+                if let Some(content) = step.get("content").and_then(|v| v.as_str()) {
+                    config.prompt_content = Some(content.to_string());
+                }
+            }
+
             return Some(config);
         }
 
@@ -17516,6 +17354,7 @@ async fn run_unified_workflow(
             timeout_seconds: step.get("timeoutSeconds").and_then(|v| v.as_u64()),
             initial_state_ids: None,
             is_setup: step.get("isSetup").and_then(|v| v.as_bool()),
+            phase: step.get("phase").and_then(|v| v.as_str()).map(|s| s.to_string()),
             run_on_subsequent_iterations: None,
             test_id: step
                 .get("test_id")
@@ -17611,6 +17450,12 @@ async fn run_unified_workflow(
                 .or_else(|| step.get("check_auto_fix"))
                 .or_else(|| step.get("checkAutoFix"))
                 .and_then(|v| v.as_bool()),
+            // Macro fields
+            macro_id: step
+                .get("macro_id")
+                .or_else(|| step.get("macroId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         })
     };
 
@@ -17657,16 +17502,124 @@ async fn run_unified_workflow(
         )));
     }
 
+    // Check if any steps are prompt steps (require AI execution)
+    let has_prompt_steps = all_steps.iter().any(|s| s.step_type == "prompt");
+
+    // Separate automation steps from prompt steps
+    let (automation_steps, prompt_steps): (Vec<_>, Vec<_>) = all_steps
+        .into_iter()
+        .partition(|s| s.step_type != "prompt");
+
     let execution_id = format!(
         "unified-workflow-{}-{}",
         id,
         chrono::Utc::now().timestamp_millis()
     );
 
+    // If workflow has prompt steps, use session-based execution
+    if has_prompt_steps {
+        info!(
+            "Workflow '{}' has {} prompt steps - using session-based execution",
+            workflow.name,
+            prompt_steps.len()
+        );
+
+        // Combine all prompt contents into a single prompt
+        let combined_prompt = prompt_steps
+            .iter()
+            .filter_map(|s| s.prompt_content.as_ref())
+            .map(|content| content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n");
+
+        if combined_prompt.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error("Workflow has prompt steps but no prompt content".to_string())),
+            ));
+        }
+
+        // Build session config
+        let session_config = SessionConfig {
+            prompt: combined_prompt.clone(),
+            continuation_prompt: None,
+            total_phases: workflow.max_iterations,
+            uses_gui: false,
+            timeout_seconds: request.timeout_seconds.unwrap_or(1800),
+            stall_threshold_seconds: 300,
+            name: workflow.name.clone(),
+            description: workflow.description.clone(),
+            custom_config: serde_json::json!({
+                "workflow_id": id,
+                "automation_steps": automation_steps,
+                "context_ids": workflow.context_ids,
+                "disabled_context_ids": workflow.disabled_context_ids,
+                "auto_include_contexts": workflow.auto_include_contexts,
+                "prompt_template": workflow.prompt_template,
+            }),
+            provider: workflow.provider.clone(),
+            model: workflow.model.clone(),
+        };
+
+        // Create task_run for tracking
+        let execution_steps_json = serde_json::to_string(&automation_steps).ok();
+        if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
+            &execution_id,
+            &workflow.name,
+            Some(&combined_prompt),
+            "ai",
+            None,
+            Some(&workflow.name),
+            Some(workflow.max_iterations),
+            Some(true),
+            execution_steps_json,
+            None,
+        ) {
+            warn!(
+                "Failed to create task_run for unified workflow {}: {}",
+                execution_id, e
+            );
+        }
+
+        // Start session via session manager
+        match state.session.start_session(session_config).await {
+            Ok(session) => {
+                info!(
+                    "Started AI session {} for unified workflow '{}'",
+                    session.id, workflow.name
+                );
+
+                // Return a result indicating the session was started
+                // The actual execution happens asynchronously
+                return Ok(Json(ApiResponse::success(
+                    crate::step_executor::ExecutionResult {
+                        success: true,
+                        total_steps: prompt_steps.len(),
+                        successful_steps: 0, // Will be updated as session progresses
+                        failed_steps: 0,
+                        total_duration_ms: 0,
+                        steps: vec![],
+                        captured_logs: None,
+                        captured_runner_logs: None,
+                    },
+                )));
+            }
+            Err(e) => {
+                error!("Failed to start session for unified workflow: {}", e);
+                // Mark task as failed
+                let _ = state.app_state.checkpoint_db.fail_task_run(&execution_id, &e);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to start AI session: {}", e))),
+                ));
+            }
+        }
+    }
+
+    // No prompt steps - use step_executor for automation-only workflow
     // Create a task_run record so the workflow shows in the Active page
     // Serialize full step configuration so re-execution on resume has all fields
-    // (previously only stored type/name which broke check_type, command, etc.)
-    let execution_steps_json = serde_json::to_string(&all_steps).ok();
+    let execution_steps_json = serde_json::to_string(&automation_steps).ok();
 
     // Create task_run to track this execution (enables Active page monitoring)
     if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
@@ -17694,9 +17647,9 @@ async fn run_unified_workflow(
         state.app_handle.clone(),
     );
 
-    // Execute all steps
+    // Execute automation steps only (no prompt steps)
     let result = executor
-        .execute_steps_with_log_sources(&all_steps, &execution_id, &[])
+        .execute_steps_with_log_sources(&automation_steps, &execution_id, &[])
         .await;
 
     info!(
@@ -17979,34 +17932,28 @@ pub fn create_router(
         .route("/prompts/:id", put(update_prompt))
         .route("/prompts/:id", delete(delete_prompt))
         .route("/prompts/:id/duplicate", post(duplicate_prompt))
-        // AI Workflow Library routes
-        .route("/ai-workflows", get(list_ai_workflows))
-        .route("/ai-workflows", post(create_ai_workflow))
-        .route("/ai-workflows/search", get(search_ai_workflows))
-        .route("/ai-workflows/categories", get(get_ai_workflow_categories))
-        .route("/ai-workflows/tags", get(get_ai_workflow_tags))
+        // Macro Library routes
+        .route("/macros", get(list_macros))
+        .route("/macros", post(create_macro))
+        .route("/macros/search", get(search_macros))
+        .route("/macros/categories", get(get_macro_categories))
+        .route("/macros/tags", get(get_macro_tags))
         .route(
-            "/ai-workflows/:id",
-            get(get_ai_workflow)
-                .put(update_ai_workflow)
-                .delete(delete_ai_workflow),
+            "/macros/:id",
+            get(get_macro).put(update_macro).delete(delete_macro),
         )
-        // GUI Workflow Library routes
-        .route("/gui-workflows", get(list_gui_workflows))
-        .route("/gui-workflows", post(create_gui_workflow))
-        .route("/gui-workflows/search", get(search_gui_workflows))
-        .route(
-            "/gui-workflows/categories",
-            get(get_gui_workflow_categories),
-        )
-        .route("/gui-workflows/tags", get(get_gui_workflow_tags))
+        .route("/macros/:id/run", post(run_macro))
+        // Legacy GUI Workflow routes (backward compatibility)
+        .route("/gui-workflows", get(list_macros))
+        .route("/gui-workflows", post(create_macro))
+        .route("/gui-workflows/search", get(search_macros))
+        .route("/gui-workflows/categories", get(get_macro_categories))
+        .route("/gui-workflows/tags", get(get_macro_tags))
         .route(
             "/gui-workflows/:id",
-            get(get_gui_workflow)
-                .put(update_gui_workflow)
-                .delete(delete_gui_workflow),
+            get(get_macro).put(update_macro).delete(delete_macro),
         )
-        .route("/gui-workflows/:id/run", post(run_gui_workflow))
+        .route("/gui-workflows/:id/run", post(run_macro))
         // Unified Session routes (replaces workflows and ai-developer)
         .route("/sessions", get(list_sessions))
         .route("/sessions/start", post(start_session))

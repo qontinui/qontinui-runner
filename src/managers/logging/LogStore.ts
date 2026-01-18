@@ -52,6 +52,8 @@ export interface AiOutputEntry {
   sessionId?: string;
   /** Human-readable session/workflow name (the task title) */
   sessionName?: string;
+  /** Workflow phase: setup, verification, agentic, or completion */
+  phase?: string;
 }
 
 type StoreListener = () => void;

@@ -48,6 +48,7 @@ export interface UseLogManagerResult {
     actionId?: string,
     sessionId?: string,
     sessionName?: string,
+    phase?: string,
   ) => void;
 
   /** Get filtered logs by level */
@@ -120,8 +121,15 @@ export function useLogManager(): UseLogManagerResult {
   }, []);
 
   const addAiOutputLog = useCallback(
-    (line: string, source: string, actionId?: string, sessionId?: string, sessionName?: string) => {
-      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName);
+    (
+      line: string,
+      source: string,
+      actionId?: string,
+      sessionId?: string,
+      sessionName?: string,
+      phase?: string,
+    ) => {
+      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName, phase);
     },
     [],
   );

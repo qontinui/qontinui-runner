@@ -19,6 +19,30 @@ pub struct GenerateWorkflowRequest {
     pub category: Option<String>,
     /// Optional tags for the generated workflow
     pub tags: Option<Vec<String>>,
+
+    // === Workflow Configuration Options ===
+
+    /// Maximum iterations for agentic phase (default: 10)
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    /// AI provider override (claude_cli, anthropic_api, openai_api, gemini_api)
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model override (depends on provider)
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Skip AI summary generation at the end (default: false)
+    #[serde(default)]
+    pub skip_ai_summary: Option<bool>,
+    /// Log source selection mode: "default", "ai", "all", or a profile_id
+    #[serde(default)]
+    pub log_source_selection: Option<String>,
+    /// Custom developer prompt template for the workflow
+    #[serde(default)]
+    pub prompt_template: Option<String>,
+    /// Whether to auto-include contexts based on task mentions (default: true)
+    #[serde(default)]
+    pub auto_include_contexts: Option<bool>,
 }
 
 /// Response from workflow generation
@@ -113,12 +137,44 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
         }
     };
 
-    // Apply category and tags from request if provided
+    // Apply request options to the generated workflow
     if let Some(category) = request.category {
         workflow.category = category;
     }
     if let Some(tags) = request.tags {
         workflow.tags = tags;
+    }
+    if let Some(max_iterations) = request.max_iterations {
+        workflow.max_iterations = max_iterations;
+    }
+    if let Some(provider) = request.provider {
+        workflow.provider = Some(provider);
+    }
+    if let Some(model) = request.model {
+        workflow.model = Some(model);
+    }
+    if let Some(skip_ai_summary) = request.skip_ai_summary {
+        workflow.skip_ai_summary = skip_ai_summary;
+    }
+    if let Some(ref log_source) = request.log_source_selection {
+        // Parse log source selection - can be "default", "ai", "all", or a profile_id
+        use crate::unified_workflows::LogSourceSelection;
+        workflow.log_source_selection = if log_source == "default"
+            || log_source == "ai"
+            || log_source == "all"
+        {
+            LogSourceSelection::Mode(log_source.clone())
+        } else {
+            LogSourceSelection::Profile {
+                profile_id: log_source.clone(),
+            }
+        };
+    }
+    if let Some(prompt_template) = request.prompt_template {
+        workflow.prompt_template = Some(prompt_template);
+    }
+    if let Some(auto_include) = request.auto_include_contexts {
+        workflow.auto_include_contexts = auto_include;
     }
 
     // Auto-fix common issues

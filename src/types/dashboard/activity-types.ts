@@ -52,6 +52,12 @@ export type ActivityStatus =
 export type TaskPhase = "setup" | "verification" | "ai_work" | "idle";
 
 /**
+ * User-facing workflow stage for orchestrated AI workflows.
+ * These map to the 4 stages shown prominently in the UI.
+ */
+export type WorkflowStage = "setup" | "agentic" | "verification" | "completion";
+
+/**
  * State of an individual activity for tracking in the dashboard.
  */
 export interface ActivityState {
@@ -195,4 +201,34 @@ export const PHASE_DISPLAY_CONFIG: Record<TaskPhase, { label: string; color: str
   verification: { label: "VERIFY", color: "purple" },
   ai_work: { label: "AI", color: "green" },
   idle: { label: "", color: "gray" },
+};
+
+/**
+ * Workflow stage display configurations for orchestrated AI workflows.
+ * These stages are shown prominently in the Active dashboard.
+ */
+export const WORKFLOW_STAGE_CONFIG: Record<
+  WorkflowStage,
+  { label: string; color: string; description: string }
+> = {
+  setup: {
+    label: "Setup",
+    color: "blue",
+    description: "Initializing and planning the task",
+  },
+  agentic: {
+    label: "Agentic",
+    color: "green",
+    description: "AI worker performing the task",
+  },
+  verification: {
+    label: "Verification",
+    color: "purple",
+    description: "Running verification checks",
+  },
+  completion: {
+    label: "Completion",
+    color: "teal",
+    description: "Completing and summarizing results",
+  },
 };

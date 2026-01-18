@@ -36,9 +36,8 @@ type ItemType =
   | "verification"
   | "api-request"
   | "script"
-  | "workflow"
   | "unified-workflow"
-  | "gui-workflow"
+  | "macro"
   | "check";
 
 interface DashboardItem {
@@ -98,23 +97,17 @@ const CATEGORY_CONFIG: Record<
     accentColor: "purple",
     builderTab: "script-builder",
   },
-  workflow: {
-    label: "AI Workflow",
-    icon: Sparkles,
-    accentColor: "green",
-    builderTab: "workflow-builder",
-  },
   "unified-workflow": {
     label: "Workflow",
     icon: Sparkles,
     accentColor: "green",
-    builderTab: "workflow-builder",
+    builderTab: "unified-workflow-builder",
   },
-  "gui-workflow": {
-    label: "GUI Workflow",
+  macro: {
+    label: "Macro",
     icon: MousePointer2,
     accentColor: "orange",
-    builderTab: "gui-workflow-builder",
+    builderTab: "macro-builder",
   },
   check: {
     label: "Check",
@@ -149,9 +142,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         verificationsRes,
         apiRequestsRes,
         scriptsRes,
-        workflowsRes,
         unifiedWorkflowsRes,
-        guiWorkflowsRes,
+        macrosRes,
         checksRes,
       ] = await Promise.allSettled([
         fetch(`${API_BASE}/prompts`),
@@ -160,9 +152,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         fetch(`${API_BASE}/saved-verifications`),
         fetch(`${API_BASE}/saved-api-requests`),
         fetch(`${API_BASE}/playwright-scripts`),
-        fetch(`${API_BASE}/ai-workflows`),
         fetch(`${API_BASE}/unified-workflows`),
-        fetch(`${API_BASE}/gui-workflows`),
+        fetch(`${API_BASE}/macros`),
         invoke<{ success: boolean; data?: any[] }>("list_checks", { enabledOnly: false }),
       ]);
 
@@ -271,24 +262,6 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         });
       }
 
-      // Process AI workflows
-      if (workflowsRes.status === "fulfilled" && workflowsRes.value.ok) {
-        const result = await workflowsRes.value.json();
-        const data = result.success ? result.data : Array.isArray(result) ? result : [];
-        data?.forEach((item: any) => {
-          allItems.push({
-            id: item.id,
-            type: "workflow",
-            name: item.name,
-            description: item.description,
-            category: item.category,
-            tags: item.tags,
-            modifiedAt: item.modified_at || item.created_at,
-            createdAt: item.created_at,
-          });
-        });
-      }
-
       // Process unified workflows
       if (unifiedWorkflowsRes.status === "fulfilled" && unifiedWorkflowsRes.value.ok) {
         const result = await unifiedWorkflowsRes.value.json();
@@ -307,14 +280,14 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
         });
       }
 
-      // Process GUI workflows
-      if (guiWorkflowsRes.status === "fulfilled" && guiWorkflowsRes.value.ok) {
-        const result = await guiWorkflowsRes.value.json();
+      // Process macros
+      if (macrosRes.status === "fulfilled" && macrosRes.value.ok) {
+        const result = await macrosRes.value.json();
         const data = result.success ? result.data : Array.isArray(result) ? result : [];
         data?.forEach((item: any) => {
           allItems.push({
             id: item.id,
-            type: "gui-workflow",
+            type: "macro",
             name: item.name,
             description: item.description,
             modifiedAt: item.modified_at || item.updated_at || item.created_at,
@@ -394,9 +367,8 @@ export function LibraryDashboard({ onNavigateToBuilder, onLog }: LibraryDashboar
       verification: 0,
       "api-request": 0,
       script: 0,
-      workflow: 0,
       "unified-workflow": 0,
-      "gui-workflow": 0,
+      macro: 0,
       check: 0,
     };
     items.forEach((item) => {

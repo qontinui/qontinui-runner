@@ -127,6 +127,8 @@ export interface AiOutputStreamEventData {
   session_id?: string;
   /** Human-readable session/workflow name (the task title) */
   session_name?: string;
+  /** Workflow phase: setup, verification, agentic, or completion */
+  phase?: string;
   [key: string]: unknown;
 }
 

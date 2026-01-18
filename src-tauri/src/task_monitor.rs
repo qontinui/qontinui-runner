@@ -7,7 +7,6 @@
 //! the AI signals completion with [TASK_COMPLETE].
 
 use crate::database::{session_start_marker, CheckpointDb, TASK_COMPLETE_MARKER};
-use crate::summary_generator;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -354,36 +353,14 @@ impl TaskMonitor {
     }
 
     /// Called when [TASK_COMPLETE] is detected
+    ///
+    /// Note: Summary generation is now handled by the Summary step in the completion phase,
+    /// so we no longer spawn async summary generation here. This prevents race conditions
+    /// where the task completes before the summary is available.
     async fn handle_task_complete(db: Arc<CheckpointDb>, task_run_id: &str) -> Result<(), String> {
         // Mark the task as complete in the database
         db.complete_task_run(task_run_id)?;
         info!("Task {} marked as complete", task_run_id);
-
-        // Generate AI summary in the background
-        // This doesn't block task completion - summary will be available shortly after
-        let db_for_summary = db.clone();
-        let task_id_for_summary = task_run_id.to_string();
-        tokio::spawn(async move {
-            info!(
-                "Starting summary generation for task {}",
-                task_id_for_summary
-            );
-            match summary_generator::generate_task_summary(&db_for_summary, &task_id_for_summary) {
-                Ok(result) => {
-                    info!(
-                        "Generated summary for task {}: goal_achieved={}",
-                        task_id_for_summary, result.goal_achieved
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to generate summary for task {}: {}",
-                        task_id_for_summary, e
-                    );
-                }
-            }
-        });
-
         Ok(())
     }
 

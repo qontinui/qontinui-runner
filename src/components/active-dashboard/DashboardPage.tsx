@@ -68,6 +68,8 @@ export function DashboardPage({ onGoToExecute }: DashboardPageProps) {
         phase={state.currentPhase}
         showPhaseBadge={state.showPhaseBadge}
         status={state.status}
+        workflowStage={state.workflowStage}
+        isOrchestrated={state.isOrchestrated}
       />
 
       {/* Main Content Area */}
@@ -82,8 +84,8 @@ export function DashboardPage({ onGoToExecute }: DashboardPageProps) {
 
       {/* Bottom Bar - always visible */}
       <BottomBar
-        iteration={state.taskInfo?.iteration ?? 1}
-        maxIterations={state.taskInfo?.maxIterations ?? 1}
+        iteration={state.isOrchestrated ? state.iteration : (state.taskInfo?.iteration ?? 1)}
+        maxIterations={state.isOrchestrated ? state.maxIterations : (state.taskInfo?.maxIterations ?? 1)}
         activeActivity={state.layout.activeWidget}
         isRunning={state.isRunning}
         currentOrchestratorAgent={state.currentOrchestratorAgent}

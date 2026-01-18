@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 31
+-- Version: 34
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -215,6 +215,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
 
     -- Runtime context (for execution context propagation)
     runtime_context_json TEXT,  -- JSON: {variables, step_outputs, iteration}
+
+    -- Orchestrator state transition history (for stage-based recap)
+    transition_history_json TEXT,  -- JSON array of StateTransition objects
 
     -- Timestamps
     created_at TEXT NOT NULL,
@@ -1414,7 +1417,21 @@ CREATE INDEX IF NOT EXISTS idx_task_runs_updated_at ON task_runs(updated_at);
 -- Verification plans: created_at ordering
 CREATE INDEX IF NOT EXISTS idx_verification_plans_created_at ON verification_plans(created_at);
 
+-- =============================================================================
+-- Context Management for Unified Workflows (Version 32)
+-- =============================================================================
+-- Adds context_ids, disabled_context_ids, and auto_include_contexts to unified_workflows
+
+-- Add context_ids column (JSON array of context IDs explicitly added to the workflow)
+-- Note: This is handled in migration code
+
+-- Add disabled_context_ids column (JSON array of context IDs excluded from auto-include)
+-- Note: This is handled in migration code
+
+-- Add auto_include_contexts column (boolean, default true)
+-- Note: This is handled in migration code
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (31, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (34, datetime('now'));

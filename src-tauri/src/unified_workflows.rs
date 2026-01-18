@@ -78,11 +78,34 @@ pub struct UnifiedWorkflow {
     #[serde(default, skip_serializing_if = "is_default_log_source")]
     pub log_source_selection: LogSourceSelection,
 
+    /// Manually added context IDs
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_ids: Vec<String>,
+
+    /// Disabled context IDs (excluded from auto-include)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_context_ids: Vec<String>,
+
+    /// Whether to auto-include contexts based on task mentions (default: true)
+    #[serde(default = "default_auto_include_contexts")]
+    pub auto_include_contexts: bool,
+
+    /// Custom developer prompt template for this workflow
+    /// When set, this template is used instead of the global default when running the workflow.
+    /// Supports variables: {{SESSION_ID}}, {{ITERATION}}, {{MAX_ITERATIONS}}, {{GOAL}},
+    /// {{EXECUTION_STEPS}}, {{WORKSPACE_ESCAPED}}
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_template: Option<String>,
+
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification (serialized as "modified_at" to match frontend)
     #[serde(rename = "modified_at")]
     pub updated_at: String,
+}
+
+fn default_auto_include_contexts() -> bool {
+    true
 }
 
 fn default_category() -> String {
@@ -123,6 +146,14 @@ pub struct CreateUnifiedWorkflowRequest {
     pub skip_ai_summary: bool,
     #[serde(default)]
     pub log_source_selection: LogSourceSelection,
+    #[serde(default)]
+    pub context_ids: Vec<String>,
+    #[serde(default)]
+    pub disabled_context_ids: Vec<String>,
+    #[serde(default = "default_auto_include_contexts")]
+    pub auto_include_contexts: bool,
+    /// Custom developer prompt template for this workflow
+    pub prompt_template: Option<String>,
 }
 
 /// Request body for updating a unified workflow
@@ -141,6 +172,11 @@ pub struct UpdateUnifiedWorkflowRequest {
     pub model: Option<String>,
     pub skip_ai_summary: Option<bool>,
     pub log_source_selection: Option<LogSourceSelection>,
+    pub context_ids: Option<Vec<String>>,
+    pub disabled_context_ids: Option<Vec<String>>,
+    pub auto_include_contexts: Option<bool>,
+    /// Custom developer prompt template for this workflow
+    pub prompt_template: Option<String>,
 }
 
 /// Query parameters for searching unified workflows

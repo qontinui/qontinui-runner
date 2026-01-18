@@ -194,6 +194,7 @@ class LogManager {
     actionId?: string,
     sessionId?: string,
     sessionName?: string,
+    phase?: string,
   ): void {
     const entry: AiOutputEntry = {
       id: `ai-${Date.now()}-${Math.random()}`,
@@ -203,6 +204,7 @@ class LogManager {
       actionId,
       sessionId,
       sessionName,
+      phase,
     };
     this.logStore.addAiOutputLog(entry);
 
@@ -216,6 +218,7 @@ class LogManager {
         action_id: entry.actionId,
         session_id: entry.sessionId,
         session_name: entry.sessionName,
+        phase: entry.phase,
       },
     }).catch((err) => {
       console.warn("[LogManager] Failed to persist AI output log:", err);

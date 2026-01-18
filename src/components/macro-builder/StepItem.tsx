@@ -1,7 +1,7 @@
 /**
  * StepItem Component
  *
- * Displays a single step in the workflow with action icon, name, and controls.
+ * Displays a single step in the macro with action icon, name, and controls.
  */
 
 import {
@@ -16,11 +16,11 @@ import {
   ChevronDown,
   Edit2,
 } from "lucide-react";
-import type { GuiWorkflowStep } from "../../types/gui-workflow";
-import { getActionTypeLabel } from "../../types/gui-workflow";
+import type { MacroStep } from "../../types/macro";
+import { getActionTypeLabel } from "../../types/macro";
 
 interface StepItemProps {
-  step: GuiWorkflowStep;
+  step: MacroStep;
   index: number;
   isEditing: boolean;
   isFirst: boolean;
@@ -50,7 +50,7 @@ function getActionIcon(actionType: string) {
   }
 }
 
-function getStepDescription(step: GuiWorkflowStep): string {
+function getStepDescription(step: MacroStep): string {
   switch (step.action_type) {
     case "click":
     case "double_click":

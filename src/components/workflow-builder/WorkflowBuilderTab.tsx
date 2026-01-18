@@ -18,6 +18,7 @@ import {
   FolderOpen,
   Search,
   Sparkles,
+  Info,
 } from "lucide-react";
 import type {
   WorkflowPhase,
@@ -41,10 +42,53 @@ import { StepConfigPanel } from "./StepConfigPanel";
 import { PromptLibraryPicker } from "./PromptLibraryPicker";
 import { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
+import { PromptTemplateEditor } from "./PromptTemplateEditor";
+import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
 
 const API_BASE = "http://localhost:9876";
+
+// =============================================================================
+// AI Provider/Model Options
+// =============================================================================
+
+/** Provider options for workflow-level AI override */
+const PROVIDER_OPTIONS = [
+  { value: "", label: "Use Default (from Settings)" },
+  { value: "claude_cli", label: "Claude CLI" },
+  { value: "anthropic_api", label: "Anthropic API" },
+  { value: "openai_api", label: "OpenAI API" },
+  { value: "gemini_api", label: "Gemini API" },
+];
+
+/** Model options per provider - shown when a specific provider is selected */
+const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
+  claude_cli: [
+    { value: "", label: "Default" },
+    { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+    { value: "claude-opus-4-20250514", label: "Claude Opus 4" },
+  ],
+  anthropic_api: [
+    { value: "", label: "Default" },
+    { value: "claude-sonnet-4-20250514", label: "Claude Sonnet 4" },
+    { value: "claude-opus-4-20250514", label: "Claude Opus 4" },
+  ],
+  openai_api: [
+    { value: "", label: "Default" },
+    { value: "gpt-4o", label: "GPT-4o" },
+    { value: "gpt-4o-mini", label: "GPT-4o Mini" },
+    { value: "o1", label: "o1" },
+    { value: "o1-mini", label: "o1-mini" },
+  ],
+  gemini_api: [
+    { value: "", label: "Default" },
+    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash (Fast)" },
+    { value: "gemini-3-pro-preview", label: "Gemini 3 Pro" },
+    { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  ],
+};
 
 // =============================================================================
 // Empty State Component
@@ -190,31 +234,50 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
 
       {/* Show provider/model settings when there are agentic steps */}
       {features.showIterationSettings && (
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-zinc-400 mb-1">Provider</label>
+        <div className="p-3 bg-zinc-800/50 rounded-md space-y-3">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-4 h-4 text-purple-400" />
+            <span className="text-sm font-medium text-zinc-300">AI Provider Override</span>
+            <div className="relative group">
+              <Info className="w-3.5 h-3.5 text-zinc-500 hover:text-zinc-300 cursor-help" />
+              <div className="absolute left-0 bottom-full mb-2 w-64 p-3 bg-zinc-800 border border-zinc-600 rounded-lg shadow-lg opacity-0 invisible group-hover:opacity-100 group-hover:visible transition-all duration-200 z-50">
+                <p className="text-xs text-zinc-300">
+                  Override the default AI provider for this workflow. Use Gemini Flash for fast,
+                  cost-effective tasks. Leave empty to use the provider from Settings.
+                </p>
+              </div>
+            </div>
+          </div>
+          <div className="flex gap-3">
             <select
               value={workflow.provider ?? ""}
-              onChange={(e) => updateWorkflow({ provider: e.target.value || undefined })}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              onChange={(e) => {
+                updateWorkflow({
+                  provider: e.target.value || undefined,
+                  model: undefined, // Reset model when provider changes
+                });
+              }}
+              className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
             >
-              <option value="">Default</option>
-              <option value="claude_cli">Claude CLI</option>
-              <option value="gemini_api">Gemini API</option>
+              {PROVIDER_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
             </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-zinc-400 mb-1">Model</label>
-            <select
-              value={workflow.model ?? ""}
-              onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
-              className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-            >
-              <option value="">Default</option>
-              <option value="claude-sonnet-4">Claude Sonnet 4</option>
-              <option value="claude-opus-4">Claude Opus 4</option>
-              <option value="gemini-2.5-pro">Gemini 2.5 Pro</option>
-            </select>
+            {workflow.provider && MODELS_BY_PROVIDER[workflow.provider] && (
+              <select
+                value={workflow.model ?? ""}
+                onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
+                className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+              >
+                {MODELS_BY_PROVIDER[workflow.provider].map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
         </div>
       )}
@@ -250,6 +313,15 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
         </div>
       )}
 
+      {/* Developer Prompt Template - show when workflow has agentic steps */}
+      {features.showIterationSettings && (
+        <PromptTemplateEditor
+          workflowTemplate={workflow.prompt_template}
+          onWorkflowTemplateChange={(template) => updateWorkflow({ prompt_template: template })}
+          hasAgenticSteps={true}
+        />
+      )}
+
       {/* Log Source Selection */}
       <div>
         <label className="block text-sm font-medium text-zinc-400 mb-1">Log Sources</label>
@@ -271,6 +343,9 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           Which log sources to include when running this workflow
         </p>
       </div>
+
+      {/* AI Contexts - show when workflow has agentic steps */}
+      {features.hasAiPrompts && <ContextManagement />}
 
       {/* Category and tags */}
       <div className="grid grid-cols-2 gap-4">

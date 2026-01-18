@@ -29,6 +29,8 @@ export interface AiOutputLine {
   sessionId?: string;
   /** Human-readable session/workflow name */
   sessionName?: string;
+  /** Workflow phase: setup, verification, agentic, or completion */
+  phase?: string;
 }
 
 interface AiOutputTabProps {

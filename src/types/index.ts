@@ -237,8 +237,16 @@ export type {
 
 export { getDiscoveryTypeLabel, getDiscoveryTypeColor, formatConfidence } from "./discoveries";
 
-// GUI Workflow types (deterministic action sequences)
+// Macro types (deterministic action sequences)
 export type {
+  MacroActionType,
+  MacroStep,
+  SavedMacro,
+  CreateMacroRequest,
+  UpdateMacroRequest,
+  MacroStepResult,
+  MacroRunResult,
+  // Backward compatibility aliases (deprecated)
   GuiActionType,
   GuiWorkflowStep,
   SavedGuiWorkflow,
@@ -246,17 +254,22 @@ export type {
   UpdateGuiWorkflowRequest,
   GuiWorkflowStepResult,
   GuiWorkflowRunResult,
-} from "./gui-workflow";
+} from "./macro";
 
 export {
-  getDefaultGuiWorkflowStep,
+  getDefaultMacroStep,
   getDefaultStepName,
-  getDefaultGuiWorkflow,
+  getDefaultMacro,
   getActionTypeIcon,
   getActionTypeLabel,
+  validateMacroStep,
+  validateMacro,
+  // Backward compatibility aliases (deprecated)
+  getDefaultGuiWorkflowStep,
+  getDefaultGuiWorkflow,
   validateGuiWorkflowStep,
   validateGuiWorkflow,
-} from "./gui-workflow";
+} from "./macro";
 
 // DOM Capture types (browser DOM snapshot capture)
 export type {

@@ -34,7 +34,6 @@ pub struct ComprehensiveExport {
     pub learning_patterns: Vec<serde_json::Value>,
     pub settings: Vec<serde_json::Value>,
     pub prompts: Vec<serde_json::Value>,
-    pub ai_workflows: Vec<serde_json::Value>,
     pub unified_workflows: Vec<serde_json::Value>,
     pub verification_tests: Vec<serde_json::Value>,
     pub task_hooks: Vec<serde_json::Value>,
@@ -60,8 +59,6 @@ pub struct ExportOptions {
     pub settings: bool,
     #[serde(default = "default_true")]
     pub prompts: bool,
-    #[serde(default = "default_true")]
-    pub ai_workflows: bool,
     #[serde(default = "default_true")]
     pub unified_workflows: bool,
     #[serde(default = "default_true")]
@@ -100,8 +97,6 @@ pub struct ImportOptions {
     pub settings: bool,
     #[serde(default = "default_true")]
     pub prompts: bool,
-    #[serde(default = "default_true")]
-    pub ai_workflows: bool,
     #[serde(default = "default_true")]
     pub unified_workflows: bool,
     #[serde(default = "default_true")]
@@ -199,12 +194,6 @@ pub fn export_all_data(
         vec![]
     };
 
-    let ai_workflows = if opts.ai_workflows {
-        state.checkpoint_db.export_all_ai_workflows()?
-    } else {
-        vec![]
-    };
-
     let unified_workflows = if opts.unified_workflows {
         state.checkpoint_db.export_all_unified_workflows()?
     } else {
@@ -255,7 +244,6 @@ pub fn export_all_data(
         learning_patterns,
         settings,
         prompts,
-        ai_workflows,
         unified_workflows,
         verification_tests,
         task_hooks,
@@ -297,7 +285,6 @@ pub fn get_import_preview(data: ComprehensiveExport) -> Result<ImportPreview, St
         "learning_patterns": data.learning_patterns.len(),
         "settings": data.settings.len(),
         "prompts": data.prompts.len(),
-        "ai_workflows": data.ai_workflows.len(),
         "unified_workflows": data.unified_workflows.len(),
         "verification_tests": data.verification_tests.len(),
         "task_hooks": data.task_hooks.len(),

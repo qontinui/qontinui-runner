@@ -35,6 +35,7 @@ import {
   Database,
   TestTube,
   Accessibility,
+  Cloud,
 } from "lucide-react";
 
 // Contexts
@@ -117,10 +118,9 @@ import { LibraryDashboard } from "./components/LibraryDashboard";
 import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
 import { Sidebar } from "./components/navigation";
-import { AiBuilderTab } from "./components/AiBuilderTab";
 import { WorkflowBuilderTab } from "./components/workflow-builder";
 import { ScriptsPage } from "./components/ScriptsPage";
-import { GuiWorkflowBuilderTab } from "./components/gui-workflow-builder";
+import { MacroBuilderTab } from "./components/macro-builder";
 import { TestBuilderTab } from "./components/test-builder";
 import { CheckBuilderTab } from "./components/check-builder";
 import { ShellCommandBuilderTab } from "./components/shell-command-builder";
@@ -198,8 +198,7 @@ type MainTabId =
   | "library"
   | "task-builder"
   | "unified-workflow-builder"
-  | "workflow-builder"
-  | "gui-workflow-builder"
+  | "macro-builder"
   | "script-builder"
   | "context-builder"
   | "state-explorer-builder"
@@ -263,8 +262,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "library",
   "task-builder",
   "unified-workflow-builder",
-  "workflow-builder",
-  "gui-workflow-builder",
+  "macro-builder",
   "script-builder",
   "context-builder",
   "state-explorer-builder",
@@ -307,8 +305,8 @@ function migrateTabId(stored: string | null): MainTabId {
   // Map old tab names to new ones
   const migrations: Record<string, MainTabId> = {
     "ai-workflows": "run-ai-output",
-    "ai-builder": "workflow-builder",
-    builder: "workflow-builder",
+    "ai-builder": "unified-workflow-builder",
+    builder: "unified-workflow-builder",
     prompts: "library",
     scripts: "script-builder",
     contexts: "library",
@@ -380,8 +378,7 @@ function AppContent() {
         run: "run",
         active: "active",
         "unified-workflow-builder": "unified-workflow-builder",
-        "workflow-builder": "workflow-builder",
-        "gui-workflow-builder": "gui-workflow-builder",
+        "macro-builder": "macro-builder",
         "script-builder": "script-builder",
         "check-builder": "check-builder",
         library: "library",
@@ -402,8 +399,8 @@ function AppContent() {
   // Workflow ID to edit (when navigating from Library to Workflow Builder)
   const [editWorkflowId, setEditWorkflowId] = useState<string | null>(null);
 
-  // GUI Workflow ID to edit (when navigating from Library to GUI Workflow Builder)
-  const [editGuiWorkflowId, setEditGuiWorkflowId] = useState<string | null>(null);
+  // Macro ID to edit (when navigating from Library to Macro Builder)
+  const [editMacroId, setEditMacroId] = useState<string | null>(null);
 
   // Builder edit IDs (when navigating from Library Dashboard to builders)
   const [editTaskId, setEditTaskId] = useState<string | null>(null);
@@ -422,13 +419,13 @@ function AppContent() {
   // Handle editing a workflow from Library
   const handleEditWorkflow = useCallback((workflowId: string) => {
     setEditWorkflowId(workflowId);
-    setActiveTab("workflow-builder");
+    setActiveTab("unified-workflow-builder");
   }, []);
 
-  // Handle editing a GUI workflow from Library
-  const handleEditGuiWorkflow = useCallback((workflowId: string) => {
-    setEditGuiWorkflowId(workflowId);
-    setActiveTab("gui-workflow-builder");
+  // Handle editing a macro from Library
+  const handleEditMacro = useCallback((macroId: string) => {
+    setEditMacroId(macroId);
+    setActiveTab("macro-builder");
   }, []);
 
   // Handle navigation from Library Dashboard to any builder
@@ -463,8 +460,9 @@ function AppContent() {
         case "unified-workflow":
           setEditWorkflowId(itemId);
           break;
-        case "gui-workflow":
-          setEditGuiWorkflowId(itemId);
+        case "macro":
+        case "gui-workflow": // backward compatibility
+          setEditMacroId(itemId);
           break;
       }
       // Navigate to the builder tab
@@ -482,15 +480,15 @@ function AppContent() {
 
   // Clear workflow ID when navigating away from workflow builder
   useEffect(() => {
-    if (activeTab !== "workflow-builder") {
+    if (activeTab !== "unified-workflow-builder") {
       setEditWorkflowId(null);
     }
   }, [activeTab]);
 
-  // Clear GUI workflow ID when navigating away from GUI workflow builder
+  // Clear macro ID when navigating away from macro builder
   useEffect(() => {
-    if (activeTab !== "gui-workflow-builder") {
-      setEditGuiWorkflowId(null);
+    if (activeTab !== "macro-builder") {
+      setEditMacroId(null);
     }
   }, [activeTab]);
 
@@ -881,7 +879,17 @@ function AppContent() {
 
       case "discoveries":
         return (
-          <div className="h-full overflow-y-auto p-4">
+          <div className="h-full overflow-y-auto p-4 space-y-4">
+            <div>
+              <div className="flex items-center gap-2 mb-2">
+                <Cloud className="w-6 h-6 text-blue-500" />
+                <h1 className="text-xl font-bold text-white">GUI Discoveries</h1>
+              </div>
+              <p className="text-sm text-gray-400">
+                Detects patterns from GUI automation runs including new UI elements, state transitions,
+                timing updates, and flaky behaviors. Requires running GUI automation workflows (not AI-only tasks).
+              </p>
+            </div>
             <DiscoverySyncPanel />
           </div>
         );
@@ -983,23 +991,10 @@ function AppContent() {
           </div>
         );
 
-      case "workflow-builder":
-        return (
-          <div className="h-full overflow-y-auto">
-            <AiBuilderTab
-              projectLogs={projectLogs}
-              onNavigateToLogLocations={() => setActiveTab("logs")}
-              onNavigateToAiOutput={() => setActiveTab("ai")}
-              onNavigateToActive={() => setActiveTab("active")}
-              editWorkflowId={editWorkflowId}
-            />
-          </div>
-        );
-
-      case "gui-workflow-builder":
+      case "macro-builder":
         return (
           <div className="h-full overflow-hidden">
-            <GuiWorkflowBuilderTab editWorkflowId={editGuiWorkflowId} />
+            <MacroBuilderTab editWorkflowId={editMacroId} />
           </div>
         );
 

@@ -1,7 +1,7 @@
 /**
  * AddStepDropdown Component
  *
- * Dropdown menu to add new steps to the workflow.
+ * Dropdown menu to add new steps to the macro.
  */
 
 import { useState, useRef, useEffect } from "react";
@@ -13,16 +13,16 @@ import {
   Command,
   Navigation,
 } from "lucide-react";
-import type { GuiActionType } from "../../types/gui-workflow";
-import { getActionTypeLabel } from "../../types/gui-workflow";
+import type { MacroActionType } from "../../types/macro";
+import { getActionTypeLabel } from "../../types/macro";
 
 interface AddStepDropdownProps {
-  onAddStep: (actionType: GuiActionType) => void;
+  onAddStep: (actionType: MacroActionType) => void;
   disabled?: boolean;
 }
 
 const actionTypes: {
-  type: GuiActionType;
+  type: MacroActionType;
   icon: React.ReactNode;
   description: string;
 }[] = [
@@ -76,7 +76,7 @@ export function AddStepDropdown({ onAddStep, disabled }: AddStepDropdownProps) {
     }
   }, [isOpen]);
 
-  const handleSelect = (type: GuiActionType) => {
+  const handleSelect = (type: MacroActionType) => {
     onAddStep(type);
     setIsOpen(false);
   };

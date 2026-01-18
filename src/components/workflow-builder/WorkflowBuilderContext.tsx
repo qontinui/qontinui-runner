@@ -25,6 +25,7 @@ import type {
   WorkflowFeatures,
   WorkflowExport,
   WorkflowImportResult,
+  PromptStep,
 } from "../../types";
 import {
   detectWorkflowFeatures,
@@ -162,19 +163,36 @@ function workflowBuilderReducer(
             selectedStepId: stepWithId.id,
             expandedPhases: { ...state.expandedPhases, agentic: true },
           };
-        case "completion":
+        case "completion": {
+          const existingSteps = state.workflow.completion_steps ?? [];
+          // Find the summary step (if it exists) to insert before it
+          const summaryIndex = existingSteps.findIndex(
+            (s) => s.type === "prompt" && (s as PromptStep).is_summary_step === true,
+          );
+
+          let newSteps: CompletionStep[];
+          if (summaryIndex >= 0) {
+            // Insert before the summary step (keep summary at the end)
+            newSteps = [
+              ...existingSteps.slice(0, summaryIndex),
+              stepWithId as CompletionStep,
+              ...existingSteps.slice(summaryIndex),
+            ];
+          } else {
+            // No summary step, just append
+            newSteps = [...existingSteps, stepWithId as CompletionStep];
+          }
+
           return {
             ...state,
             workflow: {
               ...state.workflow,
-              completion_steps: [
-                ...(state.workflow.completion_steps ?? []),
-                stepWithId as CompletionStep,
-              ],
+              completion_steps: newSteps,
             },
             selectedStepId: stepWithId.id,
             expandedPhases: { ...state.expandedPhases, completion: true },
           };
+        }
         default:
           return state;
       }
@@ -290,6 +308,34 @@ function workflowBuilderReducer(
         [newArr[index], newArr[targetIndex]] = [newArr[targetIndex], newArr[index]];
         return newArr;
       };
+
+      // Special handling for completion phase to protect summary step position
+      if (phase === "completion") {
+        const steps = state.workflow.completion_steps ?? [];
+        const stepToMove = steps.find((s) => s.id === stepId);
+
+        // Prevent moving the summary step
+        if (
+          stepToMove &&
+          stepToMove.type === "prompt" &&
+          (stepToMove as PromptStep).is_summary_step
+        ) {
+          return state;
+        }
+
+        // Prevent moving any step past (below) the summary step
+        if (direction === "down") {
+          const index = steps.findIndex((s) => s.id === stepId);
+          const nextStep = steps[index + 1];
+          if (
+            nextStep &&
+            nextStep.type === "prompt" &&
+            (nextStep as PromptStep).is_summary_step
+          ) {
+            return state;
+          }
+        }
+      }
 
       switch (phase) {
         case "setup":
@@ -690,6 +736,11 @@ export function WorkflowBuilderProvider({
         provider: workflow.provider,
         model: workflow.model,
         skip_ai_summary: workflow.skip_ai_summary,
+        log_source_selection: workflow.log_source_selection,
+        context_ids: workflow.context_ids,
+        disabled_context_ids: workflow.disabled_context_ids,
+        auto_include_contexts: workflow.auto_include_contexts,
+        prompt_template: workflow.prompt_template,
       };
 
       const url = isNew

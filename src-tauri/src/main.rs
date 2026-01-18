@@ -4,7 +4,6 @@
 mod action_service;
 mod ai_provider;
 mod ai_router;
-mod ai_workflows;
 mod api_request;
 mod auth;
 mod backup;
@@ -18,10 +17,11 @@ mod debug_lifecycle;
 mod discoveries;
 mod display;
 mod dom_capture;
+mod ai_workflows;
 mod error;
 mod executor;
 mod findings;
-mod gui_workflows;
+mod macros;
 mod iteration_bundle;
 mod log_consolidation;
 mod log_migration;
@@ -228,6 +228,8 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::config::save_last_monitor_indices,
             commands::config::get_auto_load_last_config,
             commands::config::save_auto_load_last_config,
+            commands::config::get_include_summary_step_by_default,
+            commands::config::save_include_summary_step_by_default,
             commands::config::get_workspace_paths,
             // Dataset commands
             commands::dataset::scan_local_images,

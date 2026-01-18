@@ -21,8 +21,9 @@ import {
 } from "lucide-react";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";
-import type { RecapData, RecapStep, FailureInfo, RecapStats } from "../../types/recap";
+import type { RecapData, RecapStep, FailureInfo } from "../../types/recap";
 import { getStatusColors } from "@/design-system";
+import { StagedTimeline } from "./StagedTimeline";
 
 /**
  * Format duration in milliseconds to a human-readable string.
@@ -295,47 +296,6 @@ function StepsTimeline({ steps }: StepsTimelineProps) {
   );
 }
 
-interface QuickStatsProps {
-  stats: RecapStats;
-  duration?: number;
-}
-
-function QuickStats({ stats, duration }: QuickStatsProps) {
-  const statItems = [
-    {
-      label: "GUI Actions",
-      value: stats.total_actions,
-      color: "text-foreground",
-    },
-    {
-      label: "GUI Success",
-      value: stats.successful_actions,
-      color: "text-green-500",
-    },
-    {
-      label: "GUI Failed",
-      value: stats.failed_actions,
-      color: stats.failed_actions > 0 ? "text-red-500" : "text-muted-foreground",
-    },
-    {
-      label: "AI Sessions",
-      value: stats.ai_sessions,
-      color: "text-blue-500",
-    },
-  ];
-
-  return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-      {statItems.map((item) => (
-        <div key={item.label} className="card p-3">
-          <div className="text-xs text-muted-foreground">{item.label}</div>
-          <div className={`text-xl font-semibold ${item.color}`}>{item.value}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 // ============================================================================
 // Main Component
 // ============================================================================
@@ -393,11 +353,12 @@ export function RunRecapTab() {
       {/* Summary */}
       {data.summary && <SummaryCard summary={data.summary} />}
 
-      {/* Quick Stats */}
-      <QuickStats stats={data.stats} duration={data.duration_ms} />
-
-      {/* Steps Timeline */}
-      <StepsTimeline steps={data.steps} />
+      {/* Steps/Stages Timeline */}
+      {data.stages && data.stages.length > 0 ? (
+        <StagedTimeline stages={data.stages} />
+      ) : (
+        <StepsTimeline steps={data.steps} />
+      )}
     </div>
   );
 }

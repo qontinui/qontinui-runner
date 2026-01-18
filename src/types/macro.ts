@@ -1,14 +1,14 @@
 /**
- * GUI Workflow Types
+ * Macro Types
  *
- * Type definitions for GUI Action Workflows - deterministic sequences of
+ * Type definitions for Macros - deterministic sequences of
  * GUI automation actions that can be composed, saved, and executed.
  */
 
 /**
- * Action types supported by the GUI Workflow Composer
+ * Action types supported by the Macro Builder
  */
-export type GuiActionType =
+export type MacroActionType =
   | "click"
   | "double_click"
   | "right_click"
@@ -17,13 +17,13 @@ export type GuiActionType =
   | "go_to_state";
 
 /**
- * A single step in a GUI Action Workflow
+ * A single step in a Macro
  */
-export interface GuiWorkflowStep {
+export interface MacroStep {
   /** Unique identifier (UUID v4) */
   id: string;
   /** Action type */
-  action_type: GuiActionType;
+  action_type: MacroActionType;
   /** Display name for the step */
   name: string;
 
@@ -59,17 +59,17 @@ export interface GuiWorkflowStep {
 }
 
 /**
- * A saved GUI Action Workflow
+ * A saved Macro
  */
-export interface SavedGuiWorkflow {
+export interface SavedMacro {
   /** Unique identifier (UUID v4) */
   id: string;
   /** Display name */
   name: string;
-  /** Description of what this workflow does */
+  /** Description of what this macro does */
   description: string;
   /** Ordered list of steps */
-  steps: GuiWorkflowStep[];
+  steps: MacroStep[];
   /** Category for organization */
   category: string;
   /** Tags for filtering */
@@ -78,36 +78,36 @@ export interface SavedGuiWorkflow {
   created_at: string;
   /** Last modification timestamp (ISO 8601) */
   modified_at: string;
-  /** Number of times this workflow has been run */
+  /** Number of times this macro has been run */
   run_count: number;
 }
 
 /**
- * Request to create a new GUI workflow
+ * Request to create a new macro
  */
-export interface CreateGuiWorkflowRequest {
+export interface CreateMacroRequest {
   name: string;
   description?: string;
-  steps: GuiWorkflowStep[];
+  steps: MacroStep[];
   category?: string;
   tags?: string[];
 }
 
 /**
- * Request to update an existing GUI workflow
+ * Request to update an existing macro
  */
-export interface UpdateGuiWorkflowRequest {
+export interface UpdateMacroRequest {
   name?: string;
   description?: string;
-  steps?: GuiWorkflowStep[];
+  steps?: MacroStep[];
   category?: string;
   tags?: string[];
 }
 
 /**
- * Result of running a GUI workflow step
+ * Result of running a macro step
  */
-export interface GuiWorkflowStepResult {
+export interface MacroStepResult {
   step_index: number;
   step_name: string;
   action_type: string;
@@ -117,24 +117,24 @@ export interface GuiWorkflowStepResult {
 }
 
 /**
- * Result of running a GUI workflow
+ * Result of running a macro
  */
-export interface GuiWorkflowRunResult {
-  workflow_id: string;
-  workflow_name: string;
+export interface MacroRunResult {
+  macro_id: string;
+  macro_name: string;
   total_steps: number;
   successful_steps: number;
   failed_steps: number;
   duration_ms: number;
-  step_results: GuiWorkflowStepResult[];
+  step_results: MacroStepResult[];
 }
 
 /**
- * Get default values for a new GUI workflow step
+ * Get default values for a new macro step
  */
-export function getDefaultGuiWorkflowStep(
-  actionType: GuiActionType = "click",
-): Omit<GuiWorkflowStep, "id"> {
+export function getDefaultMacroStep(
+  actionType: MacroActionType = "click",
+): Omit<MacroStep, "id"> {
   return {
     action_type: actionType,
     name: getDefaultStepName(actionType),
@@ -147,7 +147,7 @@ export function getDefaultGuiWorkflowStep(
 /**
  * Get default step name based on action type
  */
-export function getDefaultStepName(actionType: GuiActionType): string {
+export function getDefaultStepName(actionType: MacroActionType): string {
   switch (actionType) {
     case "click":
       return "Click";
@@ -167,10 +167,10 @@ export function getDefaultStepName(actionType: GuiActionType): string {
 }
 
 /**
- * Get default values for a new GUI workflow
+ * Get default values for a new macro
  */
-export function getDefaultGuiWorkflow(): Omit<
-  SavedGuiWorkflow,
+export function getDefaultMacro(): Omit<
+  SavedMacro,
   "id" | "created_at" | "modified_at"
 > {
   return {
@@ -186,7 +186,7 @@ export function getDefaultGuiWorkflow(): Omit<
 /**
  * Get icon name for an action type (Lucide icon names)
  */
-export function getActionTypeIcon(actionType: GuiActionType): string {
+export function getActionTypeIcon(actionType: MacroActionType): string {
   switch (actionType) {
     case "click":
       return "MousePointer2";
@@ -208,7 +208,7 @@ export function getActionTypeIcon(actionType: GuiActionType): string {
 /**
  * Get display label for an action type
  */
-export function getActionTypeLabel(actionType: GuiActionType): string {
+export function getActionTypeLabel(actionType: MacroActionType): string {
   switch (actionType) {
     case "click":
       return "Click";
@@ -228,9 +228,9 @@ export function getActionTypeLabel(actionType: GuiActionType): string {
 }
 
 /**
- * Validate a GUI workflow step
+ * Validate a macro step
  */
-export function validateGuiWorkflowStep(step: GuiWorkflowStep): {
+export function validateMacroStep(step: MacroStep): {
   valid: boolean;
   errors: string[];
 } {
@@ -260,7 +260,9 @@ export function validateGuiWorkflowStep(step: GuiWorkflowStep): {
       break;
     case "go_to_state":
       if (!step.target_state_ids || step.target_state_ids.length === 0) {
-        errors.push("At least one target state is required for go_to_state action");
+        errors.push(
+          "At least one target state is required for go_to_state action",
+        );
       }
       break;
   }
@@ -269,23 +271,23 @@ export function validateGuiWorkflowStep(step: GuiWorkflowStep): {
 }
 
 /**
- * Validate a complete GUI workflow
+ * Validate a complete macro
  */
-export function validateGuiWorkflow(workflow: Partial<SavedGuiWorkflow>): {
+export function validateMacro(macro: Partial<SavedMacro>): {
   valid: boolean;
   errors: string[];
 } {
   const errors: string[] = [];
 
-  if (!workflow.name || workflow.name.trim() === "") {
-    errors.push("Workflow name is required");
+  if (!macro.name || macro.name.trim() === "") {
+    errors.push("Macro name is required");
   }
 
-  if (!workflow.steps || workflow.steps.length === 0) {
+  if (!macro.steps || macro.steps.length === 0) {
     errors.push("At least one step is required");
   } else {
-    workflow.steps.forEach((step, index) => {
-      const stepValidation = validateGuiWorkflowStep(step);
+    macro.steps.forEach((step, index) => {
+      const stepValidation = validateMacroStep(step);
       if (!stepValidation.valid) {
         stepValidation.errors.forEach((error) => {
           errors.push(`Step ${index + 1}: ${error}`);
@@ -296,3 +298,40 @@ export function validateGuiWorkflow(workflow: Partial<SavedGuiWorkflow>): {
 
   return { valid: errors.length === 0, errors };
 }
+
+// ============================================================================
+// Backward compatibility aliases (deprecated - use the new names)
+// ============================================================================
+
+/** @deprecated Use MacroActionType instead */
+export type GuiActionType = MacroActionType;
+
+/** @deprecated Use MacroStep instead */
+export type GuiWorkflowStep = MacroStep;
+
+/** @deprecated Use SavedMacro instead */
+export type SavedGuiWorkflow = SavedMacro;
+
+/** @deprecated Use CreateMacroRequest instead */
+export type CreateGuiWorkflowRequest = CreateMacroRequest;
+
+/** @deprecated Use UpdateMacroRequest instead */
+export type UpdateGuiWorkflowRequest = UpdateMacroRequest;
+
+/** @deprecated Use MacroStepResult instead */
+export type GuiWorkflowStepResult = MacroStepResult;
+
+/** @deprecated Use MacroRunResult instead */
+export type GuiWorkflowRunResult = MacroRunResult;
+
+/** @deprecated Use getDefaultMacroStep instead */
+export const getDefaultGuiWorkflowStep = getDefaultMacroStep;
+
+/** @deprecated Use getDefaultMacro instead */
+export const getDefaultGuiWorkflow = getDefaultMacro;
+
+/** @deprecated Use validateMacroStep instead */
+export const validateGuiWorkflowStep = validateMacroStep;
+
+/** @deprecated Use validateMacro instead */
+export const validateGuiWorkflow = validateMacro;

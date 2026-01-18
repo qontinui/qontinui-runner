@@ -4,7 +4,6 @@
 //! - Settings (settings.json)
 //! - Prompts (prompts.json)
 //! - Playwright Scripts (playwright-scripts.json)
-//! - AI Workflows (ai_workflows.json)
 //!
 //! Backups are stored as ZIP files with a manifest for version tracking.
 
@@ -76,18 +75,12 @@ fn get_playwright_scripts_path() -> Option<PathBuf> {
     })
 }
 
-/// Get the path to ai_workflows.json
-fn get_ai_workflows_path() -> Option<PathBuf> {
-    dirs::data_local_dir().map(|d| d.join("qontinui-runner").join("ai_workflows.json"))
-}
-
 /// Files to backup with their archive names
 fn get_backup_files() -> Vec<(&'static str, Option<PathBuf>)> {
     vec![
         ("settings.json", get_settings_path()),
         ("prompts.json", get_prompts_path()),
         ("playwright-scripts.json", get_playwright_scripts_path()),
-        ("ai_workflows.json", get_ai_workflows_path()),
     ]
 }
 
@@ -335,6 +328,5 @@ mod tests {
         assert!(get_settings_path().is_some());
         assert!(get_prompts_path().is_some());
         assert!(get_playwright_scripts_path().is_some());
-        assert!(get_ai_workflows_path().is_some());
     }
 }

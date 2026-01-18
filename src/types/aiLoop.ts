@@ -37,6 +37,8 @@ export interface AiLoop {
   sessionId?: string;
   /** Run name for display */
   sessionName?: string;
+  /** Workflow phase: setup, verification, agentic, or completion */
+  phase?: string;
 }
 
 /**
@@ -102,6 +104,7 @@ export function groupEntriesIntoLoops(entries: AiOutputLine[]): AiLoop[] {
         isActive: false,
         sessionId: entry.sessionId,
         sessionName: entry.sessionName,
+        phase: entry.phase,
       };
       currentActionId = entry.actionId;
     } else if (currentSession) {

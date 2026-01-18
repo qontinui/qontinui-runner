@@ -1,21 +1,28 @@
 /**
- * constants.ts
+ * prompt-template-constants.ts
  *
- * Constants for the AI Builder components.
+ * Constants and utilities for prompt template customization in the Unified Workflow Builder.
+ * Based on the legacy AI Builder implementation in components/ai-builder/constants.ts.
  */
 
-// Storage keys
-export const CUSTOM_PROMPT_TEMPLATE_KEY = "qontinui-custom-developer-prompt-template";
-export const EXECUTION_STEPS_KEY = "qontinui-ai-execution-steps";
-export const GOAL_KEY = "qontinui-ai-goal";
-export const MAX_ITERATIONS_KEY = "qontinui-ai-max-iterations";
-export const CAPTURE_INPUT_VALIDATION_KEY = "qontinui-ai-capture-input-validation";
-export const HISTORY_KEY = "qontinui-ai-builder-history";
-export const SESSION_KEY = "qontinui-ai-developer-session";
-export const SELECTED_CONFIG_KEY = "qontinui-ai-selected-config";
+// Storage key for global custom prompt template
+export const GLOBAL_PROMPT_TEMPLATE_KEY = "qontinui-unified-workflow-prompt-template";
 
-// Default Developer Mode Prompt Template - Runner handles continuation automatically
-export const DEFAULT_DEVELOPER_PROMPT_TEMPLATE = `# AI Developer Loop
+/**
+ * Default Developer Mode Prompt Template for Unified Workflows
+ *
+ * This template wraps the AI session when running unified workflows.
+ * It provides instructions on how the AI should operate in the iterative feedback loop.
+ *
+ * Template variables:
+ * - {{SESSION_ID}} - The unique session identifier
+ * - {{ITERATION}} - Current iteration number
+ * - {{MAX_ITERATIONS}} - Maximum allowed iterations
+ * - {{GOAL}} - The workflow goal/task description
+ * - {{EXECUTION_STEPS}} - Pre-executed step results
+ * - {{WORKSPACE_ESCAPED}} - Escaped workspace path
+ */
+export const DEFAULT_UNIFIED_PROMPT_TEMPLATE = `# AI Developer Loop
 
 This is an **iterative feedback loop**. The runner executes automation, you analyze results and fix issues, then the runner re-runs automation to verify your fixes work.
 
@@ -142,42 +149,130 @@ When you fix an issue:
 `;
 
 /**
- * Get the current developer prompt template (custom or default)
+ * Get the global developer prompt template (custom or default)
  */
-export const getDeveloperPromptTemplate = (): string => {
+export const getGlobalPromptTemplate = (): string => {
   if (typeof window !== "undefined") {
-    const customTemplate = localStorage.getItem(CUSTOM_PROMPT_TEMPLATE_KEY);
+    const customTemplate = localStorage.getItem(GLOBAL_PROMPT_TEMPLATE_KEY);
     if (customTemplate) {
       return customTemplate;
     }
   }
-  return DEFAULT_DEVELOPER_PROMPT_TEMPLATE;
+  return DEFAULT_UNIFIED_PROMPT_TEMPLATE;
 };
 
 /**
- * Save a custom prompt template
+ * Save a global custom prompt template
  */
-export const saveCustomPromptTemplate = (template: string): void => {
+export const saveGlobalPromptTemplate = (template: string): void => {
   if (typeof window !== "undefined") {
-    localStorage.setItem(CUSTOM_PROMPT_TEMPLATE_KEY, template);
+    localStorage.setItem(GLOBAL_PROMPT_TEMPLATE_KEY, template);
   }
 };
 
 /**
- * Reset to default prompt template
+ * Reset global prompt template to default
  */
-export const resetPromptTemplateToDefault = (): void => {
+export const resetGlobalPromptTemplate = (): void => {
   if (typeof window !== "undefined") {
-    localStorage.removeItem(CUSTOM_PROMPT_TEMPLATE_KEY);
+    localStorage.removeItem(GLOBAL_PROMPT_TEMPLATE_KEY);
   }
 };
 
 /**
- * Check if using custom template
+ * Check if using custom global template
  */
-export const isUsingCustomTemplate = (): boolean => {
+export const isUsingGlobalCustomTemplate = (): boolean => {
   if (typeof window !== "undefined") {
-    return localStorage.getItem(CUSTOM_PROMPT_TEMPLATE_KEY) !== null;
+    return localStorage.getItem(GLOBAL_PROMPT_TEMPLATE_KEY) !== null;
   }
   return false;
 };
+
+/**
+ * Get the prompt template for a specific workflow
+ * Falls back to global custom template, then to default
+ *
+ * @param workflowTemplate - Per-workflow template override (from UnifiedWorkflow.prompt_template)
+ * @returns The template to use
+ */
+export const getPromptTemplate = (workflowTemplate?: string | null): string => {
+  // Per-workflow template takes priority
+  if (workflowTemplate) {
+    return workflowTemplate;
+  }
+  // Fall back to global (custom or default)
+  return getGlobalPromptTemplate();
+};
+
+/**
+ * Replace template variables in a prompt template
+ *
+ * @param template - The template string with {{VARIABLE}} placeholders
+ * @param variables - Object containing variable values
+ * @returns The template with variables replaced
+ */
+export const replaceTemplateVariables = (
+  template: string,
+  variables: {
+    sessionId?: string;
+    iteration?: number;
+    maxIterations?: number;
+    goal?: string;
+    executionSteps?: string;
+    workspaceEscaped?: string;
+  },
+): string => {
+  let result = template;
+
+  if (variables.sessionId !== undefined) {
+    result = result.replace(/\{\{SESSION_ID\}\}/g, variables.sessionId);
+  }
+  if (variables.iteration !== undefined) {
+    result = result.replace(/\{\{ITERATION\}\}/g, String(variables.iteration));
+  }
+  if (variables.maxIterations !== undefined) {
+    result = result.replace(/\{\{MAX_ITERATIONS\}\}/g, String(variables.maxIterations));
+  }
+  if (variables.goal !== undefined) {
+    result = result.replace(/\{\{GOAL\}\}/g, variables.goal);
+  }
+  if (variables.executionSteps !== undefined) {
+    result = result.replace(/\{\{EXECUTION_STEPS\}\}/g, variables.executionSteps);
+  }
+  if (variables.workspaceEscaped !== undefined) {
+    result = result.replace(/\{\{WORKSPACE_ESCAPED\}\}/g, variables.workspaceEscaped);
+  }
+
+  return result;
+};
+
+/**
+ * Available template variables for documentation/UI
+ */
+export const TEMPLATE_VARIABLES = [
+  {
+    name: "{{SESSION_ID}}",
+    description: "Unique session identifier",
+  },
+  {
+    name: "{{ITERATION}}",
+    description: "Current iteration number (1, 2, 3, ...)",
+  },
+  {
+    name: "{{MAX_ITERATIONS}}",
+    description: "Maximum allowed iterations",
+  },
+  {
+    name: "{{GOAL}}",
+    description: "The workflow goal/task description",
+  },
+  {
+    name: "{{EXECUTION_STEPS}}",
+    description: "Pre-executed step results and instructions",
+  },
+  {
+    name: "{{WORKSPACE_ESCAPED}}",
+    description: "Escaped workspace root path",
+  },
+];

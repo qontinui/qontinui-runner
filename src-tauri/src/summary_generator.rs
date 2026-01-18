@@ -84,13 +84,15 @@ pub fn generate_task_summary(
         return Err("Task already has a summary".to_string());
     }
 
-    // Skip if task is not complete
-    if task.status != "complete" {
+    // Skip if task is in a terminal error state
+    // Note: We allow generation while task is "running" since the Summary step
+    // in the completion phase may call this before the task is marked complete
+    if task.status == "failed" || task.status == "stopped" {
         warn!(
-            "Task {} is not complete (status: {}), skipping summary",
+            "Task {} has terminal status ({}), skipping summary",
             task_run_id, task.status
         );
-        return Err(format!("Task is not complete: {}", task.status));
+        return Err(format!("Task has terminal status: {}", task.status));
     }
 
     // Prepare the output for summarization

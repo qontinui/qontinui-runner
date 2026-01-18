@@ -68,6 +68,32 @@ pub struct RecapStats {
     pub tests_passed: i32,
 }
 
+/// A stage in the recap timeline, grouping related steps.
+/// Stages represent the 4 workflow phases: setup, agentic, verification, completion.
+#[derive(Debug, Serialize, Clone)]
+pub struct StageRecap {
+    /// Stage identifier: "setup", "agentic", "verification", "completion"
+    pub stage: String,
+    /// Display name: "Setup", "Agentic", "Verification", "Completion"
+    pub display_name: String,
+    /// Status: "success", "failed", "running", "skipped", "pending"
+    pub status: String,
+    /// When this stage started (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// When this stage ended (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// Duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// Steps in this stage
+    pub steps: Vec<RecapStep>,
+    /// Iteration number (for agentic/verification in loop)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+}
+
 /// Complete recap data for a task run.
 #[derive(Debug, Serialize)]
 pub struct RecapData {
@@ -98,7 +124,10 @@ pub struct RecapData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal_achieved: Option<bool>,
 
-    /// Steps overview (timeline)
+    /// Steps grouped by stage (with timing from transition_history)
+    pub stages: Vec<StageRecap>,
+
+    /// Steps overview (timeline) - flat list for backwards compatibility
     pub steps: Vec<RecapStep>,
 
     /// Quick statistics
@@ -605,6 +634,266 @@ fn calculate_stats(
     stats
 }
 
+/// Stage transition data parsed from transition_history_json.
+#[derive(Debug, Deserialize)]
+struct StageTransition {
+    from: String,
+    to: String,
+    timestamp: String,
+    iteration: u32,
+}
+
+/// Build stages from transition history or heuristically from steps.
+fn build_stages(
+    task_run: &TaskRun,
+    steps: &[RecapStep],
+    _verification_results: &[StoredVerificationResult],
+) -> Vec<StageRecap> {
+    // Try to parse transition history
+    if let Some(ref history_json) = task_run.transition_history_json {
+        if let Ok(transitions) = serde_json::from_str::<Vec<StageTransition>>(history_json) {
+            if !transitions.is_empty() {
+                return build_stages_from_history(&transitions, steps, task_run);
+            }
+        }
+    }
+
+    // Fallback: build stages heuristically from steps
+    build_stages_heuristic(task_run, steps)
+}
+
+/// Build stages from persisted transition history.
+fn build_stages_from_history(
+    transitions: &[StageTransition],
+    steps: &[RecapStep],
+    task_run: &TaskRun,
+) -> Vec<StageRecap> {
+    let mut stages: Vec<StageRecap> = Vec::new();
+
+    // Group transitions by target stage
+    let mut current_stage: Option<&str> = None;
+    let mut stage_start: Option<&str> = None;
+    let mut stage_iteration: Option<u32> = None;
+
+    for (i, transition) in transitions.iter().enumerate() {
+        // When stage changes, close previous and start new
+        if current_stage != Some(&transition.to) {
+            // Close previous stage if exists
+            if let Some(prev_stage) = current_stage {
+                let stage_steps = filter_steps_for_stage(prev_stage, steps);
+                let status = compute_stage_status(&stage_steps, task_run);
+                let duration = stage_start
+                    .and_then(|start| calculate_duration_ms(start, &transition.timestamp));
+
+                stages.push(StageRecap {
+                    stage: prev_stage.to_string(),
+                    display_name: get_stage_display_name(prev_stage),
+                    status,
+                    started_at: stage_start.map(String::from),
+                    ended_at: Some(transition.timestamp.clone()),
+                    duration_ms: duration,
+                    steps: stage_steps,
+                    iteration: stage_iteration,
+                });
+            }
+
+            // Start new stage
+            current_stage = Some(&transition.to);
+            stage_start = Some(&transition.timestamp);
+            stage_iteration = if transition.to == "agentic" || transition.to == "verification" {
+                Some(transition.iteration)
+            } else {
+                None
+            };
+        }
+    }
+
+    // Close final stage
+    if let Some(final_stage) = current_stage {
+        let stage_steps = filter_steps_for_stage(final_stage, steps);
+        let status = compute_stage_status(&stage_steps, task_run);
+
+        stages.push(StageRecap {
+            stage: final_stage.to_string(),
+            display_name: get_stage_display_name(final_stage),
+            status,
+            started_at: stage_start.map(String::from),
+            ended_at: task_run.completed_at.clone(),
+            duration_ms: None,
+            steps: stage_steps,
+            iteration: stage_iteration,
+        });
+    }
+
+    stages
+}
+
+/// Build stages heuristically from steps when no transition history is available.
+fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageRecap> {
+    let mut stages: Vec<StageRecap> = Vec::new();
+
+    // Group steps by inferred stage
+    let mut setup_steps: Vec<RecapStep> = Vec::new();
+    let mut verification_steps: Vec<RecapStep> = Vec::new();
+    let mut agentic_steps: Vec<RecapStep> = Vec::new();
+
+    for step in steps {
+        match step.step_type.as_str() {
+            "check" | "test" => verification_steps.push(step.clone()),
+            "ai_session" => agentic_steps.push(step.clone()),
+            "workflow" => {
+                // Classify workflows by name pattern
+                let name_lower = step.name.to_lowercase();
+                if name_lower.contains("setup")
+                    || name_lower.contains("init")
+                    || name_lower.contains("plan")
+                {
+                    setup_steps.push(step.clone());
+                } else {
+                    agentic_steps.push(step.clone());
+                }
+            }
+            "action" => agentic_steps.push(step.clone()),
+            _ => agentic_steps.push(step.clone()),
+        }
+    }
+
+    // Create stages for non-empty groups
+    if !setup_steps.is_empty() {
+        let status = compute_stage_status(&setup_steps, task_run);
+        stages.push(StageRecap {
+            stage: "setup".to_string(),
+            display_name: "Setup".to_string(),
+            status,
+            started_at: Some(task_run.created_at.clone()),
+            ended_at: None,
+            duration_ms: None,
+            steps: setup_steps,
+            iteration: None,
+        });
+    }
+
+    if !agentic_steps.is_empty() {
+        let status = compute_stage_status(&agentic_steps, task_run);
+        stages.push(StageRecap {
+            stage: "agentic".to_string(),
+            display_name: "Agentic".to_string(),
+            status,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            steps: agentic_steps,
+            iteration: None,
+        });
+    }
+
+    if !verification_steps.is_empty() {
+        let status = compute_stage_status(&verification_steps, task_run);
+        stages.push(StageRecap {
+            stage: "verification".to_string(),
+            display_name: "Verification".to_string(),
+            status,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            steps: verification_steps,
+            iteration: None,
+        });
+    }
+
+    // Always add completion stage for completed tasks
+    if task_run.status == "complete" || task_run.status == "failed" {
+        let completion_status = if task_run.status == "complete" {
+            "success"
+        } else {
+            "failed"
+        };
+
+        stages.push(StageRecap {
+            stage: "completion".to_string(),
+            display_name: "Completion".to_string(),
+            status: completion_status.to_string(),
+            started_at: None,
+            ended_at: task_run.completed_at.clone(),
+            duration_ms: None,
+            steps: Vec::new(),
+            iteration: None,
+        });
+    }
+
+    stages
+}
+
+/// Filter steps that belong to a particular stage.
+fn filter_steps_for_stage(stage: &str, steps: &[RecapStep]) -> Vec<RecapStep> {
+    steps
+        .iter()
+        .filter(|s| {
+            match stage {
+                "setup" => {
+                    s.step_type == "workflow" && is_setup_step(s)
+                }
+                "verification" => {
+                    s.step_type == "check" || s.step_type == "test"
+                }
+                "agentic" => {
+                    s.step_type == "ai_session"
+                        || s.step_type == "action"
+                        || (s.step_type == "workflow" && !is_setup_step(s))
+                }
+                "completion" => false, // Completion usually has no steps
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Check if a step is a setup-related step based on name patterns.
+fn is_setup_step(step: &RecapStep) -> bool {
+    let name_lower = step.name.to_lowercase();
+    name_lower.contains("setup")
+        || name_lower.contains("init")
+        || name_lower.contains("plan")
+        || name_lower.contains("configure")
+}
+
+/// Compute overall status for a stage based on its steps.
+fn compute_stage_status(steps: &[RecapStep], task_run: &TaskRun) -> String {
+    if steps.is_empty() {
+        return if task_run.status == "running" {
+            "pending".to_string()
+        } else {
+            "skipped".to_string()
+        };
+    }
+
+    // Check for any running steps
+    if steps.iter().any(|s| s.status == "running") {
+        return "running".to_string();
+    }
+
+    // Check for any failed steps
+    if steps.iter().any(|s| s.status == "failed") {
+        return "failed".to_string();
+    }
+
+    // All steps succeeded or skipped
+    "success".to_string()
+}
+
+/// Get display name for a stage.
+fn get_stage_display_name(stage: &str) -> String {
+    match stage {
+        "setup" => "Setup",
+        "agentic" => "Agentic",
+        "verification" => "Verification",
+        "completion" => "Completion",
+        _ => stage,
+    }
+    .to_string()
+}
+
 /// Get recap data for a specific task run.
 #[tauri::command]
 pub async fn get_task_run_recap(
@@ -661,6 +950,9 @@ pub async fn get_task_run_recap(
     // Build steps
     let steps = build_steps(&task_run, &automations, &events, &verification_results);
 
+    // Build stages from transition history or heuristically
+    let stages = build_stages(&task_run, &steps, &verification_results);
+
     // Extract failure info
     let failure_info = extract_failure_info(&task_run, &automations);
 
@@ -687,6 +979,7 @@ pub async fn get_task_run_recap(
         failure_info,
         summary,
         goal_achieved: task_run.goal_achieved,
+        stages,
         steps,
         stats,
     };

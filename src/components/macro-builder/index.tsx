@@ -1,7 +1,7 @@
 /**
- * GUI Workflow Builder
+ * Macro Builder
  *
- * Main component for building sequential GUI action workflows.
+ * Main component for building sequential macro action workflows.
  * Provides a linear step editor for composing CLICK, TYPE, HOTKEY, and GO_TO_STATE actions.
  */
 
@@ -23,14 +23,14 @@ import {
 import { cn } from "../../lib/utils";
 import { getStatusColors, getAccentColors } from "@/design-system";
 
-import { GuiBuilderProvider, useGuiBuilder } from "./GuiBuilderContext";
-import { useGuiBuilderState } from "./useGuiBuilderState";
+import { MacroBuilderProvider, useMacroBuilder } from "./MacroBuilderContext";
+import { useMacroBuilderState } from "./useMacroBuilderState";
 import { StepItem } from "./StepItem";
 import { AddStepDropdown } from "./AddStepDropdown";
 import { StepEditor } from "./StepEditor";
-import { SaveWorkflowDialog } from "./SaveWorkflowDialog";
-import type { GuiWorkflowBuilderTabProps } from "./types";
-import type { SavedGuiWorkflow } from "../../types/gui-workflow";
+import { SaveMacroDialog } from "./SaveMacroDialog";
+import type { MacroBuilderTabProps } from "./types";
+import type { SavedMacro } from "../../types/macro";
 
 const accentColors = getAccentColors("cyan");
 
@@ -44,30 +44,30 @@ function formatDate(dateString: string): string {
   });
 }
 
-function GuiBuilderContent() {
+function MacroBuilderContent() {
   const {
     steps,
     addStep,
     removeStep,
     moveStepUp,
     moveStepDown,
-    currentWorkflowId,
+    currentMacroId,
     hasUnsavedChanges,
     formState,
     setFormState,
     editingStepId,
     setEditingStepId,
     setShowSaveDialog,
-    handleSaveWorkflow,
-    handleNewWorkflow,
+    handleSaveMacro,
+    handleNewMacro,
     configLoaded,
     isRunning,
-    runWorkflow,
+    runMacro,
     lastResult,
-    savedWorkflows,
-    loadWorkflow,
-    deleteWorkflow,
-  } = useGuiBuilder();
+    savedMacros,
+    loadMacro,
+    deleteMacro,
+  } = useMacroBuilder();
 
   const [searchQuery, setSearchQuery] = useState("");
 
@@ -76,47 +76,47 @@ function GuiBuilderContent() {
     [steps, editingStepId],
   );
 
-  const filteredWorkflows = useMemo(() => {
-    if (!searchQuery.trim()) return savedWorkflows;
+  const filteredMacros = useMemo(() => {
+    if (!searchQuery.trim()) return savedMacros;
     const query = searchQuery.toLowerCase();
-    return savedWorkflows.filter(
-      (w) =>
-        w.name.toLowerCase().includes(query) ||
-        (w.description && w.description.toLowerCase().includes(query)),
+    return savedMacros.filter(
+      (m) =>
+        m.name.toLowerCase().includes(query) ||
+        (m.description && m.description.toLowerCase().includes(query)),
     );
-  }, [savedWorkflows, searchQuery]);
+  }, [savedMacros, searchQuery]);
 
-  const handleDelete = async (e: React.MouseEvent, workflow: SavedGuiWorkflow) => {
+  const handleDelete = async (e: React.MouseEvent, macro: SavedMacro) => {
     e.stopPropagation();
-    if (confirm(`Are you sure you want to delete "${workflow.name}"?`)) {
+    if (confirm(`Are you sure you want to delete "${macro.name}"?`)) {
       try {
-        await deleteWorkflow(workflow.id);
+        await deleteMacro(macro.id);
       } catch (error) {
-        console.error("Failed to delete workflow:", error);
+        console.error("Failed to delete macro:", error);
       }
     }
   };
 
   return (
     <div className="h-full flex">
-      {/* Left Panel - Workflow List */}
+      {/* Left Panel - Macro List */}
       <div className="w-80 border-r border-border flex flex-col bg-background">
         {/* Header */}
         <div className={`p-4 border-b ${accentColors.border}`}>
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <MousePointer2 className={`h-5 w-5 ${accentColors.text}`} />
-              <h2 className="font-semibold">GUI Workflows</h2>
+              <h2 className="font-semibold">Macros</h2>
             </div>
             <span className="text-xs text-muted-foreground">
-              {filteredWorkflows.length} workflow{filteredWorkflows.length !== 1 ? "s" : ""}
+              {filteredMacros.length} macro{filteredMacros.length !== 1 ? "s" : ""}
             </span>
           </div>
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <input
               type="text"
-              placeholder="Search workflows..."
+              placeholder="Search macros..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 text-sm bg-muted/50 border border-border rounded-md focus:outline-none focus:ring-2 focus:ring-primary"
@@ -127,60 +127,60 @@ function GuiBuilderContent() {
         {/* Create New Button */}
         <div className="p-3 border-b border-border">
           <button
-            onClick={handleNewWorkflow}
+            onClick={handleNewMacro}
             disabled={isRunning}
             className={`w-full flex items-center justify-center gap-2 px-3 py-2 text-sm font-medium ${accentColors.bgSolid} text-white rounded-md hover:opacity-90 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed`}
           >
             <Plus className="h-4 w-4" />
-            Create New Workflow
+            Create New Macro
           </button>
         </div>
 
-        {/* Workflow List */}
+        {/* Macro List */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {filteredWorkflows.length === 0 ? (
+          {filteredMacros.length === 0 ? (
             <div className="text-sm text-muted-foreground text-center py-8">
-              {searchQuery ? "No matching workflows" : "No saved workflows yet"}
+              {searchQuery ? "No matching macros" : "No saved macros yet"}
             </div>
           ) : (
-            filteredWorkflows.map((workflow) => (
+            filteredMacros.map((macro) => (
               <div
-                key={workflow.id}
+                key={macro.id}
                 className={cn(
                   "group p-3 rounded-lg border cursor-pointer transition-colors",
-                  currentWorkflowId === workflow.id
+                  currentMacroId === macro.id
                     ? `${accentColors.border} ${accentColors.bg}`
                     : "border-transparent hover:border-border hover:bg-muted/50",
                 )}
-                onClick={() => loadWorkflow(workflow)}
+                onClick={() => loadMacro(macro)}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium truncate">{workflow.name}</div>
-                    {workflow.description && (
+                    <div className="font-medium truncate">{macro.name}</div>
+                    {macro.description && (
                       <div className="text-sm text-muted-foreground truncate">
-                        {workflow.description}
+                        {macro.description}
                       </div>
                     )}
                     <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
                       <span>
-                        {workflow.steps.length} step{workflow.steps.length !== 1 ? "s" : ""}
+                        {macro.steps.length} step{macro.steps.length !== 1 ? "s" : ""}
                       </span>
-                      {workflow.run_count > 0 && (
+                      {macro.run_count > 0 && (
                         <span className="flex items-center gap-1">
                           <Play className="h-3 w-3" />
-                          {workflow.run_count}
+                          {macro.run_count}
                         </span>
                       )}
                     </div>
                     <div className="flex items-center gap-1 mt-1 text-xs text-muted-foreground">
                       <Clock className="h-3 w-3" />
-                      {formatDate(workflow.modified_at)}
+                      {formatDate(macro.modified_at)}
                     </div>
                   </div>
                   <button
                     className="p-1.5 rounded hover:bg-muted text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
-                    onClick={(e) => handleDelete(e, workflow)}
+                    onClick={(e) => handleDelete(e, macro)}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>
@@ -202,7 +202,7 @@ function GuiBuilderContent() {
                 type="text"
                 value={formState.name}
                 onChange={(e) => setFormState((prev) => ({ ...prev, name: e.target.value }))}
-                placeholder="Untitled Workflow"
+                placeholder="Untitled Macro"
                 className="h-8 w-48 px-2 bg-background border border-border rounded-md text-sm font-medium focus:outline-none focus:ring-2 focus:ring-primary"
               />
               {hasUnsavedChanges && (
@@ -215,7 +215,7 @@ function GuiBuilderContent() {
 
           <div className="flex items-center gap-2">
             <button
-              onClick={currentWorkflowId ? handleSaveWorkflow : () => setShowSaveDialog(true)}
+              onClick={currentMacroId ? handleSaveMacro : () => setShowSaveDialog(true)}
               disabled={isRunning}
               className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium border border-border rounded-md hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -223,7 +223,7 @@ function GuiBuilderContent() {
               Save
             </button>
             <button
-              onClick={runWorkflow}
+              onClick={runMacro}
               disabled={isRunning || steps.length === 0}
               className="flex items-center gap-1 px-3 py-1.5 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
@@ -274,7 +274,7 @@ function GuiBuilderContent() {
                 <div className="flex flex-col items-center justify-center py-12">
                   <div className="text-muted-foreground text-center mb-4">
                     <p className="text-lg font-medium">No steps yet</p>
-                    <p className="text-sm">Add steps to build your GUI workflow</p>
+                    <p className="text-sm">Add steps to build your macro</p>
                   </div>
                   <AddStepDropdown onAddStep={addStep} />
                 </div>
@@ -312,19 +312,19 @@ function GuiBuilderContent() {
       />
 
       {/* Save Dialog */}
-      <SaveWorkflowDialog />
+      <SaveMacroDialog />
     </div>
   );
 }
 
-export function GuiWorkflowBuilderTab({ editWorkflowId }: GuiWorkflowBuilderTabProps) {
-  const state = useGuiBuilderState({ editWorkflowId });
+export function MacroBuilderTab({ editMacroId }: MacroBuilderTabProps) {
+  const state = useMacroBuilderState({ editMacroId });
 
   return (
-    <GuiBuilderProvider value={state}>
-      <GuiBuilderContent />
-    </GuiBuilderProvider>
+    <MacroBuilderProvider value={state}>
+      <MacroBuilderContent />
+    </MacroBuilderProvider>
   );
 }
 
-export default GuiWorkflowBuilderTab;
+export default MacroBuilderTab;

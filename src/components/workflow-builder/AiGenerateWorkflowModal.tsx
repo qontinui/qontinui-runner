@@ -5,9 +5,23 @@
  */
 
 import { useState, useCallback } from "react";
-import { Sparkles, X, Loader2, Check, AlertCircle, ChevronDown, ChevronUp } from "lucide-react";
+import { Sparkles, X, Loader2, Check, AlertCircle, ChevronDown, ChevronUp, Settings2 } from "lucide-react";
 import type { UnifiedWorkflow } from "../../types";
 import { getAccentColors } from "@/design-system";
+
+const AI_PROVIDERS = [
+  { value: "", label: "Default (from settings)" },
+  { value: "claude_cli", label: "Claude CLI" },
+  { value: "anthropic_api", label: "Anthropic API" },
+  { value: "openai_api", label: "OpenAI API" },
+  { value: "gemini_api", label: "Gemini API" },
+];
+
+const LOG_SOURCE_OPTIONS = [
+  { value: "", label: "Default (from settings)" },
+  { value: "ai", label: "AI (auto-select)" },
+  { value: "all", label: "All enabled sources" },
+];
 
 const API_BASE = "http://localhost:9876";
 
@@ -41,6 +55,15 @@ export function AiGenerateWorkflowModal({
   const [generatedWorkflow, setGeneratedWorkflow] = useState<UnifiedWorkflow | null>(null);
   const [validationErrors, setValidationErrors] = useState<string[]>([]);
   const [showPreview, setShowPreview] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  // Advanced options
+  const [maxIterations, setMaxIterations] = useState<number | "">(10);
+  const [provider, setProvider] = useState("");
+  const [model, setModel] = useState("");
+  const [skipAiSummary, setSkipAiSummary] = useState(false);
+  const [logSourceSelection, setLogSourceSelection] = useState("");
+  const [autoIncludeContexts, setAutoIncludeContexts] = useState(true);
 
   const accentColors = getAccentColors("blue");
 
@@ -56,17 +79,39 @@ export function AiGenerateWorkflowModal({
     setValidationErrors([]);
 
     try {
+      const requestBody: Record<string, unknown> = {
+        description: description.trim(),
+        category: category.trim() || undefined,
+        tags: tags
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean),
+      };
+
+      // Add advanced options if they have non-default values
+      if (maxIterations !== "" && maxIterations !== 10) {
+        requestBody.max_iterations = maxIterations;
+      }
+      if (provider) {
+        requestBody.provider = provider;
+      }
+      if (model.trim()) {
+        requestBody.model = model.trim();
+      }
+      if (skipAiSummary) {
+        requestBody.skip_ai_summary = true;
+      }
+      if (logSourceSelection) {
+        requestBody.log_source_selection = logSourceSelection;
+      }
+      if (!autoIncludeContexts) {
+        requestBody.auto_include_contexts = false;
+      }
+
       const response = await fetch(`${API_BASE}/unified-workflows/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          description: description.trim(),
-          category: category.trim() || undefined,
-          tags: tags
-            .split(",")
-            .map((t) => t.trim())
-            .filter(Boolean),
-        }),
+        body: JSON.stringify(requestBody),
       });
 
       const result = await response.json();
@@ -90,7 +135,7 @@ export function AiGenerateWorkflowModal({
     } finally {
       setIsGenerating(false);
     }
-  }, [description, category, tags]);
+  }, [description, category, tags, maxIterations, provider, model, skipAiSummary, logSourceSelection, autoIncludeContexts]);
 
   const handleLoadWorkflow = useCallback(() => {
     if (generatedWorkflow) {
@@ -107,6 +152,14 @@ export function AiGenerateWorkflowModal({
     setGeneratedWorkflow(null);
     setValidationErrors([]);
     setShowPreview(false);
+    setShowAdvanced(false);
+    // Reset advanced options to defaults
+    setMaxIterations(10);
+    setProvider("");
+    setModel("");
+    setSkipAiSummary(false);
+    setLogSourceSelection("");
+    setAutoIncludeContexts(true);
     onClose();
   }, [onClose]);
 
@@ -196,6 +249,124 @@ export function AiGenerateWorkflowModal({
               />
               <p className="text-xs text-muted-foreground mt-1">Comma-separated</p>
             </div>
+          </div>
+
+          {/* Advanced Options */}
+          <div className="border border-border rounded-md overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowAdvanced(!showAdvanced)}
+              className="w-full flex items-center justify-between px-4 py-2 bg-muted/50 hover:bg-muted/70 transition-colors"
+              disabled={isGenerating}
+            >
+              <span className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+                <Settings2 className="w-4 h-4" />
+                Advanced Options
+              </span>
+              {showAdvanced ? (
+                <ChevronUp className="w-4 h-4 text-muted-foreground" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-muted-foreground" />
+              )}
+            </button>
+
+            {showAdvanced && (
+              <div className="p-4 space-y-4 bg-background/50">
+                {/* Provider and Model */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">
+                      AI Provider
+                    </label>
+                    <select
+                      value={provider}
+                      onChange={(e) => setProvider(e.target.value)}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      disabled={isGenerating}
+                    >
+                      {AI_PROVIDERS.map((p) => (
+                        <option key={p.value} value={p.value}>
+                          {p.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">
+                      Model Override
+                    </label>
+                    <input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="e.g., claude-3-opus, gpt-4"
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      disabled={isGenerating}
+                    />
+                  </div>
+                </div>
+
+                {/* Max Iterations and Log Source */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">
+                      Max Iterations
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={maxIterations}
+                      onChange={(e) => setMaxIterations(e.target.value ? parseInt(e.target.value, 10) : "")}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      disabled={isGenerating}
+                    />
+                    <p className="text-xs text-muted-foreground mt-1">Agentic phase limit</p>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">
+                      Log Source Selection
+                    </label>
+                    <select
+                      value={logSourceSelection}
+                      onChange={(e) => setLogSourceSelection(e.target.value)}
+                      className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                      disabled={isGenerating}
+                    >
+                      {LOG_SOURCE_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {/* Checkboxes */}
+                <div className="flex items-center gap-6">
+                  <label className="flex items-center gap-2 text-sm cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={skipAiSummary}
+                      onChange={(e) => setSkipAiSummary(e.target.checked)}
+                      className="w-4 h-4 rounded border-border"
+                      disabled={isGenerating}
+                    />
+                    <span className="text-muted-foreground">Skip AI Summary</span>
+                  </label>
+                  <label className="flex items-center gap-2 text-sm cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={autoIncludeContexts}
+                      onChange={(e) => setAutoIncludeContexts(e.target.checked)}
+                      className="w-4 h-4 rounded border-border"
+                      disabled={isGenerating}
+                    />
+                    <span className="text-muted-foreground">Auto-include Contexts</span>
+                  </label>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Error Display */}

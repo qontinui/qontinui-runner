@@ -1,13 +1,13 @@
 /**
- * SaveWorkflowDialog Component
+ * SaveMacroDialog Component
  *
- * Dialog for saving a new workflow.
+ * Dialog for saving a new macro.
  */
 
 import { Save, X, Loader2 } from "lucide-react";
-import { useGuiBuilder } from "./GuiBuilderContext";
+import { useMacroBuilder } from "./MacroBuilderContext";
 
-export function SaveWorkflowDialog() {
+export function SaveMacroDialog() {
   const {
     showSaveDialog,
     setShowSaveDialog,
@@ -16,7 +16,7 @@ export function SaveWorkflowDialog() {
     isSaving,
     handleSaveAsNew,
     steps,
-  } = useGuiBuilder();
+  } = useMacroBuilder();
 
   if (!showSaveDialog) return null;
 
@@ -30,7 +30,7 @@ export function SaveWorkflowDialog() {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Save className="w-5 h-5 text-primary" />
-            <h3 className="text-lg font-semibold">Save Workflow</h3>
+            <h3 className="text-lg font-semibold">Save Macro</h3>
           </div>
           <button
             onClick={() => setShowSaveDialog(false)}
@@ -41,7 +41,7 @@ export function SaveWorkflowDialog() {
         </div>
 
         <p className="text-sm text-muted-foreground">
-          Save this workflow to the library for easy reuse.
+          Save this macro to the library for easy reuse.
         </p>
 
         <div className="space-y-3">
@@ -51,7 +51,7 @@ export function SaveWorkflowDialog() {
               type="text"
               value={formState.name}
               onChange={(e) => setFormState((prev) => ({ ...prev, name: e.target.value }))}
-              placeholder="Enter workflow name..."
+              placeholder="Enter macro name..."
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
               autoFocus
             />
@@ -67,7 +67,7 @@ export function SaveWorkflowDialog() {
                   description: e.target.value,
                 }))
               }
-              placeholder="Describe what this workflow does..."
+              placeholder="Describe what this macro does..."
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none h-20 focus:outline-none focus:ring-2 focus:ring-primary"
             />
           </div>

@@ -62,6 +62,7 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
       const actionId = data.action_id;
       const sessionId = data.session_id;
       const sessionName = data.session_name;
+      const phase = data.phase;
 
       // Get current session from SessionManager (single source of truth)
       const currentSession = sessionManager.getCurrentSession();
@@ -92,7 +93,7 @@ export const setupAiOutputHandlers: HandlerSetupFunction = (context) => {
         console.log(`[AI_OUTPUT_HANDLER] Started findings report for session: ${newSession.id}`);
       }
 
-      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName);
+      logManager.addAiOutputLog(line, source, actionId, sessionId, sessionName, phase);
 
       // Process AI output for findings detection
       // Only process AI responses (not user prompts or hints)

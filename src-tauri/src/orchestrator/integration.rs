@@ -206,6 +206,24 @@ fn generate_criteria_summary(plan: &VerificationPlan) -> String {
 }
 
 // ============================================================================
+// Stage Transition Tracking (for stage-based recap)
+// ============================================================================
+
+/// A record of a stage transition during task execution.
+/// Used for building the stage-based timeline in the recap page.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StageTransition {
+    /// Previous stage
+    pub from: String,
+    /// New stage
+    pub to: String,
+    /// When the transition occurred (ISO 8601)
+    pub timestamp: String,
+    /// Iteration number at time of transition
+    pub iteration: u32,
+}
+
+// ============================================================================
 // Orchestrator Configuration
 // ============================================================================
 
@@ -321,6 +339,14 @@ pub struct OrchestratorState {
     pub runtime_context: RuntimeContext,
 
     // ========================================================================
+    // State Transition Tracking (for stage-based recap)
+    // ========================================================================
+    /// Current workflow stage (for transition tracking)
+    pub current_stage: String,
+    /// History of state/stage transitions (persisted to task_runs.transition_history_json)
+    pub transition_history: Vec<StageTransition>,
+
+    // ========================================================================
     // Task Duration Tracking
     // ========================================================================
     /// When the task was initialized (for total duration calculation)
@@ -354,11 +380,27 @@ impl OrchestratorState {
             coordination_messages: Vec::new(),
             domain_verification_results: HashMap::new(),
             runtime_context,
+            current_stage: "setup".to_string(),
+            transition_history: Vec::new(),
             started_at: None,
             started_at_iso: None,
             completed_at_iso: None,
             iteration_timings: Vec::new(),
             current_iteration_started_at: None,
+        }
+    }
+
+    /// Record a stage transition for the recap timeline.
+    pub fn record_stage_transition(&mut self, to_stage: &str) {
+        if self.current_stage != to_stage {
+            let transition = StageTransition {
+                from: self.current_stage.clone(),
+                to: to_stage.to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                iteration: self.iteration,
+            };
+            self.transition_history.push(transition);
+            self.current_stage = to_stage.to_string();
         }
     }
 
@@ -663,6 +705,35 @@ impl Orchestrator {
     /// Get the session context reference for output calls.
     fn session_ctx_ref(&self) -> Option<&AiOutputSessionContext> {
         self.session_ctx.as_ref()
+    }
+
+    // ========================================================================
+    // Transition History Persistence
+    // ========================================================================
+
+    /// Persist the transition history to the database.
+    /// This should be called after state changes to keep the recap data up to date.
+    pub fn persist_transition_history(&self, state: &OrchestratorState) {
+        if state.transition_history.is_empty() {
+            return;
+        }
+
+        match serde_json::to_string(&state.transition_history) {
+            Ok(json) => {
+                if let Err(e) = self
+                    .db
+                    .update_task_run_transition_history(&state.task_run_id, &json)
+                {
+                    warn!(
+                        "Failed to persist transition history for {}: {}",
+                        state.task_run_id, e
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Failed to serialize transition history: {}", e);
+            }
+        }
     }
 
     // ========================================================================

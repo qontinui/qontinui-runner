@@ -181,6 +181,10 @@ pub struct TaskRun {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_generated_at: Option<String>,
 
+    /// JSON array of StateTransition objects from orchestrator (for stage-based recap)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_history_json: Option<String>,
+
     pub created_at: String,
     pub updated_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3114,6 +3118,63 @@ impl CheckpointDb {
             info!("Successfully migrated to version 31 (log_source_selection)");
         }
 
+        // Version 32: Add context management fields to unified_workflows
+        if current_version < 32 {
+            info!("Migrating database to version 32 (adding context management to unified_workflows)");
+
+            conn.execute_batch(
+                r#"
+                -- Add context_ids column (JSON array of manually added context IDs)
+                ALTER TABLE unified_workflows ADD COLUMN context_ids TEXT DEFAULT '[]';
+
+                -- Add disabled_context_ids column (JSON array of disabled context IDs)
+                ALTER TABLE unified_workflows ADD COLUMN disabled_context_ids TEXT DEFAULT '[]';
+
+                -- Add auto_include_contexts column (whether to auto-include contexts, default true)
+                ALTER TABLE unified_workflows ADD COLUMN auto_include_contexts INTEGER DEFAULT 1;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (32, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 32: {}", e))?;
+
+            info!("Successfully migrated to version 32 (context management for unified_workflows)");
+        }
+
+        // Version 33: Add prompt_template to unified_workflows
+        if current_version < 33 {
+            info!("Migrating database to version 33 (adding prompt_template to unified_workflows)");
+
+            conn.execute_batch(
+                r#"
+                -- Add prompt_template column (custom developer prompt template per workflow)
+                ALTER TABLE unified_workflows ADD COLUMN prompt_template TEXT DEFAULT NULL;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (33, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 33: {}", e))?;
+
+            info!("Successfully migrated to version 33 (prompt_template for unified_workflows)");
+        }
+
+        // Version 34: Add transition_history_json to task_runs for stage-based recap
+        if current_version < 34 {
+            info!("Migrating database to version 34 (adding transition_history_json to task_runs)");
+
+            conn.execute_batch(
+                r#"
+                -- Add transition_history_json column for orchestrator state transition history
+                ALTER TABLE task_runs ADD COLUMN transition_history_json TEXT;
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (34, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 34: {}", e))?;
+
+            info!("Successfully migrated to version 34 (transition_history_json for task_runs)");
+        }
+
         Ok(())
     }
 
@@ -3593,6 +3654,7 @@ impl CheckpointDb {
             goal_achieved: None,
             remaining_work: None,
             summary_generated_at: None,
+            transition_history_json: None,
             created_at: now.clone(),
             updated_at: now,
             completed_at: None,
@@ -3610,7 +3672,7 @@ impl CheckpointDb {
             SELECT id, task_name, prompt, task_type, status, sessions_count, max_sessions, error_message, auto_continue,
                    execution_steps_json, log_sources_json, config_id, workflow_name,
                    COALESCE(summary, ai_summary) as summary, ai_summary, goal_achieved, remaining_work,
-                   summary_generated_at, created_at, updated_at, completed_at
+                   summary_generated_at, transition_history_json, created_at, updated_at, completed_at
             FROM task_runs
             WHERE id = ?1
             "#,
@@ -3636,9 +3698,10 @@ impl CheckpointDb {
                     goal_achieved: row.get::<_, Option<i32>>(15)?.map(|v| v != 0),
                     remaining_work: row.get(16)?,
                     summary_generated_at: row.get(17)?,
-                    created_at: row.get(18)?,
-                    updated_at: row.get(19)?,
-                    completed_at: row.get(20)?,
+                    transition_history_json: row.get(18)?,
+                    created_at: row.get(19)?,
+                    updated_at: row.get(20)?,
+                    completed_at: row.get(21)?,
                 })
             },
         );
@@ -3840,6 +3903,30 @@ impl CheckpointDb {
         Ok(())
     }
 
+    /// Update the transition history for a task run.
+    /// This stores the orchestrator's state transition history for stage-based recap.
+    pub fn update_task_run_transition_history(
+        &self,
+        id: &str,
+        transition_history_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            UPDATE task_runs SET
+                transition_history_json = ?1,
+                updated_at = ?2
+            WHERE id = ?3
+            "#,
+            params![transition_history_json, now, id],
+        )
+        .map_err(|e| format!("Failed to update task run transition history: {}", e))?;
+
+        Ok(())
+    }
+
     /// Get runtime context for a task run.
     pub fn get_task_run_runtime_context(&self, id: &str) -> Result<Option<String>, String> {
         let conn = self.get_conn()?;
@@ -3898,6 +3985,7 @@ impl CheckpointDb {
                     goal_achieved: row.get::<_, Option<i32>>(12)?.map(|v| v != 0),
                     remaining_work: row.get(13)?,
                     summary_generated_at: row.get(14)?,
+                    transition_history_json: None,
                     created_at: row.get(15)?,
                     updated_at: row.get(16)?,
                     completed_at: row.get(17)?,
@@ -3955,6 +4043,7 @@ impl CheckpointDb {
                     goal_achieved: row.get::<_, Option<i32>>(13)?.map(|v| v != 0),
                     remaining_work: row.get(14)?,
                     summary_generated_at: row.get(15)?,
+                    transition_history_json: None,
                     created_at: row.get(16)?,
                     updated_at: row.get(17)?,
                     completed_at: row.get(18)?,
@@ -7532,7 +7621,8 @@ impl CheckpointDb {
                 r#"
                 SELECT id, name, description, category, tags, setup_steps, verification_steps,
                        agentic_steps, completion_steps, max_iterations, provider, model,
-                       skip_ai_summary, created_at, updated_at, log_source_selection
+                       skip_ai_summary, created_at, updated_at, log_source_selection,
+                       context_ids, disabled_context_ids, auto_include_contexts, prompt_template
                 FROM unified_workflows
                 ORDER BY updated_at DESC
                 "#,
@@ -7578,6 +7668,16 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(15)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    context_ids: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    disabled_context_ids: row
+                        .get::<_, Option<String>>(17)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
+                    prompt_template: row.get(19)?,
                 })
             })
             .map_err(|e| format!("Failed to query unified workflows: {}", e))?
@@ -7598,7 +7698,8 @@ impl CheckpointDb {
             r#"
             SELECT id, name, description, category, tags, setup_steps, verification_steps,
                    agentic_steps, completion_steps, max_iterations, provider, model,
-                   skip_ai_summary, created_at, updated_at, log_source_selection
+                   skip_ai_summary, created_at, updated_at, log_source_selection,
+                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template
             FROM unified_workflows
             WHERE id = ?1
             "#,
@@ -7641,6 +7742,16 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(15)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    context_ids: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    disabled_context_ids: row
+                        .get::<_, Option<String>>(17)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
+                    prompt_template: row.get(19)?,
                 })
             },
         );
@@ -7672,14 +7783,19 @@ impl CheckpointDb {
             serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
         let log_source_selection_json = serde_json::to_string(&request.log_source_selection)
             .unwrap_or_else(|_| "\"default\"".to_string());
+        let context_ids_json =
+            serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
+        let disabled_context_ids_json =
+            serde_json::to_string(&request.disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
             INSERT INTO unified_workflows (
                 id, name, description, category, tags, setup_steps, verification_steps,
                 agentic_steps, completion_steps, max_iterations, provider, model,
-                skip_ai_summary, created_at, updated_at, log_source_selection
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                skip_ai_summary, created_at, updated_at, log_source_selection,
+                context_ids, disabled_context_ids, auto_include_contexts, prompt_template
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             "#,
             params![
                 id,
@@ -7698,6 +7814,10 @@ impl CheckpointDb {
                 now,
                 now,
                 log_source_selection_json,
+                context_ids_json,
+                disabled_context_ids_json,
+                request.auto_include_contexts,
+                request.prompt_template,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -7726,14 +7846,19 @@ impl CheckpointDb {
             serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
         let log_source_selection_json = serde_json::to_string(&request.log_source_selection)
             .unwrap_or_else(|_| "\"default\"".to_string());
+        let context_ids_json =
+            serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
+        let disabled_context_ids_json =
+            serde_json::to_string(&request.disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
             INSERT INTO unified_workflows (
                 id, name, description, category, tags, setup_steps, verification_steps,
                 agentic_steps, completion_steps, max_iterations, provider, model,
-                skip_ai_summary, created_at, updated_at, log_source_selection
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                skip_ai_summary, created_at, updated_at, log_source_selection,
+                context_ids, disabled_context_ids, auto_include_contexts, prompt_template
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
             "#,
             params![
                 id,
@@ -7752,6 +7877,10 @@ impl CheckpointDb {
                 now,
                 now,
                 log_source_selection_json,
+                context_ids_json,
+                disabled_context_ids_json,
+                request.auto_include_contexts,
+                request.prompt_template,
             ],
         )
         .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
@@ -7806,6 +7935,24 @@ impl CheckpointDb {
             .log_source_selection
             .as_ref()
             .unwrap_or(&existing.log_source_selection);
+        // For prompt_template: if request has a value, use it; otherwise keep existing
+        // Empty string means clear the template (set to NULL)
+        let prompt_template: Option<&str> = match &request.prompt_template {
+            Some(val) if val.is_empty() => None, // Empty string clears the template
+            Some(val) => Some(val.as_str()),     // Non-empty string sets the template
+            None => existing.prompt_template.as_deref(), // Not provided keeps existing
+        };
+        let context_ids = request
+            .context_ids
+            .as_ref()
+            .unwrap_or(&existing.context_ids);
+        let disabled_context_ids = request
+            .disabled_context_ids
+            .as_ref()
+            .unwrap_or(&existing.disabled_context_ids);
+        let auto_include_contexts = request
+            .auto_include_contexts
+            .unwrap_or(existing.auto_include_contexts);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
         let setup_steps_json =
@@ -7818,6 +7965,10 @@ impl CheckpointDb {
             serde_json::to_string(completion_steps).unwrap_or_else(|_| "[]".to_string());
         let log_source_selection_json = serde_json::to_string(log_source_selection)
             .unwrap_or_else(|_| "\"default\"".to_string());
+        let context_ids_json =
+            serde_json::to_string(context_ids).unwrap_or_else(|_| "[]".to_string());
+        let disabled_context_ids_json =
+            serde_json::to_string(disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
@@ -7835,8 +7986,12 @@ impl CheckpointDb {
                 model = ?11,
                 skip_ai_summary = ?12,
                 updated_at = ?13,
-                log_source_selection = ?14
-            WHERE id = ?15
+                log_source_selection = ?14,
+                prompt_template = ?15,
+                context_ids = ?16,
+                disabled_context_ids = ?17,
+                auto_include_contexts = ?18
+            WHERE id = ?19
             "#,
             params![
                 name,
@@ -7853,6 +8008,10 @@ impl CheckpointDb {
                 skip_ai_summary,
                 now,
                 log_source_selection_json,
+                prompt_template,
+                context_ids_json,
+                disabled_context_ids_json,
+                auto_include_contexts,
                 id,
             ],
         )
@@ -7884,7 +8043,8 @@ impl CheckpointDb {
             r#"
             SELECT id, name, description, category, tags, setup_steps, verification_steps,
                    agentic_steps, completion_steps, max_iterations, provider, model,
-                   skip_ai_summary, created_at, updated_at, log_source_selection
+                   skip_ai_summary, created_at, updated_at, log_source_selection,
+                   context_ids, disabled_context_ids, auto_include_contexts, prompt_template
             FROM unified_workflows
             WHERE 1=1
             "#,
@@ -7959,6 +8119,16 @@ impl CheckpointDb {
                         .get::<_, Option<String>>(15)?
                         .and_then(|s| serde_json::from_str(&s).ok())
                         .unwrap_or_default(),
+                    context_ids: row
+                        .get::<_, Option<String>>(16)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    disabled_context_ids: row
+                        .get::<_, Option<String>>(17)?
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default(),
+                    auto_include_contexts: row.get::<_, Option<i32>>(18)?.unwrap_or(1) != 0,
+                    prompt_template: row.get(19)?,
                 })
             })
             .map_err(|e| format!("Failed to search unified workflows: {}", e))?
@@ -7991,6 +8161,10 @@ impl CheckpointDb {
             model: original.model,
             skip_ai_summary: original.skip_ai_summary,
             log_source_selection: original.log_source_selection,
+            context_ids: original.context_ids,
+            disabled_context_ids: original.disabled_context_ids,
+            auto_include_contexts: original.auto_include_contexts,
+            prompt_template: original.prompt_template,
         };
 
         self.create_unified_workflow(&create_request)

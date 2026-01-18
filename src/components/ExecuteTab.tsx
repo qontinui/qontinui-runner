@@ -30,13 +30,13 @@ import { MonitorSelector as _MonitorSelector } from "./MonitorSelector";
 import { QuickActionsPanel } from "./QuickActionsPanel";
 import { PageTutorialMenu } from "./tutorial";
 import { useExecution } from "../contexts/ExecutionContext";
-import type { SavedExploration, ExplorationConfig, SavedGuiWorkflow } from "../types";
+import type { SavedExploration, ExplorationConfig, SavedMacro } from "../types";
 import { useStateExplorer } from "../hooks/useStateExplorer";
 import { getAccentColors } from "@/design-system";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
-type TaskType = "gui" | "gui-workflows" | "tasks" | "workflows" | "scripts" | "state-explorer";
+type TaskType = "gui" | "macros" | "tasks" | "workflows" | "scripts" | "state-explorer";
 
 interface SavedPrompt {
   id: string;
@@ -114,11 +114,11 @@ const TASK_TYPES: TaskTypeConfig[] = [
     requiresConfig: true,
   },
   {
-    id: "gui-workflows",
-    label: "GUI Workflows",
+    id: "macros",
+    label: "Macros",
     icon: MousePointer2,
     accentColor: "orange",
-    description: "Sequential GUI action workflows",
+    description: "Sequential GUI action macros",
     requiresConfig: true,
   },
   {
@@ -172,7 +172,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   // Data state
   const [prompts, setPrompts] = useState<SavedPrompt[]>([]);
   const [aiWorkflows, setAiWorkflows] = useState<SavedAiWorkflow[]>([]);
-  const [guiWorkflows, setGuiWorkflows] = useState<SavedGuiWorkflow[]>([]);
+  const [macros, setMacros] = useState<SavedMacro[]>([]);
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
   const [explorations, setExplorations] = useState<SavedExploration[]>([]);
   const [loading, setLoading] = useState(true);
@@ -181,31 +181,31 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   // UI state for workflow dropdown
   const [showWorkflowDropdown, setShowWorkflowDropdown] = useState(false);
 
-  // UI state for GUI workflow selection
-  const [selectedGuiWorkflowId, setSelectedGuiWorkflowId] = useState<string | null>(null);
-  const [showGuiWorkflowDropdown, setShowGuiWorkflowDropdown] = useState(false);
+  // UI state for macro selection
+  const [selectedMacroId, setSelectedMacroId] = useState<string | null>(null);
+  const [showMacroDropdown, setShowMacroDropdown] = useState(false);
 
-  // Get selected GUI workflow
-  const selectedGuiWorkflow = guiWorkflows.find((w) => w.id === selectedGuiWorkflowId) || null;
+  // Get selected macro
+  const selectedMacro = macros.find((m) => m.id === selectedMacroId) || null;
 
   // Fetch library items
   const fetchLibraryItems = useCallback(async () => {
     setLoading(true);
     try {
-      const [promptsRes, workflowsRes, guiWorkflowsRes, scriptsRes, explorationsRes] =
+      const [promptsRes, workflowsRes, macrosRes, scriptsRes, explorationsRes] =
         await Promise.all([
           fetch(`${API_BASE}/prompts`).catch(() => ({ ok: false })),
           fetch(`${API_BASE}/ai-workflows`).catch(() => ({ ok: false })),
-          fetch(`${API_BASE}/gui-workflows`).catch(() => ({ ok: false })),
+          fetch(`${API_BASE}/macros`).catch(() => ({ ok: false })),
           fetch(`${API_BASE}/playwright/scripts`).catch(() => ({ ok: false })),
           fetch(`${API_BASE}/saved-explorations`).catch(() => ({ ok: false })),
         ]);
 
-      const [promptsData, workflowsData, guiWorkflowsData, scriptsData, explorationsData] =
+      const [promptsData, workflowsData, macrosData, scriptsData, explorationsData] =
         await Promise.all([
           promptsRes.ok ? (promptsRes as Response).json() : { success: false },
           workflowsRes.ok ? (workflowsRes as Response).json() : { success: false },
-          guiWorkflowsRes.ok ? (guiWorkflowsRes as Response).json() : { success: false },
+          macrosRes.ok ? (macrosRes as Response).json() : { success: false },
           scriptsRes.ok ? (scriptsRes as Response).json() : { success: false },
           explorationsRes.ok ? (explorationsRes as Response).json() : { success: false },
         ]);
@@ -218,7 +218,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
 
       if (promptsData.success) setPrompts(sortByDate(promptsData.data || []));
       if (workflowsData.success) setAiWorkflows(sortByDate(workflowsData.data || []));
-      if (guiWorkflowsData.success) setGuiWorkflows(sortByDate(guiWorkflowsData.data || []));
+      if (macrosData.success) setMacros(sortByDate(macrosData.data || []));
       if (scriptsData.success) setScripts(sortByDate(scriptsData.data || []));
       if (explorationsData.success) setExplorations(explorationsData.data || []);
     } catch (error) {
@@ -371,10 +371,10 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
     }
   };
 
-  const runGuiWorkflow = async (workflow: SavedGuiWorkflow) => {
-    setRunningId(workflow.id);
+  const runMacro = async (macro: SavedMacro) => {
+    setRunningId(macro.id);
     try {
-      const response = await fetch(`${API_BASE}/gui-workflows/${workflow.id}/run`, {
+      const response = await fetch(`${API_BASE}/macros/${macro.id}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
@@ -386,20 +386,20 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
         if (data.failed_steps === 0) {
           onLog(
             "success",
-            `Completed GUI workflow: ${workflow.name} (${data.successful_steps}/${data.total_steps} steps in ${data.duration_ms}ms)`,
+            `Completed macro: ${macro.name} (${data.successful_steps}/${data.total_steps} steps in ${data.duration_ms}ms)`,
           );
         } else {
           onLog(
             "warning",
-            `GUI workflow completed with errors: ${data.failed_steps}/${data.total_steps} steps failed`,
+            `Macro completed with errors: ${data.failed_steps}/${data.total_steps} steps failed`,
           );
         }
         onNavigateToActive();
       } else {
-        throw new Error(result.error || "Failed to run GUI workflow");
+        throw new Error(result.error || "Failed to run macro");
       }
     } catch (error) {
-      onLog("error", `Failed to run GUI workflow: ${error}`);
+      onLog("error", `Failed to run macro: ${error}`);
     } finally {
       setRunningId(null);
     }
@@ -474,10 +474,10 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
           </div>
         );
 
-      case "gui-workflows":
+      case "macros":
         return (
           <div className="space-y-4">
-            {/* Config Panel for GUI Workflows */}
+            {/* Config Panel for Macros */}
             <div className="panel max-w-2xl">
               <div className="panel-header">
                 <div className="panel-title">
@@ -514,48 +514,48 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
               </div>
             </div>
 
-            {/* Run Workflow Panel */}
+            {/* Run Macro Panel */}
             <div className="panel max-w-2xl">
               <div className="panel-header">
                 <div className="panel-title">
                   <MousePointer2 className={`w-4 h-4 ${getAccentColors("orange").text}`} />
-                  <span>Run GUI Workflow</span>
+                  <span>Run Macro</span>
                 </div>
               </div>
               <div className="panel-content space-y-3">
-                {/* Workflow Selector */}
+                {/* Macro Selector */}
                 <div className="relative">
                   <button
-                    onClick={() => setShowGuiWorkflowDropdown(!showGuiWorkflowDropdown)}
-                    disabled={guiWorkflows.length === 0}
+                    onClick={() => setShowMacroDropdown(!showMacroDropdown)}
+                    disabled={macros.length === 0}
                     className="w-full flex items-center justify-between px-3 py-2 text-sm bg-muted/50 border border-border rounded-lg hover:bg-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <span
-                      className={selectedGuiWorkflow ? "text-foreground" : "text-muted-foreground"}
+                      className={selectedMacro ? "text-foreground" : "text-muted-foreground"}
                     >
-                      {selectedGuiWorkflow
-                        ? `${selectedGuiWorkflow.name} (${selectedGuiWorkflow.steps.length} steps)`
-                        : guiWorkflows.length === 0
-                          ? "No workflows available"
-                          : "Select a workflow..."}
+                      {selectedMacro
+                        ? `${selectedMacro.name} (${selectedMacro.steps.length} steps)`
+                        : macros.length === 0
+                          ? "No macros available"
+                          : "Select a macro..."}
                     </span>
                     <ChevronDown
-                      className={`w-4 h-4 transition-transform ${showGuiWorkflowDropdown ? "rotate-180" : ""}`}
+                      className={`w-4 h-4 transition-transform ${showMacroDropdown ? "rotate-180" : ""}`}
                     />
                   </button>
 
                   {/* Dropdown */}
-                  {showGuiWorkflowDropdown && guiWorkflows.length > 0 && (
+                  {showMacroDropdown && macros.length > 0 && (
                     <div className="absolute z-20 w-full mt-1 bg-card border border-border rounded-lg shadow-lg max-h-64 overflow-y-auto">
-                      {guiWorkflows.map((workflow) => (
+                      {macros.map((macro) => (
                         <button
-                          key={workflow.id}
+                          key={macro.id}
                           onClick={() => {
-                            setSelectedGuiWorkflowId(workflow.id);
-                            setShowGuiWorkflowDropdown(false);
+                            setSelectedMacroId(macro.id);
+                            setShowMacroDropdown(false);
                           }}
                           className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/50 transition-colors ${
-                            selectedGuiWorkflowId === workflow.id
+                            selectedMacroId === macro.id
                               ? getAccentColors("orange").bg
                               : ""
                           }`}
@@ -565,16 +565,16 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                           />
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className="font-medium truncate">{workflow.name}</span>
+                              <span className="font-medium truncate">{macro.name}</span>
                               <span
                                 className={`text-[10px] ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-1.5 py-0.5 rounded flex-shrink-0`}
                               >
-                                {workflow.steps.length} steps
+                                {macro.steps.length} steps
                               </span>
                             </div>
-                            {workflow.description && (
+                            {macro.description && (
                               <p className="text-xs text-muted-foreground truncate">
-                                {workflow.description}
+                                {macro.description}
                               </p>
                             )}
                           </div>
@@ -586,20 +586,20 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
 
                 {/* Run Button */}
                 <button
-                  onClick={() => selectedGuiWorkflow && runGuiWorkflow(selectedGuiWorkflow)}
-                  disabled={!selectedGuiWorkflow || !execution.configLoaded || runningId !== null}
+                  onClick={() => selectedMacro && runMacro(selectedMacro)}
+                  disabled={!selectedMacro || !execution.configLoaded || runningId !== null}
                   className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium ${getAccentColors("orange").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
                 >
-                  {runningId !== null && runningId === selectedGuiWorkflowId ? (
+                  {runningId !== null && runningId === selectedMacroId ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
                     <Play className="w-4 h-4" />
                   )}
                   {!execution.configLoaded
                     ? "Load Config First"
-                    : !selectedGuiWorkflow
-                      ? "Select a Workflow"
-                      : "Run Workflow"}
+                    : !selectedMacro
+                      ? "Select a Macro"
+                      : "Run Macro"}
                 </button>
               </div>
             </div>
@@ -609,24 +609,24 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
               <QuickActionsPanel onLog={onLog} />
             </div>
 
-            {/* GUI Workflow Cards */}
+            {/* Macro Cards */}
             <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3">
               {loading ? (
                 <div className="col-span-full empty-state">
                   <Loader2 className="empty-state-icon animate-spin" />
                 </div>
-              ) : guiWorkflows.length === 0 ? (
+              ) : macros.length === 0 ? (
                 <div className="col-span-full empty-state">
                   <FolderOpen className="empty-state-icon" />
-                  <p className="empty-state-title">No GUI workflows found</p>
+                  <p className="empty-state-title">No macros found</p>
                   <p className="empty-state-desc">
-                    Create GUI workflows in the GUI Workflow Builder to run them here.
+                    Create macros in the Macro Builder to run them here.
                   </p>
                 </div>
               ) : (
-                guiWorkflows.map((workflow) => (
+                macros.map((macro) => (
                   <div
-                    key={workflow.id}
+                    key={macro.id}
                     className={`item-card ${!execution.configLoaded ? "opacity-60" : ""}`}
                   >
                     <div className="item-card-header">
@@ -635,34 +635,34 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                       />
                       <div className="item-card-content">
                         <div className="flex items-center gap-2">
-                          <h4 className="item-card-title">{workflow.name}</h4>
+                          <h4 className="item-card-title">{macro.name}</h4>
                           <span
                             className={`text-[10px] ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-1.5 py-0.5 rounded`}
                           >
-                            {workflow.steps.length} steps
+                            {macro.steps.length} steps
                           </span>
                         </div>
-                        {workflow.description && (
-                          <p className="item-card-desc">{workflow.description}</p>
+                        {macro.description && (
+                          <p className="item-card-desc">{macro.description}</p>
                         )}
-                        {workflow.run_count > 0 && (
+                        {macro.run_count > 0 && (
                           <div className="flex gap-3 mt-1.5 text-[10px] text-muted-foreground">
-                            <span>{workflow.run_count} runs</span>
+                            <span>{macro.run_count} runs</span>
                           </div>
                         )}
                       </div>
                     </div>
                     <button
-                      onClick={() => runGuiWorkflow(workflow)}
-                      disabled={!execution.configLoaded || runningId === workflow.id}
+                      onClick={() => runMacro(macro)}
+                      disabled={!execution.configLoaded || runningId === macro.id}
                       className={`w-full mt-3 flex items-center justify-center gap-2 py-2 text-xs rounded-lg ${getAccentColors("orange").bg} ${getAccentColors("orange").text} hover:opacity-80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
                     >
-                      {runningId === workflow.id ? (
+                      {runningId === macro.id ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       ) : (
                         <Play className="w-3.5 h-3.5" />
                       )}
-                      {!execution.configLoaded ? "Load Config First" : "Run Workflow"}
+                      {!execution.configLoaded ? "Load Config First" : "Run Macro"}
                     </button>
                   </div>
                 ))
@@ -914,7 +914,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
     switch (taskType) {
       case "gui":
         return "tab-accent-blue";
-      case "gui-workflows":
+      case "macros":
         return "tab-accent-orange";
       case "tasks":
         return "tab-accent-amber";
@@ -939,8 +939,8 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
             const count =
               taskType.id === "gui"
                 ? execution.workflows.length
-                : taskType.id === "gui-workflows"
-                  ? guiWorkflows.length
+                : taskType.id === "macros"
+                  ? macros.length
                   : taskType.id === "tasks"
                     ? prompts.length
                     : taskType.id === "workflows"
