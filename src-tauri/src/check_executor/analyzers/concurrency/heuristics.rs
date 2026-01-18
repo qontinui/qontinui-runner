@@ -16,6 +16,19 @@ const THREAD_LOCAL_INDICATORS: &[&str] = &[
     "per_thread",
 ];
 
+/// Names that indicate Python loggers (thread-safe by design)
+const LOGGER_NAMES: &[&str] = &["logger", "log", "_logger", "_log", "LOGGER", "LOG"];
+
+/// Check if a state name appears to be a logger
+pub fn is_logger(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    // Exact match or ends with logger/log
+    LOGGER_NAMES.iter().any(|l| name_lower == l.to_lowercase())
+        || name_lower.ends_with("_logger")
+        || name_lower.ends_with("_log")
+        || name_lower.ends_with("logger")
+}
+
 /// Names that indicate constants (typically uppercase)
 fn is_constant_name(name: &str) -> bool {
     // All uppercase with underscores
@@ -180,6 +193,11 @@ pub fn filter_false_positives(
                 return true;
             };
 
+            // Filter out loggers (Python logging is thread-safe)
+            if is_logger(&state.name) {
+                return false;
+            }
+
             // Filter out thread-local storage
             if is_thread_local(&state.name) {
                 return false;
@@ -200,10 +218,29 @@ pub fn filter_false_positives(
                 return false;
             }
 
+            // Filter out single-assignment module-level state (only one write, at definition)
+            if is_single_assignment(state) {
+                return false;
+            }
+
             // Keep the issue
             true
         })
         .collect()
+}
+
+/// Check if a state is only assigned once (at definition time)
+pub fn is_single_assignment(state: &SharedState) -> bool {
+    use super::types::AccessType;
+
+    let write_count = state.accesses.iter()
+        .filter(|a| matches!(a.access_type, AccessType::Write | AccessType::Compound))
+        .count();
+
+    // If there's only one write and it's at the definition line, it's likely safe
+    write_count <= 1 && state.accesses.iter()
+        .filter(|a| matches!(a.access_type, AccessType::Write))
+        .all(|a| a.line == state.definition_line)
 }
 
 /// Determine if a state type is inherently thread-safe

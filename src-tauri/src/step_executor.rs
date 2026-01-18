@@ -3602,6 +3602,12 @@ impl StepExecutor {
         use tokio::process::Command;
         use tokio::time::{timeout, Duration};
 
+        // Debug logging to trace check_type values
+        info!(
+            "execute_check_step: step_name={:?}, check_type={:?}, check_command={:?}, working_dir={:?}",
+            step.name, step.check_type, step.check_command, step.check_working_directory
+        );
+
         let check_type = step.check_type.as_deref().unwrap_or("custom_command");
         let step_name = step.name.as_deref().unwrap_or("Check");
         // Note: Due to serde alias conflict, "working_directory" goes to shell_command_working_directory
