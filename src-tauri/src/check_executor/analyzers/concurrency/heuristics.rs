@@ -17,16 +17,28 @@ const THREAD_LOCAL_INDICATORS: &[&str] = &[
 ];
 
 /// Names that indicate Python loggers (thread-safe by design)
-const LOGGER_NAMES: &[&str] = &["logger", "log", "_logger", "_log", "LOGGER", "LOG"];
+const LOGGER_EXACT_NAMES: &[&str] = &["logger", "log", "_logger", "_log"];
 
 /// Check if a state name appears to be a logger
 pub fn is_logger(name: &str) -> bool {
     let name_lower = name.to_lowercase();
-    // Exact match or ends with logger/log
-    LOGGER_NAMES.iter().any(|l| name_lower == l.to_lowercase())
-        || name_lower.ends_with("_logger")
-        || name_lower.ends_with("_log")
-        || name_lower.ends_with("logger")
+
+    // Exact match (case-insensitive)
+    if LOGGER_EXACT_NAMES.iter().any(|l| name_lower == *l) {
+        return true;
+    }
+
+    // Ends with _logger or _log (with underscore to avoid false positives like "catalog")
+    if name_lower.ends_with("_logger") || name_lower.ends_with("_log") {
+        return true;
+    }
+
+    // Common pattern: mylogger, applogger (ends with "logger" but not just "log")
+    if name_lower.ends_with("logger") && name_lower.len() > 6 {
+        return true;
+    }
+
+    false
 }
 
 /// Names that indicate constants (typically uppercase)
@@ -294,5 +306,32 @@ mod tests {
         assert!(has_matching_lock("data", &locks));
         assert!(has_matching_lock("cache", &locks));
         assert!(!has_matching_lock("other", &locks));
+    }
+
+    #[test]
+    fn test_is_logger() {
+        // Standard logger names (exact match)
+        assert!(is_logger("logger"));
+        assert!(is_logger("log"));
+        assert!(is_logger("_logger"));
+        assert!(is_logger("_log"));
+        assert!(is_logger("LOGGER")); // case-insensitive
+        assert!(is_logger("LOG"));
+
+        // Module-specific loggers (ends with _logger or _log)
+        assert!(is_logger("module_logger"));
+        assert!(is_logger("app_log"));
+
+        // Pattern: ends with "logger"
+        assert!(is_logger("mylogger"));
+        assert!(is_logger("applogger"));
+
+        // Non-logger names - must NOT match
+        assert!(!is_logger("counter"));
+        assert!(!is_logger("data"));
+        assert!(!is_logger("config"));
+        assert!(!is_logger("catalog")); // ends with "log" but not "_log"
+        assert!(!is_logger("dialog"));  // ends with "log" but not "_log"
+        assert!(!is_logger("analog"));  // ends with "log" but not "_log"
     }
 }
