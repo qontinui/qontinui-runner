@@ -13,29 +13,30 @@ const API_BASE = "http://localhost:9876";
 const POLL_INTERVAL_MS = 2000;
 
 /**
- * Response from the step executions API.
+ * Response from the current-execution/steps API.
  */
-interface StepExecutionResponse {
+interface CurrentExecutionStepsResponse {
   success: boolean;
-  data?: {
-    executions: Array<{
-      id: string;
-      step_type: string;
-      step_name: string;
-      status: string;
-      start_time?: number;
-      end_time?: number;
-      duration_ms?: number;
-      error?: string;
-      output?: string;
-      // Shell command specific
-      command?: string;
-      working_directory?: string;
-      exit_code?: number;
-      stdout?: string;
-      stderr?: string;
-    }>;
-  };
+  task_run_id: string | null;
+  workflow_name?: string;
+  executions: Array<{
+    id: string;
+    step_type: string;
+    step_name: string;
+    status: string;
+    start_time?: number;
+    end_time?: number;
+    duration_ms?: number;
+    error?: string;
+    output?: string;
+    // Shell command specific
+    command?: string;
+    working_directory?: string;
+    exit_code?: number;
+    stdout?: string;
+    stderr?: string;
+  }>;
+  count: number;
 }
 
 /**
@@ -48,15 +49,15 @@ export function useShellCommandData(): ShellCommandData {
   const [startTime, setStartTime] = useState<number | null>(null);
   const [elapsedTime, setElapsedTime] = useState(0);
 
-  // Fetch shell command executions
+  // Fetch shell command executions from current-execution/steps API
   const fetchCommands = useCallback(async () => {
     try {
-      // Try to fetch from step executions endpoint filtered by type
-      const response = await fetch(`${API_BASE}/step-executions?type=shell_command`);
+      // Fetch from current-execution/steps with shell_command filter
+      const response = await fetch(`${API_BASE}/current-execution/steps?step_type=shell`);
       if (response.ok) {
-        const data: StepExecutionResponse = await response.json();
-        if (data.success && data.data?.executions) {
-          const shellCommands: ShellCommandExecution[] = data.data.executions.map((exec) => ({
+        const data: CurrentExecutionStepsResponse = await response.json();
+        if (data.success && data.executions) {
+          const shellCommands: ShellCommandExecution[] = data.executions.map((exec) => ({
             id: exec.id,
             name: exec.step_name || exec.command || "Shell Command",
             status: exec.status as ShellCommandExecution["status"],
@@ -85,7 +86,7 @@ export function useShellCommandData(): ShellCommandData {
         }
       }
     } catch {
-      // Silently ignore - API may not be available or endpoint doesn't exist yet
+      // Silently ignore - API may not be available
     } finally {
       setIsLoading(false);
     }

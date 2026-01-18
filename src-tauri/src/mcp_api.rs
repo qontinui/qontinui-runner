@@ -18077,6 +18077,11 @@ pub fn create_router(
             "/unified-workflows/:id/duplicate",
             post(duplicate_unified_workflow),
         )
+        .route(
+            "/unified-workflows/:id/export",
+            get(export_unified_workflow),
+        )
+        .route("/unified-workflows/import", post(import_unified_workflow))
         .route("/unified-workflows/:id/run", post(run_unified_workflow))
         // AWAS (Application Web Automation Specification) routes
         .route("/awas/discover", post(awas_discover))
