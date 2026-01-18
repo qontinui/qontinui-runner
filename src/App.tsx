@@ -316,19 +316,20 @@ function migrateTabId(stored: string | null): MainTabId {
     // Old observe tab migrations to new structure
     logs: "run-dashboard",
     ai: "run-ai-output",
-    "monitor-summary": "run-summary",
+    "run-summary": "run-recap", // Summary merged into Recap
+    "monitor-summary": "run-recap", // Summary merged into Recap
     "monitor-findings": "run-findings",
     "monitor-issues": "run-findings", // Issues merged into Findings
-    "monitor-learnings": "run-summary", // Learnings removed, map to summary
+    "monitor-learnings": "run-recap", // Learnings removed, map to recap
     "monitor-verification": "run-state-explorer",
     "monitor-state-explorer": "run-state-explorer",
     "monitor-statistics": "run-statistics",
     "monitor-discoveries": "discoveries",
     // Legacy monitor tab migrations
-    monitor: "run-summary",
+    monitor: "run-recap", // Map to recap
     issues: "run-findings", // Issues merged into Findings
     "run-issues": "run-findings", // Issues merged into Findings
-    learnings: "run-summary",
+    learnings: "run-recap", // Map to recap
     verification: "run-state-explorer",
     "run-verification": "run-state-explorer",
     "run-exploration": "run-state-explorer",
@@ -775,16 +776,7 @@ function AppContent() {
           </RunSelectionProvider>
         );
 
-      case "run-summary":
-        return (
-          <RunSelectionProvider>
-            <RunPageLayout title="Summary" icon={ClipboardList}>
-              <div className="h-full overflow-hidden">
-                <ExecutionSummaryTab />
-              </div>
-            </RunPageLayout>
-          </RunSelectionProvider>
-        );
+      // run-summary is now migrated to run-recap (handled by migrateTabId)
 
       case "run-findings":
         return (
@@ -1076,12 +1068,7 @@ function AppContent() {
         );
 
       // ========== MONITOR TABS ==========
-      case "monitor-summary":
-        return (
-          <div className="h-full overflow-hidden">
-            <ExecutionSummaryTab />
-          </div>
-        );
+      // monitor-summary is now migrated to run-recap (handled by migrateTabId)
 
       case "monitor-findings":
         return (
