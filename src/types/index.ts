@@ -296,6 +296,10 @@ export type {
   ApiRequestStep,
   HttpMethod,
   ApiContentType,
+  // Export/Import types
+  WorkflowExportManifest,
+  WorkflowExport,
+  WorkflowImportResult,
 } from "./unified-workflow";
 
 // Re-export unified workflow types with original names for internal use

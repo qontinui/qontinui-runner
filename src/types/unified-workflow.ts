@@ -1406,3 +1406,43 @@ export function canStepExistInPhase(stepType: UnifiedStep["type"], phase: Workfl
       return false;
   }
 }
+
+// =============================================================================
+// Export/Import Types
+// =============================================================================
+
+/**
+ * Manifest for exported workflow files
+ */
+export interface WorkflowExportManifest {
+  /** Export format version */
+  version: string;
+  /** When the export was created (ISO 8601) */
+  exported_at: string;
+  /** App version that created the export */
+  app_version: string;
+  /** Type of content */
+  content_type: "unified_workflow";
+}
+
+/**
+ * A single workflow export file
+ */
+export interface WorkflowExport {
+  /** Export manifest with version info */
+  manifest: WorkflowExportManifest;
+  /** The workflow data */
+  workflow: UnifiedWorkflow;
+}
+
+/**
+ * Result of importing a workflow
+ */
+export interface WorkflowImportResult {
+  /** The imported workflow */
+  workflow: UnifiedWorkflow;
+  /** Whether an existing workflow was overwritten */
+  overwritten: boolean;
+  /** Original ID if it was changed */
+  original_id: string | null;
+}
