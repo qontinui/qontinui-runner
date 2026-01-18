@@ -245,14 +245,19 @@ pub fn filter_false_positives(
 pub fn is_single_assignment(state: &SharedState) -> bool {
     use super::types::AccessType;
 
-    let write_count = state.accesses.iter()
+    let write_count = state
+        .accesses
+        .iter()
         .filter(|a| matches!(a.access_type, AccessType::Write | AccessType::Compound))
         .count();
 
     // If there's only one write and it's at the definition line, it's likely safe
-    write_count <= 1 && state.accesses.iter()
-        .filter(|a| matches!(a.access_type, AccessType::Write))
-        .all(|a| a.line == state.definition_line)
+    write_count <= 1
+        && state
+            .accesses
+            .iter()
+            .filter(|a| matches!(a.access_type, AccessType::Write))
+            .all(|a| a.line == state.definition_line)
 }
 
 /// Determine if a state type is inherently thread-safe
@@ -331,7 +336,7 @@ mod tests {
         assert!(!is_logger("data"));
         assert!(!is_logger("config"));
         assert!(!is_logger("catalog")); // ends with "log" but not "_log"
-        assert!(!is_logger("dialog"));  // ends with "log" but not "_log"
-        assert!(!is_logger("analog"));  // ends with "log" but not "_log"
+        assert!(!is_logger("dialog")); // ends with "log" but not "_log"
+        assert!(!is_logger("analog")); // ends with "log" but not "_log"
     }
 }

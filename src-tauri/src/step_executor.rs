@@ -1017,7 +1017,11 @@ impl StepExecutor {
             duration_ms,
         };
 
-        if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event_input) {
+        if let Err(e) = self
+            .app_state
+            .checkpoint_db
+            .create_task_run_event(&event_input)
+        {
             warn!("Failed to log step event: {}", e);
         }
     }
@@ -1428,7 +1432,10 @@ impl StepExecutor {
         );
 
         // Get the task run ID for event logging (prefer self.task_run_id, fall back to execution_id)
-        let log_task_run_id = self.task_run_id.clone().unwrap_or_else(|| execution_id.to_string());
+        let log_task_run_id = self
+            .task_run_id
+            .clone()
+            .unwrap_or_else(|| execution_id.to_string());
 
         for (index, step) in steps.iter().enumerate() {
             let step_name = step.name.clone().unwrap_or_else(|| step.step_type.clone());
@@ -1448,7 +1455,13 @@ impl StepExecutor {
                 step,
                 index,
                 "start",
-                &format!("Starting step {}/{}: {} ({})", index + 1, steps.len(), step_name, step.step_type),
+                &format!(
+                    "Starting step {}/{}: {} ({})",
+                    index + 1,
+                    steps.len(),
+                    step_name,
+                    step.step_type
+                ),
                 None,
                 None,
                 None,
@@ -1483,7 +1496,12 @@ impl StepExecutor {
                     step,
                     index,
                     "complete",
-                    &format!("Step {}/{} completed successfully in {}ms", index + 1, steps.len(), duration_ms),
+                    &format!(
+                        "Step {}/{} completed successfully in {}ms",
+                        index + 1,
+                        steps.len(),
+                        duration_ms
+                    ),
                     Some(duration_ms as i64),
                     None,
                     None,
@@ -1722,7 +1740,9 @@ impl StepExecutor {
             .unwrap_or(match step.step_type.as_str() {
                 "workflow" => 300,
                 "state" => 300,
-                _ => 30,
+                "check" => 120, // 2 minutes for code checks (Rust/TypeScript can be slow)
+                "test" => 300,  // 5 minutes for tests
+                _ => 60,        // 1 minute default for other steps
             });
 
         match step.step_type.as_str() {
@@ -3480,7 +3500,7 @@ impl StepExecutor {
             let output_data = if stdout.is_empty() {
                 None
             } else {
-                Some(stdout)
+                Some(stdout.clone())
             };
             (true, None, output_data)
         } else if fail_on_error {
@@ -3505,7 +3525,7 @@ impl StepExecutor {
             } else {
                 format!("(ignored) Command failed with exit code {:?}", exit_code)
             };
-            (true, Some(error_msg), Some(stdout))
+            (true, Some(error_msg), Some(stdout.clone()))
         };
 
         // Build completed action node
@@ -3598,7 +3618,11 @@ impl StepExecutor {
                 duration_ms: Some(duration_ms as i64),
             };
 
-            if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event_input) {
+            if let Err(e) = self
+                .app_state
+                .checkpoint_db
+                .create_task_run_event(&event_input)
+            {
                 warn!("Failed to log shell command event: {}", e);
             }
         }

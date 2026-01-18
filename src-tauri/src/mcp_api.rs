@@ -200,14 +200,34 @@ fn refetch_unified_workflow_steps(
                     monitor_index: Some(monitor),
                     check_type: get_str(&["check_type", "checkType"]),
                     check_command: get_str(&["command", "check_command", "checkCommand"]),
-                    check_working_directory: get_str(&["working_directory", "workingDirectory", "check_working_directory", "checkWorkingDirectory"]),
-                    check_auto_fix: get_bool(&["auto_fix", "autoFix", "check_auto_fix", "checkAutoFix"]),
+                    check_working_directory: get_str(&[
+                        "working_directory",
+                        "workingDirectory",
+                        "check_working_directory",
+                        "checkWorkingDirectory",
+                    ]),
+                    check_auto_fix: get_bool(&[
+                        "auto_fix",
+                        "autoFix",
+                        "check_auto_fix",
+                        "checkAutoFix",
+                    ]),
                     test_id: get_str(&["test_id", "testId"]),
                     test_type: get_str(&["test_type", "testType"]),
                     test_is_critical: get_bool(&["is_critical", "isCritical"]),
                     shell_command: get_str(&["command", "shell_command", "shellCommand"]),
-                    shell_command_working_directory: get_str(&["working_directory", "workingDirectory", "shell_command_working_directory", "shellCommandWorkingDirectory"]),
-                    shell_command_fail_on_error: get_bool(&["fail_on_error", "failOnError", "shell_command_fail_on_error", "shellCommandFailOnError"]),
+                    shell_command_working_directory: get_str(&[
+                        "working_directory",
+                        "workingDirectory",
+                        "shell_command_working_directory",
+                        "shellCommandWorkingDirectory",
+                    ]),
+                    shell_command_fail_on_error: get_bool(&[
+                        "fail_on_error",
+                        "failOnError",
+                        "shell_command_fail_on_error",
+                        "shellCommandFailOnError",
+                    ]),
                     prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
                     is_setup: get_bool(&["isSetup", "is_setup"]),
                     ..Default::default()
@@ -17124,7 +17144,10 @@ async fn export_unified_workflow(
             error!("Failed to export unified workflow: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to export unified workflow: {}", e))),
+                Json(api_error(format!(
+                    "Failed to export unified workflow: {}",
+                    e
+                ))),
             ))
         }
     }
