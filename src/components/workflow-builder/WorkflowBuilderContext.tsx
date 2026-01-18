@@ -23,6 +23,8 @@ import type {
   CompletionStep,
   WorkflowPhase,
   WorkflowFeatures,
+  WorkflowExport,
+  WorkflowImportResult,
 } from "../../types";
 import {
   detectWorkflowFeatures,
@@ -439,6 +441,13 @@ interface WorkflowBuilderContextValue {
   // API operations
   saveWorkflow: () => Promise<UnifiedWorkflow | null>;
   loadWorkflow: (id: string) => Promise<boolean>;
+
+  // Export/Import operations
+  exportWorkflow: (id: string) => Promise<WorkflowExport | null>;
+  importWorkflow: (
+    workflow: UnifiedWorkflow,
+    conflictStrategy?: "keep" | "generate" | "overwrite",
+  ) => Promise<WorkflowImportResult | null>;
 }
 
 // =============================================================================
