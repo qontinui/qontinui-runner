@@ -748,6 +748,73 @@ export function WorkflowBuilderProvider({
     }
   }, []);
 
+  // Export a workflow by ID
+  const exportWorkflow = useCallback(
+    async (id: string): Promise<WorkflowExport | null> => {
+      dispatch({ type: "SET_LOADING", payload: true });
+      dispatch({ type: "SET_ERROR", payload: null });
+
+      try {
+        const response = await fetch(`${API_BASE}/unified-workflows/${id}/export`);
+        const data = await response.json();
+
+        if (data.success && data.data) {
+          dispatch({ type: "SET_LOADING", payload: false });
+          return data.data as WorkflowExport;
+        } else {
+          dispatch({ type: "SET_ERROR", payload: data.error || "Failed to export workflow" });
+          dispatch({ type: "SET_LOADING", payload: false });
+          return null;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to export workflow";
+        dispatch({ type: "SET_ERROR", payload: message });
+        dispatch({ type: "SET_LOADING", payload: false });
+        return null;
+      }
+    },
+    [],
+  );
+
+  // Import a workflow
+  const importWorkflow = useCallback(
+    async (
+      workflow: UnifiedWorkflow,
+      conflictStrategy: "keep" | "generate" | "overwrite" = "generate",
+    ): Promise<WorkflowImportResult | null> => {
+      dispatch({ type: "SET_LOADING", payload: true });
+      dispatch({ type: "SET_ERROR", payload: null });
+
+      try {
+        const response = await fetch(`${API_BASE}/unified-workflows/import`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            workflow,
+            conflict_strategy: conflictStrategy,
+          }),
+        });
+
+        const data = await response.json();
+
+        if (data.success && data.data) {
+          dispatch({ type: "SET_LOADING", payload: false });
+          return data.data as WorkflowImportResult;
+        } else {
+          dispatch({ type: "SET_ERROR", payload: data.error || "Failed to import workflow" });
+          dispatch({ type: "SET_LOADING", payload: false });
+          return null;
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to import workflow";
+        dispatch({ type: "SET_ERROR", payload: message });
+        dispatch({ type: "SET_LOADING", payload: false });
+        return null;
+      }
+    },
+    [],
+  );
+
   const value: WorkflowBuilderContextValue = {
     state,
     features,
@@ -772,6 +839,8 @@ export function WorkflowBuilderProvider({
     markSaved,
     saveWorkflow,
     loadWorkflow,
+    exportWorkflow,
+    importWorkflow,
   };
 
   return (
