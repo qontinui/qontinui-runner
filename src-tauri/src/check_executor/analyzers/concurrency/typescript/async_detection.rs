@@ -14,7 +14,7 @@ use tree_sitter::{Node, Tree};
 pub fn detect_async_patterns(
     tree: &Tree,
     source: &str,
-    file: &str,
+    _file: &str,
     ctx: &mut AnalysisContext,
 ) -> u32 {
     let root = tree.root_node();

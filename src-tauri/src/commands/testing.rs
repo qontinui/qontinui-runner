@@ -1233,7 +1233,9 @@ pub fn analyze_page_playwright(
         if !bridge.is_running() {
             return CommandResponse {
                 success: false,
-                message: Some("Python executor not running. Please start the executor first.".to_string()),
+                message: Some(
+                    "Python executor not running. Please start the executor first.".to_string(),
+                ),
                 data: None,
             };
         }
@@ -1258,7 +1260,11 @@ pub fn analyze_page_playwright(
                 } else {
                     CommandResponse {
                         success: false,
-                        message: Some(response.error.unwrap_or_else(|| "Analysis failed".to_string())),
+                        message: Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "Analysis failed".to_string()),
+                        ),
                         data: None,
                     }
                 }
@@ -1394,7 +1400,9 @@ pub fn analyze_page_vision(
         if !bridge.is_running() {
             return CommandResponse {
                 success: false,
-                message: Some("Python executor not running. Please start the executor first.".to_string()),
+                message: Some(
+                    "Python executor not running. Please start the executor first.".to_string(),
+                ),
                 data: None,
             };
         }
@@ -1419,7 +1427,11 @@ pub fn analyze_page_vision(
                 } else {
                     CommandResponse {
                         success: false,
-                        message: Some(response.error.unwrap_or_else(|| "Analysis failed".to_string())),
+                        message: Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "Analysis failed".to_string()),
+                        ),
                         data: None,
                     }
                 }

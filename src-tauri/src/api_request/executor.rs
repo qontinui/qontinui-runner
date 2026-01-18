@@ -82,12 +82,12 @@ impl ApiRequestExecutor {
             .as_ref()
             .map(|h| self.variable_resolver.resolve_map(h))
             .unwrap_or_default();
-        let resolved_body = config.body.as_ref().map(|b| self.variable_resolver.resolve(b));
+        let resolved_body = config
+            .body
+            .as_ref()
+            .map(|b| self.variable_resolver.resolve(b));
 
-        debug!(
-            "Executing API request: {} {}",
-            config.method, resolved_url
-        );
+        debug!("Executing API request: {} {}", config.method, resolved_url);
 
         // 2. Build request
         let timeout = Duration::from_millis(config.timeout_ms.unwrap_or(30000));
@@ -170,7 +170,10 @@ impl ApiRequestExecutor {
         // Determine response type and handle accordingly
         let (response_body_type, response_body, response_file_path, response_size_bytes) =
             if is_binary_content(&content_type) {
-                let bytes = response.bytes().await.context("Failed to read response body")?;
+                let bytes = response
+                    .bytes()
+                    .await
+                    .context("Failed to read response body")?;
                 let size = bytes.len();
 
                 // Save binary to file
@@ -178,7 +181,10 @@ impl ApiRequestExecutor {
 
                 ("binary".to_string(), None, Some(file_path), size)
             } else {
-                let text = response.text().await.context("Failed to read response body")?;
+                let text = response
+                    .text()
+                    .await
+                    .context("Failed to read response body")?;
                 let size = text.len();
                 let body_type = if content_type.contains("json") {
                     "json"
@@ -526,11 +532,9 @@ fn compare_values(actual: &str, expected: &str, operator: &str) -> bool {
     match operator {
         "equals" => actual == expected,
         "contains" => actual.contains(expected),
-        "matches" => {
-            regex::Regex::new(expected)
-                .map(|re| re.is_match(actual))
-                .unwrap_or(false)
-        }
+        "matches" => regex::Regex::new(expected)
+            .map(|re| re.is_match(actual))
+            .unwrap_or(false),
         "greater_than" => {
             let a: f64 = actual.parse().unwrap_or(0.0);
             let e: f64 = expected.parse().unwrap_or(0.0);

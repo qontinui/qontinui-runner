@@ -32,7 +32,11 @@ pub fn analyze_with_defaults(working_dir: &str) -> Result<ParsedOutput, String> 
 }
 
 /// Analyze Python files for god classes with custom thresholds
-pub fn analyze(working_dir: &str, max_lines: u32, max_methods: u32) -> Result<ParsedOutput, String> {
+pub fn analyze(
+    working_dir: &str,
+    max_lines: u32,
+    max_methods: u32,
+) -> Result<ParsedOutput, String> {
     let root = Path::new(working_dir);
     if !root.exists() {
         return Err(format!("Directory does not exist: {}", working_dir));
@@ -123,9 +127,18 @@ pub fn analyze(working_dir: &str, max_lines: u32, max_methods: u32) -> Result<Pa
                 ]),
             }),
             tool_data: HashMap::from([
-                ("max_lines_threshold".to_string(), serde_json::json!(max_lines)),
-                ("max_methods_threshold".to_string(), serde_json::json!(max_methods)),
-                ("total_classes_analyzed".to_string(), serde_json::json!(total_classes)),
+                (
+                    "max_lines_threshold".to_string(),
+                    serde_json::json!(max_lines),
+                ),
+                (
+                    "max_methods_threshold".to_string(),
+                    serde_json::json!(max_methods),
+                ),
+                (
+                    "total_classes_analyzed".to_string(),
+                    serde_json::json!(total_classes),
+                ),
             ]),
         },
     })
@@ -176,7 +189,11 @@ fn analyze_class(class_node: &tree_sitter::Node, source: &str) -> Option<ClassIn
     // Find the class name
     let name = class_node
         .child_by_field_name("name")
-        .map(|n| n.utf8_text(source.as_bytes()).unwrap_or("unknown").to_string())
+        .map(|n| {
+            n.utf8_text(source.as_bytes())
+                .unwrap_or("unknown")
+                .to_string()
+        })
         .unwrap_or_else(|| "unknown".to_string());
 
     let start_line = class_node.start_position().row as u32 + 1; // 1-based

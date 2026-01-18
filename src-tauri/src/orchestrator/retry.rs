@@ -158,12 +158,7 @@ impl RetryState {
     }
 
     /// Record a new retry attempt.
-    pub fn record_attempt(
-        &mut self,
-        error: &str,
-        delay_ms: u64,
-        feedback_injected: bool,
-    ) {
+    pub fn record_attempt(&mut self, error: &str, delay_ms: u64, feedback_injected: bool) {
         self.attempt += 1;
         self.last_error = Some(error.to_string());
         self.last_attempt_at = Some(chrono::Utc::now().to_rfc3339());
@@ -271,10 +266,7 @@ impl RetryService {
         // Check if max retries exceeded
         if state.exhausted(self.config.max_retries) {
             return RetryDecision::GiveUp {
-                reason: format!(
-                    "Max retries ({}) exceeded",
-                    self.config.max_retries
-                ),
+                reason: format!("Max retries ({}) exceeded", self.config.max_retries),
             };
         }
 
@@ -311,12 +303,19 @@ impl RetryService {
 
         for pattern in &self.config.retryable_errors {
             if error_lower.contains(&pattern.to_lowercase()) {
-                debug!("Error matches retryable pattern '{}': {}", pattern, truncate_error(error, 50));
+                debug!(
+                    "Error matches retryable pattern '{}': {}",
+                    pattern,
+                    truncate_error(error, 50)
+                );
                 return true;
             }
         }
 
-        debug!("Error does not match any retryable patterns: {}", truncate_error(error, 50));
+        debug!(
+            "Error does not match any retryable patterns: {}",
+            truncate_error(error, 50)
+        );
         false
     }
 
@@ -387,9 +386,15 @@ impl RetryService {
         if error_lower.contains("timeout") {
             Some("The operation timed out. Consider breaking the task into smaller steps or checking for blocking operations.".to_string())
         } else if error_lower.contains("rate limit") || error_lower.contains("429") {
-            Some("Rate limit encountered. The system will wait before retrying. No action needed.".to_string())
+            Some(
+                "Rate limit encountered. The system will wait before retrying. No action needed."
+                    .to_string(),
+            )
         } else if error_lower.contains("connection") {
-            Some("Network connectivity issue. Check if external services are accessible.".to_string())
+            Some(
+                "Network connectivity issue. Check if external services are accessible."
+                    .to_string(),
+            )
         } else if error_lower.contains("permission") || error_lower.contains("access denied") {
             Some("Permission error. Check file/resource permissions.".to_string())
         } else if error_lower.contains("not found") || error_lower.contains("404") {
@@ -439,10 +444,7 @@ fn truncate_error(error: &str, max_len: usize) -> String {
 /// Execute an async operation with retry logic.
 ///
 /// This is a helper function that wraps an operation with automatic retry.
-pub async fn with_retry<F, Fut, T, E>(
-    service: &RetryService,
-    mut operation: F,
-) -> Result<T, E>
+pub async fn with_retry<F, Fut, T, E>(service: &RetryService, mut operation: F) -> Result<T, E>
 where
     F: FnMut(Option<String>) -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
@@ -453,9 +455,10 @@ where
     loop {
         // Get feedback from previous attempt (if any)
         let feedback = if state.attempt > 0 {
-            state.last_error.as_ref().map(|e| {
-                service.build_feedback_prompt(e, &state.error_history)
-            })
+            state
+                .last_error
+                .as_ref()
+                .map(|e| service.build_feedback_prompt(e, &state.error_history))
         } else {
             None
         };
@@ -467,14 +470,21 @@ where
                 let error_str = error.to_string();
 
                 match service.should_retry(&error_str, &state) {
-                    RetryDecision::Retry { delay_ms, feedback: _ } => {
+                    RetryDecision::Retry {
+                        delay_ms,
+                        feedback: _,
+                    } => {
                         warn!(
                             "Operation failed, retrying in {}ms: {}",
                             delay_ms,
                             truncate_error(&error_str, 100)
                         );
 
-                        state.record_attempt(&error_str, delay_ms, service.config.feedback_injection);
+                        state.record_attempt(
+                            &error_str,
+                            delay_ms,
+                            service.config.feedback_injection,
+                        );
 
                         // Wait before retry
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -561,10 +571,10 @@ mod tests {
         let service = RetryService::new(config);
 
         // base_delay * 2^attempt
-        assert_eq!(service.calculate_delay(0), 1000);  // 1000 * 2^0 = 1000
-        assert_eq!(service.calculate_delay(1), 2000);  // 1000 * 2^1 = 2000
-        assert_eq!(service.calculate_delay(2), 4000);  // 1000 * 2^2 = 4000
-        assert_eq!(service.calculate_delay(3), 8000);  // 1000 * 2^3 = 8000
+        assert_eq!(service.calculate_delay(0), 1000); // 1000 * 2^0 = 1000
+        assert_eq!(service.calculate_delay(1), 2000); // 1000 * 2^1 = 2000
+        assert_eq!(service.calculate_delay(2), 4000); // 1000 * 2^2 = 4000
+        assert_eq!(service.calculate_delay(3), 8000); // 1000 * 2^3 = 8000
     }
 
     #[test]
@@ -621,15 +631,13 @@ mod tests {
     #[test]
     fn test_build_feedback_prompt() {
         let service = RetryService::with_defaults();
-        let history = vec![
-            RetryAttempt {
-                attempt_number: 1,
-                error: "First error".to_string(),
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-                delay_ms: 1000,
-                feedback_injected: true,
-            },
-        ];
+        let history = vec![RetryAttempt {
+            attempt_number: 1,
+            error: "First error".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            delay_ms: 1000,
+            feedback_injected: true,
+        }];
 
         let feedback = service.build_feedback_prompt("Second error", &history);
 
@@ -642,6 +650,9 @@ mod tests {
     #[test]
     fn test_truncate_error() {
         assert_eq!(truncate_error("short", 10), "short");
-        assert_eq!(truncate_error("this is a longer error message", 10), "this is a ...");
+        assert_eq!(
+            truncate_error("this is a longer error message", 10),
+            "this is a ..."
+        );
     }
 }

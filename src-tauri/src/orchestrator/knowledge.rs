@@ -15,7 +15,9 @@ use tracing::{debug, info};
 
 use crate::database::{CheckpointDb, StoredTaskKnowledge, StoredVerificationResult};
 use crate::orchestrator::compression::{CompressionConfig, CompressionResult, CompressionService};
-use crate::orchestrator::types::{Confidence, CriterionOverride, Finding, OverrideCollection, WorkerSignal};
+use crate::orchestrator::types::{
+    Confidence, CriterionOverride, Finding, OverrideCollection, WorkerSignal,
+};
 
 // ============================================================================
 // Knowledge Categories
@@ -174,7 +176,10 @@ impl KnowledgeBase {
             feedback,
             None,
             "high", // Verification feedback is authoritative
-            &failed_criteria.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &failed_criteria
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
         )?;
 
         info!(
@@ -209,8 +214,12 @@ impl KnowledgeBase {
     }
 
     /// Get all unresolved findings for a task.
-    pub fn get_unresolved_findings(&self, task_run_id: &str) -> Result<Vec<StoredTaskKnowledge>, String> {
-        self.db.list_task_knowledge(task_run_id, Some("finding"), true)
+    pub fn get_unresolved_findings(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<StoredTaskKnowledge>, String> {
+        self.db
+            .list_task_knowledge(task_run_id, Some("finding"), true)
     }
 
     /// Get all knowledge for a task.
@@ -224,7 +233,8 @@ impl KnowledgeBase {
         task_run_id: &str,
         category: KnowledgeCategory,
     ) -> Result<Vec<StoredTaskKnowledge>, String> {
-        self.db.list_task_knowledge(task_run_id, Some(category.as_str()), false)
+        self.db
+            .list_task_knowledge(task_run_id, Some(category.as_str()), false)
     }
 
     // ========================================================================
@@ -331,10 +341,7 @@ impl KnowledgeBase {
     }
 
     /// Get all domains that have knowledge entries.
-    pub fn get_domains_with_knowledge(
-        &self,
-        task_run_id: &str,
-    ) -> Result<Vec<String>, String> {
+    pub fn get_domains_with_knowledge(&self, task_run_id: &str) -> Result<Vec<String>, String> {
         let all_knowledge = self.get_all_knowledge(task_run_id)?;
         let mut domains = Vec::new();
 
@@ -500,13 +507,15 @@ impl KnowledgeBase {
 
         for k in knowledge {
             // Parse the criterion_id and item from related_files
-            let criterion_id = k.related_files
+            let criterion_id = k
+                .related_files
                 .iter()
                 .find_map(|f| f.strip_prefix("criterion:"))
                 .map(|s| s.to_string())
                 .unwrap_or_default();
 
-            let item = k.related_files
+            let item = k
+                .related_files
                 .iter()
                 .find_map(|f| f.strip_prefix("item:"))
                 .map(|s| s.to_string())
@@ -553,7 +562,8 @@ impl KnowledgeBase {
         task_run_id: &str,
         iteration: u32,
     ) -> Result<Vec<StoredVerificationResult>, String> {
-        self.db.get_iteration_verification_results(task_run_id, iteration)
+        self.db
+            .get_iteration_verification_results(task_run_id, iteration)
     }
 
     /// Get the latest verification results.
@@ -602,7 +612,11 @@ pub fn parse_findings_from_output(output: &str) -> Vec<Finding> {
                     related_files: vec![],
                 });
 
-                debug!("Parsed finding: type={}, desc_len={}", finding_type, findings.last().map(|f| f.description.len()).unwrap_or(0));
+                debug!(
+                    "Parsed finding: type={}, desc_len={}",
+                    finding_type,
+                    findings.last().map(|f| f.description.len()).unwrap_or(0)
+                );
             }
 
             search_pos = abs_end + 1;
@@ -725,7 +739,8 @@ pub fn build_iteration_context_with_compression(
     context.push_str("## Previous Iteration Context\n\n");
 
     // Add latest verification feedback if any
-    let feedback = kb.get_knowledge_by_category(task_run_id, KnowledgeCategory::VerificationFeedback)?;
+    let feedback =
+        kb.get_knowledge_by_category(task_run_id, KnowledgeCategory::VerificationFeedback)?;
     if !feedback.is_empty() {
         // Get the most recent feedback
         if let Some(latest) = feedback.last() {
@@ -756,11 +771,7 @@ pub fn build_iteration_context_with_compression(
     // Add key observations (limit to recent ones)
     let observations = kb.get_knowledge_by_category(task_run_id, KnowledgeCategory::Observation)?;
     if !observations.is_empty() {
-        let recent_obs: Vec<_> = observations
-            .iter()
-            .rev()
-            .take(5)
-            .collect();
+        let recent_obs: Vec<_> = observations.iter().rev().take(5).collect();
 
         if !recent_obs.is_empty() {
             context.push_str("### Recent Observations\n\n");
@@ -785,7 +796,9 @@ pub fn build_iteration_context_with_compression(
     if context.len() > 30 {
         // Only add if we have meaningful content
         context.push_str("---\n\n");
-        context.push_str("Use this context to avoid repeating mistakes and build on previous progress.\n\n");
+        context.push_str(
+            "Use this context to avoid repeating mistakes and build on previous progress.\n\n",
+        );
     } else {
         context.clear();
     }
@@ -936,9 +949,18 @@ Done with analysis.
 
     #[test]
     fn test_knowledge_category_from_str() {
-        assert_eq!(KnowledgeCategory::from_str("bug"), Some(KnowledgeCategory::Finding));
-        assert_eq!(KnowledgeCategory::from_str("root_cause"), Some(KnowledgeCategory::RootCause));
-        assert_eq!(KnowledgeCategory::from_str("OBSERVATION"), Some(KnowledgeCategory::Observation));
+        assert_eq!(
+            KnowledgeCategory::from_str("bug"),
+            Some(KnowledgeCategory::Finding)
+        );
+        assert_eq!(
+            KnowledgeCategory::from_str("root_cause"),
+            Some(KnowledgeCategory::RootCause)
+        );
+        assert_eq!(
+            KnowledgeCategory::from_str("OBSERVATION"),
+            Some(KnowledgeCategory::Observation)
+        );
         assert_eq!(KnowledgeCategory::from_str("invalid"), None);
     }
 

@@ -55,12 +55,19 @@ impl McpClientManager {
     }
 
     /// Create a new MCP server configuration
-    pub async fn create_server(&self, input: CreateMcpServerInput) -> Result<McpServerConfig, String> {
+    pub async fn create_server(
+        &self,
+        input: CreateMcpServerInput,
+    ) -> Result<McpServerConfig, String> {
         self.db.create_mcp_server(input)
     }
 
     /// Update an MCP server configuration
-    pub async fn update_server(&self, server_id: &str, input: UpdateMcpServerInput) -> Result<McpServerConfig, String> {
+    pub async fn update_server(
+        &self,
+        server_id: &str,
+        input: UpdateMcpServerInput,
+    ) -> Result<McpServerConfig, String> {
         // Disconnect if currently connected
         let mut connections = self.connections.write().await;
         connections.remove(server_id);
@@ -92,7 +99,11 @@ impl McpClientManager {
                         server_id: config.id,
                         connected: conn.connected,
                         error: conn.last_error.clone(),
-                        tools: if conn.connected { Some(conn.tools.clone()) } else { None },
+                        tools: if conn.connected {
+                            Some(conn.tools.clone())
+                        } else {
+                            None
+                        },
                         last_connect_attempt: conn.last_connect_attempt.clone(),
                         last_connected: conn.last_connected.clone(),
                     }
@@ -112,7 +123,9 @@ impl McpClientManager {
 
     /// Get the status of a specific server
     pub async fn get_server_status(&self, server_id: &str) -> Result<McpServerStatus, String> {
-        let config = self.db.get_mcp_server(server_id)?
+        let config = self
+            .db
+            .get_mcp_server(server_id)?
             .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
 
         let connections = self.connections.read().await;
@@ -122,7 +135,11 @@ impl McpClientManager {
                 server_id: config.id,
                 connected: conn.connected,
                 error: conn.last_error.clone(),
-                tools: if conn.connected { Some(conn.tools.clone()) } else { None },
+                tools: if conn.connected {
+                    Some(conn.tools.clone())
+                } else {
+                    None
+                },
                 last_connect_attempt: conn.last_connect_attempt.clone(),
                 last_connected: conn.last_connected.clone(),
             })
@@ -140,7 +157,9 @@ impl McpClientManager {
 
     /// Connect to an MCP server
     pub async fn connect(&self, server_id: &str) -> Result<Vec<McpToolInfo>, String> {
-        let config = self.db.get_mcp_server(server_id)?
+        let config = self
+            .db
+            .get_mcp_server(server_id)?
             .ok_or_else(|| format!("MCP server not found: {}", server_id))?;
 
         if !config.enabled {
@@ -159,11 +178,17 @@ impl McpClientManager {
 
         match tools {
             Ok(tools) => {
-                info!("Connected to MCP server: {} with {} tools", config.name, tools.len());
+                info!(
+                    "Connected to MCP server: {} with {} tools",
+                    config.name,
+                    tools.len()
+                );
 
                 // Cache tools in database
                 if let Ok(tools_json) = serde_json::to_string(&tools) {
-                    let _ = self.db.update_mcp_server_tools_cache(server_id, &tools_json, &now);
+                    let _ = self
+                        .db
+                        .update_mcp_server_tools_cache(server_id, &tools_json, &now);
                 }
 
                 connections.insert(
@@ -233,7 +258,8 @@ impl McpClientManager {
         self.ensure_connected(server_id).await?;
 
         let connections = self.connections.read().await;
-        let conn = connections.get(server_id)
+        let conn = connections
+            .get(server_id)
             .ok_or_else(|| format!("Not connected to server: {}", server_id))?;
 
         if !conn.connected {
@@ -266,15 +292,13 @@ impl McpClientManager {
                     duration_ms,
                 })
             }
-            Err(e) => {
-                Ok(McpToolCallResult {
-                    success: false,
-                    content: None,
-                    error: Some(e),
-                    response_type: "error".to_string(),
-                    duration_ms,
-                })
-            }
+            Err(e) => Ok(McpToolCallResult {
+                success: false,
+                content: None,
+                error: Some(e),
+                response_type: "error".to_string(),
+                duration_ms,
+            }),
         }
     }
 
@@ -298,7 +322,9 @@ impl McpClientManager {
     // =========================================================================
 
     async fn connect_http(&self, config: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
-        let http_config = config.http_config.as_ref()
+        let http_config = config
+            .http_config
+            .as_ref()
             .ok_or("HTTP config missing for HTTP transport")?;
 
         let client = reqwest::Client::new();
@@ -330,7 +356,9 @@ impl McpClientManager {
             return Err(format!("Server returned error: {}", response.status()));
         }
 
-        let json: serde_json::Value = response.json().await
+        let json: serde_json::Value = response
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         // Parse JSON-RPC response
@@ -338,12 +366,15 @@ impl McpClientManager {
             return Err(format!("Server error: {}", error));
         }
 
-        let result = json.get("result")
-            .ok_or("Missing result in response")?;
+        let result = json.get("result").ok_or("Missing result in response")?;
 
         let tools: Vec<McpToolInfo> = serde_json::from_value(
-            result.get("tools").cloned().unwrap_or(serde_json::json!([]))
-        ).map_err(|e| format!("Failed to parse tools: {}", e))?;
+            result
+                .get("tools")
+                .cloned()
+                .unwrap_or(serde_json::json!([])),
+        )
+        .map_err(|e| format!("Failed to parse tools: {}", e))?;
 
         Ok(tools)
     }
@@ -354,7 +385,9 @@ impl McpClientManager {
         tool_name: &str,
         arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let http_config = config.http_config.as_ref()
+        let http_config = config
+            .http_config
+            .as_ref()
             .ok_or("HTTP config missing for HTTP transport")?;
 
         let client = reqwest::Client::new();
@@ -389,7 +422,9 @@ impl McpClientManager {
             return Err(format!("Server returned error: {}", response.status()));
         }
 
-        let json: serde_json::Value = response.json().await
+        let json: serde_json::Value = response
+            .json()
+            .await
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
         // Parse JSON-RPC response
@@ -397,15 +432,16 @@ impl McpClientManager {
             return Err(format!("Tool error: {}", error));
         }
 
-        let result = json.get("result")
-            .ok_or("Missing result in response")?;
+        let result = json.get("result").ok_or("Missing result in response")?;
 
         // MCP tool results have a "content" array
         if let Some(content) = result.get("content") {
             if let Some(first) = content.as_array().and_then(|a| a.first()) {
                 if let Some(text) = first.get("text") {
                     // Try to parse as JSON, fall back to string
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.as_str().unwrap_or("")) {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<serde_json::Value>(text.as_str().unwrap_or(""))
+                    {
                         return Ok(parsed);
                     }
                     return Ok(text.clone());
@@ -422,7 +458,9 @@ impl McpClientManager {
     // =========================================================================
 
     async fn connect_stdio(&self, config: &McpServerConfig) -> Result<Vec<McpToolInfo>, String> {
-        let _stdio_config = config.stdio_config.as_ref()
+        let _stdio_config = config
+            .stdio_config
+            .as_ref()
             .ok_or("Stdio config missing for stdio transport")?;
 
         // TODO: Implement stdio transport using rmcp crate
@@ -437,7 +475,9 @@ impl McpClientManager {
         _tool_name: &str,
         _arguments: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let _stdio_config = config.stdio_config.as_ref()
+        let _stdio_config = config
+            .stdio_config
+            .as_ref()
             .ok_or("Stdio config missing for stdio transport")?;
 
         // TODO: Implement stdio transport using rmcp crate

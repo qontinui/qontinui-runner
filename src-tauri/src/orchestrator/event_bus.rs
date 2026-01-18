@@ -150,10 +150,7 @@ pub enum EventPayload {
         percent: f32,
     },
     /// State transition.
-    StateChange {
-        from: String,
-        to: String,
-    },
+    StateChange { from: String, to: String },
     /// Error information.
     Error {
         code: String,

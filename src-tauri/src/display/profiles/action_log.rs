@@ -298,6 +298,10 @@ impl DisplayProfile for ActionLogProfile {
                 }
                 "action_started" | "action_completed" | "action_failed" => {
                     if let Some(action_info) = self.extract_action_info(event, "action") {
+                        // Set workflow_start_time from first action if no workflow started
+                        if workflow_start_time.is_none() {
+                            workflow_start_time = Some(action_info.timestamp);
+                        }
                         // Update existing entry or create new one
                         actions_map
                             .entry(action_info.id.clone())

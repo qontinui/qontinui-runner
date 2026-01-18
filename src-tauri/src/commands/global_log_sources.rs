@@ -39,7 +39,9 @@ pub fn get_global_log_sources() -> Result<CommandResponse, String> {
 
 /// Save all global log source settings
 #[tauri::command]
-pub fn save_global_log_sources(settings: GlobalLogSourceSettings) -> Result<CommandResponse, String> {
+pub fn save_global_log_sources(
+    settings: GlobalLogSourceSettings,
+) -> Result<CommandResponse, String> {
     info!(
         "Saving global log source settings: {} sources, {} profiles",
         settings.sources.len(),
@@ -74,8 +76,8 @@ pub fn add_global_log_source(
     let mut settings = settings::get_global_log_source_settings();
 
     // Parse category
-    let cat: LogSourceCategory = serde_json::from_str(&format!("\"{}\"", category))
-        .unwrap_or(LogSourceCategory::General);
+    let cat: LogSourceCategory =
+        serde_json::from_str(&format!("\"{}\"", category)).unwrap_or(LogSourceCategory::General);
 
     let source = GlobalLogSource {
         id: format!("source-{}", Uuid::new_v4()),
@@ -139,8 +141,8 @@ pub fn update_global_log_source(
         source.description = d;
     }
     if let Some(c) = category {
-        source.category = serde_json::from_str(&format!("\"{}\"", c))
-            .unwrap_or(LogSourceCategory::General);
+        source.category =
+            serde_json::from_str(&format!("\"{}\"", c)).unwrap_or(LogSourceCategory::General);
     }
     if let Some(t) = source_type {
         source.source_type = t;
@@ -329,7 +331,9 @@ pub fn delete_global_log_source_profile(id: String) -> Result<CommandResponse, S
 
 /// Set the default profile
 #[tauri::command]
-pub fn set_default_log_source_profile(profile_id: Option<String>) -> Result<CommandResponse, String> {
+pub fn set_default_log_source_profile(
+    profile_id: Option<String>,
+) -> Result<CommandResponse, String> {
     info!("Setting default log source profile: {:?}", profile_id);
 
     let mut settings = settings::get_global_log_source_settings();
@@ -360,8 +364,12 @@ pub fn set_log_source_ai_selection_mode(mode: String) -> Result<CommandResponse,
 
     let mut settings = settings::get_global_log_source_settings();
 
-    settings.ai_selection_mode = serde_json::from_str(&format!("\"{}\"", mode))
-        .map_err(|_| format!("Invalid mode '{}'. Use 'dynamic', 'static', or 'disabled'", mode))?;
+    settings.ai_selection_mode = serde_json::from_str(&format!("\"{}\"", mode)).map_err(|_| {
+        format!(
+            "Invalid mode '{}'. Use 'dynamic', 'static', or 'disabled'",
+            mode
+        )
+    })?;
 
     settings::save_global_log_source_settings(settings)
         .map_err(|e| format!("Failed to save settings: {}", e))?;
@@ -487,8 +495,8 @@ fn read_single_source(source: &GlobalLogSource) -> LogSourceContent {
 
 /// Tail the last N lines from a file
 fn tail_file(path: &PathBuf, num_lines: u32) -> Result<(Vec<String>, u64), String> {
-    let file = File::open(path)
-        .map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
+    let file =
+        File::open(path).map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
 
     let reader = BufReader::new(&file);
     let all_lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
@@ -584,7 +592,8 @@ pub fn migrate_project_sources_to_global() -> Result<CommandResponse, String> {
                                 let tail_lines = source
                                     .get("tail_lines")
                                     .and_then(|t| t.as_u64())
-                                    .unwrap_or(100) as u32;
+                                    .unwrap_or(100)
+                                    as u32;
                                 let enabled = source
                                     .get("enabled")
                                     .and_then(|e| e.as_bool())
@@ -682,7 +691,9 @@ pub struct SelectionReason {
 /// 2. Match keywords in source names/descriptions to context keywords
 /// 3. Always include Runner logs when step_types contain GUI automation
 #[tauri::command]
-pub fn select_log_sources_for_context(context: LogSourceSelectionContext) -> Result<CommandResponse, String> {
+pub fn select_log_sources_for_context(
+    context: LogSourceSelectionContext,
+) -> Result<CommandResponse, String> {
     info!("Selecting log sources for context: {:?}", context);
 
     let settings = settings::get_global_log_source_settings();
@@ -694,15 +705,21 @@ pub fn select_log_sources_for_context(context: LogSourceSelectionContext) -> Res
         return Ok(CommandResponse {
             success: true,
             message: Some("AI selection disabled, using profile/all sources".to_string()),
-            data: Some(serde_json::to_value(LogSourceSelectionResult {
-                selected_source_ids: sources.iter().map(|s| s.id.clone()).collect(),
-                selection_reasons: sources.iter().map(|s| SelectionReason {
-                    source_id: s.id.clone(),
-                    source_name: s.name.clone(),
-                    reason: "AI selection disabled".to_string(),
-                }).collect(),
-                ai_selection_used: false,
-            }).map_err(|e| format!("Failed to serialize result: {}", e))?),
+            data: Some(
+                serde_json::to_value(LogSourceSelectionResult {
+                    selected_source_ids: sources.iter().map(|s| s.id.clone()).collect(),
+                    selection_reasons: sources
+                        .iter()
+                        .map(|s| SelectionReason {
+                            source_id: s.id.clone(),
+                            source_name: s.name.clone(),
+                            reason: "AI selection disabled".to_string(),
+                        })
+                        .collect(),
+                    ai_selection_used: false,
+                })
+                .map_err(|e| format!("Failed to serialize result: {}", e))?,
+            ),
         });
     }
 
@@ -711,8 +728,14 @@ pub fn select_log_sources_for_context(context: LogSourceSelectionContext) -> Res
 
     Ok(CommandResponse {
         success: true,
-        message: Some(format!("Selected {} sources", result.selected_source_ids.len())),
-        data: Some(serde_json::to_value(result).map_err(|e| format!("Failed to serialize result: {}", e))?),
+        message: Some(format!(
+            "Selected {} sources",
+            result.selected_source_ids.len()
+        )),
+        data: Some(
+            serde_json::to_value(result)
+                .map_err(|e| format!("Failed to serialize result: {}", e))?,
+        ),
     })
 }
 
@@ -727,9 +750,10 @@ fn select_sources_rule_based(
     let relevant_categories = determine_relevant_categories(context);
 
     // Check if we have GUI automation steps
-    let has_gui_automation = context.step_types.iter().any(|t| {
-        matches!(t.as_str(), "workflow" | "state" | "action" | "screenshot")
-    });
+    let has_gui_automation = context
+        .step_types
+        .iter()
+        .any(|t| matches!(t.as_str(), "workflow" | "state" | "action" | "screenshot"));
     let has_playwright = context.step_types.iter().any(|t| t == "playwright");
 
     for source in sources {
@@ -756,7 +780,10 @@ fn select_sources_rule_based(
             } else if testing_match {
                 "Testing logs needed for Playwright steps".to_string()
             } else if category_match {
-                format!("Category '{}' matches target platform", format_category(&source.category))
+                format!(
+                    "Category '{}' matches target platform",
+                    format_category(&source.category)
+                )
             } else {
                 format!("Keywords match: {}", source.keywords.join(", "))
             };
@@ -771,7 +798,10 @@ fn select_sources_rule_based(
 
     // If nothing selected, fall back to General category
     if selected.is_empty() {
-        for source in sources.iter().filter(|s| s.enabled && s.category == LogSourceCategory::General) {
+        for source in sources
+            .iter()
+            .filter(|s| s.enabled && s.category == LogSourceCategory::General)
+        {
             selected.push(SelectionReason {
                 source_id: source.id.clone(),
                 source_name: source.name.clone(),
@@ -794,7 +824,10 @@ fn determine_relevant_categories(context: &LogSourceSelectionContext) -> Vec<Log
     // Check target platform
     if let Some(ref platform) = context.target_platform {
         let platform_lower = platform.to_lowercase();
-        if platform_lower.contains("mobile") || platform_lower.contains("android") || platform_lower.contains("ios") {
+        if platform_lower.contains("mobile")
+            || platform_lower.contains("android")
+            || platform_lower.contains("ios")
+        {
             categories.push(LogSourceCategory::Mobile);
         }
         if platform_lower.contains("web") || platform_lower.contains("browser") {
@@ -819,7 +852,10 @@ fn determine_relevant_categories(context: &LogSourceSelectionContext) -> Vec<Log
                 categories.push(LogSourceCategory::Frontend);
             }
         }
-        if app_lower.contains("backend") || app_lower.contains("server") || app_lower.contains("api") {
+        if app_lower.contains("backend")
+            || app_lower.contains("server")
+            || app_lower.contains("api")
+        {
             if !categories.contains(&LogSourceCategory::Backend) {
                 categories.push(LogSourceCategory::Backend);
             }
@@ -857,7 +893,9 @@ fn check_keyword_match(source: &GlobalLogSource, context: &LogSourceSelectionCon
         return false;
     }
 
-    let context_keywords: Vec<String> = context.keywords.iter()
+    let context_keywords: Vec<String> = context
+        .keywords
+        .iter()
         .chain(context.application_name.iter())
         .chain(context.target_platform.iter())
         .map(|s| s.to_lowercase())
@@ -909,30 +947,33 @@ pub fn get_log_sources_for_context(context: &LogSourceSelectionContext) -> Vec<L
     let settings = settings::get_global_log_source_settings();
 
     // Get source IDs based on selection mode
-    let source_ids: Vec<String> = if settings.ai_selection_mode == LogSourceAiSelectionMode::Disabled {
-        // Use profile or all enabled sources
-        settings::get_enabled_log_sources(settings.default_profile_id.as_deref())
-            .iter()
-            .map(|s| s.id.clone())
-            .collect()
-    } else {
-        // Use rule-based selection
-        let result = select_sources_rule_based(&settings.sources, context);
-        result.selected_source_ids
-    };
+    let source_ids: Vec<String> =
+        if settings.ai_selection_mode == LogSourceAiSelectionMode::Disabled {
+            // Use profile or all enabled sources
+            settings::get_enabled_log_sources(settings.default_profile_id.as_deref())
+                .iter()
+                .map(|s| s.id.clone())
+                .collect()
+        } else {
+            // Use rule-based selection
+            let result = select_sources_rule_based(&settings.sources, context);
+            result.selected_source_ids
+        };
 
     // Convert GlobalLogSource to LogSourceConfig
     source_ids
         .iter()
         .filter_map(|id| {
-            settings.sources.iter().find(|s| s.id == *id).map(|source| {
-                LogSourceConfig {
+            settings
+                .sources
+                .iter()
+                .find(|s| s.id == *id)
+                .map(|source| LogSourceConfig {
                     id: source.id.clone(),
                     name: source.name.clone(),
                     path: source.path.clone(),
                     enabled: source.enabled,
-                }
-            })
+                })
         })
         .collect()
 }
@@ -973,10 +1014,14 @@ pub fn get_all_enabled_log_sources() -> Vec<LogSourceConfig> {
 fn infer_category(name: &str) -> LogSourceCategory {
     let name_lower = name.to_lowercase();
 
-    if name_lower.contains("frontend") || name_lower.contains("next") || name_lower.contains("react")
+    if name_lower.contains("frontend")
+        || name_lower.contains("next")
+        || name_lower.contains("react")
     {
         LogSourceCategory::Frontend
-    } else if name_lower.contains("backend") || name_lower.contains("fastapi") || name_lower.contains("django")
+    } else if name_lower.contains("backend")
+        || name_lower.contains("fastapi")
+        || name_lower.contains("django")
     {
         LogSourceCategory::Backend
     } else if name_lower.contains("api") {
@@ -988,14 +1033,18 @@ fn infer_category(name: &str) -> LogSourceCategory {
         || name_lower.contains("ios")
     {
         LogSourceCategory::Mobile
-    } else if name_lower.contains("test") || name_lower.contains("playwright") || name_lower.contains("jest")
+    } else if name_lower.contains("test")
+        || name_lower.contains("playwright")
+        || name_lower.contains("jest")
     {
         LogSourceCategory::Testing
     } else if name_lower.contains("runner") || name_lower.contains("tauri") {
         LogSourceCategory::Runner
     } else if name_lower.contains("build") || name_lower.contains("ci") {
         LogSourceCategory::Build
-    } else if name_lower.contains("database") || name_lower.contains("db") || name_lower.contains("postgres")
+    } else if name_lower.contains("database")
+        || name_lower.contains("db")
+        || name_lower.contains("postgres")
     {
         LogSourceCategory::Database
     } else {

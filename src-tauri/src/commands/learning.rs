@@ -5,7 +5,7 @@
 
 use crate::commands::AppState;
 use crate::orchestrator::learning::{
-    AnalysisResult, Feedback, Insight, LearningSystem, LearningSummary, Pattern, TaskOutcome,
+    AnalysisResult, Feedback, Insight, LearningSummary, LearningSystem, Pattern, TaskOutcome,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -14,9 +14,8 @@ use tauri::State;
 
 /// Global learning system instance for in-memory analysis.
 /// The database stores outcomes; this provides real-time analysis.
-static LEARNING_SYSTEM: Lazy<Mutex<LearningSystem>> = Lazy::new(|| {
-    Mutex::new(LearningSystem::new())
-});
+static LEARNING_SYSTEM: Lazy<Mutex<LearningSystem>> =
+    Lazy::new(|| Mutex::new(LearningSystem::new()));
 
 /// Summary data for the learning dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,7 +83,9 @@ pub fn get_learning_patterns(state: State<'_, Arc<AppState>>) -> Result<Vec<Patt
                 "FailureMode" => crate::orchestrator::learning::PatternType::FailureMode,
                 "ToolUsage" => crate::orchestrator::learning::PatternType::ToolUsage,
                 "Collaboration" => crate::orchestrator::learning::PatternType::Collaboration,
-                "IterationBehavior" => crate::orchestrator::learning::PatternType::IterationBehavior,
+                "IterationBehavior" => {
+                    crate::orchestrator::learning::PatternType::IterationBehavior
+                }
                 "ErrorRecovery" => crate::orchestrator::learning::PatternType::ErrorRecovery,
                 "DecisionMaking" => crate::orchestrator::learning::PatternType::DecisionMaking,
                 _ => crate::orchestrator::learning::PatternType::SuccessStrategy,
@@ -209,7 +210,9 @@ pub fn get_feedback_for_context(context: String) -> Result<Vec<Feedback>, String
 
 /// Get all learning dashboard data in one call.
 #[tauri::command]
-pub fn get_learning_dashboard_data(state: State<'_, Arc<AppState>>) -> Result<LearningDashboardData, String> {
+pub fn get_learning_dashboard_data(
+    state: State<'_, Arc<AppState>>,
+) -> Result<LearningDashboardData, String> {
     // Load outcomes from database
     let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
     let mut system = LEARNING_SYSTEM.lock().map_err(|e| e.to_string())?;
@@ -263,15 +266,17 @@ pub fn record_task_outcome(
     };
 
     // Serialize metrics/decisions/tags as feedback JSON
-    let feedback_json = if outcome.metrics.is_empty() && outcome.decisions.is_empty() && outcome.tags.is_empty() {
-        None
-    } else {
-        serde_json::to_value(serde_json::json!({
-            "metrics": outcome.metrics,
-            "decisions": outcome.decisions,
-            "tags": outcome.tags,
-        })).ok()
-    };
+    let feedback_json =
+        if outcome.metrics.is_empty() && outcome.decisions.is_empty() && outcome.tags.is_empty() {
+            None
+        } else {
+            serde_json::to_value(serde_json::json!({
+                "metrics": outcome.metrics,
+                "decisions": outcome.decisions,
+                "tags": outcome.tags,
+            }))
+            .ok()
+        };
 
     state.checkpoint_db.record_learning_outcome(
         &outcome.task_id,
@@ -280,7 +285,11 @@ pub fn record_task_outcome(
         outcome.iterations,
         outcome.strategy.as_deref(),
         if tools.is_empty() { None } else { Some(&tools) },
-        if agents.is_empty() { None } else { Some(&agents) },
+        if agents.is_empty() {
+            None
+        } else {
+            Some(&agents)
+        },
         None, // error_type - not in TaskOutcome
         error_message.as_deref(),
         feedback_json.as_ref(),
@@ -294,7 +303,8 @@ pub fn record_task_outcome(
 pub fn get_best_strategy(state: State<'_, Arc<AppState>>) -> Result<Option<(String, f64)>, String> {
     let outcomes = state.checkpoint_db.get_learning_outcomes(Some(500))?;
 
-    let mut strategy_stats: std::collections::HashMap<String, (u32, u32)> = std::collections::HashMap::new();
+    let mut strategy_stats: std::collections::HashMap<String, (u32, u32)> =
+        std::collections::HashMap::new();
     for outcome in outcomes {
         if let Some(strategy) = outcome["strategy"].as_str() {
             let entry = strategy_stats.entry(strategy.to_string()).or_insert((0, 0));
@@ -352,7 +362,11 @@ pub fn add_sample_learning_data(state: State<'_, Arc<AppState>>) -> Result<(), S
     // Add successful outcomes
     for i in 0..10 {
         let tools = vec!["grep".to_string(), "edit".to_string()];
-        let strategy = if i % 2 == 0 { "incremental" } else { "parallel" };
+        let strategy = if i % 2 == 0 {
+            "incremental"
+        } else {
+            "parallel"
+        };
 
         state.checkpoint_db.record_learning_outcome(
             &format!("sample-task-{}", i),
@@ -432,7 +446,9 @@ pub fn get_learning_outcomes_paginated(
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedResult<Vec<serde_json::Value>>, String> {
-    let items = state.checkpoint_db.get_learning_outcomes_paginated(offset, limit)?;
+    let items = state
+        .checkpoint_db
+        .get_learning_outcomes_paginated(offset, limit)?;
     let total = state.checkpoint_db.get_learning_outcomes_count()?;
     Ok(PaginatedResult {
         items,
@@ -449,14 +465,14 @@ pub fn get_learning_stats_by_date_range(
     start: String,
     end: String,
 ) -> Result<serde_json::Value, String> {
-    state.checkpoint_db.get_learning_stats_by_date_range(&start, &end)
+    state
+        .checkpoint_db
+        .get_learning_stats_by_date_range(&start, &end)
 }
 
 /// Get total count of learning outcomes.
 #[tauri::command]
-pub fn get_learning_outcomes_count(
-    state: State<'_, Arc<AppState>>,
-) -> Result<i64, String> {
+pub fn get_learning_outcomes_count(state: State<'_, Arc<AppState>>) -> Result<i64, String> {
     state.checkpoint_db.get_learning_outcomes_count()
 }
 
@@ -472,7 +488,9 @@ pub fn get_recent_tasks_with_outcomes(
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let limit = limit.unwrap_or(10);
-    state.checkpoint_db.get_recent_task_runs_with_outcomes(limit)
+    state
+        .checkpoint_db
+        .get_recent_task_runs_with_outcomes(limit)
 }
 
 /// Get the current running task (if any).

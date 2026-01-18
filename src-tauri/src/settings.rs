@@ -214,7 +214,7 @@ impl Default for PlaywrightSettings {
 #[serde(rename_all = "snake_case")]
 pub enum SelfHealingLlmMode {
     #[default]
-    Disabled,   // No LLM assistance
+    Disabled, // No LLM assistance
     LocalOllama, // Use local Ollama instance
     RemoteApi,   // Use remote API (OpenAI/Anthropic)
 }
@@ -812,8 +812,13 @@ pub fn get_accessibility_settings() -> AccessibilitySettings {
 }
 
 /// Save Accessibility settings
-pub fn save_accessibility_settings(accessibility_settings: AccessibilitySettings) -> Result<(), String> {
-    info!("Saving Accessibility settings: {:?}", accessibility_settings);
+pub fn save_accessibility_settings(
+    accessibility_settings: AccessibilitySettings,
+) -> Result<(), String> {
+    info!(
+        "Saving Accessibility settings: {:?}",
+        accessibility_settings
+    );
     let mut settings = load_settings();
     settings.accessibility = accessibility_settings;
     save_settings(&settings)?;
@@ -827,7 +832,9 @@ pub fn get_self_healing_settings() -> SelfHealingSettings {
 }
 
 /// Save Self-Healing settings
-pub fn save_self_healing_settings(self_healing_settings: SelfHealingSettings) -> Result<(), String> {
+pub fn save_self_healing_settings(
+    self_healing_settings: SelfHealingSettings,
+) -> Result<(), String> {
     info!("Saving Self-Healing settings: {:?}", self_healing_settings);
     let mut settings = load_settings();
     settings.self_healing = self_healing_settings;

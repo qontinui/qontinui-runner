@@ -334,19 +334,11 @@ impl HookExecutor {
     ///
     /// Returns a list of results for each hook executed.
     /// If a hook fails and `continue_on_failure` is false, stops and returns.
-    pub fn execute_trigger(
-        &self,
-        trigger: HookTrigger,
-        context: &HookContext,
-    ) -> Vec<HookResult> {
+    pub fn execute_trigger(&self, trigger: HookTrigger, context: &HookContext) -> Vec<HookResult> {
         let hooks = self.hooks_for_trigger(trigger);
         let mut results = Vec::new();
 
-        info!(
-            "Executing {} hooks for trigger {:?}",
-            hooks.len(),
-            trigger
-        );
+        info!("Executing {} hooks for trigger {:?}", hooks.len(), trigger);
 
         for hook in hooks {
             // Check conditions
@@ -369,14 +361,13 @@ impl HookExecutor {
             };
 
             if !hook_result.success {
-                warn!(
-                    "Hook {} failed: {:?}",
-                    hook.name,
-                    hook_result.error
-                );
+                warn!("Hook {} failed: {:?}", hook.name, hook_result.error);
 
                 if !hook.continue_on_failure {
-                    error!("Hook {} failed and continue_on_failure is false, stopping", hook.name);
+                    error!(
+                        "Hook {} failed and continue_on_failure is false, stopping",
+                        hook.name
+                    );
                     results.push(hook_result);
                     break;
                 }
@@ -398,16 +389,27 @@ impl HookExecutor {
                 working_dir,
                 timeout_seconds,
                 env,
-            } => {
-                self.execute_command(command, working_dir.as_deref(), *timeout_seconds, env, context)
-            }
+            } => self.execute_command(
+                command,
+                working_dir.as_deref(),
+                *timeout_seconds,
+                env,
+                context,
+            ),
             HookAction::Webhook {
                 url,
                 method,
                 headers,
                 body,
                 timeout_seconds,
-            } => self.execute_webhook(url, method, headers, body.as_deref(), *timeout_seconds, context),
+            } => self.execute_webhook(
+                url,
+                method,
+                headers,
+                body.as_deref(),
+                *timeout_seconds,
+                context,
+            ),
             HookAction::Log { level, message } => {
                 self.execute_log(level, message, context);
                 Ok("logged".to_string())

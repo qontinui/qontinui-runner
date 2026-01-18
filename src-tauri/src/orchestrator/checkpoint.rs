@@ -123,7 +123,12 @@ impl StateSnapshot {
     }
 
     /// Add a channel snapshot.
-    pub fn with_channel(mut self, name: impl Into<String>, value: serde_json::Value, version: u64) -> Self {
+    pub fn with_channel(
+        mut self,
+        name: impl Into<String>,
+        value: serde_json::Value,
+        version: u64,
+    ) -> Self {
         let name = name.into();
         self.channels.insert(
             name.clone(),
@@ -473,7 +478,10 @@ impl CheckpointManager {
 
     /// Get checkpoint count for a task.
     pub fn count_for_task(&self, task_id: &str) -> usize {
-        self.task_index.get(task_id).map(|ids| ids.len()).unwrap_or(0)
+        self.task_index
+            .get(task_id)
+            .map(|ids| ids.len())
+            .unwrap_or(0)
     }
 
     /// Clear all checkpoints for a task.
@@ -538,9 +546,16 @@ pub struct ReplayModification {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModificationType {
     /// Changed a channel value.
-    ChannelChange { channel: String, old_value: serde_json::Value, new_value: serde_json::Value },
+    ChannelChange {
+        channel: String,
+        old_value: serde_json::Value,
+        new_value: serde_json::Value,
+    },
     /// Changed state.
-    StateChange { old_state: String, new_state: String },
+    StateChange {
+        old_state: String,
+        new_state: String,
+    },
     /// Added knowledge.
     KnowledgeAdd { entry_id: String },
     /// Removed knowledge.
@@ -570,7 +585,11 @@ impl ReplaySession {
     }
 
     /// Record a modification.
-    pub fn record_modification(&mut self, mod_type: ModificationType, description: impl Into<String>) {
+    pub fn record_modification(
+        &mut self,
+        mod_type: ModificationType,
+        description: impl Into<String>,
+    ) {
         self.modifications.push(ReplayModification {
             modification_type: mod_type,
             description: description.into(),
@@ -655,17 +674,28 @@ impl CheckpointDiff {
             }
         }
 
-        let from_finding_ids: std::collections::HashSet<_> = from.state.findings.iter().map(|f| &f.id).collect();
-        let to_finding_ids: std::collections::HashSet<_> = to.state.findings.iter().map(|f| &f.id).collect();
+        let from_finding_ids: std::collections::HashSet<_> =
+            from.state.findings.iter().map(|f| &f.id).collect();
+        let to_finding_ids: std::collections::HashSet<_> =
+            to.state.findings.iter().map(|f| &f.id).collect();
 
         let added_findings = to_finding_ids
             .difference(&from_finding_ids)
             .map(|s| (*s).clone())
             .collect();
 
-        let resolved_findings = to.state.findings
+        let resolved_findings = to
+            .state
+            .findings
             .iter()
-            .filter(|f| f.resolved && from.state.findings.iter().any(|of| of.id == f.id && !of.resolved))
+            .filter(|f| {
+                f.resolved
+                    && from
+                        .state
+                        .findings
+                        .iter()
+                        .any(|of| of.id == f.id && !of.resolved)
+            })
             .map(|f| f.id.clone())
             .collect();
 
@@ -788,11 +818,12 @@ impl ReplayManager {
         let original_task_id = checkpoint.task_id.clone();
 
         // Check if the checkpoint's task was itself a replay
-        let (root_task_id, parent_depth) = if let Some(lineage) = self.lineage.get(&checkpoint.task_id) {
-            (lineage.original_task_id.clone(), lineage.replay_depth)
-        } else {
-            (checkpoint.task_id.clone(), 0)
-        };
+        let (root_task_id, parent_depth) =
+            if let Some(lineage) = self.lineage.get(&checkpoint.task_id) {
+                (lineage.original_task_id.clone(), lineage.replay_depth)
+            } else {
+                (checkpoint.task_id.clone(), 0)
+            };
 
         let lineage = LineageInfo::replayed(
             &session.replay_task_id,
@@ -804,14 +835,18 @@ impl ReplayManager {
 
         // Update parent's child list if tracked
         if let Some(parent_lineage) = self.lineage.get_mut(&original_task_id) {
-            parent_lineage.child_task_ids.push(session.replay_task_id.clone());
+            parent_lineage
+                .child_task_ids
+                .push(session.replay_task_id.clone());
         }
 
         // Store session and lineage
         let session_id = session.id.clone();
         let replay_task_id = session.replay_task_id.clone();
-        self.active_sessions.insert(session_id.clone(), session.clone());
-        self.task_to_session.insert(replay_task_id.clone(), session_id);
+        self.active_sessions
+            .insert(session_id.clone(), session.clone());
+        self.task_to_session
+            .insert(replay_task_id.clone(), session_id);
         self.lineage.insert(replay_task_id, lineage.clone());
 
         ReplayResult {
@@ -840,7 +875,9 @@ impl ReplayManager {
 
     /// Mark a replay session as started (running).
     pub fn start_session(&mut self, session_id: &str) -> Result<(), String> {
-        let session = self.active_sessions.get_mut(session_id)
+        let session = self
+            .active_sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
         session.start();
         Ok(())
@@ -848,7 +885,9 @@ impl ReplayManager {
 
     /// Complete a replay session.
     pub fn complete_session(&mut self, session_id: &str) -> Result<(), String> {
-        let session = self.active_sessions.get_mut(session_id)
+        let session = self
+            .active_sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
         session.complete();
         Ok(())
@@ -856,7 +895,9 @@ impl ReplayManager {
 
     /// Fail a replay session.
     pub fn fail_session(&mut self, session_id: &str) -> Result<(), String> {
-        let session = self.active_sessions.get_mut(session_id)
+        let session = self
+            .active_sessions
+            .get_mut(session_id)
             .ok_or_else(|| format!("Session '{}' not found", session_id))?;
         session.fail();
         Ok(())
@@ -871,7 +912,8 @@ impl ReplayManager {
     pub fn register_original_task(&mut self, task_id: impl Into<String>) {
         let task_id = task_id.into();
         if !self.lineage.contains_key(&task_id) {
-            self.lineage.insert(task_id.clone(), LineageInfo::original(task_id));
+            self.lineage
+                .insert(task_id.clone(), LineageInfo::original(task_id));
         }
     }
 
@@ -920,7 +962,9 @@ impl ReplayManager {
 
         // Sort by depth and creation time
         tree.nodes.sort_by(|a, b| {
-            a.depth.cmp(&b.depth).then_with(|| a.created_at.cmp(&b.created_at))
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| a.created_at.cmp(&b.created_at))
         });
 
         tree
@@ -947,10 +991,13 @@ impl ReplayManager {
         let now = chrono::Utc::now();
         let max_age = chrono::Duration::seconds(max_age_seconds as i64);
 
-        let to_remove: Vec<String> = self.active_sessions
+        let to_remove: Vec<String> = self
+            .active_sessions
             .iter()
             .filter(|(_, session)| {
-                if session.status == ReplayStatus::Running || session.status == ReplayStatus::Pending {
+                if session.status == ReplayStatus::Running
+                    || session.status == ReplayStatus::Pending
+                {
                     return false;
                 }
                 if let Ok(started) = chrono::DateTime::parse_from_rfc3339(&session.started_at) {
@@ -1084,7 +1131,8 @@ impl RestorationInstructions {
             target_state: snapshot.state.clone(),
             resume_iteration: config.starting_iteration.unwrap_or(snapshot.iteration),
             channels: if config.restore_channels {
-                snapshot.channels
+                snapshot
+                    .channels
                     .iter()
                     .map(|(k, v)| (k.clone(), v.value.clone()))
                     .collect()
@@ -1220,12 +1268,18 @@ mod tests {
 
     #[test]
     fn test_checkpoint_diff() {
-        let state1 = StateSnapshot::new("planning", 1)
-            .with_channel("status", serde_json::json!("pending"), 1);
+        let state1 = StateSnapshot::new("planning", 1).with_channel(
+            "status",
+            serde_json::json!("pending"),
+            1,
+        );
         let cp1 = Checkpoint::new("task-1", state1);
 
-        let state2 = StateSnapshot::new("executing", 3)
-            .with_channel("status", serde_json::json!("running"), 5);
+        let state2 = StateSnapshot::new("executing", 3).with_channel(
+            "status",
+            serde_json::json!("running"),
+            5,
+        );
         let cp2 = Checkpoint::new("task-1", state2);
 
         let diff = CheckpointDiff::compute(&cp1, &cp2);

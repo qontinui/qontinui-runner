@@ -215,7 +215,9 @@ impl TaskLedger {
 
         // Stall warning if applicable
         if self.stall_detector.warning_signs() {
-            context.push_str("⚠️ **Warning**: Progress appears slow. Focus on the most impactful changes.\n\n");
+            context.push_str(
+                "⚠️ **Warning**: Progress appears slow. Focus on the most impactful changes.\n\n",
+            );
         }
 
         context
@@ -293,7 +295,11 @@ impl Fact {
     }
 
     /// Create a fact from verification results.
-    pub fn from_verification(key: impl Into<String>, value: impl Into<String>, iteration: u32) -> Self {
+    pub fn from_verification(
+        key: impl Into<String>,
+        value: impl Into<String>,
+        iteration: u32,
+    ) -> Self {
         Self {
             confidence: FactConfidence::Confirmed,
             source: "verification".to_string(),
@@ -358,7 +364,10 @@ impl ExecutionPlan {
 
     /// Get the number of completed steps.
     pub fn completed_count(&self) -> usize {
-        self.steps.iter().filter(|s| s.status == StepStatus::Completed).count()
+        self.steps
+            .iter()
+            .filter(|s| s.status == StepStatus::Completed)
+            .count()
     }
 
     /// Get the number of pending steps.
@@ -752,13 +761,16 @@ impl TaskLedger {
         if self.is_stalled() {
             if self.stall_detector.config.auto_replan_on_stall {
                 return LedgerAction::Replan {
-                    reason: self.stall_reason().unwrap_or_else(|| "Stall detected".to_string()),
+                    reason: self
+                        .stall_reason()
+                        .unwrap_or_else(|| "Stall detected".to_string()),
                 };
             } else {
                 return LedgerAction::PauseForHuman {
                     prompt: format!(
                         "Task appears stalled: {}. Continue or abort?",
-                        self.stall_reason().unwrap_or_else(|| "Unknown reason".to_string())
+                        self.stall_reason()
+                            .unwrap_or_else(|| "Unknown reason".to_string())
                     ),
                 };
             }
@@ -892,7 +904,10 @@ mod tests {
     fn test_plan_step_tracking() {
         let mut ledger = TaskLedger::new("Test task");
 
-        ledger.plan.steps.push(PlanStep::new("step1", "Fix type errors"));
+        ledger
+            .plan
+            .steps
+            .push(PlanStep::new("step1", "Fix type errors"));
         ledger.plan.steps.push(PlanStep::new("step2", "Run tests"));
 
         ledger.complete_step("step1");
@@ -906,7 +921,11 @@ mod tests {
     fn test_worker_context_generation() {
         let mut ledger = TaskLedger::new("Fix authentication bug");
 
-        ledger.record_fact(Fact::confirmed("root_cause", "Missing null check in validateToken", 1));
+        ledger.record_fact(Fact::confirmed(
+            "root_cause",
+            "Missing null check in validateToken",
+            1,
+        ));
         ledger.progress.current_iteration = 2;
         ledger.progress.criteria_passing = 3;
         ledger.progress.criteria_total = 5;

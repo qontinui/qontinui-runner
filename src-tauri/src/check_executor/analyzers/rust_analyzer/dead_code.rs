@@ -496,10 +496,7 @@ mod tests {
         let (imports, used) = parse_and_analyze_imports(code);
         assert_eq!(imports.len(), 2, "Should find 2 imports");
         assert!(used.contains("HashMap"), "HashMap should be used");
-        assert!(
-            !used.contains("HashSet"),
-            "HashSet should not be used"
-        );
+        assert!(!used.contains("HashSet"), "HashSet should not be used");
     }
 
     #[test]
@@ -547,7 +544,10 @@ mod tests {
         "#;
 
         let (funcs, _) = parse_and_analyze_functions(code);
-        assert!(funcs.iter().any(|f| f.is_main), "Should detect main function");
+        assert!(
+            funcs.iter().any(|f| f.is_main),
+            "Should detect main function"
+        );
     }
 
     #[test]

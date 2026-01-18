@@ -121,10 +121,14 @@ impl DependencyGraph {
 
             // Update predecessor/successor relationships
             if let Some(from_node) = dep_graph.nodes.get_mut(&transition_info.from_state_id) {
-                from_node.successors.insert(transition_info.to_state_id.clone());
+                from_node
+                    .successors
+                    .insert(transition_info.to_state_id.clone());
             }
             if let Some(to_node) = dep_graph.nodes.get_mut(&transition_info.to_state_id) {
-                to_node.predecessors.insert(transition_info.from_state_id.clone());
+                to_node
+                    .predecessors
+                    .insert(transition_info.from_state_id.clone());
             }
         }
 
@@ -177,12 +181,7 @@ impl DependencyGraph {
             let count = node
                 .predecessors
                 .iter()
-                .filter(|p| {
-                    self.nodes
-                        .get(*p)
-                        .map(|n| n.is_reachable)
-                        .unwrap_or(false)
-                })
+                .filter(|p| self.nodes.get(*p).map(|n| n.is_reachable).unwrap_or(false))
                 .count();
             in_degree.insert(state_id.clone(), count);
         }
@@ -259,8 +258,7 @@ impl DependencyGraph {
         for dependent_id in &dependents {
             if let Some(node) = self.nodes.get_mut(dependent_id) {
                 node.is_reachable = false;
-                node.unreachable_reason =
-                    Some(format!("Depends on failed state: {}", state_id));
+                node.unreachable_reason = Some(format!("Depends on failed state: {}", state_id));
             }
         }
 
@@ -383,22 +381,18 @@ mod tests {
         let mut graph = DependencyGraph::new();
 
         // Create states: A -> B -> C, A -> D
-        graph.nodes.insert(
-            "A".to_string(),
-            StateNode::new("A", "State A"),
-        );
-        graph.nodes.insert(
-            "B".to_string(),
-            StateNode::new("B", "State B"),
-        );
-        graph.nodes.insert(
-            "C".to_string(),
-            StateNode::new("C", "State C"),
-        );
-        graph.nodes.insert(
-            "D".to_string(),
-            StateNode::new("D", "State D"),
-        );
+        graph
+            .nodes
+            .insert("A".to_string(), StateNode::new("A", "State A"));
+        graph
+            .nodes
+            .insert("B".to_string(), StateNode::new("B", "State B"));
+        graph
+            .nodes
+            .insert("C".to_string(), StateNode::new("C", "State C"));
+        graph
+            .nodes
+            .insert("D".to_string(), StateNode::new("D", "State D"));
 
         graph.initial_states.push("A".to_string());
 
@@ -420,12 +414,42 @@ mod tests {
         });
 
         // Update predecessor/successor relationships
-        graph.nodes.get_mut("A").unwrap().successors.insert("B".to_string());
-        graph.nodes.get_mut("A").unwrap().successors.insert("D".to_string());
-        graph.nodes.get_mut("B").unwrap().predecessors.insert("A".to_string());
-        graph.nodes.get_mut("B").unwrap().successors.insert("C".to_string());
-        graph.nodes.get_mut("C").unwrap().predecessors.insert("B".to_string());
-        graph.nodes.get_mut("D").unwrap().predecessors.insert("A".to_string());
+        graph
+            .nodes
+            .get_mut("A")
+            .unwrap()
+            .successors
+            .insert("B".to_string());
+        graph
+            .nodes
+            .get_mut("A")
+            .unwrap()
+            .successors
+            .insert("D".to_string());
+        graph
+            .nodes
+            .get_mut("B")
+            .unwrap()
+            .predecessors
+            .insert("A".to_string());
+        graph
+            .nodes
+            .get_mut("B")
+            .unwrap()
+            .successors
+            .insert("C".to_string());
+        graph
+            .nodes
+            .get_mut("C")
+            .unwrap()
+            .predecessors
+            .insert("B".to_string());
+        graph
+            .nodes
+            .get_mut("D")
+            .unwrap()
+            .predecessors
+            .insert("A".to_string());
 
         graph.calculate_depths();
 

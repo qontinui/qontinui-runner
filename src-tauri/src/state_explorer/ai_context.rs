@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use crate::config::{StateDescription, TransitionDescription};
 use super::types::{ElementCheck, StateExplorationResult, TransitionExplorationResult};
+use crate::config::{StateDescription, TransitionDescription};
 
 /// Timing information collected during exploration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,10 +329,7 @@ impl TransitionAnalysisContext {
             }
 
             if let Some(expected_ms) = desc.expected_duration_ms {
-                prompt.push_str(&format!(
-                    "**Expected Duration:** {} ms\n\n",
-                    expected_ms
-                ));
+                prompt.push_str(&format!("**Expected Duration:** {} ms\n\n", expected_ms));
             }
         }
 
@@ -404,14 +401,16 @@ impl ExplorationAnalysisContext {
         let mut prompt = String::new();
 
         // Header
-        prompt.push_str(&format!(
-            "# State Exploration Analysis Report\n\n"
-        ));
+        prompt.push_str(&format!("# State Exploration Analysis Report\n\n"));
         prompt.push_str(&format!("**Run ID:** {}\n", self.run_id));
         prompt.push_str(&format!("**Strategy:** {}\n", self.strategy));
         prompt.push_str(&format!(
             "**Overall Status:** {}\n\n",
-            if self.summary.passed { "PASSED" } else { "FAILED" }
+            if self.summary.passed {
+                "PASSED"
+            } else {
+                "FAILED"
+            }
         ));
 
         // Summary
@@ -426,7 +425,9 @@ impl ExplorationAnalysisContext {
         ));
 
         // States with issues
-        let states_with_issues: Vec<_> = self.states.iter()
+        let states_with_issues: Vec<_> = self
+            .states
+            .iter()
             .filter(|s| s.has_discrepancies())
             .collect();
 
@@ -454,7 +455,9 @@ impl ExplorationAnalysisContext {
         }
 
         // Transitions with issues
-        let transitions_with_issues: Vec<_> = self.transitions.iter()
+        let transitions_with_issues: Vec<_> = self
+            .transitions
+            .iter()
             .filter(|t| t.error.is_some() || t.duration_exceeded)
             .collect();
 
@@ -582,7 +585,10 @@ mod tests {
         assert!(!context.has_discrepancies());
 
         // Missing element
-        context.observations.missing_elements.push("Button".to_string());
+        context
+            .observations
+            .missing_elements
+            .push("Button".to_string());
         assert!(context.has_discrepancies());
 
         // Reset and test low confidence

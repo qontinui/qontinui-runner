@@ -127,19 +127,58 @@ impl EnhancedOrchestratorConfig {
                 strategy: ContextStrategy::Unbounded,
                 ..Default::default()
             },
-            ledger: LedgerConfig { enabled: false, ..Default::default() },
-            layers: LayersConfig { enabled: false, ..Default::default() },
-            interrupt: InterruptConfig { enabled: false, ..Default::default() },
-            memory: MemoryConfig { enabled: false, ..Default::default() },
-            roles: RolesConfig { enabled: false, ..Default::default() },
-            channels: ChannelsConfig { enabled: false, ..Default::default() },
-            events: EventBusConfig { enabled: false, ..Default::default() },
-            subflows: SubflowsConfig { enabled: false, ..Default::default() },
-            parallel: ParallelConfig { enabled: false, ..Default::default() },
-            agent_tools: AgentToolsConfig { enabled: false, ..Default::default() },
-            checkpoint: CheckpointConfig { enabled: false, ..Default::default() },
-            flow: FlowConfig { enabled: false, ..Default::default() },
-            learning: LearningSystemConfig { enabled: false, ..Default::default() },
+            ledger: LedgerConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            layers: LayersConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            interrupt: InterruptConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            memory: MemoryConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            roles: RolesConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            channels: ChannelsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            events: EventBusConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            subflows: SubflowsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            parallel: ParallelConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            agent_tools: AgentToolsConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            checkpoint: CheckpointConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            flow: FlowConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            learning: LearningSystemConfig {
+                enabled: false,
+                ..Default::default()
+            },
         }
     }
 
@@ -946,7 +985,10 @@ mod tests {
         let restored: EnhancedOrchestratorConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.base.max_iterations, restored.base.max_iterations);
-        assert_eq!(config.parallel.max_concurrent_branches, restored.parallel.max_concurrent_branches);
+        assert_eq!(
+            config.parallel.max_concurrent_branches,
+            restored.parallel.max_concurrent_branches
+        );
     }
 
     #[test]

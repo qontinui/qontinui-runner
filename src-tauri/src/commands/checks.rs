@@ -72,7 +72,11 @@ pub fn execute_code_check(check_definition: CheckDefinition) -> ExecuteCheckResp
 
     info!(
         "Check {} completed: {:?} (issues: {}, fixed: {}, {}ms)",
-        check_definition.name, result.status, result.issues_found, result.issues_fixed, result.duration_ms
+        check_definition.name,
+        result.status,
+        result.issues_found,
+        result.issues_fixed,
+        result.duration_ms
     );
 
     ExecuteCheckResponse { success, result }
@@ -247,7 +251,10 @@ pub async fn create_check(
 ) -> Result<CommandResponse, String> {
     let db = &state.checkpoint_db;
 
-    info!("Creating check: {} (type: {})", input.name, input.check_type);
+    info!(
+        "Creating check: {} (type: {})",
+        input.name, input.check_type
+    );
 
     match db.create_check(&input) {
         Ok(check) => {

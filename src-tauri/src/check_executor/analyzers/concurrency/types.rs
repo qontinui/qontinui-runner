@@ -175,9 +175,7 @@ impl RacePattern {
             RacePattern::UnprotectedCompound => {
                 "Unprotected compound operation (read-modify-write)"
             }
-            RacePattern::DoubleCheckedLocking => {
-                "Double-checked locking pattern may be incorrect"
-            }
+            RacePattern::DoubleCheckedLocking => "Double-checked locking pattern may be incorrect",
             RacePattern::PartiallyProtected => {
                 "Some accesses to state are protected, others are not"
             }

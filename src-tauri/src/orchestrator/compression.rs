@@ -250,7 +250,10 @@ impl CompressionService {
     /// Check if compression is needed and perform it if so.
     ///
     /// Returns Some(result) if compression was performed, None if not needed.
-    pub fn compress_if_needed(&self, task_run_id: &str) -> Result<Option<CompressionResult>, String> {
+    pub fn compress_if_needed(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<CompressionResult>, String> {
         if !self.config.enabled {
             debug!("Compression disabled, skipping");
             return Ok(None);
@@ -333,12 +336,16 @@ impl CompressionService {
         task_run_id: &str,
         category: &str,
     ) -> Result<(usize, usize), String> {
-        let entries = self.db.list_task_knowledge(task_run_id, Some(category), false)?;
+        let entries = self
+            .db
+            .list_task_knowledge(task_run_id, Some(category), false)?;
 
         if entries.len() <= self.config.keep_recent_items {
             debug!(
                 "Category {} has {} entries, below keep threshold {}, skipping",
-                category, entries.len(), self.config.keep_recent_items
+                category,
+                entries.len(),
+                self.config.keep_recent_items
             );
             return Ok((0, 0));
         }
@@ -348,7 +355,9 @@ impl CompressionService {
         sorted_entries.sort_by_key(|e| e.iteration);
 
         // Keep recent items, compress older ones
-        let compress_count = sorted_entries.len().saturating_sub(self.config.keep_recent_items);
+        let compress_count = sorted_entries
+            .len()
+            .saturating_sub(self.config.keep_recent_items);
         let to_compress = &sorted_entries[..compress_count];
 
         if to_compress.is_empty() {
@@ -361,15 +370,16 @@ impl CompressionService {
         // Store the summary as a new knowledge entry
         let summary_content = format!(
             "[COMPRESSED SUMMARY - {} items from iterations {:?}]\n{}",
-            summary.item_count,
-            summary.covered_iterations,
-            summary.summary
+            summary.item_count, summary.covered_iterations, summary.summary
         );
 
         // Mark old entries as resolved (effectively archiving them)
         let mut archived_count = 0;
         for entry in to_compress {
-            if let Err(e) = self.db.resolve_task_knowledge(&entry.id, Some("Compressed into summary")) {
+            if let Err(e) = self
+                .db
+                .resolve_task_knowledge(&entry.id, Some("Compressed into summary"))
+            {
                 warn!("Failed to archive knowledge entry {}: {}", entry.id, e);
             } else {
                 archived_count += 1;
@@ -403,10 +413,7 @@ impl CompressionService {
         category: &str,
         entries: &[StoredTaskKnowledge],
     ) -> Result<KnowledgeSummary, String> {
-        let covered_iterations: Vec<u32> = entries
-            .iter()
-            .map(|e| e.iteration as u32)
-            .collect();
+        let covered_iterations: Vec<u32> = entries.iter().map(|e| e.iteration as u32).collect();
 
         // Build a simple extractive summary
         // In a production system, this could use AI summarization

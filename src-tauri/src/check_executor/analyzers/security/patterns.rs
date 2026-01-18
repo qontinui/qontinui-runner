@@ -445,9 +445,7 @@ pub const ALL_PATTERNS: &[SecurityPattern] = &[
 pub fn patterns_for_language(language: &str) -> Vec<&'static SecurityPattern> {
     ALL_PATTERNS
         .iter()
-        .filter(|p| {
-            p.languages.contains(&"all") || p.languages.contains(&language)
-        })
+        .filter(|p| p.languages.contains(&"all") || p.languages.contains(&language))
         .collect()
 }
 

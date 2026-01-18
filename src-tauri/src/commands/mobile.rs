@@ -108,7 +108,10 @@ fn find_adb_path() -> Option<PathBuf> {
             debug!("Using custom ADB path from settings: {:?}", path);
             return Some(path);
         } else {
-            warn!("Custom ADB path from settings does not exist: {:?}", custom_path);
+            warn!(
+                "Custom ADB path from settings does not exist: {:?}",
+                custom_path
+            );
         }
     }
 
@@ -524,10 +527,7 @@ pub async fn capture_mobile_logcat(
     let log_path = local_path.to_string_lossy().to_string();
     let lines_captured = output.lines().count();
 
-    info!(
-        "Logcat captured: {} ({} lines)",
-        log_path, lines_captured
-    );
+    info!("Logcat captured: {} ({} lines)", log_path, lines_captured);
 
     // Parse and store error logs if task_run_id provided
     if let Some(ref task_id) = task_run_id {

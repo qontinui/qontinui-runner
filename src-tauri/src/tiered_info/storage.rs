@@ -643,10 +643,7 @@ pub fn format_debugging_context_for_prompt(context: &DebuggingContext) -> String
 
 /// Get a single run by ID from run_details table (used by tests).
 /// This function works with the legacy run_details table schema.
-pub fn get_run_details(
-    conn: &Connection,
-    run_id: &str,
-) -> Result<Option<RunDetails>, String> {
+pub fn get_run_details(conn: &Connection, run_id: &str) -> Result<Option<RunDetails>, String> {
     let result = conn
         .query_row(
             r#"

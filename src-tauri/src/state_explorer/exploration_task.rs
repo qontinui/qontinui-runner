@@ -569,7 +569,8 @@ impl ExplorationTask {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Determine status based on actual detection results
-        let all_expected_found = expected_checks.is_empty() || expected_checks.iter().all(|c| c.found);
+        let all_expected_found =
+            expected_checks.is_empty() || expected_checks.iter().all(|c| c.found);
         let no_unexpected = unexpected_checks.iter().all(|c| !c.found);
 
         let status = if error_message.is_some() {

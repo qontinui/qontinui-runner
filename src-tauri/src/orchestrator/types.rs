@@ -438,7 +438,10 @@ impl WorkerInstance {
 
     /// Check if this worker is still active.
     pub fn is_active(&self) -> bool {
-        matches!(self.status, WorkerStatus::Active | WorkerStatus::AwaitingVerification)
+        matches!(
+            self.status,
+            WorkerStatus::Active | WorkerStatus::AwaitingVerification
+        )
     }
 }
 
@@ -455,10 +458,7 @@ pub enum WorkerCoordinationMessage {
 
     /// Worker found an issue that may affect other workers
     #[serde(rename = "shared_finding")]
-    SharedFinding {
-        worker_id: String,
-        finding: Finding,
-    },
+    SharedFinding { worker_id: String, finding: Finding },
 
     /// Worker is blocked waiting for another worker
     #[serde(rename = "blocked")]
@@ -735,14 +735,16 @@ impl IterationVerificationResults {
     /// Recalculate pass/fail status considering overrides.
     fn recalculate_pass_status(&mut self) {
         // Deterministic: passed if all passed OR all failures are overridden
-        self.deterministic_passed = self.deterministic_results.iter().all(|r| {
-            r.passed || self.overridden_criteria.contains(&r.criterion_id)
-        });
+        self.deterministic_passed = self
+            .deterministic_results
+            .iter()
+            .all(|r| r.passed || self.overridden_criteria.contains(&r.criterion_id));
 
         // AI: passed if all passed OR all failures are overridden
-        self.ai_passed = self.ai_results.iter().all(|r| {
-            r.passed || self.overridden_criteria.contains(&r.criterion_id)
-        });
+        self.ai_passed = self
+            .ai_results
+            .iter()
+            .all(|r| r.passed || self.overridden_criteria.contains(&r.criterion_id));
 
         self.all_passed = self.deterministic_passed && self.ai_passed;
 
@@ -1006,7 +1008,9 @@ impl OverrideCollection {
 
     /// Check if a criterion has any overrides.
     pub fn has_override(&self, criterion_id: &str) -> bool {
-        self.overrides.iter().any(|o| o.criterion_id == criterion_id)
+        self.overrides
+            .iter()
+            .any(|o| o.criterion_id == criterion_id)
     }
 
     /// Get all overrides for a specific criterion.
@@ -1034,7 +1038,11 @@ impl OverrideCollection {
 
     /// Get all unique criterion IDs that have overrides.
     pub fn overridden_criteria(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self.overrides.iter().map(|o| o.criterion_id.clone()).collect();
+        let mut ids: Vec<String> = self
+            .overrides
+            .iter()
+            .map(|o| o.criterion_id.clone())
+            .collect();
         ids.sort();
         ids.dedup();
         ids

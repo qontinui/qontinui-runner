@@ -29,7 +29,12 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
     }
 
     let config = WalkConfig {
-        extensions: vec!["ts".to_string(), "tsx".to_string(), "js".to_string(), "jsx".to_string()],
+        extensions: vec![
+            "ts".to_string(),
+            "tsx".to_string(),
+            "js".to_string(),
+            "jsx".to_string(),
+        ],
         ..Default::default()
     };
 
@@ -93,7 +98,8 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
         total_shared_states += ctx.shared_states.len() as u32;
 
         // Detect async patterns and map accesses
-        let async_count = async_detection::detect_async_patterns(&tree, &content, &file_str, &mut ctx);
+        let async_count =
+            async_detection::detect_async_patterns(&tree, &content, &file_str, &mut ctx);
         total_async_funcs += async_count;
 
         // Detect patterns
@@ -108,7 +114,11 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
 
         // Apply heuristics
         for issue in &mut issues {
-            if let Some(state) = ctx.shared_states.iter().find(|s| s.name == issue.state_name) {
+            if let Some(state) = ctx
+                .shared_states
+                .iter()
+                .find(|s| s.name == issue.state_name)
+            {
                 heuristics::adjust_severity(issue, state, is_test);
             }
         }

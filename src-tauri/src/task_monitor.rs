@@ -364,7 +364,10 @@ impl TaskMonitor {
         let db_for_summary = db.clone();
         let task_id_for_summary = task_run_id.to_string();
         tokio::spawn(async move {
-            info!("Starting summary generation for task {}", task_id_for_summary);
+            info!(
+                "Starting summary generation for task {}",
+                task_id_for_summary
+            );
             match summary_generator::generate_task_summary(&db_for_summary, &task_id_for_summary) {
                 Ok(result) => {
                     info!(

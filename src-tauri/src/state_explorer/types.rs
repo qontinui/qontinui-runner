@@ -111,7 +111,6 @@ pub struct ExplorationConfig {
     pub random_seed: Option<u64>,
 
     // Checkpoint configuration for interleaved exploration
-
     /// Number of states to explore before creating a checkpoint
     #[serde(default = "default_checkpoint_batch_size")]
     pub checkpoint_batch_size: usize,

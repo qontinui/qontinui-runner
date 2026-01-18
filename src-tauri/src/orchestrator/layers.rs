@@ -524,7 +524,7 @@ impl ExecutionLimitsLayer {
     pub fn new() -> Self {
         Self {
             max_iterations: 20,
-            iteration_timeout_secs: 300, // 5 minutes
+            iteration_timeout_secs: 300,  // 5 minutes
             min_iteration_delay_ms: 1000, // 1 second
             max_consecutive_errors: 3,
             consecutive_errors: std::sync::atomic::AtomicU32::new(0),
@@ -562,10 +562,7 @@ impl OrchestratorLayer for ExecutionLimitsLayer {
                         self.max_iterations, iteration
                     );
                     return vec![OrchestratorCommand::Pause {
-                        reason: format!(
-                            "Maximum iterations ({}) reached",
-                            self.max_iterations
-                        ),
+                        reason: format!("Maximum iterations ({}) reached", self.max_iterations),
                     }];
                 }
 
@@ -766,10 +763,7 @@ impl OrchestratorLayer for StallDetectionLayer {
                         + 1;
 
                     if count >= self.threshold {
-                        warn!(
-                            "Stall detected: {} iterations without progress",
-                            count
-                        );
+                        warn!("Stall detected: {} iterations without progress", count);
                         self.reset();
                         return vec![OrchestratorCommand::Replan {
                             reason: format!(
@@ -833,9 +827,9 @@ impl LayerStackBuilder {
 
     /// Add execution limits layer.
     pub fn with_limits(mut self, max_iterations: u32) -> Self {
-        self.engine = self.engine.with_layer(
-            ExecutionLimitsLayer::new().with_max_iterations(max_iterations),
-        );
+        self.engine = self
+            .engine
+            .with_layer(ExecutionLimitsLayer::new().with_max_iterations(max_iterations));
         self
     }
 
@@ -915,7 +909,8 @@ mod tests {
 
     #[test]
     fn test_execution_limits_max_iterations() {
-        let engine = LayeredEngine::new().with_layer(ExecutionLimitsLayer::new().with_max_iterations(5));
+        let engine =
+            LayeredEngine::new().with_layer(ExecutionLimitsLayer::new().with_max_iterations(5));
 
         let event = OrchestratorEvent::IterationStarted {
             task_id: "test".to_string(),

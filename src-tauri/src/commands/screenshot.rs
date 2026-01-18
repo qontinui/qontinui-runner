@@ -119,7 +119,9 @@ pub async fn get_screenshot_monitors(
     match result {
         Ok(response) => {
             if response.success {
-                let data = response.data.unwrap_or(json!({"success": true, "monitors": [], "count": 0}));
+                let data = response
+                    .data
+                    .unwrap_or(json!({"success": true, "monitors": [], "count": 0}));
                 let count = data.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
                 info!("Retrieved {} monitors via IPC", count);
                 Ok(CommandResponse {
@@ -128,7 +130,9 @@ pub async fn get_screenshot_monitors(
                     data: Some(data),
                 })
             } else {
-                let error_msg = response.error.unwrap_or_else(|| "Get monitors failed".to_string());
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Get monitors failed".to_string());
                 error!("Get monitors via IPC failed: {}", error_msg);
                 Err(error_msg)
             }
@@ -193,10 +197,7 @@ async fn capture_screenshot_internal(
                     .and_then(|s| s.as_str())
                     .map(|s| s.to_string());
 
-                let width = data
-                    .get("width")
-                    .and_then(|w| w.as_i64())
-                    .map(|w| w as i32);
+                let width = data.get("width").and_then(|w| w.as_i64()).map(|w| w as i32);
 
                 let height = data
                     .get("height")
@@ -218,7 +219,9 @@ async fn capture_screenshot_internal(
                     error: None,
                 })
             } else {
-                let error_msg = response.error.unwrap_or_else(|| "Screenshot capture failed".to_string());
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Screenshot capture failed".to_string());
                 error!("Screenshot capture via IPC failed: {}", error_msg);
                 Ok(ScreenshotCaptureResult {
                     success: false,
@@ -287,7 +290,8 @@ pub async fn capture_and_upload_screenshot(
     );
 
     // 1. Capture the screenshot via IPC (no delay for upload workflow)
-    let capture_result = capture_screenshot_internal(state.inner().clone(), config.monitor, None).await?;
+    let capture_result =
+        capture_screenshot_internal(state.inner().clone(), config.monitor, None).await?;
 
     if !capture_result.success || capture_result.screenshot_base64.is_none() {
         return Ok(ScreenshotUploadResult {

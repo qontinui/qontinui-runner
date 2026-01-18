@@ -122,7 +122,10 @@ pub fn analyze(working_dir: &str, max_coupling: u32) -> Result<ParsedOutput, Str
     // Second pass: build afferent coupling (imported_by)
     let module_names: Vec<String> = modules.keys().cloned().collect();
     for module_name in &module_names {
-        let imports = modules.get(module_name).map(|m| m.imports.clone()).unwrap_or_default();
+        let imports = modules
+            .get(module_name)
+            .map(|m| m.imports.clone())
+            .unwrap_or_default();
         for imported in imports {
             // Normalize the import to match module names
             let normalized = normalize_import(&imported, &module_names);
@@ -220,7 +223,10 @@ pub fn analyze(working_dir: &str, max_coupling: u32) -> Result<ParsedOutput, Str
                     "high_instability_modules".to_string(),
                     serde_json::json!(high_instability_count),
                 ),
-                ("total_modules".to_string(), serde_json::json!(modules.len())),
+                (
+                    "total_modules".to_string(),
+                    serde_json::json!(modules.len()),
+                ),
             ]),
         },
     })
@@ -233,9 +239,7 @@ pub fn analyze_with_defaults(working_dir: &str) -> Result<ParsedOutput, String> 
 
 /// Convert a file path to a Python module name
 fn path_to_module_name(file_path: &Path, root: &Path) -> String {
-    let relative = file_path
-        .strip_prefix(root)
-        .unwrap_or(file_path);
+    let relative = file_path.strip_prefix(root).unwrap_or(file_path);
 
     let mut parts: Vec<&str> = relative
         .components()
@@ -281,8 +285,8 @@ fn extract_imports(
                 (dotted_name) @relative_import))
     "#;
 
-    let query = Query::new(language, query_str)
-        .map_err(|e| format!("Failed to create query: {}", e))?;
+    let query =
+        Query::new(language, query_str).map_err(|e| format!("Failed to create query: {}", e))?;
 
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
@@ -290,10 +294,7 @@ fn extract_imports(
     while let Some(m) = matches.next() {
         for capture in m.captures {
             let node = capture.node;
-            let text = node
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
+            let text = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
 
             if !text.is_empty() {
                 // Get the top-level module name (first part before dot)

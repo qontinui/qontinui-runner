@@ -162,9 +162,11 @@ fn analyze_trait_method(method: &syn::TraitItemFn, trait_name: &str) -> Option<F
 /// Extract the type name from a syn::Type
 fn extract_type_name(ty: &syn::Type) -> Option<String> {
     match ty {
-        syn::Type::Path(type_path) => {
-            type_path.path.segments.last().map(|seg| seg.ident.to_string())
-        }
+        syn::Type::Path(type_path) => type_path
+            .path
+            .segments
+            .last()
+            .map(|seg| seg.ident.to_string()),
         _ => None,
     }
 }
@@ -302,10 +304,22 @@ pub fn analyze(working_dir: &str, max_complexity: u32) -> Result<ParsedOutput, S
                 ]),
             }),
             tool_data: HashMap::from([
-                ("total_functions".to_string(), serde_json::json!(total_functions)),
-                ("complex_functions".to_string(), serde_json::json!(complex_functions)),
-                ("average_complexity".to_string(), serde_json::json!(avg_complexity)),
-                ("max_threshold".to_string(), serde_json::json!(max_complexity)),
+                (
+                    "total_functions".to_string(),
+                    serde_json::json!(total_functions),
+                ),
+                (
+                    "complex_functions".to_string(),
+                    serde_json::json!(complex_functions),
+                ),
+                (
+                    "average_complexity".to_string(),
+                    serde_json::json!(avg_complexity),
+                ),
+                (
+                    "max_threshold".to_string(),
+                    serde_json::json!(max_complexity),
+                ),
             ]),
         },
     })
@@ -330,7 +344,10 @@ mod tests {
 
         let syntax: syn::ItemFn = syn::parse_str(code).unwrap();
         let result = analyze_function(&syntax);
-        assert_eq!(result.complexity, 1, "Simple function should have complexity 1");
+        assert_eq!(
+            result.complexity, 1,
+            "Simple function should have complexity 1"
+        );
     }
 
     #[test]
@@ -345,7 +362,10 @@ mod tests {
 
         let syntax: syn::ItemFn = syn::parse_str(code).unwrap();
         let result = analyze_function(&syntax);
-        assert_eq!(result.complexity, 2, "Function with if should have complexity 2");
+        assert_eq!(
+            result.complexity, 2,
+            "Function with if should have complexity 2"
+        );
     }
 
     #[test]
@@ -381,7 +401,10 @@ mod tests {
         let syntax: syn::ItemFn = syn::parse_str(code).unwrap();
         let result = analyze_function(&syntax);
         // 4 arms - 1 = 3, plus base = 4
-        assert!(result.complexity >= 3, "Match with 4 arms should have complexity >= 3");
+        assert!(
+            result.complexity >= 3,
+            "Match with 4 arms should have complexity >= 3"
+        );
     }
 
     #[test]
@@ -401,7 +424,10 @@ mod tests {
         let syntax: syn::ItemFn = syn::parse_str(code).unwrap();
         let result = analyze_function(&syntax);
         // Base 1 + for 1 + while 1 + loop 1 = 4
-        assert_eq!(result.complexity, 4, "Function with 3 loops should have complexity 4");
+        assert_eq!(
+            result.complexity, 4,
+            "Function with 3 loops should have complexity 4"
+        );
     }
 
     #[test]
@@ -417,6 +443,9 @@ mod tests {
         let syntax: syn::ItemFn = syn::parse_str(code).unwrap();
         let result = analyze_function(&syntax);
         // Base 1 + if 1 + && 1 + || 1 = 4
-        assert_eq!(result.complexity, 4, "Logical operators should add complexity");
+        assert_eq!(
+            result.complexity, 4,
+            "Logical operators should add complexity"
+        );
     }
 }

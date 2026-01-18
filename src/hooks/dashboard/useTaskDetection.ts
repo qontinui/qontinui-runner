@@ -56,6 +56,7 @@ interface DetectedStepTypes {
   hasApiRequest: boolean;
   hasScript: boolean;
   hasWorkflowRef: boolean;
+  hasAiTask: boolean;
 }
 
 /**
@@ -70,6 +71,7 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
     hasApiRequest: false,
     hasScript: false,
     hasWorkflowRef: false,
+    hasAiTask: false,
   };
 
   if (!stepsJson) {
@@ -84,30 +86,46 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
 
     const result = { ...defaultResult };
 
-    // GUI-related step types (includes unified workflow gui_action)
+    // GUI-related step types - must be specific to visual/GUI automation
+    // Excluded: "workflow" (too generic), "action" (too generic), "wait" (could be non-GUI delay)
     const guiStepTypes = [
       "screenshot",
-      "workflow",
-      "action",
       "click",
-      "type",
-      "find",
-      "wait",
+      "type", // keyboard typing
+      "find", // template matching
+      "find_all",
       "scroll",
       "drag",
       "hotkey",
       "gui",
       "gui_action", // Unified workflow GUI action steps
+      "mouse_move",
+      "double_click",
+      "right_click",
     ];
 
     // Playwright step types
     const playwrightStepTypes = ["playwright", "playwright_test"];
 
     // Verification step types
-    const verificationStepTypes = ["verification", "verify", "test", "check"];
+    const verificationStepTypes = [
+      "verification",
+      "verify",
+      "test",
+      "check",
+      "link_check",
+      "format_check",
+      "type_check",
+      "code_analysis",
+      "security_check",
+      "repository_test",
+    ];
 
     // Shell command step types
-    const shellCommandStepTypes = ["shell_command", "shell", "command", "cmd"];
+    const shellCommandStepTypes = ["shell_command", "shell", "command", "cmd", "bash", "powershell"];
+
+    // AI/Prompt step types (for detecting AI activity from execution steps)
+    const aiStepTypes = ["prompt", "ai_task", "ai", "agentic", "llm"];
 
     // API request step types
     const apiRequestStepTypes = ["api_request", "api", "http", "request"];
@@ -122,28 +140,37 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
       const stepType = step.type || step.step_type;
       if (!stepType) continue;
 
+      // Normalize: lowercase and replace spaces with underscores for consistent matching
       const lowerType = stepType.toLowerCase();
+      const normalizedType = lowerType.replace(/\s+/g, "_");
 
-      if (playwrightStepTypes.includes(lowerType)) {
+      // Check both original lowercase and normalized versions
+      const matchesType = (types: string[]) =>
+        types.includes(lowerType) || types.includes(normalizedType);
+
+      if (matchesType(playwrightStepTypes)) {
         result.hasPlaywright = true;
       }
-      if (verificationStepTypes.includes(lowerType)) {
+      if (matchesType(verificationStepTypes)) {
         result.hasVerification = true;
       }
-      if (guiStepTypes.includes(lowerType)) {
+      if (matchesType(guiStepTypes)) {
         result.hasGuiAutomation = true;
       }
-      if (shellCommandStepTypes.includes(lowerType)) {
+      if (matchesType(shellCommandStepTypes)) {
         result.hasShellCommand = true;
       }
-      if (apiRequestStepTypes.includes(lowerType)) {
+      if (matchesType(apiRequestStepTypes)) {
         result.hasApiRequest = true;
       }
-      if (scriptStepTypes.includes(lowerType)) {
+      if (matchesType(scriptStepTypes)) {
         result.hasScript = true;
       }
-      if (workflowRefStepTypes.includes(lowerType)) {
+      if (matchesType(workflowRefStepTypes)) {
         result.hasWorkflowRef = true;
+      }
+      if (matchesType(aiStepTypes)) {
+        result.hasAiTask = true;
       }
     }
 
@@ -168,10 +195,12 @@ function detectActivities(task: RunningTaskData): ActivityType[] {
     hasApiRequest,
     hasScript,
     hasWorkflowRef,
+    hasAiTask,
   } = parseExecutionSteps(task.execution_steps_json);
 
-  // GUI automation if config_id, workflow_name, or GUI steps are present
-  if (task.config_id || task.workflow_name || hasGuiAutomation) {
+  // GUI automation only if config_id (qontinui state machine) or actual GUI steps are present
+  // Note: workflow_name alone doesn't imply GUI automation - workflows can run scripts, shell commands, etc.
+  if (task.config_id || hasGuiAutomation) {
     activities.push("gui_automation");
   }
 
@@ -199,13 +228,13 @@ function detectActivities(task: RunningTaskData): ActivityType[] {
     activities.push("workflow_ref");
   }
 
-  // AI conversation if task has a prompt
-  if (task.prompt) {
+  // AI conversation if task has a prompt or AI task steps
+  if (task.prompt || hasAiTask) {
     activities.push("ai_conversation");
   }
 
   // Findings are always potentially present for AI tasks
-  if (task.prompt) {
+  if (task.prompt || hasAiTask) {
     activities.push("findings");
   }
 
@@ -217,7 +246,7 @@ function detectActivities(task: RunningTaskData): ActivityType[] {
  */
 function buildTaskActivityInfo(task: RunningTaskData): TaskActivityInfo {
   const activities = detectActivities(task);
-  const { hasPlaywright, hasVerification, hasGuiAutomation } = parseExecutionSteps(
+  const { hasPlaywright, hasVerification, hasGuiAutomation, hasAiTask } = parseExecutionSteps(
     task.execution_steps_json,
   );
 
@@ -225,9 +254,9 @@ function buildTaskActivityInfo(task: RunningTaskData): TaskActivityInfo {
     taskId: task.id,
     taskType: task.task_type,
     taskName: task.task_name,
-    // hasConfig is true if config_id, workflow_name, OR GUI automation steps are present
-    hasConfig: !!(task.config_id || task.workflow_name || hasGuiAutomation),
-    hasPrompt: !!task.prompt,
+    // hasConfig is true only if config_id (qontinui state machine) or actual GUI automation steps are present
+    hasConfig: !!(task.config_id || hasGuiAutomation),
+    hasPrompt: !!(task.prompt || hasAiTask),
     hasPlaywrightScripts: hasPlaywright,
     hasVerificationTests: hasVerification,
     workflowName: task.workflow_name ?? null,

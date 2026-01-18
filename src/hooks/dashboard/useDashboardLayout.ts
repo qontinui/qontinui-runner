@@ -115,45 +115,15 @@ export function useDashboardLayout(
   }, [initialTaskInfo, resetLayoutForTask]);
 
   /**
-   * Auto-switch active widget when an activity starts running.
-   * Debounced to prevent rapid switching from brief status changes.
-   * Only switches if user hasn't manually selected a widget.
+   * Auto-switch is DISABLED to prevent flickering.
+   * Users can manually click on widgets to switch between them.
+   * The first detected widget (by priority) is shown by default.
+   *
+   * Previously, auto-switching would occur when an activity's status changed to "running",
+   * but this caused rapid flickering as different activities toggled status.
    */
-  useEffect(() => {
-    // Clear any pending auto-switch
-    if (autoSwitchTimeoutRef.current) {
-      clearTimeout(autoSwitchTimeoutRef.current);
-      autoSwitchTimeoutRef.current = null;
-    }
-
-    // Don't auto-switch if user has manually selected a widget
-    if (userSelectedRef.current) return;
-
-    const runningActivity = Array.from(activities.entries()).find(
-      ([, state]) => state.status === "running",
-    );
-
-    if (runningActivity) {
-      const [type] = runningActivity;
-      // Only switch if different from current
-      if (type !== activeWidget) {
-        // Debounce the switch to prevent flickering from brief status changes
-        autoSwitchTimeoutRef.current = setTimeout(() => {
-          // Re-check that the activity is still running
-          const stillRunning = activities.get(type)?.status === "running";
-          if (stillRunning && !userSelectedRef.current) {
-            setActiveWidgetState(type);
-          }
-        }, AUTO_SWITCH_DEBOUNCE_MS);
-      }
-    }
-
-    return () => {
-      if (autoSwitchTimeoutRef.current) {
-        clearTimeout(autoSwitchTimeoutRef.current);
-      }
-    };
-  }, [activities, activeWidget]);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _autoSwitchDisabled = { autoSwitchTimeoutRef, userSelectedRef, AUTO_SWITCH_DEBOUNCE_MS };
 
   /**
    * Summary widgets are all detected widgets except the active one.

@@ -89,9 +89,7 @@ impl RuntimeContext {
     /// Get the most recent step output.
     pub fn get_previous_output(&self) -> Option<&StepOutput> {
         // Find the step with the latest timestamp
-        self.step_outputs
-            .values()
-            .max_by_key(|s| &s.completed_at)
+        self.step_outputs.values().max_by_key(|s| &s.completed_at)
     }
 
     /// Increment the iteration counter.
@@ -246,7 +244,11 @@ impl ExpressionEvaluator {
     }
 
     /// Resolve step output expressions (steps.step_id.output[.field]).
-    fn resolve_step_expression(&self, expression: &str, context: &RuntimeContext) -> Option<String> {
+    fn resolve_step_expression(
+        &self,
+        expression: &str,
+        context: &RuntimeContext,
+    ) -> Option<String> {
         let parts: Vec<&str> = expression.splitn(4, '.').collect();
 
         if parts.len() < 3 {

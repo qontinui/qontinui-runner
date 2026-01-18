@@ -6,7 +6,9 @@
 use super::file_walker::{walk_files, WalkConfig};
 use super::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;
-use crate::check_executor::types::{CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity};
+use crate::check_executor::types::{
+    CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity,
+};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -103,9 +105,7 @@ impl CompiledPatterns {
         let patterns = markers
             .into_iter()
             .filter_map(|(marker_type, pattern)| {
-                Regex::new(pattern)
-                    .ok()
-                    .map(|regex| (marker_type, regex))
+                Regex::new(pattern).ok().map(|regex| (marker_type, regex))
             })
             .collect();
 
@@ -337,7 +337,10 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
         "review_count".to_string(),
         serde_json::json!(marker_counts.get("REV001").copied().unwrap_or(0)),
     );
-    tool_data.insert("marker_counts".to_string(), serde_json::json!(marker_counts));
+    tool_data.insert(
+        "marker_counts".to_string(),
+        serde_json::json!(marker_counts),
+    );
 
     Ok(ParsedOutput {
         issues_found,

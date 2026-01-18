@@ -377,7 +377,12 @@ impl LongTermMemory {
     pub fn get_by_category(&self, category: &str) -> Vec<&Learning> {
         self.category_index
             .get(category)
-            .map(|indices| indices.iter().filter_map(|&i| self.learnings.get(i)).collect())
+            .map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|&i| self.learnings.get(i))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -404,7 +409,9 @@ impl LongTermMemory {
             .filter(|l| {
                 l.insight.to_lowercase().contains(&query_lower)
                     || l.category.to_lowercase().contains(&query_lower)
-                    || l.tags.iter().any(|t| t.to_lowercase().contains(&query_lower))
+                    || l.tags
+                        .iter()
+                        .any(|t| t.to_lowercase().contains(&query_lower))
             })
             .collect()
     }
@@ -631,11 +638,7 @@ impl EntityMemory {
     pub fn get_by_type(&self, entity_type: EntityType) -> Vec<&Entity> {
         self.type_index
             .get(&entity_type)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.entities.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.entities.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -897,10 +900,8 @@ mod tests {
         let main_id = main.id.clone();
         em.upsert(main);
 
-        let func = Entity::new("run", EntityType::Function).with_relationship(
-            RelationType::ContainedBy,
-            main_id.clone(),
-        );
+        let func = Entity::new("run", EntityType::Function)
+            .with_relationship(RelationType::ContainedBy, main_id.clone());
         em.upsert(func);
 
         let related = em.get_related(&main_id);

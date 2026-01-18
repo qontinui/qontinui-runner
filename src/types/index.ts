@@ -447,10 +447,4 @@ export {
 } from "./checkpoint";
 
 // Recap types (Session overview)
-export type {
-  RecapStep,
-  FailureInfo,
-  RecapStats,
-  RecapData,
-  RecapResponse,
-} from "./recap";
+export type { RecapStep, FailureInfo, RecapStats, RecapData, RecapResponse } from "./recap";

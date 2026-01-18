@@ -1,4 +1,4 @@
 //! Security vulnerability scanner
 
-pub mod scan;
 pub mod patterns;
+pub mod scan;

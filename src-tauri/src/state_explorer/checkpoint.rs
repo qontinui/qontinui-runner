@@ -173,8 +173,7 @@ impl ExplorationCheckpoint {
         let json = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read checkpoint file: {}", e))?;
 
-        serde_json::from_str(&json)
-            .map_err(|e| format!("Failed to parse checkpoint: {}", e))
+        serde_json::from_str(&json).map_err(|e| format!("Failed to parse checkpoint: {}", e))
     }
 
     /// Get a summary of issues for AI analysis
@@ -222,9 +221,10 @@ impl ExplorationCheckpoint {
     pub fn should_trigger_agentic(&self) -> bool {
         match &self.trigger {
             CheckpointTrigger::CriticalFailure { .. } => true,
-            CheckpointTrigger::IssueThreshold { issue_count, threshold } => {
-                *issue_count >= *threshold
-            }
+            CheckpointTrigger::IssueThreshold {
+                issue_count,
+                threshold,
+            } => *issue_count >= *threshold,
             CheckpointTrigger::BatchComplete { .. } => {
                 // Only trigger if there are issues to fix
                 !self.accumulated_issues.is_empty()
@@ -380,14 +380,12 @@ impl CheckpointManager {
 
     /// Get the latest checkpoint for a run
     pub fn get_latest_checkpoint(&self, run_id: &str) -> Option<&ExplorationCheckpoint> {
-        self.checkpoints
-            .get(run_id)
-            .and_then(|checkpoints| {
-                checkpoints
-                    .iter()
-                    .filter(|c| c.status == CheckpointStatus::Active)
-                    .last()
-            })
+        self.checkpoints.get(run_id).and_then(|checkpoints| {
+            checkpoints
+                .iter()
+                .filter(|c| c.status == CheckpointStatus::Active)
+                .last()
+        })
     }
 
     /// Load checkpoints from disk for a run
@@ -397,7 +395,7 @@ impl CheckpointManager {
             return Ok(vec![]);
         }
 
-        let pattern = format!("checkpoint-{}-*.json", run_id);
+        let _pattern = format!("checkpoint-{}-*.json", run_id);
         let mut loaded = vec![];
 
         for entry in std::fs::read_dir(&checkpoint_dir)
@@ -477,15 +475,24 @@ mod tests {
 
         // Batch complete
         let trigger = manager.should_checkpoint(5, 1, false);
-        assert!(matches!(trigger, Some(CheckpointTrigger::BatchComplete { .. })));
+        assert!(matches!(
+            trigger,
+            Some(CheckpointTrigger::BatchComplete { .. })
+        ));
 
         // Issue threshold
         let trigger = manager.should_checkpoint(2, 3, false);
-        assert!(matches!(trigger, Some(CheckpointTrigger::IssueThreshold { .. })));
+        assert!(matches!(
+            trigger,
+            Some(CheckpointTrigger::IssueThreshold { .. })
+        ));
 
         // Critical failure
         let trigger = manager.should_checkpoint(1, 0, true);
-        assert!(matches!(trigger, Some(CheckpointTrigger::CriticalFailure { .. })));
+        assert!(matches!(
+            trigger,
+            Some(CheckpointTrigger::CriticalFailure { .. })
+        ));
     }
 
     #[test]

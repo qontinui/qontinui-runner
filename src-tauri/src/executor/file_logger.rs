@@ -511,25 +511,29 @@ impl FileLogger {
         let extraction_entries: Vec<ApiExtractionResult> = params
             .extractions
             .iter()
-            .map(|(var_name, json_path, value, success, err)| ApiExtractionResult {
-                variable_name: var_name.clone(),
-                json_path: json_path.clone(),
-                extracted_value: value.clone(),
-                success: *success,
-                error: err.clone(),
-            })
+            .map(
+                |(var_name, json_path, value, success, err)| ApiExtractionResult {
+                    variable_name: var_name.clone(),
+                    json_path: json_path.clone(),
+                    extracted_value: value.clone(),
+                    success: *success,
+                    error: err.clone(),
+                },
+            )
             .collect();
 
         let assertion_entries: Vec<ApiAssertionResult> = params
             .assertions
             .iter()
-            .map(|(assertion_type, expected, actual, passed, err)| ApiAssertionResult {
-                assertion_type: assertion_type.clone(),
-                expected: expected.clone(),
-                actual: actual.clone(),
-                passed: *passed,
-                error: err.clone(),
-            })
+            .map(
+                |(assertion_type, expected, actual, passed, err)| ApiAssertionResult {
+                    assertion_type: assertion_type.clone(),
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                    passed: *passed,
+                    error: err.clone(),
+                },
+            )
             .collect();
 
         let entry = ApiRequestFileEntry {

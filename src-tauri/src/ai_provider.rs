@@ -111,12 +111,18 @@ pub fn run_prompt_with_routing(
     );
 
     match ai_settings.provider {
-        AiProvider::ClaudeCli => {
-            run_claude_cli(prompt, &ai_settings.claude_cli, timeout, model_override.as_deref())
-        }
-        AiProvider::ClaudeApi => {
-            run_claude_api(prompt, &ai_settings.claude_api, timeout, model_override.as_deref())
-        }
+        AiProvider::ClaudeCli => run_claude_cli(
+            prompt,
+            &ai_settings.claude_cli,
+            timeout,
+            model_override.as_deref(),
+        ),
+        AiProvider::ClaudeApi => run_claude_api(
+            prompt,
+            &ai_settings.claude_api,
+            timeout,
+            model_override.as_deref(),
+        ),
         AiProvider::GeminiCli => {
             // Gemini routing only works within Gemini models, warn if trying to route to Claude model
             if let Some(ref model) = model_override {
@@ -124,7 +130,12 @@ pub fn run_prompt_with_routing(
                     warn!("Cannot route to Claude model when using Gemini provider, using default Gemini model");
                     run_gemini_cli(prompt, &ai_settings.gemini_cli, timeout, None)
                 } else {
-                    run_gemini_cli(prompt, &ai_settings.gemini_cli, timeout, model_override.as_deref())
+                    run_gemini_cli(
+                        prompt,
+                        &ai_settings.gemini_cli,
+                        timeout,
+                        model_override.as_deref(),
+                    )
                 }
             } else {
                 run_gemini_cli(prompt, &ai_settings.gemini_cli, timeout, None)
@@ -136,7 +147,12 @@ pub fn run_prompt_with_routing(
                     warn!("Cannot route to Claude model when using Gemini provider, using default Gemini model");
                     run_gemini_api(prompt, &ai_settings.gemini_api, timeout, None)
                 } else {
-                    run_gemini_api(prompt, &ai_settings.gemini_api, timeout, model_override.as_deref())
+                    run_gemini_api(
+                        prompt,
+                        &ai_settings.gemini_api,
+                        timeout,
+                        model_override.as_deref(),
+                    )
                 }
             } else {
                 run_gemini_api(prompt, &ai_settings.gemini_api, timeout, None)
@@ -180,10 +196,22 @@ fn run_claude_cli(
 
     if use_stdin {
         // Use file-based approach for long prompts (avoids Windows cmd length limits)
-        run_claude_cli_with_file(prompt, claude_program, effective_mode, config_dir, model_override)
+        run_claude_cli_with_file(
+            prompt,
+            claude_program,
+            effective_mode,
+            config_dir,
+            model_override,
+        )
     } else {
         // Use command-line argument for short prompts
-        run_claude_cli_with_arg(prompt, claude_program, effective_mode, config_dir, model_override)
+        run_claude_cli_with_arg(
+            prompt,
+            claude_program,
+            effective_mode,
+            config_dir,
+            model_override,
+        )
     }
 }
 
@@ -276,7 +304,10 @@ fn run_claude_cli_with_file(
                     dir, prompt_path, claude_program, model_flag
                 )
             } else {
-                format!("cat '{}' | {} --print{}", prompt_path, claude_program, model_flag)
+                format!(
+                    "cat '{}' | {} --print{}",
+                    prompt_path, claude_program, model_flag
+                )
             };
             Command::new("sh").args(["-c", &native_cmd]).output()
         }
@@ -401,7 +432,11 @@ fn run_claude_api(
     use keyring::Entry;
 
     let model = model_override.unwrap_or(&settings.model);
-    info!("Running Claude API (model: {}, override: {})", model, model_override.is_some());
+    info!(
+        "Running Claude API (model: {}, override: {})",
+        model,
+        model_override.is_some()
+    );
 
     // Get API key from keychain
     let api_key = match Entry::new("com.qontinui.runner.ai", "claude_api") {
@@ -527,21 +562,17 @@ fn run_gemini_cli(
 
     info!(
         "Running Gemini CLI (mode: {:?}, program: {}, model: {}, override: {})",
-        effective_mode, gemini_program, model, model_override.is_some()
+        effective_mode,
+        gemini_program,
+        model,
+        model_override.is_some()
     );
 
     let output_result = match effective_mode {
         CliExecutionMode::WindowsNative | CliExecutionMode::Auto => {
             // On Windows, use cmd.exe /c to handle .cmd files from npm install
             Command::new("cmd.exe")
-                .args([
-                    "/c",
-                    gemini_program,
-                    "--model",
-                    model,
-                    "-p",
-                    prompt,
-                ])
+                .args(["/c", gemini_program, "--model", model, "-p", prompt])
                 .output()
         }
         CliExecutionMode::Wsl => Command::new("wsl")
@@ -600,7 +631,9 @@ fn run_gemini_api(
     let model = model_override.unwrap_or(&settings.model);
     info!(
         "Running Gemini API (model: {}, temp: {}, override: {})",
-        model, settings.temperature, model_override.is_some()
+        model,
+        settings.temperature,
+        model_override.is_some()
     );
 
     // Get API key from keychain

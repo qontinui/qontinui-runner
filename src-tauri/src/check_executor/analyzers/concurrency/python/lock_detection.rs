@@ -30,7 +30,10 @@ fn traverse_for_locks(node: &Node, source: &str, ctx: &mut AnalysisContext) {
     // Look for assignments that create locks
     if kind == "assignment" || kind == "annotated_assignment" {
         if let Some(name) = get_assignment_target_name(node, source) {
-            if let Some(value) = node.child_by_field_name("right").or_else(|| node.child_by_field_name("value")) {
+            if let Some(value) = node
+                .child_by_field_name("right")
+                .or_else(|| node.child_by_field_name("value"))
+            {
                 if let Some(lock_type) = detect_lock_type(&value, source) {
                     ctx.locks.push(LockInfo {
                         name: name.clone(),
@@ -76,13 +79,19 @@ fn detect_init_locks(body: &Node, source: &str, ctx: &mut AnalysisContext) {
                                     if let Some(attr) = left.child_by_field_name("attribute") {
                                         if let Ok(attr_name) = attr.utf8_text(source.as_bytes()) {
                                             if let Some(right) = expr.child_by_field_name("right") {
-                                                if let Some(lock_type) = detect_lock_type(&right, source) {
+                                                if let Some(lock_type) =
+                                                    detect_lock_type(&right, source)
+                                                {
                                                     let lock_name = format!("self.{}", attr_name);
                                                     ctx.locks.push(LockInfo {
                                                         name: lock_name.clone(),
                                                         lock_type,
-                                                        definition_line: child.start_position().row as u32 + 1,
-                                                        protects: infer_protected_states(&lock_name, ctx),
+                                                        definition_line: child.start_position().row
+                                                            as u32
+                                                            + 1,
+                                                        protects: infer_protected_states(
+                                                            &lock_name, ctx,
+                                                        ),
                                                     });
                                                 }
                                             }
@@ -102,7 +111,10 @@ fn detect_init_locks(body: &Node, source: &str, ctx: &mut AnalysisContext) {
 fn get_assignment_target_name(node: &Node, source: &str) -> Option<String> {
     node.child_by_field_name("left")
         .and_then(|left| match left.kind() {
-            "identifier" => left.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+            "identifier" => left
+                .utf8_text(source.as_bytes())
+                .ok()
+                .map(|s| s.to_string()),
             "attribute" => {
                 // Handle self.lock or cls.lock
                 let obj = left.child_by_field_name("object")?;
@@ -152,10 +164,7 @@ fn infer_protected_states(lock_name: &str, ctx: &AnalysisContext) -> Vec<String>
 
     // Look for states with matching names
     for state in &ctx.shared_states {
-        let state_base = state
-            .name
-            .strip_prefix("self.")
-            .unwrap_or(&state.name);
+        let state_base = state.name.strip_prefix("self.").unwrap_or(&state.name);
 
         if state_base == base_name
             || state_base.starts_with(&format!("{}_", base_name))

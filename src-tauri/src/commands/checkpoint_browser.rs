@@ -8,10 +8,9 @@
 
 use crate::commands::AppState;
 use crate::orchestrator::checkpoint::{
-    Checkpoint, CheckpointDiff, CheckpointManager, CheckpointSummary,
-    CheckpointTrigger, LineageInfo, LineageTree, ReplayManager,
-    ReplaySession, RestorationInstructions, StateRestorationConfig, StateSnapshot,
-    VerificationSnapshot,
+    Checkpoint, CheckpointDiff, CheckpointManager, CheckpointSummary, CheckpointTrigger,
+    LineageInfo, LineageTree, ReplayManager, ReplaySession, RestorationInstructions,
+    StateRestorationConfig, StateSnapshot, VerificationSnapshot,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -21,14 +20,11 @@ use tauri::State;
 
 /// Global checkpoint manager instance for in-memory operations (replay, comparison).
 /// The database stores checkpoints persistently; this provides real-time operations.
-static CHECKPOINT_MANAGER: Lazy<Mutex<CheckpointManager>> = Lazy::new(|| {
-    Mutex::new(CheckpointManager::new().with_max_per_task(50))
-});
+static CHECKPOINT_MANAGER: Lazy<Mutex<CheckpointManager>> =
+    Lazy::new(|| Mutex::new(CheckpointManager::new().with_max_per_task(50)));
 
 /// Global replay manager instance for managing replay sessions and lineage.
-static REPLAY_MANAGER: Lazy<Mutex<ReplayManager>> = Lazy::new(|| {
-    Mutex::new(ReplayManager::new())
-});
+static REPLAY_MANAGER: Lazy<Mutex<ReplayManager>> = Lazy::new(|| Mutex::new(ReplayManager::new()));
 
 /// List all checkpoints, optionally filtered by task ID.
 #[tauri::command]
@@ -36,7 +32,9 @@ pub fn list_orchestrator_checkpoints(
     state: State<'_, Arc<AppState>>,
     task_id: Option<String>,
 ) -> Result<Vec<CheckpointSummary>, String> {
-    let checkpoints_json = state.checkpoint_db.get_orchestrator_checkpoints(task_id.as_deref())?;
+    let checkpoints_json = state
+        .checkpoint_db
+        .get_orchestrator_checkpoints(task_id.as_deref())?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -50,7 +48,11 @@ pub fn list_orchestrator_checkpoints(
             state: cp["state"].as_str().unwrap_or("Unknown").to_string(),
             tags: cp["tags"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
         .collect();
@@ -69,8 +71,8 @@ pub fn get_orchestrator_checkpoint(
     if let Some(cp) = checkpoint_json {
         // Deserialize the state snapshot from JSON
         let state_json = &cp["state"];
-        let snapshot: StateSnapshot = serde_json::from_value(state_json.clone())
-            .unwrap_or_else(|_| StateSnapshot {
+        let snapshot: StateSnapshot =
+            serde_json::from_value(state_json.clone()).unwrap_or_else(|_| StateSnapshot {
                 state: state_json.as_str().unwrap_or("Unknown").to_string(),
                 iteration: cp["iteration"].as_i64().unwrap_or(0) as u32,
                 channels: HashMap::new(),
@@ -95,8 +97,8 @@ pub fn get_orchestrator_checkpoint(
             },
         };
 
-        let mut checkpoint = Checkpoint::new(cp["task_id"].as_str().unwrap_or(""), snapshot)
-            .with_trigger(trigger);
+        let mut checkpoint =
+            Checkpoint::new(cp["task_id"].as_str().unwrap_or(""), snapshot).with_trigger(trigger);
 
         if let Some(name) = cp["name"].as_str() {
             checkpoint = checkpoint.with_name(name);
@@ -135,8 +137,8 @@ pub fn create_orchestrator_checkpoint(
 
     // Also save to in-memory manager for real-time operations
     let mut manager = CHECKPOINT_MANAGER.lock().map_err(|e| e.to_string())?;
-    let mut checkpoint = Checkpoint::new(&task_id, snapshot.clone())
-        .with_trigger(CheckpointTrigger::Manual);
+    let mut checkpoint =
+        Checkpoint::new(&task_id, snapshot.clone()).with_trigger(CheckpointTrigger::Manual);
 
     if let Some(ref n) = name {
         checkpoint = checkpoint.with_name(n.clone());
@@ -262,8 +264,12 @@ pub fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Result<(),
             1 => CheckpointTrigger::IterationBoundary { iteration: i },
             3 => CheckpointTrigger::Manual,
             4 => CheckpointTrigger::VerificationBoundary,
-            5 => CheckpointTrigger::AfterSuccess { operation: "Task completed".to_string() },
-            _ => CheckpointTrigger::Automatic { reason: "Auto checkpoint".to_string() },
+            5 => CheckpointTrigger::AfterSuccess {
+                operation: "Task completed".to_string(),
+            },
+            _ => CheckpointTrigger::Automatic {
+                reason: "Auto checkpoint".to_string(),
+            },
         };
 
         let trigger_str = match i {
@@ -309,7 +315,11 @@ pub fn add_sample_checkpoints(app_state: State<'_, Arc<AppState>>) -> Result<(),
             custom_data: HashMap::new(),
         };
 
-        let name = if i == 3 { Some("Before risky change") } else { None };
+        let name = if i == 3 {
+            Some("Before risky change")
+        } else {
+            None
+        };
 
         let mut checkpoint = Checkpoint::new(task_id, snapshot.clone())
             .with_trigger(trigger)
@@ -416,10 +426,12 @@ pub fn replay_from_checkpoint(
 
     // Create restoration instructions
     let restoration_config = StateRestorationConfig::full();
-    let restoration_instructions = RestorationInstructions::from_checkpoint(&checkpoint, &restoration_config);
+    let restoration_instructions =
+        RestorationInstructions::from_checkpoint(&checkpoint, &restoration_config);
 
     // Create a new task run in the database (branched from checkpoint)
-    let original_prompt = app_state.checkpoint_db
+    let original_prompt = app_state
+        .checkpoint_db
         .get_task_run(&checkpoint.task_id)
         .ok()
         .flatten()
@@ -434,8 +446,7 @@ pub fn replay_from_checkpoint(
 
     let replay_task_name = format!(
         "Replay: {} (from iteration {})",
-        checkpoint.task_id,
-        checkpoint.state.iteration
+        checkpoint.task_id, checkpoint.state.iteration
     );
 
     // Create the new task run
@@ -443,14 +454,14 @@ pub fn replay_from_checkpoint(
         &new_task_run_id,
         &replay_task_name,
         Some(&replay_prompt),
-        None, // max_sessions
+        None,       // max_sessions
         Some(true), // auto_continue
-        None, // execution_steps_json
-        None, // log_sources_json
+        None,       // execution_steps_json
+        None,       // log_sources_json
     )?;
 
     // Save replay lineage to database
-    let lineage_json = serde_json::to_string(&replay_result.lineage)
+    let _lineage_json = serde_json::to_string(&replay_result.lineage)
         .map_err(|e| format!("Failed to serialize lineage: {}", e))?;
 
     // Store lineage in task_runs custom field (runtime_context_json)
@@ -461,7 +472,8 @@ pub fn replay_from_checkpoint(
             "source_checkpoint_id": checkpoint_id,
             "restored_iteration": checkpoint.state.iteration,
             "restored_state": checkpoint.state.state,
-        }).to_string(),
+        })
+        .to_string(),
     )?;
 
     Ok(ReplayFromCheckpointResponse {
@@ -534,7 +546,11 @@ pub fn get_task_lineage_info(task_run_id: String) -> Result<Option<LineageInfo>,
 #[tauri::command]
 pub fn list_active_replay_sessions() -> Result<Vec<ReplaySession>, String> {
     let replay_manager = REPLAY_MANAGER.lock().map_err(|e| e.to_string())?;
-    Ok(replay_manager.list_active_sessions().into_iter().cloned().collect())
+    Ok(replay_manager
+        .list_active_sessions()
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
 /// Complete a replay session.
@@ -603,7 +619,11 @@ pub fn get_checkpoints_filtered(
             state: cp["state"].as_str().unwrap_or("Unknown").to_string(),
             tags: cp["tags"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
         .collect();
@@ -619,11 +639,10 @@ pub fn get_checkpoints_paginated(
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedCheckpointResult, String> {
-    let checkpoints_json = state.checkpoint_db.get_checkpoints_paginated(
-        task_id.as_deref(),
-        offset,
-        limit,
-    )?;
+    let checkpoints_json =
+        state
+            .checkpoint_db
+            .get_checkpoints_paginated(task_id.as_deref(), offset, limit)?;
 
     let summaries: Vec<CheckpointSummary> = checkpoints_json
         .into_iter()
@@ -637,12 +656,18 @@ pub fn get_checkpoints_paginated(
             state: cp["state"].as_str().unwrap_or("Unknown").to_string(),
             tags: cp["tags"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
         })
         .collect();
 
-    let total = state.checkpoint_db.get_checkpoints_count(task_id.as_deref())?;
+    let total = state
+        .checkpoint_db
+        .get_checkpoints_count(task_id.as_deref())?;
 
     Ok(PaginatedCheckpointResult {
         items: summaries,
@@ -658,5 +683,7 @@ pub fn get_checkpoints_count(
     state: State<'_, Arc<AppState>>,
     task_id: Option<String>,
 ) -> Result<i64, String> {
-    state.checkpoint_db.get_checkpoints_count(task_id.as_deref())
+    state
+        .checkpoint_db
+        .get_checkpoints_count(task_id.as_deref())
 }

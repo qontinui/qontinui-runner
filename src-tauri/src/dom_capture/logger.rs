@@ -187,9 +187,7 @@ impl DomCaptureLogger {
 
         debug!(
             "Logged DOM capture: {} from {} ({})",
-            id,
-            capture.source,
-            capture.capture_type
+            id, capture.source, capture.capture_type
         );
 
         Ok(capture)
@@ -253,8 +251,7 @@ impl DomCaptureLogger {
             return Err(format!("HTML file not found: {}", capture.html_file_path));
         }
 
-        fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read HTML file: {}", e))
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read HTML file: {}", e))
     }
 
     /// Clear all DOM capture files and logs (called on startup)

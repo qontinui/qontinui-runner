@@ -51,9 +51,10 @@ pub fn optimize_database(
     Ok(CommandResponse {
         success: true,
         message: Some(message),
-        data: Some(serde_json::to_value(&result).map_err(|e| {
-            format!("Failed to serialize optimization result: {}", e)
-        })?),
+        data: Some(
+            serde_json::to_value(&result)
+                .map_err(|e| format!("Failed to serialize optimization result: {}", e))?,
+        ),
     })
 }
 

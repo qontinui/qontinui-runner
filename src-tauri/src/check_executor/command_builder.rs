@@ -88,7 +88,9 @@ fn parse_command_string(cmd: &str) -> Result<(String, Vec<String>), Box<dyn Erro
 // Python Tools
 // ============================================================================
 
-fn build_black_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_black_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     if !check_def.auto_fix {
@@ -105,7 +107,9 @@ fn build_black_command(check_def: &CheckDefinition) -> Result<(String, Vec<Strin
     Ok(("black".to_string(), args))
 }
 
-fn build_isort_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_isort_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     if !check_def.auto_fix {
@@ -122,7 +126,9 @@ fn build_isort_command(check_def: &CheckDefinition) -> Result<(String, Vec<Strin
     Ok(("isort".to_string(), args))
 }
 
-fn build_ruff_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_ruff_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec!["check".to_string()];
 
     if check_def.auto_fix {
@@ -143,7 +149,9 @@ fn build_ruff_command(check_def: &CheckDefinition) -> Result<(String, Vec<String
     Ok(("ruff".to_string(), args))
 }
 
-fn build_mypy_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_mypy_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     if let Some(ref config) = check_def.config_path {
@@ -159,7 +167,9 @@ fn build_mypy_command(check_def: &CheckDefinition) -> Result<(String, Vec<String
     Ok(("mypy".to_string(), args))
 }
 
-fn build_pyright_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_pyright_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     // Pyright outputs JSON by default with this flag
@@ -177,7 +187,9 @@ fn build_pyright_command(check_def: &CheckDefinition) -> Result<(String, Vec<Str
 // JavaScript/TypeScript Tools
 // ============================================================================
 
-fn build_eslint_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_eslint_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     if check_def.auto_fix {
@@ -198,7 +210,9 @@ fn build_eslint_command(check_def: &CheckDefinition) -> Result<(String, Vec<Stri
     Ok(("eslint".to_string(), args))
 }
 
-fn build_prettier_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_prettier_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     if check_def.auto_fix {
@@ -228,7 +242,9 @@ fn build_tsc_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>
     Ok(("tsc".to_string(), args))
 }
 
-fn build_biome_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_biome_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec![];
 
     if check_def.auto_fix {
@@ -256,7 +272,9 @@ fn build_biome_command(check_def: &CheckDefinition) -> Result<(String, Vec<Strin
 // Rust Tools
 // ============================================================================
 
-fn build_clippy_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_clippy_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec!["clippy".to_string()];
 
     if check_def.auto_fix {
@@ -279,7 +297,9 @@ fn build_clippy_command(check_def: &CheckDefinition) -> Result<(String, Vec<Stri
     Ok(("cargo".to_string(), args))
 }
 
-fn build_rustfmt_command(check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_rustfmt_command(
+    check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec!["fmt".to_string()];
 
     if !check_def.auto_fix {
@@ -289,7 +309,9 @@ fn build_rustfmt_command(check_def: &CheckDefinition) -> Result<(String, Vec<Str
     Ok(("cargo".to_string(), args))
 }
 
-fn build_cargo_check_command(_check_def: &CheckDefinition) -> Result<(String, Vec<String>), Box<dyn Error>> {
+fn build_cargo_check_command(
+    _check_def: &CheckDefinition,
+) -> Result<(String, Vec<String>), Box<dyn Error>> {
     let mut args = vec!["check".to_string()];
 
     // Message format for parsing

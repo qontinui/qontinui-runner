@@ -9,10 +9,10 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::ai_router::TaskContext;
 use super::types::{
     CriterionType, SuccessCriterion, VerificationMethod, VerificationPlan, WorkerDomain,
 };
+use crate::ai_router::TaskContext;
 
 /// Context provided to the planning agent for goal analysis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,7 +303,10 @@ pub fn build_planning_user_prompt(context: &PlanningContext) -> String {
     prompt.push_str("## Available Verification Methods\n\n");
     for method in &context.available_methods {
         if method.available {
-            prompt.push_str(&format!("- **{:?}**: {}\n", method.method, method.description));
+            prompt.push_str(&format!(
+                "- **{:?}**: {}\n",
+                method.method, method.description
+            ));
             if let Some(hints) = &method.config_hints {
                 prompt.push_str(&format!("  Config: {}\n", hints));
             }
@@ -314,14 +317,22 @@ pub fn build_planning_user_prompt(context: &PlanningContext) -> String {
     // Add existing execution steps if any
     if let Some(steps) = &context.configured_execution_steps {
         prompt.push_str("## Pre-configured Execution Steps\n\n");
-        prompt.push_str(&format!("```json\n{}\n```\n\n", serde_json::to_string_pretty(steps).unwrap_or_default()));
-        prompt.push_str("These steps are already configured. You can reference them or add more.\n\n");
+        prompt.push_str(&format!(
+            "```json\n{}\n```\n\n",
+            serde_json::to_string_pretty(steps).unwrap_or_default()
+        ));
+        prompt.push_str(
+            "These steps are already configured. You can reference them or add more.\n\n",
+        );
     }
 
     // Add replanning context if applicable
     if let Some(previous) = &context.previous_plan {
         prompt.push_str("## Previous Plan (Replanning Requested)\n\n");
-        prompt.push_str(&format!("Previous goal summary: {}\n\n", previous.goal_summary));
+        prompt.push_str(&format!(
+            "Previous goal summary: {}\n\n",
+            previous.goal_summary
+        ));
         if let Some(reason) = &context.replan_reason {
             prompt.push_str(&format!("**Replan reason**: {}\n\n", reason));
         }
@@ -363,9 +374,7 @@ pub fn parse_planning_response(response: &str) -> Result<VerificationPlan, Strin
         .map(|arr| arr.iter().cloned().collect())
         .unwrap_or_default();
 
-    let suggested_worker_count = parsed["suggested_worker_count"]
-        .as_u64()
-        .unwrap_or(1) as u32;
+    let suggested_worker_count = parsed["suggested_worker_count"].as_u64().unwrap_or(1) as u32;
 
     let worker_domains = parse_worker_domains(&parsed["worker_domains"]);
 
@@ -380,7 +389,9 @@ pub fn parse_planning_response(response: &str) -> Result<VerificationPlan, Strin
 }
 
 fn parse_success_criteria(value: &serde_json::Value) -> Result<Vec<SuccessCriterion>, String> {
-    let arr = value.as_array().ok_or("success_criteria must be an array")?;
+    let arr = value
+        .as_array()
+        .ok_or("success_criteria must be an array")?;
     let mut criteria = Vec::new();
 
     for item in arr {
@@ -581,10 +592,7 @@ pub fn create_verification_plan(
 
     // Combine into a single prompt for the AI
     // (Most AI providers expect a single prompt, system instructions can be prepended)
-    let full_prompt = format!(
-        "{}\n\n---\n\n{}",
-        system_prompt, user_prompt
-    );
+    let full_prompt = format!("{}\n\n---\n\n{}", system_prompt, user_prompt);
 
     debug!(
         "Planning prompt built (length: {} chars)",
@@ -596,7 +604,8 @@ pub fn create_verification_plan(
         .with_file_count(context.project_hints.test_frameworks.len());
 
     // Call the AI provider with routing
-    let ai_response = crate::ai_provider::run_prompt_with_routing(&full_prompt, &task_context, timeout_seconds);
+    let ai_response =
+        crate::ai_provider::run_prompt_with_routing(&full_prompt, &task_context, timeout_seconds);
 
     if !ai_response.success {
         let error_msg = ai_response
@@ -607,7 +616,10 @@ pub fn create_verification_plan(
     }
 
     let raw_response = ai_response.output;
-    debug!("Planning AI response (length: {} chars)", raw_response.len());
+    debug!(
+        "Planning AI response (length: {} chars)",
+        raw_response.len()
+    );
 
     // Parse the response into a VerificationPlan
     let mut plan = parse_planning_response(&raw_response)?;
@@ -630,8 +642,7 @@ pub fn create_verification_plan(
     // Get previous version ID if this is a replan
     let previous_version_id = if context.previous_plan.is_some() {
         // Try to get the previous plan from the database
-        db.get_latest_verification_plan(task_run_id)?
-            .map(|p| p.id)
+        db.get_latest_verification_plan(task_run_id)?.map(|p| p.id)
     } else {
         None
     };
@@ -680,7 +691,8 @@ pub fn create_replan(
     );
 
     // Get the previous plan
-    let previous_stored = db.get_latest_verification_plan(task_run_id)?
+    let previous_stored = db
+        .get_latest_verification_plan(task_run_id)?
         .ok_or_else(|| "Cannot replan: no existing plan found".to_string())?;
 
     let previous_plan = previous_stored.parse_plan()?;
@@ -726,13 +738,22 @@ pub fn build_worker_plan_context(plan: &VerificationPlan) -> String {
     context.push_str(&format!("**Goal:** {}\n\n", plan.goal_summary));
 
     context.push_str("### Success Criteria\n\n");
-    context.push_str("Your work will be verified against these criteria. Focus on making them all pass.\n\n");
+    context.push_str(
+        "Your work will be verified against these criteria. Focus on making them all pass.\n\n",
+    );
 
     for (i, criterion) in plan.success_criteria.iter().enumerate() {
-        let critical_marker = if criterion.is_critical { " [CRITICAL]" } else { " [informational]" };
+        let critical_marker = if criterion.is_critical {
+            " [CRITICAL]"
+        } else {
+            " [informational]"
+        };
         context.push_str(&format!(
             "{}. **{}**{}: {}\n",
-            i + 1, criterion.id, critical_marker, criterion.description
+            i + 1,
+            criterion.id,
+            critical_marker,
+            criterion.description
         ));
 
         match criterion.criterion_type {
@@ -743,7 +764,10 @@ pub fn build_worker_plan_context(plan: &VerificationPlan) -> String {
                 if let Some(config) = &criterion.verification_config {
                     if let Ok(config_str) = serde_json::to_string_pretty(config) {
                         if config_str.len() < 200 {
-                            context.push_str(&format!("   - Config: {}\n", config_str.replace('\n', " ")));
+                            context.push_str(&format!(
+                                "   - Config: {}\n",
+                                config_str.replace('\n', " ")
+                            ));
                         }
                     }
                 }
@@ -760,7 +784,9 @@ pub fn build_worker_plan_context(plan: &VerificationPlan) -> String {
     context.push_str("### Worker Signals\n\n");
     context.push_str("When you believe the work is complete, emit:\n");
     context.push_str("```\n[WORK_COMPLETE] Brief reason why work is done\n```\n\n");
-    context.push_str("The system will then run verification. If verification fails, you'll get feedback.\n\n");
+    context.push_str(
+        "The system will then run verification. If verification fails, you'll get feedback.\n\n",
+    );
     context.push_str("If you discover the plan is inadequate, emit:\n");
     context.push_str("```\n[NEED_REPLAN] Reason why replanning is needed\n```\n\n");
 

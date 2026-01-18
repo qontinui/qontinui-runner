@@ -652,7 +652,12 @@ pub const CHECK_TOOLS: &[CheckToolInfo] = &[
         language: CheckLanguage::Javascript,
         supports_auto_fix: true,
         default_command: "eslint .",
-        config_files: &[".eslintrc", ".eslintrc.js", ".eslintrc.json", "eslint.config.js"],
+        config_files: &[
+            ".eslintrc",
+            ".eslintrc.js",
+            ".eslintrc.json",
+            "eslint.config.js",
+        ],
         install_command: Some("npm install eslint"),
     },
     // JavaScript/TypeScript - Formatting
@@ -664,7 +669,12 @@ pub const CHECK_TOOLS: &[CheckToolInfo] = &[
         language: CheckLanguage::Javascript,
         supports_auto_fix: true,
         default_command: "prettier --check .",
-        config_files: &[".prettierrc", ".prettierrc.js", ".prettierrc.json", "prettier.config.js"],
+        config_files: &[
+            ".prettierrc",
+            ".prettierrc.js",
+            ".prettierrc.json",
+            "prettier.config.js",
+        ],
         install_command: Some("npm install prettier"),
     },
     // JavaScript/TypeScript - Type Checking

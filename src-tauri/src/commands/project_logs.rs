@@ -1003,7 +1003,10 @@ pub fn find_log_sources_with_ai(
                 project_path.join("log"),
                 project_path.join(".logs"),
                 project_path.join("var/log"),
-                project_path.parent().map(|p| p.join(".dev-logs")).unwrap_or_default(),
+                project_path
+                    .parent()
+                    .map(|p| p.join(".dev-logs"))
+                    .unwrap_or_default(),
             ];
 
             for search_dir in search_dirs {
@@ -1034,7 +1037,12 @@ pub fn find_log_sources_with_ai(
         format!(
             "\n\nExisting log files found on this system:\n{}\n\
             Include these files in your suggestions if they seem relevant to the application.",
-            discovered_logs.iter().take(20).map(|p| format!("- {}", p)).collect::<Vec<_>>().join("\n")
+            discovered_logs
+                .iter()
+                .take(20)
+                .map(|p| format!("- {}", p))
+                .collect::<Vec<_>>()
+                .join("\n")
         )
     };
 
@@ -1081,7 +1089,11 @@ pub fn find_log_sources_with_ai(
     if !response.success {
         return CommandResponse {
             success: false,
-            message: Some(response.error.unwrap_or_else(|| "AI request failed".to_string())),
+            message: Some(
+                response
+                    .error
+                    .unwrap_or_else(|| "AI request failed".to_string()),
+            ),
             data: None,
         };
     }

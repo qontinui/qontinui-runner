@@ -83,8 +83,7 @@ use crate::config::ConfigLoader;
 use crate::config_storage::{ConfigMetadata, ConfigStorage, StoredConfig};
 use crate::context;
 use crate::dom_capture::{
-    DomCapture, DomCaptureLogger, DomCaptureSource, DomCaptureTrigger,
-    ReceiveExtensionDomRequest,
+    DomCapture, DomCaptureLogger, DomCaptureSource, DomCaptureTrigger, ReceiveExtensionDomRequest,
 };
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
@@ -92,6 +91,10 @@ use crate::mcp::awas::{
     awas_check_support, awas_discover, awas_execute, awas_extract_elements, awas_list_actions,
 };
 use crate::mcp::types::{GoToStateRequest, GoToStateResult};
+use crate::orchestrator::{
+    CompressionConfig, DeterministicVerifier, Orchestrator, OrchestratorConfig, OrchestratorState,
+    RetryConfig, RetryService, RetryState, WorkerOutputAction, WorkerSignal,
+};
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
 use crate::session::SessionManager;
@@ -99,11 +102,6 @@ use crate::settings;
 use crate::summary_generator;
 use crate::task_monitor::TaskMonitor;
 use crate::task_recorder::{TaskConfig, TaskRecorder};
-use crate::orchestrator::{
-    CompressionConfig, RetryConfig, RetryState, RetryService,
-    WorkerSignal, DeterministicVerifier, Orchestrator, OrchestratorConfig,
-    OrchestratorState, WorkerOutputAction,
-};
 use crate::tiered_info::{self, RunDetails};
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
@@ -116,6 +114,158 @@ use std::os::windows::process::CommandExt;
 // Windows constants for process creation
 #[cfg(target_os = "windows")]
 const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+
+/// Re-fetch execution steps from unified workflow for a task.
+/// For unified workflow tasks, this fetches fresh step definitions from the database
+/// to ensure fields like check_type, command, etc. are present (which may be missing
+/// from old cached execution_steps_json that only stored type/name).
+fn refetch_unified_workflow_steps(
+    task_id: &str,
+    cached_steps_json: Option<String>,
+    db: &crate::database::CheckpointDb,
+) -> Option<String> {
+    // Check if this is a unified workflow task
+    if !task_id.starts_with("unified-workflow-") {
+        return cached_steps_json;
+    }
+
+    // Extract workflow ID from task ID (format: unified-workflow-{uuid}-{timestamp})
+    let parts: Vec<&str> = task_id.split('-').collect();
+    if parts.len() < 7 {
+        return cached_steps_json;
+    }
+
+    let workflow_id = format!(
+        "{}-{}-{}-{}-{}",
+        parts[2], parts[3], parts[4], parts[5], parts[6]
+    );
+
+    info!(
+        "Re-fetching unified workflow steps for task {} from workflow {}",
+        task_id, workflow_id
+    );
+
+    // Fetch workflow from database
+    match db.get_unified_workflow(&workflow_id) {
+        Ok(Some(workflow)) => {
+            use crate::step_executor::ExecutionStepConfig;
+            let monitor = 0;
+            let mut all_steps: Vec<ExecutionStepConfig> = Vec::new();
+
+            // Helper closure to convert step
+            let convert_step = |step: &serde_json::Value| -> Option<ExecutionStepConfig> {
+                // Try direct deserialization first
+                if let Ok(mut config) = serde_json::from_value::<ExecutionStepConfig>(step.clone())
+                {
+                    if config.monitor_index.is_none() {
+                        config.monitor_index = Some(monitor);
+                    }
+                    return Some(config);
+                }
+
+                // Fall back to manual extraction
+                let step_type = step.get("type").and_then(|t| t.as_str())?;
+                let name = step
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
+
+                // Helper to get string from either snake_case or camelCase
+                let get_str = |keys: &[&str]| -> Option<String> {
+                    keys.iter()
+                        .find_map(|k| step.get(*k).and_then(|v| v.as_str()))
+                        .map(|s| s.to_string())
+                };
+                let get_bool = |keys: &[&str]| -> Option<bool> {
+                    keys.iter()
+                        .find_map(|k| step.get(*k).and_then(|v| v.as_bool()))
+                };
+
+                Some(ExecutionStepConfig {
+                    step_type: step_type.to_string(),
+                    name,
+                    monitor_index: Some(monitor),
+                    check_type: get_str(&["check_type", "checkType"]),
+                    check_command: get_str(&["command", "check_command", "checkCommand"]),
+                    check_working_directory: get_str(&["working_directory", "workingDirectory", "check_working_directory", "checkWorkingDirectory"]),
+                    check_auto_fix: get_bool(&["auto_fix", "autoFix", "check_auto_fix", "checkAutoFix"]),
+                    test_id: get_str(&["test_id", "testId"]),
+                    test_type: get_str(&["test_type", "testType"]),
+                    test_is_critical: get_bool(&["is_critical", "isCritical"]),
+                    shell_command: get_str(&["command", "shell_command", "shellCommand"]),
+                    shell_command_working_directory: get_str(&["working_directory", "workingDirectory", "shell_command_working_directory", "shellCommandWorkingDirectory"]),
+                    shell_command_fail_on_error: get_bool(&["fail_on_error", "failOnError", "shell_command_fail_on_error", "shellCommandFailOnError"]),
+                    prompt_content: get_str(&["content", "prompt_content", "promptContent"]),
+                    is_setup: get_bool(&["isSetup", "is_setup"]),
+                    ..Default::default()
+                })
+            };
+
+            // Add setup steps (mark as setup)
+            for step in &workflow.setup_steps {
+                if let Some(mut config) = convert_step(step) {
+                    config.is_setup = Some(true);
+                    all_steps.push(config);
+                }
+            }
+
+            // Add verification steps
+            for step in &workflow.verification_steps {
+                if let Some(config) = convert_step(step) {
+                    all_steps.push(config);
+                }
+            }
+
+            // Add agentic steps
+            for step in &workflow.agentic_steps {
+                if let Some(config) = convert_step(step) {
+                    all_steps.push(config);
+                }
+            }
+
+            // Add completion steps
+            for step in &workflow.completion_steps {
+                if let Some(config) = convert_step(step) {
+                    all_steps.push(config);
+                }
+            }
+
+            info!(
+                "Re-fetched {} steps from unified workflow definition",
+                all_steps.len()
+            );
+
+            // Update the task_run with the correct execution_steps_json
+            if let Ok(new_json) = serde_json::to_string(&all_steps) {
+                if let Err(e) =
+                    db.update_task_run_execution_steps(task_id, Some(new_json.clone()), None)
+                {
+                    warn!(
+                        "Failed to update execution_steps_json for task {}: {}",
+                        task_id, e
+                    );
+                }
+                Some(new_json)
+            } else {
+                cached_steps_json
+            }
+        }
+        Ok(None) => {
+            warn!(
+                "Unified workflow {} not found, using cached execution_steps_json",
+                workflow_id
+            );
+            cached_steps_json
+        }
+        Err(e) => {
+            warn!(
+                "Failed to fetch unified workflow {}: {}, using cached execution_steps_json",
+                workflow_id, e
+            );
+            cached_steps_json
+        }
+    }
+}
 
 /// Generate a stable ID from a file path using a hash.
 fn generate_id_from_path(path: &str) -> String {
@@ -844,17 +994,15 @@ fn run_claude_session_with_retry(
                 match decision {
                     crate::orchestrator::RetryDecision::Retry { delay_ms, feedback } => {
                         // Check if feedback will be injected
-                        let will_inject_feedback = config.feedback_injection && !feedback.is_empty();
+                        let will_inject_feedback =
+                            config.feedback_injection && !feedback.is_empty();
 
                         // Record this attempt
                         retry_state.record_attempt(&error, delay_ms, will_inject_feedback);
 
                         warn!(
                             "Session {} failed (attempt {}), retrying in {}ms: {}",
-                            session_id,
-                            retry_state.attempt,
-                            delay_ms,
-                            error
+                            session_id, retry_state.attempt, delay_ms, error
                         );
 
                         // Wait before retry
@@ -910,7 +1058,8 @@ pub struct ApiState {
     /// Currently running AI process PIDs (for stopping)
     pub current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>,
     /// Orchestrator states by task_run_id (for agentic task orchestration)
-    pub orchestrator_states: Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
+    pub orchestrator_states:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
     /// Web extraction state tracking
     pub extraction_state: Arc<ExtractionState>,
 }
@@ -1261,37 +1410,38 @@ async fn sse_events_handler(
 
     // Convert broadcast receiver to SSE stream
     // Use futures_util::StreamExt::filter_map for compatibility with Sse
-    let stream = FuturesStreamExt::filter_map(BroadcastStream::new(event_rx), |result| async move {
-        match result {
-            Ok(event) => {
-                // Serialize event to JSON and wrap in SSE Event
-                match serde_json::to_string(&event) {
-                    Ok(json_str) => {
-                        // Determine event type from the event data
-                        let event_type = event
-                            .get("event_type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("message");
+    let stream =
+        FuturesStreamExt::filter_map(BroadcastStream::new(event_rx), |result| async move {
+            match result {
+                Ok(event) => {
+                    // Serialize event to JSON and wrap in SSE Event
+                    match serde_json::to_string(&event) {
+                        Ok(json_str) => {
+                            // Determine event type from the event data
+                            let event_type = event
+                                .get("event_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("message");
 
-                        Some(Ok(Event::default()
-                            .event(format!("qontinui/{}", event_type))
-                            .data(json_str)))
-                    }
-                    Err(e) => {
-                        warn!("Failed to serialize event for SSE: {}", e);
-                        None
+                            Some(Ok(Event::default()
+                                .event(format!("qontinui/{}", event_type))
+                                .data(json_str)))
+                        }
+                        Err(e) => {
+                            warn!("Failed to serialize event for SSE: {}", e);
+                            None
+                        }
                     }
                 }
+                Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                    warn!("SSE client lagged, skipped {} events", n);
+                    // Send a notification about skipped events
+                    Some(Ok(Event::default().event("qontinui/warning").data(
+                        format!("{{\"message\": \"Skipped {} events due to lag\"}}", n),
+                    )))
+                }
             }
-            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                warn!("SSE client lagged, skipped {} events", n);
-                // Send a notification about skipped events
-                Some(Ok(Event::default()
-                    .event("qontinui/warning")
-                    .data(format!("{{\"message\": \"Skipped {} events due to lag\"}}", n))))
-            }
-        }
-    });
+        });
 
     // Return SSE response with keep-alive
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -1830,10 +1980,12 @@ async fn get_status(
 async fn get_tool_version(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ToolVersionResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
 
     // Get current config ID
-    let config_id = state.current_config_id.lock()
+    let config_id = state
+        .current_config_id
+        .lock()
         .ok()
         .and_then(|guard| guard.clone())
         .unwrap_or_else(|| "none".to_string());
@@ -2801,25 +2953,22 @@ async fn capture_screenshot_step(
     }
 
     // Capture screenshot via Python IPC
-    let capture_response = match capture_screenshot_ipc(
-        state.app_state.clone(),
-        request.monitor,
-        "png",
-    ).await {
-        Ok(response) => response,
-        Err(e) => {
-            error!("MCP API: Failed to capture screenshot via IPC: {}", e);
-            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
-                success: false,
-                screenshot_path: None,
-                absolute_path: None,
-                width: None,
-                height: None,
-                monitor: request.monitor,
-                error: Some(format!("IPC error: {}", e)),
-            })));
-        }
-    };
+    let capture_response =
+        match capture_screenshot_ipc(state.app_state.clone(), request.monitor, "png").await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("MCP API: Failed to capture screenshot via IPC: {}", e);
+                return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
+                    success: false,
+                    screenshot_path: None,
+                    absolute_path: None,
+                    width: None,
+                    height: None,
+                    monitor: request.monitor,
+                    error: Some(format!("IPC error: {}", e)),
+                })));
+            }
+        };
 
     let screenshot_base64 = match capture_response
         .get("screenshot_base64")
@@ -3117,7 +3266,10 @@ impl ExtractionState {
 
     /// Mark extraction as started with the given ID
     pub fn start(&self, extraction_id: Option<String>) {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.is_running = true;
         inner.extraction_id = extraction_id;
         inner.stats = ExtractionStats::default();
@@ -3125,30 +3277,45 @@ impl ExtractionState {
 
     /// Mark extraction as stopped
     pub fn stop(&self) {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.is_running = false;
     }
 
     /// Mark extraction as complete with final stats
     pub fn complete(&self, stats: ExtractionStats) {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.is_running = false;
         inner.stats = stats;
     }
 
     /// Update the extraction stats
     pub fn update_stats(&self, stats: ExtractionStats) {
-        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.stats = stats;
     }
 
     /// Get the current extraction status
     pub fn get_status(&self) -> ExtractionStatusResponse {
-        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         ExtractionStatusResponse {
             is_running: inner.is_running,
             extraction_id: inner.extraction_id.clone(),
-            stats: if inner.is_running || inner.stats.states_found > 0 || inner.stats.pages_extracted > 0 {
+            stats: if inner.is_running
+                || inner.stats.states_found > 0
+                || inner.stats.pages_extracted > 0
+            {
                 Some(inner.stats.clone())
             } else {
                 None
@@ -3287,9 +3454,10 @@ async fn start_web_extraction(
     );
 
     // Generate an extraction ID from session_id or create a new one
-    let extraction_id = request.session_id.clone().unwrap_or_else(|| {
-        format!("extraction_{}", chrono::Utc::now().timestamp_millis())
-    });
+    let extraction_id = request
+        .session_id
+        .clone()
+        .unwrap_or_else(|| format!("extraction_{}", chrono::Utc::now().timestamp_millis()));
 
     // Build extraction params
     let params = serde_json::json!({
@@ -3334,7 +3502,10 @@ async fn start_web_extraction(
         Ok(_) => {
             // Mark extraction as running
             extraction_state.start(Some(extraction_id_for_state.clone()));
-            info!("MCP API: Web extraction started with ID: {}", extraction_id_for_state);
+            info!(
+                "MCP API: Web extraction started with ID: {}",
+                extraction_id_for_state
+            );
             Ok(Json(ApiResponse::success(serde_json::json!({
                 "started": true,
                 "extraction_id": extraction_id_for_state,
@@ -3400,8 +3571,10 @@ async fn get_extraction_status(
 ) -> Result<Json<ApiResponse<ExtractionStatusResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Return the tracked extraction state
     let status = state.extraction_state.get_status();
-    debug!("MCP API: Extraction status - is_running: {}, extraction_id: {:?}",
-           status.is_running, status.extraction_id);
+    debug!(
+        "MCP API: Extraction status - is_running: {}, extraction_id: {:?}",
+        status.is_running, status.extraction_id
+    );
     Ok(Json(ApiResponse::success(status)))
 }
 
@@ -3412,8 +3585,10 @@ async fn update_extraction_stats(
     State(state): State<Arc<ApiState>>,
     Json(stats): Json<ExtractionStats>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
-    debug!("MCP API: Updating extraction stats - states: {}, transitions: {}, pages: {}, errors: {}",
-           stats.states_found, stats.transitions_found, stats.pages_extracted, stats.errors);
+    debug!(
+        "MCP API: Updating extraction stats - states: {}, transitions: {}, pages: {}, errors: {}",
+        stats.states_found, stats.transitions_found, stats.pages_extracted, stats.errors
+    );
     state.extraction_state.update_stats(stats);
     Ok(Json(ApiResponse::success("Stats updated".to_string())))
 }
@@ -3425,10 +3600,14 @@ async fn complete_extraction(
     State(state): State<Arc<ApiState>>,
     Json(stats): Json<ExtractionStats>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("MCP API: Extraction complete - states: {}, transitions: {}, pages: {}, errors: {}",
-          stats.states_found, stats.transitions_found, stats.pages_extracted, stats.errors);
+    info!(
+        "MCP API: Extraction complete - states: {}, transitions: {}, pages: {}, errors: {}",
+        stats.states_found, stats.transitions_found, stats.pages_extracted, stats.errors
+    );
     state.extraction_state.complete(stats);
-    Ok(Json(ApiResponse::success("Extraction completed".to_string())))
+    Ok(Json(ApiResponse::success(
+        "Extraction completed".to_string(),
+    )))
 }
 
 /// Get extraction screenshot
@@ -3637,18 +3816,30 @@ async fn get_uitars_extraction_status(
         Ok(response) => {
             // Return the actual status from Python
             if response.success {
-                Ok(Json(ApiResponse::success(response.data.unwrap_or(serde_json::json!({
-                    "status": "idle",
-                    "current_step": 0,
-                    "max_steps": 0,
-                    "elapsed_seconds": 0.0,
-                    "states_discovered": 0,
-                    "transitions_discovered": 0,
-                    "uitars_available": false
-                })))))
+                Ok(Json(ApiResponse::success(response.data.unwrap_or(
+                    serde_json::json!({
+                        "status": "idle",
+                        "current_step": 0,
+                        "max_steps": 0,
+                        "elapsed_seconds": 0.0,
+                        "states_discovered": 0,
+                        "transitions_discovered": 0,
+                        "uitars_available": false
+                    }),
+                ))))
             } else {
-                error!("MCP API: UI-TARS extraction status command failed: {:?}", response.error);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(response.error.unwrap_or_else(|| "Unknown error".to_string())))))
+                error!(
+                    "MCP API: UI-TARS extraction status command failed: {:?}",
+                    response.error
+                );
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(
+                        response
+                            .error
+                            .unwrap_or_else(|| "Unknown error".to_string()),
+                    )),
+                ))
             }
         }
         Err(e) => {
@@ -3693,16 +3884,28 @@ async fn get_uitars_extraction_results(
         Ok(response) => {
             // Return the actual results from Python
             if response.success {
-                Ok(Json(ApiResponse::success(response.data.unwrap_or(serde_json::json!({
-                    "states": [],
-                    "transitions": [],
-                    "total_steps": 0,
-                    "total_screenshots": 0,
-                    "exploration_time_seconds": 0.0
-                })))))
+                Ok(Json(ApiResponse::success(response.data.unwrap_or(
+                    serde_json::json!({
+                        "states": [],
+                        "transitions": [],
+                        "total_steps": 0,
+                        "total_screenshots": 0,
+                        "exploration_time_seconds": 0.0
+                    }),
+                ))))
             } else {
-                error!("MCP API: UI-TARS extraction results command failed: {:?}", response.error);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(response.error.unwrap_or_else(|| "Unknown error".to_string())))))
+                error!(
+                    "MCP API: UI-TARS extraction results command failed: {:?}",
+                    response.error
+                );
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(
+                        response
+                            .error
+                            .unwrap_or_else(|| "Unknown error".to_string()),
+                    )),
+                ))
             }
         }
         Err(e) => {
@@ -4724,9 +4927,13 @@ async fn capture_screenshot_ipc(
     match result {
         Ok(response) => {
             if response.success {
-                Ok(response.data.unwrap_or(serde_json::json!({"success": true})))
+                Ok(response
+                    .data
+                    .unwrap_or(serde_json::json!({"success": true})))
             } else {
-                Err(response.error.unwrap_or_else(|| "Screenshot capture failed".to_string()))
+                Err(response
+                    .error
+                    .unwrap_or_else(|| "Screenshot capture failed".to_string()))
             }
         }
         Err(e) => Err(e),
@@ -4734,9 +4941,7 @@ async fn capture_screenshot_ipc(
 }
 
 /// Get monitors via Python IPC (physical pixel coordinates)
-async fn get_monitors_ipc(
-    app_state: Arc<crate::AppState>,
-) -> Result<serde_json::Value, String> {
+async fn get_monitors_ipc(app_state: Arc<crate::AppState>) -> Result<serde_json::Value, String> {
     let result = tokio::task::spawn_blocking(move || {
         let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
             tracing::warn!("IPC: python_bridge mutex was poisoned, recovering");
@@ -4760,9 +4965,13 @@ async fn get_monitors_ipc(
     match result {
         Ok(response) => {
             if response.success {
-                Ok(response.data.unwrap_or(serde_json::json!({"success": true, "monitors": [], "count": 0})))
+                Ok(response
+                    .data
+                    .unwrap_or(serde_json::json!({"success": true, "monitors": [], "count": 0})))
             } else {
-                Err(response.error.unwrap_or_else(|| "Get monitors failed".to_string()))
+                Err(response
+                    .error
+                    .unwrap_or_else(|| "Get monitors failed".to_string()))
             }
         }
         Err(e) => Err(e),
@@ -4862,7 +5071,10 @@ async fn list_models(
                     .error
                     .unwrap_or_else(|| "List models failed".to_string());
                 error!("MCP API: List models failed: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -4931,7 +5143,10 @@ async fn download_model(
                     .error
                     .unwrap_or_else(|| "Model download failed".to_string());
                 error!("MCP API: Model download failed: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -4995,7 +5210,10 @@ async fn delete_model(
                     .error
                     .unwrap_or_else(|| "Model delete failed".to_string());
                 error!("MCP API: Model delete failed: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -5059,7 +5277,10 @@ async fn get_model_status(
                     .error
                     .unwrap_or_else(|| "Get model status failed".to_string());
                 error!("MCP API: Get model status failed: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -5120,7 +5341,10 @@ async fn get_models_disk_usage(
                     .error
                     .unwrap_or_else(|| "Get disk usage failed".to_string());
                 error!("MCP API: Get disk usage failed: {}", error_msg);
-                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+                Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(error_msg)),
+                ))
             }
         }
         Err(e) => {
@@ -5270,10 +5494,7 @@ async fn start_integration_test(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<StartIntegrationTestRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!(
-        "MCP API: Starting integration test run: {}",
-        request.name
-    );
+    info!("MCP API: Starting integration test run: {}", request.name);
 
     let app_state = state.app_state.clone();
 
@@ -5347,9 +5568,10 @@ async fn get_test_run_status(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5396,9 +5618,10 @@ async fn get_integration_test_results(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5439,16 +5662,20 @@ async fn list_integration_test_runs(
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     let app_state = state.app_state.clone();
-    let limit: i32 = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+    let limit: i32 = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
 
     let params = serde_json::json!({
         "limit": limit,
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5516,15 +5743,19 @@ async fn mock_gui_action(
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(format!("Unknown action type: {}", request.action_type))),
+                Json(api_error(format!(
+                    "Unknown action type: {}",
+                    request.action_type
+                ))),
             ));
         }
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5567,9 +5798,10 @@ async fn get_testing_states(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5611,9 +5843,10 @@ async fn get_testing_transitions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5661,9 +5894,10 @@ async fn find_testing_path(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5712,9 +5946,10 @@ async fn traverse_to_state(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5722,7 +5957,11 @@ async fn traverse_to_state(
             }
 
             let timeout_duration = std::time::Duration::from_secs(120);
-            bridge.send_command_and_wait("testing_traverse_to_state", Some(params), timeout_duration)
+            bridge.send_command_and_wait(
+                "testing_traverse_to_state",
+                Some(params),
+                timeout_duration,
+            )
         } else {
             Err("Python executor not initialized".to_string())
         }
@@ -5756,9 +5995,10 @@ async fn get_testing_active_states(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5805,9 +6045,10 @@ async fn set_testing_mock_mode(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5849,9 +6090,10 @@ async fn get_mocked_actions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5893,9 +6135,10 @@ async fn clear_mocked_actions(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5945,9 +6188,10 @@ async fn run_testing_assertion(
     });
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -5990,9 +6234,10 @@ async fn end_integration_test(
     let app_state = state.app_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            poisoned.into_inner()
-        });
+        let mut bridge_lock = app_state
+            .python_bridge
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
@@ -6144,7 +6389,10 @@ async fn start_playwright_collection(
                 let error_msg = response
                     .error
                     .unwrap_or_else(|| "Failed to start Playwright collection".to_string());
-                error!("MCP API: Playwright collection failed to start: {}", error_msg);
+                error!(
+                    "MCP API: Playwright collection failed to start: {}",
+                    error_msg
+                );
                 Ok(Json(ApiResponse::success(serde_json::json!({
                     "success": false,
                     "error": error_msg
@@ -6179,7 +6427,11 @@ async fn get_playwright_collection_status(
         });
 
         if let Some(ref mut bridge) = *bridge_lock {
-            bridge.send_command_and_wait("get_playwright_collection_status", Some(cmd_params), timeout)
+            bridge.send_command_and_wait(
+                "get_playwright_collection_status",
+                Some(cmd_params),
+                timeout,
+            )
         } else {
             Err("Python executor not initialized".to_string())
         }
@@ -6205,7 +6457,9 @@ async fn get_playwright_collection_status(
                     }))))
                 }
             } else {
-                let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Unknown error".to_string());
                 error!("MCP API: Playwright collection status error: {}", error_msg);
                 Ok(Json(ApiResponse::success(serde_json::json!({
                     "status": "error",
@@ -6241,7 +6495,11 @@ async fn get_playwright_collection_results(
         if let Some(ref mut bridge) = *bridge_lock {
             // Use longer timeout for getting results (may include large screenshots)
             let timeout = std::time::Duration::from_secs(60);
-            bridge.send_command_and_wait("get_playwright_collection_results", Some(cmd_params), timeout)
+            bridge.send_command_and_wait(
+                "get_playwright_collection_results",
+                Some(cmd_params),
+                timeout,
+            )
         } else {
             Err("Python executor not initialized".to_string())
         }
@@ -6277,7 +6535,10 @@ async fn get_playwright_collection_results(
             }
         }
         Err(e) => {
-            error!("MCP API: Failed to get Playwright collection results: {}", e);
+            error!(
+                "MCP API: Failed to get Playwright collection results: {}",
+                e
+            );
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
@@ -6315,7 +6576,9 @@ async fn stop_playwright_collection(
     match result {
         Ok(_) => {
             info!("MCP API: Playwright collection stopped");
-            Ok(Json(ApiResponse::success("Playwright collection stopped".to_string())))
+            Ok(Json(ApiResponse::success(
+                "Playwright collection stopped".to_string(),
+            )))
         }
         Err(e) => {
             error!("MCP API: Failed to stop Playwright collection: {}", e);
@@ -7060,7 +7323,11 @@ async fn has_running_ai_tasks_async(db: Arc<CheckpointDb>) -> bool {
 
 /// Migrate JSONL logs to SQLite for a completed task run.
 /// This should be called after a task completes (success or failure) to persist logs.
-async fn migrate_logs_for_task(db: Arc<CheckpointDb>, task_id: &str, workflow_name: Option<String>) {
+async fn migrate_logs_for_task(
+    db: Arc<CheckpointDb>,
+    task_id: &str,
+    workflow_name: Option<String>,
+) {
     let task_id_owned = task_id.to_string();
 
     // Get the dev-logs directory path
@@ -7095,7 +7362,10 @@ async fn migrate_logs_for_task(db: Arc<CheckpointDb>, task_id: &str, workflow_na
         }
     };
 
-    info!("Migrating JSONL logs to SQLite for task run: {}", task_id_owned);
+    info!(
+        "Migrating JSONL logs to SQLite for task run: {}",
+        task_id_owned
+    );
 
     let result = tokio::task::spawn_blocking(move || {
         crate::log_migration::migrate_logs_to_sqlite(
@@ -7119,14 +7389,21 @@ async fn migrate_logs_for_task(db: Arc<CheckpointDb>, task_id: &str, workflow_na
                 migration_result.playwright_results
             );
             if !migration_result.errors.is_empty() {
-                warn!("Log migration had {} errors: {:?}", migration_result.errors.len(), migration_result.errors);
+                warn!(
+                    "Log migration had {} errors: {:?}",
+                    migration_result.errors.len(),
+                    migration_result.errors
+                );
             }
         }
         Ok(Err(e)) => {
             warn!("Failed to migrate logs for task {}: {}", task_id, e);
         }
         Err(e) => {
-            warn!("spawn_blocking error during log migration for task {}: {}", task_id, e);
+            warn!(
+                "spawn_blocking error during log migration for task {}: {}",
+                task_id, e
+            );
         }
     }
 }
@@ -7140,7 +7417,8 @@ async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> b
     let max_retries = 3;
 
     // Get workflow name before completion for log migration context
-    let workflow_name = db.get_task_run(&task_id_owned)
+    let workflow_name = db
+        .get_task_run(&task_id_owned)
         .ok()
         .flatten()
         .and_then(|t| t.workflow_name);
@@ -7452,37 +7730,54 @@ async fn run_prompt(
 ) -> Result<Json<ApiResponse<RunPromptResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Determine mode and get prompt name + content + orchestrator config
     // Orchestrator config is extracted from saved prompts (system-level setting, not user-controllable)
-    let (prompt_name, prompt_content, prompt_id, prompt_max_sessions, requires_orchestrator, orchestrator_goal, orchestrator_max_iterations, orchestrator_verification_first) =
-        if let Some(ref id) = request.prompt_id {
-            // Mode 1: Lookup from database
-            let prompt = prompts::get_prompt(id).ok_or_else(|| {
-                (
-                    StatusCode::NOT_FOUND,
-                    Json(api_error(format!("Prompt not found: {}", id))),
-                )
-            })?;
+    let (
+        prompt_name,
+        prompt_content,
+        prompt_id,
+        prompt_max_sessions,
+        requires_orchestrator,
+        orchestrator_goal,
+        orchestrator_max_iterations,
+        orchestrator_verification_first,
+    ) = if let Some(ref id) = request.prompt_id {
+        // Mode 1: Lookup from database
+        let prompt = prompts::get_prompt(id).ok_or_else(|| {
             (
-                prompt.name.clone(),
-                prompt.content.clone(),
-                Some(prompt.id.clone()),
-                prompt.max_sessions,
-                prompt.requires_orchestrator,
-                prompt.orchestrator_goal.clone(),
-                prompt.orchestrator_max_iterations,
-                prompt.orchestrator_verification_first,
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Prompt not found: {}", id))),
             )
-        } else if let (Some(name), Some(content)) = (&request.name, &request.content) {
-            // Mode 2: Ad-hoc prompt (no orchestrator by default)
-            (name.clone(), content.clone(), None, None, false, None, None, None)
-        } else {
-            // Invalid: neither mode satisfied
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(api_error(
-                    "Must provide either prompt_id OR (name AND content)",
-                )),
-            ));
-        };
+        })?;
+        (
+            prompt.name.clone(),
+            prompt.content.clone(),
+            Some(prompt.id.clone()),
+            prompt.max_sessions,
+            prompt.requires_orchestrator,
+            prompt.orchestrator_goal.clone(),
+            prompt.orchestrator_max_iterations,
+            prompt.orchestrator_verification_first,
+        )
+    } else if let (Some(name), Some(content)) = (&request.name, &request.content) {
+        // Mode 2: Ad-hoc prompt (no orchestrator by default)
+        (
+            name.clone(),
+            content.clone(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+    } else {
+        // Invalid: neither mode satisfied
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "Must provide either prompt_id OR (name AND content)",
+            )),
+        ));
+    };
 
     // Generate session_id if not provided
     let session_id = request.session_id.unwrap_or_else(|| {
@@ -7688,7 +7983,9 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
     let workspace_path = get_workspace_paths_internal()
         .map(|(root, _, _)| root.to_string_lossy().to_string())
         .unwrap_or_else(|_| "{{WORKSPACE}}".to_string());
-    let service_restart_content = service_restart.content.replace("{{WORKSPACE}}", &workspace_path);
+    let service_restart_content = service_restart
+        .content
+        .replace("{{WORKSPACE}}", &workspace_path);
     let mut service_restart_with_path = service_restart.clone();
     service_restart_with_path.content = service_restart_content;
     let service_restart_section = format!(
@@ -7904,19 +8201,28 @@ If your task requires running visual automation, use the Runner API to execute w
         };
 
         // Start the session via session manager
-        let session = state.session.start_session(session_config).await.map_err(|e| {
-            error!("MCP API: Failed to start orchestrator session: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to start session: {}", e))),
-            )
-        })?;
+        let session = state
+            .session
+            .start_session(session_config)
+            .await
+            .map_err(|e| {
+                error!("MCP API: Failed to start orchestrator session: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to start session: {}", e))),
+                )
+            })?;
 
         let orchestrator_session_id = session.id.clone();
-        info!("MCP API: Started orchestrator session: {}", orchestrator_session_id);
+        info!(
+            "MCP API: Started orchestrator session: {}",
+            orchestrator_session_id
+        );
 
         // Initialize the orchestrator
-        let orch_goal = orchestrator_goal.clone().unwrap_or_else(|| prompt_content.clone());
+        let orch_goal = orchestrator_goal
+            .clone()
+            .unwrap_or_else(|| prompt_content.clone());
         let orch_max_iterations = orchestrator_max_iterations.unwrap_or(10);
 
         info!(
@@ -7942,10 +8248,8 @@ If your task requires running visual automation, use the Runner API to execute w
             enable_checkpointing: true,
         };
 
-        let orchestrator = Orchestrator::new(
-            orchestrator_config,
-            state.app_state.checkpoint_db.clone(),
-        );
+        let orchestrator =
+            Orchestrator::new(orchestrator_config, state.app_state.checkpoint_db.clone());
 
         // Initialize the orchestrator state with planning
         match orchestrator.initialize_task(&orchestrator_session_id, &orch_goal) {
@@ -7953,7 +8257,11 @@ If your task requires running visual automation, use the Runner API to execute w
                 info!(
                     "MCP API: Orchestrator initialized for session {} with {} success criteria",
                     orchestrator_session_id,
-                    orch_state.plan.as_ref().map(|p| p.success_criteria.len()).unwrap_or(0)
+                    orch_state
+                        .plan
+                        .as_ref()
+                        .map(|p| p.success_criteria.len())
+                        .unwrap_or(0)
                 );
 
                 // Run initial verification if configured (for verification-first workflows)
@@ -7983,7 +8291,10 @@ If your task requires running visual automation, use the Runner API to execute w
                         }),
                     );
 
-                    match orchestrator_with_output.run_initial_verification(&mut orch_state).await {
+                    match orchestrator_with_output
+                        .run_initial_verification(&mut orch_state)
+                        .await
+                    {
                         Ok(results) => {
                             info!(
                                 "MCP API: Initial verification complete for session {}: {} passed, {} failed",
@@ -8053,7 +8364,10 @@ If your task requires running visual automation, use the Runner API to execute w
                 let db = match CheckpointDb::new() {
                     Ok(d) => d,
                     Err(e) => {
-                        warn!("Failed to open database for orchestrator session check: {}", e);
+                        warn!(
+                            "Failed to open database for orchestrator session check: {}",
+                            e
+                        );
                         break;
                     }
                 };
@@ -8061,17 +8375,24 @@ If your task requires running visual automation, use the Runner API to execute w
                 let task = match db.get_task_run(&session_id_for_loop) {
                     Ok(Some(t)) => t,
                     Ok(None) => {
-                        info!("Orchestrator task {} not found, exiting loop", session_id_for_loop);
+                        info!(
+                            "Orchestrator task {} not found, exiting loop",
+                            session_id_for_loop
+                        );
                         break;
                     }
                     Err(e) => {
-                        warn!("Failed to get orchestrator task {}: {}", session_id_for_loop, e);
+                        warn!(
+                            "Failed to get orchestrator task {}: {}",
+                            session_id_for_loop, e
+                        );
                         break;
                     }
                 };
 
                 // Check if task is complete or stopped
-                if task.status == "completed" || task.status == "failed" || task.status == "stopped" {
+                if task.status == "completed" || task.status == "failed" || task.status == "stopped"
+                {
                     info!(
                         "Orchestrator task {} finished with status: {}",
                         session_id_for_loop, task.status
@@ -8118,8 +8439,10 @@ If your task requires running visual automation, use the Runner API to execute w
             )
         })?;
 
-        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", orchestrator_session_id));
-        let log_file = dev_logs_path.join(format!("claude-session-{}.log", orchestrator_session_id));
+        let state_file =
+            dev_logs_path.join(format!("ai-developer-{}.json", orchestrator_session_id));
+        let log_file =
+            dev_logs_path.join(format!("claude-session-{}.log", orchestrator_session_id));
 
         Ok(Json(ApiResponse::success(RunPromptResponse {
             task_run_id: orchestrator_session_id.clone(),
@@ -9035,11 +9358,7 @@ if __name__ == "__main__":
                 .current_dir(&working_dir)
                 .kill_on_drop(true);
 
-            timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                cmd.output(),
-            )
-            .await
+            timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
         } else {
             // No dependencies, use python directly
             let mut cmd = Command::new("python");
@@ -9047,11 +9366,7 @@ if __name__ == "__main__":
                 .current_dir(&working_dir)
                 .kill_on_drop(true);
 
-            timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                cmd.output(),
-            )
-            .await
+            timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
         }
     } else {
         // No dependencies, use python directly
@@ -9060,11 +9375,7 @@ if __name__ == "__main__":
             .current_dir(&working_dir)
             .kill_on_drop(true);
 
-        timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            cmd.output(),
-        )
-        .await
+        timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await
     };
 
     // Cleanup the temp script
@@ -9078,16 +9389,16 @@ if __name__ == "__main__":
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
             // Parse return value from stdout if present
-            let (stdout_clean, return_value) =
-                if let Some(idx) = stdout.find("__QONTINUI_RETURN__:") {
-                    let (before, after) = stdout.split_at(idx);
-                    let json_str = after.trim_start_matches("__QONTINUI_RETURN__:");
-                    let parsed: Option<serde_json::Value> =
-                        serde_json::from_str(json_str.trim()).ok();
-                    (before.to_string(), parsed)
-                } else {
-                    (stdout, None)
-                };
+            let (stdout_clean, return_value) = if let Some(idx) =
+                stdout.find("__QONTINUI_RETURN__:")
+            {
+                let (before, after) = stdout.split_at(idx);
+                let json_str = after.trim_start_matches("__QONTINUI_RETURN__:");
+                let parsed: Option<serde_json::Value> = serde_json::from_str(json_str.trim()).ok();
+                (before.to_string(), parsed)
+            } else {
+                (stdout, None)
+            };
 
             Ok(Json(ApiResponse::success(InlinePythonResponse {
                 success: output.status.success(),
@@ -9200,7 +9511,10 @@ If you encounter issues, include them in your response.
         timeout_seconds: 300, // 5 minutes per iteration
         stall_threshold_seconds: 60,
         name: session_name.clone(),
-        description: format!("Sub-agent task: {}", request.task.chars().take(50).collect::<String>()),
+        description: format!(
+            "Sub-agent task: {}",
+            request.task.chars().take(50).collect::<String>()
+        ),
         custom_config: serde_json::json!({}),
         provider: None,
         model: None,
@@ -10020,11 +10334,11 @@ async fn start_session(
                 &task_run_id,
                 &session_name,
                 Some(&prompt_for_task_run),
-                "task", // task_type
-                None,   // config_id
-                None,   // workflow_name
+                "task",               // task_type
+                None,                 // config_id
+                None,                 // workflow_name
                 request.max_sessions, // max_sessions from request (None = unlimited)
-                None,   // auto_continue - defaults to true
+                None,                 // auto_continue - defaults to true
                 execution_steps_json.clone(),
                 log_sources_json.clone(),
             ) {
@@ -10039,7 +10353,9 @@ async fn start_session(
 
             // Initialize orchestrator if enabled
             let enable_orchestrator = request.enable_orchestrator;
-            let orchestrator_goal = request.orchestrator_goal.clone()
+            let orchestrator_goal = request
+                .orchestrator_goal
+                .clone()
                 .unwrap_or_else(|| prompt_for_task_run.clone());
             let orchestrator_max_iterations = request.orchestrator_max_iterations.unwrap_or(10);
 
@@ -10067,10 +10383,8 @@ async fn start_session(
                     enable_checkpointing: true,
                 };
 
-                let orchestrator = Orchestrator::new(
-                    orchestrator_config,
-                    state.app_state.checkpoint_db.clone(),
-                );
+                let orchestrator =
+                    Orchestrator::new(orchestrator_config, state.app_state.checkpoint_db.clone());
 
                 // Initialize the orchestrator state with planning
                 match orchestrator.initialize_task(&task_run_id, &orchestrator_goal) {
@@ -10078,7 +10392,11 @@ async fn start_session(
                         info!(
                             "Orchestrator initialized for task {} with {} success criteria",
                             task_run_id,
-                            orch_state.plan.as_ref().map(|p| p.success_criteria.len()).unwrap_or(0)
+                            orch_state
+                                .plan
+                                .as_ref()
+                                .map(|p| p.success_criteria.len())
+                                .unwrap_or(0)
                         );
 
                         // Run initial verification if configured (for verification-first workflows)
@@ -10139,12 +10457,19 @@ async fn start_session(
                 info!("Starting session '{}' (id: {})", session_name, session_id);
 
                 // Log session start
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                    .open(crate::paths::get_workflow_debug_log_path()) {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(crate::paths::get_workflow_debug_log_path())
+                {
                     use std::io::Write;
-                    let _ = writeln!(f, "[{}] START_SESSION: name={}, id={}",
+                    let _ = writeln!(
+                        f,
+                        "[{}] START_SESSION: name={}, id={}",
                         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                        session_name, session_id);
+                        session_name,
+                        session_id
+                    );
                 }
 
                 // Track the current task_id for this session
@@ -10195,12 +10520,18 @@ async fn start_session(
 
                     // Check termination conditions
                     if task.status == "completed" || task.status == "stopped" {
-                        info!("Task {} is {}, exiting continuation loop", task_id, task.status);
+                        info!(
+                            "Task {} is {}, exiting continuation loop",
+                            task_id, task.status
+                        );
                         break;
                     }
 
                     if !task.auto_continue {
-                        info!("Task {} has auto_continue disabled, exiting continuation loop", task_id);
+                        info!(
+                            "Task {} has auto_continue disabled, exiting continuation loop",
+                            task_id
+                        );
                         // Mark as completed since we're not continuing
                         if let Err(e) = db.complete_task_run(&task_id) {
                             warn!("Failed to mark task {} as complete: {}", task_id, e);
@@ -10211,7 +10542,10 @@ async fn start_session(
                     // Check max_sessions limit
                     if let Some(max) = task.max_sessions {
                         if task.sessions_count >= max {
-                            info!("Task {} reached max sessions ({}/{}), exiting", task_id, task.sessions_count, max);
+                            info!(
+                                "Task {} reached max sessions ({}/{}), exiting",
+                                task_id, task.sessions_count, max
+                            );
                             if let Err(e) = db.complete_task_run(&task_id) {
                                 warn!("Failed to mark task {} as complete: {}", task_id, e);
                             }
@@ -10223,21 +10557,41 @@ async fn start_session(
                     // Re-execute deterministic steps BEFORE starting AI session
                     // =====================================================================
                     let iteration = task.sessions_count + 1;
-                    info!("Cross-session continuation: Starting iteration {} for task '{}'", iteration, task.task_name);
+                    info!(
+                        "Cross-session continuation: Starting iteration {} for task '{}'",
+                        iteration, task.task_name
+                    );
 
                     // Log iteration start
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                        .open(crate::paths::get_workflow_debug_log_path()) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(crate::paths::get_workflow_debug_log_path())
+                    {
                         use std::io::Write;
-                        let _ = writeln!(f, "[{}] CROSS_SESSION_ITERATION: task={}, iteration={}",
+                        let _ = writeln!(
+                            f,
+                            "[{}] CROSS_SESSION_ITERATION: task={}, iteration={}",
                             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                            task_id, iteration);
+                            task_id,
+                            iteration
+                        );
                     }
 
-                    let execution_summary = if let Some(ref steps_json) = task.execution_steps_json {
+                    // Re-fetch unified workflow steps to ensure all fields are present
+                    let execution_steps_json = refetch_unified_workflow_steps(
+                        &task_id,
+                        task.execution_steps_json.clone(),
+                        &db,
+                    );
+                    let execution_summary = if let Some(ref steps_json) = execution_steps_json {
                         match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
                             Ok(execution_steps) if !execution_steps.is_empty() => {
-                                info!("Re-executing {} deterministic steps for iteration {}", execution_steps.len(), iteration);
+                                info!(
+                                    "Re-executing {} deterministic steps for iteration {}",
+                                    execution_steps.len(),
+                                    iteration
+                                );
 
                                 // Parse log sources if present
                                 let log_sources: Vec<LogSourceConfig> = task
@@ -10275,8 +10629,10 @@ async fn start_session(
 
                                 // Generate execution summary using IterationBundle
                                 if !execution_result.steps.is_empty() {
-                                    let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
-                                    let timestamp_now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                                    let relevant_logs =
+                                        RelevantLogSources::from_steps(&execution_steps);
+                                    let timestamp_now =
+                                        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
                                     let mut bundle = IterationBundle::new(
                                         iteration,
@@ -10289,11 +10645,14 @@ async fn start_session(
 
                                     // Add application logs if captured
                                     if let Some(ref captured) = execution_result.captured_logs {
-                                        bundle.add_application_logs(&captured.sources, &log_sources);
+                                        bundle
+                                            .add_application_logs(&captured.sources, &log_sources);
                                     }
 
                                     // Add runner logs if captured
-                                    if let Some(ref runner_logs) = execution_result.captured_runner_logs {
+                                    if let Some(ref runner_logs) =
+                                        execution_result.captured_runner_logs
+                                    {
                                         bundle.add_gui_automation_logs(
                                             runner_logs.actions.clone(),
                                             runner_logs.image_recognition.clone(),
@@ -10329,12 +10688,15 @@ async fn start_session(
                             String::new()
                         });
 
-                    let has_execution_steps = task.execution_steps_json.as_ref().is_some_and(|json| {
-                        serde_json::from_str::<Vec<serde_json::Value>>(json)
-                            .is_ok_and(|steps| !steps.is_empty())
-                    });
+                    let has_execution_steps =
+                        task.execution_steps_json.as_ref().is_some_and(|json| {
+                            serde_json::from_str::<Vec<serde_json::Value>>(json)
+                                .is_ok_and(|steps| !steps.is_empty())
+                        });
 
-                    let pre_execution_message = if has_execution_steps && !execution_summary.is_empty() {
+                    let pre_execution_message = if has_execution_steps
+                        && !execution_summary.is_empty()
+                    {
                         "\
                         **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
                         The Pre-Execution Results section below shows FRESH results from this iteration.\n\n\
@@ -10383,7 +10745,10 @@ async fn start_session(
                         timeout_seconds: 600,
                         stall_threshold_seconds: 300,
                         name: format!("{} (iteration {})", task.task_name, iteration),
-                        description: format!("Cross-session continuation - iteration #{}", iteration),
+                        description: format!(
+                            "Cross-session continuation - iteration #{}",
+                            iteration
+                        ),
                         custom_config: serde_json::json!({}),
                         provider: None,
                         model: None,
@@ -10398,11 +10763,17 @@ async fn start_session(
                     // Start the new session
                     match state_clone.session.start_session(session_config).await {
                         Ok(new_session) => {
-                            info!("Started iteration {} session {} for task '{}'", iteration, new_session.id, task.task_name);
+                            info!(
+                                "Started iteration {} session {} for task '{}'",
+                                iteration, new_session.id, task.task_name
+                            );
 
                             emit_ai_output(
                                 &state_clone.app_handle,
-                                &format!("🔄 Starting iteration {} for '{}'", iteration, task.task_name),
+                                &format!(
+                                    "🔄 Starting iteration {} for '{}'",
+                                    iteration, task.task_name
+                                ),
                                 "status",
                                 None,
                                 Some(&session_ctx),
@@ -10513,13 +10884,19 @@ async fn stop_session(
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
-        &format!("🛑 Session {} stopped (killed {} process(es))", session_id, killed_count),
+        &format!(
+            "🛑 Session {} stopped (killed {} process(es))",
+            session_id, killed_count
+        ),
         "status",
         Some(&session_id),
         None,
     );
 
-    info!("Session {} stopped, killed {} process(es)", session_id, killed_count);
+    info!(
+        "Session {} stopped, killed {} process(es)",
+        session_id, killed_count
+    );
 
     Ok(Json(ApiResponse::success(session)))
 }
@@ -10579,10 +10956,13 @@ fn parse_worker_output_signal(output: &str) -> WorkerOutputSignal {
 
     for marker in &legacy_markers {
         if output_upper.contains(marker) {
-            info!("Legacy completion marker detected: {} - treating as WORK_COMPLETE", marker);
+            info!(
+                "Legacy completion marker detected: {} - treating as WORK_COMPLETE",
+                marker
+            );
             // Treat legacy markers as WORK_COMPLETE so verification still runs
             return WorkerOutputSignal::WorkComplete {
-                reason: Some(format!("Legacy marker: {}", marker))
+                reason: Some(format!("Legacy marker: {}", marker)),
             };
         }
     }
@@ -10599,9 +10979,12 @@ fn parse_worker_output_signal(output: &str) -> WorkerOutputSignal {
     for pattern in &completion_patterns {
         if let Ok(re) = Regex::new(pattern) {
             if re.is_match(output) {
-                info!("Goal completion pattern detected: {} - treating as WORK_COMPLETE", pattern);
+                info!(
+                    "Goal completion pattern detected: {} - treating as WORK_COMPLETE",
+                    pattern
+                );
                 return WorkerOutputSignal::WorkComplete {
-                    reason: Some(format!("Pattern match: {}", pattern))
+                    reason: Some(format!("Pattern match: {}", pattern)),
                 };
             }
         }
@@ -10675,11 +11058,18 @@ async fn run_deterministic_verification(
             Ok(result) => {
                 let stdout = String::from_utf8_lossy(&result.stdout);
                 let stderr = String::from_utf8_lossy(&result.stderr);
-                raw_output.push_str(&format!("=== npm build (CRITICAL) ===\nExit: {}\nStdout:\n{}\nStderr:\n{}\n\n",
-                    result.status.code().unwrap_or(-1), stdout, stderr));
+                raw_output.push_str(&format!(
+                    "=== npm build (CRITICAL) ===\nExit: {}\nStdout:\n{}\nStderr:\n{}\n\n",
+                    result.status.code().unwrap_or(-1),
+                    stdout,
+                    stderr
+                ));
 
                 if !result.status.success() {
-                    critical_failures.push(format!("npm build failed with exit code {}", result.status.code().unwrap_or(-1)));
+                    critical_failures.push(format!(
+                        "npm build failed with exit code {}",
+                        result.status.code().unwrap_or(-1)
+                    ));
                     // Extract error lines
                     for line in stderr.lines().chain(stdout.lines()) {
                         let lower = line.to_lowercase();
@@ -10709,11 +11099,18 @@ async fn run_deterministic_verification(
             Ok(result) => {
                 let stdout = String::from_utf8_lossy(&result.stdout);
                 let stderr = String::from_utf8_lossy(&result.stderr);
-                raw_output.push_str(&format!("=== cargo check (CRITICAL) ===\nExit: {}\nStdout:\n{}\nStderr:\n{}\n\n",
-                    result.status.code().unwrap_or(-1), stdout, stderr));
+                raw_output.push_str(&format!(
+                    "=== cargo check (CRITICAL) ===\nExit: {}\nStdout:\n{}\nStderr:\n{}\n\n",
+                    result.status.code().unwrap_or(-1),
+                    stdout,
+                    stderr
+                ));
 
                 if !result.status.success() {
-                    critical_failures.push(format!("cargo check failed with exit code {}", result.status.code().unwrap_or(-1)));
+                    critical_failures.push(format!(
+                        "cargo check failed with exit code {}",
+                        result.status.code().unwrap_or(-1)
+                    ));
                     // Extract error lines
                     for line in stderr.lines() {
                         if line.contains("error[E") || line.starts_with("error:") {
@@ -10765,7 +11162,9 @@ fn generate_verification_feedback(result: &DeterministicVerificationResult) -> S
 
     if !result.all_passed {
         feedback.push_str("## ⚠️ Deterministic Verification Failed\n\n");
-        feedback.push_str("The system ran verification after your [WORK_COMPLETE] signal and found issues:\n\n");
+        feedback.push_str(
+            "The system ran verification after your [WORK_COMPLETE] signal and found issues:\n\n",
+        );
 
         feedback.push_str("### Checks Run\n");
         for check in &result.checks_run {
@@ -10789,7 +11188,9 @@ fn generate_verification_feedback(result: &DeterministicVerificationResult) -> S
         }
 
         feedback.push_str("\n### Action Required\n");
-        feedback.push_str("Please fix the CRITICAL issues above and signal [WORK_COMPLETE] again when ready.\n");
+        feedback.push_str(
+            "Please fix the CRITICAL issues above and signal [WORK_COMPLETE] again when ready.\n",
+        );
         feedback.push_str("The task will NOT be marked complete until all critical checks pass.\n");
     }
 
@@ -11284,7 +11685,8 @@ async fn force_continue_simple(
                 .unwrap_or_else(|_| ".".to_string());
 
             tokio::spawn(async move {
-                run_unified_session_loop(state_clone, sid, workspace_root, None, None, None, 1).await;
+                run_unified_session_loop(state_clone, sid, workspace_root, None, None, None, 1)
+                    .await;
             });
 
             Json(ApiResponse::success(ForceContinueResponse {
@@ -11509,9 +11911,199 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
         // =====================================================================
         // Re-execute deterministic steps BEFORE resuming AI session
         // =====================================================================
+        // For unified workflow tasks, re-fetch steps from the workflow definition
+        // to ensure we have the latest step configuration (including check_type, etc.)
+        // Task IDs for unified workflows follow pattern: unified-workflow-{workflow_id}-{timestamp}
+        info!(
+            "DEBUG: Checking task_id '{}' starts_with 'unified-workflow-': {}",
+            task.id,
+            task.id.starts_with("unified-workflow-")
+        );
+        let execution_steps_json = if task.id.starts_with("unified-workflow-") {
+            // Extract workflow ID from task ID (format: unified-workflow-{uuid}-{timestamp})
+            let parts: Vec<&str> = task.id.split('-').collect();
+            // UUID is parts 2-6 (indices 2,3,4,5,6 = 5 parts of UUID)
+            if parts.len() >= 7 {
+                let workflow_id = format!(
+                    "{}-{}-{}-{}-{}",
+                    parts[2], parts[3], parts[4], parts[5], parts[6]
+                );
+                info!(
+                    "Unified workflow task detected, re-fetching steps from workflow {}",
+                    workflow_id
+                );
+
+                // Re-fetch workflow from database to get latest step definitions
+                match state
+                    .app_state
+                    .checkpoint_db
+                    .get_unified_workflow(&workflow_id)
+                {
+                    Ok(Some(workflow)) => {
+                        // Convert workflow steps to ExecutionStepConfig using the same logic
+                        // as the run_unified_workflow endpoint
+                        let monitor = 0; // Default monitor
+                        let mut all_steps: Vec<ExecutionStepConfig> = Vec::new();
+
+                        // Helper closure to convert step
+                        let convert_step_inline =
+                            |step: &serde_json::Value| -> Option<ExecutionStepConfig> {
+                                // Try direct deserialization first
+                                if let Ok(mut config) =
+                                    serde_json::from_value::<ExecutionStepConfig>(step.clone())
+                                {
+                                    if config.monitor_index.is_none() {
+                                        config.monitor_index = Some(monitor);
+                                    }
+                                    return Some(config);
+                                }
+
+                                // Fall back to manual extraction
+                                let step_type = step.get("type").and_then(|t| t.as_str())?;
+                                let name = step
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .map(|s| s.to_string());
+
+                                // Helper to get string from either snake_case or camelCase
+                                let get_str = |keys: &[&str]| -> Option<String> {
+                                    keys.iter()
+                                        .find_map(|k| step.get(*k).and_then(|v| v.as_str()))
+                                        .map(|s| s.to_string())
+                                };
+                                let get_bool = |keys: &[&str]| -> Option<bool> {
+                                    keys.iter()
+                                        .find_map(|k| step.get(*k).and_then(|v| v.as_bool()))
+                                };
+
+                                Some(ExecutionStepConfig {
+                                    step_type: step_type.to_string(),
+                                    name,
+                                    monitor_index: Some(monitor),
+                                    check_type: get_str(&["check_type", "checkType"]),
+                                    check_command: get_str(&[
+                                        "command",
+                                        "check_command",
+                                        "checkCommand",
+                                    ]),
+                                    check_working_directory: get_str(&[
+                                        "working_directory",
+                                        "workingDirectory",
+                                        "check_working_directory",
+                                        "checkWorkingDirectory",
+                                    ]),
+                                    check_auto_fix: get_bool(&[
+                                        "auto_fix",
+                                        "autoFix",
+                                        "check_auto_fix",
+                                        "checkAutoFix",
+                                    ]),
+                                    test_id: get_str(&["test_id", "testId"]),
+                                    test_type: get_str(&["test_type", "testType"]),
+                                    test_is_critical: get_bool(&["is_critical", "isCritical"]),
+                                    shell_command: get_str(&[
+                                        "command",
+                                        "shell_command",
+                                        "shellCommand",
+                                    ]),
+                                    shell_command_working_directory: get_str(&[
+                                        "working_directory",
+                                        "workingDirectory",
+                                        "shell_command_working_directory",
+                                        "shellCommandWorkingDirectory",
+                                    ]),
+                                    shell_command_fail_on_error: get_bool(&[
+                                        "fail_on_error",
+                                        "failOnError",
+                                        "shell_command_fail_on_error",
+                                        "shellCommandFailOnError",
+                                    ]),
+                                    prompt_content: get_str(&[
+                                        "content",
+                                        "prompt_content",
+                                        "promptContent",
+                                    ]),
+                                    is_setup: get_bool(&["isSetup", "is_setup"]),
+                                    ..Default::default()
+                                })
+                            };
+
+                        // Add setup steps (mark as setup)
+                        for step in &workflow.setup_steps {
+                            if let Some(mut config) = convert_step_inline(step) {
+                                config.is_setup = Some(true);
+                                all_steps.push(config);
+                            }
+                        }
+
+                        // Add verification steps
+                        for step in &workflow.verification_steps {
+                            if let Some(config) = convert_step_inline(step) {
+                                all_steps.push(config);
+                            }
+                        }
+
+                        // Add completion steps
+                        for step in &workflow.completion_steps {
+                            if let Some(config) = convert_step_inline(step) {
+                                all_steps.push(config);
+                            }
+                        }
+
+                        info!(
+                            "Re-fetched {} steps from unified workflow definition",
+                            all_steps.len()
+                        );
+
+                        // Also update the task_run with the correct execution_steps_json
+                        // so future resumes don't need to re-fetch
+                        if let Ok(new_json) = serde_json::to_string(&all_steps) {
+                            if let Err(e) = state
+                                .app_state
+                                .checkpoint_db
+                                .update_task_run_execution_steps(
+                                    &task.id,
+                                    Some(new_json.clone()),
+                                    None,
+                                )
+                            {
+                                warn!(
+                                    "Failed to update execution_steps_json for task {}: {}",
+                                    task.id, e
+                                );
+                            }
+                            Some(new_json)
+                        } else {
+                            task.execution_steps_json.clone()
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "Unified workflow {} not found, using cached execution_steps_json",
+                            workflow_id
+                        );
+                        task.execution_steps_json.clone()
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to fetch unified workflow {}: {}, using cached execution_steps_json",
+                            workflow_id, e
+                        );
+                        task.execution_steps_json.clone()
+                    }
+                }
+            } else {
+                // Couldn't parse workflow ID from task ID
+                task.execution_steps_json.clone()
+            }
+        } else {
+            // Not a unified workflow task, use cached steps
+            task.execution_steps_json.clone()
+        };
+
         // Parse and re-execute execution_steps_json if present
         // This ensures the AI sees fresh results from workflows/actions/screenshots
-        let execution_summary = if let Some(ref steps_json) = task.execution_steps_json {
+        let execution_summary = if let Some(ref steps_json) = execution_steps_json {
             match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
                 Ok(execution_steps) if !execution_steps.is_empty() => {
                     info!(
@@ -11755,7 +12347,12 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                 let task_id = task.id.clone();
                 let run_ctx = session_ctx.clone();
                 // Capture additional fields needed for cross-session continuation
-                let execution_steps_json = task.execution_steps_json.clone();
+                // Re-fetch unified workflow steps to ensure all fields (check_type, etc.) are present
+                let execution_steps_json = refetch_unified_workflow_steps(
+                    &task.id,
+                    task.execution_steps_json.clone(),
+                    &db,
+                );
                 let log_sources_json = task.log_sources_json.clone();
                 let original_prompt = task.prompt.clone();
                 let first_iteration = task.sessions_count + 1; // Iteration number for display
@@ -11787,7 +12384,10 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                         let db = match CheckpointDb::new() {
                             Ok(d) => d,
                             Err(e) => {
-                                warn!("Failed to open database for resume continuation check: {}", e);
+                                warn!(
+                                    "Failed to open database for resume continuation check: {}",
+                                    e
+                                );
                                 break;
                             }
                         };
@@ -11799,19 +12399,28 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                                 break;
                             }
                             Err(e) => {
-                                warn!("Failed to get task {} in resume continuation: {}", task_id, e);
+                                warn!(
+                                    "Failed to get task {} in resume continuation: {}",
+                                    task_id, e
+                                );
                                 break;
                             }
                         };
 
                         // Check termination conditions
                         if task.status == "completed" || task.status == "stopped" {
-                            info!("Task {} is {}, exiting resume continuation loop", task_id, task.status);
+                            info!(
+                                "Task {} is {}, exiting resume continuation loop",
+                                task_id, task.status
+                            );
                             break;
                         }
 
                         if !task.auto_continue {
-                            info!("Task {} has auto_continue disabled, exiting resume continuation", task_id);
+                            info!(
+                                "Task {} has auto_continue disabled, exiting resume continuation",
+                                task_id
+                            );
                             if let Err(e) = db.complete_task_run(&task_id) {
                                 warn!("Failed to mark task {} as complete: {}", task_id, e);
                             }
@@ -11836,18 +12445,29 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                         info!("Resume cross-session continuation: Starting iteration {} for task '{}'", iteration, task.task_name);
 
                         // Log iteration start
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                            .open(crate::paths::get_workflow_debug_log_path()) {
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(crate::paths::get_workflow_debug_log_path())
+                        {
                             use std::io::Write;
-                            let _ = writeln!(f, "[{}] RESUME_CROSS_SESSION_ITERATION: task={}, iteration={}",
+                            let _ = writeln!(
+                                f,
+                                "[{}] RESUME_CROSS_SESSION_ITERATION: task={}, iteration={}",
                                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
-                                task_id, iteration);
+                                task_id,
+                                iteration
+                            );
                         }
 
                         let execution_summary = if let Some(ref steps_json) = execution_steps_json {
                             match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
                                 Ok(execution_steps) if !execution_steps.is_empty() => {
-                                    info!("Re-executing {} deterministic steps for iteration {}", execution_steps.len(), iteration);
+                                    info!(
+                                        "Re-executing {} deterministic steps for iteration {}",
+                                        execution_steps.len(),
+                                        iteration
+                                    );
 
                                     // Parse log sources if present
                                     let log_sources: Vec<LogSourceConfig> = log_sources_json
@@ -11884,8 +12504,11 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
 
                                     // Generate execution summary using IterationBundle
                                     if !execution_result.steps.is_empty() {
-                                        let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
-                                        let timestamp_now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                                        let relevant_logs =
+                                            RelevantLogSources::from_steps(&execution_steps);
+                                        let timestamp_now = chrono::Utc::now()
+                                            .format("%Y-%m-%dT%H:%M:%SZ")
+                                            .to_string();
 
                                         let mut bundle = IterationBundle::new(
                                             iteration,
@@ -11898,11 +12521,16 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
 
                                         // Add application logs if captured
                                         if let Some(ref captured) = execution_result.captured_logs {
-                                            bundle.add_application_logs(&captured.sources, &log_sources);
+                                            bundle.add_application_logs(
+                                                &captured.sources,
+                                                &log_sources,
+                                            );
                                         }
 
                                         // Add runner logs if captured
-                                        if let Some(ref runner_logs) = execution_result.captured_runner_logs {
+                                        if let Some(ref runner_logs) =
+                                            execution_result.captured_runner_logs
+                                        {
                                             bundle.add_gui_automation_logs(
                                                 runner_logs.actions.clone(),
                                                 runner_logs.image_recognition.clone(),
@@ -11925,10 +12553,11 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                         };
 
                         // Build continuation prompt
-                        let consolidated_output = log_consolidation::get_consolidated_output_for_task(
-                            &task.created_at,
-                            task.completed_at.as_deref(),
-                        );
+                        let consolidated_output =
+                            log_consolidation::get_consolidated_output_for_task(
+                                &task.created_at,
+                                task.completed_at.as_deref(),
+                            );
 
                         // Get findings context from database
                         let findings_context = db
@@ -11938,12 +12567,15 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                                 String::new()
                             });
 
-                        let has_execution_steps = execution_steps_json.as_ref().is_some_and(|json| {
-                            serde_json::from_str::<Vec<serde_json::Value>>(json)
-                                .is_ok_and(|steps| !steps.is_empty())
-                        });
+                        let has_execution_steps =
+                            execution_steps_json.as_ref().is_some_and(|json| {
+                                serde_json::from_str::<Vec<serde_json::Value>>(json)
+                                    .is_ok_and(|steps| !steps.is_empty())
+                            });
 
-                        let pre_execution_message = if has_execution_steps && !execution_summary.is_empty() {
+                        let pre_execution_message = if has_execution_steps
+                            && !execution_summary.is_empty()
+                        {
                             "\
                             **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
                             The Pre-Execution Results section below shows FRESH results from this iteration.\n\n\
@@ -11988,7 +12620,10 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                             timeout_seconds: 600,
                             stall_threshold_seconds: 300,
                             name: format!("{} (iteration {})", task.task_name, iteration),
-                            description: format!("Cross-session continuation - iteration #{}", iteration),
+                            description: format!(
+                                "Cross-session continuation - iteration #{}",
+                                iteration
+                            ),
                             custom_config: serde_json::json!({}),
                             provider: None,
                             model: None,
@@ -12003,11 +12638,17 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                         // Start the new session
                         match state_clone.session.start_session(session_config).await {
                             Ok(new_session) => {
-                                info!("Started iteration {} session {} for task '{}' (from resume)", iteration, new_session.id, task.task_name);
+                                info!(
+                                    "Started iteration {} session {} for task '{}' (from resume)",
+                                    iteration, new_session.id, task.task_name
+                                );
 
                                 emit_ai_output(
                                     &state_clone.app_handle,
-                                    &format!("🔄 Starting iteration {} for '{}'", iteration, task.task_name),
+                                    &format!(
+                                        "🔄 Starting iteration {} for '{}'",
+                                        iteration, task.task_name
+                                    ),
                                     "status",
                                     None,
                                     Some(&session_ctx),
@@ -12035,7 +12676,10 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                                 // Continue the loop - will check task status and decide if more iterations needed
                             }
                             Err(e) => {
-                                error!("Failed to start iteration {} session (from resume): {}", iteration, e);
+                                error!(
+                                    "Failed to start iteration {} session (from resume): {}",
+                                    iteration, e
+                                );
                                 emit_ai_output(
                                     &state_clone.app_handle,
                                     &format!("❌ Failed to start iteration {}: {}", iteration, e),
@@ -12088,7 +12732,7 @@ async fn run_unified_session_loop(
     external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
     run_ctx: Option<AiOutputSessionContext>, // Context for grouping output into a single Run
     task_run_id: Option<String>, // ID to use for database task_run operations (for resumed tasks)
-    iteration: u32, // Cross-session iteration number for display (1, 2, 3, ...)
+    iteration: u32,              // Cross-session iteration number for display (1, 2, 3, ...)
 ) {
     // Use task_run_id if provided (for resumed tasks), otherwise use session_id
     let db_task_id = task_run_id.unwrap_or_else(|| session_id.clone());
@@ -12215,10 +12859,8 @@ async fn run_unified_session_loop(
                     compression: Some(CompressionConfig::default()),
                     enable_checkpointing: true,
                 };
-                let orchestrator = Orchestrator::new(
-                    orch_config,
-                    state.app_state.checkpoint_db.clone(),
-                );
+                let orchestrator =
+                    Orchestrator::new(orch_config, state.app_state.checkpoint_db.clone());
 
                 match orchestrator.build_worker_prompt(orch_state, &current_prompt) {
                     Ok(enhanced_prompt) => {
@@ -12334,7 +12976,10 @@ async fn run_unified_session_loop(
                 if let Some(mut s) = state.session.get_session(&session_id).await {
                     let explicit_completion = s.checkpoint.completed || {
                         let status_upper = s.checkpoint.status.to_uppercase();
-                        matches!(status_upper.as_str(), "COMPLETE" | "COMPLETED" | "DONE" | "FINISHED")
+                        matches!(
+                            status_upper.as_str(),
+                            "COMPLETE" | "COMPLETED" | "DONE" | "FINISHED"
+                        )
                     };
 
                     if explicit_completion {
@@ -12363,7 +13008,10 @@ async fn run_unified_session_loop(
                             Some(&session_id),
                             Some(&session_ctx),
                         );
-                        info!("Session {} completed after {} phases (explicit completion)", session_id, phase);
+                        info!(
+                            "Session {} completed after {} phases (explicit completion)",
+                            session_id, phase
+                        );
                         return;
                     }
 
@@ -12386,7 +13034,8 @@ async fn run_unified_session_loop(
                         // Get initial_verification_run from state
                         let initial_verification_run = {
                             let states = state.orchestrator_states.lock().await;
-                            states.get(&db_task_id)
+                            states
+                                .get(&db_task_id)
                                 .map(|s| s.initial_verification_run)
                                 .unwrap_or(false)
                         };
@@ -12401,10 +13050,8 @@ async fn run_unified_session_loop(
                             compression: Some(CompressionConfig::default()),
                             enable_checkpointing: true,
                         };
-                        let orchestrator = Orchestrator::new(
-                            orch_config,
-                            state.app_state.checkpoint_db.clone(),
-                        );
+                        let orchestrator =
+                            Orchestrator::new(orch_config, state.app_state.checkpoint_db.clone());
 
                         // Process output and get action
                         let action = {
@@ -12425,8 +13072,12 @@ async fn run_unified_session_loop(
                                     let mut states = state.orchestrator_states.lock().await;
                                     if let Some(orch_state) = states.get_mut(&db_task_id) {
                                         // Try to load latest screenshot for AI verification
-                                        let screenshot = crate::orchestrator::load_latest_screenshot_as_base64().ok();
-                                        orchestrator.run_verification(orch_state, screenshot.as_deref()).await
+                                        let screenshot =
+                                            crate::orchestrator::load_latest_screenshot_as_base64()
+                                                .ok();
+                                        orchestrator
+                                            .run_verification(orch_state, screenshot.as_deref())
+                                            .await
                                     } else {
                                         Err("Orchestrator state not found".to_string())
                                     }
@@ -12438,20 +13089,27 @@ async fn run_unified_session_loop(
                                             info!("Orchestrator verification PASSED - marking task complete");
                                             s.status = SessionStatus::Completed;
                                             s.checkpoint.completed = true;
-                                            s.checkpoint.status = "orchestrator_verified_complete".to_string();
+                                            s.checkpoint.status =
+                                                "orchestrator_verified_complete".to_string();
                                             let _ = state.session.update_session(s).await;
 
                                             // Mark task complete
                                             if !complete_task_run_with_retry(
                                                 state.app_state.checkpoint_db.clone(),
                                                 &db_task_id,
-                                            ).await {
-                                                error!("Failed to mark task_run {} as complete", db_task_id);
+                                            )
+                                            .await
+                                            {
+                                                error!(
+                                                    "Failed to mark task_run {} as complete",
+                                                    db_task_id
+                                                );
                                             }
 
                                             // Clean up orchestrator state
                                             {
-                                                let mut states = state.orchestrator_states.lock().await;
+                                                let mut states =
+                                                    state.orchestrator_states.lock().await;
                                                 states.remove(&db_task_id);
                                             }
 
@@ -12477,7 +13135,8 @@ async fn run_unified_session_loop(
                                             );
                                             s.status = SessionStatus::Completed;
                                             s.checkpoint.completed = false;
-                                            s.checkpoint.status = "orchestrator_verification_failed".to_string();
+                                            s.checkpoint.status =
+                                                "orchestrator_verification_failed".to_string();
                                             let _ = state.session.update_session(s).await;
 
                                             emit_ai_output(
@@ -12506,7 +13165,9 @@ async fn run_unified_session_loop(
                                 {
                                     let mut states = state.orchestrator_states.lock().await;
                                     if let Some(orch_state) = states.get_mut(&db_task_id) {
-                                        if let Err(e) = orchestrator.handle_replan(orch_state, &reason) {
+                                        if let Err(e) =
+                                            orchestrator.handle_replan(orch_state, &reason)
+                                        {
                                             warn!("Failed to handle replan: {}", e);
                                         }
                                     }
@@ -12514,12 +13175,18 @@ async fn run_unified_session_loop(
 
                                 s.status = SessionStatus::Completed;
                                 s.checkpoint.completed = false;
-                                s.checkpoint.status = format!("orchestrator_replan:{}", reason.chars().take(100).collect::<String>());
+                                s.checkpoint.status = format!(
+                                    "orchestrator_replan:{}",
+                                    reason.chars().take(100).collect::<String>()
+                                );
                                 let _ = state.session.update_session(s).await;
 
                                 emit_ai_output(
                                     &app_handle,
-                                    &format!("🔄 Session {} orchestrator replan requested: {}", session_id, reason),
+                                    &format!(
+                                        "🔄 Session {} orchestrator replan requested: {}",
+                                        session_id, reason
+                                    ),
                                     "status",
                                     Some(&session_id),
                                     Some(&session_ctx),
@@ -12527,7 +13194,10 @@ async fn run_unified_session_loop(
                                 return;
                             }
                             Ok(WorkerOutputAction::MaxIterationsReached) => {
-                                info!("Orchestrator: Max iterations reached for task {}", db_task_id);
+                                info!(
+                                    "Orchestrator: Max iterations reached for task {}",
+                                    db_task_id
+                                );
                                 s.status = SessionStatus::Completed;
                                 s.checkpoint.completed = false;
                                 s.checkpoint.status = "orchestrator_max_iterations".to_string();
@@ -12568,7 +13238,8 @@ async fn run_unified_session_loop(
                             let verification_result = run_deterministic_verification(
                                 &workspace_root,
                                 None, // TODO: Pass verification config from task
-                            ).await;
+                            )
+                            .await;
 
                             if verification_result.all_passed {
                                 info!("Legacy deterministic verification PASSED - marking task complete");
@@ -12619,7 +13290,8 @@ async fn run_unified_session_loop(
 
                                 // Generate feedback for logging/display
                                 // The continuation loop will re-run verification and generate feedback
-                                let _feedback = generate_verification_feedback(&verification_result);
+                                let _feedback =
+                                    generate_verification_feedback(&verification_result);
 
                                 let _ = state.session.update_session(s).await;
 
@@ -12647,15 +13319,15 @@ async fn run_unified_session_loop(
                             s.status = SessionStatus::Completed;
                             s.checkpoint.completed = false;
                             // Use a special status format to encode the reason
-                            s.checkpoint.status = format!("replan_requested:{}", reason.chars().take(100).collect::<String>());
+                            s.checkpoint.status = format!(
+                                "replan_requested:{}",
+                                reason.chars().take(100).collect::<String>()
+                            );
                             let _ = state.session.update_session(s).await;
 
                             emit_ai_output(
                                 &app_handle,
-                                &format!(
-                                    "🔄 Session {} requested replan: {}",
-                                    session_id, reason
-                                ),
+                                &format!("🔄 Session {} requested replan: {}", session_id, reason),
                                 "status",
                                 Some(&session_id),
                                 Some(&session_ctx),
@@ -12782,11 +13454,19 @@ async fn run_unified_session_loop(
                 }
 
                 // Migrate logs to SQLite even on failure (for debugging/analysis)
-                let workflow_name = state.app_state.checkpoint_db.get_task_run(&db_task_id)
+                let workflow_name = state
+                    .app_state
+                    .checkpoint_db
+                    .get_task_run(&db_task_id)
                     .ok()
                     .flatten()
                     .and_then(|t| t.workflow_name);
-                migrate_logs_for_task(state.app_state.checkpoint_db.clone(), &db_task_id, workflow_name).await;
+                migrate_logs_for_task(
+                    state.app_state.checkpoint_db.clone(),
+                    &db_task_id,
+                    workflow_name,
+                )
+                .await;
 
                 emit_ai_output(
                     &app_handle,
@@ -13201,7 +13881,10 @@ async fn stop_task_run(
     // Emit status to frontend
     emit_ai_output(
         &state.app_handle,
-        &format!("🛑 Task {} stopped (killed {} process(es))", id, killed_count),
+        &format!(
+            "🛑 Task {} stopped (killed {} process(es))",
+            id, killed_count
+        ),
         "status",
         None,
         None,
@@ -13252,7 +13935,12 @@ async fn generate_task_summary(
         summary_generator::generate_task_summary(&db, &task_id)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task spawn error: {}", e)))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Task spawn error: {}", e),
+        )
+    })?;
 
     match result {
         Ok(summary_result) => Ok(Json(serde_json::json!({
@@ -13343,6 +14031,190 @@ async fn get_task_run_events(
         "task_run_id": id,
         "events": events,
         "count": events.len()
+    })))
+}
+
+/// Query parameters for current execution steps.
+#[derive(Debug, Deserialize)]
+struct CurrentExecutionStepsQuery {
+    /// Filter by step type (shell_command, prompt, verification, etc.)
+    step_type: Option<String>,
+    /// Maximum number of steps to return
+    limit: Option<u32>,
+}
+
+/// Step execution data for dashboard widget.
+#[derive(Debug, Serialize)]
+struct StepExecutionData {
+    id: String,
+    step_type: String,
+    step_name: String,
+    status: String, // "pending", "running", "success", "failed"
+    start_time: Option<i64>,
+    end_time: Option<i64>,
+    duration_ms: Option<i64>,
+    error: Option<String>,
+    output: Option<String>,
+    // Shell command specific fields
+    command: Option<String>,
+    working_directory: Option<String>,
+    exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+/// Get step executions for the currently running task.
+/// This endpoint combines running task detection with event querying,
+/// so the frontend doesn't need to track task IDs.
+async fn get_current_execution_steps(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Query(query): axum::extract::Query<CurrentExecutionStepsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get running tasks
+    let running_tasks = state
+        .app_state
+        .checkpoint_db
+        .get_running_task_runs()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // If no running task, return empty
+    if running_tasks.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "success": true,
+            "task_run_id": null,
+            "executions": [],
+            "count": 0,
+            "message": "No running task"
+        })));
+    }
+
+    // Use the first running task (typically there's only one)
+    let task = &running_tasks[0];
+
+    // Get events for this task, filtering by step-related events
+    let events = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_events(&task.id, Some("general"), query.limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Transform events into step execution data
+    let mut executions: Vec<StepExecutionData> = Vec::new();
+
+    for event in events {
+        // Parse the event data JSON to extract step information
+        let data: Option<serde_json::Value> = event
+            .get("data")
+            .and_then(|d| d.as_str())
+            .and_then(|s| serde_json::from_str(s).ok());
+
+        let event_type = event
+            .get("event_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let event_subtype = event
+            .get("event_subtype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let message = event.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Filter by step type if specified
+        if let Some(ref filter_type) = query.step_type {
+            let step_type = data
+                .as_ref()
+                .and_then(|d| d.get("step_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !step_type
+                .to_lowercase()
+                .contains(&filter_type.to_lowercase())
+            {
+                continue;
+            }
+        }
+
+        // Create step execution data from event
+        let step_data = StepExecutionData {
+            id: event
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            step_type: data
+                .as_ref()
+                .and_then(|d| d.get("step_type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(event_type)
+                .to_string(),
+            step_name: data
+                .as_ref()
+                .and_then(|d| d.get("step_name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| message.to_string()),
+            status: match event_subtype {
+                "start" => "running",
+                "complete" | "success" => "success",
+                "error" | "failed" => "failed",
+                _ => "pending",
+            }
+            .to_string(),
+            start_time: event.get("timestamp").and_then(|v| {
+                v.as_str()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp_millis())
+            }),
+            end_time: data
+                .as_ref()
+                .and_then(|d| d.get("end_time"))
+                .and_then(|v| v.as_i64()),
+            duration_ms: event.get("duration_ms").and_then(|v| v.as_i64()),
+            error: data
+                .as_ref()
+                .and_then(|d| d.get("error"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            output: data
+                .as_ref()
+                .and_then(|d| d.get("output"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            command: data
+                .as_ref()
+                .and_then(|d| d.get("command"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            working_directory: data
+                .as_ref()
+                .and_then(|d| d.get("working_directory"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            exit_code: data
+                .as_ref()
+                .and_then(|d| d.get("exit_code"))
+                .and_then(|v| v.as_i64())
+                .map(|i| i as i32),
+            stdout: data
+                .as_ref()
+                .and_then(|d| d.get("stdout"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            stderr: data
+                .as_ref()
+                .and_then(|d| d.get("stderr"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+        };
+
+        executions.push(step_data);
+    }
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "task_run_id": task.id,
+        "workflow_name": task.workflow_name,
+        "executions": executions,
+        "count": executions.len()
     })))
 }
 
@@ -13442,7 +14314,12 @@ async fn migrate_task_run_logs(
         )
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task spawn error: {}", e)))?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Task spawn error: {}", e),
+        )
+    })?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     Ok(Json(serde_json::json!({
@@ -13688,8 +14565,14 @@ async fn parse_config_file(
                 .filter_map(|s| {
                     let id = s.get("id")?.as_str()?.to_string();
                     let name = s.get("name")?.as_str()?.to_string();
-                    let description = s.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let is_initial = s.get("isInitial").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let description = s
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let is_initial = s
+                        .get("isInitial")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let is_final = s.get("isFinal").and_then(|v| v.as_bool()).unwrap_or(false);
                     Some(ConfigStateInfo {
                         id,
@@ -13706,9 +14589,16 @@ async fn parse_config_file(
                 .iter()
                 .filter_map(|t| {
                     let id = t.get("id")?.as_str()?.to_string();
-                    let from_state = t.get("fromState").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let to_state = t.get("toState").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let name = t.get("name")
+                    let from_state = t
+                        .get("fromState")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let to_state = t
+                        .get("toState")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    let name = t
+                        .get("name")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())
                         .unwrap_or_else(|| {
@@ -15439,7 +16329,8 @@ async fn sync_context_to_web(project_id: &str, ctx: &context::Context) -> Result
 // ============================================================================
 
 /// List all DOM captures
-async fn list_dom_captures() -> Result<Json<ApiResponse<Vec<DomCapture>>>, (StatusCode, Json<ApiResponse<()>>)> {
+async fn list_dom_captures(
+) -> Result<Json<ApiResponse<Vec<DomCapture>>>, (StatusCode, Json<ApiResponse<()>>)> {
     let captures = DomCaptureLogger::list_captures();
     Ok(Json(ApiResponse::success(captures)))
 }
@@ -15466,10 +16357,7 @@ async fn get_dom_capture_html(
             [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
             html,
         )),
-        Err(e) => Err((
-            StatusCode::NOT_FOUND,
-            Json(api_error(e)),
-        )),
+        Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
     }
 }
 
@@ -15538,8 +16426,12 @@ struct TestApiRequestBody {
 /// Import a cURL command and return the parsed configuration
 async fn import_curl_command(
     Json(request): Json<ImportCurlRequest>,
-) -> Result<Json<ApiResponse<crate::api_request::ParsedCurl>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("Importing cURL command: {} bytes", request.curl_command.len());
+) -> Result<Json<ApiResponse<crate::api_request::ParsedCurl>>, (StatusCode, Json<ApiResponse<()>>)>
+{
+    info!(
+        "Importing cURL command: {} bytes",
+        request.curl_command.len()
+    );
 
     match crate::api_request::parse_curl(&request.curl_command) {
         Ok(parsed) => {
@@ -15559,7 +16451,10 @@ async fn import_curl_command(
 /// Test an API request immediately (for debugging/testing in the editor)
 async fn test_api_request(
     Json(request): Json<TestApiRequestBody>,
-) -> Result<Json<ApiResponse<crate::api_request::ApiRequestResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::api_request::ApiRequestResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Testing API request: {} {}", request.method, request.url);
 
     // Parse method
@@ -15572,7 +16467,10 @@ async fn test_api_request(
         _ => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error(format!("Invalid HTTP method: {}", request.method))),
+                Json(api_error(format!(
+                    "Invalid HTTP method: {}",
+                    request.method
+                ))),
             ))
         }
     };
@@ -15639,8 +16537,14 @@ struct ImportCurlToLibraryRequest {
 async fn import_curl_to_library(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<ImportCurlToLibraryRequest>,
-) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("Importing cURL to library: {} bytes", request.curl_command.len());
+) -> Result<
+    Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    info!(
+        "Importing cURL to library: {} bytes",
+        request.curl_command.len()
+    );
 
     // Parse the cURL command
     let parsed = match crate::api_request::parse_curl(&request.curl_command) {
@@ -15688,9 +16592,16 @@ async fn import_curl_to_library(
         credential_id: None,
     };
 
-    match state.app_state.checkpoint_db.create_saved_api_request(&create_request) {
+    match state
+        .app_state
+        .checkpoint_db
+        .create_saved_api_request(&create_request)
+    {
         Ok(saved) => {
-            info!("Saved API request to library: {} ({}) - {} {}", saved.name, saved.id, saved.method, parsed.url);
+            info!(
+                "Saved API request to library: {} ({}) - {} {}",
+                saved.name, saved.id, saved.method, parsed.url
+            );
             Ok(Json(ApiResponse::success(saved)))
         }
         Err(e) => {
@@ -15710,14 +16621,20 @@ async fn import_curl_to_library(
 /// List all saved API requests
 async fn list_saved_api_requests(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     match state.app_state.checkpoint_db.list_saved_api_requests() {
         Ok(requests) => Ok(Json(ApiResponse::success(requests))),
         Err(e) => {
             error!("Failed to list saved API requests: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to list saved API requests: {}", e))),
+                Json(api_error(format!(
+                    "Failed to list saved API requests: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15727,7 +16644,10 @@ async fn list_saved_api_requests(
 async fn get_saved_api_request(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     match state.app_state.checkpoint_db.get_saved_api_request(&id) {
         Ok(Some(request)) => Ok(Json(ApiResponse::success(request))),
         Ok(None) => Err((
@@ -15748,18 +16668,34 @@ async fn get_saved_api_request(
 async fn create_saved_api_request(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<crate::saved_api_requests::CreateSavedApiRequestRequest>,
-) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
-    info!("Creating saved API request: {} {}", request.method, request.url);
-    match state.app_state.checkpoint_db.create_saved_api_request(&request) {
+) -> Result<
+    Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    info!(
+        "Creating saved API request: {} {}",
+        request.method, request.url
+    );
+    match state
+        .app_state
+        .checkpoint_db
+        .create_saved_api_request(&request)
+    {
         Ok(created) => {
-            info!("Created saved API request: {} ({})", created.name, created.id);
+            info!(
+                "Created saved API request: {} ({})",
+                created.name, created.id
+            );
             Ok(Json(ApiResponse::success(created)))
         }
         Err(e) => {
             error!("Failed to create saved API request: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to create saved API request: {}", e))),
+                Json(api_error(format!(
+                    "Failed to create saved API request: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15770,11 +16706,21 @@ async fn update_saved_api_request(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<crate::saved_api_requests::UpdateSavedApiRequestRequest>,
-) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Updating saved API request: {}", id);
-    match state.app_state.checkpoint_db.update_saved_api_request(&id, &request) {
+    match state
+        .app_state
+        .checkpoint_db
+        .update_saved_api_request(&id, &request)
+    {
         Ok(updated) => {
-            info!("Updated saved API request: {} ({})", updated.name, updated.id);
+            info!(
+                "Updated saved API request: {} ({})",
+                updated.name, updated.id
+            );
             Ok(Json(ApiResponse::success(updated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -15785,7 +16731,10 @@ async fn update_saved_api_request(
             error!("Failed to update saved API request: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to update saved API request: {}", e))),
+                Json(api_error(format!(
+                    "Failed to update saved API request: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15810,7 +16759,10 @@ async fn delete_saved_api_request(
             error!("Failed to delete saved API request: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to delete saved API request: {}", e))),
+                Json(api_error(format!(
+                    "Failed to delete saved API request: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15820,14 +16772,24 @@ async fn delete_saved_api_request(
 async fn search_saved_api_requests(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<crate::saved_api_requests::SearchSavedApiRequestsQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.search_saved_api_requests(&query) {
+) -> Result<
+    Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    match state
+        .app_state
+        .checkpoint_db
+        .search_saved_api_requests(&query)
+    {
         Ok(requests) => Ok(Json(ApiResponse::success(requests))),
         Err(e) => {
             error!("Failed to search saved API requests: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to search saved API requests: {}", e))),
+                Json(api_error(format!(
+                    "Failed to search saved API requests: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15837,7 +16799,11 @@ async fn search_saved_api_requests(
 async fn get_saved_api_request_categories(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.get_saved_api_request_categories() {
+    match state
+        .app_state
+        .checkpoint_db
+        .get_saved_api_request_categories()
+    {
         Ok(categories) => Ok(Json(ApiResponse::success(categories))),
         Err(e) => {
             error!("Failed to get saved API request categories: {}", e);
@@ -15869,9 +16835,16 @@ async fn get_saved_api_request_tags(
 async fn duplicate_saved_api_request(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Duplicating saved API request: {}", id);
-    match state.app_state.checkpoint_db.duplicate_saved_api_request(&id) {
+    match state
+        .app_state
+        .checkpoint_db
+        .duplicate_saved_api_request(&id)
+    {
         Ok(duplicated) => {
             info!("Duplicated saved API request: {} -> {}", id, duplicated.id);
             Ok(Json(ApiResponse::success(duplicated)))
@@ -15884,7 +16857,10 @@ async fn duplicate_saved_api_request(
             error!("Failed to duplicate saved API request: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to duplicate saved API request: {}", e))),
+                Json(api_error(format!(
+                    "Failed to duplicate saved API request: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15901,14 +16877,20 @@ async fn duplicate_saved_api_request(
 /// List all unified workflows
 async fn list_unified_workflows(
     State(state): State<Arc<ApiState>>,
-) -> Result<Json<ApiResponse<Vec<crate::unified_workflows::UnifiedWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<Vec<crate::unified_workflows::UnifiedWorkflow>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     match state.app_state.checkpoint_db.list_unified_workflows() {
         Ok(workflows) => Ok(Json(ApiResponse::success(workflows))),
         Err(e) => {
             error!("Failed to list unified workflows: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to list unified workflows: {}", e))),
+                Json(api_error(format!(
+                    "Failed to list unified workflows: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15918,7 +16900,10 @@ async fn list_unified_workflows(
 async fn get_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     match state.app_state.checkpoint_db.get_unified_workflow(&id) {
         Ok(Some(workflow)) => Ok(Json(ApiResponse::success(workflow))),
         Ok(None) => Err((
@@ -15939,18 +16924,31 @@ async fn get_unified_workflow(
 async fn create_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<crate::unified_workflows::CreateUnifiedWorkflowRequest>,
-) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Creating unified workflow: {}", request.name);
-    match state.app_state.checkpoint_db.create_unified_workflow(&request) {
+    match state
+        .app_state
+        .checkpoint_db
+        .create_unified_workflow(&request)
+    {
         Ok(created) => {
-            info!("Created unified workflow: {} ({})", created.name, created.id);
+            info!(
+                "Created unified workflow: {} ({})",
+                created.name, created.id
+            );
             Ok(Json(ApiResponse::success(created)))
         }
         Err(e) => {
             error!("Failed to create unified workflow: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to create unified workflow: {}", e))),
+                Json(api_error(format!(
+                    "Failed to create unified workflow: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -15961,11 +16959,21 @@ async fn update_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<crate::unified_workflows::UpdateUnifiedWorkflowRequest>,
-) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Updating unified workflow: {}", id);
-    match state.app_state.checkpoint_db.update_unified_workflow(&id, &request) {
+    match state
+        .app_state
+        .checkpoint_db
+        .update_unified_workflow(&id, &request)
+    {
         Ok(updated) => {
-            info!("Updated unified workflow: {} ({})", updated.name, updated.id);
+            info!(
+                "Updated unified workflow: {} ({})",
+                updated.name, updated.id
+            );
             Ok(Json(ApiResponse::success(updated)))
         }
         Err(e) if e.contains("not found") => Err((
@@ -15976,7 +16984,10 @@ async fn update_unified_workflow(
             error!("Failed to update unified workflow: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to update unified workflow: {}", e))),
+                Json(api_error(format!(
+                    "Failed to update unified workflow: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -16001,7 +17012,10 @@ async fn delete_unified_workflow(
             error!("Failed to delete unified workflow: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to delete unified workflow: {}", e))),
+                Json(api_error(format!(
+                    "Failed to delete unified workflow: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -16011,14 +17025,24 @@ async fn delete_unified_workflow(
 async fn search_unified_workflows(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<crate::unified_workflows::SearchUnifiedWorkflowsQuery>,
-) -> Result<Json<ApiResponse<Vec<crate::unified_workflows::UnifiedWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
-    match state.app_state.checkpoint_db.search_unified_workflows(&query) {
+) -> Result<
+    Json<ApiResponse<Vec<crate::unified_workflows::UnifiedWorkflow>>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    match state
+        .app_state
+        .checkpoint_db
+        .search_unified_workflows(&query)
+    {
         Ok(workflows) => Ok(Json(ApiResponse::success(workflows))),
         Err(e) => {
             error!("Failed to search unified workflows: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to search unified workflows: {}", e))),
+                Json(api_error(format!(
+                    "Failed to search unified workflows: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -16028,9 +17052,16 @@ async fn search_unified_workflows(
 async fn duplicate_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
-) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Duplicating unified workflow: {}", id);
-    match state.app_state.checkpoint_db.duplicate_unified_workflow(&id) {
+    match state
+        .app_state
+        .checkpoint_db
+        .duplicate_unified_workflow(&id)
+    {
         Ok(duplicated) => {
             info!("Duplicated unified workflow: {} -> {}", id, duplicated.id);
             Ok(Json(ApiResponse::success(duplicated)))
@@ -16043,7 +17074,10 @@ async fn duplicate_unified_workflow(
             error!("Failed to duplicate unified workflow: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(api_error(format!("Failed to duplicate unified workflow: {}", e))),
+                Json(api_error(format!(
+                    "Failed to duplicate unified workflow: {}",
+                    e
+                ))),
             ))
         }
     }
@@ -16070,7 +17104,10 @@ async fn run_unified_workflow(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Json(request): Json<RunUnifiedWorkflowRequest>,
-) -> Result<Json<ApiResponse<crate::step_executor::ExecutionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+) -> Result<
+    Json<ApiResponse<crate::step_executor::ExecutionResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
     info!("Running unified workflow: {}", id);
 
     // Fetch the workflow
@@ -16108,67 +17145,191 @@ async fn run_unified_workflow(
     let mut all_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
 
     // Helper to convert Value steps to ExecutionStepConfig
-    let convert_step = |step: &serde_json::Value, monitor: i32| -> Option<crate::step_executor::ExecutionStepConfig> {
+    let convert_step = |step: &serde_json::Value,
+                        monitor: i32|
+     -> Option<crate::step_executor::ExecutionStepConfig> {
         // Try to deserialize the step directly
-        if let Ok(mut config) = serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone()) {
+        if let Ok(mut config) =
+            serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone())
+        {
             // Set monitor index if not specified
             if config.monitor_index.is_none() {
                 config.monitor_index = Some(monitor);
             }
+
+            // Fix ambiguous "command" field mapping based on step_type
+            // Both shell_command and check_command have alias "command", so serde picks one arbitrarily.
+            // We need to ensure the command goes to the right field based on step_type.
+            if let Some(command) = step.get("command").and_then(|v| v.as_str()) {
+                let cmd = command.to_string();
+                match config.step_type.as_str() {
+                    "shell_command" => {
+                        if config.shell_command.is_none() {
+                            config.shell_command = Some(cmd);
+                        }
+                    }
+                    "check" => {
+                        if config.check_command.is_none() {
+                            config.check_command = Some(cmd);
+                        }
+                    }
+                    "test" => {
+                        // Test steps may also use command field
+                        if config.shell_command.is_none() {
+                            config.shell_command = Some(cmd);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             return Some(config);
         }
 
         // Fall back to extracting type and creating manually
         let step_type = step.get("type").and_then(|t| t.as_str())?;
-        let name = step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+        let name = step
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string());
 
         Some(crate::step_executor::ExecutionStepConfig {
             step_type: step_type.to_string(),
             name,
-            action_type: step.get("actionType").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            target_image_id: step.get("targetImageId").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            target_image_name: step.get("targetImageName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            action_type: step
+                .get("actionType")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            target_image_id: step
+                .get("targetImageId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            target_image_name: step
+                .get("targetImageName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             monitor_index: Some(monitor),
-            take_screenshot: step.get("takeScreenshot").and_then(|v| v.as_bool()).unwrap_or(false),
-            screenshot_delay: step.get("screenshotDelay").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(0),
+            take_screenshot: step
+                .get("takeScreenshot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            screenshot_delay: step
+                .get("screenshotDelay")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(0),
             screenshot_monitor: step.get("screenshotMonitor").cloned(),
-            playwright_script_id: step.get("playwrightScriptId").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            playwright_script_content: step.get("playwrightScript").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            playwright_script_id: step
+                .get("playwrightScriptId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            playwright_script_content: step
+                .get("playwrightScript")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             playwright_target_url: None,
-            prompt_content: step.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            prompt_content: step
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             timeout_seconds: step.get("timeoutSeconds").and_then(|v| v.as_u64()),
             initial_state_ids: None,
             is_setup: step.get("isSetup").and_then(|v| v.as_bool()),
             run_on_subsequent_iterations: None,
-            test_id: None,
-            test_type: None,
-            test_is_critical: None,
-            awas_url: step.get("awasUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            awas_action_id: step.get("awasActionName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            test_id: step
+                .get("test_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            test_type: step
+                .get("test_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            test_is_critical: step.get("is_critical").and_then(|v| v.as_bool()),
+            awas_url: step
+                .get("awasUrl")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            awas_action_id: step
+                .get("awasActionName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             awas_params: step.get("awasParameters").cloned(),
             awas_html: None,
-            awas_base_url: step.get("awasBaseUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            mcp_server_id: step.get("mcpServerId").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            mcp_server_name: step.get("mcpServerName").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            mcp_tool_name: step.get("mcpToolName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            awas_base_url: step
+                .get("awasBaseUrl")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            mcp_server_id: step
+                .get("mcpServerId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            mcp_server_name: step
+                .get("mcpServerName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            mcp_tool_name: step
+                .get("mcpToolName")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             mcp_arguments: step.get("mcpArguments").cloned(),
             mcp_fail_on_error: step.get("mcpFailOnError").and_then(|v| v.as_bool()),
             // Shell command fields
-            shell_command: step.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            shell_command_id: step.get("shell_command_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            shell_command_working_directory: step.get("working_directory").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            shell_command: step
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            shell_command_id: step
+                .get("shell_command_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            shell_command_working_directory: step
+                .get("working_directory")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             shell_command_fail_on_error: step.get("fail_on_error").and_then(|v| v.as_bool()),
             // API request fields
-            api_method: step.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            api_url: step.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            api_method: step
+                .get("method")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            api_url: step
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             api_headers: step.get("headers").cloned(),
-            api_body: step.get("body").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            api_content_type: step.get("content_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            // Check fields
-            check_type: step.get("check_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            check_command: step.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            check_working_directory: step.get("working_directory").and_then(|v| v.as_str()).map(|s| s.to_string()),
-            check_auto_fix: step.get("auto_fix").and_then(|v| v.as_bool()),
+            api_body: step
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            api_content_type: step
+                .get("content_type")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            // Check fields - support both snake_case and camelCase
+            check_type: step
+                .get("check_type")
+                .or_else(|| step.get("checkType"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            check_command: step
+                .get("command")
+                .or_else(|| step.get("check_command"))
+                .or_else(|| step.get("checkCommand"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            check_working_directory: step
+                .get("working_directory")
+                .or_else(|| step.get("workingDirectory"))
+                .or_else(|| step.get("check_working_directory"))
+                .or_else(|| step.get("checkWorkingDirectory"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            check_auto_fix: step
+                .get("auto_fix")
+                .or_else(|| step.get("autoFix"))
+                .or_else(|| step.get("check_auto_fix"))
+                .or_else(|| step.get("checkAutoFix"))
+                .and_then(|v| v.as_bool()),
         })
     };
 
@@ -16201,44 +17362,48 @@ async fn run_unified_workflow(
     }
 
     if all_steps.is_empty() {
-        return Ok(Json(ApiResponse::success(crate::step_executor::ExecutionResult {
-            success: true,
-            total_steps: 0,
-            successful_steps: 0,
-            failed_steps: 0,
-            total_duration_ms: 0,
-            steps: vec![],
-            captured_logs: None,
-            captured_runner_logs: None,
-        })));
+        return Ok(Json(ApiResponse::success(
+            crate::step_executor::ExecutionResult {
+                success: true,
+                total_steps: 0,
+                successful_steps: 0,
+                failed_steps: 0,
+                total_duration_ms: 0,
+                steps: vec![],
+                captured_logs: None,
+                captured_runner_logs: None,
+            },
+        )));
     }
 
-    let execution_id = format!("unified-workflow-{}-{}", id, chrono::Utc::now().timestamp_millis());
+    let execution_id = format!(
+        "unified-workflow-{}-{}",
+        id,
+        chrono::Utc::now().timestamp_millis()
+    );
 
     // Create a task_run record so the workflow shows in the Active page
-    // Build execution_steps_json for activity detection in the dashboard
-    let steps_for_detection: Vec<serde_json::Value> = all_steps.iter().map(|step| {
-        serde_json::json!({
-            "type": step.step_type,
-            "name": step.name,
-        })
-    }).collect();
-    let execution_steps_json = serde_json::to_string(&steps_for_detection).ok();
+    // Serialize full step configuration so re-execution on resume has all fields
+    // (previously only stored type/name which broke check_type, command, etc.)
+    let execution_steps_json = serde_json::to_string(&all_steps).ok();
 
     // Create task_run to track this execution (enables Active page monitoring)
     if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
         &execution_id,
         &workflow.name,
-        None, // no prompt
-        "automation", // task_type - identifies as automation task
-        None, // config_id
+        None,                 // no prompt
+        "automation",         // task_type - identifies as automation task
+        None,                 // config_id
         Some(&workflow.name), // workflow_name - helps identify this in the dashboard
-        None, // max_sessions
-        None, // auto_continue
+        None,                 // max_sessions
+        None,                 // auto_continue
         execution_steps_json, // execution_steps_json - for activity detection
-        None, // log_sources_json
+        None,                 // log_sources_json
     ) {
-        warn!("Failed to create task_run for unified workflow {}: {}", execution_id, e);
+        warn!(
+            "Failed to create task_run for unified workflow {}: {}",
+            execution_id, e
+        );
     }
 
     // Create step executor
@@ -16260,16 +17425,29 @@ async fn run_unified_workflow(
 
     // Update task_run status based on result
     if result.success {
-        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&execution_id) {
-            warn!("Failed to mark task_run {} as completed: {}", execution_id, e);
+        if let Err(e) = state
+            .app_state
+            .checkpoint_db
+            .complete_task_run(&execution_id)
+        {
+            warn!(
+                "Failed to mark task_run {} as completed: {}",
+                execution_id, e
+            );
         }
     } else {
-        let error_msg = result.steps.iter()
+        let error_msg = result
+            .steps
+            .iter()
             .find(|s| !s.success)
             .and_then(|s| s.error.as_ref())
             .map(|s| s.as_str())
             .unwrap_or("Unknown error");
-        if let Err(e) = state.app_state.checkpoint_db.fail_task_run(&execution_id, error_msg) {
+        if let Err(e) = state
+            .app_state
+            .checkpoint_db
+            .fail_task_run(&execution_id, error_msg)
+        {
             warn!("Failed to mark task_run {} as failed: {}", execution_id, e);
         }
     }
@@ -16373,9 +17551,11 @@ pub fn create_router(
         let global_auto_continue = settings::get_auto_continue_ai_workflow();
 
         // Log to debug file
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(
-            crate::paths::get_workflow_debug_log_path(),
-        ) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(crate::paths::get_workflow_debug_log_path())
+        {
             use std::io::Write;
             let _ = writeln!(
                 f,
@@ -16439,8 +17619,14 @@ pub fn create_router(
         // UI-TARS extraction routes
         .route("/uitars-extraction/start", post(start_uitars_extraction))
         .route("/uitars-extraction/stop", post(stop_uitars_extraction))
-        .route("/uitars-extraction/status", get(get_uitars_extraction_status))
-        .route("/uitars-extraction/results", get(get_uitars_extraction_results))
+        .route(
+            "/uitars-extraction/status",
+            get(get_uitars_extraction_status),
+        )
+        .route(
+            "/uitars-extraction/results",
+            get(get_uitars_extraction_results),
+        )
         // Vision extraction route (runs Edge Detection, SAM3, OCR on desktop)
         .route("/vision-extraction/extract", post(run_vision_extraction))
         // Pattern matching routes
@@ -16469,10 +17655,22 @@ pub fn create_router(
         .route("/testing/assertion", post(run_testing_assertion))
         .route("/testing/end/:id", post(end_integration_test))
         // Playwright State Collector routes
-        .route("/playwright-collection/start", post(start_playwright_collection))
-        .route("/playwright-collection/status", get(get_playwright_collection_status))
-        .route("/playwright-collection/results", get(get_playwright_collection_results))
-        .route("/playwright-collection/stop", post(stop_playwright_collection))
+        .route(
+            "/playwright-collection/start",
+            post(start_playwright_collection),
+        )
+        .route(
+            "/playwright-collection/status",
+            get(get_playwright_collection_status),
+        )
+        .route(
+            "/playwright-collection/results",
+            get(get_playwright_collection_results),
+        )
+        .route(
+            "/playwright-collection/stop",
+            post(stop_playwright_collection),
+        )
         // RAG routes
         .route("/rag/import", post(import_rag))
         .route("/rag/list", get(list_rag_configs))
@@ -16602,12 +17800,20 @@ pub fn create_router(
             "/task-runs/:id/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
-        .route("/task-runs/:id/generate-summary", post(generate_task_summary))
+        .route(
+            "/task-runs/:id/generate-summary",
+            post(generate_task_summary),
+        )
         // Hybrid logging routes (SQLite event storage)
         .route("/task-runs/:id/events", get(get_task_run_events))
         .route("/task-runs/:id/screenshots", get(get_task_run_screenshots))
-        .route("/task-runs/:id/playwright-results", get(get_task_run_playwright_results))
+        .route(
+            "/task-runs/:id/playwright-results",
+            get(get_task_run_playwright_results),
+        )
         .route("/task-runs/:id/migrate-logs", post(migrate_task_run_logs))
+        // Current execution steps (for dashboard widgets - no task ID needed)
+        .route("/current-execution/steps", get(get_current_execution_steps))
         // Automation Run routes (for MCP/AI access to task_run_automation)
         .route("/runs", get(list_automation_runs))
         .route("/runs/:id", get(get_automation_run))
@@ -16623,11 +17829,17 @@ pub fn create_router(
         .route("/configs/:id/export", post(export_config))
         // State Explorer routes
         .route("/state-explorer/start", post(start_exploration))
-        .route("/state-explorer/strategies", get(get_exploration_strategies))
+        .route(
+            "/state-explorer/strategies",
+            get(get_exploration_strategies),
+        )
         .route("/state-explorer/preview", post(preview_exploration))
         .route("/state-explorer/history", get(get_exploration_history))
         .route("/state-explorer/:run_id", get(get_exploration_report))
-        .route("/state-explorer/:run_id/prompt", get(get_exploration_prompt))
+        .route(
+            "/state-explorer/:run_id/prompt",
+            get(get_exploration_prompt),
+        )
         // Verification Test routes (test CRUD and execution)
         .route("/tests", get(list_tests).post(create_test))
         .route("/tests/execute-suite", post(execute_test_suite_handler))
@@ -16670,20 +17882,48 @@ pub fn create_router(
         .route("/dom/receive", post(receive_dom_from_extension))
         // API Request routes
         .route("/api-request/import-curl", post(import_curl_command))
-        .route("/api-request/import-to-library", post(import_curl_to_library))
+        .route(
+            "/api-request/import-to-library",
+            post(import_curl_to_library),
+        )
         .route("/api-request/test", post(test_api_request))
         // Saved API Requests Library routes
-        .route("/saved-api-requests", get(list_saved_api_requests).post(create_saved_api_request))
+        .route(
+            "/saved-api-requests",
+            get(list_saved_api_requests).post(create_saved_api_request),
+        )
         .route("/saved-api-requests/search", get(search_saved_api_requests))
-        .route("/saved-api-requests/categories", get(get_saved_api_request_categories))
+        .route(
+            "/saved-api-requests/categories",
+            get(get_saved_api_request_categories),
+        )
         .route("/saved-api-requests/tags", get(get_saved_api_request_tags))
-        .route("/saved-api-requests/:id", get(get_saved_api_request).put(update_saved_api_request).delete(delete_saved_api_request))
-        .route("/saved-api-requests/:id/duplicate", post(duplicate_saved_api_request))
+        .route(
+            "/saved-api-requests/:id",
+            get(get_saved_api_request)
+                .put(update_saved_api_request)
+                .delete(delete_saved_api_request),
+        )
+        .route(
+            "/saved-api-requests/:id/duplicate",
+            post(duplicate_saved_api_request),
+        )
         // Unified Workflows routes
-        .route("/unified-workflows", get(list_unified_workflows).post(create_unified_workflow))
+        .route(
+            "/unified-workflows",
+            get(list_unified_workflows).post(create_unified_workflow),
+        )
         .route("/unified-workflows/search", get(search_unified_workflows))
-        .route("/unified-workflows/:id", get(get_unified_workflow).put(update_unified_workflow).delete(delete_unified_workflow))
-        .route("/unified-workflows/:id/duplicate", post(duplicate_unified_workflow))
+        .route(
+            "/unified-workflows/:id",
+            get(get_unified_workflow)
+                .put(update_unified_workflow)
+                .delete(delete_unified_workflow),
+        )
+        .route(
+            "/unified-workflows/:id/duplicate",
+            post(duplicate_unified_workflow),
+        )
         .route("/unified-workflows/:id/run", post(run_unified_workflow))
         // AWAS (Application Web Automation Specification) routes
         .route("/awas/discover", post(awas_discover))

@@ -89,7 +89,11 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
 
         // Apply heuristics
         for issue in &mut issues {
-            if let Some(state) = ctx.shared_states.iter().find(|s| s.name == issue.state_name) {
+            if let Some(state) = ctx
+                .shared_states
+                .iter()
+                .find(|s| s.name == issue.state_name)
+            {
                 heuristics::adjust_severity(issue, state, is_test);
             }
         }

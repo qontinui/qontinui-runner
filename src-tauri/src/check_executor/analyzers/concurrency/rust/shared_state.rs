@@ -15,36 +15,34 @@ use syn::{Block, Expr, File, Item, ItemStatic, Type};
 /// Convert a syn::Type to a string representation
 pub fn type_to_string(ty: &Type) -> String {
     match ty {
-        Type::Path(type_path) => {
-            type_path
-                .path
-                .segments
-                .iter()
-                .map(|seg| {
-                    let ident = seg.ident.to_string();
-                    match &seg.arguments {
-                        syn::PathArguments::None => ident,
-                        syn::PathArguments::AngleBracketed(args) => {
-                            let args_str: Vec<String> = args
-                                .args
-                                .iter()
-                                .filter_map(|arg| match arg {
-                                    syn::GenericArgument::Type(t) => Some(type_to_string(t)),
-                                    _ => None,
-                                })
-                                .collect();
-                            if args_str.is_empty() {
-                                ident
-                            } else {
-                                format!("{}<{}>", ident, args_str.join(", "))
-                            }
+        Type::Path(type_path) => type_path
+            .path
+            .segments
+            .iter()
+            .map(|seg| {
+                let ident = seg.ident.to_string();
+                match &seg.arguments {
+                    syn::PathArguments::None => ident,
+                    syn::PathArguments::AngleBracketed(args) => {
+                        let args_str: Vec<String> = args
+                            .args
+                            .iter()
+                            .filter_map(|arg| match arg {
+                                syn::GenericArgument::Type(t) => Some(type_to_string(t)),
+                                _ => None,
+                            })
+                            .collect();
+                        if args_str.is_empty() {
+                            ident
+                        } else {
+                            format!("{}<{}>", ident, args_str.join(", "))
                         }
-                        syn::PathArguments::Parenthesized(_) => ident,
                     }
-                })
-                .collect::<Vec<_>>()
-                .join("::")
-        }
+                    syn::PathArguments::Parenthesized(_) => ident,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("::"),
         Type::Reference(type_ref) => {
             let inner = type_to_string(&type_ref.elem);
             if type_ref.mutability.is_some() {
@@ -89,17 +87,27 @@ fn detect_item_shared_state(item: &Item, file_path: &str, ctx: &mut AnalysisCont
                 ctx.shared_states.push(SharedState {
                     name,
                     state_type: SharedStateType::LazyStatic,
-                    definition_line: macro_item.mac.path.segments.first()
+                    definition_line: macro_item
+                        .mac
+                        .path
+                        .segments
+                        .first()
                         .map(|s| s.ident.span().start().line as u32)
                         .unwrap_or(1),
                     file: file_path.to_string(),
                     accesses: Vec::new(),
                     appears_thread_safe: true, // lazy_static is typically thread-safe
-                    thread_safe_reason: Some("lazy_static! provides thread-safe initialization".to_string()),
+                    thread_safe_reason: Some(
+                        "lazy_static! provides thread-safe initialization".to_string(),
+                    ),
                 });
             } else {
                 // Anonymous macro - check if it's lazy_static
-                let macro_name = macro_item.mac.path.segments.iter()
+                let macro_name = macro_item
+                    .mac
+                    .path
+                    .segments
+                    .iter()
                     .map(|s| s.ident.to_string())
                     .collect::<Vec<_>>()
                     .join("::");
@@ -108,13 +116,19 @@ fn detect_item_shared_state(item: &Item, file_path: &str, ctx: &mut AnalysisCont
                     ctx.shared_states.push(SharedState {
                         name: "lazy_static_block".to_string(),
                         state_type: SharedStateType::LazyStatic,
-                        definition_line: macro_item.mac.path.segments.first()
+                        definition_line: macro_item
+                            .mac
+                            .path
+                            .segments
+                            .first()
                             .map(|s| s.ident.span().start().line as u32)
                             .unwrap_or(1),
                         file: file_path.to_string(),
                         accesses: Vec::new(),
                         appears_thread_safe: true,
-                        thread_safe_reason: Some("lazy_static! provides thread-safe initialization".to_string()),
+                        thread_safe_reason: Some(
+                            "lazy_static! provides thread-safe initialization".to_string(),
+                        ),
                     });
                 }
             }
@@ -238,7 +252,7 @@ impl<'a> Visit<'a> for AccessVisitor<'a> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         match expr {
             // Track unsafe blocks
-            Expr::Unsafe(unsafe_expr) => {
+            Expr::Unsafe(_unsafe_expr) => {
                 let was_unsafe = self.in_unsafe;
                 self.in_unsafe = true;
                 syn::visit::visit_expr(self, expr);
@@ -269,7 +283,11 @@ impl<'a> Visit<'a> for AccessVisitor<'a> {
                 if let Expr::Path(path) = assign.left.as_ref() {
                     if let Some(ident) = path.path.get_ident() {
                         let name = ident.to_string();
-                        self.record_access(&name, ident.span().start().line as u32, AccessType::Write);
+                        self.record_access(
+                            &name,
+                            ident.span().start().line as u32,
+                            AccessType::Write,
+                        );
                     }
                 }
             }
@@ -290,7 +308,11 @@ impl<'a> Visit<'a> for AccessVisitor<'a> {
                     if let Expr::Path(path) = binary.left.as_ref() {
                         if let Some(ident) = path.path.get_ident() {
                             let name = ident.to_string();
-                            self.record_access(&name, ident.span().start().line as u32, AccessType::Compound);
+                            self.record_access(
+                                &name,
+                                ident.span().start().line as u32,
+                                AccessType::Compound,
+                            );
                         }
                     }
                 }

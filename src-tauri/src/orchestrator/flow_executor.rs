@@ -327,7 +327,10 @@ impl FlowExecutor {
         });
 
         if state.status == FlowStatus::Failed {
-            Err(state.error.clone().unwrap_or_else(|| "Flow failed".to_string()))
+            Err(state
+                .error
+                .clone()
+                .unwrap_or_else(|| "Flow failed".to_string()))
         } else {
             Ok(())
         }
@@ -365,12 +368,10 @@ impl FlowExecutor {
         // Execute based on step type
         let result = match &step.step_type {
             StepType::Agent {
-                role,
-                prompt,
-                next,
-                ..
+                role, prompt, next, ..
             } => {
-                self.execute_agent_step(&step.id, role, prompt, next, &state.context).await
+                self.execute_agent_step(&step.id, role, prompt, next, &state.context)
+                    .await
             }
 
             StepType::Tool {
@@ -383,7 +384,8 @@ impl FlowExecutor {
                 for (k, v) in resolved_inputs {
                     merged_inputs.insert(k, v);
                 }
-                self.execute_tool_step(&step.id, tool_id, &merged_inputs, next, &state.context).await
+                self.execute_tool_step(&step.id, tool_id, &merged_inputs, next, &state.context)
+                    .await
             }
 
             StepType::Conditional {
@@ -398,8 +400,10 @@ impl FlowExecutor {
                     else_step.clone()
                 };
 
-                StepResult::success(&step.id, Some(next_step))
-                    .with_output("condition_result".to_string(), serde_json::json!(condition_met))
+                StepResult::success(&step.id, Some(next_step)).with_output(
+                    "condition_result".to_string(),
+                    serde_json::json!(condition_met),
+                )
             }
 
             StepType::Parallel {
@@ -447,7 +451,8 @@ impl FlowExecutor {
                 output_key,
                 next,
             } => {
-                self.execute_transform_step(&step.id, expression, output_key, next, &state.context).await
+                self.execute_transform_step(&step.id, expression, output_key, next, &state.context)
+                    .await
             }
 
             StepType::Wait { seconds, next } => {
@@ -462,7 +467,8 @@ impl FlowExecutor {
                 body_step,
                 next,
             } => {
-                self.execute_loop_step(&step.id, over, body_step, next, state).await
+                self.execute_loop_step(&step.id, over, body_step, next, state)
+                    .await
             }
 
             StepType::End => StepResult::success(&step.id, None),
@@ -539,10 +545,8 @@ impl FlowExecutor {
                         result = result.with_output(key, value);
                     }
                     // Always include the raw response
-                    result = result.with_output(
-                        "response".to_string(),
-                        serde_json::json!(response.output),
-                    );
+                    result = result
+                        .with_output("response".to_string(), serde_json::json!(response.output));
                     result = result.with_output("role".to_string(), serde_json::json!(role));
                     result
                 } else {
@@ -587,7 +591,9 @@ impl FlowExecutor {
                 // Format context values nicely
                 let value_str = match value {
                     serde_json::Value::String(s) => s.clone(),
-                    other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+                    other => {
+                        serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())
+                    }
                 };
                 full_prompt.push_str(&format!("- **{}**: {}\n", key, value_str));
             }
@@ -676,7 +682,10 @@ impl FlowExecutor {
         let args = serde_json::json!(inputs);
 
         // Check if this is a built-in tool first
-        if let Some(result) = self.try_execute_builtin_tool(step_id, tool_id, inputs, context).await {
+        if let Some(result) = self
+            .try_execute_builtin_tool(step_id, tool_id, inputs, context)
+            .await
+        {
             return result.with_next(next);
         }
 
@@ -747,7 +756,10 @@ impl FlowExecutor {
                         StepResult::success(step_id, None)
                             .with_output("parsed".to_string(), parsed),
                     ),
-                    Err(e) => Some(StepResult::failure(step_id, format!("JSON parse error: {}", e))),
+                    Err(e) => Some(StepResult::failure(
+                        step_id,
+                        format!("JSON parse error: {}", e),
+                    )),
                 }
             }
             "json_stringify" => {
@@ -777,10 +789,7 @@ impl FlowExecutor {
             "get_context" => {
                 let key = inputs.get("key")?.as_str()?;
                 let value = context.get(key).cloned().unwrap_or(serde_json::Value::Null);
-                Some(
-                    StepResult::success(step_id, None)
-                        .with_output("value".to_string(), value),
-                )
+                Some(StepResult::success(step_id, None).with_output("value".to_string(), value))
             }
             "merge_context" => {
                 let mut merged = serde_json::Map::new();
@@ -804,10 +813,10 @@ impl FlowExecutor {
                     .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
-                Some(
-                    StepResult::success(step_id, None)
-                        .with_output("output".to_string(), serde_json::json!(result.join(separator))),
-                )
+                Some(StepResult::success(step_id, None).with_output(
+                    "output".to_string(),
+                    serde_json::json!(result.join(separator)),
+                ))
             }
             "string_split" => {
                 let input = inputs.get("input")?.as_str()?;
@@ -863,7 +872,10 @@ impl FlowExecutor {
                     StepResult::success(step_id, None)
                         .with_output("iso".to_string(), serde_json::json!(now.to_rfc3339()))
                         .with_output("unix".to_string(), serde_json::json!(now.timestamp()))
-                        .with_output("unix_millis".to_string(), serde_json::json!(now.timestamp_millis())),
+                        .with_output(
+                            "unix_millis".to_string(),
+                            serde_json::json!(now.timestamp_millis()),
+                        ),
                 )
             }
 
@@ -894,10 +906,7 @@ impl FlowExecutor {
 
             // Sleep/delay tool
             "sleep" => {
-                let ms = inputs
-                    .get("ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1000);
+                let ms = inputs.get("ms").and_then(|v| v.as_u64()).unwrap_or(1000);
                 tokio::time::sleep(tokio::time::Duration::from_millis(ms)).await;
                 Some(
                     StepResult::success(step_id, None)
@@ -928,24 +937,24 @@ impl FlowExecutor {
 
         // Build the HTTP request
         let client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(self.config.default_step_timeout_secs))
+            .timeout(std::time::Duration::from_secs(
+                self.config.default_step_timeout_secs,
+            ))
             .build()
         {
             Ok(c) => c,
             Err(e) => {
-                return StepResult::failure(step_id, format!("Failed to create HTTP client: {}", e));
+                return StepResult::failure(
+                    step_id,
+                    format!("Failed to create HTTP client: {}", e),
+                );
             }
         };
 
         // The runner's MCP API endpoint for tool execution
         let url = format!("http://localhost:9876/api/mcp/tools/{}/execute", tool_id);
 
-        match client
-            .post(&url)
-            .json(inputs)
-            .send()
-            .await
-        {
+        match client.post(&url).json(inputs).send().await {
             Ok(response) => {
                 if response.status().is_success() {
                     match response.json::<serde_json::Value>().await {
@@ -966,15 +975,14 @@ impl FlowExecutor {
                             } else {
                                 result = result.with_output("result".to_string(), output);
                             }
-                            result = result.with_output("tool_id".to_string(), serde_json::json!(tool_id));
+                            result = result
+                                .with_output("tool_id".to_string(), serde_json::json!(tool_id));
                             result
                         }
-                        Err(e) => {
-                            StepResult::failure(
-                                step_id,
-                                format!("Failed to parse tool response: {}", e),
-                            )
-                        }
+                        Err(e) => StepResult::failure(
+                            step_id,
+                            format!("Failed to parse tool response: {}", e),
+                        ),
                     }
                 } else {
                     let status = response.status();
@@ -996,7 +1004,10 @@ impl FlowExecutor {
                 );
                 StepResult::failure(
                     step_id,
-                    format!("Tool '{}' execution failed: {}. Is the runner API available?", tool_id, e),
+                    format!(
+                        "Tool '{}' execution failed: {}. Is the runner API available?",
+                        tool_id, e
+                    ),
                 )
             }
         }
@@ -1092,7 +1103,10 @@ impl FlowExecutor {
         let items = match state.context.get(over) {
             Some(serde_json::Value::Array(arr)) => arr.clone(),
             _ => {
-                return StepResult::failure(step_id, format!("Loop variable '{}' is not an array", over));
+                return StepResult::failure(
+                    step_id,
+                    format!("Loop variable '{}' is not an array", over),
+                );
             }
         };
 
@@ -1100,9 +1114,13 @@ impl FlowExecutor {
 
         for (index, item) in items.iter().enumerate() {
             // Set loop context
-            state.context.insert("loop.index".to_string(), serde_json::json!(index));
+            state
+                .context
+                .insert("loop.index".to_string(), serde_json::json!(index));
             state.context.insert("loop.item".to_string(), item.clone());
-            state.context.insert("loop.length".to_string(), serde_json::json!(items.len()));
+            state
+                .context
+                .insert("loop.length".to_string(), serde_json::json!(items.len()));
 
             // Execute body step (this is simplified - in reality we'd need to
             // look up the step and execute it)
@@ -1124,7 +1142,11 @@ impl FlowExecutor {
     }
 
     /// Advance execution by one step (for step-by-step UI updates).
-    pub async fn step_once(&self, flow: &Flow, state: &mut FlowState) -> Result<StepResult, String> {
+    pub async fn step_once(
+        &self,
+        flow: &Flow,
+        state: &mut FlowState,
+    ) -> Result<StepResult, String> {
         if state.is_finished() {
             return Err("Flow is already finished".to_string());
         }
@@ -1183,7 +1205,10 @@ impl FlowExecutor {
                 state.complete();
             }
         } else {
-            let error = result.error.clone().unwrap_or_else(|| "Unknown error".to_string());
+            let error = result
+                .error
+                .clone()
+                .unwrap_or_else(|| "Unknown error".to_string());
             state.step_failed(&error);
             if !step.continue_on_error {
                 state.fail(&error);
@@ -1354,14 +1379,12 @@ mod tests {
     #[tokio::test]
     async fn test_conditional_flow() {
         let flow = Flow::new("conditional_test")
-            .add_step(
-                FlowStep::conditional(
-                    "check",
-                    Condition::is_true("flag"),
-                    "success",
-                    "failure",
-                ),
-            )
+            .add_step(FlowStep::conditional(
+                "check",
+                Condition::is_true("flag"),
+                "success",
+                "failure",
+            ))
             .add_step(FlowStep::end("success"))
             .add_step(FlowStep::fail("failure", "Condition not met"));
 
@@ -1378,14 +1401,12 @@ mod tests {
     #[tokio::test]
     async fn test_conditional_flow_else_branch() {
         let flow = Flow::new("conditional_test")
-            .add_step(
-                FlowStep::conditional(
-                    "check",
-                    Condition::is_true("flag"),
-                    "success",
-                    "failure",
-                ),
-            )
+            .add_step(FlowStep::conditional(
+                "check",
+                Condition::is_true("flag"),
+                "success",
+                "failure",
+            ))
             .add_step(FlowStep::end("success"))
             .add_step(FlowStep::fail("failure", "Condition not met"));
 
@@ -1443,10 +1464,7 @@ mod tests {
 
         let mut context = HashMap::new();
         context.insert("source1".to_string(), serde_json::json!("value1"));
-        context.insert(
-            "nested".to_string(),
-            serde_json::json!({"value": "value2"}),
-        );
+        context.insert("nested".to_string(), serde_json::json!({"value": "value2"}));
 
         let resolved = resolve_input_mappings(&mappings, &context);
 
@@ -1458,10 +1476,7 @@ mod tests {
     fn test_evaluate_simple_expression() {
         let mut context = HashMap::new();
         context.insert("foo".to_string(), serde_json::json!("bar"));
-        context.insert(
-            "nested".to_string(),
-            serde_json::json!({"key": "value"}),
-        );
+        context.insert("nested".to_string(), serde_json::json!({"key": "value"}));
 
         assert_eq!(
             evaluate_simple_expression("foo", &context),

@@ -48,7 +48,11 @@ impl VariableResolver {
 
     /// Get all variables
     pub fn get_all(&self) -> HashMap<String, String> {
-        self.variables.read().ok().map(|v| v.clone()).unwrap_or_default()
+        self.variables
+            .read()
+            .ok()
+            .map(|v| v.clone())
+            .unwrap_or_default()
     }
 
     /// Clear all variables
@@ -191,7 +195,7 @@ mod tests {
     #[test]
     fn test_extract_variable_names() {
         let names = VariableResolver::extract_variable_names(
-            "URL: {{base_url}}/{{resource}}/{{id}}?token={{token}}"
+            "URL: {{base_url}}/{{resource}}/{{id}}?token={{token}}",
         );
         assert_eq!(names.len(), 4);
         assert!(names.contains(&"base_url".to_string()));

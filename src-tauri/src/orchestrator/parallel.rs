@@ -301,11 +301,9 @@ impl MergeStrategy {
                 let ratio = successful as f32 / total_branches as f32;
                 ratio >= *threshold
             }
-            Self::WaitFor { branch_ids } => {
-                branch_ids
-                    .iter()
-                    .all(|id| results.iter().any(|r| r.branch_id == *id))
-            }
+            Self::WaitFor { branch_ids } => branch_ids
+                .iter()
+                .all(|id| results.iter().any(|r| r.branch_id == *id)),
             Self::Race => successful >= 1,
             Self::Custom { .. } => false, // Custom handlers not evaluated here
         }
@@ -469,9 +467,10 @@ impl ParallelExecution {
 
         // Check fail-fast condition
         if self.fail_fast {
-            let has_critical_failure = self.branches.iter().any(|b| {
-                b.critical && b.status == BranchStatus::Failed
-            });
+            let has_critical_failure = self
+                .branches
+                .iter()
+                .any(|b| b.critical && b.status == BranchStatus::Failed);
             if has_critical_failure {
                 return false;
             }
@@ -479,7 +478,10 @@ impl ParallelExecution {
 
         // Check if merge condition is satisfied
         let results: Vec<_> = self.results.values().collect();
-        if self.merge_strategy.is_satisfied(&results, self.branches.len()) {
+        if self
+            .merge_strategy
+            .is_satisfied(&results, self.branches.len())
+        {
             return false;
         }
 
@@ -531,8 +533,16 @@ impl ParallelExecution {
             completed: self.results.len(),
             successful,
             failed,
-            pending: self.branches.iter().filter(|b| b.status == BranchStatus::Pending).count(),
-            running: self.branches.iter().filter(|b| b.status == BranchStatus::Running).count(),
+            pending: self
+                .branches
+                .iter()
+                .filter(|b| b.status == BranchStatus::Pending)
+                .count(),
+            running: self
+                .branches
+                .iter()
+                .filter(|b| b.status == BranchStatus::Running)
+                .count(),
             total_duration_ms: total_duration,
             total_findings,
         }

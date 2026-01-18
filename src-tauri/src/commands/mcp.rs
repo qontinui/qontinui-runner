@@ -12,8 +12,8 @@
 
 use crate::commands::AppState;
 use crate::mcp_client::{
-    CreateMcpServerInput, McpCallsResult, McpServerConfig, McpServerStatus,
-    McpToolCallResult, McpToolInfo, UpdateMcpServerInput,
+    CreateMcpServerInput, McpCallsResult, McpServerConfig, McpServerStatus, McpToolCallResult,
+    McpToolInfo, UpdateMcpServerInput,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -76,7 +76,10 @@ pub async fn get_mcp_server(
 ) -> Result<McpResponse<McpServerConfig>, String> {
     match state.checkpoint_db.get_mcp_server(&server_id) {
         Ok(Some(server)) => Ok(McpResponse::ok(server)),
-        Ok(None) => Ok(McpResponse::err(format!("MCP server not found: {}", server_id))),
+        Ok(None) => Ok(McpResponse::err(format!(
+            "MCP server not found: {}",
+            server_id
+        ))),
         Err(e) => {
             error!("Failed to get MCP server: {}", e);
             Ok(McpResponse::err(e))
@@ -162,7 +165,11 @@ pub async fn connect_mcp_server(
 
     match mcp_manager.connect(&server_id).await {
         Ok(tools) => {
-            info!("Connected to MCP server {} with {} tools", server_id, tools.len());
+            info!(
+                "Connected to MCP server {} with {} tools",
+                server_id,
+                tools.len()
+            );
             Ok(McpResponse::ok(tools))
         }
         Err(e) => {
@@ -254,12 +261,21 @@ pub async fn call_mcp_tool(
 
     let mcp_manager = state.mcp_client_manager.lock().await;
 
-    match mcp_manager.call_tool(&server_id, &tool_name, arguments).await {
+    match mcp_manager
+        .call_tool(&server_id, &tool_name, arguments)
+        .await
+    {
         Ok(result) => {
             if result.success {
-                info!("MCP tool call succeeded: {}.{} ({}ms)", server_id, tool_name, result.duration_ms);
+                info!(
+                    "MCP tool call succeeded: {}.{} ({}ms)",
+                    server_id, tool_name, result.duration_ms
+                );
             } else {
-                error!("MCP tool call failed: {}.{}: {:?}", server_id, tool_name, result.error);
+                error!(
+                    "MCP tool call failed: {}.{}: {:?}",
+                    server_id, tool_name, result.error
+                );
             }
             Ok(McpResponse::ok(result))
         }
@@ -281,7 +297,10 @@ pub async fn get_task_run_mcp_calls(
     task_run_id: String,
     success_filter: Option<bool>,
 ) -> Result<McpResponse<McpCallsResult>, String> {
-    match state.checkpoint_db.get_task_run_mcp_calls(&task_run_id, success_filter) {
+    match state
+        .checkpoint_db
+        .get_task_run_mcp_calls(&task_run_id, success_filter)
+    {
         Ok(result) => Ok(McpResponse::ok(result)),
         Err(e) => {
             error!("Failed to get task run MCP calls: {}", e);

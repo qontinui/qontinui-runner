@@ -253,11 +253,7 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    pub fn new(
-        id: impl Into<String>,
-        name: impl Into<String>,
-        pattern_type: PatternType,
-    ) -> Self {
+    pub fn new(id: impl Into<String>, name: impl Into<String>, pattern_type: PatternType) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
             id: id.into(),
@@ -581,9 +577,7 @@ impl LearningSystem {
     pub fn record_outcome(&mut self, outcome: TaskOutcome) {
         // Update strategy stats
         if let Some(strategy) = &outcome.strategy {
-            let stats = self.strategy_stats
-                .entry(strategy.clone())
-                .or_default();
+            let stats = self.strategy_stats.entry(strategy.clone()).or_default();
             stats.total_uses += 1;
             if outcome.status == OutcomeStatus::Success {
                 stats.successes += 1;
@@ -619,7 +613,9 @@ impl LearningSystem {
 
         // Calculate basic metrics
         let total = self.outcomes.len();
-        let successes = self.outcomes.iter()
+        let successes = self
+            .outcomes
+            .iter()
             .filter(|o| o.status == OutcomeStatus::Success)
             .count();
         let success_rate = if total > 0 {
@@ -629,7 +625,9 @@ impl LearningSystem {
         };
 
         // Calculate averages
-        let durations: Vec<u64> = self.outcomes.iter()
+        let durations: Vec<u64> = self
+            .outcomes
+            .iter()
             .filter_map(|o| o.duration_secs)
             .collect();
         let avg_duration = if !durations.is_empty() {
@@ -638,9 +636,7 @@ impl LearningSystem {
             None
         };
 
-        let iterations: Vec<u32> = self.outcomes.iter()
-            .filter_map(|o| o.iterations)
-            .collect();
+        let iterations: Vec<u32> = self.outcomes.iter().filter_map(|o| o.iterations).collect();
         let avg_iterations = if !iterations.is_empty() {
             Some(iterations.iter().sum::<u32>() as f64 / iterations.len() as f64)
         } else {
@@ -648,14 +644,18 @@ impl LearningSystem {
         };
 
         // Find top tools
-        let mut top_tools: Vec<(String, u32)> = self.tool_stats.iter()
+        let mut top_tools: Vec<(String, u32)> = self
+            .tool_stats
+            .iter()
             .map(|(k, v)| (k.clone(), v.total_uses))
             .collect();
         top_tools.sort_by(|a, b| b.1.cmp(&a.1));
         top_tools.truncate(5);
 
         // Find top strategies
-        let mut top_strategies: Vec<(String, f64)> = self.strategy_stats.iter()
+        let mut top_strategies: Vec<(String, f64)> = self
+            .strategy_stats
+            .iter()
             .filter(|(_, v)| v.total_uses >= self.config.min_pattern_occurrences)
             .map(|(k, v)| {
                 let success_rate = v.successes as f64 / v.total_uses as f64;
@@ -698,40 +698,36 @@ impl LearningSystem {
 
                 if success_rate >= 0.7 {
                     let pattern_id = format!("strategy_success_{}", strategy);
-                    let pattern = self.patterns
-                        .entry(pattern_id.clone())
-                        .or_insert_with(|| {
-                            Pattern::new(
-                                &pattern_id,
-                                format!("Successful strategy: {}", strategy),
-                                PatternType::SuccessStrategy,
-                            )
-                            .with_description(format!(
-                                "Strategy '{}' has a {}% success rate",
-                                strategy,
-                                (success_rate * 100.0) as u32
-                            ))
-                        });
+                    let pattern = self.patterns.entry(pattern_id.clone()).or_insert_with(|| {
+                        Pattern::new(
+                            &pattern_id,
+                            format!("Successful strategy: {}", strategy),
+                            PatternType::SuccessStrategy,
+                        )
+                        .with_description(format!(
+                            "Strategy '{}' has a {}% success rate",
+                            strategy,
+                            (success_rate * 100.0) as u32
+                        ))
+                    });
                     pattern.success_rate = success_rate;
                     pattern.occurrences = stats.total_uses;
                     pattern.confidence = (stats.total_uses as f64 / 10.0).min(1.0);
                 } else if success_rate <= 0.3 {
                     let pattern_id = format!("strategy_failure_{}", strategy);
-                    let pattern = self.patterns
-                        .entry(pattern_id.clone())
-                        .or_insert_with(|| {
-                            Pattern::new(
-                                &pattern_id,
-                                format!("Problematic strategy: {}", strategy),
-                                PatternType::FailureMode,
-                            )
-                            .with_description(format!(
-                                "Strategy '{}' has only {}% success rate",
-                                strategy,
-                                (success_rate * 100.0) as u32
-                            ))
-                            .with_recommendation(format!("Consider avoiding '{}'", strategy))
-                        });
+                    let pattern = self.patterns.entry(pattern_id.clone()).or_insert_with(|| {
+                        Pattern::new(
+                            &pattern_id,
+                            format!("Problematic strategy: {}", strategy),
+                            PatternType::FailureMode,
+                        )
+                        .with_description(format!(
+                            "Strategy '{}' has only {}% success rate",
+                            strategy,
+                            (success_rate * 100.0) as u32
+                        ))
+                        .with_recommendation(format!("Consider avoiding '{}'", strategy))
+                    });
                     pattern.success_rate = success_rate;
                     pattern.occurrences = stats.total_uses;
                 }
@@ -745,15 +741,13 @@ impl LearningSystem {
                     let success_rate = stats.in_successful_tasks as f64 / stats.total_uses as f64;
 
                     let pattern_id = format!("tool_usage_{}", tool);
-                    let pattern = self.patterns
-                        .entry(pattern_id.clone())
-                        .or_insert_with(|| {
-                            Pattern::new(
-                                &pattern_id,
-                                format!("Tool usage: {}", tool),
-                                PatternType::ToolUsage,
-                            )
-                        });
+                    let pattern = self.patterns.entry(pattern_id.clone()).or_insert_with(|| {
+                        Pattern::new(
+                            &pattern_id,
+                            format!("Tool usage: {}", tool),
+                            PatternType::ToolUsage,
+                        )
+                    });
                     pattern.success_rate = success_rate;
                     pattern.occurrences = stats.total_uses;
                 }
@@ -761,52 +755,75 @@ impl LearningSystem {
         }
 
         // Identify iteration behavior patterns
-        let high_iteration_outcomes: Vec<&TaskOutcome> = self.outcomes.iter()
+        let high_iteration_outcomes: Vec<&TaskOutcome> = self
+            .outcomes
+            .iter()
             .filter(|o| o.iterations.map(|i| i > 10).unwrap_or(false))
             .collect();
 
         if high_iteration_outcomes.len() >= self.config.min_pattern_occurrences as usize {
-            let success_count = high_iteration_outcomes.iter()
+            let success_count = high_iteration_outcomes
+                .iter()
                 .filter(|o| o.status == OutcomeStatus::Success)
                 .count();
             let success_rate = success_count as f64 / high_iteration_outcomes.len() as f64;
 
             let pattern_id = "high_iteration_tasks".to_string();
-            let pattern = self.patterns
-                .entry(pattern_id.clone())
-                .or_insert_with(|| {
-                    Pattern::new(
-                        &pattern_id,
-                        "High iteration tasks",
-                        PatternType::IterationBehavior,
-                    )
-                    .with_description("Tasks requiring more than 10 iterations")
-                });
+            let pattern = self.patterns.entry(pattern_id.clone()).or_insert_with(|| {
+                Pattern::new(
+                    &pattern_id,
+                    "High iteration tasks",
+                    PatternType::IterationBehavior,
+                )
+                .with_description("Tasks requiring more than 10 iterations")
+            });
             pattern.success_rate = success_rate;
             pattern.occurrences = high_iteration_outcomes.len() as u32;
         }
     }
 
-    fn generate_insights(&mut self, success_rate: f64, avg_duration: Option<f64>, avg_iterations: Option<f64>) {
+    fn generate_insights(
+        &mut self,
+        success_rate: f64,
+        avg_duration: Option<f64>,
+        avg_iterations: Option<f64>,
+    ) {
         // Clear old insights
         self.insights.clear();
 
         // Success rate insight
         if self.outcomes.len() >= 5 {
             let insight = if success_rate >= 0.8 {
-                Insight::new(InsightCategory::Quality, "High success rate indicates effective task execution")
-                    .with_confidence(0.8)
-                    .with_evidence(format!("{}% success rate across {} tasks", (success_rate * 100.0) as u32, self.outcomes.len()))
+                Insight::new(
+                    InsightCategory::Quality,
+                    "High success rate indicates effective task execution",
+                )
+                .with_confidence(0.8)
+                .with_evidence(format!(
+                    "{}% success rate across {} tasks",
+                    (success_rate * 100.0) as u32,
+                    self.outcomes.len()
+                ))
             } else if success_rate <= 0.4 {
-                Insight::new(InsightCategory::Quality, "Low success rate suggests need for strategy improvements")
-                    .with_confidence(0.8)
-                    .with_evidence(format!("Only {}% success rate across {} tasks", (success_rate * 100.0) as u32, self.outcomes.len()))
-                    .with_recommendation("Review failed tasks for common patterns")
-                    .with_recommendation("Consider adjusting verification criteria")
+                Insight::new(
+                    InsightCategory::Quality,
+                    "Low success rate suggests need for strategy improvements",
+                )
+                .with_confidence(0.8)
+                .with_evidence(format!(
+                    "Only {}% success rate across {} tasks",
+                    (success_rate * 100.0) as u32,
+                    self.outcomes.len()
+                ))
+                .with_recommendation("Review failed tasks for common patterns")
+                .with_recommendation("Consider adjusting verification criteria")
             } else {
-                Insight::new(InsightCategory::Quality, "Moderate success rate - room for improvement")
-                    .with_confidence(0.6)
-                    .with_evidence(format!("{}% success rate", (success_rate * 100.0) as u32))
+                Insight::new(
+                    InsightCategory::Quality,
+                    "Moderate success rate - room for improvement",
+                )
+                .with_confidence(0.6)
+                .with_evidence(format!("{}% success rate", (success_rate * 100.0) as u32))
             };
             self.insights.push(insight);
         }
@@ -814,11 +831,14 @@ impl LearningSystem {
         // Duration insight
         if let Some(avg_dur) = avg_duration {
             if avg_dur > 300.0 {
-                let insight = Insight::new(InsightCategory::Performance, "Tasks are taking longer than expected")
-                    .with_confidence(0.7)
-                    .with_evidence(format!("Average duration: {:.1} seconds", avg_dur))
-                    .with_recommendation("Consider parallel execution for independent subtasks")
-                    .with_recommendation("Review context strategies for efficiency");
+                let insight = Insight::new(
+                    InsightCategory::Performance,
+                    "Tasks are taking longer than expected",
+                )
+                .with_confidence(0.7)
+                .with_evidence(format!("Average duration: {:.1} seconds", avg_dur))
+                .with_recommendation("Consider parallel execution for independent subtasks")
+                .with_recommendation("Review context strategies for efficiency");
                 self.insights.push(insight);
             }
         }
@@ -826,11 +846,14 @@ impl LearningSystem {
         // Iteration insight
         if let Some(avg_iter) = avg_iterations {
             if avg_iter > 8.0 {
-                let insight = Insight::new(InsightCategory::Efficiency, "High average iterations may indicate unclear goals")
-                    .with_confidence(0.6)
-                    .with_evidence(format!("Average iterations: {:.1}", avg_iter))
-                    .with_recommendation("Ensure verification criteria are well-defined")
-                    .with_recommendation("Consider breaking complex tasks into subtasks");
+                let insight = Insight::new(
+                    InsightCategory::Efficiency,
+                    "High average iterations may indicate unclear goals",
+                )
+                .with_confidence(0.6)
+                .with_evidence(format!("Average iterations: {:.1}", avg_iter))
+                .with_recommendation("Ensure verification criteria are well-defined")
+                .with_recommendation("Consider breaking complex tasks into subtasks");
                 self.insights.push(insight);
             }
         }
@@ -845,7 +868,8 @@ impl LearningSystem {
                             format!("Strategy '{}' is highly effective", pattern.name),
                         )
                         .with_confidence(pattern.confidence)
-                        .with_evidence(format!("{}% success rate over {} uses",
+                        .with_evidence(format!(
+                            "{}% success rate over {} uses",
                             (pattern.success_rate * 100.0) as u32,
                             pattern.occurrences
                         ))
@@ -874,12 +898,11 @@ impl LearningSystem {
             return Trend::Insufficient;
         }
 
-        let recent: Vec<&TaskOutcome> = self.outcomes.iter()
-            .rev()
-            .take(window_size)
-            .collect();
+        let recent: Vec<&TaskOutcome> = self.outcomes.iter().rev().take(window_size).collect();
 
-        let older: Vec<&TaskOutcome> = self.outcomes.iter()
+        let older: Vec<&TaskOutcome> = self
+            .outcomes
+            .iter()
             .rev()
             .skip(window_size)
             .take(window_size)
@@ -889,13 +912,17 @@ impl LearningSystem {
             return Trend::Insufficient;
         }
 
-        let recent_success_rate = recent.iter()
+        let recent_success_rate = recent
+            .iter()
             .filter(|o| o.status == OutcomeStatus::Success)
-            .count() as f64 / recent.len() as f64;
+            .count() as f64
+            / recent.len() as f64;
 
-        let older_success_rate = older.iter()
+        let older_success_rate = older
+            .iter()
             .filter(|o| o.status == OutcomeStatus::Success)
-            .count() as f64 / older.len() as f64;
+            .count() as f64
+            / older.len() as f64;
 
         let diff = recent_success_rate - older_success_rate;
 
@@ -920,7 +947,11 @@ impl LearningSystem {
                     self.feedback.push(Feedback {
                         feedback_type: FeedbackType::RecommendStrategy,
                         priority: ((success_rate * 100.0) as u32).min(100),
-                        content: format!("Strategy '{}' has {}% success rate", strategy, (success_rate * 100.0) as u32),
+                        content: format!(
+                            "Strategy '{}' has {}% success rate",
+                            strategy,
+                            (success_rate * 100.0) as u32
+                        ),
                         apply_when: vec!["task_start".to_string()],
                         source: format!("pattern:strategy_success_{}", strategy),
                         confidence: (stats.total_uses as f64 / 10.0).min(1.0),
@@ -929,7 +960,11 @@ impl LearningSystem {
                     self.feedback.push(Feedback {
                         feedback_type: FeedbackType::AvoidStrategy,
                         priority: ((1.0 - success_rate) * 100.0) as u32,
-                        content: format!("Strategy '{}' has only {}% success rate - consider alternatives", strategy, (success_rate * 100.0) as u32),
+                        content: format!(
+                            "Strategy '{}' has only {}% success rate - consider alternatives",
+                            strategy,
+                            (success_rate * 100.0) as u32
+                        ),
                         apply_when: vec!["task_start".to_string()],
                         source: format!("pattern:strategy_failure_{}", strategy),
                         confidence: (stats.total_uses as f64 / 10.0).min(1.0),
@@ -959,14 +994,16 @@ impl LearningSystem {
 
     /// Get feedback applicable to a given context
     pub fn get_applicable_feedback(&self, context: &str) -> Vec<&Feedback> {
-        self.feedback.iter()
+        self.feedback
+            .iter()
             .filter(|f| f.apply_when.iter().any(|c| c == context))
             .collect()
     }
 
     /// Get the most effective strategy
     pub fn get_best_strategy(&self) -> Option<(String, f64)> {
-        self.strategy_stats.iter()
+        self.strategy_stats
+            .iter()
             .filter(|(_, stats)| stats.total_uses >= self.config.min_pattern_occurrences)
             .map(|(name, stats)| {
                 let success_rate = stats.successes as f64 / stats.total_uses as f64;
@@ -988,7 +1025,9 @@ impl LearningSystem {
     /// Get summary statistics
     pub fn get_summary(&self) -> LearningSummary {
         let total_tasks = self.outcomes.len();
-        let successful_tasks = self.outcomes.iter()
+        let successful_tasks = self
+            .outcomes
+            .iter()
             .filter(|o| o.status == OutcomeStatus::Success)
             .count();
 
@@ -1072,14 +1111,14 @@ mod tests {
             learning.record_outcome(
                 TaskOutcome::success(format!("task-{}", i))
                     .with_strategy("effective")
-                    .with_tool("tool_a")
+                    .with_tool("tool_a"),
             );
         }
         for i in 5..8 {
             learning.record_outcome(
                 TaskOutcome::failure(format!("task-{}", i))
                     .with_strategy("ineffective")
-                    .with_tool("tool_b")
+                    .with_tool("tool_b"),
             );
         }
 
@@ -1092,7 +1131,8 @@ mod tests {
 
     #[test]
     fn test_pattern_observation() {
-        let mut pattern = Pattern::new("test-pattern", "Test Pattern", PatternType::SuccessStrategy);
+        let mut pattern =
+            Pattern::new("test-pattern", "Test Pattern", PatternType::SuccessStrategy);
 
         pattern.record_observation("task-1", true);
         assert_eq!(pattern.occurrences, 1);
@@ -1179,8 +1219,7 @@ mod tests {
         // Create outcomes with good strategy
         for i in 0..5 {
             learning.record_outcome(
-                TaskOutcome::success(format!("task-{}", i))
-                    .with_strategy("good_strategy")
+                TaskOutcome::success(format!("task-{}", i)).with_strategy("good_strategy"),
             );
         }
 
@@ -1188,7 +1227,9 @@ mod tests {
 
         let feedback = learning.get_applicable_feedback("task_start");
         assert!(!feedback.is_empty());
-        assert!(feedback.iter().any(|f| f.feedback_type == FeedbackType::RecommendStrategy));
+        assert!(feedback
+            .iter()
+            .any(|f| f.feedback_type == FeedbackType::RecommendStrategy));
     }
 
     #[test]

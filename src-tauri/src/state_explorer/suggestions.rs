@@ -363,9 +363,7 @@ impl AssertionSuggester {
 
         for state_result in &result.state_explorations {
             // Skip failed states if configured
-            if self.config.only_passed_states
-                && state_result.status != ExplorationStatus::Passed
-            {
+            if self.config.only_passed_states && state_result.status != ExplorationStatus::Passed {
                 continue;
             }
 
@@ -425,10 +423,8 @@ impl AssertionSuggester {
                 ));
 
                 if let Some((x, y, w, h)) = element_check.location {
-                    suggestion.add_evidence(format!(
-                        "Located at ({}, {}) with size {}x{}",
-                        x, y, w, h
-                    ));
+                    suggestion
+                        .add_evidence(format!("Located at ({}, {}) with size {}x{}", x, y, w, h));
                 }
 
                 suggestions.push(suggestion);
@@ -692,7 +688,9 @@ pub fn suggestions_to_markdown(suggestions: &SuggestionSet) -> String {
     let high_conf = suggestions.high_confidence(0.9);
     if !high_conf.is_empty() {
         md.push_str("## High Confidence Suggestions (≥90%)\n\n");
-        md.push_str("These suggestions have very high confidence and are recommended for adoption:\n\n");
+        md.push_str(
+            "These suggestions have very high confidence and are recommended for adoption:\n\n",
+        );
         for suggestion in high_conf {
             md.push_str(&format!(
                 "- **{}**: {} ({:.0}%)\n",

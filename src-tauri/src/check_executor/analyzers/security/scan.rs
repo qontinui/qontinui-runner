@@ -6,7 +6,9 @@ use super::patterns::{SecurityPattern, ALL_PATTERNS};
 use crate::check_executor::analyzers::common::file_walker::{walk_files, WalkConfig};
 use crate::check_executor::analyzers::common::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;
-use crate::check_executor::types::{CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity};
+use crate::check_executor::types::{
+    CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity,
+};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -150,10 +152,7 @@ pub fn analyze(working_dir: &str, patterns: &[SecurityPattern]) -> Result<Parsed
 
     for file_path in &files {
         // Determine language from extension
-        let ext = file_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let language = extension_to_language(ext);
 
         // Get applicable patterns for this file
@@ -182,7 +181,12 @@ pub fn analyze(working_dir: &str, patterns: &[SecurityPattern]) -> Result<Parsed
         };
 
         // Scan the file
-        let result = scan_file(file_path, &content, &applicable_patterns, &compiled_patterns);
+        let result = scan_file(
+            file_path,
+            &content,
+            &applicable_patterns,
+            &compiled_patterns,
+        );
 
         if !result.issues.is_empty() {
             files_with_issues += 1;
@@ -226,7 +230,10 @@ pub fn analyze(working_dir: &str, patterns: &[SecurityPattern]) -> Result<Parsed
     let medium_count = severity_counts.get("medium").copied().unwrap_or(0);
     let low_count = severity_counts.get("low").copied().unwrap_or(0);
 
-    tool_data.insert("critical_issues".to_string(), serde_json::json!(critical_count));
+    tool_data.insert(
+        "critical_issues".to_string(),
+        serde_json::json!(critical_count),
+    );
     tool_data.insert("medium_issues".to_string(), serde_json::json!(medium_count));
     tool_data.insert("low_issues".to_string(), serde_json::json!(low_count));
 
@@ -242,7 +249,10 @@ pub fn analyze(working_dir: &str, patterns: &[SecurityPattern]) -> Result<Parsed
                 total_issues: issues_found,
                 issues_by_severity: HashMap::from([
                     ("critical".to_string(), critical_count),
-                    ("high".to_string(), severity_counts.get("high").copied().unwrap_or(0)),
+                    (
+                        "high".to_string(),
+                        severity_counts.get("high").copied().unwrap_or(0),
+                    ),
                     ("medium".to_string(), medium_count),
                     ("low".to_string(), low_count),
                 ]),
@@ -315,7 +325,11 @@ AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
 
         // Should detect AWS key
         assert!(result.issues_found > 0);
-        assert!(result.structured_output.issues.iter().any(|i| i.code == Some("SEC001".to_string())));
+        assert!(result
+            .structured_output
+            .issues
+            .iter()
+            .any(|i| i.code == Some("SEC001".to_string())));
     }
 
     #[test]
@@ -367,7 +381,11 @@ fn dangerous_operation(ptr: *const u8) {
 
         // Should detect unsafe block
         assert!(result.issues_found > 0);
-        assert!(result.structured_output.issues.iter().any(|i| i.code == Some("SEC080".to_string())));
+        assert!(result
+            .structured_output
+            .issues
+            .iter()
+            .any(|i| i.code == Some("SEC080".to_string())));
     }
 
     #[test]
@@ -409,7 +427,11 @@ def safe_function():
         let temp_dir = TempDir::new().unwrap();
 
         // Create files with various issues
-        create_test_file(temp_dir.path(), "secrets.py", r#"api_key = "secret_key_123456789012""#);
+        create_test_file(
+            temp_dir.path(),
+            "secrets.py",
+            r#"api_key = "secret_key_123456789012""#,
+        );
         create_test_file(temp_dir.path(), "debug.ts", r#"debugger;"#);
         create_test_file(temp_dir.path(), "safe.py", r#"x = 1"#);
 

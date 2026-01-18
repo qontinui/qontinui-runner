@@ -1435,7 +1435,11 @@ impl CheckpointDb {
 
         // Get database size before optimization
         let size_before: i64 = conn
-            .query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |row| row.get(0))
+            .query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
 
         // Run integrity check if requested
@@ -1466,7 +1470,11 @@ impl CheckpointDb {
 
         // Get database size after optimization
         let size_after: i64 = conn
-            .query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |row| row.get(0))
+            .query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )
             .unwrap_or(0);
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -1548,7 +1556,9 @@ impl CheckpointDb {
         let mut counts = Vec::new();
         for table in tables {
             let count: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM \"{}\"", table), [], |row| row.get(0))
+                .query_row(&format!("SELECT COUNT(*) FROM \"{}\"", table), [], |row| {
+                    row.get(0)
+                })
                 .unwrap_or(0);
             counts.push(TableRowCount {
                 table_name: table,
@@ -2554,12 +2564,11 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 23: {}", e))?;
 
             // Add retry_state_json column (ALTER TABLE must be separate)
-            let _ = conn.execute(
-                "ALTER TABLE task_runs ADD COLUMN retry_state_json TEXT",
-                [],
-            );
+            let _ = conn.execute("ALTER TABLE task_runs ADD COLUMN retry_state_json TEXT", []);
 
-            info!("Successfully migrated to version 23 (task_knowledge_summaries, retry_state_json)");
+            info!(
+                "Successfully migrated to version 23 (task_knowledge_summaries, retry_state_json)"
+            );
         }
 
         // Migration 24: Add task_run_api_requests table
@@ -5759,7 +5768,8 @@ impl CheckpointDb {
     /// Update an existing check.
     pub fn update_check(&self, id: &str, input: &UpdateCheckInput) -> Result<Check, String> {
         // First verify the check exists
-        let existing = self.get_check(id)?
+        let existing = self
+            .get_check(id)?
             .ok_or_else(|| format!("Check not found: {}", id))?;
 
         let conn = self.get_conn()?;
@@ -5771,7 +5781,10 @@ impl CheckpointDb {
         let check_type = input.check_type.as_ref().unwrap_or(&existing.check_type);
         let tool = input.tool.as_ref().unwrap_or(&existing.tool);
         let command = input.command.clone().or(existing.command);
-        let working_directory = input.working_directory.clone().or(existing.working_directory);
+        let working_directory = input
+            .working_directory
+            .clone()
+            .or(existing.working_directory);
         let config_path = input.config_path.clone().or(existing.config_path);
         let auto_fix = input.auto_fix.unwrap_or(existing.auto_fix);
         let fail_on_warning = input.fail_on_warning.unwrap_or(existing.fail_on_warning);
@@ -5780,8 +5793,8 @@ impl CheckpointDb {
         let enabled = input.enabled.unwrap_or(existing.enabled);
         let tags = input.tags.clone().unwrap_or(existing.tags);
 
-        let tags_json = serde_json::to_string(&tags)
-            .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+        let tags_json =
+            serde_json::to_string(&tags).map_err(|e| format!("Failed to serialize tags: {}", e))?;
 
         let rows = conn
             .execute(
@@ -5843,7 +5856,11 @@ impl CheckpointDb {
     }
 
     /// Get check results for a specific check.
-    pub fn get_check_results(&self, check_id: &str, limit: u32) -> Result<Vec<CheckResult>, String> {
+    pub fn get_check_results(
+        &self,
+        check_id: &str,
+        limit: u32,
+    ) -> Result<Vec<CheckResult>, String> {
         let conn = self.get_conn()?;
 
         let sql = format!(
@@ -6012,7 +6029,9 @@ impl CheckpointDb {
             working_directory: row.get(4).ok(),
             timeout_seconds: row.get::<_, i64>(5)? as i32,
             fail_on_error: row.get::<_, i32>(6)? != 0,
-            category: row.get::<_, Option<String>>(7)?.unwrap_or_else(|| "general".to_string()),
+            category: row
+                .get::<_, Option<String>>(7)?
+                .unwrap_or_else(|| "general".to_string()),
             tags: row
                 .get::<_, Option<String>>(8)?
                 .and_then(|s| serde_json::from_str(&s).ok())
@@ -6048,7 +6067,10 @@ impl CheckpointDb {
     }
 
     /// Create a new shell command.
-    pub fn create_shell_command(&self, input: &CreateShellCommandInput) -> Result<ShellCommand, String> {
+    pub fn create_shell_command(
+        &self,
+        input: &CreateShellCommandInput,
+    ) -> Result<ShellCommand, String> {
         let conn = self.get_conn()?;
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
@@ -6089,9 +6111,14 @@ impl CheckpointDb {
     }
 
     /// Update an existing shell command.
-    pub fn update_shell_command(&self, id: &str, input: &UpdateShellCommandInput) -> Result<ShellCommand, String> {
+    pub fn update_shell_command(
+        &self,
+        id: &str,
+        input: &UpdateShellCommandInput,
+    ) -> Result<ShellCommand, String> {
         // First verify the shell command exists
-        let existing = self.get_shell_command(id)?
+        let existing = self
+            .get_shell_command(id)?
             .ok_or_else(|| format!("Shell command not found: {}", id))?;
 
         let conn = self.get_conn()?;
@@ -6101,15 +6128,18 @@ impl CheckpointDb {
         let name = input.name.as_ref().unwrap_or(&existing.name);
         let description = input.description.clone().or(existing.description);
         let command = input.command.as_ref().unwrap_or(&existing.command);
-        let working_directory = input.working_directory.clone().or(existing.working_directory);
+        let working_directory = input
+            .working_directory
+            .clone()
+            .or(existing.working_directory);
         let timeout_seconds = input.timeout_seconds.unwrap_or(existing.timeout_seconds);
         let fail_on_error = input.fail_on_error.unwrap_or(existing.fail_on_error);
         let category = input.category.as_ref().unwrap_or(&existing.category);
         let tags = input.tags.clone().unwrap_or(existing.tags);
         let enabled = input.enabled.unwrap_or(existing.enabled);
 
-        let tags_json = serde_json::to_string(&tags)
-            .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+        let tags_json =
+            serde_json::to_string(&tags).map_err(|e| format!("Failed to serialize tags: {}", e))?;
 
         let rows = conn
             .execute(
@@ -6163,7 +6193,11 @@ impl CheckpointDb {
     }
 
     /// Get shell command results for a specific shell command.
-    pub fn get_shell_command_results(&self, shell_command_id: &str, limit: u32) -> Result<Vec<ShellCommandResult>, String> {
+    pub fn get_shell_command_results(
+        &self,
+        shell_command_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ShellCommandResult>, String> {
         let conn = self.get_conn()?;
 
         let sql = format!(
@@ -6271,7 +6305,8 @@ impl CheckpointDb {
         use std::time::Instant;
 
         // Get the shell command
-        let cmd = self.get_shell_command(id)?
+        let cmd = self
+            .get_shell_command(id)?
             .ok_or_else(|| format!("Shell command not found: {}", id))?;
 
         if !cmd.enabled {
@@ -6590,7 +6625,10 @@ impl CheckpointDb {
     }
 
     /// Get a verification plan by ID.
-    pub fn get_verification_plan(&self, id: &str) -> Result<Option<StoredVerificationPlan>, String> {
+    pub fn get_verification_plan(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredVerificationPlan>, String> {
         let conn = self.get_conn()?;
 
         let result: SqliteResult<StoredVerificationPlan> = conn.query_row(
@@ -6852,9 +6890,7 @@ impl CheckpointDb {
     }
 
     /// Helper function to convert a row to StoredTaskKnowledge.
-    fn row_to_task_knowledge(
-        row: &rusqlite::Row,
-    ) -> rusqlite::Result<StoredTaskKnowledge> {
+    fn row_to_task_knowledge(row: &rusqlite::Row) -> rusqlite::Result<StoredTaskKnowledge> {
         Ok(StoredTaskKnowledge {
             id: row.get(0)?,
             task_run_id: row.get(1)?,
@@ -7011,7 +7047,9 @@ impl CheckpointDb {
             .ok();
 
         match max_iteration {
-            Some(iteration) => self.get_iteration_verification_results(task_run_id, iteration as u32),
+            Some(iteration) => {
+                self.get_iteration_verification_results(task_run_id, iteration as u32)
+            }
             None => Ok(vec![]),
         }
     }
@@ -7246,7 +7284,10 @@ impl CheckpointDb {
             .as_ref()
             .unwrap_or(&current.variable_extractions);
         let assertions = request.assertions.as_ref().unwrap_or(&current.assertions);
-        let credential_id = request.credential_id.as_ref().or(current.credential_id.as_ref());
+        let credential_id = request
+            .credential_id
+            .as_ref()
+            .or(current.credential_id.as_ref());
 
         let method_str = format!("{}", method);
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
@@ -7343,8 +7384,10 @@ impl CheckpointDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let params_refs: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params_refs: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let requests = stmt
             .query_map(params_refs.as_slice(), |row| {
@@ -7502,7 +7545,9 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     description: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    category: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "general".to_string()),
+                    category: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "general".to_string()),
                     tags: row
                         .get::<_, Option<String>>(4)?
                         .and_then(|s| serde_json::from_str(&s).ok())
@@ -7563,7 +7608,9 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     description: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    category: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "general".to_string()),
+                    category: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "general".to_string()),
                     tags: row
                         .get::<_, Option<String>>(4)?
                         .and_then(|s| serde_json::from_str(&s).ok())
@@ -7615,11 +7662,16 @@ impl CheckpointDb {
         let now = Utc::now().to_rfc3339();
 
         let tags_json = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
-        let setup_steps_json = serde_json::to_string(&request.setup_steps).unwrap_or_else(|_| "[]".to_string());
-        let verification_steps_json = serde_json::to_string(&request.verification_steps).unwrap_or_else(|_| "[]".to_string());
-        let agentic_steps_json = serde_json::to_string(&request.agentic_steps).unwrap_or_else(|_| "[]".to_string());
-        let completion_steps_json = serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
-        let log_source_selection_json = serde_json::to_string(&request.log_source_selection).unwrap_or_else(|_| "\"default\"".to_string());
+        let setup_steps_json =
+            serde_json::to_string(&request.setup_steps).unwrap_or_else(|_| "[]".to_string());
+        let verification_steps_json =
+            serde_json::to_string(&request.verification_steps).unwrap_or_else(|_| "[]".to_string());
+        let agentic_steps_json =
+            serde_json::to_string(&request.agentic_steps).unwrap_or_else(|_| "[]".to_string());
+        let completion_steps_json =
+            serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
+        let log_source_selection_json = serde_json::to_string(&request.log_source_selection)
+            .unwrap_or_else(|_| "\"default\"".to_string());
 
         conn.execute(
             r#"
@@ -7670,25 +7722,48 @@ impl CheckpointDb {
 
         // Merge updates
         let name = request.name.as_ref().unwrap_or(&existing.name);
-        let description = request.description.as_ref().unwrap_or(&existing.description);
+        let description = request
+            .description
+            .as_ref()
+            .unwrap_or(&existing.description);
         let category = request.category.as_ref().unwrap_or(&existing.category);
         let tags = request.tags.as_ref().unwrap_or(&existing.tags);
-        let setup_steps = request.setup_steps.as_ref().unwrap_or(&existing.setup_steps);
-        let verification_steps = request.verification_steps.as_ref().unwrap_or(&existing.verification_steps);
-        let agentic_steps = request.agentic_steps.as_ref().unwrap_or(&existing.agentic_steps);
-        let completion_steps = request.completion_steps.as_ref().unwrap_or(&existing.completion_steps);
+        let setup_steps = request
+            .setup_steps
+            .as_ref()
+            .unwrap_or(&existing.setup_steps);
+        let verification_steps = request
+            .verification_steps
+            .as_ref()
+            .unwrap_or(&existing.verification_steps);
+        let agentic_steps = request
+            .agentic_steps
+            .as_ref()
+            .unwrap_or(&existing.agentic_steps);
+        let completion_steps = request
+            .completion_steps
+            .as_ref()
+            .unwrap_or(&existing.completion_steps);
         let max_iterations = request.max_iterations.unwrap_or(existing.max_iterations);
         let provider = request.provider.as_ref().or(existing.provider.as_ref());
         let model = request.model.as_ref().or(existing.model.as_ref());
         let skip_ai_summary = request.skip_ai_summary.unwrap_or(existing.skip_ai_summary);
-        let log_source_selection = request.log_source_selection.as_ref().unwrap_or(&existing.log_source_selection);
+        let log_source_selection = request
+            .log_source_selection
+            .as_ref()
+            .unwrap_or(&existing.log_source_selection);
 
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
-        let setup_steps_json = serde_json::to_string(setup_steps).unwrap_or_else(|_| "[]".to_string());
-        let verification_steps_json = serde_json::to_string(verification_steps).unwrap_or_else(|_| "[]".to_string());
-        let agentic_steps_json = serde_json::to_string(agentic_steps).unwrap_or_else(|_| "[]".to_string());
-        let completion_steps_json = serde_json::to_string(completion_steps).unwrap_or_else(|_| "[]".to_string());
-        let log_source_selection_json = serde_json::to_string(log_source_selection).unwrap_or_else(|_| "\"default\"".to_string());
+        let setup_steps_json =
+            serde_json::to_string(setup_steps).unwrap_or_else(|_| "[]".to_string());
+        let verification_steps_json =
+            serde_json::to_string(verification_steps).unwrap_or_else(|_| "[]".to_string());
+        let agentic_steps_json =
+            serde_json::to_string(agentic_steps).unwrap_or_else(|_| "[]".to_string());
+        let completion_steps_json =
+            serde_json::to_string(completion_steps).unwrap_or_else(|_| "[]".to_string());
+        let log_source_selection_json = serde_json::to_string(log_source_selection)
+            .unwrap_or_else(|_| "\"default\"".to_string());
 
         conn.execute(
             r#"
@@ -7786,8 +7861,10 @@ impl CheckpointDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let params: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let workflows = stmt
             .query_map(params.as_slice(), |row| {
@@ -7795,7 +7872,9 @@ impl CheckpointDb {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     description: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    category: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "general".to_string()),
+                    category: row
+                        .get::<_, Option<String>>(3)?
+                        .unwrap_or_else(|| "general".to_string()),
                     tags: row
                         .get::<_, Option<String>>(4)?
                         .and_then(|s| serde_json::from_str(&s).ok())
@@ -7972,8 +8051,10 @@ impl CheckpointDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let params: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let events = stmt
             .query_map(params.as_slice(), |row| {
@@ -8066,8 +8147,10 @@ impl CheckpointDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let params: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let screenshots = stmt
             .query_map(params.as_slice(), |row| {
@@ -8166,8 +8249,10 @@ impl CheckpointDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let params: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = params_vec
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
 
         let results = stmt
             .query_map(params.as_slice(), |row| {
@@ -8336,8 +8421,7 @@ impl CheckpointDb {
             .prepare(&sql)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let params: Vec<&dyn rusqlite::ToSql> =
-            params_vec.iter().map(|b| b.as_ref()).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
 
         let results = stmt
             .query_map(params.as_slice(), |row| {
@@ -8505,8 +8589,20 @@ impl CheckpointDb {
                 tools_used, files_modified, error_type, error_message, feedback, created_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             "#,
-            params![id, task_id, status, duration_secs, iterations, strategy,
-                    tools_json, files_json, error_type, error_message, feedback_json, now],
+            params![
+                id,
+                task_id,
+                status,
+                duration_secs,
+                iterations,
+                strategy,
+                tools_json,
+                files_json,
+                error_type,
+                error_message,
+                feedback_json,
+                now
+            ],
         )
         .map_err(|e| format!("Failed to record learning outcome: {}", e))?;
 
@@ -8514,7 +8610,10 @@ impl CheckpointDb {
     }
 
     /// Get learning outcomes for analysis
-    pub fn get_learning_outcomes(&self, limit: Option<u32>) -> Result<Vec<serde_json::Value>, String> {
+    pub fn get_learning_outcomes(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.get_conn()?;
         let limit_val = limit.unwrap_or(100) as i64;
 
@@ -8651,7 +8750,10 @@ impl CheckpointDb {
     }
 
     /// Get checkpoints for a task
-    pub fn get_orchestrator_checkpoints(&self, task_id: Option<&str>) -> Result<Vec<serde_json::Value>, String> {
+    pub fn get_orchestrator_checkpoints(
+        &self,
+        task_id: Option<&str>,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.get_conn()?;
 
         let query = if task_id.is_some() {
@@ -8710,7 +8812,10 @@ impl CheckpointDb {
     }
 
     /// Get a single checkpoint by ID
-    pub fn get_orchestrator_checkpoint(&self, id: &str) -> Result<Option<serde_json::Value>, String> {
+    pub fn get_orchestrator_checkpoint(
+        &self,
+        id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
         let conn = self.get_conn()?;
 
         let result: SqliteResult<serde_json::Value> = conn.query_row(
@@ -8745,7 +8850,10 @@ impl CheckpointDb {
         let conn = self.get_conn()?;
 
         let affected = conn
-            .execute("DELETE FROM orchestrator_checkpoints WHERE id = ?1", params![id])
+            .execute(
+                "DELETE FROM orchestrator_checkpoints WHERE id = ?1",
+                params![id],
+            )
             .map_err(|e| format!("Failed to delete checkpoint: {}", e))?;
 
         Ok(affected > 0)
@@ -8806,8 +8914,19 @@ impl CheckpointDb {
                 version = ?10,
                 updated_at = ?11
             "#,
-            params![id, name, description, steps, start_step, timeout_secs,
-                    inputs, outputs, tags, version, now],
+            params![
+                id,
+                name,
+                description,
+                steps,
+                start_step,
+                timeout_secs,
+                inputs,
+                outputs,
+                tags,
+                version,
+                now
+            ],
         )
         .map_err(|e| format!("Failed to save flow: {}", e))?;
 
@@ -8900,15 +9019,21 @@ impl CheckpointDb {
     pub fn save_flow_execution(&self, execution: &serde_json::Value) -> Result<(), String> {
         let conn = self.get_conn()?;
 
-        let instance_id = execution["instance_id"].as_str().ok_or("Execution must have instance_id")?;
-        let flow_id = execution["flow_id"].as_str().ok_or("Execution must have flow_id")?;
+        let instance_id = execution["instance_id"]
+            .as_str()
+            .ok_or("Execution must have instance_id")?;
+        let flow_id = execution["flow_id"]
+            .as_str()
+            .ok_or("Execution must have flow_id")?;
         let current_step = execution["current_step"].as_str();
         let status = execution["status"].as_str().unwrap_or("pending");
         let context = serde_json::to_string(&execution["context"]).ok();
         let history = serde_json::to_string(&execution["history"]).ok();
         let error = execution["error"].as_str();
         let default_started_at = Utc::now().to_rfc3339();
-        let started_at = execution["started_at"].as_str().unwrap_or(&default_started_at);
+        let started_at = execution["started_at"]
+            .as_str()
+            .unwrap_or(&default_started_at);
         let completed_at = execution["completed_at"].as_str();
 
         conn.execute(
@@ -8932,7 +9057,10 @@ impl CheckpointDb {
     }
 
     /// Get flow execution by instance ID
-    pub fn get_flow_execution(&self, instance_id: &str) -> Result<Option<serde_json::Value>, String> {
+    pub fn get_flow_execution(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<serde_json::Value>, String> {
         let conn = self.get_conn()?;
 
         let result: SqliteResult<serde_json::Value> = conn.query_row(
@@ -9224,11 +9352,9 @@ impl CheckpointDb {
     /// Get total count of learning outcomes (for pagination).
     pub fn get_learning_outcomes_count(&self) -> Result<i64, String> {
         let conn = self.get_conn()?;
-        conn.query_row(
-            "SELECT COUNT(*) FROM learning_outcomes",
-            [],
-            |row| row.get(0),
-        )
+        conn.query_row("SELECT COUNT(*) FROM learning_outcomes", [], |row| {
+            row.get(0)
+        })
         .map_err(|e| format!("Failed to get count: {}", e))
     }
 
@@ -9380,11 +9506,9 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to get count: {}", e))
         } else {
-            conn.query_row(
-                "SELECT COUNT(*) FROM orchestrator_checkpoints",
-                [],
-                |row| row.get(0),
-            )
+            conn.query_row("SELECT COUNT(*) FROM orchestrator_checkpoints", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("Failed to get count: {}", e))
         }
     }
@@ -9563,12 +9687,8 @@ impl CheckpointDb {
             )
             .map_err(|e| format!("Failed to get count: {}", e))
         } else {
-            conn.query_row(
-                "SELECT COUNT(*) FROM flow_executions",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("Failed to get count: {}", e))
+            conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |row| row.get(0))
+                .map_err(|e| format!("Failed to get count: {}", e))
         }
     }
 
@@ -9578,7 +9698,10 @@ impl CheckpointDb {
 
     /// Get recent task runs with their learning outcomes joined.
     /// Returns task runs along with any associated learning outcome data.
-    pub fn get_recent_task_runs_with_outcomes(&self, limit: u32) -> Result<Vec<serde_json::Value>, String> {
+    pub fn get_recent_task_runs_with_outcomes(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -9681,7 +9804,10 @@ impl CheckpointDb {
         match result {
             Ok(task_id) => Ok(Some(task_id)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(format!("Failed to get most recent task with checkpoints: {}", e)),
+            Err(e) => Err(format!(
+                "Failed to get most recent task with checkpoints: {}",
+                e
+            )),
         }
     }
 
@@ -9744,7 +9870,9 @@ impl CheckpointDb {
         let conn = self.get_conn()?;
 
         let flows_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM orchestrator_flows", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM orchestrator_flows", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let flow_executions_count: i64 = conn
@@ -9752,15 +9880,21 @@ impl CheckpointDb {
             .unwrap_or(0);
 
         let checkpoints_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM orchestrator_checkpoints", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM orchestrator_checkpoints", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let learning_outcomes_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM learning_outcomes", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM learning_outcomes", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let learning_patterns_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM learning_patterns", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM learning_patterns", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let settings_count: i64 = conn
@@ -9776,11 +9910,15 @@ impl CheckpointDb {
             .unwrap_or(0);
 
         let unified_workflows_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM unified_workflows", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM unified_workflows", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let verification_tests_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM verification_tests", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM verification_tests", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let task_hooks_count: i64 = conn
@@ -9792,7 +9930,9 @@ impl CheckpointDb {
             .unwrap_or(0);
 
         let saved_api_requests_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM saved_api_requests", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM saved_api_requests", [], |row| {
+                row.get(0)
+            })
             .unwrap_or(0);
 
         let configs_count: i64 = conn
@@ -9834,9 +9974,11 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let tags_str: String = row.get(4)?;
-                let tags: serde_json::Value = serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
+                let tags: serde_json::Value =
+                    serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
                 let definition_str: String = row.get(3)?;
-                let definition: serde_json::Value = serde_json::from_str(&definition_str).unwrap_or(serde_json::json!({}));
+                let definition: serde_json::Value =
+                    serde_json::from_str(&definition_str).unwrap_or(serde_json::json!({}));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -9917,7 +10059,8 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let state_str: String = row.get(4)?;
-                let state: serde_json::Value = serde_json::from_str(&state_str).unwrap_or(serde_json::json!({}));
+                let state: serde_json::Value =
+                    serde_json::from_str(&state_str).unwrap_or(serde_json::json!({}));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -9947,7 +10090,8 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let value_str: String = row.get(1)?;
-                let value: serde_json::Value = serde_json::from_str(&value_str).unwrap_or(serde_json::Value::Null);
+                let value: serde_json::Value =
+                    serde_json::from_str(&value_str).unwrap_or(serde_json::Value::Null);
 
                 Ok(serde_json::json!({
                     "key": row.get::<_, String>(0)?,
@@ -9979,7 +10123,8 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let vars_str: String = row.get(4)?;
-                let variables: serde_json::Value = serde_json::from_str(&vars_str).unwrap_or(serde_json::json!([]));
+                let variables: serde_json::Value =
+                    serde_json::from_str(&vars_str).unwrap_or(serde_json::json!([]));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10015,7 +10160,8 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let config_str: String = row.get(3)?;
-                let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
+                let config: serde_json::Value =
+                    serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10051,13 +10197,17 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let tags_str: String = row.get(4)?;
-                let tags: serde_json::Value = serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
+                let tags: serde_json::Value =
+                    serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
                 let setup_str: String = row.get(5)?;
-                let setup: serde_json::Value = serde_json::from_str(&setup_str).unwrap_or(serde_json::json!([]));
+                let setup: serde_json::Value =
+                    serde_json::from_str(&setup_str).unwrap_or(serde_json::json!([]));
                 let verif_str: String = row.get(6)?;
-                let verification: serde_json::Value = serde_json::from_str(&verif_str).unwrap_or(serde_json::json!([]));
+                let verification: serde_json::Value =
+                    serde_json::from_str(&verif_str).unwrap_or(serde_json::json!([]));
                 let agent_str: String = row.get(7)?;
-                let agentic: serde_json::Value = serde_json::from_str(&agent_str).unwrap_or(serde_json::json!([]));
+                let agentic: serde_json::Value =
+                    serde_json::from_str(&agent_str).unwrap_or(serde_json::json!([]));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10110,9 +10260,11 @@ impl CheckpointDb {
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or(serde_json::Value::Null);
                 let config_str: String = row.get(10)?;
-                let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
+                let config: serde_json::Value =
+                    serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
                 let tags_str: String = row.get(16)?;
-                let tags: serde_json::Value = serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
+                let tags: serde_json::Value =
+                    serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10164,9 +10316,11 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let action_str: String = row.get(5)?;
-                let action_config: serde_json::Value = serde_json::from_str(&action_str).unwrap_or(serde_json::json!({}));
+                let action_config: serde_json::Value =
+                    serde_json::from_str(&action_str).unwrap_or(serde_json::json!({}));
                 let cond_str: String = row.get(9)?;
-                let conditions: serde_json::Value = serde_json::from_str(&cond_str).unwrap_or(serde_json::json!([]));
+                let conditions: serde_json::Value =
+                    serde_json::from_str(&cond_str).unwrap_or(serde_json::json!([]));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10210,7 +10364,8 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let config_str: String = row.get(6)?;
-                let task_config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
+                let task_config: serde_json::Value =
+                    serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10255,13 +10410,17 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let tags_str: String = row.get(4)?;
-                let tags: serde_json::Value = serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
+                let tags: serde_json::Value =
+                    serde_json::from_str(&tags_str).unwrap_or(serde_json::json!([]));
                 let headers_str: String = row.get(7)?;
-                let headers: serde_json::Value = serde_json::from_str(&headers_str).unwrap_or(serde_json::json!({}));
+                let headers: serde_json::Value =
+                    serde_json::from_str(&headers_str).unwrap_or(serde_json::json!({}));
                 let extractions_str: String = row.get(12)?;
-                let extractions: serde_json::Value = serde_json::from_str(&extractions_str).unwrap_or(serde_json::json!([]));
+                let extractions: serde_json::Value =
+                    serde_json::from_str(&extractions_str).unwrap_or(serde_json::json!([]));
                 let assertions_str: String = row.get(13)?;
-                let assertions: serde_json::Value = serde_json::from_str(&assertions_str).unwrap_or(serde_json::json!([]));
+                let assertions: serde_json::Value =
+                    serde_json::from_str(&assertions_str).unwrap_or(serde_json::json!([]));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10307,7 +10466,8 @@ impl CheckpointDb {
         let results = stmt
             .query_map([], |row| {
                 let config_str: String = row.get(2)?;
-                let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
+                let config: serde_json::Value =
+                    serde_json::from_str(&config_str).unwrap_or(serde_json::json!({}));
 
                 Ok(serde_json::json!({
                     "id": row.get::<_, String>(0)?,
@@ -10327,7 +10487,11 @@ impl CheckpointDb {
     }
 
     /// Import flows (with conflict handling).
-    pub fn import_flows(&self, flows: &[serde_json::Value], conflict_mode: &str) -> Result<ImportResult, String> {
+    pub fn import_flows(
+        &self,
+        flows: &[serde_json::Value],
+        conflict_mode: &str,
+    ) -> Result<ImportResult, String> {
         let conn = self.get_conn()?;
         let mut imported = 0;
         let mut skipped = 0;
@@ -10375,11 +10539,19 @@ impl CheckpointDb {
             }
         }
 
-        Ok(ImportResult { imported, skipped, errors })
+        Ok(ImportResult {
+            imported,
+            skipped,
+            errors,
+        })
     }
 
     /// Import prompts (with conflict handling).
-    pub fn import_prompts(&self, prompts: &[serde_json::Value], conflict_mode: &str) -> Result<ImportResult, String> {
+    pub fn import_prompts(
+        &self,
+        prompts: &[serde_json::Value],
+        conflict_mode: &str,
+    ) -> Result<ImportResult, String> {
         let conn = self.get_conn()?;
         let mut imported = 0;
         let mut skipped = 0;
@@ -10394,7 +10566,9 @@ impl CheckpointDb {
             }
 
             let exists: bool = conn
-                .query_row("SELECT 1 FROM prompts WHERE id = ?1", params![id], |_| Ok(true))
+                .query_row("SELECT 1 FROM prompts WHERE id = ?1", params![id], |_| {
+                    Ok(true)
+                })
                 .unwrap_or(false);
 
             if exists && conflict_mode == "skip" {
@@ -10421,11 +10595,19 @@ impl CheckpointDb {
             }
         }
 
-        Ok(ImportResult { imported, skipped, errors })
+        Ok(ImportResult {
+            imported,
+            skipped,
+            errors,
+        })
     }
 
     /// Import settings (with conflict handling).
-    pub fn import_settings(&self, settings: &[serde_json::Value], conflict_mode: &str) -> Result<ImportResult, String> {
+    pub fn import_settings(
+        &self,
+        settings: &[serde_json::Value],
+        conflict_mode: &str,
+    ) -> Result<ImportResult, String> {
         let conn = self.get_conn()?;
         let mut imported = 0;
         let mut skipped = 0;
@@ -10440,7 +10622,11 @@ impl CheckpointDb {
             }
 
             let exists: bool = conn
-                .query_row("SELECT 1 FROM settings WHERE key = ?1", params![key], |_| Ok(true))
+                .query_row(
+                    "SELECT 1 FROM settings WHERE key = ?1",
+                    params![key],
+                    |_| Ok(true),
+                )
                 .unwrap_or(false);
 
             if exists && conflict_mode == "skip" {
@@ -10461,11 +10647,19 @@ impl CheckpointDb {
             }
         }
 
-        Ok(ImportResult { imported, skipped, errors })
+        Ok(ImportResult {
+            imported,
+            skipped,
+            errors,
+        })
     }
 
     /// Import unified workflows (with conflict handling).
-    pub fn import_unified_workflows(&self, workflows: &[serde_json::Value], conflict_mode: &str) -> Result<ImportResult, String> {
+    pub fn import_unified_workflows(
+        &self,
+        workflows: &[serde_json::Value],
+        conflict_mode: &str,
+    ) -> Result<ImportResult, String> {
         let conn = self.get_conn()?;
         let mut imported = 0;
         let mut skipped = 0;
@@ -10480,7 +10674,11 @@ impl CheckpointDb {
             }
 
             let exists: bool = conn
-                .query_row("SELECT 1 FROM unified_workflows WHERE id = ?1", params![id], |_| Ok(true))
+                .query_row(
+                    "SELECT 1 FROM unified_workflows WHERE id = ?1",
+                    params![id],
+                    |_| Ok(true),
+                )
                 .unwrap_or(false);
 
             if exists && conflict_mode == "skip" {
@@ -10493,8 +10691,10 @@ impl CheckpointDb {
             let category = workflow["category"].as_str();
             let tags = serde_json::to_string(&workflow["tags"]).unwrap_or("[]".to_string());
             let setup = serde_json::to_string(&workflow["setup_steps"]).unwrap_or("[]".to_string());
-            let verif = serde_json::to_string(&workflow["verification_steps"]).unwrap_or("[]".to_string());
-            let agent = serde_json::to_string(&workflow["agentic_steps"]).unwrap_or("[]".to_string());
+            let verif =
+                serde_json::to_string(&workflow["verification_steps"]).unwrap_or("[]".to_string());
+            let agent =
+                serde_json::to_string(&workflow["agentic_steps"]).unwrap_or("[]".to_string());
             let max_iter = workflow["max_iterations"].as_i64();
             let provider = workflow["provider"].as_str();
             let model = workflow["model"].as_str();
@@ -10513,11 +10713,19 @@ impl CheckpointDb {
             }
         }
 
-        Ok(ImportResult { imported, skipped, errors })
+        Ok(ImportResult {
+            imported,
+            skipped,
+            errors,
+        })
     }
 
     /// Import learning outcomes (with conflict handling).
-    pub fn import_learning_outcomes(&self, outcomes: &[serde_json::Value], conflict_mode: &str) -> Result<ImportResult, String> {
+    pub fn import_learning_outcomes(
+        &self,
+        outcomes: &[serde_json::Value],
+        conflict_mode: &str,
+    ) -> Result<ImportResult, String> {
         let conn = self.get_conn()?;
         let mut imported = 0;
         let mut skipped = 0;
@@ -10573,11 +10781,19 @@ impl CheckpointDb {
             }
         }
 
-        Ok(ImportResult { imported, skipped, errors })
+        Ok(ImportResult {
+            imported,
+            skipped,
+            errors,
+        })
     }
 
     /// Import learning patterns (with conflict handling).
-    pub fn import_learning_patterns(&self, patterns: &[serde_json::Value], conflict_mode: &str) -> Result<ImportResult, String> {
+    pub fn import_learning_patterns(
+        &self,
+        patterns: &[serde_json::Value],
+        conflict_mode: &str,
+    ) -> Result<ImportResult, String> {
         let conn = self.get_conn()?;
         let mut imported = 0;
         let mut skipped = 0;
@@ -10592,7 +10808,11 @@ impl CheckpointDb {
             }
 
             let exists: bool = conn
-                .query_row("SELECT 1 FROM learning_patterns WHERE id = ?1", params![id], |_| Ok(true))
+                .query_row(
+                    "SELECT 1 FROM learning_patterns WHERE id = ?1",
+                    params![id],
+                    |_| Ok(true),
+                )
                 .unwrap_or(false);
 
             if exists && conflict_mode == "skip" {
@@ -10620,7 +10840,11 @@ impl CheckpointDb {
             }
         }
 
-        Ok(ImportResult { imported, skipped, errors })
+        Ok(ImportResult {
+            imported,
+            skipped,
+            errors,
+        })
     }
 
     // ==================== Mobile Development Feedback ====================
@@ -10674,7 +10898,10 @@ impl CheckpointDb {
     }
 
     /// Create a new mobile state capture.
-    pub fn create_mobile_state(&self, input: &CreateMobileStateInput) -> Result<MobileState, String> {
+    pub fn create_mobile_state(
+        &self,
+        input: &CreateMobileStateInput,
+    ) -> Result<MobileState, String> {
         let conn = self.get_conn()?;
         let now = Utc::now().to_rfc3339();
 
@@ -10745,7 +10972,11 @@ impl CheckpointDb {
     }
 
     /// Get mobile state captures for a task run.
-    pub fn get_mobile_states(&self, task_run_id: &str, limit: Option<u32>) -> Result<Vec<MobileState>, String> {
+    pub fn get_mobile_states(
+        &self,
+        task_run_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<MobileState>, String> {
         let conn = self.get_conn()?;
         let limit_val = limit.unwrap_or(100);
 
@@ -10778,7 +11009,10 @@ impl CheckpointDb {
     }
 
     /// Get the latest mobile state for a task run.
-    pub fn get_latest_mobile_state(&self, task_run_id: &str) -> Result<Option<MobileState>, String> {
+    pub fn get_latest_mobile_state(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Option<MobileState>, String> {
         let states = self.get_mobile_states(task_run_id, Some(1))?;
         Ok(states.into_iter().next())
     }
@@ -10909,7 +11143,11 @@ impl CheckpointDb {
     }
 
     /// Get mobile error logs for a task run.
-    pub fn get_mobile_errors(&self, task_run_id: &str, limit: Option<u32>) -> Result<Vec<MobileLog>, String> {
+    pub fn get_mobile_errors(
+        &self,
+        task_run_id: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<MobileLog>, String> {
         self.get_mobile_logs(task_run_id, None, true, limit)
     }
 
@@ -10991,7 +11229,10 @@ impl CheckpointDb {
     }
 
     /// Get a specific MCP server by ID.
-    pub fn get_mcp_server(&self, id: &str) -> Result<Option<crate::mcp_client::McpServerConfig>, String> {
+    pub fn get_mcp_server(
+        &self,
+        id: &str,
+    ) -> Result<Option<crate::mcp_client::McpServerConfig>, String> {
         let conn = self.get_conn()?;
 
         let mut stmt = conn
@@ -11055,9 +11296,13 @@ impl CheckpointDb {
             crate::mcp_client::McpTransport::Stdio => "stdio",
         };
 
-        let stdio_config_json = input.stdio_config.as_ref()
+        let stdio_config_json = input
+            .stdio_config
+            .as_ref()
             .map(|c| serde_json::to_string(c).unwrap_or_default());
-        let http_config_json = input.http_config.as_ref()
+        let http_config_json = input
+            .http_config
+            .as_ref()
             .map(|c| serde_json::to_string(c).unwrap_or_default());
 
         conn.execute(
@@ -11099,7 +11344,8 @@ impl CheckpointDb {
         let now = Utc::now().to_rfc3339();
 
         // Get existing record and merge with input
-        let existing = self.get_mcp_server(id)?
+        let existing = self
+            .get_mcp_server(id)?
             .ok_or_else(|| format!("MCP server not found: {}", id))?;
 
         let name = input.name.unwrap_or(existing.name);
@@ -11115,9 +11361,11 @@ impl CheckpointDb {
             crate::mcp_client::McpTransport::Http => "http",
             crate::mcp_client::McpTransport::Stdio => "stdio",
         };
-        let stdio_config_json = stdio_config.as_ref()
+        let stdio_config_json = stdio_config
+            .as_ref()
             .map(|c| serde_json::to_string(c).unwrap_or_default());
-        let http_config_json = http_config.as_ref()
+        let http_config_json = http_config
+            .as_ref()
             .map(|c| serde_json::to_string(c).unwrap_or_default());
 
         conn.execute(
@@ -11152,11 +11400,8 @@ impl CheckpointDb {
     pub fn delete_mcp_server(&self, id: &str) -> Result<(), String> {
         let conn = self.get_conn()?;
 
-        conn.execute(
-            "DELETE FROM mcp_servers WHERE id = ?1",
-            params![id],
-        )
-        .map_err(|e| format!("Failed to delete MCP server: {}", e))?;
+        conn.execute("DELETE FROM mcp_servers WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete MCP server: {}", e))?;
 
         Ok(())
     }
@@ -11272,27 +11517,28 @@ impl CheckpointDb {
             .prepare(query)
             .map_err(|e| format!("Failed to prepare statement: {}", e))?;
 
-        let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<crate::mcp_client::McpCallRecord> {
-            Ok(crate::mcp_client::McpCallRecord {
-                id: row.get(0)?,
-                task_run_id: row.get(1)?,
-                step_id: row.get(2)?,
-                step_name: row.get(3)?,
-                server_id: row.get(4)?,
-                server_name: row.get(5)?,
-                tool_name: row.get(6)?,
-                arguments: row.get(7)?,
-                resolved_arguments: row.get(8)?,
-                response: row.get(9)?,
-                response_type: row.get(10)?,
-                duration_ms: row.get(11)?,
-                extractions: row.get(12)?,
-                assertions: row.get(13)?,
-                success: row.get(14)?,
-                error_message: row.get(15)?,
-                created_at: row.get(16)?,
-            })
-        };
+        let row_mapper =
+            |row: &rusqlite::Row| -> rusqlite::Result<crate::mcp_client::McpCallRecord> {
+                Ok(crate::mcp_client::McpCallRecord {
+                    id: row.get(0)?,
+                    task_run_id: row.get(1)?,
+                    step_id: row.get(2)?,
+                    step_name: row.get(3)?,
+                    server_id: row.get(4)?,
+                    server_name: row.get(5)?,
+                    tool_name: row.get(6)?,
+                    arguments: row.get(7)?,
+                    resolved_arguments: row.get(8)?,
+                    response: row.get(9)?,
+                    response_type: row.get(10)?,
+                    duration_ms: row.get(11)?,
+                    extractions: row.get(12)?,
+                    assertions: row.get(13)?,
+                    success: row.get(14)?,
+                    error_message: row.get(15)?,
+                    created_at: row.get(16)?,
+                })
+            };
 
         let calls: Vec<crate::mcp_client::McpCallRecord> = if let Some(success) = success_filter {
             stmt.query_map(params![task_run_id, success], row_mapper)

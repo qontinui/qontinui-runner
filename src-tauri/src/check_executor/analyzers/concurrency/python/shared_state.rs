@@ -9,14 +9,9 @@ use crate::check_executor::analyzers::concurrency::types::{
 use tree_sitter::{Node, Tree};
 
 /// Detect shared state in a Python file
-pub fn detect_shared_state(
-    tree: &Tree,
-    source: &str,
-    file: &str,
-    ctx: &mut AnalysisContext,
-) {
+pub fn detect_shared_state(tree: &Tree, source: &str, file: &str, ctx: &mut AnalysisContext) {
     let root = tree.root_node();
-    let cursor = root.walk();
+    let _cursor = root.walk();
 
     // Detect module-level globals
     detect_module_globals(&root, source, file, ctx);
@@ -44,7 +39,9 @@ fn detect_module_globals(root: &Node, source: &str, file: &str, ctx: &mut Analys
                                     definition_line: child.start_position().row as u32 + 1,
                                     file: file.to_string(),
                                     accesses: Vec::new(),
-                                    appears_thread_safe: is_likely_thread_safe(&name, &expr, source),
+                                    appears_thread_safe: is_likely_thread_safe(
+                                        &name, &expr, source,
+                                    ),
                                     thread_safe_reason: None,
                                 });
                             }
@@ -74,14 +71,16 @@ fn detect_class_variables(root: &Node, source: &str, file: &str, ctx: &mut Analy
                     // Look for assignments that are NOT inside methods
                     if body_child.kind() == "expression_statement" {
                         if let Some(expr) = body_child.child(0) {
-                            if expr.kind() == "assignment" || expr.kind() == "annotated_assignment" {
+                            if expr.kind() == "assignment" || expr.kind() == "annotated_assignment"
+                            {
                                 if let Some(target) = expr.child_by_field_name("left") {
                                     if let Some(name) = extract_identifier_name(&target, source) {
                                         let full_name = format!("{}.{}", class_name, name);
                                         ctx.shared_states.push(SharedState {
                                             name: full_name,
                                             state_type: SharedStateType::ClassVariable,
-                                            definition_line: body_child.start_position().row as u32 + 1,
+                                            definition_line: body_child.start_position().row as u32
+                                                + 1,
                                             file: file.to_string(),
                                             accesses: Vec::new(),
                                             appears_thread_safe: is_likely_thread_safe(
@@ -103,7 +102,10 @@ fn detect_class_variables(root: &Node, source: &str, file: &str, ctx: &mut Analy
 /// Extract identifier name from a node
 fn extract_identifier_name(node: &Node, source: &str) -> Option<String> {
     match node.kind() {
-        "identifier" => node.utf8_text(source.as_bytes()).ok().map(|s| s.to_string()),
+        "identifier" => node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(|s| s.to_string()),
         "pattern_list" | "tuple_pattern" => {
             // For tuple unpacking, get the first element
             node.child(0)
@@ -184,9 +186,11 @@ fn traverse_for_accesses(
     if kind == "identifier" {
         if let Ok(name) = node.utf8_text(source.as_bytes()) {
             // Check if this is a known shared state
-            if ctx.shared_states.iter().any(|s| {
-                s.name == name || s.name.ends_with(&format!(".{}", name))
-            }) {
+            if ctx
+                .shared_states
+                .iter()
+                .any(|s| s.name == name || s.name.ends_with(&format!(".{}", name)))
+            {
                 let access_type = determine_access_type(node, source);
                 let state_name = ctx
                     .shared_states
@@ -393,8 +397,14 @@ class MyClass:
         let mut ctx = AnalysisContext::new();
         detect_shared_state(&tree, code, "test.py", &mut ctx);
 
-        assert!(ctx.shared_states.iter().any(|s| s.name == "MyClass.shared_list"));
-        assert!(ctx.shared_states.iter().any(|s| s.name == "MyClass.counter"));
+        assert!(ctx
+            .shared_states
+            .iter()
+            .any(|s| s.name == "MyClass.shared_list"));
+        assert!(ctx
+            .shared_states
+            .iter()
+            .any(|s| s.name == "MyClass.counter"));
     }
 
     #[test]

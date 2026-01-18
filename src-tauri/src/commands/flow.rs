@@ -35,9 +35,8 @@ impl FlowExecutionStorage {
 }
 
 /// Global execution storage instance using tokio mutex for async access.
-static EXECUTION_STORAGE: Lazy<TokioMutex<FlowExecutionStorage>> = Lazy::new(|| {
-    TokioMutex::new(FlowExecutionStorage::new())
-});
+static EXECUTION_STORAGE: Lazy<TokioMutex<FlowExecutionStorage>> =
+    Lazy::new(|| TokioMutex::new(FlowExecutionStorage::new()));
 
 /// Summary of a flow for listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +63,11 @@ pub fn list_flows(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowSummary>, S
             step_count: f["step_count"].as_i64().unwrap_or(0) as usize,
             tags: f["tags"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
             version: f["version"].as_str().unwrap_or("1.0.0").to_string(),
         })
@@ -96,8 +99,8 @@ pub fn get_flow(state: State<'_, Arc<AppState>>, id: String) -> Result<Option<Fl
 /// Save a flow (create or update).
 #[tauri::command]
 pub fn save_flow(state: State<'_, Arc<AppState>>, flow: Flow) -> Result<String, String> {
-    let flow_json = serde_json::to_value(&flow)
-        .map_err(|e| format!("Failed to serialize flow: {}", e))?;
+    let flow_json =
+        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
     state.checkpoint_db.save_flow(&flow_json)
 }
 
@@ -129,7 +132,9 @@ pub async fn start_flow_execution(
     inputs: HashMap<String, serde_json::Value>,
 ) -> Result<String, String> {
     // Get flow from database
-    let flow_json = app_state.checkpoint_db.get_flow(&flow_id)?
+    let flow_json = app_state
+        .checkpoint_db
+        .get_flow(&flow_id)?
         .ok_or_else(|| format!("Flow '{}' not found", flow_id))?;
 
     let flow: Flow = serde_json::from_value(flow_json)
@@ -147,7 +152,9 @@ pub async fn start_flow_execution(
     // Save to in-memory storage for real-time access
     {
         let mut storage = EXECUTION_STORAGE.lock().await;
-        storage.executions.insert(instance_id.clone(), state.clone());
+        storage
+            .executions
+            .insert(instance_id.clone(), state.clone());
         storage.flows.insert(instance_id.clone(), flow.clone());
     }
 
@@ -157,11 +164,14 @@ pub async fn start_flow_execution(
     app_state.checkpoint_db.save_flow_execution(&state_json)?;
 
     // Emit flow started event
-    emit_flow_event(&app_handle, FlowEvent::FlowStarted {
-        instance_id: instance_id.clone(),
-        flow_id: flow.id.clone(),
-        flow_name: flow.name.clone(),
-    });
+    emit_flow_event(
+        &app_handle,
+        FlowEvent::FlowStarted {
+            instance_id: instance_id.clone(),
+            flow_id: flow.id.clone(),
+            flow_name: flow.name.clone(),
+        },
+    );
 
     info!(
         instance_id = %instance_id,
@@ -185,11 +195,15 @@ pub async fn step_flow_execution(
     let mut storage = EXECUTION_STORAGE.lock().await;
 
     // Clone the flow first to avoid borrow conflicts
-    let flow = storage.flows.get(&instance_id)
+    let flow = storage
+        .flows
+        .get(&instance_id)
         .ok_or_else(|| format!("Flow for execution '{}' not found", instance_id))?
         .clone();
 
-    let state = storage.executions.get_mut(&instance_id)
+    let state = storage
+        .executions
+        .get_mut(&instance_id)
         .ok_or_else(|| format!("Execution '{}' not found", instance_id))?;
 
     // Check if flow is already finished
@@ -206,10 +220,9 @@ pub async fn step_flow_execution(
 
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
-    let executor = FlowExecutor::new()
-        .with_event_callback(move |event| {
-            emit_flow_event(&app_handle_clone, event);
-        });
+    let executor = FlowExecutor::new().with_event_callback(move |event| {
+        emit_flow_event(&app_handle_clone, event);
+    });
 
     // Execute one step
     let result = executor.step_once(&flow, state).await;
@@ -220,19 +233,15 @@ pub async fn step_flow_execution(
     }
 
     match result {
-        Ok(step_result) => {
-            Ok(StepExecutionResult {
-                step_id: Some(step_result.step_id),
-                success: step_result.success,
-                flow_completed: state.is_finished(),
-                outputs: step_result.outputs,
-                error: step_result.error,
-                next_step: state.current_step.clone(),
-            })
-        }
-        Err(e) => {
-            Err(e)
-        }
+        Ok(step_result) => Ok(StepExecutionResult {
+            step_id: Some(step_result.step_id),
+            success: step_result.success,
+            flow_completed: state.is_finished(),
+            outputs: step_result.outputs,
+            error: step_result.error,
+            next_step: state.current_step.clone(),
+        }),
+        Err(e) => Err(e),
     }
 }
 
@@ -249,11 +258,15 @@ pub async fn run_flow_execution(
     let (flow, mut state) = {
         let storage = EXECUTION_STORAGE.lock().await;
 
-        let state = storage.executions.get(&instance_id)
+        let state = storage
+            .executions
+            .get(&instance_id)
             .ok_or_else(|| format!("Execution '{}' not found", instance_id))?
             .clone();
 
-        let flow = storage.flows.get(&instance_id)
+        let flow = storage
+            .flows
+            .get(&instance_id)
             .ok_or_else(|| format!("Flow for execution '{}' not found", instance_id))?
             .clone();
 
@@ -274,10 +287,9 @@ pub async fn run_flow_execution(
 
     // Create executor with event emitter
     let app_handle_clone = app_handle.clone();
-    let executor = FlowExecutor::new()
-        .with_event_callback(move |event| {
-            emit_flow_event(&app_handle_clone, event);
-        });
+    let executor = FlowExecutor::new().with_event_callback(move |event| {
+        emit_flow_event(&app_handle_clone, event);
+    });
 
     // Execute the flow
     let result = executor.execute(&flow, &mut state).await;
@@ -285,7 +297,9 @@ pub async fn run_flow_execution(
     // Update storage with final state
     {
         let mut storage = EXECUTION_STORAGE.lock().await;
-        storage.executions.insert(instance_id.clone(), state.clone());
+        storage
+            .executions
+            .insert(instance_id.clone(), state.clone());
     }
 
     // Persist final state
@@ -340,7 +354,9 @@ pub async fn provide_flow_input(
 ) -> Result<bool, String> {
     let mut storage = EXECUTION_STORAGE.lock().await;
 
-    let state = storage.executions.get_mut(&instance_id)
+    let state = storage
+        .executions
+        .get_mut(&instance_id)
         .ok_or_else(|| format!("Execution '{}' not found", instance_id))?;
 
     if state.status != FlowStatus::WaitingForInput {
@@ -396,7 +412,9 @@ pub async fn get_flow_execution(
 
 /// List all flow executions.
 #[tauri::command]
-pub fn list_flow_executions(state: State<'_, Arc<AppState>>) -> Result<Vec<FlowExecutionSummary>, String> {
+pub fn list_flow_executions(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<FlowExecutionSummary>, String> {
     let executions_json = state.checkpoint_db.list_flow_executions()?;
 
     let summaries = executions_json
@@ -464,14 +482,17 @@ pub async fn cancel_flow_execution(
 
         // Emit completion event
         if let Some(flow) = flow_clone {
-            emit_flow_event(&app_handle, FlowEvent::FlowCompleted {
-                instance_id: instance_id.clone(),
-                flow_id: flow.id.clone(),
-                success: false,
-                error: Some("Cancelled by user".to_string()),
-                total_steps: state.execution_count(),
-                duration_ms: 0,
-            });
+            emit_flow_event(
+                &app_handle,
+                FlowEvent::FlowCompleted {
+                    instance_id: instance_id.clone(),
+                    flow_id: flow.id.clone(),
+                    success: false,
+                    error: Some("Cancelled by user".to_string()),
+                    total_steps: state.execution_count(),
+                    duration_ms: 0,
+                },
+            );
         }
 
         // Update database
@@ -495,15 +516,21 @@ pub fn create_sample_flow() -> Result<Flow, String> {
         .with_description("A sample flow that analyzes code, identifies issues, and applies fixes")
         // Add analyze step
         .add_step(
-            FlowStep::agent("analyze", "code_reviewer", "Analyze the code and identify potential issues")
-                .with_description("AI agent analyzes the codebase")
-                .then("check-issues"),
+            FlowStep::agent(
+                "analyze",
+                "code_reviewer",
+                "Analyze the code and identify potential issues",
+            )
+            .with_description("AI agent analyzes the codebase")
+            .then("check-issues"),
         )
         // Add conditional step
         .add_step(
             FlowStep::conditional(
                 "check-issues",
-                Condition::Expression { expr: "context.issues.length > 0".to_string() },
+                Condition::Expression {
+                    expr: "context.issues.length > 0".to_string(),
+                },
                 "fix-issues",
                 "complete",
             )
@@ -511,9 +538,13 @@ pub fn create_sample_flow() -> Result<Flow, String> {
         )
         // Add fix step
         .add_step(
-            FlowStep::agent("fix-issues", "debugger", "Fix the identified issues one by one")
-                .with_description("AI agent fixes identified issues")
-                .then("verify"),
+            FlowStep::agent(
+                "fix-issues",
+                "debugger",
+                "Fix the identified issues one by one",
+            )
+            .with_description("AI agent fixes identified issues")
+            .then("verify"),
         )
         // Add verify step
         .add_step(
@@ -534,8 +565,8 @@ pub fn create_sample_flow() -> Result<Flow, String> {
 #[tauri::command]
 pub fn add_sample_flow(state: State<'_, Arc<AppState>>) -> Result<String, String> {
     let flow = create_sample_flow()?;
-    let flow_json = serde_json::to_value(&flow)
-        .map_err(|e| format!("Failed to serialize flow: {}", e))?;
+    let flow_json =
+        serde_json::to_value(&flow).map_err(|e| format!("Failed to serialize flow: {}", e))?;
     state.checkpoint_db.save_flow(&flow_json)
 }
 
@@ -576,7 +607,11 @@ pub fn get_flows_by_tag(
             step_count: f["step_count"].as_i64().unwrap_or(0) as usize,
             tags: f["tags"]
                 .as_array()
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
                 .unwrap_or_default(),
             version: f["version"].as_str().unwrap_or("1.0.0").to_string(),
         })
@@ -591,10 +626,9 @@ pub fn get_flow_executions_filtered(
     state: State<'_, Arc<AppState>>,
     filter: FlowExecutionFilter,
 ) -> Result<Vec<FlowExecutionSummary>, String> {
-    let executions_json = state.checkpoint_db.get_flow_executions_filtered(
-        filter.flow_id.as_deref(),
-        filter.status.as_deref(),
-    )?;
+    let executions_json = state
+        .checkpoint_db
+        .get_flow_executions_filtered(filter.flow_id.as_deref(), filter.status.as_deref())?;
 
     let summaries = executions_json
         .into_iter()
@@ -619,11 +653,10 @@ pub fn get_flow_executions_paginated(
     offset: i64,
     limit: i64,
 ) -> Result<PaginatedFlowExecutionResult, String> {
-    let executions_json = state.checkpoint_db.get_flow_executions_paginated(
-        flow_id.as_deref(),
-        offset,
-        limit,
-    )?;
+    let executions_json =
+        state
+            .checkpoint_db
+            .get_flow_executions_paginated(flow_id.as_deref(), offset, limit)?;
 
     let summaries = executions_json
         .into_iter()
@@ -637,7 +670,9 @@ pub fn get_flow_executions_paginated(
         })
         .collect();
 
-    let total = state.checkpoint_db.get_flow_executions_count(flow_id.as_deref())?;
+    let total = state
+        .checkpoint_db
+        .get_flow_executions_count(flow_id.as_deref())?;
 
     Ok(PaginatedFlowExecutionResult {
         items: summaries,
@@ -653,7 +688,9 @@ pub fn get_flow_executions_count(
     state: State<'_, Arc<AppState>>,
     flow_id: Option<String>,
 ) -> Result<i64, String> {
-    state.checkpoint_db.get_flow_executions_count(flow_id.as_deref())
+    state
+        .checkpoint_db
+        .get_flow_executions_count(flow_id.as_deref())
 }
 
 // ============================================================================

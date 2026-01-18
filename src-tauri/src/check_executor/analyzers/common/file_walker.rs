@@ -49,7 +49,11 @@ pub fn walk_files(root: &Path, config: &WalkConfig) -> Vec<PathBuf> {
                 files.push(entry.path().to_path_buf());
             } else if let Some(ext) = entry.path().extension() {
                 let ext_str = ext.to_string_lossy().to_lowercase();
-                if config.extensions.iter().any(|e| e.to_lowercase() == ext_str) {
+                if config
+                    .extensions
+                    .iter()
+                    .any(|e| e.to_lowercase() == ext_str)
+                {
                     files.push(entry.path().to_path_buf());
                 }
             }

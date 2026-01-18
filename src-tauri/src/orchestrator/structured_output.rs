@@ -397,7 +397,12 @@ impl StructuredOverride {
 
     /// Convert to the legacy CriterionOverride type.
     pub fn to_criterion_override(&self, iteration: u32) -> CriterionOverride {
-        CriterionOverride::new(&self.criterion_id, &self.item, &self.justification, iteration)
+        CriterionOverride::new(
+            &self.criterion_id,
+            &self.item,
+            &self.justification,
+            iteration,
+        )
     }
 }
 
@@ -550,7 +555,9 @@ fn parse_legacy_output(output: &str, _iteration: u32) -> WorkerOutput {
     // Parse signals
     if output.contains("[WORK_COMPLETE]") {
         let reason = extract_marker_content(output, "[WORK_COMPLETE]");
-        result.signals.push(StructuredSignal::WorkComplete { reason });
+        result
+            .signals
+            .push(StructuredSignal::WorkComplete { reason });
     } else if output.contains("[NEED_REPLAN]") {
         let reason = extract_marker_content(output, "[NEED_REPLAN]")
             .unwrap_or_else(|| "Plan revision requested".to_string());
@@ -863,7 +870,10 @@ Justification: Facade pattern delegates to specialized subsystems
         let parsed = parse_worker_output(output);
         let output = parsed.get_output(1);
         assert_eq!(output.criterion_overrides.len(), 1);
-        assert_eq!(output.criterion_overrides[0].criterion_id, "god_class_detection");
+        assert_eq!(
+            output.criterion_overrides[0].criterion_id,
+            "god_class_detection"
+        );
         assert_eq!(output.criterion_overrides[0].item, "ConfigManager");
     }
 

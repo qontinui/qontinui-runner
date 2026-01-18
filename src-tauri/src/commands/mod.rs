@@ -60,17 +60,22 @@ pub mod extraction;
 pub mod findings;
 pub mod flow; // Flow designer commands
 pub mod global_log_sources; // Global log source management
+pub mod hooks;
 pub mod interaction;
 pub mod issues;
 pub mod learning; // Learning insights dashboard commands
 pub mod logging;
 pub mod mcp; // MCP client management and tool calling
+pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
+pub mod mobile_settings; // Mobile settings (ADB path, device config)
 pub mod playwright_settings;
 pub mod project_logs;
-pub mod self_healing_settings;
 pub mod rag;
+pub mod recap; // Session recap overview
 pub mod screenshot;
 pub mod screenshots;
+pub mod self_healing_settings;
+pub mod shell_commands; // Shell command management and execution
 pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
 pub mod storage;
@@ -78,11 +83,6 @@ pub mod task_sync; // renamed from ai_task_reporting
 pub mod testing;
 pub mod tiered_info;
 pub mod verification;
-pub mod hooks;
-pub mod shell_commands; // Shell command management and execution
-pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
-pub mod mobile_settings; // Mobile settings (ADB path, device config)
-pub mod recap; // Session recap overview
 pub mod video;
 pub mod websocket;
 

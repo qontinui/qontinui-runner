@@ -2,7 +2,9 @@
 //!
 //! Detects patterns like TOCTOU, double-checked locking, and unprotected compound operations.
 
-use super::types::{AccessType, AnalysisContext, RaceIssue, RacePattern, RaceSeverity, StateAccess};
+use super::types::{
+    AccessType, AnalysisContext, RaceIssue, RacePattern, RaceSeverity, StateAccess,
+};
 
 /// Detect TOCTOU (Time-of-Check to Time-of-Use) patterns
 ///
@@ -251,11 +253,7 @@ pub fn detect_partially_protected(ctx: &AnalysisContext, file: &str) -> Vec<Race
 
         // If some but not all accesses are protected
         if protected_count > 0 && protected_count < total_count && total_count > 2 {
-            let unprotected: Vec<_> = state
-                .accesses
-                .iter()
-                .filter(|a| !a.is_protected)
-                .collect();
+            let unprotected: Vec<_> = state.accesses.iter().filter(|a| !a.is_protected).collect();
 
             if let Some(first_unprotected) = unprotected.first() {
                 issues.push(RaceIssue {

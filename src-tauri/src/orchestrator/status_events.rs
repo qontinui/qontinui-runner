@@ -496,7 +496,10 @@ mod tests {
 
     #[test]
     fn test_trigger_to_string() {
-        assert_eq!(trigger_to_string(HookTrigger::PreExecution), "pre_execution");
+        assert_eq!(
+            trigger_to_string(HookTrigger::PreExecution),
+            "pre_execution"
+        );
         assert_eq!(trigger_to_string(HookTrigger::OnError), "on_error");
     }
 }

@@ -234,7 +234,8 @@ impl<'ast> Visit<'ast> for UnsafeVisitor {
                 if matches!(unary.op, syn::UnOp::Deref(_)) {
                     // Check if it's a raw pointer dereference
                     // This is a heuristic - we look for *ptr patterns
-                    if let Expr::Path(_) | Expr::Field(_) | Expr::MethodCall(_) = unary.expr.as_ref()
+                    if let Expr::Path(_) | Expr::Field(_) | Expr::MethodCall(_) =
+                        unary.expr.as_ref()
                     {
                         // Could be pointer deref, report as potential
                         self.add_unsafe(
@@ -419,7 +420,9 @@ mod tests {
 
         let locations = parse_and_analyze(code);
         assert!(
-            locations.iter().any(|l| l.kind == UnsafeKind::UnsafeFunction),
+            locations
+                .iter()
+                .any(|l| l.kind == UnsafeKind::UnsafeFunction),
             "Should detect unsafe function"
         );
     }
@@ -527,6 +530,9 @@ mod tests {
         "#;
 
         let locations = parse_and_analyze(code);
-        assert!(locations.is_empty(), "Safe code should have no unsafe locations");
+        assert!(
+            locations.is_empty(),
+            "Safe code should have no unsafe locations"
+        );
     }
 }

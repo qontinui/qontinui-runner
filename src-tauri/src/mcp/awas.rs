@@ -341,9 +341,18 @@ pub async fn awas_check_support(
                 info!("MCP API: AWAS check support completed");
                 // Parse the response data to extract supported, version, manifest_url
                 let data = response.data.unwrap_or(serde_json::json!({}));
-                let supported = data.get("supported").and_then(|v| v.as_bool()).unwrap_or(false);
-                let version = data.get("version").and_then(|v| v.as_str()).map(String::from);
-                let manifest_url = data.get("manifest_url").and_then(|v| v.as_str()).map(String::from);
+                let supported = data
+                    .get("supported")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let version = data
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let manifest_url = data
+                    .get("manifest_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
 
                 Ok(Json(ApiResponse::success(AwasCheckSupportResponse {
                     supported,
@@ -421,8 +430,15 @@ pub async fn awas_list_actions(
                         arr.iter()
                             .filter_map(|a| {
                                 let id = a.get("id")?.as_str()?.to_string();
-                                let name = a.get("name").and_then(|v| v.as_str()).unwrap_or(&id).to_string();
-                                let description = a.get("description").and_then(|v| v.as_str()).map(String::from);
+                                let name = a
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&id)
+                                    .to_string();
+                                let description = a
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .map(String::from);
                                 let params = a.get("params").cloned();
                                 Some(AwasActionInfo {
                                     id,

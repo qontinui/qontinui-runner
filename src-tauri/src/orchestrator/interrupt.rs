@@ -124,7 +124,11 @@ pub struct DecisionChoice {
 
 impl DecisionChoice {
     /// Create a new decision choice.
-    pub fn new(id: impl Into<String>, label: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
         Self {
             id: id.into(),
             label: label.into(),
@@ -326,7 +330,9 @@ impl Interrupt {
     /// Get the prompt for display.
     pub fn display_prompt(&self) -> String {
         match &self.reason {
-            InterruptReason::HumanApproval { prompt, options, .. } => {
+            InterruptReason::HumanApproval {
+                prompt, options, ..
+            } => {
                 let mut display = prompt.clone();
                 if !options.is_empty() {
                     display.push_str("\n\nOptions:");
@@ -349,8 +355,15 @@ impl Interrupt {
             InterruptReason::CriticalDecision { context, choices } => {
                 let mut display = format!("Decision required:\n{}\n\nChoices:", context);
                 for choice in choices {
-                    let rec = if choice.recommended { " (recommended)" } else { "" };
-                    display.push_str(&format!("\n  - {}: {}{}", choice.label, choice.description, rec));
+                    let rec = if choice.recommended {
+                        " (recommended)"
+                    } else {
+                        ""
+                    };
+                    display.push_str(&format!(
+                        "\n  - {}: {}{}",
+                        choice.label, choice.description, rec
+                    ));
                 }
                 display
             }
@@ -388,7 +401,10 @@ impl Interrupt {
                 }
                 display
             }
-            InterruptReason::Custom { interrupt_type, data } => {
+            InterruptReason::Custom {
+                interrupt_type,
+                data,
+            } => {
                 format!("Custom interrupt ({}): {:?}", interrupt_type, data)
             }
         }
@@ -396,7 +412,9 @@ impl Interrupt {
 }
 
 /// Priority of an interrupt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum InterruptPriority {
     /// Low priority, can wait.
@@ -571,12 +589,16 @@ impl ResumeValue {
 
     /// Create a selected value by label.
     pub fn selected_label(label: impl Into<String>) -> Self {
-        Self::SelectedLabel { label: label.into() }
+        Self::SelectedLabel {
+            label: label.into(),
+        }
     }
 
     /// Create a text value.
     pub fn text(value: impl Into<String>) -> Self {
-        Self::Text { value: value.into() }
+        Self::Text {
+            value: value.into(),
+        }
     }
 
     /// Create a boolean value.
@@ -828,8 +850,8 @@ mod tests {
 
     #[test]
     fn test_interrupt_creation() {
-        let interrupt = Interrupt::human_approval("Continue with deployment?")
-            .with_options(vec!["Yes", "No"]);
+        let interrupt =
+            Interrupt::human_approval("Continue with deployment?").with_options(vec!["Yes", "No"]);
 
         assert!(!interrupt.resolved);
         assert!(matches!(
@@ -849,7 +871,12 @@ mod tests {
         assert_eq!(manager.pending().len(), 1);
 
         let resolved = manager
-            .resume(&id, ResumeAction::Continue, Some(ResumeValue::boolean(true)), "test_user")
+            .resume(
+                &id,
+                ResumeAction::Continue,
+                Some(ResumeValue::boolean(true)),
+                "test_user",
+            )
             .unwrap();
 
         assert!(resolved.resolved);

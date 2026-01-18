@@ -7,8 +7,8 @@ pub mod heuristics;
 pub mod patterns;
 pub mod python;
 pub mod rust;
-pub mod typescript;
 pub mod types;
+pub mod typescript;
 
 use crate::check_executor::output_parser::ParsedOutput;
 use crate::check_executor::types::{CheckStructuredOutput, CheckSummary, IssueSeverity};
@@ -99,7 +99,10 @@ pub fn analyze_all(working_dir: &str) -> Result<ParsedOutput, String> {
         .iter()
         .filter(|i| {
             i.severity == IssueSeverity::Error
-                && matches!(i.code.as_deref(), Some("RACE002") | Some("RACE003") | Some("RACE004"))
+                && matches!(
+                    i.code.as_deref(),
+                    Some("RACE002") | Some("RACE003") | Some("RACE004")
+                )
         })
         .count() as u32;
     let medium_count = all_issues
@@ -197,7 +200,8 @@ mod tests {
                 if !output.structured_output.issues.is_empty() {
                     println!("\n=== Issues Found ===\n");
                     for issue in &output.structured_output.issues {
-                        println!("[{}] {} (line {})",
+                        println!(
+                            "[{}] {} (line {})",
                             issue.code.as_deref().unwrap_or("???"),
                             issue.file,
                             issue.line.unwrap_or(0)

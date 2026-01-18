@@ -224,8 +224,7 @@ impl AgentTool {
 
     /// Add an input parameter.
     pub fn with_input(mut self, name: impl Into<String>, input_type: ToolInputType) -> Self {
-        self.inputs
-            .push(ToolInput::required(name, input_type));
+        self.inputs.push(ToolInput::required(name, input_type));
         self
     }
 
@@ -553,9 +552,11 @@ impl ToolRegistry {
 
     /// Get a tool by ID or alias.
     pub fn get(&self, id: &str) -> Option<&AgentTool> {
-        self.agent_tools
-            .get(id)
-            .or_else(|| self.aliases.get(id).and_then(|real_id| self.agent_tools.get(real_id)))
+        self.agent_tools.get(id).or_else(|| {
+            self.aliases
+                .get(id)
+                .and_then(|real_id| self.agent_tools.get(real_id))
+        })
     }
 
     /// List all tool IDs.
@@ -573,7 +574,10 @@ impl ToolRegistry {
 
     /// Get all tools as JSON schemas (for LLM function calling).
     pub fn to_json_schemas(&self) -> Vec<serde_json::Value> {
-        self.agent_tools.values().map(|t| t.to_json_schema()).collect()
+        self.agent_tools
+            .values()
+            .map(|t| t.to_json_schema())
+            .collect()
     }
 
     /// Create registry with predefined agent tools.

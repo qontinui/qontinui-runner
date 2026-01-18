@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-use super::types::{ExplorationResult, ExplorationStatus, StateExplorationResult, TransitionExplorationResult};
+use super::types::{
+    ExplorationResult, ExplorationStatus, StateExplorationResult, TransitionExplorationResult,
+};
 
 /// Type of discrepancy found during exploration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

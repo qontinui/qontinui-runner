@@ -157,14 +157,12 @@ impl OrchestratorRuntime {
 
         // Configure modules based on config
         if config.checkpoint.enabled {
-            modules.checkpoints = CheckpointManager::new()
-                .with_max_per_task(config.checkpoint.max_checkpoints);
+            modules.checkpoints =
+                CheckpointManager::new().with_max_per_task(config.checkpoint.max_checkpoints);
         }
 
         if config.learning.enabled {
-            modules.learning = LearningSystem::with_config(
-                config.learning.clone().into(),
-            );
+            modules.learning = LearningSystem::with_config(config.learning.clone().into());
         }
 
         if config.roles.use_predefined_roles {
@@ -247,8 +245,7 @@ impl OrchestratorRuntime {
         if self.config.learning.enabled {
             let task_id = self.state.task_id.clone().unwrap_or_default();
             let outcome = if success {
-                TaskOutcome::success(&task_id)
-                    .with_iterations(self.state.iteration)
+                TaskOutcome::success(&task_id).with_iterations(self.state.iteration)
             } else {
                 TaskOutcome::failure(&task_id)
                     .with_iterations(self.state.iteration)
@@ -299,7 +296,9 @@ impl OrchestratorRuntime {
     /// Get recent memory context.
     pub fn get_memory_context(&self, limit: usize) -> Vec<String> {
         if self.config.memory.enabled {
-            self.modules.memory.short_term
+            self.modules
+                .memory
+                .short_term
                 .get_recent(limit)
                 .iter()
                 .map(|i| i.content.clone())
@@ -401,10 +400,8 @@ impl OrchestratorRuntime {
             custom_data: HashMap::new(),
         };
 
-        let checkpoint = Checkpoint::new(
-            self.state.task_id.as_deref().unwrap_or("unknown"),
-            snapshot,
-        );
+        let checkpoint =
+            Checkpoint::new(self.state.task_id.as_deref().unwrap_or("unknown"), snapshot);
 
         let checkpoint_id = self.modules.checkpoints.save(checkpoint);
 
@@ -431,7 +428,10 @@ impl OrchestratorRuntime {
             return Err("Checkpointing is disabled".to_string());
         }
 
-        let checkpoint = self.modules.checkpoints.load(checkpoint_id)
+        let checkpoint = self
+            .modules
+            .checkpoints
+            .load(checkpoint_id)
             .ok_or_else(|| format!("Checkpoint '{}' not found", checkpoint_id))?;
 
         self.state.task_id = Some(checkpoint.task_id.clone());
@@ -462,7 +462,9 @@ impl OrchestratorRuntime {
             merge_strategy: execution.merge_strategy.clone(),
         };
 
-        self.state.parallel_executions.insert(execution_id.clone(), state);
+        self.state
+            .parallel_executions
+            .insert(execution_id.clone(), state);
         self.state.status = RuntimeStatus::InParallelExecution;
 
         Ok(execution_id)
@@ -494,7 +496,10 @@ impl OrchestratorRuntime {
             return Err("Flow mode is disabled".to_string());
         }
 
-        let flow = self.modules.flows.get(flow_id)
+        let flow = self
+            .modules
+            .flows
+            .get(flow_id)
             .ok_or_else(|| format!("Flow '{}' not found", flow_id))?
             .clone();
 
@@ -634,20 +639,48 @@ impl OrchestratorRuntime {
     pub fn enabled_features(&self) -> Vec<String> {
         let mut features = Vec::new();
 
-        if self.config.ledger.enabled { features.push("ledger".to_string()); }
-        if self.config.context.enabled { features.push("context".to_string()); }
-        if self.config.layers.enabled { features.push("layers".to_string()); }
-        if self.config.interrupt.enabled { features.push("interrupt".to_string()); }
-        if self.config.memory.enabled { features.push("memory".to_string()); }
-        if self.config.roles.enabled { features.push("roles".to_string()); }
-        if self.config.channels.enabled { features.push("channels".to_string()); }
-        if self.config.events.enabled { features.push("events".to_string()); }
-        if self.config.subflows.enabled { features.push("subflows".to_string()); }
-        if self.config.parallel.enabled { features.push("parallel".to_string()); }
-        if self.config.agent_tools.enabled { features.push("agent_tools".to_string()); }
-        if self.config.checkpoint.enabled { features.push("checkpoint".to_string()); }
-        if self.config.flow.enabled { features.push("flow".to_string()); }
-        if self.config.learning.enabled { features.push("learning".to_string()); }
+        if self.config.ledger.enabled {
+            features.push("ledger".to_string());
+        }
+        if self.config.context.enabled {
+            features.push("context".to_string());
+        }
+        if self.config.layers.enabled {
+            features.push("layers".to_string());
+        }
+        if self.config.interrupt.enabled {
+            features.push("interrupt".to_string());
+        }
+        if self.config.memory.enabled {
+            features.push("memory".to_string());
+        }
+        if self.config.roles.enabled {
+            features.push("roles".to_string());
+        }
+        if self.config.channels.enabled {
+            features.push("channels".to_string());
+        }
+        if self.config.events.enabled {
+            features.push("events".to_string());
+        }
+        if self.config.subflows.enabled {
+            features.push("subflows".to_string());
+        }
+        if self.config.parallel.enabled {
+            features.push("parallel".to_string());
+        }
+        if self.config.agent_tools.enabled {
+            features.push("agent_tools".to_string());
+        }
+        if self.config.checkpoint.enabled {
+            features.push("checkpoint".to_string());
+        }
+        if self.config.flow.enabled {
+            features.push("flow".to_string());
+        }
+        if self.config.learning.enabled {
+            features.push("learning".to_string());
+        }
 
         features
     }
@@ -793,11 +826,13 @@ mod tests {
 
         // Create test context items
         let items: Vec<ContextItem> = (0..100)
-            .map(|i| ContextItem::new(
-                format!("item-{}", i),
-                "a".repeat(1000),
-                ItemCategory::WorkOutput,
-            ))
+            .map(|i| {
+                ContextItem::new(
+                    format!("item-{}", i),
+                    "a".repeat(1000),
+                    ItemCategory::WorkOutput,
+                )
+            })
             .collect();
 
         let result = runtime.apply_context_strategy(&items);

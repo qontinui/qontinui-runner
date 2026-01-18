@@ -169,7 +169,10 @@ mod tests {
     #[test]
     fn test_default_dev_logs_dir_is_valid() {
         let path = get_default_dev_logs_dir();
-        assert!(path.ends_with("qontinui-runner/dev-logs") || path.ends_with("qontinui-runner\\dev-logs"));
+        assert!(
+            path.ends_with("qontinui-runner/dev-logs")
+                || path.ends_with("qontinui-runner\\dev-logs")
+        );
     }
 
     #[test]

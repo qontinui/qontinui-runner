@@ -36,8 +36,8 @@ use crate::orchestrator::{
     },
     planning::{create_replan, create_simple_plan, inject_plan_context},
     realtime_events::{
-        emit_checkpoint_created, emit_learning_update, emit_task_completed, emit_task_started,
-        emit_iteration_started as emit_realtime_iteration_started,
+        emit_checkpoint_created, emit_iteration_started as emit_realtime_iteration_started,
+        emit_learning_update, emit_task_completed, emit_task_started,
     },
     types::{
         DomainAssignment, DomainVerificationResult, IterationVerificationResults,
@@ -113,7 +113,10 @@ pub fn generate_verification_guidance(plan: &VerificationPlan) -> String {
     }
 
     // Check for AI-evaluated criteria
-    let has_ai_criteria = plan.success_criteria.iter().any(|c| c.criterion_type == CriterionType::AiEvaluated);
+    let has_ai_criteria = plan
+        .success_criteria
+        .iter()
+        .any(|c| c.criterion_type == CriterionType::AiEvaluated);
 
     if seen_methods.is_empty() && !has_ai_criteria {
         return guidance;
@@ -186,7 +189,11 @@ fn generate_criteria_summary(plan: &VerificationPlan) -> String {
     summary.push_str("\n### Success Criteria Summary\n\n");
 
     for criterion in &plan.success_criteria {
-        let critical_marker = if criterion.is_critical { "🔴" } else { "🟡" };
+        let critical_marker = if criterion.is_critical {
+            "🔴"
+        } else {
+            "🟡"
+        };
         summary.push_str(&format!(
             "- {} **{}**: {}\n",
             critical_marker, criterion.id, criterion.description
@@ -316,7 +323,6 @@ pub struct OrchestratorState {
     // ========================================================================
     // Task Duration Tracking
     // ========================================================================
-
     /// When the task was initialized (for total duration calculation)
     pub started_at: Option<Instant>,
     /// ISO timestamp when task started (for display/logging)
@@ -409,7 +415,12 @@ impl OrchestratorState {
     }
 
     /// Create a new worker and add it to the state.
-    pub fn create_worker(&mut self, worker_id: &str, name: &str, max_iterations: u32) -> &mut WorkerInstance {
+    pub fn create_worker(
+        &mut self,
+        worker_id: &str,
+        name: &str,
+        max_iterations: u32,
+    ) -> &mut WorkerInstance {
         let worker = WorkerInstance::new(worker_id, name, max_iterations);
         self.workers.insert(worker_id.to_string(), worker);
         self.workers.get_mut(worker_id).unwrap()
@@ -441,16 +452,20 @@ impl OrchestratorState {
     /// Check if all workers have completed.
     pub fn all_workers_complete(&self) -> bool {
         !self.workers.is_empty()
-            && self.workers.values().all(|w| {
-                matches!(w.status, WorkerStatus::Completed | WorkerStatus::Error)
-            })
+            && self
+                .workers
+                .values()
+                .all(|w| matches!(w.status, WorkerStatus::Completed | WorkerStatus::Error))
     }
 
     /// Check if all workers are awaiting verification.
     pub fn all_workers_awaiting_verification(&self) -> bool {
         !self.workers.is_empty()
             && self.workers.values().all(|w| {
-                matches!(w.status, WorkerStatus::AwaitingVerification | WorkerStatus::Completed)
+                matches!(
+                    w.status,
+                    WorkerStatus::AwaitingVerification | WorkerStatus::Completed
+                )
             })
     }
 
@@ -461,16 +476,24 @@ impl OrchestratorState {
 
     /// Get a domain assignment by ID.
     pub fn get_domain(&self, domain_id: &str) -> Option<&DomainAssignment> {
-        self.domain_assignments.iter().find(|d| d.domain_id == domain_id)
+        self.domain_assignments
+            .iter()
+            .find(|d| d.domain_id == domain_id)
     }
 
     /// Get a mutable reference to a domain assignment by ID.
     pub fn get_domain_mut(&mut self, domain_id: &str) -> Option<&mut DomainAssignment> {
-        self.domain_assignments.iter_mut().find(|d| d.domain_id == domain_id)
+        self.domain_assignments
+            .iter_mut()
+            .find(|d| d.domain_id == domain_id)
     }
 
     /// Assign a worker to a domain.
-    pub fn assign_worker_to_domain(&mut self, worker_id: &str, domain_id: &str) -> Result<(), String> {
+    pub fn assign_worker_to_domain(
+        &mut self,
+        worker_id: &str,
+        domain_id: &str,
+    ) -> Result<(), String> {
         // Update the worker
         if let Some(worker) = self.workers.get_mut(worker_id) {
             worker.assign_to_domain(domain_id);
@@ -479,7 +502,11 @@ impl OrchestratorState {
         }
 
         // Update the domain
-        if let Some(domain) = self.domain_assignments.iter_mut().find(|d| d.domain_id == domain_id) {
+        if let Some(domain) = self
+            .domain_assignments
+            .iter_mut()
+            .find(|d| d.domain_id == domain_id)
+        {
             domain.assign_worker(worker_id);
         } else {
             return Err(format!("Domain '{}' not found", domain_id));
@@ -495,22 +522,30 @@ impl OrchestratorState {
     }
 
     /// Get coordination messages for a specific worker.
-    pub fn coordination_messages_for_worker(&self, worker_id: &str) -> Vec<&WorkerCoordinationMessage> {
+    pub fn coordination_messages_for_worker(
+        &self,
+        worker_id: &str,
+    ) -> Vec<&WorkerCoordinationMessage> {
         self.coordination_messages
             .iter()
             .filter(|m| match m {
                 WorkerCoordinationMessage::FilesModified { worker_id: id, .. } => id != worker_id,
                 WorkerCoordinationMessage::SharedFinding { worker_id: id, .. } => id != worker_id,
                 WorkerCoordinationMessage::Blocked { waiting_for, .. } => waiting_for == worker_id,
-                WorkerCoordinationMessage::ReadyForVerification { worker_id: id, .. } => id != worker_id,
-                WorkerCoordinationMessage::SyncPoint { worker_ids, .. } => worker_ids.contains(&worker_id.to_string()),
+                WorkerCoordinationMessage::ReadyForVerification { worker_id: id, .. } => {
+                    id != worker_id
+                }
+                WorkerCoordinationMessage::SyncPoint { worker_ids, .. } => {
+                    worker_ids.contains(&worker_id.to_string())
+                }
             })
             .collect()
     }
 
     /// Store domain verification result.
     pub fn store_domain_verification(&mut self, result: DomainVerificationResult) {
-        self.domain_verification_results.insert(result.domain_id.clone(), result);
+        self.domain_verification_results
+            .insert(result.domain_id.clone(), result);
     }
 
     /// Check if all domains have passed verification.
@@ -601,16 +636,16 @@ impl Orchestrator {
     fn execute_hooks(&self, trigger: HookTrigger, state: &OrchestratorState) {
         let context = HookContext::new(&state.task_run_id, "orchestrated_task")
             .with_iteration(state.iteration)
-            .with_status(if state.is_complete { "complete" } else { "running" });
+            .with_status(if state.is_complete {
+                "complete"
+            } else {
+                "running"
+            });
 
         let results = self.hook_executor.execute_trigger(trigger, &context);
         for result in results {
             if !result.success {
-                warn!(
-                    "Hook {} failed: {:?}",
-                    result.hook_name,
-                    result.error
-                );
+                warn!("Hook {} failed: {:?}", result.hook_name, result.error);
             }
         }
     }
@@ -832,10 +867,9 @@ impl Orchestrator {
 
         // Add plan info to custom data
         if let Some(ref plan) = state.plan {
-            snapshot.custom_data.insert(
-                "plan_version".to_string(),
-                serde_json::json!(plan.version),
-            );
+            snapshot
+                .custom_data
+                .insert("plan_version".to_string(), serde_json::json!(plan.version));
             snapshot.custom_data.insert(
                 "criteria_count".to_string(),
                 serde_json::json!(plan.success_criteria.len()),
@@ -874,7 +908,12 @@ impl Orchestrator {
         if let Some(app_handle) = &self.app_handle {
             emit_orchestrator_task_start(app_handle, task_run_id, goal, self.session_ctx_ref());
             // Emit realtime task status event
-            emit_task_started(app_handle, task_run_id, self.config.max_iterations, Some(goal));
+            emit_task_started(
+                app_handle,
+                task_run_id,
+                self.config.max_iterations,
+                Some(goal),
+            );
         }
 
         let mut state = OrchestratorState::new(task_run_id.to_string());
@@ -907,12 +946,20 @@ impl Orchestrator {
             // Emit plan created output
             if let Some(app_handle) = &self.app_handle {
                 emit_plan_created(app_handle, &plan_result.plan, self.session_ctx_ref());
-                emit_planning_complete(app_handle, plan_result.plan.version, self.session_ctx_ref());
+                emit_planning_complete(
+                    app_handle,
+                    plan_result.plan.version,
+                    self.session_ctx_ref(),
+                );
             }
 
             info!(
                 "Created verification plan with {} criteria",
-                state.plan.as_ref().map(|p| p.success_criteria.len()).unwrap_or(0)
+                state
+                    .plan
+                    .as_ref()
+                    .map(|p| p.success_criteria.len())
+                    .unwrap_or(0)
             );
 
             // Save checkpoint after planning completes
@@ -963,10 +1010,7 @@ impl Orchestrator {
         }
 
         // Run verification (no screenshot for initial verification)
-        let results = self
-            .verifier
-            .verify(plan, 0, None)
-            .await;
+        let results = self.verifier.verify(plan, 0, None).await;
 
         // Emit results for each deterministic check
         if let Some(app_handle) = &self.app_handle {
@@ -1039,8 +1083,16 @@ impl Orchestrator {
 
         info!(
             "Initial verification complete: {} passed, {} failed",
-            results.deterministic_results.iter().filter(|r| r.passed).count(),
-            results.deterministic_results.iter().filter(|r| !r.passed).count()
+            results
+                .deterministic_results
+                .iter()
+                .filter(|r| r.passed)
+                .count(),
+            results
+                .deterministic_results
+                .iter()
+                .filter(|r| !r.passed)
+                .count()
         );
 
         Ok(results)
@@ -1109,15 +1161,21 @@ impl Orchestrator {
             // Emit context injection output
             if let Some(app_handle) = &self.app_handle {
                 // Count knowledge by category for output
-                let findings_count = self.knowledge_base
+                let findings_count = self
+                    .knowledge_base
                     .get_knowledge_by_category(&state.task_run_id, KnowledgeCategory::Finding)
                     .map(|k| k.len())
                     .unwrap_or(0);
-                let feedback_count = self.knowledge_base
-                    .get_knowledge_by_category(&state.task_run_id, KnowledgeCategory::VerificationFeedback)
+                let feedback_count = self
+                    .knowledge_base
+                    .get_knowledge_by_category(
+                        &state.task_run_id,
+                        KnowledgeCategory::VerificationFeedback,
+                    )
                     .map(|k| k.len())
                     .unwrap_or(0);
-                let observations_count = self.knowledge_base
+                let observations_count = self
+                    .knowledge_base
                     .get_knowledge_by_category(&state.task_run_id, KnowledgeCategory::Observation)
                     .map(|k| k.len())
                     .unwrap_or(0);
@@ -1209,11 +1267,8 @@ impl Orchestrator {
 
         // Record any findings and emit output
         for finding in &findings {
-            self.knowledge_base.record_finding(
-                &state.task_run_id,
-                finding,
-                state.iteration,
-            )?;
+            self.knowledge_base
+                .record_finding(&state.task_run_id, finding, state.iteration)?;
 
             // Emit finding recorded output
             if let Some(app_handle) = &self.app_handle {
@@ -1449,11 +1504,7 @@ impl Orchestrator {
     }
 
     /// Handle a replan request from a worker.
-    pub fn handle_replan(
-        &self,
-        state: &mut OrchestratorState,
-        reason: &str,
-    ) -> Result<(), String> {
+    pub fn handle_replan(&self, state: &mut OrchestratorState, reason: &str) -> Result<(), String> {
         info!(
             "Handling replan for task {} (reason: {})",
             state.task_run_id, reason
@@ -1480,18 +1531,10 @@ impl Orchestrator {
     }
 
     /// Mark the task as complete.
-    pub fn complete_task(
-        &self,
-        state: &mut OrchestratorState,
-        result: TaskCompletionResult,
-    ) {
+    pub fn complete_task(&self, state: &mut OrchestratorState, result: TaskCompletionResult) {
         let (status_name, is_success, reason) = match &result {
-            TaskCompletionResult::Success { .. } => {
-                ("Success", true, None)
-            }
-            TaskCompletionResult::Failed { reason, .. } => {
-                ("Failed", false, Some(reason.as_str()))
-            }
+            TaskCompletionResult::Success { .. } => ("Success", true, None),
+            TaskCompletionResult::Failed { reason, .. } => ("Failed", false, Some(reason.as_str())),
             TaskCompletionResult::Stopped { .. } => {
                 ("Stopped", false, Some("Task stopped by user"))
             }
@@ -1500,7 +1543,10 @@ impl Orchestrator {
             }
         };
 
-        info!("Marking task {} as complete: {}", state.task_run_id, status_name);
+        info!(
+            "Marking task {} as complete: {}",
+            state.task_run_id, status_name
+        );
 
         // Complete timing for the final iteration
         state.complete_iteration_timing();
@@ -1560,29 +1606,51 @@ impl Orchestrator {
     }
 
     /// Record a learning outcome to the database for the AI learning system.
-    fn record_learning_outcome(
-        &self,
-        state: &OrchestratorState,
-        result: &TaskCompletionResult,
-    ) {
+    fn record_learning_outcome(&self, state: &OrchestratorState, result: &TaskCompletionResult) {
         // Map completion result to status and extract data
         let (status, iterations, error_message, findings) = match result {
-            TaskCompletionResult::Success { iterations, findings, .. } => {
-                ("success", *iterations, None, findings.clone())
-            }
-            TaskCompletionResult::Failed { reason, iterations, findings, .. } => {
-                ("failure", *iterations, Some(reason.clone()), findings.clone())
-            }
-            TaskCompletionResult::Stopped { at_iteration, findings, .. } => {
-                ("abandoned", *at_iteration, Some("Task stopped by user".to_string()), findings.clone())
-            }
-            TaskCompletionResult::Paused { at_iteration, findings, .. } => {
-                ("partial", *at_iteration, Some("Max iterations reached".to_string()), findings.clone())
-            }
+            TaskCompletionResult::Success {
+                iterations,
+                findings,
+                ..
+            } => ("success", *iterations, None, findings.clone()),
+            TaskCompletionResult::Failed {
+                reason,
+                iterations,
+                findings,
+                ..
+            } => (
+                "failure",
+                *iterations,
+                Some(reason.clone()),
+                findings.clone(),
+            ),
+            TaskCompletionResult::Stopped {
+                at_iteration,
+                findings,
+                ..
+            } => (
+                "abandoned",
+                *at_iteration,
+                Some("Task stopped by user".to_string()),
+                findings.clone(),
+            ),
+            TaskCompletionResult::Paused {
+                at_iteration,
+                findings,
+                ..
+            } => (
+                "partial",
+                *at_iteration,
+                Some("Max iterations reached".to_string()),
+                findings.clone(),
+            ),
         };
 
         // Extract files touched from workers (collect unique files)
-        let files_modified: Vec<String> = state.workers.values()
+        let files_modified: Vec<String> = state
+            .workers
+            .values()
             .flat_map(|w| w.touched_files.iter().cloned())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -1691,7 +1759,10 @@ impl Orchestrator {
     }
 
     /// Get accumulated findings for a task.
-    pub fn get_findings(&self, task_run_id: &str) -> Result<Vec<crate::database::StoredTaskKnowledge>, String> {
+    pub fn get_findings(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<crate::database::StoredTaskKnowledge>, String> {
         self.knowledge_base.get_all_knowledge(task_run_id)
     }
 
@@ -1811,20 +1882,26 @@ impl Orchestrator {
             prompt.push_str("## Updates from Other Workers\n\n");
             for msg in coord_messages {
                 match msg {
-                    WorkerCoordinationMessage::FilesModified { worker_id: id, files } => {
-                        prompt.push_str(&format!(
-                            "- **{}** modified: {}\n",
-                            id,
-                            files.join(", ")
-                        ));
+                    WorkerCoordinationMessage::FilesModified {
+                        worker_id: id,
+                        files,
+                    } => {
+                        prompt.push_str(&format!("- **{}** modified: {}\n", id, files.join(", ")));
                     }
-                    WorkerCoordinationMessage::SharedFinding { worker_id: id, finding } => {
+                    WorkerCoordinationMessage::SharedFinding {
+                        worker_id: id,
+                        finding,
+                    } => {
                         prompt.push_str(&format!(
                             "- **{}** found: {} ({})\n",
                             id, finding.description, finding.finding_type
                         ));
                     }
-                    WorkerCoordinationMessage::Blocked { worker_id: id, reason, .. } => {
+                    WorkerCoordinationMessage::Blocked {
+                        worker_id: id,
+                        reason,
+                        ..
+                    } => {
                         prompt.push_str(&format!("- **{}** is blocked: {}\n", id, reason));
                     }
                     WorkerCoordinationMessage::ReadyForVerification { worker_id: id, .. } => {
@@ -1877,7 +1954,9 @@ impl Orchestrator {
         prompt.push_str("## Worker Signals\n\n");
         prompt.push_str("When you complete work in your domain, emit:\n");
         prompt.push_str("```\n[WORK_COMPLETE] Brief reason why your domain work is done\n```\n\n");
-        prompt.push_str("The system will coordinate with other workers before running verification.\n\n");
+        prompt.push_str(
+            "The system will coordinate with other workers before running verification.\n\n",
+        );
 
         // Add base prompt
         prompt.push_str("---\n\n");
@@ -1919,11 +1998,8 @@ impl Orchestrator {
             }
 
             // Record in knowledge base
-            self.knowledge_base.record_finding(
-                &task_run_id,
-                finding,
-                worker_iteration,
-            )?;
+            self.knowledge_base
+                .record_finding(&task_run_id, finding, worker_iteration)?;
 
             // Add coordination message for shared findings
             state.add_coordination_message(WorkerCoordinationMessage::SharedFinding {
@@ -1937,7 +2013,9 @@ impl Orchestrator {
             Some(WorkerSignal::WorkComplete { reason }) => {
                 let worker = state.get_worker_mut(worker_id).unwrap();
                 worker.await_verification();
-                worker.last_signal = Some(WorkerSignal::WorkComplete { reason: reason.clone() });
+                worker.last_signal = Some(WorkerSignal::WorkComplete {
+                    reason: reason.clone(),
+                });
 
                 let domain = worker.domain.clone();
                 state.add_coordination_message(WorkerCoordinationMessage::ReadyForVerification {
@@ -1960,11 +2038,12 @@ impl Orchestrator {
             }
             Some(WorkerSignal::NeedReplan { reason }) => {
                 let worker = state.get_worker_mut(worker_id).unwrap();
-                worker.last_signal = Some(WorkerSignal::NeedReplan { reason: reason.clone() });
+                worker.last_signal = Some(WorkerSignal::NeedReplan {
+                    reason: reason.clone(),
+                });
                 info!(
                     "Worker '{}' signaled NEED_REPLAN at iteration {}",
-                    worker_id,
-                    worker.iteration
+                    worker_id, worker.iteration
                 );
                 Ok(WorkerOutputAction::Replan { reason })
             }
@@ -1981,7 +2060,11 @@ impl Orchestrator {
                     );
                     // Check if this is the last worker to hit max
                     let all_at_max = state.workers.values().all(|w| {
-                        w.iteration >= w.max_iterations || matches!(w.status, WorkerStatus::Completed | WorkerStatus::AwaitingVerification)
+                        w.iteration >= w.max_iterations
+                            || matches!(
+                                w.status,
+                                WorkerStatus::Completed | WorkerStatus::AwaitingVerification
+                            )
                     });
                     if all_at_max {
                         Ok(WorkerOutputAction::MaxIterationsReached)
@@ -2068,7 +2151,11 @@ impl Orchestrator {
         if domain_criteria.is_empty() {
             return Ok(DomainVerificationResult {
                 domain_id: domain_id.to_string(),
-                worker_ids: state.workers_for_domain(domain_id).iter().map(|w| w.worker_id.clone()).collect(),
+                worker_ids: state
+                    .workers_for_domain(domain_id)
+                    .iter()
+                    .map(|w| w.worker_id.clone())
+                    .collect(),
                 results: vec![],
                 all_passed: true,
                 failure_summary: None,
@@ -2196,7 +2283,10 @@ impl Orchestrator {
             issue_threshold: exploration_config.checkpoint_issue_threshold,
             pause_on_critical: exploration_config.checkpoint_on_critical,
             interleave_enabled: exploration_config.interleave_with_agentic,
-            checkpoint_dir: exploration_config.output_directory.clone().map(PathBuf::from),
+            checkpoint_dir: exploration_config
+                .output_directory
+                .clone()
+                .map(PathBuf::from),
         };
 
         // Create checkpoint manager
@@ -2206,7 +2296,8 @@ impl Orchestrator {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".dev-logs/state-explorer"));
 
-        let _checkpoint_manager = CheckpointManager::new(checkpoint_config.clone(), output_dir.clone());
+        let _checkpoint_manager =
+            CheckpointManager::new(checkpoint_config.clone(), output_dir.clone());
 
         // Create and run the exploration task
         let task = ExplorationTask::new(exploration_config.clone(), app_state);
@@ -2224,13 +2315,17 @@ impl Orchestrator {
                 result
                     .state_explorations
                     .iter()
-                    .filter(|s| matches!(s.status, crate::state_explorer::ExplorationStatus::Passed))
+                    .filter(|s| {
+                        matches!(s.status, crate::state_explorer::ExplorationStatus::Passed)
+                    })
                     .map(|s| s.state_id.clone())
                     .collect(),
                 result
                     .state_explorations
                     .iter()
-                    .filter(|s| matches!(s.status, crate::state_explorer::ExplorationStatus::Pending))
+                    .filter(|s| {
+                        matches!(s.status, crate::state_explorer::ExplorationStatus::Pending)
+                    })
                     .map(|s| s.state_id.clone())
                     .collect(),
                 result.states_visited as usize,
@@ -2283,10 +2378,7 @@ impl Orchestrator {
                 ExplorationInterleaveStatus::CompletedSuccess
             };
 
-            info!(
-                "Exploration completed with status: {:?}",
-                final_status
-            );
+            info!("Exploration completed with status: {:?}", final_status);
 
             Ok(ExplorationInterleaveResult {
                 status: final_status,
@@ -2479,7 +2571,8 @@ pub async fn run_orchestrated_task(
                     // Verification failed, continue iteration
                     if state.iteration >= config.max_iterations {
                         let result = TaskCompletionResult::Failed {
-                            reason: "Max iterations reached without passing verification".to_string(),
+                            reason: "Max iterations reached without passing verification"
+                                .to_string(),
                             iterations: state.iteration,
                             last_results: Some(results),
                             findings: vec![],
@@ -2591,7 +2684,10 @@ mod tests {
 
         worker.error("Something went wrong");
         assert_eq!(worker.status, WorkerStatus::Error);
-        assert_eq!(worker.error_message, Some("Something went wrong".to_string()));
+        assert_eq!(
+            worker.error_message,
+            Some("Something went wrong".to_string())
+        );
         assert!(worker.completed_at.is_some());
     }
 
@@ -2705,10 +2801,16 @@ mod tests {
         assert!(!state.all_workers_awaiting_verification());
 
         // Mark both as awaiting verification
-        state.get_worker_mut("worker-1").unwrap().await_verification();
+        state
+            .get_worker_mut("worker-1")
+            .unwrap()
+            .await_verification();
         assert!(!state.all_workers_awaiting_verification());
 
-        state.get_worker_mut("worker-2").unwrap().await_verification();
+        state
+            .get_worker_mut("worker-2")
+            .unwrap()
+            .await_verification();
         assert!(state.all_workers_awaiting_verification());
     }
 

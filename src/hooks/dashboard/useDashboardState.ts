@@ -161,19 +161,20 @@ export function useDashboardState(): UseDashboardStateResult {
           // Ignore errors checking AI status
         }
 
-        // Update activity states based on what's running
-        // Priority: GUI running > AI running > default to AI if prompt exists
+        // Update activity states based on what's actually running
+        // Only set "running" status when there's actual evidence of activity
+        // This prevents flickering from aggressive status toggling
         if (guiRunning) {
           updateActivityState("gui_automation", { status: "running" });
-          updateActivityState("ai_conversation", { status: "idle" });
-        } else if (aiRunning) {
+        } else {
           updateActivityState("gui_automation", { status: "idle" });
-          updateActivityState("ai_conversation", { status: "running" });
-        } else if (taskInfo?.hasPrompt) {
-          // Default to AI conversation when nothing else is running
-          updateActivityState("gui_automation", { status: "idle" });
+        }
+
+        if (aiRunning) {
           updateActivityState("ai_conversation", { status: "running" });
         }
+        // Note: Don't set AI to idle when not running - let it stay in its current state
+        // This prevents flickering when AI pauses between outputs
       } catch {
         // Silently ignore polling errors
       }

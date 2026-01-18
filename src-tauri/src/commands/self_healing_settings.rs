@@ -4,9 +4,7 @@
 //! - Getting and setting self-healing settings
 //! - Secure API key storage in OS keychain for remote LLM providers
 
-use crate::settings::{
-    self, SelfHealingApiProvider, SelfHealingLlmMode, SelfHealingSettings,
-};
+use crate::settings::{self, SelfHealingApiProvider, SelfHealingLlmMode, SelfHealingSettings};
 use anyhow::{Context, Result};
 use keyring::Entry;
 use tracing::info;
@@ -38,7 +36,10 @@ fn get_self_healing_api_key(provider: &str) -> Result<Option<String>> {
     match entry.get_password() {
         Ok(key) => Ok(Some(key)),
         Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("Failed to retrieve self-healing API key: {}", e)),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to retrieve self-healing API key: {}",
+            e
+        )),
     }
 }
 
@@ -55,7 +56,10 @@ fn delete_api_key_from_keychain(provider: &str) -> Result<()> {
             info!("No self-healing API key found for provider: {}", provider);
             Ok(())
         }
-        Err(e) => Err(anyhow::anyhow!("Failed to delete self-healing API key: {}", e)),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to delete self-healing API key: {}",
+            e
+        )),
     }
 }
 
@@ -205,7 +209,10 @@ pub fn delete_self_healing_api_key(provider: String) -> Result<CommandResponse, 
 /// * `Err(String)` - Error message if check fails
 #[tauri::command]
 pub fn has_self_healing_api_key(provider: String) -> Result<CommandResponse, String> {
-    info!("Checking if self-healing API key exists for provider: {}", provider);
+    info!(
+        "Checking if self-healing API key exists for provider: {}",
+        provider
+    );
 
     let has_key = get_self_healing_api_key(&provider)
         .map_err(|e| format!("Failed to check API key: {}", e))?

@@ -34,7 +34,10 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
     };
 
     let files = walk_files(root, &config);
-    debug!("Found {} Python files to analyze for race conditions", files.len());
+    debug!(
+        "Found {} Python files to analyze for race conditions",
+        files.len()
+    );
 
     let mut parser = tree_sitter::Parser::new();
     let language = tree_sitter_python::LANGUAGE;
@@ -89,7 +92,11 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
 
         // Apply heuristics to reduce false positives
         for issue in &mut issues {
-            if let Some(state) = ctx.shared_states.iter().find(|s| s.name == issue.state_name) {
+            if let Some(state) = ctx
+                .shared_states
+                .iter()
+                .find(|s| s.name == issue.state_name)
+            {
                 heuristics::adjust_severity(issue, state, is_test);
             }
         }

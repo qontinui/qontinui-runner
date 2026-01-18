@@ -31,11 +31,7 @@ export type WorkflowPhase = "setup" | "verification" | "agentic" | "completion";
  * - "all": Use all enabled log sources
  * - { profile_id: string }: Use a specific profile
  */
-export type LogSourceSelection =
-  | "default"
-  | "ai"
-  | "all"
-  | { profile_id: string };
+export type LogSourceSelection = "default" | "ai" | "all" | { profile_id: string };
 
 // =============================================================================
 // Step Types

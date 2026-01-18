@@ -51,7 +51,10 @@ pub fn run_native_analyzer(check_def: &CheckDefinition) -> Result<ParsedOutput, 
         // CheckTool::QualityGate => common::quality_gate::analyze(working_dir, check_def),
 
         // Not a native analyzer - use command execution
-        _ => Err(format!("Tool {:?} is not a native analyzer", check_def.tool)),
+        _ => Err(format!(
+            "Tool {:?} is not a native analyzer",
+            check_def.tool
+        )),
     }
 }
 

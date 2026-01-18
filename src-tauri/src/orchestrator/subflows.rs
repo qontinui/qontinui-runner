@@ -253,10 +253,7 @@ impl InputPort {
             // Check allowed values
             if let Some(allowed) = &rules.allowed_values {
                 if !allowed.contains(value) {
-                    return Err(format!(
-                        "Input '{}' value not in allowed values",
-                        self.name
-                    ));
+                    return Err(format!("Input '{}' value not in allowed values", self.name));
                 }
             }
         }
@@ -550,7 +547,12 @@ impl Default for SubflowRetryConfig {
 
 impl SubflowStep {
     /// Create a new worker step.
-    pub fn worker(id: impl Into<String>, name: impl Into<String>, domain: &str, prompt: &str) -> Self {
+    pub fn worker(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        domain: &str,
+        prompt: &str,
+    ) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
@@ -671,10 +673,7 @@ pub struct StepResult {
 
 impl SubflowInstance {
     /// Create a new instance.
-    pub fn new(
-        subflow_id: impl Into<String>,
-        inputs: HashMap<String, serde_json::Value>,
-    ) -> Self {
+    pub fn new(subflow_id: impl Into<String>, inputs: HashMap<String, serde_json::Value>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             subflow_id: subflow_id.into(),
@@ -819,7 +818,10 @@ impl SubflowLibrary {
                 )
                 .with_output(OutputPort::new("passed", PortType::Boolean))
                 .with_output(OutputPort::new("total_tests", PortType::Integer))
-                .with_output(OutputPort::new("failed_tests", PortType::Array(Box::new(PortType::String))))
+                .with_output(OutputPort::new(
+                    "failed_tests",
+                    PortType::Array(Box::new(PortType::String)),
+                ))
                 .with_tag("testing")
                 .with_tag("ci"),
         );
@@ -829,10 +831,16 @@ impl SubflowLibrary {
             SubflowDef::new("lint_code", "Lint Code")
                 .with_description("Run linting tools on the codebase")
                 .with_input(InputPort::required("project_path", PortType::FilePath))
-                .with_input(InputPort::optional("fix", PortType::Boolean).with_default(serde_json::json!(false)))
+                .with_input(
+                    InputPort::optional("fix", PortType::Boolean)
+                        .with_default(serde_json::json!(false)),
+                )
                 .with_output(OutputPort::new("issues_found", PortType::Integer))
                 .with_output(OutputPort::new("issues_fixed", PortType::Integer))
-                .with_output(OutputPort::new("issues", PortType::Array(Box::new(PortType::Json))))
+                .with_output(OutputPort::new(
+                    "issues",
+                    PortType::Array(Box::new(PortType::Json)),
+                ))
                 .with_tag("linting")
                 .with_tag("code-quality"),
         );
@@ -847,8 +855,14 @@ impl SubflowLibrary {
                         .with_default(serde_json::json!("debug")),
                 )
                 .with_output(OutputPort::new("success", PortType::Boolean))
-                .with_output(OutputPort::new("errors", PortType::Array(Box::new(PortType::String))))
-                .with_output(OutputPort::new("warnings", PortType::Array(Box::new(PortType::String))))
+                .with_output(OutputPort::new(
+                    "errors",
+                    PortType::Array(Box::new(PortType::String)),
+                ))
+                .with_output(OutputPort::new(
+                    "warnings",
+                    PortType::Array(Box::new(PortType::String)),
+                ))
                 .with_tag("build")
                 .with_tag("ci"),
         );

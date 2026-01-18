@@ -35,15 +35,15 @@
 
 mod types;
 
+pub mod analyzers;
 pub mod command_builder;
 pub mod output_parser;
-pub mod analyzers;
 
 // Re-export public types
 pub use types::{
     CheckDefinition, CheckExecutionResult, CheckLanguage, CheckStatus, CheckSuiteSummary,
-    CheckTool, CheckToolInfoSerialized, CheckType,
-    ProjectDetectionResult, SuggestedCheck, CHECK_TOOLS, CHECK_TYPE_INFO,
+    CheckTool, CheckToolInfoSerialized, CheckType, ProjectDetectionResult, SuggestedCheck,
+    CHECK_TOOLS, CHECK_TYPE_INFO,
 };
 
 use std::path::Path;
@@ -143,7 +143,9 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
 
     if !is_tool_applicable(&check_def.tool, &project_type) {
         let tool_info = CHECK_TOOLS.iter().find(|t| t.tool == check_def.tool);
-        let tool_lang = tool_info.map(|t| format!("{:?}", t.language)).unwrap_or_else(|| "Unknown".to_string());
+        let tool_lang = tool_info
+            .map(|t| format!("{:?}", t.language))
+            .unwrap_or_else(|| "Unknown".to_string());
 
         info!(
             "Skipping check {} - tool {:?} ({}) not applicable for {:?} project",
@@ -170,7 +172,10 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
         };
     }
 
-    debug!("Project type detected: {:?}, tool {:?} is applicable", project_type, check_def.tool);
+    debug!(
+        "Project type detected: {:?}, tool {:?} is applicable",
+        project_type, check_def.tool
+    );
 
     // Check if this tool has a native analyzer implementation
     if analyzers::has_native_analyzer(&check_def.tool) {
@@ -245,7 +250,10 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
 
     // Check for timeout (if we had timeout support - for now just check exit code)
     if duration_ms >= (check_def.timeout_seconds as u64 * 1000) {
-        warn!("Check {} timed out after {} seconds", check_def.id, check_def.timeout_seconds);
+        warn!(
+            "Check {} timed out after {} seconds",
+            check_def.id, check_def.timeout_seconds
+        );
         return CheckExecutionResult::timeout(
             check_def.id.clone(),
             check_def.name.clone(),
@@ -266,7 +274,10 @@ pub fn execute_check(check_def: &CheckDefinition) -> CheckExecutionResult {
     } else {
         // Some tools use non-zero exit codes for issues found
         if parsed.issues_found > 0 {
-            if check_def.auto_fix && parsed.issues_fixed > 0 && parsed.issues_fixed >= parsed.issues_found {
+            if check_def.auto_fix
+                && parsed.issues_fixed > 0
+                && parsed.issues_fixed >= parsed.issues_found
+            {
                 CheckStatus::Fixed
             } else {
                 CheckStatus::Failed
@@ -311,7 +322,7 @@ fn execute_native_check(
     started_at: String,
     start_time: Instant,
 ) -> CheckExecutionResult {
-    let working_dir = check_def
+    let _working_dir = check_def
         .working_directory
         .clone()
         .unwrap_or_else(|| ".".to_string());
@@ -417,7 +428,12 @@ pub fn detect_project_checks(working_directory: &str) -> ProjectDetectionResult 
     };
 
     // Check for Python project
-    let python_indicators = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"];
+    let python_indicators = [
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "requirements.txt",
+    ];
     for indicator in &python_indicators {
         if path.join(indicator).exists() {
             if !result.detected_languages.contains(&CheckLanguage::Python) {
@@ -454,7 +470,10 @@ pub fn detect_project_checks(working_directory: &str) -> ProjectDetectionResult 
         match lang {
             CheckLanguage::Python => {
                 // Check for ruff config
-                if path.join("ruff.toml").exists() || path.join(".ruff.toml").exists() || path.join("pyproject.toml").exists() {
+                if path.join("ruff.toml").exists()
+                    || path.join(".ruff.toml").exists()
+                    || path.join("pyproject.toml").exists()
+                {
                     result.detected_tools.push(CheckTool::Ruff);
                     result.suggested_checks.push(SuggestedCheck {
                         tool: CheckTool::Ruff,
@@ -493,7 +512,12 @@ pub fn detect_project_checks(working_directory: &str) -> ProjectDetectionResult 
             }
             CheckLanguage::Javascript | CheckLanguage::Typescript => {
                 // Check for eslint config
-                let eslint_configs = [".eslintrc", ".eslintrc.js", ".eslintrc.json", "eslint.config.js"];
+                let eslint_configs = [
+                    ".eslintrc",
+                    ".eslintrc.js",
+                    ".eslintrc.json",
+                    "eslint.config.js",
+                ];
                 for config in &eslint_configs {
                     if path.join(config).exists() {
                         result.detected_tools.push(CheckTool::Eslint);
@@ -511,7 +535,12 @@ pub fn detect_project_checks(working_directory: &str) -> ProjectDetectionResult 
                 }
 
                 // Check for prettier
-                let prettier_configs = [".prettierrc", ".prettierrc.js", ".prettierrc.json", "prettier.config.js"];
+                let prettier_configs = [
+                    ".prettierrc",
+                    ".prettierrc.js",
+                    ".prettierrc.json",
+                    "prettier.config.js",
+                ];
                 for config in &prettier_configs {
                     if path.join(config).exists() {
                         result.detected_tools.push(CheckTool::Prettier);

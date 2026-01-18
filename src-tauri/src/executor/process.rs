@@ -115,7 +115,10 @@ impl ProcessManager {
         // Set the model cache directory for lazy loading
         if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
             let models_dir = app_data_dir.join("models");
-            cmd.env("QONTINUI_MODELS_DIR", models_dir.to_string_lossy().to_string());
+            cmd.env(
+                "QONTINUI_MODELS_DIR",
+                models_dir.to_string_lossy().to_string(),
+            );
         }
 
         // Spawn Python process

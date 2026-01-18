@@ -512,7 +512,10 @@ mod tests {
             Some(15),
         );
         assert!(prompt.requires_orchestrator);
-        assert_eq!(prompt.orchestrator_goal, Some("Implement feature X with tests".to_string()));
+        assert_eq!(
+            prompt.orchestrator_goal,
+            Some("Implement feature X with tests".to_string())
+        );
         assert_eq!(prompt.orchestrator_max_iterations, Some(15));
     }
 }

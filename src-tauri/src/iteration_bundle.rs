@@ -113,6 +113,21 @@ pub struct StepConfigSummary {
     /// Initial state IDs for workflow steps
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_state_ids: Option<Vec<String>>,
+    /// For check steps: "lint", "format", "typecheck", "analyze", "security", "custom_command"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_type: Option<String>,
+    /// Shell command or check command
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Test ID for verification test steps
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_id: Option<String>,
+    /// Test type for test steps: "repository", "playwright", etc.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_type: Option<String>,
+    /// Working directory for shell commands and checks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
 }
 
 /// Reference to a screenshot with context
@@ -441,6 +456,11 @@ impl IterationBundle {
                         timeout_seconds: step.config.timeout_seconds,
                         playwright_script_id: step.config.playwright_script_id.clone(),
                         initial_state_ids: step.config.initial_state_ids.clone(),
+                        check_type: step.config.check_type.clone(),
+                        command: step.config.command.clone(),
+                        test_id: step.config.test_id.clone(),
+                        test_type: step.config.test_type.clone(),
+                        working_directory: step.config.working_directory.clone(),
                     },
                 }
             })
@@ -982,6 +1002,46 @@ impl IterationBundle {
                     parts.push(format!("script_id={}", script_id));
                 }
             }
+            "check" => {
+                if let Some(ref check_type) = config.check_type {
+                    parts.push(format!("type={}", check_type));
+                }
+                if let Some(ref command) = config.command {
+                    // Truncate long commands
+                    let cmd_display = if command.len() > 50 {
+                        format!("{}...", &command[..50])
+                    } else {
+                        command.clone()
+                    };
+                    parts.push(format!("command=\"{}\"", cmd_display));
+                }
+            }
+            "shell_command" => {
+                if let Some(ref command) = config.command {
+                    let cmd_display = if command.len() > 50 {
+                        format!("{}...", &command[..50])
+                    } else {
+                        command.clone()
+                    };
+                    parts.push(format!("command=\"{}\"", cmd_display));
+                }
+            }
+            "test" => {
+                if let Some(ref test_id) = config.test_id {
+                    parts.push(format!("test_id={}", test_id));
+                }
+                if let Some(ref test_type) = config.test_type {
+                    parts.push(format!("type={}", test_type));
+                }
+                if let Some(ref command) = config.command {
+                    let cmd_display = if command.len() > 50 {
+                        format!("{}...", &command[..50])
+                    } else {
+                        command.clone()
+                    };
+                    parts.push(format!("command=\"{}\"", cmd_display));
+                }
+            }
             _ => {}
         }
 
@@ -994,6 +1054,9 @@ impl IterationBundle {
         }
         if let Some(timeout) = config.timeout_seconds {
             parts.push(format!("timeout={}s", timeout));
+        }
+        if let Some(ref working_dir) = config.working_directory {
+            parts.push(format!("working_dir=\"{}\"", working_dir));
         }
 
         parts
@@ -1187,7 +1250,10 @@ impl IterationBundle {
         md.push_str("**Note:** Use the Read tool to view HTML content if needed for debugging UI/styling issues.\n\n");
 
         // List linked screenshots
-        let with_screenshots: Vec<_> = captures.iter().filter(|c| c.linked_screenshot.is_some()).collect();
+        let with_screenshots: Vec<_> = captures
+            .iter()
+            .filter(|c| c.linked_screenshot.is_some())
+            .collect();
         if !with_screenshots.is_empty() {
             md.push_str("**Linked Screenshots:**\n");
             for capture in with_screenshots {

@@ -11,12 +11,7 @@ use crate::check_executor::analyzers::concurrency::types::{
 use tree_sitter::{Node, Tree};
 
 /// Detect shared state in a TypeScript file
-pub fn detect_shared_state(
-    tree: &Tree,
-    source: &str,
-    file: &str,
-    ctx: &mut AnalysisContext,
-) {
+pub fn detect_shared_state(tree: &Tree, source: &str, file: &str, ctx: &mut AnalysisContext) {
     let root = tree.root_node();
 
     // Detect module-level variables
@@ -65,7 +60,9 @@ fn detect_module_variables(root: &Node, source: &str, file: &str, ctx: &mut Anal
         if child.kind() == "export_statement" {
             let mut export_cursor = child.walk();
             for export_child in child.children(&mut export_cursor) {
-                if export_child.kind() == "lexical_declaration" || export_child.kind() == "variable_declaration" {
+                if export_child.kind() == "lexical_declaration"
+                    || export_child.kind() == "variable_declaration"
+                {
                     let is_const = get_declaration_kind(&export_child, source) == "const";
                     if is_const {
                         continue;
@@ -79,7 +76,8 @@ fn detect_module_variables(root: &Node, source: &str, file: &str, ctx: &mut Anal
                                     ctx.shared_states.push(SharedState {
                                         name: name.to_string(),
                                         state_type: SharedStateType::ModuleVariable,
-                                        definition_line: export_child.start_position().row as u32 + 1,
+                                        definition_line: export_child.start_position().row as u32
+                                            + 1,
                                         file: file.to_string(),
                                         accesses: Vec::new(),
                                         appears_thread_safe: false,
@@ -184,7 +182,7 @@ fn has_modifier(node: &Node, source: &str, modifier: &str) -> bool {
 }
 
 /// Check if a variable appears to be effectively immutable
-fn is_likely_immutable(declarator: &Node, source: &str) -> bool {
+fn is_likely_immutable(declarator: &Node, _source: &str) -> bool {
     // Check the initializer - if it's a primitive literal, it might be effectively constant
     if let Some(value) = declarator.child_by_field_name("value") {
         match value.kind() {
@@ -212,7 +210,8 @@ fn traverse_for_accesses(
     let kind = node.kind();
 
     // Track async context
-    let is_async_func = kind == "arrow_function" || kind == "function_declaration" || kind == "method_definition";
+    let is_async_func =
+        kind == "arrow_function" || kind == "function_declaration" || kind == "method_definition";
     let new_in_async = if is_async_func {
         has_async_modifier(node, source)
     } else {
@@ -230,7 +229,11 @@ fn traverse_for_accesses(
     // Check for identifier access
     if kind == "identifier" {
         if let Ok(name) = node.utf8_text(source.as_bytes()) {
-            if ctx.shared_states.iter().any(|s| s.name == name || s.name.ends_with(&format!(".{}", name))) {
+            if ctx
+                .shared_states
+                .iter()
+                .any(|s| s.name == name || s.name.ends_with(&format!(".{}", name)))
+            {
                 let access_type = determine_access_type(node, source);
                 let state_name = ctx
                     .shared_states
@@ -246,7 +249,8 @@ fn traverse_for_accesses(
                     column: Some(node.start_position().column as u32 + 1),
                     is_protected: false, // TypeScript doesn't have built-in locks
                     lock_name: None,
-                    context: func_name.map(|s| format!("{}({})", s, if new_in_async { "async" } else { "" })),
+                    context: func_name
+                        .map(|s| format!("{}({})", s, if new_in_async { "async" } else { "" })),
                 };
 
                 ctx.add_access(&state_name, access);
@@ -333,8 +337,17 @@ fn determine_access_type(node: &Node, source: &str) -> AccessType {
 fn is_mutating_method(method: &str) -> bool {
     matches!(
         method,
-        "push" | "pop" | "shift" | "unshift" | "splice" | "sort" | "reverse" |
-        "set" | "delete" | "clear" | "add"
+        "push"
+            | "pop"
+            | "shift"
+            | "unshift"
+            | "splice"
+            | "sort"
+            | "reverse"
+            | "set"
+            | "delete"
+            | "clear"
+            | "add"
     )
 }
 

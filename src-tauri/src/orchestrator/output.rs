@@ -7,11 +7,10 @@
 
 use tracing::debug;
 
-use crate::mcp_api::{emit_ai_output, AiOutputSessionContext};
 use super::types::{
-    CriterionType, Finding, IterationVerificationResults, VerificationPlan,
-    VerificationResult,
+    CriterionType, Finding, IterationVerificationResults, VerificationPlan, VerificationResult,
 };
+use crate::mcp_api::{emit_ai_output, AiOutputSessionContext};
 
 // ============================================================================
 // Output Source Constants
@@ -77,7 +76,11 @@ pub fn emit_plan_created(
             CriterionType::Deterministic => "DETERMINISTIC",
             CriterionType::AiEvaluated => "AI",
         };
-        let critical_marker = if criterion.is_critical { "[CRITICAL]" } else { "" };
+        let critical_marker = if criterion.is_critical {
+            "[CRITICAL]"
+        } else {
+            ""
+        };
 
         emit_ai_output(
             app_handle,
@@ -110,7 +113,10 @@ pub fn emit_replanning(
 ) {
     emit_ai_output(
         app_handle,
-        &format!("[Planning Agent] Replanning due to: {}", truncate(reason, 100)),
+        &format!(
+            "[Planning Agent] Replanning due to: {}",
+            truncate(reason, 100)
+        ),
         SOURCE_PLANNING,
         None,
         session_ctx,
@@ -126,7 +132,10 @@ pub fn emit_planning_complete(
 ) {
     emit_ai_output(
         app_handle,
-        &format!("[Planning Agent] Plan v{} ready for execution", plan_version),
+        &format!(
+            "[Planning Agent] Plan v{} ready for execution",
+            plan_version
+        ),
         SOURCE_PLANNING,
         None,
         session_ctx,
@@ -149,9 +158,7 @@ pub fn emit_verification_start(
         app_handle,
         &format!(
             "[Verification Agent] Running checks (iteration {}, {} deterministic, {} AI)",
-            iteration,
-            deterministic_count,
-            ai_count
+            iteration, deterministic_count, ai_count
         ),
         SOURCE_VERIFICATION,
         None,
@@ -173,23 +180,22 @@ pub fn emit_deterministic_result(
     let icon = if result.passed { "[PASS]" } else { "[FAIL]" };
 
     let details = if result.passed {
-        result.observations.first()
+        result
+            .observations
+            .first()
             .map(|o| truncate(o, 50))
             .unwrap_or_else(|| "OK".to_string())
     } else {
-        result.issues.first()
+        result
+            .issues
+            .first()
             .map(|i| truncate(i, 50))
             .unwrap_or_else(|| "Failed".to_string())
     };
 
     emit_ai_output(
         app_handle,
-        &format!(
-            "  {} {} - {}",
-            icon,
-            result.criterion_id,
-            details
-        ),
+        &format!("  {} {} - {}", icon, result.criterion_id, details),
         SOURCE_VERIFICATION,
         None,
         session_ctx,
@@ -213,11 +219,7 @@ pub fn emit_ai_verification_start(
 
     emit_ai_output(
         app_handle,
-        &format!(
-            "  [AI] Verifying: {}{}",
-            criterion_id,
-            prompt_preview
-        ),
+        &format!("  [AI] Verifying: {}{}", criterion_id, prompt_preview),
         SOURCE_VERIFICATION,
         None,
         session_ctx,
@@ -234,16 +236,21 @@ pub fn emit_ai_verification_result(
     let status = if result.passed { "PASS" } else { "FAIL" };
     let icon = if result.passed { "[PASS]" } else { "[FAIL]" };
 
-    let confidence = result.confidence
+    let confidence = result
+        .confidence
         .map(|c| format!(" (confidence: {:?})", c))
         .unwrap_or_default();
 
     let details = if result.passed {
-        result.observations.first()
+        result
+            .observations
+            .first()
             .map(|o| truncate(o, 50))
             .unwrap_or_else(|| "Verified".to_string())
     } else {
-        result.issues.first()
+        result
+            .issues
+            .first()
             .map(|i| truncate(i, 50))
             .unwrap_or_else(|| "Failed".to_string())
     };
@@ -252,10 +259,7 @@ pub fn emit_ai_verification_result(
         app_handle,
         &format!(
             "  {} {} - {}{}",
-            icon,
-            result.criterion_id,
-            details,
-            confidence
+            icon, result.criterion_id, details, confidence
         ),
         SOURCE_VERIFICATION,
         None,
@@ -274,7 +278,11 @@ pub fn emit_verification_complete(
     session_ctx: Option<&AiOutputSessionContext>,
 ) {
     let total_det = results.deterministic_results.len();
-    let passed_det = results.deterministic_results.iter().filter(|r| r.passed).count();
+    let passed_det = results
+        .deterministic_results
+        .iter()
+        .filter(|r| r.passed)
+        .count();
     let total_ai = results.ai_results.len();
     let passed_ai = results.ai_results.iter().filter(|r| r.passed).count();
 
@@ -389,8 +397,7 @@ pub fn emit_verification_feedback_recorded(
         app_handle,
         &format!(
             "[Knowledge Base] Verification feedback recorded for iteration {} ({} failed criteria)",
-            iteration,
-            failed_criteria_count
+            iteration, failed_criteria_count
         ),
         SOURCE_KNOWLEDGE,
         None,
@@ -442,7 +449,10 @@ pub fn emit_finding_resolved(
 
     emit_ai_output(
         app_handle,
-        &format!("[Knowledge Base] Finding resolved: {}{}", finding_id, notes_str),
+        &format!(
+            "[Knowledge Base] Finding resolved: {}{}",
+            finding_id, notes_str
+        ),
         SOURCE_KNOWLEDGE,
         None,
         session_ctx,
@@ -485,7 +495,10 @@ pub fn emit_iteration_start(
 ) {
     emit_ai_output(
         app_handle,
-        &format!("[Orchestrator] Starting iteration {}/{}", iteration, max_iterations),
+        &format!(
+            "[Orchestrator] Starting iteration {}/{}",
+            iteration, max_iterations
+        ),
         SOURCE_ORCHESTRATOR,
         None,
         session_ctx,
@@ -503,7 +516,10 @@ pub fn emit_orchestrator_task_complete(
     if success {
         emit_ai_output(
             app_handle,
-            &format!("[Orchestrator] Task completed successfully after {} iteration(s)", iterations),
+            &format!(
+                "[Orchestrator] Task completed successfully after {} iteration(s)",
+                iterations
+            ),
             SOURCE_ORCHESTRATOR,
             None,
             session_ctx,
@@ -537,7 +553,10 @@ pub fn emit_worker_signal(
 
     emit_ai_output(
         app_handle,
-        &format!("[Orchestrator] Worker signal: {}{}", signal_type, reason_str),
+        &format!(
+            "[Orchestrator] Worker signal: {}{}",
+            signal_type, reason_str
+        ),
         SOURCE_ORCHESTRATOR,
         None,
         session_ctx,
@@ -566,7 +585,10 @@ pub fn emit_override_detected(
         None,
         session_ctx,
     );
-    debug!("Override detected: criterion={}, item={}", criterion_id, item);
+    debug!(
+        "Override detected: criterion={}, item={}",
+        criterion_id, item
+    );
 }
 
 /// Emit output when an override is applied during verification.

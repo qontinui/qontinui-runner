@@ -749,8 +749,8 @@ pub fn save_agentic_settings(
         complex_model: routing_complex_model,
         file_count_thresholds: (routing_file_threshold_simple, routing_file_threshold_medium),
         prompt_length_thresholds: existing_settings.routing.prompt_length_thresholds, // Preserve
-        complex_keywords: existing_settings.routing.complex_keywords, // Preserve
-        simple_keywords: existing_settings.routing.simple_keywords,   // Preserve
+        complex_keywords: existing_settings.routing.complex_keywords,                 // Preserve
+        simple_keywords: existing_settings.routing.simple_keywords,                   // Preserve
     };
 
     let ai_settings = AiSettings {

@@ -42,7 +42,10 @@ pub enum AssertionType {
         expected_text: String,
     },
     /// Count of elements matching pattern should equal expected
-    ElementCount { pattern: String, expected_count: usize },
+    ElementCount {
+        pattern: String,
+        expected_count: usize,
+    },
     /// Custom assertion with expression (for future AI evaluation)
     Custom { expression: String },
 }
@@ -292,9 +295,7 @@ mod tests {
             expected_text: "Welcome".to_string(),
         };
 
-        assert!(assertion_type
-            .description()
-            .contains("should contain text"));
+        assert!(assertion_type.description().contains("should contain text"));
     }
 
     #[test]

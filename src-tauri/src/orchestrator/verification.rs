@@ -10,10 +10,10 @@ use std::process::Command;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+use super::types::*;
 use crate::ai_router::TaskContext;
 use crate::commands::AppState;
 use crate::state_explorer::{ExplorationConfig, ExplorationStatus, ExplorationTask};
-use super::types::*;
 
 /// Executor for deterministic verification checks.
 pub struct DeterministicVerifier {
@@ -65,7 +65,9 @@ impl DeterministicVerifier {
         match method {
             VerificationMethod::BuildSuccess => self.verify_build(criterion).await,
             VerificationMethod::UnitTest => self.verify_tests(criterion, "unit").await,
-            VerificationMethod::IntegrationTest => self.verify_tests(criterion, "integration").await,
+            VerificationMethod::IntegrationTest => {
+                self.verify_tests(criterion, "integration").await
+            }
             VerificationMethod::Playwright => self.verify_playwright(criterion).await,
             VerificationMethod::LogPattern => self.verify_log_pattern(criterion).await,
             VerificationMethod::GuiAutomation => self.verify_gui_automation(criterion).await,
@@ -170,7 +172,10 @@ impl DeterministicVerifier {
             VerificationResult {
                 passed: !result.passed,
                 issues: if result.passed {
-                    vec![format!("Pattern '{}' was found but should not exist", pattern)]
+                    vec![format!(
+                        "Pattern '{}' was found but should not exist",
+                        pattern
+                    )]
                 } else {
                     vec![]
                 },
@@ -194,7 +199,10 @@ impl DeterministicVerifier {
                     confidence: None,
                     observations: vec!["State Explorer not configured (no AppState)".to_string()],
                     issues: vec![],
-                    suggestions: vec!["Use DeterministicVerifier::with_app_state() for State Explorer support".to_string()],
+                    suggestions: vec![
+                        "Use DeterministicVerifier::with_app_state() for State Explorer support"
+                            .to_string(),
+                    ],
                     raw_output: None,
                 };
             }
@@ -216,8 +224,13 @@ impl DeterministicVerifier {
                 criterion_type: CriterionType::Deterministic,
                 confidence: None,
                 observations: vec![],
-                issues: vec!["GuiAutomation criterion requires config_path in verification_config".to_string()],
-                suggestions: vec!["Add verification_config.config_path with path to qontinui config".to_string()],
+                issues: vec![
+                    "GuiAutomation criterion requires config_path in verification_config"
+                        .to_string(),
+                ],
+                suggestions: vec![
+                    "Add verification_config.config_path with path to qontinui config".to_string(),
+                ],
                 raw_output: None,
             };
         }
@@ -267,7 +280,9 @@ impl DeterministicVerifier {
                     confidence: None,
                     observations: vec![],
                     issues: vec![format!("State Explorer execution failed: {}", e)],
-                    suggestions: vec!["Check config path and ensure the application is running".to_string()],
+                    suggestions: vec![
+                        "Check config path and ensure the application is running".to_string()
+                    ],
                     raw_output: Some(format!("Error: {}", e)),
                 };
             }
@@ -298,14 +313,19 @@ impl DeterministicVerifier {
             .iter()
             .filter(|s| matches!(s.status, ExplorationStatus::Failed))
             .map(|s| {
-                let missing: Vec<_> = s.expected_elements_found
+                let missing: Vec<_> = s
+                    .expected_elements_found
                     .iter()
                     .filter(|e| !e.found)
                     .map(|e| e.element.clone())
                     .collect();
 
                 if !missing.is_empty() {
-                    format!("State '{}' missing elements: {}", s.state_name, missing.join(", "))
+                    format!(
+                        "State '{}' missing elements: {}",
+                        s.state_name,
+                        missing.join(", ")
+                    )
                 } else if let Some(err) = &s.error {
                     format!("State '{}' error: {}", s.state_name, err)
                 } else {
@@ -443,7 +463,11 @@ impl DeterministicVerifier {
                         .collect();
 
                     if error_lines.is_empty() {
-                        vec![format!("{} failed with exit code {}", check_name, output.status.code().unwrap_or(-1))]
+                        vec![format!(
+                            "{} failed with exit code {}",
+                            check_name,
+                            output.status.code().unwrap_or(-1)
+                        )]
                     } else {
                         error_lines
                     }
@@ -476,7 +500,10 @@ impl DeterministicVerifier {
                     confidence: None,
                     observations: vec![],
                     issues: vec![format!("Failed to execute {}: {}", check_name, e)],
-                    suggestions: vec!["Check that the command is valid and dependencies are installed".to_string()],
+                    suggestions: vec![
+                        "Check that the command is valid and dependencies are installed"
+                            .to_string(),
+                    ],
                     raw_output: Some(format!("Error: {}", e)),
                 }
             }
@@ -498,10 +525,12 @@ impl AiVerificationContextBuilder {
         criterion: &SuccessCriterion,
         goal_summary: &str,
     ) -> VerificationAgentContext {
-        let evaluation_prompt = criterion
-            .evaluation_prompt
-            .clone()
-            .unwrap_or_else(|| format!("Verify that the goal has been achieved: {}", criterion.description));
+        let evaluation_prompt = criterion.evaluation_prompt.clone().unwrap_or_else(|| {
+            format!(
+                "Verify that the goal has been achieved: {}",
+                criterion.description
+            )
+        });
 
         VerificationAgentContext {
             screenshot_base64,
@@ -542,8 +571,7 @@ Evaluate this screenshot against these criteria:
 {}
 
 Respond with JSON only."#,
-            context.goal_context,
-            context.evaluation_prompt
+            context.goal_context, context.evaluation_prompt
         )
     }
 
@@ -628,7 +656,10 @@ impl AiVerifier {
         info!(
             "Running AI verification for criterion: {} (prompt: {:?})",
             criterion.id,
-            criterion.evaluation_prompt.as_deref().map(|s| &s[..s.len().min(50)])
+            criterion
+                .evaluation_prompt
+                .as_deref()
+                .map(|s| &s[..s.len().min(50)])
         );
 
         // Build isolated context
@@ -645,7 +676,8 @@ impl AiVerifier {
         // For AI verification with images, we need to use a special prompt format
         // that includes the base64 image. Most AI providers support this via
         // a specific message format.
-        let full_prompt = Self::build_vision_prompt(&system_prompt, &user_prompt, screenshot_base64);
+        let full_prompt =
+            Self::build_vision_prompt(&system_prompt, &user_prompt, screenshot_base64);
 
         debug!(
             "AI verification prompt built (length: {} chars)",
@@ -653,11 +685,14 @@ impl AiVerifier {
         );
 
         // Build task context for routing (AI verification is typically simple/medium complexity)
-        let task_context = TaskContext::from_prompt(&full_prompt)
-            .with_criteria_count(1); // Single criterion being verified
+        let task_context = TaskContext::from_prompt(&full_prompt).with_criteria_count(1); // Single criterion being verified
 
         // Call the AI provider with routing
-        let ai_response = crate::ai_provider::run_prompt_with_routing(&full_prompt, &task_context, self.timeout_seconds);
+        let ai_response = crate::ai_provider::run_prompt_with_routing(
+            &full_prompt,
+            &task_context,
+            self.timeout_seconds,
+        );
 
         if !ai_response.success {
             let error_msg = ai_response
@@ -709,7 +744,11 @@ impl AiVerifier {
     ///
     /// This creates a prompt format that works with vision-capable AI models.
     /// The format depends on the AI provider being used.
-    fn build_vision_prompt(system_prompt: &str, user_prompt: &str, screenshot_base64: &str) -> String {
+    fn build_vision_prompt(
+        system_prompt: &str,
+        user_prompt: &str,
+        screenshot_base64: &str,
+    ) -> String {
         // For Claude CLI, we can include the image as a data URL in the prompt
         // Claude will recognize and process embedded images
         //
@@ -878,9 +917,7 @@ impl VerificationOrchestrator {
 
         // If deterministic failed, skip AI verification
         if !deterministic_passed {
-            info!(
-                "Deterministic verification failed, skipping AI verification"
-            );
+            info!("Deterministic verification failed, skipping AI verification");
 
             let failure_summary = build_failure_summary(&deterministic_results, &[]);
 
@@ -900,7 +937,10 @@ impl VerificationOrchestrator {
         // Run AI verification if there are AI criteria and we have a screenshot
         let ai_results = if plan.has_ai_criteria() {
             if let Some(screenshot) = screenshot_base64 {
-                info!("Running AI verification with {} criteria", plan.ai_criteria().len());
+                info!(
+                    "Running AI verification with {} criteria",
+                    plan.ai_criteria().len()
+                );
                 self.ai_verifier.verify_all_parallel(plan, screenshot).await
             } else {
                 warn!("Plan has AI criteria but no screenshot provided, skipping AI verification");
@@ -966,17 +1006,22 @@ fn build_failure_summary(
             det_failures.len()
         ));
         for r in det_failures {
-            summary.push_str(&format!("  - {}: {}\n", r.criterion_id, r.issues.join(", ")));
+            summary.push_str(&format!(
+                "  - {}: {}\n",
+                r.criterion_id,
+                r.issues.join(", ")
+            ));
         }
     }
 
     if !ai_failures.is_empty() {
-        summary.push_str(&format!(
-            "{} AI check(s) failed:\n",
-            ai_failures.len()
-        ));
+        summary.push_str(&format!("{} AI check(s) failed:\n", ai_failures.len()));
         for r in ai_failures {
-            summary.push_str(&format!("  - {}: {}\n", r.criterion_id, r.issues.join(", ")));
+            summary.push_str(&format!(
+                "  - {}: {}\n",
+                r.criterion_id,
+                r.issues.join(", ")
+            ));
         }
     }
 
@@ -993,8 +1038,7 @@ fn build_failure_summary(
 pub fn load_screenshot_as_base64(path: &str) -> Result<String, String> {
     use base64::{engine::general_purpose::STANDARD, Engine};
 
-    let data = std::fs::read(path)
-        .map_err(|e| format!("Failed to read screenshot file: {}", e))?;
+    let data = std::fs::read(path).map_err(|e| format!("Failed to read screenshot file: {}", e))?;
 
     let base64_data = STANDARD.encode(&data);
 
@@ -1046,8 +1090,7 @@ pub fn load_latest_screenshot_as_base64() -> Result<String, String> {
     let latest = &screenshots[0];
     let path = latest.path();
 
-    let data = std::fs::read(&path)
-        .map_err(|e| format!("Failed to read screenshot: {}", e))?;
+    let data = std::fs::read(&path).map_err(|e| format!("Failed to read screenshot: {}", e))?;
 
     let base64_data = STANDARD.encode(&data);
 
@@ -1171,18 +1214,16 @@ Based on the screenshot, here's my evaluation:
             },
         ];
 
-        let ai_results = vec![
-            VerificationResult {
-                criterion_id: "visual".to_string(),
-                passed: false,
-                criterion_type: CriterionType::AiEvaluated,
-                confidence: Some(Confidence::High),
-                observations: vec![],
-                issues: vec!["Button color is red, not blue".to_string()],
-                suggestions: vec![],
-                raw_output: None,
-            },
-        ];
+        let ai_results = vec![VerificationResult {
+            criterion_id: "visual".to_string(),
+            passed: false,
+            criterion_type: CriterionType::AiEvaluated,
+            confidence: Some(Confidence::High),
+            observations: vec![],
+            issues: vec!["Button color is red, not blue".to_string()],
+            suggestions: vec![],
+            raw_output: None,
+        }];
 
         let summary = build_failure_summary(&det_results, &ai_results);
 

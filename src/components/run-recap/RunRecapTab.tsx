@@ -303,17 +303,17 @@ interface QuickStatsProps {
 function QuickStats({ stats, duration }: QuickStatsProps) {
   const statItems = [
     {
-      label: "Total Actions",
+      label: "GUI Actions",
       value: stats.total_actions,
       color: "text-foreground",
     },
     {
-      label: "Successful",
+      label: "GUI Success",
       value: stats.successful_actions,
       color: "text-green-500",
     },
     {
-      label: "Failed",
+      label: "GUI Failed",
       value: stats.failed_actions,
       color: stats.failed_actions > 0 ? "text-red-500" : "text-muted-foreground",
     },

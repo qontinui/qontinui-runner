@@ -265,7 +265,10 @@ fn parse_mypy_output(stdout: &str, stderr: &str) -> ParsedOutput {
     }
 
     let issues_found = issues.len() as u32;
-    let error_count = issues.iter().filter(|i| i.severity == IssueSeverity::Error).count() as u32;
+    let error_count = issues
+        .iter()
+        .filter(|i| i.severity == IssueSeverity::Error)
+        .count() as u32;
     let warning_count = issues_found - error_count;
 
     ParsedOutput {
@@ -492,7 +495,10 @@ fn parse_cargo_output(stdout: &str, _stderr: &str) -> ParsedOutput {
     }
 
     let issues_found = issues.len() as u32;
-    let error_count = issues.iter().filter(|i| i.severity == IssueSeverity::Error).count() as u32;
+    let error_count = issues
+        .iter()
+        .filter(|i| i.severity == IssueSeverity::Error)
+        .count() as u32;
     let warning_count = issues_found - error_count;
 
     ParsedOutput {
@@ -573,10 +579,7 @@ fn parse_tsc_line(line: &str) -> Option<CheckIssue> {
                 if let Some(second_colon) = after_colon.find(':') {
                     let code = after_colon[..second_colon].trim();
                     let message = after_colon[second_colon + 1..].trim();
-                    (
-                        Some(code.to_string()),
-                        message.to_string(),
-                    )
+                    (Some(code.to_string()), message.to_string())
                 } else {
                     (None, after_colon.to_string())
                 }
@@ -619,7 +622,11 @@ fn parse_black_output(stdout: &str, stderr: &str, auto_fix: bool) -> ParsedOutpu
         }
     }
 
-    let issues_found = if auto_fix { reformatted } else { would_reformat };
+    let issues_found = if auto_fix {
+        reformatted
+    } else {
+        would_reformat
+    };
     let issues_fixed = if auto_fix { reformatted } else { 0 };
 
     ParsedOutput {
@@ -762,18 +769,36 @@ fn parse_devtools_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> 
 
                 issues.push(CheckIssue {
                     file,
-                    line: issue_val.get("line").and_then(|l| l.as_u64()).map(|l| l as u32),
-                    column: issue_val.get("column").and_then(|c| c.as_u64()).map(|c| c as u32),
-                    end_line: issue_val.get("end_line").and_then(|l| l.as_u64()).map(|l| l as u32),
-                    end_column: issue_val.get("end_column").and_then(|c| c.as_u64()).map(|c| c as u32),
-                    code: issue_val.get("code").and_then(|c| c.as_str()).map(|s| s.to_string()),
+                    line: issue_val
+                        .get("line")
+                        .and_then(|l| l.as_u64())
+                        .map(|l| l as u32),
+                    column: issue_val
+                        .get("column")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c as u32),
+                    end_line: issue_val
+                        .get("end_line")
+                        .and_then(|l| l.as_u64())
+                        .map(|l| l as u32),
+                    end_column: issue_val
+                        .get("end_column")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c as u32),
+                    code: issue_val
+                        .get("code")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string()),
                     message: issue_val
                         .get("message")
                         .and_then(|m| m.as_str())
                         .unwrap_or("")
                         .to_string(),
                     severity,
-                    fixable: issue_val.get("fixable").and_then(|f| f.as_bool()).unwrap_or(false),
+                    fixable: issue_val
+                        .get("fixable")
+                        .and_then(|f| f.as_bool())
+                        .unwrap_or(false),
                     fix_applied: None,
                 });
             }
@@ -785,8 +810,14 @@ fn parse_devtools_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> 
     }
 
     let issues_found = issues.len() as u32;
-    let error_count = issues.iter().filter(|i| i.severity == IssueSeverity::Error).count() as u32;
-    let warning_count = issues.iter().filter(|i| i.severity == IssueSeverity::Warning).count() as u32;
+    let error_count = issues
+        .iter()
+        .filter(|i| i.severity == IssueSeverity::Error)
+        .count() as u32;
+    let warning_count = issues
+        .iter()
+        .filter(|i| i.severity == IssueSeverity::Warning)
+        .count() as u32;
 
     ParsedOutput {
         issues_found,
@@ -893,6 +924,9 @@ mod tests {
 
         assert_eq!(result.issues_found, 1);
         assert_eq!(result.structured_output.issues.len(), 1);
-        assert_eq!(result.structured_output.issues[0].code, Some("E501".to_string()));
+        assert_eq!(
+            result.structured_output.issues[0].code,
+            Some("E501".to_string())
+        );
     }
 }

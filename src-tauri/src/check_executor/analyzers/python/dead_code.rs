@@ -8,9 +8,7 @@ use std::path::Path;
 use crate::check_executor::analyzers::common::file_walker::{walk_files, WalkConfig};
 use crate::check_executor::analyzers::common::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;
-use crate::check_executor::types::{
-    CheckStructuredOutput, CheckSummary, IssueSeverity,
-};
+use crate::check_executor::types::{CheckStructuredOutput, CheckSummary, IssueSeverity};
 
 /// Information about a defined symbol
 #[derive(Debug, Clone)]
@@ -78,7 +76,7 @@ pub fn analyze(working_dir: &str) -> Result<ParsedOutput, String> {
             None => continue,
         };
 
-        let file_str = file_path.to_string_lossy().to_string();
+        let _file_str = file_path.to_string_lossy().to_string();
         let relative_path = file_path
             .strip_prefix(root)
             .unwrap_or(file_path)

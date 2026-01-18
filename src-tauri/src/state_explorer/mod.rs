@@ -42,8 +42,7 @@ pub use types::{ExplorationConfig, ExplorationResult, ExplorationStatus};
 
 // Checkpoint system for interleaved exploration
 pub use checkpoint::{
-    CheckpointConfig, CheckpointManager, CheckpointTrigger,
-    ExplorationCheckpoint,
+    CheckpointConfig, CheckpointManager, CheckpointTrigger, ExplorationCheckpoint,
 };
 
 // Explicit assertions for states

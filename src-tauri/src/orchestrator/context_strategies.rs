@@ -546,7 +546,10 @@ fn apply_buffered_window(items: &[ContextItem], config: &BufferedWindowConfig) -
         original_tokens,
         items_removed,
         removal_summary: if items_removed > 0 {
-            Some(format!("[{} older items removed to fit window]", items_removed))
+            Some(format!(
+                "[{} older items removed to fit window]",
+                items_removed
+            ))
         } else {
             None
         },
@@ -567,9 +570,9 @@ fn apply_token_limited(items: &[ContextItem], config: &TokenLimitedConfig) -> St
     }
 
     // Separate critical items (system, pinned)
-    let (critical, removable): (Vec<_>, Vec<_>) = items.iter().partition(|i| {
-        i.pinned || (config.preserve_system && i.category == ItemCategory::System)
-    });
+    let (critical, removable): (Vec<_>, Vec<_>) = items
+        .iter()
+        .partition(|i| i.pinned || (config.preserve_system && i.category == ItemCategory::System));
 
     let critical_tokens: usize = critical.iter().map(|i| i.tokens).sum();
     let remaining_budget = effective_limit.saturating_sub(critical_tokens);
@@ -581,9 +584,7 @@ fn apply_token_limited(items: &[ContextItem], config: &TokenLimitedConfig) -> St
             sorted.sort_by_key(|i| std::cmp::Reverse(i.iteration));
             select_within_budget(&sorted, remaining_budget)
         }
-        RemovalStrategy::MiddleOut => {
-            apply_middle_out_removal(&removable, remaining_budget)
-        }
+        RemovalStrategy::MiddleOut => apply_middle_out_removal(&removable, remaining_budget),
         RemovalStrategy::LowestPriority => {
             let mut sorted: Vec<ContextItem> = removable.iter().map(|i| (*i).clone()).collect();
             sorted.sort_by_key(|i| std::cmp::Reverse(i.priority));
@@ -699,10 +700,7 @@ fn apply_middle_out_removal(items: &[&ContextItem], budget: usize) -> Vec<Contex
     }
 
     // Collect head and tail items
-    let mut result: Vec<ContextItem> = items[..head_count]
-        .iter()
-        .map(|i| (*i).clone())
-        .collect();
+    let mut result: Vec<ContextItem> = items[..head_count].iter().map(|i| (*i).clone()).collect();
 
     let tail_start = items.len() - tail_count;
     result.extend(items[tail_start..].iter().map(|i| (*i).clone()));
@@ -830,10 +828,7 @@ fn apply_semantic_pruning(items: &[ContextItem], config: &SemanticPruningConfig)
         original_tokens,
         items_removed,
         removal_summary: if items_removed > 0 {
-            Some(format!(
-                "[{} low-relevance items pruned]",
-                items_removed
-            ))
+            Some(format!("[{} low-relevance items pruned]", items_removed))
         } else {
             None
         },

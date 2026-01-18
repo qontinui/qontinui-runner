@@ -335,14 +335,14 @@ impl TaskRouter {
         }
 
         // Determine final complexity
-        let (complexity, confidence) = if complex_score >= simple_score && complex_score >= medium_score
-        {
-            (TaskComplexity::Complex, complex_score)
-        } else if simple_score >= medium_score {
-            (TaskComplexity::Simple, simple_score)
-        } else {
-            (TaskComplexity::Medium, medium_score)
-        };
+        let (complexity, confidence) =
+            if complex_score >= simple_score && complex_score >= medium_score {
+                (TaskComplexity::Complex, complex_score)
+            } else if simple_score >= medium_score {
+                (TaskComplexity::Simple, simple_score)
+            } else {
+                (TaskComplexity::Medium, medium_score)
+            };
 
         // Normalize confidence to 0.0-1.0 range
         let total_score = simple_score + medium_score + complex_score;

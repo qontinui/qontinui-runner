@@ -20,6 +20,10 @@ import { useAiConversationData } from "./widgets/ai-conversation";
 import { useVerificationData } from "./widgets/verification";
 import { useFindingsData } from "./widgets/findings";
 import { useExecutionStatusWidgetData } from "./widgets/execution-status";
+import { useShellCommandData } from "./widgets/shell-command";
+import { useApiRequestData } from "./widgets/api-request";
+import { useScriptData } from "./widgets/script";
+import { useWorkflowRefData } from "./widgets/workflow-ref";
 
 /**
  * Props for DashboardLayout.
@@ -67,6 +71,22 @@ function getWidgetBorderClasses(
     cyan: {
       running: "border-cyan-500 ring-2 ring-cyan-500/20",
       idle: "border-cyan-500/30",
+    },
+    slate: {
+      running: "border-slate-500 ring-2 ring-slate-500/20",
+      idle: "border-slate-500/30",
+    },
+    orange: {
+      running: "border-orange-500 ring-2 ring-orange-500/20",
+      idle: "border-orange-500/30",
+    },
+    indigo: {
+      running: "border-indigo-500 ring-2 ring-indigo-500/20",
+      idle: "border-indigo-500/30",
+    },
+    pink: {
+      running: "border-pink-500 ring-2 ring-pink-500/20",
+      idle: "border-pink-500/30",
     },
   };
 
@@ -340,6 +360,174 @@ const ExecutionStatusRenderer = memo(function ExecutionStatusRenderer({
 });
 
 /**
+ * Shell Command widget renderer - calls useShellCommandData statically.
+ */
+const ShellCommandRenderer = memo(function ShellCommandRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("shell_command")!;
+  const data = useShellCommandData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
+ * API Request widget renderer - calls useApiRequestData statically.
+ */
+const ApiRequestRenderer = memo(function ApiRequestRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("api_request")!;
+  const data = useApiRequestData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
+ * Script widget renderer - calls useScriptData statically.
+ */
+const ScriptRenderer = memo(function ScriptRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("script")!;
+  const data = useScriptData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
+ * Workflow Ref widget renderer - calls useWorkflowRefData statically.
+ */
+const WorkflowRefRenderer = memo(function WorkflowRefRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("workflow_ref")!;
+  const data = useWorkflowRefData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
  * Active widget dispatcher - renders the correct type-specific component.
  * Each type has its own component with static hook calls.
  * Memoized to prevent unnecessary re-renders when parent state changes.
@@ -367,6 +555,14 @@ const ActiveWidget = memo(function ActiveWidget({
       return <FindingsRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     case "execution_status":
       return <ExecutionStatusRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "shell_command":
+      return <ShellCommandRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "api_request":
+      return <ApiRequestRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "script":
+      return <ScriptRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "workflow_ref":
+      return <WorkflowRefRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     default:
       return (
         <div className="flex items-center justify-center h-full text-muted-foreground">
@@ -496,6 +692,48 @@ const ExecutionStatusSummaryRenderer = memo(function ExecutionStatusSummaryRende
 });
 
 /**
+ * Shell Command summary renderer.
+ */
+const ShellCommandSummaryRenderer = memo(function ShellCommandSummaryRenderer(
+  props: SummaryRendererProps,
+) {
+  const config = widgetRegistry.get("shell_command")!;
+  const data = useShellCommandData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
+ * API Request summary renderer.
+ */
+const ApiRequestSummaryRenderer = memo(function ApiRequestSummaryRenderer(
+  props: SummaryRendererProps,
+) {
+  const config = widgetRegistry.get("api_request")!;
+  const data = useApiRequestData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
+ * Script summary renderer.
+ */
+const ScriptSummaryRenderer = memo(function ScriptSummaryRenderer(props: SummaryRendererProps) {
+  const config = widgetRegistry.get("script")!;
+  const data = useScriptData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
+ * Workflow Ref summary renderer.
+ */
+const WorkflowRefSummaryRenderer = memo(function WorkflowRefSummaryRenderer(
+  props: SummaryRendererProps,
+) {
+  const config = widgetRegistry.get("workflow_ref")!;
+  const data = useWorkflowRefData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
  * Summary widget dispatcher - renders the correct type-specific component.
  * Memoized to prevent unnecessary re-renders when parent state changes.
  */
@@ -554,6 +792,38 @@ const SummaryWidget = memo(function SummaryWidget({
     case "execution_status":
       return (
         <ExecutionStatusSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
+    case "shell_command":
+      return (
+        <ShellCommandSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
+    case "api_request":
+      return (
+        <ApiRequestSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
+    case "script":
+      return (
+        <ScriptSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
+    case "workflow_ref":
+      return (
+        <WorkflowRefSummaryRenderer
           status={status}
           onClick={onClick}
           onNavigateToDetail={onNavigateToDetail}

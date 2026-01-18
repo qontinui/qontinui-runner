@@ -194,7 +194,9 @@ pub async fn create_shell_command(
     let tags_json = serde_json::to_string(&input.tags.unwrap_or_default())
         .map_err(|e| format!("Failed to serialize tags: {}", e))?;
 
-    let timeout_seconds = input.timeout_seconds.unwrap_or_else(default_timeout_seconds);
+    let timeout_seconds = input
+        .timeout_seconds
+        .unwrap_or_else(default_timeout_seconds);
     let fail_on_error = input.fail_on_error.unwrap_or_else(default_fail_on_error);
 
     conn.execute(
@@ -263,18 +265,18 @@ pub async fn get_shell_command(
         params![id],
         |row| {
             Ok((
-                row.get::<_, String>(0)?,          // id
-                row.get::<_, String>(1)?,          // name
-                row.get::<_, Option<String>>(2)?,  // description
-                row.get::<_, String>(3)?,          // command
-                row.get::<_, Option<String>>(4)?,  // working_directory
-                row.get::<_, i32>(5)?,             // timeout_seconds
-                row.get::<_, bool>(6)?,            // fail_on_error
-                row.get::<_, Option<String>>(7)?,  // category
-                row.get::<_, String>(8)?,          // tags
-                row.get::<_, bool>(9)?,            // enabled
-                row.get::<_, String>(10)?,         // created_at
-                row.get::<_, String>(11)?,         // updated_at
+                row.get::<_, String>(0)?,         // id
+                row.get::<_, String>(1)?,         // name
+                row.get::<_, Option<String>>(2)?, // description
+                row.get::<_, String>(3)?,         // command
+                row.get::<_, Option<String>>(4)?, // working_directory
+                row.get::<_, i32>(5)?,            // timeout_seconds
+                row.get::<_, bool>(6)?,           // fail_on_error
+                row.get::<_, Option<String>>(7)?, // category
+                row.get::<_, String>(8)?,         // tags
+                row.get::<_, bool>(9)?,           // enabled
+                row.get::<_, String>(10)?,        // created_at
+                row.get::<_, String>(11)?,        // updated_at
             ))
         },
     );
@@ -390,18 +392,18 @@ pub async fn list_shell_commands(
     let commands_iter = stmt
         .query_map(params_refs.as_slice(), |row| {
             Ok((
-                row.get::<_, String>(0)?,          // id
-                row.get::<_, String>(1)?,          // name
-                row.get::<_, Option<String>>(2)?,  // description
-                row.get::<_, String>(3)?,          // command
-                row.get::<_, Option<String>>(4)?,  // working_directory
-                row.get::<_, i32>(5)?,             // timeout_seconds
-                row.get::<_, bool>(6)?,            // fail_on_error
-                row.get::<_, Option<String>>(7)?,  // category
-                row.get::<_, String>(8)?,          // tags
-                row.get::<_, bool>(9)?,            // enabled
-                row.get::<_, String>(10)?,         // created_at
-                row.get::<_, String>(11)?,         // updated_at
+                row.get::<_, String>(0)?,         // id
+                row.get::<_, String>(1)?,         // name
+                row.get::<_, Option<String>>(2)?, // description
+                row.get::<_, String>(3)?,         // command
+                row.get::<_, Option<String>>(4)?, // working_directory
+                row.get::<_, i32>(5)?,            // timeout_seconds
+                row.get::<_, bool>(6)?,           // fail_on_error
+                row.get::<_, Option<String>>(7)?, // category
+                row.get::<_, String>(8)?,         // tags
+                row.get::<_, bool>(9)?,           // enabled
+                row.get::<_, String>(10)?,        // created_at
+                row.get::<_, String>(11)?,        // updated_at
             ))
         })
         .map_err(|e| format!("Failed to query shell commands: {}", e))?;
@@ -490,15 +492,15 @@ pub async fn update_shell_command(
         params![id],
         |row| {
             Ok((
-                row.get::<_, String>(0)?,          // name
-                row.get::<_, Option<String>>(1)?,  // description
-                row.get::<_, String>(2)?,          // command
-                row.get::<_, Option<String>>(3)?,  // working_directory
-                row.get::<_, i32>(4)?,             // timeout_seconds
-                row.get::<_, bool>(5)?,            // fail_on_error
-                row.get::<_, Option<String>>(6)?,  // category
-                row.get::<_, String>(7)?,          // tags
-                row.get::<_, bool>(8)?,            // enabled
+                row.get::<_, String>(0)?,         // name
+                row.get::<_, Option<String>>(1)?, // description
+                row.get::<_, String>(2)?,         // command
+                row.get::<_, Option<String>>(3)?, // working_directory
+                row.get::<_, i32>(4)?,            // timeout_seconds
+                row.get::<_, bool>(5)?,           // fail_on_error
+                row.get::<_, Option<String>>(6)?, // category
+                row.get::<_, String>(7)?,         // tags
+                row.get::<_, bool>(8)?,           // enabled
             ))
         },
     );
@@ -661,13 +663,13 @@ pub async fn execute_shell_command(
         params![id],
         |row| {
             Ok((
-                row.get::<_, String>(0)?,          // id
-                row.get::<_, String>(1)?,          // name
-                row.get::<_, String>(2)?,          // command
-                row.get::<_, Option<String>>(3)?,  // working_directory
-                row.get::<_, i32>(4)?,             // timeout_seconds
-                row.get::<_, bool>(5)?,            // fail_on_error
-                row.get::<_, bool>(6)?,            // enabled
+                row.get::<_, String>(0)?,         // id
+                row.get::<_, String>(1)?,         // name
+                row.get::<_, String>(2)?,         // command
+                row.get::<_, Option<String>>(3)?, // working_directory
+                row.get::<_, i32>(4)?,            // timeout_seconds
+                row.get::<_, bool>(5)?,           // fail_on_error
+                row.get::<_, bool>(6)?,           // enabled
             ))
         },
     );
@@ -746,10 +748,7 @@ pub async fn execute_shell_command(
             )
         }
         Err(_) => {
-            error!(
-                "Command '{}' timed out after {}s",
-                name, timeout_seconds
-            );
+            error!("Command '{}' timed out after {}s", name, timeout_seconds);
             (
                 false,
                 None,
@@ -862,15 +861,15 @@ pub async fn get_shell_command_results(
     let results_iter = stmt
         .query_map(params![shell_command_id, limit], |row| {
             Ok((
-                row.get::<_, String>(0)?,          // id
-                row.get::<_, String>(1)?,          // shell_command_id
-                row.get::<_, Option<String>>(2)?,  // task_run_id
-                row.get::<_, bool>(3)?,            // success
-                row.get::<_, Option<i32>>(4)?,     // exit_code
-                row.get::<_, String>(5)?,          // stdout
-                row.get::<_, String>(6)?,          // stderr
-                row.get::<_, i64>(7)?,             // duration_ms
-                row.get::<_, String>(8)?,          // executed_at
+                row.get::<_, String>(0)?,         // id
+                row.get::<_, String>(1)?,         // shell_command_id
+                row.get::<_, Option<String>>(2)?, // task_run_id
+                row.get::<_, bool>(3)?,           // success
+                row.get::<_, Option<i32>>(4)?,    // exit_code
+                row.get::<_, String>(5)?,         // stdout
+                row.get::<_, String>(6)?,         // stderr
+                row.get::<_, i64>(7)?,            // duration_ms
+                row.get::<_, String>(8)?,         // executed_at
             ))
         })
         .map_err(|e| format!("Failed to query shell command results: {}", e))?;

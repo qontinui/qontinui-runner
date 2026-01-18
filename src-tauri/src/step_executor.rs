@@ -19,13 +19,13 @@ use crate::action_service::UnifiedActionService;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
 use crate::database::CreateTaskRunAwasStepInput;
-use crate::mcp_client::CreateMcpCallInput;
 use crate::display::RawEvent;
 use crate::executor::file_logger::FileLogger;
 use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, ActionEvent, ImageRecognitionEvent,
     RelevantLogSources,
 };
+use crate::mcp_client::CreateMcpCallInput;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tracing::{info, warn};
 
 /// Configuration for a single execution step
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ExecutionStepConfig {
     /// Step type: "workflow", "state", "action", "screenshot", "playwright", "prompt"
     #[serde(rename = "type")]
@@ -115,17 +115,21 @@ pub struct ExecutionStepConfig {
     pub test_id: Option<String>,
 
     /// Test type for verification test steps
-    #[serde(rename = "testType")]
+    #[serde(alias = "testType", alias = "test_type")]
     pub test_type: Option<String>,
 
     /// Whether test failure should fail the workflow
-    #[serde(rename = "testIsCritical", default)]
+    #[serde(
+        alias = "testIsCritical",
+        alias = "test_is_critical",
+        alias = "is_critical",
+        default
+    )]
     pub test_is_critical: Option<bool>,
 
     // ========================================================================
     // AWAS Step Fields
     // ========================================================================
-
     /// AWAS: URL for AWAS operations (discover, execute, check_support)
     #[serde(rename = "awasUrl")]
     pub awas_url: Option<String>,
@@ -149,7 +153,6 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // MCP Call Step Fields
     // ========================================================================
-
     /// MCP: Server ID for the MCP server to call
     #[serde(rename = "mcpServerId")]
     pub mcp_server_id: Option<String>,
@@ -173,7 +176,6 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // Shell Command Step Fields
     // ========================================================================
-
     /// Shell Command: The command to execute
     #[serde(alias = "shellCommand", alias = "command")]
     pub shell_command: Option<String>,
@@ -193,7 +195,6 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // API Request Step Fields
     // ========================================================================
-
     /// API Request: HTTP method (GET, POST, PUT, PATCH, DELETE)
     #[serde(alias = "apiMethod", alias = "method")]
     pub api_method: Option<String>,
@@ -217,16 +218,18 @@ pub struct ExecutionStepConfig {
     // ========================================================================
     // Check Step Fields
     // ========================================================================
-
     /// Check: Type of check (lint, format, typecheck, analyze, security, custom_command)
     #[serde(alias = "checkType", alias = "check_type")]
     pub check_type: Option<String>,
 
-    /// Check: Command to run (shares with shell_command)
+    /// Check: Command to run
+    /// Note: The "command" alias conflicts with shell_command, so JSON "command" will go there.
+    /// The execute_check_step function handles this by checking both fields.
     #[serde(alias = "checkCommand")]
     pub check_command: Option<String>,
 
     /// Check: Working directory
+    /// Note: The "working_directory" alias conflicts with shell_command_working_directory
     #[serde(alias = "checkWorkingDirectory")]
     pub check_working_directory: Option<String>,
 
@@ -677,7 +680,11 @@ impl ExecutionStepConfig {
     // ========================================================================
 
     /// Create an MCP call step
-    pub fn mcp_call(server_id: &str, tool_name: &str, arguments: Option<serde_json::Value>) -> Self {
+    pub fn mcp_call(
+        server_id: &str,
+        tool_name: &str,
+        arguments: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             step_type: "mcp_call".to_string(),
             name: Some(format!("MCP Call: {}", tool_name)),
@@ -785,6 +792,16 @@ pub struct StepExecutionConfig {
     pub playwright_script_id: Option<String>,
     /// Initial state IDs for workflow steps
     pub initial_state_ids: Option<Vec<String>>,
+    /// For check steps: "lint", "format", "typecheck", "analyze", "security", "custom_command"
+    pub check_type: Option<String>,
+    /// Shell command or check command
+    pub command: Option<String>,
+    /// Test ID for verification test steps
+    pub test_id: Option<String>,
+    /// Test type for test steps: "repository", "playwright", etc.
+    pub test_type: Option<String>,
+    /// Working directory for shell commands and checks
+    pub working_directory: Option<String>,
 }
 
 /// Result of executing all steps
@@ -954,7 +971,13 @@ impl StepExecutor {
     }
 
     /// Emit a tree event to the Tauri frontend (if app_handle is available)
-    fn emit_tree_event(&self, event_type: &str, node: &serde_json::Value, timestamp: f64, sequence: u32) {
+    fn emit_tree_event(
+        &self,
+        event_type: &str,
+        node: &serde_json::Value,
+        timestamp: f64,
+        sequence: u32,
+    ) {
         use tauri::Emitter;
         if let Some(ref app_handle) = self.app_handle {
             let tree_event = json!({
@@ -1029,16 +1052,26 @@ impl StepExecutor {
             url: url.map(|s| s.to_string()),
             action_id: action_id.map(|s| s.to_string()),
             parameters: parameters.map(|p| serde_json::to_string(p).unwrap_or_default()),
-            response_data: response.data.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+            response_data: response
+                .data
+                .as_ref()
+                .map(|d| serde_json::to_string(d).unwrap_or_default()),
             success: response.success,
             error_message: response.error.clone(),
             duration_ms: Some(duration_ms),
             timestamp,
         };
 
-        match self.app_state.checkpoint_db.create_task_run_awas_step(&input) {
+        match self
+            .app_state
+            .checkpoint_db
+            .create_task_run_awas_step(&input)
+        {
             Ok(id) => {
-                info!("Saved AWAS step result to database: {} (type: {})", id, step_type);
+                info!(
+                    "Saved AWAS step result to database: {} (type: {})",
+                    id, step_type
+                );
             }
             Err(e) => {
                 warn!("Failed to save AWAS step result to database: {}", e);
@@ -1105,9 +1138,8 @@ impl StepExecutor {
         iteration: u32,
     ) -> Vec<ExecutionStepConfig> {
         // Separate Playwright steps from other steps
-        let (playwright_steps, other_steps): (Vec<_>, Vec<_>) = steps
-            .iter()
-            .partition(|s| s.step_type == "playwright");
+        let (playwright_steps, other_steps): (Vec<_>, Vec<_>) =
+            steps.iter().partition(|s| s.step_type == "playwright");
 
         // For first iteration, still combine Playwright scripts for efficiency
         // For subsequent iterations, also filter non-Playwright steps
@@ -1154,9 +1186,10 @@ impl StepExecutor {
                 // Skip individual Playwright steps (they're now combined)
             } else {
                 // Include non-Playwright steps that passed the filter
-                if filtered_other_steps.iter().any(|s| {
-                    s.name == step.name && s.step_type == step.step_type
-                }) {
+                if filtered_other_steps
+                    .iter()
+                    .any(|s| s.name == step.name && s.step_type == step.step_type)
+                {
                     result.push(step.clone());
                 }
             }
@@ -1180,9 +1213,10 @@ impl StepExecutor {
         }
 
         // Separate setup and verification Playwright steps
-        let (setup_steps, verification_steps): (Vec<&&ExecutionStepConfig>, Vec<&&ExecutionStepConfig>) = steps
-            .iter()
-            .partition(|s| s.is_setup.unwrap_or(false));
+        let (setup_steps, verification_steps): (
+            Vec<&&ExecutionStepConfig>,
+            Vec<&&ExecutionStepConfig>,
+        ) = steps.iter().partition(|s| s.is_setup.unwrap_or(false));
 
         info!(
             "Combining {} Playwright scripts ({} setup, {} verification) into single script",
@@ -1192,10 +1226,7 @@ impl StepExecutor {
         );
 
         // Collect script IDs for the combined step name
-        let script_names: Vec<String> = steps
-            .iter()
-            .filter_map(|s| s.name.clone())
-            .collect();
+        let script_names: Vec<String> = steps.iter().filter_map(|s| s.name.clone()).collect();
 
         // Collect script contents (setup first, then verification)
         let mut combined_content_parts: Vec<String> = Vec::new();
@@ -1402,6 +1433,17 @@ impl StepExecutor {
                     timeout_seconds: step.timeout_seconds,
                     playwright_script_id: step.playwright_script_id.clone(),
                     initial_state_ids: step.initial_state_ids.clone(),
+                    check_type: step.check_type.clone(),
+                    command: step
+                        .check_command
+                        .clone()
+                        .or_else(|| step.shell_command.clone()),
+                    test_id: step.test_id.clone(),
+                    test_type: step.test_type.clone(),
+                    working_directory: step
+                        .check_working_directory
+                        .clone()
+                        .or_else(|| step.shell_command_working_directory.clone()),
                 },
             });
         }
@@ -1823,7 +1865,12 @@ impl StepExecutor {
                         }
 
                         // Emit to Tauri frontend for action log refresh
-                        self.emit_tree_event("action_failed", &failed_node, end_timestamp, sequence);
+                        self.emit_tree_event(
+                            "action_failed",
+                            &failed_node,
+                            end_timestamp,
+                            sequence,
+                        );
 
                         // Record failed screenshot event
                         self.record_screenshot_event(
@@ -1865,18 +1912,260 @@ impl StepExecutor {
                 }
             }
             "test" => {
-                // Execute verification test
-                if let Some(ref test_id) = step.test_id {
-                    match self.execute_verification_test(test_id, step.test_is_critical.unwrap_or(true)).await {
+                // Execute verification test with tree event emission
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static TEST_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+                let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+                let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                let action_id = format!("test-{}", sequence);
+                let step_name = step
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Verification Test".to_string());
+                let test_id_display = step
+                    .test_id
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let is_critical = step.test_is_critical.unwrap_or(true);
+
+                // Build action node for tree events
+                let action_node = json!({
+                    "id": &action_id,
+                    "node_type": "action",
+                    "name": format!("TEST: {}", step_name),
+                    "timestamp": timestamp,
+                    "status": "pending",
+                    "metadata": {
+                        "test_id": &test_id_display,
+                        "is_critical": is_critical,
+                    }
+                });
+
+                // Emit action_started tree event to file log
+                FileLogger::log_tree_event(
+                    "action_started",
+                    &action_node,
+                    &[],
+                    timestamp,
+                    sequence,
+                );
+
+                // Also add to DisplayProcessor for Session/Actions page
+                {
+                    let raw_event = RawEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        event_type: "action_started".to_string(),
+                        timestamp,
+                        data: json!({ "node": action_node.clone() }),
+                        sequence: sequence as u64,
+                    };
+                    let mut processor = self.app_state.display_processor.lock().await;
+                    processor.event_log_mut().add_event(raw_event);
+                }
+
+                // Emit to Tauri frontend for action log refresh
+                self.emit_tree_event("action_started", &action_node, timestamp, sequence);
+
+                // Execute the test
+                let result = if let Some(ref test_id) = step.test_id {
+                    // Execute stored verification test by ID
+                    match self.execute_verification_test(test_id, is_critical).await {
                         Ok((success, error)) => (success, error, None),
                         Err(e) => (false, Some(format!("Test execution error: {}", e)), None),
                     }
+                } else if step.test_type.as_deref() == Some("repository") {
+                    // Repository test: run a command in the working directory
+                    let command = step
+                        .check_command
+                        .clone()
+                        .or_else(|| step.shell_command.clone())
+                        .unwrap_or_else(|| "pytest".to_string());
+                    let working_dir = step
+                        .check_working_directory
+                        .clone()
+                        .or_else(|| step.shell_command_working_directory.clone())
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|_| ".".to_string())
+                        });
+
+                    info!("Executing repository test: {} in {}", command, working_dir);
+
+                    match self.execute_shell_command_step(&command, &working_dir).await {
+                        Ok((exit_code, stdout, stderr)) => {
+                            let success = exit_code == 0;
+                            let error = if success {
+                                None
+                            } else {
+                                let output = format!(
+                                    "Exit code: {}\nstdout: {}\nstderr: {}",
+                                    exit_code,
+                                    stdout.chars().take(500).collect::<String>(),
+                                    stderr.chars().take(500).collect::<String>()
+                                );
+                                Some(output)
+                            };
+                            (success, error, None)
+                        }
+                        Err(e) => (false, Some(format!("Repository test error: {}", e)), None),
+                    }
                 } else {
-                    (false, Some("No test ID specified".to_string()), None)
+                    (
+                        false,
+                        Some("No test ID specified and test_type is not 'repository'".to_string()),
+                        None,
+                    )
+                };
+
+                let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                let duration = end_timestamp - timestamp;
+                let (success, ref error_opt, _) = result;
+
+                // Build completed/failed node
+                let completed_node = json!({
+                    "id": &action_id,
+                    "node_type": "action",
+                    "name": format!("TEST: {}", step_name),
+                    "timestamp": end_timestamp,
+                    "status": if success { "success" } else { "failed" },
+                    "duration": duration,
+                    "error": error_opt.clone(),
+                    "metadata": {
+                        "test_id": &test_id_display,
+                        "is_critical": is_critical,
+                    }
+                });
+
+                let event_type = if success {
+                    "action_completed"
+                } else {
+                    "action_failed"
+                };
+
+                // Emit tree event to file log
+                FileLogger::log_tree_event(
+                    event_type,
+                    &completed_node,
+                    &[],
+                    end_timestamp,
+                    sequence,
+                );
+
+                // Also add to DisplayProcessor for Session/Actions page
+                {
+                    let raw_event = RawEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        event_type: event_type.to_string(),
+                        timestamp: end_timestamp,
+                        data: json!({ "node": completed_node.clone() }),
+                        sequence: sequence as u64,
+                    };
+                    let mut processor = self.app_state.display_processor.lock().await;
+                    processor.event_log_mut().add_event(raw_event);
                 }
+
+                // Emit to Tauri frontend for action log refresh
+                self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
+
+                result
             }
             "prompt" => {
-                // Prompt steps are text for the AI, not executed here
+                // Prompt steps are text for the AI, not executed here - emit tree events for UI visibility
+                use std::sync::atomic::{AtomicU32, Ordering};
+                static PROMPT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+                let sequence = PROMPT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+                let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                let action_id = format!("prompt-{}", sequence);
+                let step_name = step.name.clone().unwrap_or_else(|| "AI Prompt".to_string());
+                let prompt_text = step.prompt_content.clone().unwrap_or_else(|| String::new());
+                let prompt_preview = if prompt_text.len() > 100 {
+                    format!("{}...", &prompt_text[..100])
+                } else {
+                    prompt_text.clone()
+                };
+
+                // Build action node for tree events
+                let action_node = json!({
+                    "id": &action_id,
+                    "node_type": "action",
+                    "name": format!("PROMPT: {}", step_name),
+                    "timestamp": timestamp,
+                    "status": "pending",
+                    "metadata": {
+                        "prompt_preview": prompt_preview,
+                        "type": "ai_prompt",
+                    }
+                });
+
+                // Emit action_started tree event to file log
+                FileLogger::log_tree_event(
+                    "action_started",
+                    &action_node,
+                    &[],
+                    timestamp,
+                    sequence,
+                );
+
+                // Also add to DisplayProcessor for Session/Actions page
+                {
+                    let raw_event = RawEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        event_type: "action_started".to_string(),
+                        timestamp,
+                        data: json!({ "node": action_node.clone() }),
+                        sequence: sequence as u64,
+                    };
+                    let mut processor = self.app_state.display_processor.lock().await;
+                    processor.event_log_mut().add_event(raw_event);
+                }
+
+                // Emit to Tauri frontend for action log refresh
+                self.emit_tree_event("action_started", &action_node, timestamp, sequence);
+
+                // Prompt steps complete immediately (text is passed to AI, not executed here)
+                let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+
+                // Build completed node
+                let completed_node = json!({
+                    "id": &action_id,
+                    "node_type": "action",
+                    "name": format!("PROMPT: {}", step_name),
+                    "timestamp": end_timestamp,
+                    "status": "success",
+                    "duration": end_timestamp - timestamp,
+                    "metadata": {
+                        "prompt_preview": prompt_preview,
+                        "type": "ai_prompt",
+                        "note": "Prompt text passed to AI for processing",
+                    }
+                });
+
+                // Emit action_completed tree event to file log
+                FileLogger::log_tree_event(
+                    "action_completed",
+                    &completed_node,
+                    &[],
+                    end_timestamp,
+                    sequence,
+                );
+
+                // Also add to DisplayProcessor for Session/Actions page
+                {
+                    let raw_event = RawEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        event_type: "action_completed".to_string(),
+                        timestamp: end_timestamp,
+                        data: json!({ "node": completed_node.clone() }),
+                        sequence: sequence as u64,
+                    };
+                    let mut processor = self.app_state.display_processor.lock().await;
+                    processor.event_log_mut().add_event(raw_event);
+                }
+
+                // Emit to Tauri frontend for action log refresh
+                self.emit_tree_event("action_completed", &completed_node, end_timestamp, sequence);
+
                 (true, None, None)
             }
             // ================================================================
@@ -1886,38 +2175,57 @@ impl StepExecutor {
                 if let Some(ref url) = step.awas_url {
                     self.execute_awas_discover(url, timeout).await
                 } else {
-                    (false, Some("No URL specified for AWAS discover".to_string()), None)
+                    (
+                        false,
+                        Some("No URL specified for AWAS discover".to_string()),
+                        None,
+                    )
                 }
             }
             "awas_execute" => {
-                if let (Some(ref url), Some(ref action_id)) = (&step.awas_url, &step.awas_action_id) {
-                    self.execute_awas_action(url, action_id, step.awas_params.clone(), timeout).await
+                if let (Some(ref url), Some(ref action_id)) = (&step.awas_url, &step.awas_action_id)
+                {
+                    self.execute_awas_action(url, action_id, step.awas_params.clone(), timeout)
+                        .await
                 } else {
-                    (false, Some("URL and action_id required for AWAS execute".to_string()), None)
+                    (
+                        false,
+                        Some("URL and action_id required for AWAS execute".to_string()),
+                        None,
+                    )
                 }
             }
             "awas_check_support" => {
                 if let Some(ref url) = step.awas_url {
                     self.execute_awas_check_support(url, timeout).await
                 } else {
-                    (false, Some("No URL specified for AWAS check support".to_string()), None)
+                    (
+                        false,
+                        Some("No URL specified for AWAS check support".to_string()),
+                        None,
+                    )
                 }
             }
-            "awas_list_actions" => {
-                self.execute_awas_list_actions(timeout).await
-            }
+            "awas_list_actions" => self.execute_awas_list_actions(timeout).await,
             "awas_extract_elements" => {
                 if let Some(ref html) = step.awas_html {
-                    self.execute_awas_extract_elements(html, step.awas_base_url.as_deref(), timeout).await
+                    self.execute_awas_extract_elements(html, step.awas_base_url.as_deref(), timeout)
+                        .await
                 } else {
-                    (false, Some("No HTML specified for AWAS extract elements".to_string()), None)
+                    (
+                        false,
+                        Some("No HTML specified for AWAS extract elements".to_string()),
+                        None,
+                    )
                 }
             }
             // ================================================================
             // MCP Call Step Type
             // ================================================================
             "mcp_call" => {
-                if let (Some(ref server_id), Some(ref tool_name)) = (&step.mcp_server_id, &step.mcp_tool_name) {
+                if let (Some(ref server_id), Some(ref tool_name)) =
+                    (&step.mcp_server_id, &step.mcp_tool_name)
+                {
                     self.execute_mcp_call(
                         server_id,
                         tool_name,
@@ -1925,17 +2233,20 @@ impl StepExecutor {
                         timeout,
                         step.name.as_deref(),
                         step.mcp_fail_on_error.unwrap_or(true),
-                    ).await
+                    )
+                    .await
                 } else {
-                    (false, Some("Server ID and tool name required for MCP call".to_string()), None)
+                    (
+                        false,
+                        Some("Server ID and tool name required for MCP call".to_string()),
+                        None,
+                    )
                 }
             }
             // ================================================================
             // Shell Command Step Type
             // ================================================================
-            "shell_command" => {
-                self.execute_shell_command_step(step, timeout).await
-            }
+            "shell_command" => self.execute_shell_command_step(step, timeout).await,
             // ================================================================
             // Script Step Type (Playwright inline code)
             // ================================================================
@@ -1951,7 +2262,11 @@ impl StepExecutor {
                 } else if let Some(ref script_id) = step.playwright_script_id {
                     self.run_playwright_script(script_id).await
                 } else {
-                    (false, Some("No script code or script ID specified".to_string()), None)
+                    (
+                        false,
+                        Some("No script code or script ID specified".to_string()),
+                        None,
+                    )
                 }
             }
             // ================================================================
@@ -1976,7 +2291,11 @@ impl StepExecutor {
                         Err(e) => (false, Some(format!("Workflow ref error: {}", e)), None),
                     }
                 } else {
-                    (false, Some("No workflow name specified for workflow_ref".to_string()), None)
+                    (
+                        false,
+                        Some("No workflow name specified for workflow_ref".to_string()),
+                        None,
+                    )
                 }
             }
             // ================================================================
@@ -2004,27 +2323,38 @@ impl StepExecutor {
                         match action_type.as_str() {
                             "type" | "hotkey" | "scroll" => {
                                 // These would need special handling via Python bridge
-                                (false, Some(format!("GUI action '{}' not yet implemented in step executor", action_type)), None)
+                                (
+                                    false,
+                                    Some(format!(
+                                        "GUI action '{}' not yet implemented in step executor",
+                                        action_type
+                                    )),
+                                    None,
+                                )
                             }
-                            _ => (false, Some("No target image ID specified for GUI action".to_string()), None)
+                            _ => (
+                                false,
+                                Some("No target image ID specified for GUI action".to_string()),
+                                None,
+                            ),
                         }
                     }
                 } else {
-                    (false, Some("No action type specified for GUI action".to_string()), None)
+                    (
+                        false,
+                        Some("No action type specified for GUI action".to_string()),
+                        None,
+                    )
                 }
             }
             // ================================================================
             // API Request Step Type
             // ================================================================
-            "api_request" => {
-                self.execute_api_request_step(step, timeout).await
-            }
+            "api_request" => self.execute_api_request_step(step, timeout).await,
             // ================================================================
             // Check Step Type (code quality checks)
             // ================================================================
-            "check" => {
-                self.execute_check_step(step, timeout).await
-            }
+            "check" => self.execute_check_step(step, timeout).await,
             _ => {
                 warn!("Unknown step type: {}", step.step_type);
                 (
@@ -2192,7 +2522,10 @@ impl StepExecutor {
             self, TestCategory, TestDefinition, TestStatus, TestType, VisionConfig,
         };
 
-        info!("Executing verification test: {} (critical: {})", test_id, is_critical);
+        info!(
+            "Executing verification test: {} (critical: {})",
+            test_id, is_critical
+        );
 
         // Get the test from database
         let verification_test = self
@@ -2293,7 +2626,10 @@ impl StepExecutor {
             "url": url,
         });
 
-        match self.execute_awas_command("awas_discover", Some(params.clone()), timeout_secs).await {
+        match self
+            .execute_awas_command("awas_discover", Some(params.clone()), timeout_secs)
+            .await
+        {
             Ok(response) => {
                 let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -2309,10 +2645,15 @@ impl StepExecutor {
                 );
 
                 if response.success {
-                    info!("AWAS Discover completed successfully for {} in {}ms", url, duration_ms);
+                    info!(
+                        "AWAS Discover completed successfully for {} in {}ms",
+                        url, duration_ms
+                    );
                     (true, None, None)
                 } else {
-                    let error = response.error.unwrap_or_else(|| "AWAS discover failed".to_string());
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "AWAS discover failed".to_string());
                     (false, Some(error), None)
                 }
             }
@@ -2358,7 +2699,10 @@ impl StepExecutor {
             "params": params,
         });
 
-        match self.execute_awas_command("awas_execute", Some(command_params.clone()), timeout_secs).await {
+        match self
+            .execute_awas_command("awas_execute", Some(command_params.clone()), timeout_secs)
+            .await
+        {
             Ok(response) => {
                 let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -2374,10 +2718,15 @@ impl StepExecutor {
                 );
 
                 if response.success {
-                    info!("AWAS Execute '{}' completed successfully in {}ms", action_id, duration_ms);
+                    info!(
+                        "AWAS Execute '{}' completed successfully in {}ms",
+                        action_id, duration_ms
+                    );
                     (true, None, None)
                 } else {
-                    let error = response.error.unwrap_or_else(|| "AWAS execute failed".to_string());
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "AWAS execute failed".to_string());
                     (false, Some(error), None)
                 }
             }
@@ -2419,7 +2768,10 @@ impl StepExecutor {
             "url": url,
         });
 
-        match self.execute_awas_command("awas_check_support", Some(params.clone()), timeout_secs).await {
+        match self
+            .execute_awas_command("awas_check_support", Some(params.clone()), timeout_secs)
+            .await
+        {
             Ok(response) => {
                 let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -2436,20 +2788,29 @@ impl StepExecutor {
 
                 if response.success {
                     // Extract support status from response data
-                    let supported = response.data
+                    let supported = response
+                        .data
                         .as_ref()
                         .and_then(|d| d.get("supported"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
 
                     if supported {
-                        info!("AWAS is supported at {} (checked in {}ms)", url, duration_ms);
+                        info!(
+                            "AWAS is supported at {} (checked in {}ms)",
+                            url, duration_ms
+                        );
                     } else {
-                        info!("AWAS is not supported at {} (checked in {}ms)", url, duration_ms);
+                        info!(
+                            "AWAS is not supported at {} (checked in {}ms)",
+                            url, duration_ms
+                        );
                     }
                     (true, None, None)
                 } else {
-                    let error = response.error.unwrap_or_else(|| "AWAS check support failed".to_string());
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "AWAS check support failed".to_string());
                     (false, Some(error), None)
                 }
             }
@@ -2487,7 +2848,10 @@ impl StepExecutor {
 
         let start_time = std::time::Instant::now();
 
-        match self.execute_awas_command("awas_list_actions", None, timeout_secs).await {
+        match self
+            .execute_awas_command("awas_list_actions", None, timeout_secs)
+            .await
+        {
             Ok(response) => {
                 let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -2503,16 +2867,22 @@ impl StepExecutor {
                 );
 
                 if response.success {
-                    let action_count = response.data
+                    let action_count = response
+                        .data
                         .as_ref()
                         .and_then(|d| d.get("actions"))
                         .and_then(|v| v.as_array())
                         .map(|a| a.len())
                         .unwrap_or(0);
-                    info!("AWAS List Actions: found {} actions in {}ms", action_count, duration_ms);
+                    info!(
+                        "AWAS List Actions: found {} actions in {}ms",
+                        action_count, duration_ms
+                    );
                     (true, None, None)
                 } else {
-                    let error = response.error.unwrap_or_else(|| "AWAS list actions failed".to_string());
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "AWAS list actions failed".to_string());
                     (false, Some(error), None)
                 }
             }
@@ -2563,7 +2933,10 @@ impl StepExecutor {
             "base_url": base_url,
         });
 
-        match self.execute_awas_command("awas_extract_elements", Some(params), timeout_secs).await {
+        match self
+            .execute_awas_command("awas_extract_elements", Some(params), timeout_secs)
+            .await
+        {
             Ok(response) => {
                 let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -2579,10 +2952,15 @@ impl StepExecutor {
                 );
 
                 if response.success {
-                    info!("AWAS Extract Elements completed successfully in {}ms", duration_ms);
+                    info!(
+                        "AWAS Extract Elements completed successfully in {}ms",
+                        duration_ms
+                    );
                     (true, None, None)
                 } else {
-                    let error = response.error.unwrap_or_else(|| "AWAS extract elements failed".to_string());
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "AWAS extract elements failed".to_string());
                     (false, Some(error), None)
                 }
             }
@@ -2623,9 +3001,10 @@ impl StepExecutor {
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
         tokio::task::spawn_blocking(move || {
-            let mut bridge_lock = app_state.python_bridge.lock().map_err(|e| {
-                format!("Failed to acquire python_bridge lock: {}", e)
-            })?;
+            let mut bridge_lock = app_state
+                .python_bridge
+                .lock()
+                .map_err(|e| format!("Failed to acquire python_bridge lock: {}", e))?;
 
             if let Some(ref mut bridge) = *bridge_lock {
                 if !bridge.is_running() {
@@ -2657,7 +3036,7 @@ impl StepExecutor {
         server_id: &str,
         tool_name: &str,
         arguments: serde_json::Value,
-        timeout_secs: u64,
+        _timeout_secs: u64,
         step_name: Option<&str>,
         fail_on_error: bool,
     ) -> (bool, Option<String>, Option<String>) {
@@ -2670,7 +3049,9 @@ impl StepExecutor {
 
         // Temporarily set timeout on the server config (not persisted)
         // The actual timeout is handled by the MCP client implementation
-        let result = mcp_manager.call_tool(server_id, tool_name, arguments.clone()).await;
+        let result = mcp_manager
+            .call_tool(server_id, tool_name, arguments.clone())
+            .await;
         let duration_ms = start_time.elapsed().as_millis() as i64;
 
         match result {
@@ -2689,19 +3070,28 @@ impl StepExecutor {
                 );
 
                 if call_result.success {
-                    info!("MCP Call '{}.{}' succeeded in {}ms", server_id, tool_name, duration_ms);
+                    info!(
+                        "MCP Call '{}.{}' succeeded in {}ms",
+                        server_id, tool_name, duration_ms
+                    );
                     // Return the content as a JSON string in the screenshot_path field
                     // (repurposing this field for MCP result data)
-                    let result_data = call_result.content
+                    let result_data = call_result
+                        .content
                         .map(|c| serde_json::to_string(&c).unwrap_or_default());
                     (true, None, result_data)
                 } else {
-                    let error = call_result.error.unwrap_or_else(|| "MCP call failed".to_string());
+                    let error = call_result
+                        .error
+                        .unwrap_or_else(|| "MCP call failed".to_string());
                     if fail_on_error {
                         (false, Some(error), None)
                     } else {
                         // Return success but include the error message
-                        info!("MCP Call '{}.{}' failed but fail_on_error=false, continuing", server_id, tool_name);
+                        info!(
+                            "MCP Call '{}.{}' failed but fail_on_error=false, continuing",
+                            server_id, tool_name
+                        );
                         (true, Some(format!("(ignored) {}", error)), None)
                     }
                 }
@@ -2725,7 +3115,10 @@ impl StepExecutor {
                 if fail_on_error {
                     (false, Some(error_msg), None)
                 } else {
-                    info!("MCP Call '{}.{}' errored but fail_on_error=false, continuing", server_id, tool_name);
+                    info!(
+                        "MCP Call '{}.{}' errored but fail_on_error=false, continuing",
+                        server_id, tool_name
+                    );
                     (true, Some(format!("(ignored) {}", error_msg)), None)
                 }
             }
@@ -2768,9 +3161,16 @@ impl StepExecutor {
             error_message: error.map(|e| e.to_string()),
         };
 
-        match self.app_state.checkpoint_db.create_task_run_mcp_call(&input) {
+        match self
+            .app_state
+            .checkpoint_db
+            .create_task_run_mcp_call(&input)
+        {
             Ok(id) => {
-                info!("Saved MCP call result to database: {} (tool: {})", id, tool_name);
+                info!(
+                    "Saved MCP call result to database: {} (tool: {})",
+                    id, tool_name
+                );
             }
             Err(e) => {
                 warn!("Failed to save MCP call result to database: {}", e);
@@ -2799,7 +3199,14 @@ impl StepExecutor {
                 // If no direct command, check for shell_command_id
                 if let Some(_id) = &step.shell_command_id {
                     // TODO: Look up saved shell command by ID from database
-                    return (false, Some("Shell command lookup by ID not yet implemented in step executor".to_string()), None);
+                    return (
+                        false,
+                        Some(
+                            "Shell command lookup by ID not yet implemented in step executor"
+                                .to_string(),
+                        ),
+                        None,
+                    );
                 }
                 return (false, Some("No shell command specified".to_string()), None);
             }
@@ -2824,7 +3231,13 @@ impl StepExecutor {
             || command.contains("| %")
             || command.contains("| ?");
 
-        let shell_type = if cfg!(target_os = "windows") && is_powershell { "powershell" } else if cfg!(target_os = "windows") { "cmd" } else { "sh" };
+        let shell_type = if cfg!(target_os = "windows") && is_powershell {
+            "powershell"
+        } else if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        };
 
         info!(
             "Executing shell command '{}': {} (shell: {}, timeout: {}s, working_dir: {:?})",
@@ -2861,13 +3274,7 @@ impl StepExecutor {
         });
 
         // Emit action_started tree event to file log
-        FileLogger::log_tree_event(
-            "action_started",
-            &action_node,
-            &[],
-            timestamp,
-            sequence,
-        );
+        FileLogger::log_tree_event("action_started", &action_node, &[], timestamp, sequence);
 
         // Also add to DisplayProcessor for Session/Actions page
         {
@@ -2985,18 +3392,29 @@ impl StepExecutor {
 
         let (final_success, error_msg, output_data) = if success {
             // Return stdout in the screenshot_path field (repurposed for output data)
-            let output_data = if stdout.is_empty() { None } else { Some(stdout) };
+            let output_data = if stdout.is_empty() {
+                None
+            } else {
+                Some(stdout)
+            };
             (true, None, output_data)
         } else if fail_on_error {
             let error_msg = if !stderr.is_empty() {
-                format!("Command failed (exit code {:?}): {}", exit_code, stderr.trim())
+                format!(
+                    "Command failed (exit code {:?}): {}",
+                    exit_code,
+                    stderr.trim()
+                )
             } else {
                 format!("Command failed with exit code {:?}", exit_code)
             };
             (false, Some(error_msg), None)
         } else {
             // Return success but include the error message
-            info!("Shell command '{}' failed but fail_on_error=false, continuing", step_name);
+            info!(
+                "Shell command '{}' failed but fail_on_error=false, continuing",
+                step_name
+            );
             let error_msg = if !stderr.is_empty() {
                 format!("(ignored) Command failed: {}", stderr.trim())
             } else {
@@ -3024,16 +3442,14 @@ impl StepExecutor {
             }
         });
 
-        let event_type = if final_success { "action_completed" } else { "action_failed" };
+        let event_type = if final_success {
+            "action_completed"
+        } else {
+            "action_failed"
+        };
 
         // Emit completion tree event to file log
-        FileLogger::log_tree_event(
-            event_type,
-            &completed_node,
-            &[],
-            end_timestamp,
-            sequence,
-        );
+        FileLogger::log_tree_event(event_type, &completed_node, &[], end_timestamp, sequence);
 
         // Also add to DisplayProcessor for Session/Actions page
         {
@@ -3067,14 +3483,22 @@ impl StepExecutor {
         let method = match &step.api_method {
             Some(m) => m.to_uppercase(),
             None => {
-                return (false, Some("No HTTP method specified for API request".to_string()), None);
+                return (
+                    false,
+                    Some("No HTTP method specified for API request".to_string()),
+                    None,
+                );
             }
         };
 
         let url = match &step.api_url {
             Some(u) => u.clone(),
             None => {
-                return (false, Some("No URL specified for API request".to_string()), None);
+                return (
+                    false,
+                    Some("No URL specified for API request".to_string()),
+                    None,
+                );
             }
         };
 
@@ -3088,7 +3512,11 @@ impl StepExecutor {
         {
             Ok(c) => c,
             Err(e) => {
-                return (false, Some(format!("Failed to create HTTP client: {}", e)), None);
+                return (
+                    false,
+                    Some(format!("Failed to create HTTP client: {}", e)),
+                    None,
+                );
             }
         };
 
@@ -3100,7 +3528,11 @@ impl StepExecutor {
             "PATCH" => client.patch(&url),
             "DELETE" => client.delete(&url),
             _ => {
-                return (false, Some(format!("Unsupported HTTP method: {}", method)), None);
+                return (
+                    false,
+                    Some(format!("Unsupported HTTP method: {}", method)),
+                    None,
+                );
             }
         };
 
@@ -3144,17 +3576,25 @@ impl StepExecutor {
                             // Return response body in the output field
                             (true, None, Some(body))
                         } else {
-                            (false, Some(format!("HTTP {}: {}", status_code, body.chars().take(500).collect::<String>())), Some(body))
+                            (
+                                false,
+                                Some(format!(
+                                    "HTTP {}: {}",
+                                    status_code,
+                                    body.chars().take(500).collect::<String>()
+                                )),
+                                Some(body),
+                            )
                         }
                     }
-                    Err(e) => {
-                        (false, Some(format!("Failed to read response body: {}", e)), None)
-                    }
+                    Err(e) => (
+                        false,
+                        Some(format!("Failed to read response body: {}", e)),
+                        None,
+                    ),
                 }
             }
-            Err(e) => {
-                (false, Some(format!("API request failed: {}", e)), None)
-            }
+            Err(e) => (false, Some(format!("API request failed: {}", e)), None),
         }
     }
 
@@ -3174,33 +3614,280 @@ impl StepExecutor {
 
         let check_type = step.check_type.as_deref().unwrap_or("custom_command");
         let step_name = step.name.as_deref().unwrap_or("Check");
+        // Note: Due to serde alias conflict, "working_directory" goes to shell_command_working_directory
+        // So we check both fields for backwards compatibility
+        let working_directory = step
+            .check_working_directory
+            .clone()
+            .or_else(|| step.shell_command_working_directory.clone());
 
-        // Get the command to run
-        let command = match &step.check_command {
-            Some(cmd) => cmd.clone(),
+        // Detect project type from working directory to auto-select appropriate tools
+        let detected_language = {
+            let work_dir = working_directory.as_deref().unwrap_or(".");
+            let path = std::path::Path::new(work_dir);
+
+            if path.join("Cargo.toml").exists() {
+                "rust"
+            } else if path.join("pyproject.toml").exists()
+                || path.join("setup.py").exists()
+                || path.join("requirements.txt").exists()
+            {
+                "python"
+            } else if path.join("go.mod").exists() {
+                "go"
+            } else if path.join("tsconfig.json").exists() {
+                "typescript"
+            } else if path.join("package.json").exists() {
+                "javascript"
+            } else if path.join("CMakeLists.txt").exists()
+                || path.join("Makefile").exists()
+                || path.join("configure.ac").exists()
+            {
+                "c_cpp"
+            } else if path.join("build.gradle").exists()
+                || path.join("build.gradle.kts").exists()
+                || path.join("pom.xml").exists()
+            {
+                "java"
+            } else if path.join("mix.exs").exists() {
+                "elixir"
+            } else if path.join("Gemfile").exists() {
+                "ruby"
+            } else if path.join("composer.json").exists() {
+                "php"
+            } else if path.join("Package.swift").exists() {
+                "swift"
+            } else if path.join("*.csproj").exists() || path.join("*.sln").exists() {
+                // Note: glob patterns don't work with exists(), but we'll check for common .NET files
+                "dotnet"
+            } else {
+                "unknown"
+            }
+        };
+
+        // Additional check for .NET projects (need to actually scan directory)
+        let detected_language = if detected_language == "unknown" {
+            let work_dir = working_directory.as_deref().unwrap_or(".");
+            let path = std::path::Path::new(work_dir);
+            if let Ok(entries) = std::fs::read_dir(path) {
+                let has_dotnet = entries.filter_map(|e| e.ok()).any(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    name.ends_with(".csproj") || name.ends_with(".sln") || name.ends_with(".fsproj")
+                });
+                if has_dotnet {
+                    "dotnet"
+                } else {
+                    "unknown"
+                }
+            } else {
+                "unknown"
+            }
+        } else {
+            detected_language
+        };
+
+        info!(
+            "Check step '{}': detected language = {}",
+            step_name, detected_language
+        );
+
+        // Get the command to run - auto-detect based on language if not specified
+        // Note: Due to serde alias conflict, "command" in JSON goes to shell_command, not check_command
+        // So we check both fields for backwards compatibility with frontend using "command" field
+        let explicit_command = step
+            .check_command
+            .as_ref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| step.shell_command.as_ref().filter(|s| !s.is_empty()));
+
+        let command = match explicit_command {
+            Some(cmd) => Some(cmd.clone()),
             None => {
-                // Default commands based on check type
-                match check_type {
-                    "lint" => "npm run lint".to_string(),
-                    "format" => "npm run format:check".to_string(),
-                    "typecheck" => "npm run typecheck".to_string(),
-                    "analyze" => "npm run analyze".to_string(),
-                    "security" => "npm audit".to_string(),
+                // Auto-select commands based on detected language and check type
+                match (check_type, detected_language) {
+                    // Python checks
+                    ("lint", "python") => Some("ruff check .".to_string()),
+                    ("format", "python") => Some("black --check .".to_string()),
+                    ("typecheck", "python") => Some("mypy .".to_string()),
+                    ("analyze", "python") => Some("ruff check . --statistics".to_string()),
+                    ("security", "python") => Some("pip-audit".to_string()),
+
+                    // Rust checks
+                    ("lint", "rust") => Some("cargo clippy -- -D warnings".to_string()),
+                    ("format", "rust") => Some("cargo fmt --check".to_string()),
+                    ("typecheck", "rust") => Some("cargo check".to_string()),
+                    ("analyze", "rust") => Some("cargo clippy --all-targets --all-features".to_string()),
+                    ("security", "rust") => Some("cargo audit".to_string()),
+
+                    // Go checks
+                    ("lint", "go") => Some("golangci-lint run".to_string()),
+                    ("format", "go") => Some("gofmt -l .".to_string()),
+                    ("typecheck", "go") => Some("go vet ./...".to_string()),
+                    ("analyze", "go") => Some("go vet ./... && staticcheck ./...".to_string()),
+                    ("security", "go") => Some("gosec ./...".to_string()),
+
+                    // TypeScript checks
+                    ("lint", "typescript") => Some("npx eslint . --ext .ts,.tsx".to_string()),
+                    ("format", "typescript") => Some("npx prettier --check .".to_string()),
+                    ("typecheck", "typescript") => Some("npx tsc --noEmit".to_string()),
+                    ("analyze", "typescript") => Some("npx eslint . --ext .ts,.tsx --format json".to_string()),
+                    ("security", "typescript") => Some("npm audit".to_string()),
+
+                    // JavaScript checks
+                    ("lint", "javascript") => Some("npx eslint .".to_string()),
+                    ("format", "javascript") => Some("npx prettier --check .".to_string()),
+                    ("typecheck", "javascript") => None, // No typecheck for plain JS
+                    ("analyze", "javascript") => Some("npx eslint . --format json".to_string()),
+                    ("security", "javascript") => Some("npm audit".to_string()),
+
+                    // C/C++ checks (using common tools)
+                    ("lint", "c_cpp") => Some("cppcheck --enable=all .".to_string()),
+                    ("format", "c_cpp") => Some("clang-format --dry-run -Werror **/*.cpp **/*.c **/*.h".to_string()),
+                    ("typecheck", "c_cpp") => Some("make -n".to_string()), // Dry-run make
+                    ("analyze", "c_cpp") => Some("cppcheck --enable=all --xml .".to_string()),
+                    ("security", "c_cpp") => Some("flawfinder .".to_string()),
+
+                    // Java checks
+                    ("lint", "java") => Some("./gradlew checkstyleMain || mvn checkstyle:check".to_string()),
+                    ("format", "java") => Some("./gradlew spotlessCheck || mvn spotless:check".to_string()),
+                    ("typecheck", "java") => Some("./gradlew compileJava || mvn compile".to_string()),
+                    ("analyze", "java") => Some("./gradlew pmd || mvn pmd:check".to_string()),
+                    ("security", "java") => Some("./gradlew dependencyCheckAnalyze || mvn org.owasp:dependency-check-maven:check".to_string()),
+
+                    // Ruby checks
+                    ("lint", "ruby") => Some("bundle exec rubocop".to_string()),
+                    ("format", "ruby") => Some("bundle exec rubocop --format offenses".to_string()),
+                    ("typecheck", "ruby") => Some("bundle exec srb tc".to_string()), // Sorbet
+                    ("analyze", "ruby") => Some("bundle exec rubocop --format json".to_string()),
+                    ("security", "ruby") => Some("bundle exec bundler-audit check".to_string()),
+
+                    // PHP checks
+                    ("lint", "php") => Some("./vendor/bin/phpcs".to_string()),
+                    ("format", "php") => Some("./vendor/bin/php-cs-fixer fix --dry-run --diff".to_string()),
+                    ("typecheck", "php") => Some("./vendor/bin/phpstan analyse".to_string()),
+                    ("analyze", "php") => Some("./vendor/bin/phpmd . text cleancode,codesize,controversial".to_string()),
+                    ("security", "php") => Some("composer audit".to_string()),
+
+                    // Elixir checks
+                    ("lint", "elixir") => Some("mix credo".to_string()),
+                    ("format", "elixir") => Some("mix format --check-formatted".to_string()),
+                    ("typecheck", "elixir") => Some("mix dialyzer".to_string()),
+                    ("analyze", "elixir") => Some("mix credo --format json".to_string()),
+                    ("security", "elixir") => Some("mix deps.audit".to_string()),
+
+                    // Swift checks
+                    ("lint", "swift") => Some("swiftlint".to_string()),
+                    ("format", "swift") => Some("swiftformat --lint .".to_string()),
+                    ("typecheck", "swift") => Some("swift build".to_string()),
+                    ("analyze", "swift") => Some("swiftlint --reporter json".to_string()),
+                    ("security", "swift") => None, // No standard security tool
+
+                    // .NET checks
+                    ("lint", "dotnet") => Some("dotnet format --verify-no-changes".to_string()),
+                    ("format", "dotnet") => Some("dotnet format --verify-no-changes".to_string()),
+                    ("typecheck", "dotnet") => Some("dotnet build --no-restore".to_string()),
+                    ("analyze", "dotnet") => Some("dotnet build /p:TreatWarningsAsErrors=true".to_string()),
+                    ("security", "dotnet") => Some("dotnet list package --vulnerable".to_string()),
+
+                    // Unknown language - skip gracefully
+                    (check_type_val, "unknown") => {
+                        warn!(
+                            "Check step '{}': No language detected, skipping {} check. \
+                            Specify a command explicitly or ensure project has recognizable marker files.",
+                            step_name, check_type_val
+                        );
+                        None
+                    }
+
+                    // Catch-all for unrecognized check types on known languages
                     _ => {
-                        return (false, Some("No command specified for check step".to_string()), None);
+                        warn!(
+                            "Check step '{}': Unsupported check type '{}' for language '{}', skipping.",
+                            step_name, check_type, detected_language
+                        );
+                        None
                     }
                 }
             }
         };
 
-        let working_directory = step.check_working_directory.clone();
+        // Handle the case where no command could be determined (skip gracefully)
+        let command = match command {
+            Some(cmd) => cmd,
+            None => {
+                info!(
+                    "Check step '{}' skipped: no applicable check for type '{}' and language '{}'",
+                    step_name, check_type, detected_language
+                );
+                // Return success with a warning message
+                return (
+                    true,
+                    Some(format!(
+                        "Skipped: No {} check available for {} projects. Specify a command explicitly if needed.",
+                        check_type, detected_language
+                    )),
+                    None,
+                );
+            }
+        };
         let auto_fix = step.check_auto_fix.unwrap_or(false);
 
-        // Modify command for auto-fix if enabled
+        // Modify command for auto-fix if enabled (language-aware)
         let final_command = if auto_fix {
-            match check_type {
-                "lint" => command.replace("lint", "lint:fix").replace(":check", ":fix"),
-                "format" => command.replace("format:check", "format").replace("--check", ""),
+            match (check_type, detected_language) {
+                // Python auto-fix
+                ("lint", "python") => command.replace("ruff check", "ruff check --fix"),
+                ("format", "python") => command.replace("--check", ""),
+
+                // Rust auto-fix
+                ("lint", "rust") => command.replace("cargo clippy", "cargo clippy --fix"),
+                ("format", "rust") => command.replace("--check", ""),
+
+                // Go auto-fix
+                ("lint", "go") => command.replace("golangci-lint run", "golangci-lint run --fix"),
+                ("format", "go") => command.replace("gofmt -l", "gofmt -w"),
+
+                // TypeScript/JavaScript auto-fix
+                ("lint", "typescript") | ("lint", "javascript") => {
+                    if command.contains("eslint") {
+                        format!("{} --fix", command)
+                    } else {
+                        command.replace("lint", "lint:fix")
+                    }
+                }
+                ("format", "typescript") | ("format", "javascript") => {
+                    if command.contains("prettier") {
+                        command.replace("--check", "--write")
+                    } else {
+                        command
+                            .replace("format:check", "format")
+                            .replace("--check", "")
+                    }
+                }
+
+                // C/C++ auto-fix
+                ("format", "c_cpp") => command.replace("--dry-run -Werror", "-i"),
+
+                // Ruby auto-fix
+                ("lint", "ruby") | ("format", "ruby") => format!("{} --autocorrect", command),
+
+                // PHP auto-fix
+                ("lint", "php") => command.replace("phpcs", "phpcbf"),
+                ("format", "php") => command.replace("--dry-run --diff", ""),
+
+                // Elixir auto-fix
+                ("format", "elixir") => command.replace("--check-formatted", ""),
+
+                // Swift auto-fix
+                ("lint", "swift") => format!("{} --fix", command),
+                ("format", "swift") => command.replace("--lint", ""),
+
+                // .NET auto-fix
+                ("lint", "dotnet") | ("format", "dotnet") => {
+                    command.replace("--verify-no-changes", "")
+                }
+
+                // For languages without auto-fix, just return the command as-is
                 _ => command,
             }
         } else {
@@ -3211,6 +3898,55 @@ impl StepExecutor {
             "Executing check '{}' ({}): {} (timeout: {}s, working_dir: {:?})",
             step_name, check_type, final_command, timeout_secs, working_directory
         );
+
+        // Generate sequence number and timestamp for tree events
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CHECK_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        let sequence = CHECK_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let action_id = format!("check-{}", sequence);
+
+        // Truncate command for display
+        let command_display = if final_command.len() > 50 {
+            format!("{}...", &final_command[..50])
+        } else {
+            final_command.clone()
+        };
+
+        // Build action node for tree events
+        let action_node = json!({
+            "id": &action_id,
+            "node_type": "action",
+            "name": format!("CHECK: {}", step_name),
+            "timestamp": timestamp,
+            "status": "pending",
+            "metadata": {
+                "check_type": check_type,
+                "command": &command_display,
+                "working_directory": working_directory.as_deref().unwrap_or(""),
+                "auto_fix": auto_fix,
+                "timeout_seconds": timeout_secs,
+            }
+        });
+
+        // Emit action_started tree event to file log
+        FileLogger::log_tree_event("action_started", &action_node, &[], timestamp, sequence);
+
+        // Also add to DisplayProcessor for Session/Actions page
+        {
+            let raw_event = RawEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: "action_started".to_string(),
+                timestamp,
+                data: json!({ "node": action_node.clone() }),
+                sequence: sequence as u64,
+            };
+            let mut processor = self.app_state.display_processor.lock().await;
+            processor.event_log_mut().add_event(raw_event);
+        }
+
+        // Emit to Tauri frontend for action log refresh
+        self.emit_tree_event("action_started", &action_node, timestamp, sequence);
 
         // Build the command
         let mut cmd = if cfg!(target_os = "windows") {
@@ -3240,7 +3976,7 @@ impl StepExecutor {
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // Process the result
-        match output_result {
+        let (final_success, error_msg, output_data) = match output_result {
             Ok(Ok(output)) => {
                 let exit_code = output.status.code();
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -3253,11 +3989,19 @@ impl StepExecutor {
                 );
 
                 if success {
-                    let output_data = if stdout.is_empty() { None } else { Some(stdout) };
+                    let output_data = if stdout.is_empty() {
+                        None
+                    } else {
+                        Some(stdout)
+                    };
                     (true, None, output_data)
                 } else {
                     let error_output = if !stderr.is_empty() { stderr } else { stdout };
-                    (false, Some(format!("Check failed: {}", error_output.trim())), None)
+                    (
+                        false,
+                        Some(format!("Check failed: {}", error_output.trim())),
+                        None,
+                    )
                 }
             }
             Ok(Err(e)) => {
@@ -3266,9 +4010,60 @@ impl StepExecutor {
             }
             Err(_) => {
                 warn!("Check '{}' timed out after {}s", step_name, timeout_secs);
-                (false, Some(format!("Check timed out after {} seconds", timeout_secs)), None)
+                (
+                    false,
+                    Some(format!("Check timed out after {} seconds", timeout_secs)),
+                    None,
+                )
             }
+        };
+
+        // Emit completion event
+        let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let duration = end_timestamp - timestamp;
+
+        let completed_node = json!({
+            "id": &action_id,
+            "node_type": "action",
+            "name": format!("CHECK: {}", step_name),
+            "timestamp": end_timestamp,
+            "status": if final_success { "success" } else { "failed" },
+            "duration": duration,
+            "metadata": {
+                "check_type": check_type,
+                "command": &command_display,
+                "working_directory": working_directory.as_deref().unwrap_or(""),
+                "duration_ms": duration_ms,
+                "error": error_msg.as_deref().unwrap_or(""),
+            }
+        });
+
+        let event_type = if final_success {
+            "action_completed"
+        } else {
+            "action_failed"
+        };
+
+        // Emit completion tree event to file log
+        FileLogger::log_tree_event(event_type, &completed_node, &[], end_timestamp, sequence);
+
+        // Also add to DisplayProcessor for Session/Actions page
+        {
+            let raw_event = RawEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: event_type.to_string(),
+                timestamp: end_timestamp,
+                data: json!({ "node": completed_node.clone() }),
+                sequence: sequence as u64,
+            };
+            let mut processor = self.app_state.display_processor.lock().await;
+            processor.event_log_mut().add_event(raw_event);
         }
+
+        // Emit to Tauri frontend for action log refresh
+        self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
+
+        (final_success, error_msg, output_data)
     }
 }
 

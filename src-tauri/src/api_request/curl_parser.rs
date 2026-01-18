@@ -106,10 +106,8 @@ pub fn parse_curl(curl_command: &str) -> Result<ParsedCurl, CurlParseError> {
     if let Some(caps) = user_re.captures(&normalized) {
         let auth = &caps[1];
         // Base64 encode for Basic auth
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            auth.as_bytes(),
-        );
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth.as_bytes());
         headers.insert("Authorization".to_string(), format!("Basic {}", encoded));
     }
 
@@ -146,7 +144,9 @@ fn normalize_command(cmd: &str) -> String {
     // Remove backslash-newline continuations (Unix style)
     let without_continuations = cmd.replace("\\\n", " ").replace("\\\r\n", " ");
     // Remove backtick continuations (PowerShell style)
-    let without_backticks = without_continuations.replace("`\n", " ").replace("`\r\n", " ");
+    let without_backticks = without_continuations
+        .replace("`\n", " ")
+        .replace("`\r\n", " ");
     // Normalize whitespace
     without_backticks
         .split_whitespace()
@@ -227,7 +227,10 @@ mod tests {
             -H 'Authorization: Bearer token123' \
             -H 'Content-Type: application/json'"#;
         let parsed = parse_curl(curl).unwrap();
-        assert_eq!(parsed.headers.get("Authorization").unwrap(), "Bearer token123");
+        assert_eq!(
+            parsed.headers.get("Authorization").unwrap(),
+            "Bearer token123"
+        );
         assert_eq!(parsed.content_type, Some("application/json".to_string()));
     }
 

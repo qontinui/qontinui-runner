@@ -19,7 +19,8 @@ const THREAD_LOCAL_INDICATORS: &[&str] = &[
 /// Names that indicate constants (typically uppercase)
 fn is_constant_name(name: &str) -> bool {
     // All uppercase with underscores
-    name.chars().all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
+    name.chars()
+        .all(|c| c.is_uppercase() || c == '_' || c.is_numeric())
         && name.chars().any(|c| c.is_alphabetic())
 }
 

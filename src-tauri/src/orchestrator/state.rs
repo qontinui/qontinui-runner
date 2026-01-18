@@ -249,7 +249,7 @@ impl TaskOrchestrator {
 
             // From AiVerification
             (TaskState::AiVerification, TaskState::Completion) => true, // All passed
-            (TaskState::AiVerification, TaskState::Execution) => true, // Failed, retry
+            (TaskState::AiVerification, TaskState::Execution) => true,  // Failed, retry
             (TaskState::AiVerification, TaskState::Paused) => true,
             (TaskState::AiVerification, TaskState::Stopped) => true,
 
@@ -604,7 +604,10 @@ mod tests {
 
         // Valid: Setup -> DeterministicVerification
         assert!(orchestrator
-            .transition(TaskState::DeterministicVerification, TransitionReason::SetupComplete)
+            .transition(
+                TaskState::DeterministicVerification,
+                TransitionReason::SetupComplete
+            )
             .is_ok());
 
         // Valid: DeterministicVerification -> Completion (all passed, no AI)
@@ -635,7 +638,10 @@ mod tests {
             .transition(TaskState::Setup, TransitionReason::PlanCreated)
             .is_ok());
         assert!(orchestrator
-            .transition(TaskState::DeterministicVerification, TransitionReason::SetupComplete)
+            .transition(
+                TaskState::DeterministicVerification,
+                TransitionReason::SetupComplete
+            )
             .is_ok());
         assert!(orchestrator
             .transition(TaskState::Completion, TransitionReason::DeterministicPassed)
@@ -662,10 +668,7 @@ mod tests {
             .is_ok());
 
         // Invalid: Execution -> Complete (must go through Completion)
-        let result = orchestrator.transition(
-            TaskState::Complete,
-            TransitionReason::WorkComplete,
-        );
+        let result = orchestrator.transition(TaskState::Complete, TransitionReason::WorkComplete);
         assert!(result.is_err());
     }
 }

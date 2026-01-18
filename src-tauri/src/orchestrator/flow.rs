@@ -274,10 +274,7 @@ pub enum StepType {
         next: String,
     },
     /// Delay/wait.
-    Wait {
-        seconds: u64,
-        next: String,
-    },
+    Wait { seconds: u64, next: String },
     /// Loop construct.
     Loop {
         over: String, // expression evaluating to array
@@ -532,9 +529,15 @@ impl FlowStep {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Condition {
     /// Check if a value equals something.
-    Equals { left: String, right: serde_json::Value },
+    Equals {
+        left: String,
+        right: serde_json::Value,
+    },
     /// Check if a value doesn't equal something.
-    NotEquals { left: String, right: serde_json::Value },
+    NotEquals {
+        left: String,
+        right: serde_json::Value,
+    },
     /// Check if a value is greater than.
     GreaterThan { left: String, right: f64 },
     /// Check if a value is less than.
@@ -604,45 +607,31 @@ impl Condition {
         match self {
             Self::Equals { left, right } => context.get(left) == Some(right),
             Self::NotEquals { left, right } => context.get(left) != Some(right),
-            Self::GreaterThan { left, right } => {
-                context
-                    .get(left)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v > *right)
-                    .unwrap_or(false)
-            }
-            Self::LessThan { left, right } => {
-                context
-                    .get(left)
-                    .and_then(|v| v.as_f64())
-                    .map(|v| v < *right)
-                    .unwrap_or(false)
-            }
-            Self::IsTrue { value } => {
-                context
-                    .get(value)
-                    .map(|v| v.as_bool().unwrap_or(false))
-                    .unwrap_or(false)
-            }
-            Self::IsFalse { value } => {
-                context
-                    .get(value)
-                    .map(|v| !v.as_bool().unwrap_or(true))
-                    .unwrap_or(true)
-            }
-            Self::IsNull { value } => {
-                context.get(value).map(|v| v.is_null()).unwrap_or(true)
-            }
-            Self::IsNotNull { value } => {
-                context.get(value).map(|v| !v.is_null()).unwrap_or(false)
-            }
-            Self::Contains { value, substring } => {
-                context
-                    .get(value)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.contains(substring))
-                    .unwrap_or(false)
-            }
+            Self::GreaterThan { left, right } => context
+                .get(left)
+                .and_then(|v| v.as_f64())
+                .map(|v| v > *right)
+                .unwrap_or(false),
+            Self::LessThan { left, right } => context
+                .get(left)
+                .and_then(|v| v.as_f64())
+                .map(|v| v < *right)
+                .unwrap_or(false),
+            Self::IsTrue { value } => context
+                .get(value)
+                .map(|v| v.as_bool().unwrap_or(false))
+                .unwrap_or(false),
+            Self::IsFalse { value } => context
+                .get(value)
+                .map(|v| !v.as_bool().unwrap_or(true))
+                .unwrap_or(true),
+            Self::IsNull { value } => context.get(value).map(|v| v.is_null()).unwrap_or(true),
+            Self::IsNotNull { value } => context.get(value).map(|v| !v.is_null()).unwrap_or(false),
+            Self::Contains { value, substring } => context
+                .get(value)
+                .and_then(|v| v.as_str())
+                .map(|s| s.contains(substring))
+                .unwrap_or(false),
             Self::And { conditions } => conditions.iter().all(|c| c.evaluate(context)),
             Self::Or { conditions } => conditions.iter().any(|c| c.evaluate(context)),
             Self::Not { condition } => !condition.evaluate(context),
@@ -830,8 +819,7 @@ impl FlowState {
         let completed_at = self.completed_at.as_ref()?;
 
         // Parse the ISO timestamps
-        let start =
-            chrono::DateTime::parse_from_rfc3339(&self.started_at).ok()?;
+        let start = chrono::DateTime::parse_from_rfc3339(&self.started_at).ok()?;
         let end = chrono::DateTime::parse_from_rfc3339(completed_at).ok()?;
 
         // Calculate duration
@@ -939,16 +927,10 @@ mod tests {
         context.insert("a".to_string(), serde_json::json!(true));
         context.insert("b".to_string(), serde_json::json!(false));
 
-        let and_cond = Condition::and(vec![
-            Condition::is_true("a"),
-            Condition::is_true("b"),
-        ]);
+        let and_cond = Condition::and(vec![Condition::is_true("a"), Condition::is_true("b")]);
         assert!(!and_cond.evaluate(&context));
 
-        let or_cond = Condition::or(vec![
-            Condition::is_true("a"),
-            Condition::is_true("b"),
-        ]);
+        let or_cond = Condition::or(vec![Condition::is_true("a"), Condition::is_true("b")]);
         assert!(or_cond.evaluate(&context));
     }
 
@@ -972,10 +954,10 @@ mod tests {
 
     #[test]
     fn test_parallel_step() {
-        let step = FlowStep::parallel("parallel_work", vec![
-            "branch_a".to_string(),
-            "branch_b".to_string(),
-        ])
+        let step = FlowStep::parallel(
+            "parallel_work",
+            vec!["branch_a".to_string(), "branch_b".to_string()],
+        )
         .then("merge");
 
         if let StepType::Parallel { branches, next, .. } = &step.step_type {

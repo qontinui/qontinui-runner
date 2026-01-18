@@ -385,19 +385,19 @@ pub async fn get_all_hooks(state: State<'_, Arc<AppState>>) -> Result<CommandRes
     let hooks_iter = stmt
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,           // id
-                row.get::<_, String>(1)?,           // name
-                row.get::<_, Option<String>>(2)?,   // description
-                row.get::<_, String>(3)?,           // trigger
-                row.get::<_, String>(4)?,           // action_type
-                row.get::<_, String>(5)?,           // action_config
-                row.get::<_, bool>(6)?,             // enabled
-                row.get::<_, i32>(7)?,              // execution_order
-                row.get::<_, bool>(8)?,             // continue_on_failure
-                row.get::<_, String>(9)?,           // conditions
-                row.get::<_, Option<String>>(10)?,  // task_run_id
-                row.get::<_, String>(11)?,          // created_at
-                row.get::<_, String>(12)?,          // updated_at
+                row.get::<_, String>(0)?,          // id
+                row.get::<_, String>(1)?,          // name
+                row.get::<_, Option<String>>(2)?,  // description
+                row.get::<_, String>(3)?,          // trigger
+                row.get::<_, String>(4)?,          // action_type
+                row.get::<_, String>(5)?,          // action_config
+                row.get::<_, bool>(6)?,            // enabled
+                row.get::<_, i32>(7)?,             // execution_order
+                row.get::<_, bool>(8)?,            // continue_on_failure
+                row.get::<_, String>(9)?,          // conditions
+                row.get::<_, Option<String>>(10)?, // task_run_id
+                row.get::<_, String>(11)?,         // created_at
+                row.get::<_, String>(12)?,         // updated_at
             ))
         })
         .map_err(|e| format!("Failed to query hooks: {}", e))?;
@@ -715,7 +715,9 @@ pub async fn update_hook(
     };
     let enabled = request.enabled.unwrap_or(current_enabled);
     let execution_order = request.execution_order.unwrap_or(current_execution_order);
-    let continue_on_failure = request.continue_on_failure.unwrap_or(current_continue_on_failure);
+    let continue_on_failure = request
+        .continue_on_failure
+        .unwrap_or(current_continue_on_failure);
     let conditions_str = match request.conditions {
         Some(conditions) => serde_json::to_string(&conditions)
             .map_err(|e| format!("Failed to serialize conditions: {}", e))?,

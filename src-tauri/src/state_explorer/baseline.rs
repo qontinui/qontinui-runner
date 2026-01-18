@@ -180,10 +180,7 @@ pub enum ChangeType {
 
 impl ExplorationBaseline {
     /// Create a baseline from an exploration result
-    pub fn from_result(
-        result: &super::types::ExplorationResult,
-        name: impl Into<String>,
-    ) -> Self {
+    pub fn from_result(result: &super::types::ExplorationResult, name: impl Into<String>) -> Self {
         let mut state_signatures = HashMap::new();
         let mut transition_signatures = HashMap::new();
 
@@ -327,7 +324,10 @@ impl ExplorationBaseline {
 
         // Build summary
         let regression_count = changed_states.iter().filter(|d| d.is_regression).count()
-            + changed_transitions.iter().filter(|d| d.is_regression).count();
+            + changed_transitions
+                .iter()
+                .filter(|d| d.is_regression)
+                .count();
 
         let summary = format!(
             "{} new states, {} missing states, {} changed states, {} regressions, {:.1}% timing change",
@@ -460,8 +460,7 @@ impl ExplorationBaseline {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize baseline: {}", e))?;
 
-        std::fs::write(&path, json)
-            .map_err(|e| format!("Failed to write baseline file: {}", e))?;
+        std::fs::write(&path, json).map_err(|e| format!("Failed to write baseline file: {}", e))?;
 
         Ok(path)
     }
@@ -484,8 +483,12 @@ impl BaselineDiff {
 
     /// Get count of regressions
     pub fn regression_count(&self) -> usize {
-        self.changed_states.iter().filter(|d| d.is_regression).count()
-            + self.changed_transitions
+        self.changed_states
+            .iter()
+            .filter(|d| d.is_regression)
+            .count()
+            + self
+                .changed_transitions
                 .iter()
                 .filter(|d| d.is_regression)
                 .count()
@@ -547,13 +550,13 @@ impl BaselineDiff {
         if !self.changed_states.is_empty() {
             md.push_str("## Changed States\n\n");
             for diff in &self.changed_states {
-                md.push_str(&format!(
-                    "### {} ({})\n\n",
-                    diff.state_name, diff.state_id
-                ));
+                md.push_str(&format!("### {} ({})\n\n", diff.state_name, diff.state_id));
                 md.push_str(&format!("- **Change Type:** {:?}\n", diff.change_type));
                 if !diff.elements_added.is_empty() {
-                    md.push_str(&format!("- **Elements Added:** {:?}\n", diff.elements_added));
+                    md.push_str(&format!(
+                        "- **Elements Added:** {:?}\n",
+                        diff.elements_added
+                    ));
                 }
                 if !diff.elements_removed.is_empty() {
                     md.push_str(&format!(
@@ -692,7 +695,9 @@ impl BaselineManager {
     /// Delete a baseline
     pub fn delete(&mut self, id: &str) -> Result<(), String> {
         if let Some(baseline) = self.baselines.remove(id) {
-            let path = self.baselines_dir.join(format!("baseline-{}.json", baseline.id));
+            let path = self
+                .baselines_dir
+                .join(format!("baseline-{}.json", baseline.id));
             if path.exists() {
                 std::fs::remove_file(&path)
                     .map_err(|e| format!("Failed to delete baseline file: {}", e))?;
@@ -763,10 +768,16 @@ mod tests {
         let elements3 = vec!["a".to_string(), "b".to_string()];
 
         // Same elements in different order should have same hash
-        assert_eq!(compute_element_hash(&elements1), compute_element_hash(&elements2));
+        assert_eq!(
+            compute_element_hash(&elements1),
+            compute_element_hash(&elements2)
+        );
 
         // Different elements should have different hash
-        assert_ne!(compute_element_hash(&elements1), compute_element_hash(&elements3));
+        assert_ne!(
+            compute_element_hash(&elements1),
+            compute_element_hash(&elements3)
+        );
     }
 
     #[test]

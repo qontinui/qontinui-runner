@@ -298,33 +298,31 @@ impl CredentialValue {
     /// Get the header to apply for this credential
     pub fn get_auth_header(&self, credential_type: CredentialType) -> Option<(String, String)> {
         match credential_type {
-            CredentialType::BearerToken => {
-                self.access_token.as_ref().map(|token| {
-                    ("Authorization".to_string(), format!("Bearer {}", token))
-                })
-            }
-            CredentialType::BasicAuth => {
-                match (&self.username, &self.password) {
-                    (Some(user), Some(pass)) => {
-                        use base64::Engine;
-                        let encoded = base64::engine::general_purpose::STANDARD
-                            .encode(format!("{}:{}", user, pass));
-                        Some(("Authorization".to_string(), format!("Basic {}", encoded)))
-                    }
-                    _ => None,
+            CredentialType::BearerToken => self
+                .access_token
+                .as_ref()
+                .map(|token| ("Authorization".to_string(), format!("Bearer {}", token))),
+            CredentialType::BasicAuth => match (&self.username, &self.password) {
+                (Some(user), Some(pass)) => {
+                    use base64::Engine;
+                    let encoded = base64::engine::general_purpose::STANDARD
+                        .encode(format!("{}:{}", user, pass));
+                    Some(("Authorization".to_string(), format!("Basic {}", encoded)))
                 }
-            }
-            CredentialType::ApiKey => {
-                self.api_key.as_ref().map(|key| {
-                    let header_name = self.header_name.clone().unwrap_or_else(|| "X-API-Key".to_string());
-                    (header_name, key.clone())
-                })
-            }
+                _ => None,
+            },
+            CredentialType::ApiKey => self.api_key.as_ref().map(|key| {
+                let header_name = self
+                    .header_name
+                    .clone()
+                    .unwrap_or_else(|| "X-API-Key".to_string());
+                (header_name, key.clone())
+            }),
             CredentialType::OAuth2 => {
                 // OAuth2 uses bearer token for requests
-                self.access_token.as_ref().map(|token| {
-                    ("Authorization".to_string(), format!("Bearer {}", token))
-                })
+                self.access_token
+                    .as_ref()
+                    .map(|token| ("Authorization".to_string(), format!("Bearer {}", token)))
             }
         }
     }

@@ -59,9 +59,13 @@ impl ExplorationDepth {
     pub fn description(&self) -> &'static str {
         match self {
             Self::QuickScan => "Critical path only, stops on first failure. Fast CI/CD check.",
-            Self::Standard => "Balanced exploration with reasonable coverage. Default for development.",
+            Self::Standard => {
+                "Balanced exploration with reasonable coverage. Default for development."
+            }
             Self::Deep => "Thorough exploration of all states and transitions. Good for releases.",
-            Self::Exhaustive => "Complete coverage including all permutations. Use for stress testing.",
+            Self::Exhaustive => {
+                "Complete coverage including all permutations. Use for stress testing."
+            }
         }
     }
 
@@ -70,7 +74,7 @@ impl ExplorationDepth {
         match self {
             Self::QuickScan => 5,
             Self::Standard => 20,
-            Self::Deep => 0,      // unlimited
+            Self::Deep => 0,       // unlimited
             Self::Exhaustive => 0, // unlimited
         }
     }
@@ -386,9 +390,15 @@ mod tests {
 
     #[test]
     fn test_depth_from_string() {
-        assert_eq!(ExplorationDepth::from_str("quick"), ExplorationDepth::QuickScan);
+        assert_eq!(
+            ExplorationDepth::from_str("quick"),
+            ExplorationDepth::QuickScan
+        );
         assert_eq!(ExplorationDepth::from_str("DEEP"), ExplorationDepth::Deep);
-        assert_eq!(ExplorationDepth::from_str("unknown"), ExplorationDepth::Standard);
+        assert_eq!(
+            ExplorationDepth::from_str("unknown"),
+            ExplorationDepth::Standard
+        );
     }
 
     #[test]

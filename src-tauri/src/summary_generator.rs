@@ -67,7 +67,10 @@ pub struct SummaryResult {
 ///
 /// # Returns
 /// Ok(SummaryResult) on success, Err on failure
-pub fn generate_task_summary(db: &CheckpointDb, task_run_id: &str) -> Result<SummaryResult, String> {
+pub fn generate_task_summary(
+    db: &CheckpointDb,
+    task_run_id: &str,
+) -> Result<SummaryResult, String> {
     info!("Generating summary for task run: {}", task_run_id);
 
     // Get the task run from the database
@@ -253,7 +256,8 @@ mod tests {
         assert!(result.contains("\"summary\""));
 
         // Raw JSON
-        let response2 = r#"{"summary": "Test", "goal_achieved": false, "remaining_work": "More work"}"#;
+        let response2 =
+            r#"{"summary": "Test", "goal_achieved": false, "remaining_work": "More work"}"#;
         let result2 = extract_json_from_response(response2).unwrap();
         assert!(result2.contains("\"summary\""));
     }
