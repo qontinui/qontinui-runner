@@ -335,9 +335,9 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               />
               <QuickLinkCard
                 icon={ClipboardList}
-                title="Summary"
-                description="AI output summary and conclusions"
-                onClick={() => onNavigate?.("run-summary")}
+                title="Recap"
+                description="AI summary and detailed breakdown"
+                onClick={() => onNavigate?.("run-recap")}
               />
               <QuickLinkCard
                 icon={FileText}

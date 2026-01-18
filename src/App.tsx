@@ -173,7 +173,6 @@ type MainTabId =
   | "run-recap"
   | "run-actions"
   | "run-image"
-  | "run-summary"
   | "run-findings"
   | "run-state-explorer"
   | "run-tests"
@@ -188,7 +187,8 @@ type MainTabId =
   // Legacy tab IDs for migration
   | "ai"
   | "logs"
-  | "monitor-summary"
+  | "run-summary" // Legacy: migrates to run-recap
+  | "monitor-summary" // Legacy: migrates to run-recap
   | "monitor-findings"
   | "monitor-issues"
   | "monitor-learnings"
@@ -237,7 +237,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "run-recap",
   "run-actions",
   "run-image",
-  "run-summary",
   "run-findings",
   "run-state-explorer",
   "run-tests",
@@ -252,7 +251,8 @@ const VALID_TAB_IDS: MainTabId[] = [
   // Legacy (for migration)
   "ai",
   "logs",
-  "monitor-summary",
+  "run-summary", // Legacy: migrates to run-recap
+  "monitor-summary", // Legacy: migrates to run-recap
   "monitor-findings",
   "monitor-issues",
   "monitor-learnings",
