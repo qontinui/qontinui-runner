@@ -7706,6 +7706,60 @@ impl CheckpointDb {
             .ok_or_else(|| "Failed to retrieve created workflow".to_string())
     }
 
+    /// Create a new unified workflow with a specific ID (for imports)
+    pub fn create_unified_workflow_with_id(
+        &self,
+        id: &str,
+        request: &crate::unified_workflows::CreateUnifiedWorkflowRequest,
+    ) -> Result<crate::unified_workflows::UnifiedWorkflow, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let tags_json = serde_json::to_string(&request.tags).unwrap_or_else(|_| "[]".to_string());
+        let setup_steps_json =
+            serde_json::to_string(&request.setup_steps).unwrap_or_else(|_| "[]".to_string());
+        let verification_steps_json =
+            serde_json::to_string(&request.verification_steps).unwrap_or_else(|_| "[]".to_string());
+        let agentic_steps_json =
+            serde_json::to_string(&request.agentic_steps).unwrap_or_else(|_| "[]".to_string());
+        let completion_steps_json =
+            serde_json::to_string(&request.completion_steps).unwrap_or_else(|_| "[]".to_string());
+        let log_source_selection_json = serde_json::to_string(&request.log_source_selection)
+            .unwrap_or_else(|_| "\"default\"".to_string());
+
+        conn.execute(
+            r#"
+            INSERT INTO unified_workflows (
+                id, name, description, category, tags, setup_steps, verification_steps,
+                agentic_steps, completion_steps, max_iterations, provider, model,
+                skip_ai_summary, created_at, updated_at, log_source_selection
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            "#,
+            params![
+                id,
+                request.name,
+                request.description,
+                request.category,
+                tags_json,
+                setup_steps_json,
+                verification_steps_json,
+                agentic_steps_json,
+                completion_steps_json,
+                request.max_iterations as i64,
+                request.provider,
+                request.model,
+                request.skip_ai_summary,
+                now,
+                now,
+                log_source_selection_json,
+            ],
+        )
+        .map_err(|e| format!("Failed to create unified workflow: {}", e))?;
+
+        self.get_unified_workflow(id)?
+            .ok_or_else(|| "Failed to retrieve created workflow".to_string())
+    }
+
     /// Update an existing unified workflow
     pub fn update_unified_workflow(
         &self,
