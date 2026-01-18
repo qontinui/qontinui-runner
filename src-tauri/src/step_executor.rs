@@ -3552,6 +3552,57 @@ impl StepExecutor {
         // Emit to Tauri frontend for action log refresh
         self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
 
+        // Log detailed shell command event to database (if task_run_id is set)
+        if let Some(ref task_run_id) = self.task_run_id {
+            // Truncate stdout/stderr for database storage (limit to 10KB each)
+            let stdout_db = if stdout.len() > 10240 {
+                format!("{}... (truncated)", &stdout[..10240])
+            } else {
+                stdout.clone()
+            };
+            let stderr_db = if stderr.len() > 10240 {
+                format!("{}... (truncated)", &stderr[..10240])
+            } else {
+                stderr.clone()
+            };
+
+            let shell_data = json!({
+                "step_type": "shell_command",
+                "step_name": step_name,
+                "command": &command,
+                "working_directory": working_directory.as_deref(),
+                "shell_type": shell_type,
+                "exit_code": exit_code,
+                "stdout": stdout_db,
+                "stderr": stderr_db,
+                "duration_ms": duration_ms,
+                "success": final_success,
+            });
+
+            let event_input = CreateTaskRunEventInput {
+                task_run_id: task_run_id.clone(),
+                event_type: "shell_command".to_string(),
+                event_subtype: Some(if final_success { "complete" } else { "error" }.to_string()),
+                message: format!(
+                    "Shell command '{}' {} (exit code: {:?}, {}ms)",
+                    step_name,
+                    if final_success { "completed" } else { "failed" },
+                    exit_code,
+                    duration_ms
+                ),
+                data: Some(serde_json::to_string(&shell_data).unwrap_or_default()),
+                workflow_name: None,
+                state_name: None,
+                action_id: Some(action_id.clone()),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                duration_ms: Some(duration_ms as i64),
+            };
+
+            if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event_input) {
+                warn!("Failed to log shell command event: {}", e);
+            }
+        }
+
         (final_success, error_msg, output_data)
     }
 

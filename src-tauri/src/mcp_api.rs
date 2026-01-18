@@ -14104,24 +14104,29 @@ async fn get_current_execution_steps(
     // Use the first running task (typically there's only one)
     let task = &running_tasks[0];
 
-    // Get events for this task, filtering by step-related events
+    // Get all events for this task (don't filter by event_type, we'll filter in code)
     let events = state
         .app_state
         .checkpoint_db
-        .get_task_run_events(&task.id, Some("general"), query.limit)
+        .get_task_run_events(&task.id, None, query.limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     // Transform events into step execution data
+    // Only include step_execution and shell_command events
     let mut executions: Vec<StepExecutionData> = Vec::new();
 
     for event in events {
+        // Only process step-related events
+        let event_type = event.event_type.as_str();
+        if event_type != "step_execution" && event_type != "shell_command" {
+            continue;
+        }
         // Parse the event data JSON to extract step information
         let data: Option<serde_json::Value> = event
             .data
             .as_ref()
             .and_then(|s| serde_json::from_str(s).ok());
 
-        let event_type = event.event_type.as_str();
         let event_subtype = event.event_subtype.as_deref().unwrap_or("");
         let message = event.message.as_str();
 
