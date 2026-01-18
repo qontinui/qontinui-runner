@@ -2,13 +2,27 @@
 //!
 //! Executes user-defined Python verification scripts that output structured JSON results.
 //! Scripts can perform custom verification logic like log analysis, API checks, etc.
+//!
+//! ## API Request Integration
+//!
+//! Tests can include an `api_request_config` in their config to execute an HTTP request
+//! before running the Python script. The API response is injected as `_api_response`
+//! variable in the script, providing access to:
+//! - `_api_response["status_code"]` - HTTP status code
+//! - `_api_response["response_body"]` - Response body (JSON or text)
+//! - `_api_response["response_headers"]` - Response headers dict
+//! - `_api_response["response_time_ms"]` - Response time in milliseconds
+//! - `_api_response["extractions"]` - Extracted variables from JSON paths
+//! - `_api_response["assertions"]` - Pre-evaluated assertion results
 
 use super::types::{AssertionResult, TestDefinition, TestExecutionResult, TestStatus, TestType};
+use crate::api_request::executor::ApiRequestExecutor;
+use crate::api_request::types::ApiRequestConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::process::Command;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 /// Expected output format from Python verification scripts
@@ -43,7 +57,11 @@ struct PythonAssertion {
 }
 
 /// Generate a wrapper script that provides helpers and enforces JSON output
-fn generate_python_wrapper(user_code: &str, env_vars: &HashMap<String, String>) -> String {
+fn generate_python_wrapper(
+    user_code: &str,
+    env_vars: &HashMap<String, String>,
+    api_response_json: Option<&str>,
+) -> String {
     // Convert env vars to Python dict literal
     let env_dict: String = env_vars
         .iter()
@@ -56,6 +74,38 @@ fn generate_python_wrapper(user_code: &str, env_vars: &HashMap<String, String>) 
         })
         .collect::<Vec<_>>()
         .join("\n");
+
+    // API response injection
+    let api_response_code = match api_response_json {
+        Some(json_str) => {
+            format!(
+                r#"
+# API Response from pre-request (captured from browser extension or configured API request)
+# Available fields:
+#   _api_response["status_code"] - HTTP status code (int)
+#   _api_response["response_body"] - Response body (str, may be JSON)
+#   _api_response["response_headers"] - Headers dict
+#   _api_response["response_time_ms"] - Response time in ms (int)
+#   _api_response["extractions"] - Extracted variables list
+#   _api_response["assertions"] - Pre-evaluated assertion results
+_api_response = json.loads('''{}''')
+
+# Convenience: parse response body as JSON if possible
+try:
+    if _api_response.get("response_body"):
+        _api_response["json"] = json.loads(_api_response["response_body"])
+except (json.JSONDecodeError, TypeError):
+    _api_response["json"] = None
+"#,
+                json_str.replace("'''", r"\'\'\'")
+            )
+        }
+        None => String::from(
+            "\n# No API request configured - _api_response is not available\n_api_response = None\n",
+        ),
+    };
+
+    let indented_user_code = indent_code(user_code, 4);
 
     format!(
         r#"#!/usr/bin/env python3
@@ -76,7 +126,7 @@ _env_vars = {{
 }}
 for k, v in _env_vars.items():
     os.environ[k] = v
-
+{api_response_code}
 # Result structure
 _result = {{
     "status": "error",
@@ -136,14 +186,15 @@ try:
 except Exception as e:
     _result["status"] = "error"
     _result["error"] = str(e)
-    _result["output"] += f"\nException: {{e}}\n"
+    _result["output"] += f"\nException: {{{{e}}}}\n"
     _result["output"] += traceback.format_exc()
 
 # Output JSON result
 print(json.dumps(_result))
 "#,
         env_dict = env_dict,
-        user_code = indent_code(user_code, 4)
+        api_response_code = api_response_code,
+        user_code = indented_user_code
     )
 }
 
@@ -160,6 +211,32 @@ fn indent_code(code: &str, spaces: usize) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Execute an API request and return the result as JSON string
+fn execute_api_request(config: &ApiRequestConfig) -> Result<String, String> {
+    // Use tokio runtime to execute async code
+    let runtime = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle,
+        Err(_) => {
+            // Create a new runtime if not in async context
+            return Err("No async runtime available for API request".to_string());
+        }
+    };
+
+    let executor = ApiRequestExecutor::new();
+    let config = config.clone();
+
+    // Block on the async execution
+    let result = std::thread::spawn(move || {
+        runtime.block_on(async move { executor.execute(&config, None).await })
+    })
+    .join()
+    .map_err(|_| "API request thread panicked".to_string())?
+    .map_err(|e| format!("API request failed: {}", e))?;
+
+    // Serialize the result to JSON
+    serde_json::to_string(&result).map_err(|e| format!("Failed to serialize API response: {}", e))
 }
 
 /// Execute a Python verification script
@@ -194,6 +271,31 @@ pub fn execute_python_script(test_def: &TestDefinition) -> TestExecutionResult {
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
+    // Check for API request configuration
+    let api_response_json: Option<String> = test_def
+        .config
+        .get("api_request_config")
+        .and_then(|v| serde_json::from_value::<ApiRequestConfig>(v.clone()).ok())
+        .map(|api_config| {
+            info!(
+                "Executing API request before Python script: {} {}",
+                api_config.method, api_config.url
+            );
+            match execute_api_request(&api_config) {
+                Ok(json) => {
+                    info!("API request successful, injecting response into Python script");
+                    Some(json)
+                }
+                Err(e) => {
+                    error!("API request failed: {}", e);
+                    // Return None to indicate no API response available
+                    // The Python script can check if _api_response is None
+                    None
+                }
+            }
+        })
+        .flatten();
+
     // Create temp directory for scripts
     let temp_dir = std::env::temp_dir().join("qontinui-verification");
     if let Err(e) = fs::create_dir_all(&temp_dir) {
@@ -204,8 +306,9 @@ pub fn execute_python_script(test_def: &TestDefinition) -> TestExecutionResult {
         );
     }
 
-    // Generate wrapped script
-    let wrapped_script = generate_python_wrapper(&python_code, &env_vars);
+    // Generate wrapped script with optional API response
+    let wrapped_script =
+        generate_python_wrapper(&python_code, &env_vars, api_response_json.as_deref());
 
     // Write to temp file
     let script_filename = format!("verify-{}.py", Uuid::new_v4());
@@ -356,10 +459,22 @@ mod tests {
     fn test_generate_wrapper() {
         let code = "assertion('test', True)";
         let env = HashMap::new();
-        let wrapper = generate_python_wrapper(code, &env);
+        let wrapper = generate_python_wrapper(code, &env, None);
         assert!(wrapper.contains("def assertion"));
         assert!(wrapper.contains("json.dumps(_result)"));
         assert!(wrapper.contains("assertion('test', True)"));
+        assert!(wrapper.contains("_api_response = None"));
+    }
+
+    #[test]
+    fn test_generate_wrapper_with_api_response() {
+        let code = "log(_api_response['status_code'])";
+        let env = HashMap::new();
+        let api_response = r#"{"status_code": 200, "response_body": "{\"data\": 42}"}"#;
+        let wrapper = generate_python_wrapper(code, &env, Some(api_response));
+        assert!(wrapper.contains("_api_response = json.loads"));
+        assert!(wrapper.contains("status_code"));
+        assert!(wrapper.contains("_api_response[\"json\"]"));
     }
 
     #[test]

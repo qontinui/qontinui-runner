@@ -10,6 +10,7 @@ import { useState, useEffect, useRef } from "react";
 import { X, Wifi, Cloud, LogOut, User, Tag, ChevronDown, Check } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import { useAuth } from "../AuthProvider";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import type { ConnectionInfo, Project } from "../../types/auth";
 
 const RUNNER_NAME_STORAGE_KEY = "qontinui-runner-name";
@@ -138,9 +139,9 @@ export function AuthConnectionSettings({
 
       {/* Error message */}
       {error && (
-        <div className="p-3 bg-red-500/10 rounded-lg flex items-start gap-2">
-          <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-          <span className="text-red-400 text-xs">{error}</span>
+        <div className={`p-3 ${getStatusColors("error").bg} rounded-lg flex items-start gap-2`}>
+          <X className={`w-4 h-4 ${getStatusColors("error").icon} shrink-0 mt-0.5`} />
+          <span className={`${getStatusColors("error").text} text-xs`}>{error}</span>
         </div>
       )}
 
@@ -240,8 +241,12 @@ export function AuthConnectionSettings({
           <Wifi className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Connection Status</h4>
           {connected && (
-            <span className="flex items-center gap-1.5 text-green-400 text-xs">
-              <span className="inline-block w-1.5 h-1.5 bg-green-400 rounded-full animate-pulse"></span>
+            <span
+              className={`flex items-center gap-1.5 ${getStatusColors("success").text} text-xs`}
+            >
+              <span
+                className={`inline-block w-1.5 h-1.5 ${getStatusColors("success").icon.replace("text-", "bg-")} rounded-full animate-pulse`}
+              ></span>
               Connected
             </span>
           )}
@@ -261,7 +266,11 @@ export function AuthConnectionSettings({
             </div>
             <div className="flex justify-between">
               <span className="text-muted-foreground">WebSocket:</span>
-              <span className={connected ? "text-green-400" : "text-orange-400"}>
+              <span
+                className={
+                  connected ? getStatusColors("success").text : getAccentColors("orange").text
+                }
+              >
                 {connected ? "Connected" : "Disconnected"}
               </span>
             </div>
@@ -298,16 +307,16 @@ export function AuthConnectionSettings({
         </div>
 
         {!selectedProjectId && projects.length > 0 && (
-          <div className="p-2.5 bg-orange-500/10 rounded-lg">
-            <div className="text-xs text-orange-400">
+          <div className={`p-2.5 ${getAccentColors("orange").bg} rounded-lg`}>
+            <div className={`text-xs ${getAccentColors("orange").text}`}>
               Please select a project before connecting.
             </div>
           </div>
         )}
 
         {projects.length === 0 && (
-          <div className="p-2.5 bg-blue-500/10 rounded-lg">
-            <div className="text-xs text-blue-400">
+          <div className={`p-2.5 ${getAccentColors("blue").bg} rounded-lg`}>
+            <div className={`text-xs ${getAccentColors("blue").text}`}>
               No projects found. Create a project on qontinui.io first.
             </div>
           </div>

@@ -5,6 +5,8 @@
 //! - Secure API key storage in OS keychain
 //! - Testing AI connections
 
+use crate::ai_router::RoutingConfig;
+use crate::orchestrator::{CompressionConfig, RetryConfig};
 use crate::settings::{
     self, AiProvider, AiSettings, ClaudeApiSettings, ClaudeCliSettings, CliExecutionMode,
     GeminiApiSettings, GeminiAuthMethod, GeminiCliSettings,
@@ -110,6 +112,7 @@ pub fn get_ai_settings() -> Result<CommandResponse, String> {
 /// * `execution_mode` - CLI execution mode ("auto", "windows_native", "wsl", "native")
 /// * `custom_path` - Optional custom path to claude executable
 /// * `timeout_seconds` - CLI timeout in seconds
+/// * `config_dir` - Optional CLAUDE_CONFIG_DIR for multi-account support
 /// * `model` - Claude API model name
 /// * `max_tokens` - Maximum tokens for API calls
 /// * `auto_refine_video_after_iterations` - Default iteration threshold for video in auto-refine
@@ -123,13 +126,14 @@ pub fn save_ai_settings(
     execution_mode: String,
     custom_path: Option<String>,
     timeout_seconds: u64,
+    config_dir: Option<String>,
     model: String,
     max_tokens: u32,
     auto_refine_video_after_iterations: Option<u32>,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, video_after_iterations={:?}",
-        provider, execution_mode, timeout_seconds, auto_refine_video_after_iterations
+        "Saving AI settings: provider={}, execution_mode={}, timeout={}s, config_dir={:?}, video_after_iterations={:?}",
+        provider, execution_mode, timeout_seconds, config_dir, auto_refine_video_after_iterations
     );
 
     let ai_provider = match provider.as_str() {
@@ -157,12 +161,17 @@ pub fn save_ai_settings(
             execution_mode: cli_execution_mode,
             custom_path,
             timeout_seconds,
+            config_dir,
         },
         claude_api: ClaudeApiSettings { model, max_tokens },
         // Preserve existing Gemini settings
         gemini_cli: existing_settings.gemini_cli,
         gemini_api: existing_settings.gemini_api,
         auto_refine_video_after_iterations: auto_refine_video_after_iterations.unwrap_or(3),
+        // Preserve compression, retry, and routing settings
+        compression: existing_settings.compression,
+        retry: existing_settings.retry,
+        routing: existing_settings.routing,
     };
 
     settings::save_ai_settings(ai_settings)
@@ -178,14 +187,14 @@ pub fn save_ai_settings(
 /// Save Gemini-specific AI settings.
 ///
 /// Updates the Gemini settings in the persistent settings file.
+/// NOTE: This function preserves the existing provider selection - it only updates Gemini-specific settings.
 ///
 /// # Arguments
-/// * `provider` - AI provider ("gemini_cli" or "gemini_api")
 /// * `execution_mode` - CLI execution mode ("auto", "windows_native", "wsl", "native")
 /// * `custom_path` - Optional custom path to gemini executable
 /// * `timeout_seconds` - CLI timeout in seconds
 /// * `auth_method` - Gemini CLI auth method ("oauth" or "api_key")
-/// * `model` - Gemini model name (e.g., "gemini-3-flash")
+/// * `model` - Gemini model name (e.g., "gemini-3-flash-preview")
 /// * `max_output_tokens` - Maximum output tokens for API calls
 /// * `temperature` - Temperature for API calls
 ///
@@ -194,7 +203,6 @@ pub fn save_ai_settings(
 /// * `Err(String)` - Error message if settings cannot be saved
 #[tauri::command]
 pub fn save_gemini_settings(
-    provider: String,
     execution_mode: String,
     custom_path: Option<String>,
     timeout_seconds: u64,
@@ -204,15 +212,9 @@ pub fn save_gemini_settings(
     temperature: f32,
 ) -> Result<CommandResponse, String> {
     info!(
-        "Saving Gemini settings: provider={}, model={}, auth={}",
-        provider, model, auth_method
+        "Saving Gemini settings: model={}, auth={}",
+        model, auth_method
     );
-
-    let ai_provider = match provider.as_str() {
-        "gemini_cli" => AiProvider::GeminiCli,
-        "gemini_api" => AiProvider::GeminiApi,
-        _ => return Err(format!("Invalid Gemini provider: {}", provider)),
-    };
 
     let cli_execution_mode = match execution_mode.as_str() {
         "auto" => CliExecutionMode::Auto,
@@ -223,16 +225,17 @@ pub fn save_gemini_settings(
     };
 
     let gemini_auth_method = match auth_method.as_str() {
-        "oauth" => GeminiAuthMethod::OAuth,
+        "oauth" | "o_auth" => GeminiAuthMethod::OAuth,
         "api_key" => GeminiAuthMethod::ApiKey,
         _ => return Err(format!("Invalid auth method: {}", auth_method)),
     };
 
-    // Get existing settings to preserve Claude configuration
+    // Get existing settings to preserve Claude configuration AND provider selection
     let existing_settings = settings::get_ai_settings();
 
     let ai_settings = AiSettings {
-        provider: ai_provider,
+        // IMPORTANT: Preserve the existing provider - don't overwrite it!
+        provider: existing_settings.provider,
         // Preserve existing Claude settings
         claude_cli: existing_settings.claude_cli,
         claude_api: existing_settings.claude_api,
@@ -249,6 +252,10 @@ pub fn save_gemini_settings(
             temperature,
         },
         auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
+        // Preserve compression, retry, and routing settings
+        compression: existing_settings.compression,
+        retry: existing_settings.retry,
+        routing: existing_settings.routing,
     };
 
     settings::save_ai_settings(ai_settings)
@@ -628,6 +635,144 @@ async fn test_gemini_api_connection(settings: &GeminiApiSettings) -> Result<Stri
             Err(format!("API error ({}): {}", status, error_body))
         }
     }
+}
+
+/// Get the agentic settings (compression, retry, routing).
+///
+/// Returns the agentic features settings from the persistent settings file.
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success with agentic settings data
+/// * `Err(String)` - Error message if settings cannot be loaded
+#[tauri::command]
+pub fn get_agentic_settings() -> Result<CommandResponse, String> {
+    info!("Getting agentic settings");
+
+    let ai_settings = settings::get_ai_settings();
+
+    let agentic_data = serde_json::json!({
+        "compression": ai_settings.compression,
+        "retry": ai_settings.retry,
+        "routing": ai_settings.routing,
+    });
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Agentic settings retrieved".to_string()),
+        data: Some(agentic_data),
+    })
+}
+
+/// Save agentic settings (compression, retry, routing).
+///
+/// Updates the agentic features settings in the persistent settings file.
+///
+/// # Arguments
+/// * `compression_enabled` - Enable memory compression
+/// * `compression_threshold_tokens` - Token count to trigger compression
+/// * `compression_target_tokens` - Target token count after compression
+/// * `compression_keep_recent_items` - Number of recent items to always keep
+/// * `compression_summarize_batch_size` - Items to summarize together
+/// * `retry_enabled` - Enable retry with feedback
+/// * `retry_max_retries` - Maximum retry attempts
+/// * `retry_base_delay_ms` - Base delay before first retry
+/// * `retry_max_delay_ms` - Maximum delay (caps exponential growth)
+/// * `retry_exponential_base` - Base for exponential backoff
+/// * `retry_jitter` - Add random jitter to delays
+/// * `retry_feedback_injection` - Inject error feedback into retry prompts
+/// * `routing_enabled` - Enable intelligent task routing
+/// * `routing_simple_model` - Model for simple tasks
+/// * `routing_medium_model` - Model for medium tasks
+/// * `routing_complex_model` - Model for complex tasks
+/// * `routing_file_threshold_simple` - Max files for simple classification
+/// * `routing_file_threshold_medium` - Max files for medium classification
+///
+/// # Returns
+/// * `Ok(CommandResponse)` - Success
+/// * `Err(String)` - Error message if settings cannot be saved
+#[tauri::command]
+pub fn save_agentic_settings(
+    // Compression settings
+    compression_enabled: bool,
+    compression_threshold_tokens: usize,
+    compression_target_tokens: usize,
+    compression_keep_recent_items: usize,
+    compression_summarize_batch_size: usize,
+    // Retry settings
+    retry_enabled: bool,
+    retry_max_retries: u32,
+    retry_base_delay_ms: u64,
+    retry_max_delay_ms: u64,
+    retry_exponential_base: f32,
+    retry_jitter: bool,
+    retry_feedback_injection: bool,
+    // Routing settings
+    routing_enabled: bool,
+    routing_simple_model: String,
+    routing_medium_model: String,
+    routing_complex_model: String,
+    routing_file_threshold_simple: usize,
+    routing_file_threshold_medium: usize,
+) -> Result<CommandResponse, String> {
+    info!(
+        "Saving agentic settings: compression={}, retry={}, routing={}",
+        compression_enabled, retry_enabled, routing_enabled
+    );
+
+    // Get existing settings to preserve other configurations
+    let existing_settings = settings::get_ai_settings();
+
+    let compression_config = CompressionConfig {
+        enabled: compression_enabled,
+        threshold_tokens: compression_threshold_tokens,
+        target_tokens: compression_target_tokens,
+        keep_recent_items: compression_keep_recent_items,
+        summarize_batch_size: compression_summarize_batch_size,
+        tokens_per_char: existing_settings.compression.tokens_per_char, // Preserve advanced setting
+    };
+
+    let retry_config = RetryConfig {
+        enabled: retry_enabled,
+        max_retries: retry_max_retries,
+        base_delay_ms: retry_base_delay_ms,
+        max_delay_ms: retry_max_delay_ms,
+        exponential_base: retry_exponential_base,
+        jitter: retry_jitter,
+        feedback_injection: retry_feedback_injection,
+        retryable_errors: existing_settings.retry.retryable_errors, // Preserve custom patterns
+    };
+
+    let routing_config = RoutingConfig {
+        enabled: routing_enabled,
+        simple_model: routing_simple_model,
+        medium_model: routing_medium_model,
+        complex_model: routing_complex_model,
+        file_count_thresholds: (routing_file_threshold_simple, routing_file_threshold_medium),
+        prompt_length_thresholds: existing_settings.routing.prompt_length_thresholds, // Preserve
+        complex_keywords: existing_settings.routing.complex_keywords, // Preserve
+        simple_keywords: existing_settings.routing.simple_keywords,   // Preserve
+    };
+
+    let ai_settings = AiSettings {
+        provider: existing_settings.provider,
+        claude_cli: existing_settings.claude_cli,
+        claude_api: existing_settings.claude_api,
+        gemini_cli: existing_settings.gemini_cli,
+        gemini_api: existing_settings.gemini_api,
+        auto_refine_video_after_iterations: existing_settings.auto_refine_video_after_iterations,
+        compression: compression_config,
+        retry: retry_config,
+        routing: routing_config,
+    };
+
+    settings::save_ai_settings(ai_settings)
+        .map_err(|e| format!("Failed to save agentic settings: {}", e))?;
+
+    Ok(CommandResponse {
+        success: true,
+        message: Some("Agentic settings saved".to_string()),
+        data: None,
+    })
 }
 
 /// Get the API key for a provider (used by mcp_api.rs for API calls)

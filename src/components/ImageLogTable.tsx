@@ -7,6 +7,7 @@
  */
 
 import { ImageRecognitionEntry } from "../managers/LogManager";
+import { getStatusColors } from "@/design-system";
 
 interface ImageLogTableProps {
   imageLogs: ImageRecognitionEntry[];
@@ -65,8 +66,8 @@ export default function ImageLogTable({ imageLogs, onRowClick }: ImageLogTablePr
                 <span
                   className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
                     entry.found
-                      ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
-                      : "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400"
+                      ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                      : `${getStatusColors("error").bg} ${getStatusColors("error").text}`
                   }`}
                 >
                   {entry.found ? "FOUND" : "NOT FOUND"}
@@ -76,8 +77,8 @@ export default function ImageLogTable({ imageLogs, onRowClick }: ImageLogTablePr
                 <span
                   className={`font-mono ${
                     entry.confidence >= entry.threshold
-                      ? "text-green-600 dark:text-green-400"
-                      : "text-red-600 dark:text-red-400"
+                      ? getStatusColors("success").text
+                      : getStatusColors("error").text
                   }`}
                 >
                   {(entry.confidence * 100).toFixed(1)}%

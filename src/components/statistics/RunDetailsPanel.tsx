@@ -25,6 +25,7 @@ import {
   Image,
   AlertCircle,
 } from "lucide-react";
+import { getStatusColors, getAccentColors, getSeverityColors } from "@/design-system";
 import type {
   RunDetails,
   RunStatus,
@@ -105,12 +106,12 @@ export function RunDetailsPanel({ run, onClose }: RunDetailsPanelProps) {
                 <ActionStat
                   label="Success"
                   value={run.actions_summary.success}
-                  color="text-green-500"
+                  color={getStatusColors("success").text}
                 />
                 <ActionStat
                   label="Failed"
                   value={run.actions_summary.failed}
-                  color="text-red-500"
+                  color={getStatusColors("error").text}
                 />
                 <ActionStat
                   label="Skipped"
@@ -196,10 +197,14 @@ export function RunDetailsPanel({ run, onClose }: RunDetailsPanelProps) {
         {run.anomalies.length > 0 && (
           <CollapsibleSection
             title="Anomalies"
-            icon={<AlertCircle className="w-4 h-4 text-yellow-500" />}
+            icon={<AlertCircle className={`w-4 h-4 ${getStatusColors("warning").icon}`} />}
             isOpen={expandedSections.has("anomalies")}
             onToggle={() => toggleSection("anomalies")}
-            badge={<span className="text-xs text-yellow-500">{run.anomalies.length}</span>}
+            badge={
+              <span className={`text-xs ${getStatusColors("warning").text}`}>
+                {run.anomalies.length}
+              </span>
+            }
           >
             <div className="space-y-2">
               {run.anomalies.map((anomaly, idx) => (
@@ -218,31 +223,34 @@ export function RunDetailsPanel({ run, onClose }: RunDetailsPanelProps) {
 function StatusIcon({ status }: { status: RunStatus }) {
   switch (status) {
     case "completed":
-      return <CheckCircle2 className="w-6 h-6 text-green-500" />;
+      return <CheckCircle2 className={`w-6 h-6 ${getStatusColors("success").icon}`} />;
     case "failed":
-      return <XCircle className="w-6 h-6 text-red-500" />;
+      return <XCircle className={`w-6 h-6 ${getStatusColors("error").icon}`} />;
     case "timeout":
-      return <Clock className="w-6 h-6 text-orange-500" />;
+      return <Clock className={`w-6 h-6 ${getAccentColors("orange").text}`} />;
     case "cancelled":
       return <XCircle className="w-6 h-6 text-muted-foreground" />;
     case "running":
-      return <Activity className="w-6 h-6 text-blue-500 animate-pulse" />;
+      return <Activity className={`w-6 h-6 ${getStatusColors("running").icon} animate-pulse`} />;
     default:
       return <AlertTriangle className="w-6 h-6 text-muted-foreground" />;
   }
 }
 
 function StatusBadge({ status }: { status: RunStatus }) {
-  const colors: Record<RunStatus, string> = {
-    completed: "bg-green-500/10 text-green-500",
-    failed: "bg-red-500/10 text-red-500",
-    timeout: "bg-orange-500/10 text-orange-500",
-    cancelled: "bg-muted text-muted-foreground",
-    running: "bg-blue-500/10 text-blue-500",
+  const statusMap: Record<RunStatus, string> = {
+    completed: "success",
+    failed: "error",
+    timeout: "warning",
+    cancelled: "cancelled",
+    running: "running",
   };
+  const colors = getStatusColors(statusMap[status] || "idle");
 
   return (
-    <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors[status]}`}>{status}</span>
+    <span className={`px-2 py-0.5 rounded text-xs font-medium ${colors.bg} ${colors.text}`}>
+      {status}
+    </span>
   );
 }
 
@@ -308,9 +316,9 @@ function TransitionItem({ transition }: { transition: TransitionRecord }) {
       <span className="text-muted-foreground">via {transition.action}</span>
       <span className="ml-auto text-xs text-muted-foreground">{transition.duration_ms}ms</span>
       {transition.success ? (
-        <CheckCircle2 className="w-4 h-4 text-green-500" />
+        <CheckCircle2 className={`w-4 h-4 ${getStatusColors("success").icon}`} />
       ) : (
-        <XCircle className="w-4 h-4 text-red-500" />
+        <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />
       )}
       {transition.error && (
         <span className="text-xs text-destructive" title={transition.error}>
@@ -331,7 +339,11 @@ function TemplateMatchItem({ match }: { match: TemplateMatchRecord }) {
       <div className="flex items-center gap-4 text-xs text-muted-foreground">
         <span>{match.count} matches</span>
         <span>{(match.avg_confidence * 100).toFixed(0)}% confidence</span>
-        <span className={successRate < 80 ? "text-yellow-500" : "text-green-500"}>
+        <span
+          className={
+            successRate < 80 ? getStatusColors("warning").text : getStatusColors("success").text
+          }
+        >
           {successRate.toFixed(0)}% success
         </span>
       </div>
@@ -340,14 +352,18 @@ function TemplateMatchItem({ match }: { match: TemplateMatchRecord }) {
 }
 
 function AnomalyItem({ anomaly }: { anomaly: Anomaly }) {
-  const severityColors: Record<AnomalySeverity, string> = {
-    low: "bg-blue-500/10 text-blue-500 border-blue-500/20",
-    medium: "bg-yellow-500/10 text-yellow-500 border-yellow-500/20",
-    high: "bg-red-500/10 text-red-500 border-red-500/20",
+  const getSeverityStyle = (severity: AnomalySeverity): string => {
+    const severityMap: Record<AnomalySeverity, string> = {
+      low: "low",
+      medium: "medium",
+      high: "high",
+    };
+    const colors = getSeverityColors(severityMap[severity]);
+    return `${colors.bg} ${colors.text} ${colors.border}`;
   };
 
   return (
-    <div className={`p-3 rounded border ${severityColors[anomaly.severity]} text-sm`}>
+    <div className={`p-3 rounded border ${getSeverityStyle(anomaly.severity)} text-sm`}>
       <div className="flex items-center justify-between mb-1">
         <span className="font-medium capitalize">{anomaly.anomaly_type.replace(/_/g, " ")}</span>
         <span className="text-xs uppercase">{anomaly.severity}</span>

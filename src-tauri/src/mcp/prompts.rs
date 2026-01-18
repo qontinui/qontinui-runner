@@ -56,7 +56,7 @@ pub struct CreatePromptRequest {
     /// AI provider override (e.g., "gemini_api", "claude_cli")
     #[serde(default)]
     pub provider: Option<String>,
-    /// AI model override (e.g., "gemini-3-flash")
+    /// AI model override (e.g., "gemini-3-flash-preview")
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -89,7 +89,7 @@ pub struct UpdatePromptRequest {
     pub max_sessions: Option<Option<u32>>,
     /// AI provider override (e.g., "gemini_api", "claude_cli")
     pub provider: Option<Option<String>>,
-    /// AI model override (e.g., "gemini-3-flash")
+    /// AI model override (e.g., "gemini-3-flash-preview")
     pub model: Option<Option<String>>,
 }
 

@@ -93,7 +93,7 @@ struct ParsedEntry {
 
 /// Get the .dev-logs directory path.
 fn get_dev_logs_dir() -> PathBuf {
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 /// Consolidate AI output from ai-output.jsonl for a time range.

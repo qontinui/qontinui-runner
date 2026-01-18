@@ -6,6 +6,7 @@
 
 import { Loader2, Play, RotateCcw } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getAccentColors } from "@/design-system";
 
 export function ResumeWorkflowBanner() {
   const { resumableWorkflow, isRunning, isResuming, handleResumeWorkflow } = useAiBuilder();
@@ -15,11 +16,13 @@ export function ResumeWorkflowBanner() {
   }
 
   return (
-    <div className="card p-4 border-2 border-orange-500/50 bg-orange-500/5">
+    <div
+      className={`card p-4 border-2 ${getAccentColors("orange").border} ${getAccentColors("orange").bg}`}
+    >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-orange-500/20 rounded-lg">
-            <RotateCcw className="w-5 h-5 text-orange-500" />
+          <div className={`p-2 ${getAccentColors("orange").bg} rounded-lg`}>
+            <RotateCcw className={`w-5 h-5 ${getAccentColors("orange").text}`} />
           </div>
           <div>
             <h4 className="font-medium text-foreground">Continue Previous Workflow</h4>
@@ -37,7 +40,7 @@ export function ResumeWorkflowBanner() {
         <button
           onClick={handleResumeWorkflow}
           disabled={isResuming}
-          className="flex items-center gap-2 px-4 py-2 bg-orange-500 text-white rounded-md font-medium hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+          className={`flex items-center gap-2 px-4 py-2 ${getAccentColors("orange").bgSolid} text-white rounded-md font-medium hover:bg-orange-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
         >
           {isResuming ? (
             <>

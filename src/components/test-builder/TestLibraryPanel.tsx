@@ -120,28 +120,22 @@ export function TestLibraryPanel() {
     state,
     filteredTests,
     selectTest,
-    createTest,
     deleteTest,
     duplicateTest,
     setSearchQuery,
     setFilterType,
     loadTests,
+    startNewTest,
+    isDraftSelected,
+    discardDraft,
   } = useTestBuilder();
   const [showNewTestMenu, setShowNewTestMenu] = useState(false);
   const [importExportMode, setImportExportMode] = useState<"import" | "export" | null>(null);
 
-  const handleCreateTest = async (testType: TestType) => {
+  const handleCreateTest = (testType: TestType) => {
     setShowNewTestMenu(false);
-    await createTest({
-      name: `New ${testTypeLabels[testType]}`,
-      test_type: testType,
-      category:
-        testType === "playwright_cdp"
-          ? "dom"
-          : testType === "qontinui_vision"
-            ? "visual"
-            : "custom",
-    });
+    // Start creating a new test as a draft (does not save to database)
+    startNewTest(testType);
   };
 
   const handleDeleteTest = async (id: string) => {
@@ -235,6 +229,25 @@ export function TestLibraryPanel() {
           </select>
         </div>
       </div>
+
+      {/* Draft Test Indicator */}
+      {isDraftSelected && (
+        <div className="mx-2 mb-2 p-2 bg-amber-900/30 border border-amber-700/50 rounded-md">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 bg-amber-500 rounded-full animate-pulse" />
+              <span className="text-xs text-amber-400 font-medium">Unsaved Draft</span>
+            </div>
+            <button
+              onClick={discardDraft}
+              className="text-xs text-amber-500 hover:text-amber-400 transition-colors"
+              title="Discard draft"
+            >
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Test List */}
       <div className="flex-1 overflow-y-auto p-2 space-y-4">

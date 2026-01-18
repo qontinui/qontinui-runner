@@ -1,0 +1,145 @@
+/**
+ * ExecutionStatusSummary Component
+ *
+ * Compact summary widget for displaying execution status in the Active Dashboard sidebar.
+ * Shows quick stats for routing, retries, compression, and hooks.
+ */
+
+import { Brain, RefreshCw, Archive, Webhook, Circle } from "lucide-react";
+import { Badge } from "../../../ui/Badge";
+import { getStatusColors, getAccentColors } from "@/design-system";
+import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
+import type { ExecutionStatusWidgetData } from "./types";
+import type { ExecutionStatus as ExecutionStatusType } from "../../../../types/executionStatus";
+
+interface ExecutionStatusSummaryProps extends BaseWidgetProps {
+  data: ExecutionStatusWidgetData;
+}
+
+function getStatusInfo(status: ExecutionStatusType["status"]) {
+  switch (status) {
+    case "running":
+      return {
+        color: getStatusColors("running"),
+        label: "Running",
+        dotClass: "bg-green-500 animate-pulse",
+      };
+    case "completed":
+      return {
+        color: getStatusColors("success"),
+        label: "Completed",
+        dotClass: "bg-green-500",
+      };
+    case "failed":
+      return {
+        color: getStatusColors("error"),
+        label: "Failed",
+        dotClass: "bg-red-500",
+      };
+    case "paused":
+      return {
+        color: getStatusColors("warning"),
+        label: "Paused",
+        dotClass: "bg-amber-500",
+      };
+    case "idle":
+    default:
+      return {
+        color: { bg: "bg-muted/50", text: "text-muted-foreground", border: "border-muted" },
+        label: "Idle",
+        dotClass: "bg-muted-foreground",
+      };
+  }
+}
+
+export function ExecutionStatusSummary({ data }: ExecutionStatusSummaryProps) {
+  const { status } = data;
+  const statusInfo = getStatusInfo(status.status);
+  const hasRouting = status.routing.decision !== null;
+  const hasRetries = status.retry.state.errorHistory.length > 0;
+  const hasCompression = status.compression.currentTokenCount !== null;
+  const hasHooks = status.hooks.executionHistory.length > 0;
+
+  // Count active features
+  const activeFeatures = [hasRouting, hasRetries, hasCompression, hasHooks].filter(Boolean).length;
+
+  return (
+    <div className="space-y-3">
+      {/* Status Row */}
+      <div className="flex items-center justify-between">
+        <Badge className={`${statusInfo.color.bg} ${statusInfo.color.text}`} size="sm">
+          <Circle className={`w-2 h-2 mr-1.5 ${statusInfo.dotClass}`} />
+          {statusInfo.label}
+        </Badge>
+        {status.iteration > 0 && (
+          <span className="text-[10px] text-muted-foreground">Iter {status.iteration}</span>
+        )}
+      </div>
+
+      {/* Feature Stats Grid */}
+      <div className="grid grid-cols-2 gap-2">
+        {/* Routing */}
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <Brain className="w-3 h-3 text-muted-foreground" />
+          {hasRouting && status.routing.decision ? (
+            <span className="text-foreground">{status.routing.decision.complexity}</span>
+          ) : (
+            <span className="text-muted-foreground">No routing</span>
+          )}
+        </div>
+
+        {/* Retries */}
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <RefreshCw className="w-3 h-3 text-muted-foreground" />
+          {hasRetries ? (
+            <span
+              className={status.retry.exhausted ? getAccentColors("red").text : "text-foreground"}
+            >
+              {status.retry.state.attempt} retries
+            </span>
+          ) : (
+            <span className="text-muted-foreground">No retries</span>
+          )}
+        </div>
+
+        {/* Compression */}
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <Archive className="w-3 h-3 text-muted-foreground" />
+          {hasCompression && status.compression.currentTokenCount ? (
+            <span
+              className={
+                status.compression.compressionImminent
+                  ? getAccentColors("amber").text
+                  : "text-foreground"
+              }
+            >
+              {Math.round(status.compression.thresholdPercentage)}%
+            </span>
+          ) : (
+            <span className="text-muted-foreground">-</span>
+          )}
+        </div>
+
+        {/* Hooks */}
+        <div className="flex items-center gap-1.5 text-[11px]">
+          <Webhook className="w-3 h-3 text-muted-foreground" />
+          {hasHooks ? (
+            <span className="text-foreground">
+              {status.hooks.executionHistory.filter((h) => h.success).length}/
+              {status.hooks.executionHistory.length}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">No hooks</span>
+          )}
+        </div>
+      </div>
+
+      {/* Active Features Count */}
+      {activeFeatures > 0 && (
+        <div className="text-[10px] text-muted-foreground text-center pt-1 border-t border-border/30">
+          {activeFeatures} active feature{activeFeatures !== 1 ? "s" : ""}
+        </div>
+      )}
+    </div>
+  );
+}

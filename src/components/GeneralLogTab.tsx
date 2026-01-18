@@ -7,6 +7,7 @@
 
 import { RefObject } from "react";
 import type { LogEntry } from "../managers/LogManager";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 export interface GeneralLogTabProps {
   logs: LogEntry[];
@@ -31,13 +32,13 @@ export function GeneralLogTab({ logs, containerRef }: GeneralLogTabProps) {
             <span
               className={`flex-shrink-0 font-medium ${
                 log.level === "error"
-                  ? "text-red-400"
+                  ? getStatusColors("error").text
                   : log.level === "warning"
-                    ? "text-orange-400"
+                    ? getStatusColors("warning").text
                     : log.level === "success"
-                      ? "text-green-400"
+                      ? getStatusColors("success").text
                       : log.level === "debug"
-                        ? "text-blue-400"
+                        ? getAccentColors("blue").text
                         : "text-muted-foreground"
               }`}
             >

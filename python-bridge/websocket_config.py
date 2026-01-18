@@ -12,8 +12,7 @@ from dataclasses import dataclass
 class WebSocketConfig:
     """Configuration for WebSocket client."""
 
-    # WebSocket endpoint
-    # IMPORTANT: WebSocket endpoint is on main backend (port 8000), NOT qontinui-api (port 8001)
+    # WebSocket endpoint (main backend on port 8000)
     api_url: str = "ws://localhost:8000"
 
     # Authentication

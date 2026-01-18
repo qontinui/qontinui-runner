@@ -25,6 +25,7 @@ import {
   Loader2,
   Info,
 } from "lucide-react";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 interface InteractionRecordingStatus {
   is_recording: boolean;
@@ -261,11 +262,11 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
           <div className="flex items-center gap-3">
             <div
               className={`w-8 h-8 rounded-full flex items-center justify-center ${
-                isRecording ? "bg-red-500/20" : "bg-muted"
+                isRecording ? getStatusColors("error").bg : "bg-muted"
               }`}
             >
               <Video
-                className={`w-4 h-4 ${isRecording ? "text-red-500" : "text-muted-foreground"}`}
+                className={`w-4 h-4 ${isRecording ? getStatusColors("error").icon : "text-muted-foreground"}`}
               />
             </div>
             <div>
@@ -320,9 +321,11 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
         {/* Recording Status */}
         <div className="flex-shrink-0 p-4">
           {error && (
-            <div className="mb-3 px-3 py-2 bg-red-500/10 rounded-lg flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-              <span className="text-red-400 text-xs">{error}</span>
+            <div
+              className={`mb-3 px-3 py-2 ${getStatusColors("error").bg} rounded-lg flex items-start gap-2`}
+            >
+              <AlertCircle className={`w-4 h-4 ${getStatusColors("error").icon} shrink-0 mt-0.5`} />
+              <span className={`${getStatusColors("error").text} text-xs`}>{error}</span>
             </div>
           )}
 
@@ -331,10 +334,14 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
               {/* Recording indicator */}
               <div className="flex items-center justify-center gap-3">
                 <span className="relative flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-red-500"></span>
+                  <span
+                    className={`animate-ping absolute inline-flex h-full w-full rounded-full ${getAccentColors("red").bgSolid} opacity-75`}
+                  ></span>
+                  <span
+                    className={`relative inline-flex rounded-full h-3 w-3 ${getAccentColors("red").bgSolid}`}
+                  ></span>
                 </span>
-                <span className="text-lg font-mono font-semibold text-red-500">
+                <span className={`text-lg font-mono font-semibold ${getAccentColors("red").text}`}>
                   {formatDuration(duration)}
                 </span>
               </div>
@@ -363,7 +370,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
                 <button
                   onClick={handleStopRecording}
                   disabled={isStopping}
-                  className="flex items-center gap-2 px-6 py-3 bg-red-500 hover:bg-red-600 disabled:bg-red-500/50 text-white rounded-lg font-medium transition-colors"
+                  className={`flex items-center gap-2 px-6 py-3 ${getAccentColors("red").bgSolid} hover:opacity-90 disabled:opacity-50 text-white rounded-lg font-medium transition-colors`}
                 >
                   {isStopping ? (
                     <>
@@ -407,7 +414,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
                 <button
                   onClick={handleStartRecording}
                   disabled={isStarting}
-                  className="flex items-center gap-2 px-6 py-3 bg-green-600 hover:bg-green-700 disabled:bg-green-600/50 text-white rounded-lg font-medium transition-colors"
+                  className={`flex items-center gap-2 px-6 py-3 ${getAccentColors("green").bgSolid} hover:opacity-90 disabled:opacity-50 text-white rounded-lg font-medium transition-colors`}
                 >
                   {isStarting ? (
                     <>
@@ -427,7 +434,7 @@ export function CaptureTab({ onLog }: CaptureTabProps) {
               {lastRecording && (
                 <div className="mt-6 p-3 rounded-lg bg-muted/30 space-y-2">
                   <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-                    <CheckCircle className="w-4 h-4 text-green-500" />
+                    <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />
                     Last Recording
                   </div>
                   <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">

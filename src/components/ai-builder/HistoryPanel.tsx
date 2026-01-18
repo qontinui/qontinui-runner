@@ -7,6 +7,7 @@
 import { CheckCircle, History, RefreshCw, XCircle } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
 import CollapsiblePanel from "../CollapsiblePanel";
+import { getStatusColors } from "@/design-system";
 
 export function HistoryPanel() {
   const { history, loadFromHistory, getHistorySummary } = useAiBuilder();
@@ -29,8 +30,12 @@ export function HistoryPanel() {
               className="w-full text-left p-3 bg-background rounded-md hover:bg-muted/30 transition-colors"
             >
               <div className="flex items-center gap-2">
-                {entry.success === true && <CheckCircle className="w-4 h-4 text-green-500" />}
-                {entry.success === false && <XCircle className="w-4 h-4 text-red-500" />}
+                {entry.success === true && (
+                  <CheckCircle className={`w-4 h-4 ${getStatusColors("success").text}`} />
+                )}
+                {entry.success === false && (
+                  <XCircle className={`w-4 h-4 ${getStatusColors("error").text}`} />
+                )}
                 {entry.success === undefined && (
                   <RefreshCw className="w-4 h-4 text-muted-foreground" />
                 )}

@@ -1,0 +1,429 @@
+//! Code Quality Check Commands
+//!
+//! Provides Tauri commands for managing and executing code quality checks.
+//! Supports linting, formatting, type checking, and custom commands.
+//!
+//! # Supported Tools
+//! - Python: black, isort, ruff, mypy, pyright
+//! - JavaScript/TypeScript: eslint, prettier, tsc, biome
+//! - Rust: clippy, rustfmt, cargo check
+//! - Custom: Any command-line tool
+
+use super::CommandResponse;
+use crate::check_executor::{
+    detect_project_checks, execute_check, execute_check_suite, CheckDefinition,
+    CheckExecutionResult, CheckSuiteSummary, CheckToolInfoSerialized, ProjectDetectionResult,
+    CHECK_TOOLS, CHECK_TYPE_INFO,
+};
+use crate::database::{Check, CreateCheckInput, UpdateCheckInput};
+use crate::AppState;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::State;
+use tracing::{error, info};
+
+// ============================================================================
+// Request/Response Types
+// ============================================================================
+
+/// Request to execute a single check
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecuteCheckRequest {
+    pub check_definition: CheckDefinition,
+}
+
+/// Response from executing a single check
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecuteCheckResponse {
+    pub success: bool,
+    pub result: CheckExecutionResult,
+}
+
+/// Request to execute multiple checks
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecuteCheckSuiteRequest {
+    pub checks: Vec<CheckDefinition>,
+    #[serde(default)]
+    pub stop_on_failure: bool,
+}
+
+/// Response from executing a check suite
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecuteCheckSuiteResponse {
+    pub success: bool,
+    pub results: Vec<CheckExecutionResult>,
+    pub summary: CheckSuiteSummary,
+}
+
+// ============================================================================
+// Execution Commands
+// ============================================================================
+
+/// Execute a single code quality check
+#[tauri::command]
+pub fn execute_code_check(check_definition: CheckDefinition) -> ExecuteCheckResponse {
+    info!(
+        "Executing check: {} (tool: {:?}, type: {:?})",
+        check_definition.name, check_definition.tool, check_definition.check_type
+    );
+
+    let result = execute_check(&check_definition);
+    let success = result.is_success();
+
+    info!(
+        "Check {} completed: {:?} (issues: {}, fixed: {}, {}ms)",
+        check_definition.name, result.status, result.issues_found, result.issues_fixed, result.duration_ms
+    );
+
+    ExecuteCheckResponse { success, result }
+}
+
+/// Execute multiple code quality checks
+#[tauri::command]
+pub fn execute_code_check_suite(request: ExecuteCheckSuiteRequest) -> ExecuteCheckSuiteResponse {
+    info!(
+        "Executing check suite: {} checks (stop_on_failure: {})",
+        request.checks.len(),
+        request.stop_on_failure
+    );
+
+    let (results, summary) = execute_check_suite(&request.checks, request.stop_on_failure);
+    let success = summary.all_passed();
+
+    info!(
+        "Check suite completed: {}/{} passed ({:.1}% pass rate, {}ms total)",
+        summary.passed + summary.fixed,
+        summary.total,
+        summary.pass_rate(),
+        summary.duration_ms
+    );
+
+    ExecuteCheckSuiteResponse {
+        success,
+        results,
+        summary,
+    }
+}
+
+/// Execute a check by its database ID
+#[tauri::command]
+pub async fn execute_check_by_id(
+    check_id: String,
+    task_run_id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    info!("Executing check by ID: {}", check_id);
+
+    let db = &state.checkpoint_db;
+
+    // Get the check from database
+    let check = match db.get_check(&check_id) {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Check not found: {}", check_id)),
+                data: None,
+            });
+        }
+        Err(e) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Failed to get check: {}", e)),
+                data: None,
+            });
+        }
+    };
+
+    // Convert to CheckDefinition
+    let check_def = check_to_definition(&check);
+
+    // Execute the check
+    let result = execute_check(&check_def);
+
+    // Store result in database if task_run_id provided
+    if let Some(ref run_id) = task_run_id {
+        let status_str = serde_json::to_string(&result.status)
+            .unwrap_or("\"pending\"".to_string())
+            .trim_matches('"')
+            .to_string();
+        let structured = result
+            .structured_output
+            .as_ref()
+            .map(|o| serde_json::to_string(o).unwrap_or_default());
+
+        if let Err(e) = db.save_check_result(
+            &result.check_id,
+            &status_str,
+            Some(result.started_at.as_str()),
+            Some(result.completed_at.as_str()),
+            Some(result.duration_ms as i64),
+            Some(result.output.as_str()),
+            result.error.as_deref(),
+            result.issues_found as i32,
+            result.issues_fixed as i32,
+            result.files_checked as i32,
+            structured.as_deref(),
+            Some(run_id.as_str()),
+        ) {
+            error!("Failed to store check result: {}", e);
+        }
+    }
+
+    Ok(CommandResponse {
+        success: result.is_success(),
+        message: Some(format!(
+            "Check {} completed: {:?}",
+            check.name, result.status
+        )),
+        data: Some(serde_json::to_value(result).unwrap_or_default()),
+    })
+}
+
+// ============================================================================
+// CRUD Commands
+// ============================================================================
+
+/// List all checks
+#[tauri::command]
+pub async fn list_checks(
+    enabled_only: Option<bool>,
+    check_type: Option<String>,
+    tool: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    match db.list_checks(
+        enabled_only.unwrap_or(false),
+        check_type.as_deref(),
+        tool.as_deref(),
+    ) {
+        Ok(checks) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} checks", checks.len())),
+            data: Some(serde_json::to_value(checks).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to list checks: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Get a single check by ID
+#[tauri::command]
+pub async fn get_check(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    match db.get_check(&id) {
+        Ok(Some(check)) => Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::to_value(check).unwrap_or_default()),
+        }),
+        Ok(None) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Check not found: {}", id)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to get check: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Create a new check
+#[tauri::command]
+pub async fn create_check(
+    input: CreateCheckInput,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Creating check: {} (type: {})", input.name, input.check_type);
+
+    match db.create_check(&input) {
+        Ok(check) => {
+            info!("Created check: {} ({})", check.name, check.id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Check created: {}", check.name)),
+                data: Some(serde_json::to_value(check).unwrap_or_default()),
+            })
+        }
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to create check: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Update an existing check
+#[tauri::command]
+pub async fn update_check(
+    id: String,
+    input: UpdateCheckInput,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Updating check: {}", id);
+
+    match db.update_check(&id, &input) {
+        Ok(check) => {
+            info!("Updated check: {} ({})", check.name, check.id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Check updated: {}", check.name)),
+                data: Some(serde_json::to_value(check).unwrap_or_default()),
+            })
+        }
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to update check: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Delete a check
+#[tauri::command]
+pub async fn delete_check(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Deleting check: {}", id);
+
+    match db.delete_check(&id) {
+        Ok(true) => {
+            info!("Deleted check: {}", id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some("Check deleted".to_string()),
+                data: None,
+            })
+        }
+        Ok(false) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Check not found: {}", id)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to delete check: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+// ============================================================================
+// Project Detection Commands
+// ============================================================================
+
+/// Detect project type and suggest relevant checks
+#[tauri::command]
+pub fn detect_project_check_suggestions(
+    working_directory: String,
+) -> Result<ProjectDetectionResult, String> {
+    info!("Detecting project checks for: {}", working_directory);
+
+    let result = detect_project_checks(&working_directory);
+
+    info!(
+        "Detected {} languages, {} tools, {} suggested checks",
+        result.detected_languages.len(),
+        result.detected_tools.len(),
+        result.suggested_checks.len()
+    );
+
+    Ok(result)
+}
+
+/// Get information about available check tools
+#[tauri::command]
+pub fn get_check_tool_info() -> CommandResponse {
+    let tools: Vec<CheckToolInfoSerialized> = CHECK_TOOLS.iter().map(|t| t.into()).collect();
+    let check_types: Vec<serde_json::Value> = CHECK_TYPE_INFO
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "check_type": t.check_type,
+                "name": t.name,
+                "description": t.description,
+                "icon": t.icon,
+                "color": t.color,
+            })
+        })
+        .collect();
+
+    CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "tools": tools,
+            "check_types": check_types,
+        })),
+    }
+}
+
+// ============================================================================
+// Check Results Commands
+// ============================================================================
+
+/// Get check results for a specific check
+#[tauri::command]
+pub async fn get_check_results(
+    check_id: String,
+    limit: Option<u32>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+    let limit = limit.unwrap_or(10);
+
+    match db.get_check_results(&check_id, limit) {
+        Ok(results) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} results", results.len())),
+            data: Some(serde_json::to_value(results).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to get check results: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Convert a database Check to a CheckDefinition for execution
+fn check_to_definition(check: &Check) -> CheckDefinition {
+    use crate::check_executor::{CheckTool, CheckType};
+
+    CheckDefinition {
+        id: check.id.clone(),
+        name: check.name.clone(),
+        check_type: serde_json::from_str(&format!("\"{}\"", check.check_type))
+            .unwrap_or(CheckType::Lint),
+        tool: serde_json::from_str(&format!("\"{}\"", check.tool)).unwrap_or(CheckTool::Custom),
+        command: check.command.clone(),
+        working_directory: check.working_directory.clone(),
+        config_path: check.config_path.clone(),
+        auto_fix: check.auto_fix,
+        fail_on_warning: check.fail_on_warning,
+        timeout_seconds: check.timeout_seconds,
+        is_critical: check.is_critical,
+    }
+}

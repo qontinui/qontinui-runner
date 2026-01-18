@@ -11,6 +11,7 @@ import { useContexts } from "./hooks/useContexts";
 import { ContextFilters } from "./ContextFilters";
 import { ContextCard } from "./ContextCard";
 import { ContextEditor } from "./ContextEditor";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import type {
   ContextWithMetadata,
   CreateContextRequest,
@@ -258,7 +259,7 @@ export function ContextList({ onLog }: ContextListProps) {
                 onClick={() => handleCreate("user")}
                 className="w-full flex items-start gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted/50 transition-colors"
               >
-                <User className="w-4 h-4 text-purple-400 mt-0.5" />
+                <User className={`w-4 h-4 ${getAccentColors("purple").text} mt-0.5`} />
                 <div className="text-left">
                   <div className="font-medium">User Context</div>
                   <div className="text-xs text-muted-foreground">Available across all projects</div>
@@ -268,7 +269,7 @@ export function ContextList({ onLog }: ContextListProps) {
                 onClick={() => handleCreate("project")}
                 className="w-full flex items-start gap-2 px-3 py-2 text-sm text-foreground hover:bg-muted/50 transition-colors"
               >
-                <FolderOpen className="w-4 h-4 text-blue-400 mt-0.5" />
+                <FolderOpen className={`w-4 h-4 ${getAccentColors("blue").text} mt-0.5`} />
                 <div className="text-left">
                   <div className="font-medium">Project Context</div>
                   <div className="text-xs text-muted-foreground">Saved with loaded config file</div>
@@ -281,7 +282,9 @@ export function ContextList({ onLog }: ContextListProps) {
 
       {/* Error Display */}
       {error && (
-        <div className="flex items-center gap-2 p-3 bg-red-500/10 text-red-500 rounded-lg">
+        <div
+          className={`flex items-center gap-2 p-3 ${getStatusColors("error").bg} ${getStatusColors("error").text} rounded-lg`}
+        >
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <span className="text-sm">{error}</span>
         </div>
@@ -322,7 +325,7 @@ export function ContextList({ onLog }: ContextListProps) {
           {groupedContexts.user.length > 0 && (
             <div>
               <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
-                <User className="w-4 h-4 text-purple-400" />
+                <User className={`w-4 h-4 ${getAccentColors("purple").text}`} />
                 User Contexts ({groupedContexts.user.length})
                 <span className="text-xs text-muted-foreground/70">
                   &mdash; Available across all projects
@@ -348,7 +351,7 @@ export function ContextList({ onLog }: ContextListProps) {
           {groupedContexts.project.length > 0 && (
             <div>
               <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
-                <FolderOpen className="w-4 h-4 text-blue-400" />
+                <FolderOpen className={`w-4 h-4 ${getAccentColors("blue").text}`} />
                 Project Contexts ({groupedContexts.project.length})
                 <span className="text-xs text-muted-foreground/70">
                   &mdash; Saved with loaded config
@@ -424,7 +427,7 @@ export function ContextList({ onLog }: ContextListProps) {
                 onClick={() => handleDuplicateConfirm("project")}
                 className="w-full flex items-center gap-3 px-4 py-3 bg-muted/50 hover:bg-muted rounded-lg transition-colors"
               >
-                <FolderOpen className="w-5 h-5 text-blue-400" />
+                <FolderOpen className={`w-5 h-5 ${getAccentColors("blue").text}`} />
                 <div className="text-left">
                   <div className="font-medium">Project Scope</div>
                   <div className="text-xs text-muted-foreground">
@@ -436,7 +439,7 @@ export function ContextList({ onLog }: ContextListProps) {
                 onClick={() => handleDuplicateConfirm("user")}
                 className="w-full flex items-center gap-3 px-4 py-3 bg-muted/50 hover:bg-muted rounded-lg transition-colors"
               >
-                <User className="w-5 h-5 text-purple-400" />
+                <User className={`w-5 h-5 ${getAccentColors("purple").text}`} />
                 <div className="text-left">
                   <div className="font-medium">User Scope</div>
                   <div className="text-xs text-muted-foreground">Available across all projects</div>

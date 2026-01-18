@@ -22,6 +22,7 @@ import {
   ToggleRight,
   Wrench,
 } from "lucide-react";
+import { getStatusColors, getAccentColors } from "@/design-system";
 import type { ExecutionReport as ExecutionReportType, Finding } from "../../types/findings";
 import { findingsTracker, getVisibleCategories } from "../../services";
 import { CategorySection } from "./CategorySection";
@@ -42,13 +43,13 @@ interface ExecutionReportProps {
 
 const statusLabels: Record<
   string,
-  { label: string; color: string; icon: React.ComponentType<{ className?: string }> }
+  { label: string; colorKey: string; icon: React.ComponentType<{ className?: string }> }
 > = {
-  running: { label: "Running", color: "text-blue-400", icon: Loader2 },
-  completed: { label: "Completed", color: "text-green-400", icon: CheckCircle },
-  paused_for_input: { label: "Needs Input", color: "text-purple-400", icon: AlertCircle },
-  failed: { label: "Failed", color: "text-red-400", icon: AlertCircle },
-  cancelled: { label: "Cancelled", color: "text-text-muted", icon: AlertCircle },
+  running: { label: "Running", colorKey: "running", icon: Loader2 },
+  completed: { label: "Completed", colorKey: "success", icon: CheckCircle },
+  paused_for_input: { label: "Needs Input", colorKey: "paused", icon: AlertCircle },
+  failed: { label: "Failed", colorKey: "error", icon: AlertCircle },
+  cancelled: { label: "Cancelled", colorKey: "cancelled", icon: AlertCircle },
 };
 
 type FilterMode = "all" | "actionable" | "needs_input" | "resolved";
@@ -370,16 +371,20 @@ Work through ALL findings systematically. Fix each one and report your resolutio
           </div>
 
           {/* Status Badge */}
-          {statusInfo && (
-            <div
-              className={`flex items-center gap-2 px-3 py-1.5 rounded-lg bg-muted/50 ${statusInfo.color}`}
-            >
-              <StatusIcon
-                className={`w-4 h-4 ${report?.status === "running" ? "animate-spin" : ""}`}
-              />
-              <span className="text-sm font-medium">{statusInfo.label}</span>
-            </div>
-          )}
+          {statusInfo &&
+            (() => {
+              const statusColors = getStatusColors(statusInfo.colorKey);
+              return (
+                <div
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${statusColors.bg} ${statusColors.text}`}
+                >
+                  <StatusIcon
+                    className={`w-4 h-4 ${report?.status === "running" ? "animate-spin" : ""}`}
+                  />
+                  <span className="text-sm font-medium">{statusInfo.label}</span>
+                </div>
+              );
+            })()}
         </div>
 
         {/* Summary Stats */}
@@ -388,30 +393,54 @@ Work through ALL findings systematically. Fix each one and report your resolutio
             <span className="text-muted-foreground">Total:</span>
             <span className="font-semibold">{summary.total}</span>
           </div>
-          {summary.actionable > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/10 rounded-lg text-amber-400">
-              <span>Actionable:</span>
-              <span className="font-semibold">{summary.actionable}</span>
-            </div>
-          )}
-          {summary.needsInput > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-purple-500/10 rounded-lg text-purple-400">
-              <span>Needs Input:</span>
-              <span className="font-semibold">{summary.needsInput}</span>
-            </div>
-          )}
-          {summary.resolved > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 rounded-lg text-green-400">
-              <span>Resolved:</span>
-              <span className="font-semibold">{summary.resolved}</span>
-            </div>
-          )}
-          {summary.informational > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-500/10 rounded-lg text-slate-400">
-              <span>Info:</span>
-              <span className="font-semibold">{summary.informational}</span>
-            </div>
-          )}
+          {summary.actionable > 0 &&
+            (() => {
+              const colors = getAccentColors("amber");
+              return (
+                <div
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${colors.bg} ${colors.text}`}
+                >
+                  <span>Actionable:</span>
+                  <span className="font-semibold">{summary.actionable}</span>
+                </div>
+              );
+            })()}
+          {summary.needsInput > 0 &&
+            (() => {
+              const colors = getAccentColors("purple");
+              return (
+                <div
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${colors.bg} ${colors.text}`}
+                >
+                  <span>Needs Input:</span>
+                  <span className="font-semibold">{summary.needsInput}</span>
+                </div>
+              );
+            })()}
+          {summary.resolved > 0 &&
+            (() => {
+              const colors = getAccentColors("green");
+              return (
+                <div
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${colors.bg} ${colors.text}`}
+                >
+                  <span>Resolved:</span>
+                  <span className="font-semibold">{summary.resolved}</span>
+                </div>
+              );
+            })()}
+          {summary.informational > 0 &&
+            (() => {
+              const colors = getAccentColors("slate");
+              return (
+                <div
+                  className={`flex items-center gap-2 px-3 py-1.5 rounded-lg ${colors.bg} ${colors.text}`}
+                >
+                  <span>Info:</span>
+                  <span className="font-semibold">{summary.informational}</span>
+                </div>
+              );
+            })()}
         </div>
 
         {/* Filter and Actions */}
@@ -468,7 +497,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
               disabled={autoFixLoading}
               className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
                 autoFixEnabled
-                  ? "bg-blue-500/20 text-blue-400 hover:bg-blue-500/30"
+                  ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} hover:bg-blue-500/30`
                   : "bg-muted/50 text-muted-foreground hover:bg-muted"
               } ${autoFixLoading ? "opacity-50" : ""}`}
               title={
@@ -493,7 +522,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
               <button
                 onClick={handleAnalyzeAll}
                 disabled={isAnalyzingAll}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-purple-500 hover:bg-purple-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors"
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${getAccentColors("purple").bgSolid} hover:bg-purple-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors`}
                 title={`Fix ${summary.autoFixable} auto-fixable findings (code bugs, security, tests, docs)`}
               >
                 {isAnalyzingAll ? (

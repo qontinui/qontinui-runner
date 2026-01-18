@@ -12,8 +12,13 @@ import { StorageSettings } from "./StorageSettings";
 import { AdvancedSettings } from "./AdvancedSettings";
 import { UpdateSettings } from "./UpdateSettings";
 import { AiSettings } from "./AiSettings";
+import { AgenticSettings } from "./AgenticSettings";
 import { BackupSettings } from "./BackupSettings";
 import { PlaywrightSettings } from "./PlaywrightSettings";
+import { SelfHealingSettings } from "./SelfHealingSettings";
+import { MobileSettings } from "./MobileSettings";
+import { LogSourcesSettings } from "./LogSourcesSettings";
+import { McpSettings } from "./McpSettings";
 import type { Project, ConnectionInfo } from "../../types/auth";
 
 interface WebSocketState {
@@ -40,7 +45,12 @@ interface SettingsProps {
 type SettingsTab =
   | "account"
   | "ai"
+  | "agentic"
+  | "self-healing"
   | "playwright"
+  | "mobile"
+  | "mcp"
+  | "log-sources"
   | "general"
   | "storage"
   | "backup"
@@ -62,7 +72,12 @@ export function Settings({
   const validTabs = [
     "account",
     "ai",
+    "agentic",
+    "self-healing",
     "playwright",
+    "mobile",
+    "mcp",
+    "log-sources",
     "general",
     "storage",
     "backup",
@@ -114,8 +129,18 @@ export function Settings({
         );
       case "ai":
         return <AiSettings onLog={onLog} />;
+      case "agentic":
+        return <AgenticSettings onLog={onLog} />;
+      case "self-healing":
+        return <SelfHealingSettings onLog={onLog} />;
       case "playwright":
         return <PlaywrightSettings onLog={onLog} />;
+      case "mobile":
+        return <MobileSettings onLog={onLog} />;
+      case "mcp":
+        return <McpSettings onLog={onLog} />;
+      case "log-sources":
+        return <LogSourcesSettings onLog={onLog} />;
       case "general":
         return <GeneralSettings onLog={onLog} />;
       case "storage":

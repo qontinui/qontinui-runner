@@ -88,7 +88,13 @@ export interface TaskRun {
 /**
  * Valid JSONL log types.
  */
-export type JsonlLogType = "general" | "actions" | "image-recognition" | "playwright" | "ai-output";
+export type JsonlLogType =
+  | "general"
+  | "actions"
+  | "image-recognition"
+  | "playwright"
+  | "ai-output"
+  | "api-requests";
 
 /**
  * Result of reading JSONL logs.
@@ -157,6 +163,7 @@ export interface JsonlLogsSummary {
   image_recognition: JsonlLogFileInfo;
   playwright: JsonlLogFileInfo;
   ai_output: JsonlLogFileInfo;
+  api_requests: JsonlLogFileInfo;
 }
 
 // =============================================================================
@@ -226,6 +233,68 @@ export interface PlaywrightLogEntry {
   page_snapshot?: string;
 }
 
+/**
+ * Variable extraction result from API response.
+ */
+export interface ApiExtractionResult {
+  variable_name: string;
+  json_path: string;
+  extracted_value?: string;
+  success: boolean;
+  error?: string;
+}
+
+/**
+ * Assertion result from API response verification.
+ */
+export interface ApiAssertionResult {
+  type: string;
+  expected: string;
+  actual: string;
+  passed: boolean;
+  error?: string;
+}
+
+/**
+ * API request log entry.
+ */
+export interface ApiRequestLogEntry {
+  id: string;
+  timestamp: string;
+  step_id: string;
+  step_name: string;
+
+  // Request details
+  method: string;
+  url: string;
+  resolved_url: string;
+  headers: Record<string, string>;
+  body?: string;
+  content_type?: string;
+
+  // Response details
+  status_code: number;
+  status_text: string;
+  response_headers: Record<string, string>;
+  response_time_ms: number;
+
+  // Response body handling
+  response_body_type: "json" | "text" | "binary";
+  response_body?: string;
+  response_file_path?: string;
+  response_size_bytes: number;
+
+  // Variable extractions performed
+  extractions?: ApiExtractionResult[];
+
+  // Assertion results
+  assertions?: ApiAssertionResult[];
+
+  // Overall result
+  success: boolean;
+  error?: string;
+}
+
 // =============================================================================
 // Text Log Types (plain text, filtered by task run time range)
 // =============================================================================
@@ -234,7 +303,7 @@ export interface PlaywrightLogEntry {
  * Valid text log types for dev logs.
  * Only logs with parseable timestamps are supported.
  */
-export type TextLogType = "backend" | "backend-err" | "qontinui-api" | "qontinui-api-err";
+export type TextLogType = "backend" | "backend-err";
 
 /**
  * Result of reading text logs for a task run.
@@ -410,6 +479,270 @@ export interface ContextInfo {
  */
 export interface ContextsResult {
   contexts: ContextInfo[];
+}
+
+// =============================================================================
+// SQLite Migrated Log Types
+// =============================================================================
+
+/**
+ * Task run event from SQLite database.
+ * Replaces JSONL files for historical queries.
+ */
+export interface TaskRunEvent {
+  id: number;
+  task_run_id: string;
+  /** Event type: 'general', 'action', 'image_recognition', 'state_change', 'ai_output' */
+  event_type: string;
+  /** Event subtype: 'start', 'complete', 'error', 'match', 'transition', etc. */
+  event_subtype?: string | null;
+  /** Human-readable message */
+  message: string;
+  /** JSON payload with event-specific data */
+  data?: string | null;
+  /** Context */
+  workflow_name?: string | null;
+  state_name?: string | null;
+  action_id?: string | null;
+  /** Timing */
+  timestamp: string;
+  duration_ms?: number | null;
+}
+
+/**
+ * Result of querying task run events from SQLite.
+ */
+export interface TaskRunEventsResult {
+  task_run_id: string;
+  events: TaskRunEvent[];
+  count: number;
+  event_type_filter?: string | null;
+}
+
+/**
+ * Task run screenshot from SQLite database.
+ */
+export interface TaskRunScreenshotDb {
+  id: string;
+  task_run_id: string;
+  event_id?: number | null;
+  /** Path to PNG file */
+  file_path: string;
+  /** Screenshot type: 'annotated', 'raw', 'diff', 'failure' */
+  screenshot_type: string;
+  /** Context from image recognition */
+  template_name?: string | null;
+  confidence?: number | null;
+  /** JSON {x, y, width, height} */
+  match_location?: string | null;
+  /** Metadata */
+  width?: number | null;
+  height?: number | null;
+  file_size_bytes?: number | null;
+  created_at: string;
+}
+
+/**
+ * Result of querying task run screenshots from SQLite.
+ */
+export interface TaskRunScreenshotsDbResult {
+  task_run_id: string;
+  screenshots: TaskRunScreenshotDb[];
+  count: number;
+}
+
+/**
+ * Playwright test result from SQLite database.
+ */
+export interface TaskRunPlaywrightResultDb {
+  id: string;
+  task_run_id: string;
+  /** Test identification */
+  test_name: string;
+  spec_file?: string | null;
+  /** Status: 'passed', 'failed', 'skipped', 'timeout' */
+  status: string;
+  duration_ms?: number | null;
+  /** Output */
+  stdout?: string | null;
+  stderr?: string | null;
+  console_output?: string | null;
+  page_snapshot?: string | null;
+  /** Failure details */
+  error_message?: string | null;
+  failure_screenshot_path?: string | null;
+  /** Assertion summary */
+  assertions_passed: number;
+  assertions_failed: number;
+  created_at: string;
+}
+
+/**
+ * Result of querying Playwright results from SQLite.
+ */
+export interface TaskRunPlaywrightResultsDbResult {
+  task_run_id: string;
+  results: TaskRunPlaywrightResultDb[];
+  count: number;
+  passed: number;
+  failed: number;
+}
+
+/**
+ * Summary of all migrated log data for a task run.
+ */
+export interface TaskRunMigratedLogsSummary {
+  task_run_id: string;
+  events_count: number;
+  screenshots_count: number;
+  playwright_results_count: number;
+  events_by_type: Record<string, number>;
+}
+
+/**
+ * API request record from SQLite database.
+ * Stores API request execution results migrated from JSONL logs.
+ */
+export interface TaskRunApiRequestDb {
+  id: string;
+  task_run_id: string;
+  /** Step identification */
+  step_id: string;
+  step_name?: string | null;
+  /** Request details */
+  method: string;
+  url: string;
+  resolved_url: string;
+  /** JSON object {header: value} */
+  request_headers?: string | null;
+  request_body?: string | null;
+  /** Response details */
+  status_code: number;
+  status_text?: string | null;
+  /** JSON object {header: value} */
+  response_headers?: string | null;
+  response_time_ms: number;
+  /** Response body handling */
+  response_body_type: string;
+  response_body?: string | null;
+  response_size_bytes?: number | null;
+  /** JSON array of extraction results */
+  extractions?: string | null;
+  /** JSON array of assertion results */
+  assertions?: string | null;
+  /** Overall result */
+  success: boolean;
+  error_message?: string | null;
+  created_at: string;
+}
+
+/**
+ * Result of querying API requests from SQLite.
+ */
+export interface TaskRunApiRequestsDbResult {
+  task_run_id: string;
+  requests: TaskRunApiRequestDb[];
+  count: number;
+  success_count: number;
+  failed_count: number;
+}
+
+// =============================================================================
+// AWAS Step Types
+// =============================================================================
+
+/**
+ * AWAS (Automated Web Agent System) step record from SQLite database.
+ * Stores AWAS step execution results.
+ */
+export interface TaskRunAwasStepDb {
+  id: string;
+  task_run_id: string;
+  /** Step identification */
+  step_id?: string | null;
+  step_name?: string | null;
+  /** Step type: 'awas_discover', 'awas_execute', 'awas_check_support', 'awas_list_actions', 'awas_extract_elements' */
+  step_type: string;
+  /** Context URL */
+  url?: string | null;
+  /** Execution parameters */
+  action_id?: string | null;
+  /** JSON: step-specific parameters */
+  parameters?: string | null;
+  /** Response data (JSON: contains manifest, actions, elements, etc. depending on step_type) */
+  response_data?: string | null;
+  /** Results */
+  success: boolean;
+  error_message?: string | null;
+  duration_ms?: number | null;
+  created_at: string;
+}
+
+/**
+ * Result of querying AWAS steps from SQLite.
+ */
+export interface TaskRunAwasStepsDbResult {
+  task_run_id: string;
+  steps: TaskRunAwasStepDb[];
+  count: number;
+  success_count: number;
+  failed_count: number;
+}
+
+// =============================================================================
+// MCP Call Types
+// =============================================================================
+
+/**
+ * MCP call record from SQLite database.
+ * Stores MCP tool call execution results.
+ */
+export interface TaskRunMcpCallDb {
+  id: string;
+  task_run_id: string;
+
+  /** Step identification */
+  step_id: string;
+  step_name?: string | null;
+
+  /** Server identification */
+  server_id: string;
+  server_name?: string | null;
+
+  /** Tool call details */
+  tool_name: string;
+  /** JSON: tool arguments */
+  arguments?: string | null;
+  /** JSON: resolved arguments after variable substitution */
+  resolved_arguments?: string | null;
+
+  /** Response details */
+  /** JSON: tool response content */
+  response?: string | null;
+  response_type: string; // 'text', 'json', 'error'
+  duration_ms: number;
+
+  /** Variable extractions (JSON array of extraction results) */
+  extractions?: string | null;
+  /** Assertion results (JSON array of assertion results) */
+  assertions?: string | null;
+
+  /** Overall result */
+  success: boolean;
+  error_message?: string | null;
+
+  created_at: string;
+}
+
+/**
+ * Result of querying MCP calls from SQLite.
+ */
+export interface TaskRunMcpCallsDbResult {
+  task_run_id: string;
+  calls: TaskRunMcpCallDb[];
+  count: number;
+  success_count: number;
+  failed_count: number;
 }
 
 // =============================================================================

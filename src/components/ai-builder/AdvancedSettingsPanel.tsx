@@ -7,6 +7,7 @@
 import { Code, Info, MousePointer2, ToggleLeft, ToggleRight } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
 import CollapsiblePanel from "../CollapsiblePanel";
+import { getAccentColors } from "@/design-system";
 
 export function AdvancedSettingsPanel() {
   const { captureInputValidation, setCaptureInputValidation } = useAiBuilder();
@@ -22,7 +23,7 @@ export function AdvancedSettingsPanel() {
         {/* Input Capture for Coordinate Validation Toggle */}
         <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
           <div className="flex items-center gap-2">
-            <MousePointer2 className="w-4 h-4 text-purple-500" />
+            <MousePointer2 className={`w-4 h-4 ${getAccentColors("purple").text}`} />
             <div>
               <div className="flex items-center gap-1.5">
                 <span className="text-sm font-medium">Capture Input for Validation</span>
@@ -58,7 +59,7 @@ export function AdvancedSettingsPanel() {
           </div>
           <button
             onClick={() => setCaptureInputValidation(!captureInputValidation)}
-            className={`flex items-center transition-colors ${captureInputValidation ? "text-purple-500" : "text-muted-foreground"}`}
+            className={`flex items-center transition-colors ${captureInputValidation ? getAccentColors("purple").text : "text-muted-foreground"}`}
             title={captureInputValidation ? "Input capture enabled" : "Input capture disabled"}
           >
             {captureInputValidation ? (
@@ -71,7 +72,7 @@ export function AdvancedSettingsPanel() {
 
         {/* When Input Capture is enabled, show explanation */}
         {captureInputValidation && (
-          <div className="space-y-2 pl-2 border-l-2 border-purple-500/30">
+          <div className={`space-y-2 pl-2 border-l-2 ${getAccentColors("purple").border}`}>
             <p className="text-xs text-muted-foreground">
               Compares reported click positions with actual mouse events to detect coordinate bugs
               (multi-monitor offsets, DPI scaling issues).

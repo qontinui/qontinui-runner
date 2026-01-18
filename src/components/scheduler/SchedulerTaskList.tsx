@@ -17,6 +17,7 @@ import {
   Loader2,
 } from "lucide-react";
 import type { ScheduledTask } from "../../types/scheduler";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import {
   describeSchedule,
   describeTaskType,
@@ -62,13 +63,13 @@ export function SchedulerTaskList({
     const status = task.last_run.status;
     switch (status) {
       case "running":
-        return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
+        return <Loader2 className={`w-4 h-4 ${getStatusColors("running").icon} animate-spin`} />;
       case "completed":
-        return <CheckCircle className="w-4 h-4 text-green-500" />;
+        return <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />;
       case "failed":
-        return <XCircle className="w-4 h-4 text-red-500" />;
+        return <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />;
       case "skipped":
-        return <SkipForward className="w-4 h-4 text-yellow-500" />;
+        return <SkipForward className={`w-4 h-4 ${getStatusColors("warning").icon}`} />;
       default:
         return <Clock className="w-4 h-4 text-muted-foreground" />;
     }
@@ -100,12 +101,16 @@ export function SchedulerTaskList({
                     <span className="px-2 py-0.5 text-xs bg-muted rounded">Disabled</span>
                   )}
                   {task.skip_if_completed && task.last_run?.success && (
-                    <span className="px-2 py-0.5 text-xs bg-green-500/10 text-green-500 rounded">
+                    <span
+                      className={`px-2 py-0.5 text-xs ${getAccentColors("green").bg} ${getAccentColors("green").text} rounded`}
+                    >
                       Completed
                     </span>
                   )}
                   {task.auto_fix_on_failure && (
-                    <span className="px-2 py-0.5 text-xs bg-orange-500/10 text-orange-500 rounded">
+                    <span
+                      className={`px-2 py-0.5 text-xs ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded`}
+                    >
                       Auto-Fix
                     </span>
                   )}
@@ -145,7 +150,7 @@ export function SchedulerTaskList({
                     {task.enabled ? (
                       <Pause className="w-4 h-4 text-muted-foreground" />
                     ) : (
-                      <Play className="w-4 h-4 text-green-500" />
+                      <Play className={`w-4 h-4 ${getAccentColors("green").text}`} />
                     )}
                   </button>
                   <button
@@ -158,7 +163,7 @@ export function SchedulerTaskList({
                     title="Run Now"
                   >
                     <PlayCircle
-                      className={`w-4 h-4 ${running ? "text-blue-500 animate-pulse" : "text-primary"}`}
+                      className={`w-4 h-4 ${running ? `${getStatusColors("running").icon} animate-pulse` : "text-primary"}`}
                     />
                   </button>
                   <button
@@ -210,7 +215,13 @@ export function SchedulerTaskList({
                   </div>
                   <div>
                     <span className="text-muted-foreground">Success:</span>{" "}
-                    <span className={task.last_run.success ? "text-green-500" : "text-red-500"}>
+                    <span
+                      className={
+                        task.last_run.success
+                          ? getAccentColors("green").text
+                          : getAccentColors("red").text
+                      }
+                    >
                       {task.last_run.success ? "Yes" : "No"}
                     </span>
                   </div>
@@ -221,7 +232,9 @@ export function SchedulerTaskList({
                     </div>
                   )}
                   {task.last_run.triggered_auto_fix && (
-                    <div className="col-span-2 text-orange-500">Auto-fix was triggered</div>
+                    <div className={`col-span-2 ${getAccentColors("orange").text}`}>
+                      Auto-fix was triggered
+                    </div>
                   )}
                 </div>
               </div>

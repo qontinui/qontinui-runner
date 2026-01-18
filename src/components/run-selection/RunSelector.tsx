@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
 import type { TaskRun, TaskRunStatus } from "../../types/aiData";
+import { getStatusColors } from "@/design-system";
 
 interface RunSelectorProps {
   /** Additional class name */
@@ -27,34 +28,46 @@ interface RunSelectorProps {
 }
 
 // Status icon and color mapping for TaskRun statuses
-const statusConfig: Record<
-  TaskRunStatus,
-  { icon: typeof CheckCircle; color: string; bgColor: string; label: string }
-> = {
-  running: {
-    icon: Loader2,
-    color: "text-blue-400",
-    bgColor: "bg-blue-500/10",
-    label: "Running",
-  },
-  complete: {
-    icon: CheckCircle,
-    color: "text-green-400",
-    bgColor: "bg-green-500/10",
-    label: "Complete",
-  },
-  failed: {
-    icon: XCircle,
-    color: "text-red-400",
-    bgColor: "bg-red-500/10",
-    label: "Failed",
-  },
-  stopped: {
-    icon: StopCircle,
-    color: "text-slate-400",
-    bgColor: "bg-slate-500/10",
-    label: "Stopped",
-  },
+const getStatusConfig = (
+  status: TaskRunStatus,
+): { icon: typeof CheckCircle; color: string; bgColor: string; label: string } => {
+  switch (status) {
+    case "running":
+      return {
+        icon: Loader2,
+        color: getStatusColors("running").text,
+        bgColor: getStatusColors("running").bg,
+        label: "Running",
+      };
+    case "complete":
+      return {
+        icon: CheckCircle,
+        color: getStatusColors("success").text,
+        bgColor: getStatusColors("success").bg,
+        label: "Complete",
+      };
+    case "failed":
+      return {
+        icon: XCircle,
+        color: getStatusColors("error").text,
+        bgColor: getStatusColors("error").bg,
+        label: "Failed",
+      };
+    case "stopped":
+      return {
+        icon: StopCircle,
+        color: getStatusColors("cancelled").text,
+        bgColor: getStatusColors("cancelled").bg,
+        label: "Stopped",
+      };
+    default:
+      return {
+        icon: Activity,
+        color: "text-muted-foreground",
+        bgColor: "bg-muted",
+        label: "Unknown",
+      };
+  }
 };
 
 /**
@@ -119,7 +132,7 @@ function RunItem({
   isSelected: boolean;
   onClick: () => void;
 }) {
-  const config = statusConfig[run.status];
+  const config = getStatusConfig(run.status);
   const StatusIcon = config.icon;
   const isRunning = run.status === "running";
   const duration = calculateDuration(run.created_at, run.completed_at);
@@ -142,7 +155,9 @@ function RunItem({
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium truncate">{run.task_name || "Unknown Task"}</span>
           {isRunning && (
-            <span className="px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">
+            <span
+              className={`px-1.5 py-0.5 text-xs ${getStatusColors("running").bg} ${getStatusColors("running").text} rounded`}
+            >
               In Progress
             </span>
           )}
@@ -223,7 +238,7 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
 
   // Get display info for selected run
   const displayRun = selectedRun || recentRuns.find((r) => r.id === selectedRunId);
-  const config = displayRun ? statusConfig[displayRun.status] : null;
+  const config = displayRun ? getStatusConfig(displayRun.status) : null;
   const StatusIcon = config?.icon || Activity;
   const duration = displayRun
     ? calculateDuration(displayRun.created_at, displayRun.completed_at)
@@ -292,10 +307,12 @@ export function RunSelector({ className = "", showCurrentOption = true }: RunSel
                 }}
                 className="w-full flex items-center gap-3 px-3 py-2 text-left hover:bg-muted/50 border-b border-border"
               >
-                <div className="p-1 rounded bg-blue-500/10">
-                  <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                <div className={`p-1 rounded ${getStatusColors("running").bg}`}>
+                  <Loader2 className={`w-4 h-4 ${getStatusColors("running").text} animate-spin`} />
                 </div>
-                <span className="text-sm font-medium text-blue-400">Current Run (In Progress)</span>
+                <span className={`text-sm font-medium ${getStatusColors("running").text}`}>
+                  Current Run (In Progress)
+                </span>
               </button>
             </>
           )}

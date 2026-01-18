@@ -1,0 +1,192 @@
+name: Build Python Executor
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_cuda:
+        description: 'Include CUDA support'
+        type: boolean
+        default: false
+      include_sam3:
+        description: 'Include SAM3 support'
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      include_cuda:
+        description: 'Include CUDA support'
+        type: boolean
+        default: false
+      include_sam3:
+        description: 'Include SAM3 support'
+        type: boolean
+        default: true
+    outputs:
+      artifact-name:
+        description: 'Name of the uploaded artifact'
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+env:
+  PYTHON_VERSION: '3.12'
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            name: linux-x64
+          - platform: macos-latest
+            target: x86_64-apple-darwin
+            name: macos-x64
+          - platform: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
+          - platform: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: windows-x64
+
+    runs-on: ${{ matrix.platform }}
+    outputs:
+      artifact-name: python-executors
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: 1.8.3
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache Poetry dependencies
+        uses: actions/cache@v4
+        with:
+          path: python-bridge/.venv
+          key: poetry-${{ matrix.platform }}-${{ hashFiles('python-bridge/poetry.lock') }}
+          restore-keys: |
+            poetry-${{ matrix.platform }}-
+
+      - name: Install Python dependencies
+        working-directory: python-bridge
+        run: |
+          poetry install --no-interaction
+
+      - name: Install PyInstaller
+        working-directory: python-bridge
+        run: |
+          poetry add pyinstaller --group dev
+
+      # Install qontinui library
+      - name: Clone qontinui library
+        uses: actions/checkout@v4
+        with:
+          repository: qontinui/qontinui
+          path: qontinui-lib
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install qontinui library
+        working-directory: python-bridge
+        run: |
+          poetry run pip install -e ../qontinui-lib
+
+      # Build the executor
+      - name: Build Python executor (Linux/macOS)
+        if: runner.os != 'Windows'
+        working-directory: python-bridge
+        env:
+          QONTINUI_INCLUDE_CUDA: ${{ inputs.include_cuda && '1' || '0' }}
+          QONTINUI_INCLUDE_SAM3: ${{ inputs.include_sam3 && '1' || '0' }}
+        run: |
+          poetry run python build_executor.py --skip-copy
+
+      - name: Build Python executor (Windows)
+        if: runner.os == 'Windows'
+        working-directory: python-bridge
+        env:
+          QONTINUI_INCLUDE_CUDA: ${{ inputs.include_cuda && '1' || '0' }}
+          QONTINUI_INCLUDE_SAM3: ${{ inputs.include_sam3 && '1' || '0' }}
+        run: |
+          poetry run python build_executor.py --skip-copy
+
+      # Copy to the binaries directory with correct naming
+      - name: Prepare executor for upload (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          mkdir -p binaries
+          cp python-bridge/dist/qontinui-executor binaries/qontinui-executor-${{ matrix.target }}
+          chmod +x binaries/qontinui-executor-${{ matrix.target }}
+
+      - name: Prepare executor for upload (macOS x64)
+        if: matrix.platform == 'macos-latest' && matrix.target == 'x86_64-apple-darwin'
+        run: |
+          mkdir -p binaries
+          cp python-bridge/dist/qontinui-executor binaries/qontinui-executor-${{ matrix.target }}
+          chmod +x binaries/qontinui-executor-${{ matrix.target }}
+
+      - name: Prepare executor for upload (macOS ARM)
+        if: matrix.platform == 'macos-latest' && matrix.target == 'aarch64-apple-darwin'
+        run: |
+          mkdir -p binaries
+          # Note: For true ARM64 build, we'd need an ARM runner
+          # For now, we build universal or x64 and rename
+          cp python-bridge/dist/qontinui-executor binaries/qontinui-executor-${{ matrix.target }}
+          chmod +x binaries/qontinui-executor-${{ matrix.target }}
+
+      - name: Prepare executor for upload (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path binaries
+          Copy-Item python-bridge/dist/qontinui-executor.exe binaries/qontinui-executor-${{ matrix.target }}.exe
+
+      # Get file size for logging
+      - name: Report executable size
+        shell: bash
+        run: |
+          if [ -f "binaries/qontinui-executor-${{ matrix.target }}" ]; then
+            ls -lh binaries/qontinui-executor-${{ matrix.target }}
+          elif [ -f "binaries/qontinui-executor-${{ matrix.target }}.exe" ]; then
+            ls -lh binaries/qontinui-executor-${{ matrix.target }}.exe
+          fi
+
+      # Upload as artifact
+      - name: Upload Python executor artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-executor-${{ matrix.name }}
+          path: binaries/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Combine all platform executors into a single artifact
+  combine:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-executors
+          pattern: python-executor-*
+          merge-multiple: true
+
+      - name: List combined executors
+        run: |
+          echo "Combined Python executors:"
+          ls -la all-executors/
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-executors
+          path: all-executors/
+          retention-days: 7
+          if-no-files-found: error

@@ -229,7 +229,7 @@ class CloudStreamingService:
                 "websockets library not installed. Install with: pip install websockets"
             )
 
-        # NOTE: Port 8000 is the main backend, NOT 8001 (qontinui-api)
+        # NOTE: Port 8000 is the main backend
         self.websocket_url = websocket_url or "wss://localhost:8000/ws/stream"
         self.api_url = api_url or "https://localhost:8000"
         self.config = config or StreamConfig()

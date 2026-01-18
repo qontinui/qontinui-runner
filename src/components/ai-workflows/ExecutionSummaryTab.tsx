@@ -33,9 +33,12 @@ import {
   Sparkles,
 } from "lucide-react";
 import type { Finding, FindingSeverity } from "../../types/findings";
-import { findingsTracker, getVisibleCategories } from "../../services";
+import { findingsTracker, getVisibleCategories, aiDataService } from "../../services";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import type { TaskRunStatus } from "../../types/aiData";
+import { useQueryClient } from "@tanstack/react-query";
+import { aiDataKeys } from "../../hooks/useAiData";
+import { getSeverityColors, getStatusColors, getAccentColors } from "@/design-system";
 
 // Categories to include in the summary (code-focused)
 const CODE_FOCUSED_CATEGORIES = [
@@ -48,12 +51,10 @@ const CODE_FOCUSED_CATEGORIES = [
   "warning",
 ];
 
-const severityColors: Record<FindingSeverity, string> = {
-  critical: "text-red-500 bg-red-500/10",
-  high: "text-orange-500 bg-orange-500/10",
-  medium: "text-amber-500 bg-amber-500/10",
-  low: "text-blue-500 bg-blue-500/10",
-  info: "text-slate-400 bg-slate-400/10",
+// Helper to get severity color classes from design system
+const getSeverityColorClasses = (severity: FindingSeverity): string => {
+  const colors = getSeverityColors(severity);
+  return `${colors.text} ${colors.bg}`;
 };
 
 const categoryIcons: Record<string, React.ComponentType<{ className?: string }>> = {
@@ -73,11 +74,20 @@ const statusIcons: Record<TaskRunStatus, React.ComponentType<{ className?: strin
   running: Loader2,
 };
 
-const statusColors: Record<TaskRunStatus, string> = {
-  complete: "text-green-400 bg-green-500/10",
-  failed: "text-red-400 bg-red-500/10",
-  stopped: "text-slate-400 bg-slate-500/10",
-  running: "text-blue-400 bg-blue-500/10",
+// Map TaskRunStatus to design system StatusType
+const taskRunStatusToStatusType = (status: TaskRunStatus): string => {
+  switch (status) {
+    case "complete":
+      return "success";
+    case "failed":
+      return "error";
+    case "stopped":
+      return "cancelled";
+    case "running":
+      return "running";
+    default:
+      return "idle";
+  }
 };
 
 /**
@@ -95,10 +105,37 @@ export function ExecutionSummaryTab() {
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
     new Set(["code_bug", "security"]),
   );
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+
+  const queryClient = useQueryClient();
 
   // Use RunSelectionContext if available
   const runSelection = useRunSelectionOptional();
   const selectedRun = runSelection?.selectedRun;
+
+  // Handler for generating summary
+  const handleGenerateSummary = async () => {
+    if (!selectedRun?.id) return;
+
+    setIsGeneratingSummary(true);
+    setSummaryError(null);
+
+    try {
+      const result = await aiDataService.generateSummary(selectedRun.id);
+      if (result.success) {
+        // Invalidate queries to refresh the data
+        queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRun(selectedRun.id) });
+        queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRuns() });
+      } else {
+        setSummaryError(result.error || "Failed to generate summary");
+      }
+    } catch (error) {
+      setSummaryError(error instanceof Error ? error.message : "Failed to generate summary");
+    } finally {
+      setIsGeneratingSummary(false);
+    }
+  };
 
   // Load findings and subscribe to updates
   useEffect(() => {
@@ -143,12 +180,17 @@ export function ExecutionSummaryTab() {
     return grouped;
   }, [displayFindings]);
 
+  // Helper to check if a finding is effectively resolved
+  // Items in "already_fixed" category are considered resolved (they were fixed before this session)
+  const isEffectivelyResolved = (f: Finding) =>
+    f.status === "resolved" || f.categoryId === "already_fixed";
+
   // Calculate summary statistics
   const summary = useMemo(() => {
     const total = displayFindings.length;
-    const resolved = displayFindings.filter((f) => f.status === "resolved").length;
+    const resolved = displayFindings.filter(isEffectivelyResolved).length;
     const pending = displayFindings.filter(
-      (f) => f.status === "detected" || f.status === "in_progress",
+      (f) => !isEffectivelyResolved(f) && (f.status === "detected" || f.status === "in_progress"),
     ).length;
     const critical = displayFindings.filter((f) => f.severity === "critical").length;
     const high = displayFindings.filter((f) => f.severity === "high").length;
@@ -273,9 +315,11 @@ export function ExecutionSummaryTab() {
           <div className="flex items-center gap-2">
             {(() => {
               const StatusIcon = statusIcons[selectedRun.status] || AlertCircle;
-              const color = statusColors[selectedRun.status] || "text-slate-400 bg-slate-500/10";
+              const statusColors = getStatusColors(taskRunStatusToStatusType(selectedRun.status));
               return (
-                <span className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded ${color}`}>
+                <span
+                  className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded ${statusColors.text} ${statusColors.bg}`}
+                >
                   <StatusIcon
                     className={`w-3 h-3 ${selectedRun.status === "running" ? "animate-spin" : ""}`}
                   />
@@ -294,8 +338,8 @@ export function ExecutionSummaryTab() {
               <span
                 className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded ${
                   selectedRun.goal_achieved
-                    ? "text-green-400 bg-green-500/10"
-                    : "text-amber-400 bg-amber-500/10"
+                    ? `${getStatusColors("success").text} ${getStatusColors("success").bg}`
+                    : `${getAccentColors("amber").text} ${getAccentColors("amber").bg}`
                 }`}
               >
                 <Target className="w-3 h-3" />
@@ -307,8 +351,10 @@ export function ExecutionSummaryTab() {
 
         {/* Error message if run failed */}
         {selectedRun?.status === "failed" && selectedRun.error_message && (
-          <div className="p-2 bg-red-500/10 border border-red-500/20 rounded text-sm">
-            <span className="font-medium text-red-400">Error: </span>
+          <div
+            className={`p-2 ${getStatusColors("error").bg} border ${getStatusColors("error").border} rounded text-sm`}
+          >
+            <span className={`font-medium ${getStatusColors("error").text}`}>Error: </span>
             <span className="text-red-300">{selectedRun.error_message}</span>
           </div>
         )}
@@ -330,10 +376,14 @@ export function ExecutionSummaryTab() {
             {selectedRun.ai_summary}
           </p>
           {selectedRun.remaining_work && !selectedRun.goal_achieved && (
-            <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/20 rounded">
+            <div
+              className={`mt-3 p-3 ${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded`}
+            >
               <div className="flex items-center gap-2 mb-1">
-                <AlertTriangle className="w-4 h-4 text-amber-400" />
-                <span className="font-medium text-amber-400 text-sm">Remaining Work</span>
+                <AlertTriangle className={`w-4 h-4 ${getAccentColors("amber").text}`} />
+                <span className={`font-medium ${getAccentColors("amber").text} text-sm`}>
+                  Remaining Work
+                </span>
               </div>
               <p className="text-sm text-amber-300/90 whitespace-pre-wrap">
                 {selectedRun.remaining_work}
@@ -343,18 +393,52 @@ export function ExecutionSummaryTab() {
         </div>
       )}
 
-      {/* Summary waiting indicator (when run complete but summary not generated) */}
+      {/* Summary section for completed runs without AI summary */}
       {selectedRun &&
-        selectedRun.status !== "running" &&
+        selectedRun.status === "complete" &&
         !selectedRun.ai_summary &&
-        selectedRun.status === "complete" && (
-          <div className="flex-shrink-0 border-b border-border p-4 bg-muted/20">
-            <div className="flex items-center gap-2 text-muted-foreground">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span className="text-sm">Generating AI summary...</span>
-            </div>
-          </div>
-        )}
+        (() => {
+          // Check if the run completed recently (within 2 minutes)
+          const completedAt = selectedRun.completed_at
+            ? new Date(selectedRun.completed_at).getTime()
+            : null;
+          const now = Date.now();
+          const isRecentlyCompleted = completedAt && now - completedAt < 2 * 60 * 1000;
+
+          if (isRecentlyCompleted || isGeneratingSummary) {
+            // Show loading indicator for recently completed runs or when generating
+            return (
+              <div className="flex-shrink-0 border-b border-border p-4 bg-muted/20">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span className="text-sm">Generating AI summary...</span>
+                </div>
+              </div>
+            );
+          } else {
+            // Show "not available" with option to generate
+            return (
+              <div className="flex-shrink-0 border-b border-border p-4 bg-muted/20">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-muted-foreground">
+                    <FileText className="w-4 h-4 opacity-50" />
+                    <span className="text-sm">No AI summary available for this run.</span>
+                  </div>
+                  <button
+                    onClick={handleGenerateSummary}
+                    className="flex items-center gap-2 px-3 py-1.5 text-sm bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
+                  >
+                    <Sparkles className="w-4 h-4" />
+                    Generate Summary
+                  </button>
+                </div>
+                {summaryError && (
+                  <div className="mt-2 text-sm text-red-400">Error: {summaryError}</div>
+                )}
+              </div>
+            );
+          }
+        })()}
 
       {/* Findings Summary Stats */}
       <div className="flex-shrink-0 border-b border-border p-4">
@@ -364,24 +448,32 @@ export function ExecutionSummaryTab() {
             <span className="font-semibold">{summary.total}</span>
           </div>
           {summary.resolved > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-green-500/10 rounded-lg text-green-400">
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 ${getStatusColors("success").bg} rounded-lg ${getStatusColors("success").text}`}
+            >
               <CheckCircle className="w-4 h-4" />
               <span>{summary.resolved} Resolved</span>
             </div>
           )}
           {summary.pending > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/10 rounded-lg text-amber-400">
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 ${getAccentColors("amber").bg} rounded-lg ${getAccentColors("amber").text}`}
+            >
               <AlertCircle className="w-4 h-4" />
               <span>{summary.pending} Pending</span>
             </div>
           )}
           {summary.critical > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-red-500/10 rounded-lg text-red-400">
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 ${getSeverityColors("critical").bg} rounded-lg ${getSeverityColors("critical").text}`}
+            >
               <span>{summary.critical} Critical</span>
             </div>
           )}
           {summary.high > 0 && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-orange-500/10 rounded-lg text-orange-400">
+            <div
+              className={`flex items-center gap-2 px-3 py-1.5 ${getSeverityColors("high").bg} rounded-lg ${getSeverityColors("high").text}`}
+            >
               <span>{summary.high} High</span>
             </div>
           )}
@@ -401,7 +493,7 @@ export function ExecutionSummaryTab() {
           categoriesWithFindings.map((category) => {
             const categoryFindings = findingsByCategory.get(category.id) || [];
             const isExpanded = expandedCategories.has(category.id);
-            const resolved = categoryFindings.filter((f) => f.status === "resolved").length;
+            const resolved = categoryFindings.filter(isEffectivelyResolved).length;
             const Icon = categoryIcons[category.id] || AlertCircle;
 
             return (
@@ -432,23 +524,31 @@ export function ExecutionSummaryTab() {
                     {categoryFindings.map((finding) => (
                       <div
                         key={finding.id}
-                        className={`p-3 ${finding.status === "resolved" ? "bg-muted/20" : ""}`}
+                        className={`p-3 ${isEffectivelyResolved(finding) ? "bg-muted/20" : ""}`}
                       >
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 flex-wrap">
                               <span
-                                className={`px-2 py-0.5 text-xs rounded ${
-                                  severityColors[finding.severity]
-                                }`}
+                                className={`px-2 py-0.5 text-xs rounded ${getSeverityColorClasses(finding.severity)}`}
                               >
                                 {finding.severity.toUpperCase()}
                               </span>
                               {finding.status === "resolved" && (
-                                <span className="px-2 py-0.5 text-xs rounded bg-green-500/10 text-green-400">
+                                <span
+                                  className={`px-2 py-0.5 text-xs rounded ${getStatusColors("success").bg} ${getStatusColors("success").text}`}
+                                >
                                   RESOLVED
                                 </span>
                               )}
+                              {finding.categoryId === "already_fixed" &&
+                                finding.status !== "resolved" && (
+                                  <span
+                                    className={`px-2 py-0.5 text-xs rounded ${getStatusColors("success").bg} ${getStatusColors("success").text}`}
+                                  >
+                                    ALREADY FIXED
+                                  </span>
+                                )}
                               <span className="font-medium truncate">{finding.title}</span>
                             </div>
                             <p className="text-sm text-muted-foreground mt-1">
@@ -464,8 +564,12 @@ export function ExecutionSummaryTab() {
                               </div>
                             )}
                             {finding.resolution && (
-                              <div className="mt-2 p-2 bg-green-500/5 border border-green-500/20 rounded text-sm">
-                                <span className="font-medium text-green-400">Resolution: </span>
+                              <div
+                                className={`mt-2 p-2 bg-green-500/5 border ${getStatusColors("success").border} rounded text-sm`}
+                              >
+                                <span className={`font-medium ${getStatusColors("success").text}`}>
+                                  Resolution:{" "}
+                                </span>
                                 <span className="text-green-300">{finding.resolution}</span>
                               </div>
                             )}

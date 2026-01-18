@@ -18,6 +18,7 @@ interface AiBuilderProviderProps {
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
   onNavigateToAiOutput?: () => void;
+  onNavigateToActive?: () => void;
   editWorkflowId?: string | null;
 }
 
@@ -26,12 +27,14 @@ export function AiBuilderProvider({
   projectLogs,
   onNavigateToLogLocations,
   onNavigateToAiOutput,
+  onNavigateToActive,
   editWorkflowId,
 }: AiBuilderProviderProps) {
   const state = useAiBuilderState({
     projectLogs,
     onNavigateToLogLocations,
     onNavigateToAiOutput,
+    onNavigateToActive,
     editWorkflowId,
   });
 

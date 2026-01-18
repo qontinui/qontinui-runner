@@ -2,72 +2,35 @@
  * ActiveDashboardPage Component
  *
  * Main page component for the Active Dashboard.
- * Assembles the ControlBar, LiveExecutionView, StatusPanel, BottomBar,
- * and IdleState components into a cohesive live execution monitoring view.
+ * Uses the new dynamic widget-based system that shows only activities
+ * relevant to the currently running task.
  *
  * Layout:
- * - ControlBar: Top bar with workflow name, status badge, and playback controls
- * - Main area (when running):
- *   - LiveExecutionView (70%): Screenshot view + action stream
- *   - StatusPanel (30%): Summary stats, screenshots, image recognition, warnings
- * - Main area (when idle):
- *   - IdleState: Prompt to navigate to Execute page
- * - BottomBar: Iteration progress, current action, connection status
+ * - ControlBar: Top bar with task name, phase badge, status, and controls
+ * - Main area: Dynamic widget layout
+ *   - Active widget (65%): Currently running activity
+ *   - Summary widgets (35%): Other activities in compact view
+ * - BottomBar: Iteration progress, current activity, connection status
+ *
+ * Widget Types:
+ * - GUI Automation: Screenshot, action stream, image recognition
+ * - Playwright: Test execution and results
+ * - AI Conversation: Chat history and thinking indicator
+ * - Verification: "Did the fix work?" results
+ * - Findings: AI-detected issues
  */
 
-import { ControlBar } from "./ControlBar";
-import { LiveExecutionView } from "./LiveExecutionView";
-import { StatusPanel } from "./StatusPanel";
-import { BottomBar } from "./BottomBar";
-import { IdleState } from "./IdleState";
-import { useDashboardState } from "./useDashboardState";
+import { DashboardPage, type DashboardPageProps } from "./DashboardPage";
 
-export interface ActiveDashboardPageProps {
-  /** Callback to navigate to the Execute tab/page */
-  onGoToExecute: () => void;
-}
+export type ActiveDashboardPageProps = DashboardPageProps;
 
-export function ActiveDashboardPage({ onGoToExecute }: ActiveDashboardPageProps) {
-  const dashboard = useDashboardState();
-
-  const isIdle = dashboard.executionState.status === "idle";
-
-  return (
-    <div className="flex h-full flex-col bg-background">
-      {/* Control Bar - always visible */}
-      <ControlBar
-        workflowName={dashboard.executionState.workflowName}
-        status={dashboard.executionState.status}
-        onPlayPause={dashboard.onPlayPause}
-        onStop={dashboard.onStop}
-        onGoToExecute={onGoToExecute}
-      />
-
-      {/* Main Content Area */}
-      {isIdle ? (
-        <IdleState onGoToExecute={onGoToExecute} />
-      ) : (
-        <div className="flex flex-1 overflow-hidden">
-          {/* Left: Live Execution View (70%) */}
-          <LiveExecutionView
-            actions={dashboard.actions}
-            status={dashboard.executionState.status}
-            currentAction={dashboard.currentAction}
-          />
-
-          {/* Right: Status Panel (30%) */}
-          <StatusPanel executionState={dashboard.executionState} />
-        </div>
-      )}
-
-      {/* Bottom Bar - always visible */}
-      <BottomBar
-        currentAction={dashboard.currentAction}
-        iteration={dashboard.executionState.iteration}
-        maxIterations={dashboard.executionState.maxIterations}
-      />
-    </div>
-  );
+/**
+ * ActiveDashboardPage - The Active Dashboard entry point.
+ *
+ * This component wraps the new DashboardPage to maintain backward compatibility.
+ */
+export function ActiveDashboardPage(props: ActiveDashboardPageProps) {
+  return <DashboardPage {...props} />;
 }
 
 export default ActiveDashboardPage;

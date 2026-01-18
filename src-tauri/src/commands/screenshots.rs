@@ -61,7 +61,7 @@ impl ScreenshotsResponse {
 
 /// Get the .dev-logs directory path.
 fn get_dev_logs_dir() -> PathBuf {
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 /// List all image files in a directory.

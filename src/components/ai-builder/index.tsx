@@ -67,6 +67,7 @@ interface AiBuilderTabProps {
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
   onNavigateToAiOutput?: () => void;
+  onNavigateToActive?: () => void;
   editWorkflowId?: string | null;
 }
 
@@ -78,6 +79,7 @@ export function AiBuilderTab({
   projectLogs,
   onNavigateToLogLocations,
   onNavigateToAiOutput,
+  onNavigateToActive,
   editWorkflowId,
 }: AiBuilderTabProps) {
   return (
@@ -85,6 +87,7 @@ export function AiBuilderTab({
       projectLogs={projectLogs}
       onNavigateToLogLocations={onNavigateToLogLocations}
       onNavigateToAiOutput={onNavigateToAiOutput}
+      onNavigateToActive={onNavigateToActive}
       editWorkflowId={editWorkflowId}
     >
       <AiBuilderContent />

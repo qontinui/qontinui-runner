@@ -44,10 +44,36 @@ pub struct SavedPrompt {
     /// If not set, uses global settings
     #[serde(default)]
     pub provider: Option<String>,
-    /// AI model override (e.g., "gemini-3-flash", "claude-sonnet-4")
+    /// AI model override (e.g., "gemini-3-flash-preview", "claude-sonnet-4")
     /// If not set, uses provider's default model
     #[serde(default)]
     pub model: Option<String>,
+    /// Whether this prompt requires the orchestrator for planning and verification
+    /// When true, the runner will use the unified session API with orchestrator support.
+    /// When false, the runner uses the simpler direct execution path.
+    /// This is a system-level configuration, not a user toggle.
+    #[serde(default)]
+    pub requires_orchestrator: bool,
+    /// Goal description for the orchestrator (used for planning)
+    /// If not provided, the prompt content will be used as the goal
+    #[serde(default)]
+    pub orchestrator_goal: Option<String>,
+    /// Maximum iterations for the orchestrator (default: 10)
+    #[serde(default)]
+    pub orchestrator_max_iterations: Option<u32>,
+    /// Whether to run verification before the first worker iteration.
+    ///
+    /// This is useful for non-automation workflows (like improve-all) where:
+    /// - There is no GUI automation to test
+    /// - The "work" is fixing code issues identified by verification
+    /// - The worker needs verification results FIRST to know what to fix
+    ///
+    /// When true, after planning:
+    /// 1. Run deterministic verification immediately
+    /// 2. Store results as initial feedback for the worker
+    /// 3. Worker gets feedback showing what needs to be fixed
+    #[serde(default)]
+    pub orchestrator_verification_first: Option<bool>,
     /// ISO 8601 timestamp of creation
     pub created_at: String,
     /// ISO 8601 timestamp of last modification
@@ -65,6 +91,9 @@ impl SavedPrompt {
         max_sessions: Option<u32>,
         provider: Option<String>,
         model: Option<String>,
+        requires_orchestrator: bool,
+        orchestrator_goal: Option<String>,
+        orchestrator_max_iterations: Option<u32>,
     ) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
@@ -77,6 +106,10 @@ impl SavedPrompt {
             max_sessions,
             provider,
             model,
+            requires_orchestrator,
+            orchestrator_goal,
+            orchestrator_max_iterations,
+            orchestrator_verification_first: None, // Default to not using verification-first flow
             created_at: now.clone(),
             modified_at: now,
         }
@@ -190,6 +223,9 @@ pub fn create_prompt(
     max_sessions: Option<u32>,
     provider: Option<String>,
     model: Option<String>,
+    requires_orchestrator: bool,
+    orchestrator_goal: Option<String>,
+    orchestrator_max_iterations: Option<u32>,
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
@@ -202,6 +238,9 @@ pub fn create_prompt(
         max_sessions,
         provider,
         model,
+        requires_orchestrator,
+        orchestrator_goal,
+        orchestrator_max_iterations,
     );
     let created = prompt.clone();
 
@@ -223,6 +262,9 @@ pub fn update_prompt(
     max_sessions: Option<Option<u32>>,
     provider: Option<Option<String>>,
     model: Option<Option<String>>,
+    requires_orchestrator: Option<bool>,
+    orchestrator_goal: Option<Option<String>>,
+    orchestrator_max_iterations: Option<Option<u32>>,
 ) -> Result<SavedPrompt, String> {
     let mut library = load_prompt_library();
 
@@ -255,6 +297,15 @@ pub fn update_prompt(
     }
     if let Some(model) = model {
         prompt.model = model;
+    }
+    if let Some(requires_orchestrator) = requires_orchestrator {
+        prompt.requires_orchestrator = requires_orchestrator;
+    }
+    if let Some(orchestrator_goal) = orchestrator_goal {
+        prompt.orchestrator_goal = orchestrator_goal;
+    }
+    if let Some(orchestrator_max_iterations) = orchestrator_max_iterations {
+        prompt.orchestrator_max_iterations = orchestrator_max_iterations;
     }
 
     prompt.modified_at = chrono::Utc::now().to_rfc3339();
@@ -376,6 +427,9 @@ pub fn duplicate_prompt(id: &str, new_name: Option<String>) -> Result<SavedPromp
         original.max_sessions,
         original.provider,
         original.model,
+        original.requires_orchestrator,
+        original.orchestrator_goal,
+        original.orchestrator_max_iterations,
     )
 }
 
@@ -394,11 +448,15 @@ mod tests {
             Some(5),
             None,
             None,
+            false,
+            None,
+            None,
         );
         assert_eq!(prompt.category, "Dev");
         assert_eq!(prompt.max_sessions, Some(5));
         assert_eq!(prompt.provider, None);
         assert_eq!(prompt.model, None);
+        assert!(!prompt.requires_orchestrator);
     }
 
     #[test]
@@ -410,6 +468,9 @@ mod tests {
             "Dev".to_string(),
             vec![],
             None,
+            None,
+            None,
+            false,
             None,
             None,
         );
@@ -426,9 +487,32 @@ mod tests {
             vec!["lint".to_string()],
             None,
             Some("gemini_api".to_string()),
-            Some("gemini-3-flash".to_string()),
+            Some("gemini-3-flash-preview".to_string()),
+            false,
+            None,
+            None,
         );
         assert_eq!(prompt.provider, Some("gemini_api".to_string()));
-        assert_eq!(prompt.model, Some("gemini-3-flash".to_string()));
+        assert_eq!(prompt.model, Some("gemini-3-flash-preview".to_string()));
+    }
+
+    #[test]
+    fn test_prompt_with_orchestrator() {
+        let prompt = SavedPrompt::with_details(
+            "Development Task".to_string(),
+            "A task that requires verification".to_string(),
+            "Implement feature X".to_string(),
+            "Dev".to_string(),
+            vec!["feature".to_string()],
+            None,
+            None,
+            None,
+            true,
+            Some("Implement feature X with tests".to_string()),
+            Some(15),
+        );
+        assert!(prompt.requires_orchestrator);
+        assert_eq!(prompt.orchestrator_goal, Some("Implement feature X with tests".to_string()));
+        assert_eq!(prompt.orchestrator_max_iterations, Some(15));
     }
 }

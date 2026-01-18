@@ -7,9 +7,11 @@
 //! - `types` - Shared types and structs
 //! - `goals` - Goal verification logic
 //! - `server` - HTTP routing and server initialization (delegates to mcp_api)
+//! - `awas` - AWAS (Application Web Automation Specification) handlers
 //!
 //! Other modules are defined but not yet fully migrated from mcp_api.rs.
 
+pub mod awas;
 pub mod goals;
 pub mod server;
 pub mod types;

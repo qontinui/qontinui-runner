@@ -33,6 +33,7 @@ import {
   X,
 } from "lucide-react";
 import type { ContextWithMetadata, ContextScope } from "../../types/context";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 interface ContextCardProps {
   context: ContextWithMetadata;
@@ -52,12 +53,12 @@ const scopeConfig: Record<
   project: {
     icon: FolderOpen,
     label: "Project",
-    color: "bg-blue-500/20 text-blue-400 border-blue-500/30",
+    color: `${getAccentColors("blue").bg} ${getAccentColors("blue").text} ${getAccentColors("blue").border}`,
   },
   user: {
     icon: User,
     label: "User",
-    color: "bg-purple-500/20 text-purple-400 border-purple-500/30",
+    color: `${getAccentColors("purple").bg} ${getAccentColors("purple").text} ${getAccentColors("purple").border}`,
   },
   builtin: {
     icon: Package,
@@ -137,7 +138,7 @@ export function ContextCard({
     <div
       className={`rounded-lg border transition-all ${
         isPendingSync
-          ? "border-blue-500/50 bg-card"
+          ? `${getAccentColors("blue").border} bg-card`
           : context.enabled
             ? "border-border bg-card hover:border-primary/30"
             : "border-border/50 bg-card/50 opacity-60"
@@ -145,8 +146,10 @@ export function ContextCard({
     >
       {/* Pending Sync Banner */}
       {isPendingSync && (
-        <div className="flex items-center justify-between gap-3 px-3 py-2 bg-blue-500/10 border-b border-blue-500/30">
-          <div className="flex items-center gap-2 text-sm text-blue-400">
+        <div
+          className={`flex items-center justify-between gap-3 px-3 py-2 ${getAccentColors("blue").bg} border-b ${getAccentColors("blue").border}`}
+        >
+          <div className={`flex items-center gap-2 text-sm ${getAccentColors("blue").text}`}>
             <Cloud className="w-4 h-4" />
             <span>Sync this context to qontinui-web?</span>
           </div>
@@ -154,7 +157,7 @@ export function ContextCard({
             <button
               onClick={() => onApproveSync?.(context)}
               disabled={isProcessing}
-              className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-white bg-blue-500 hover:bg-blue-600 rounded transition-colors disabled:opacity-50"
+              className={`flex items-center gap-1 px-2 py-1 text-xs font-medium text-white ${getAccentColors("blue").bgSolid} hover:bg-blue-600 rounded transition-colors disabled:opacity-50`}
               title="Approve sync to qontinui-web"
             >
               <Check className="w-3 h-3" />
@@ -205,7 +208,7 @@ export function ContextCard({
               <span
                 className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
                   context.enabled
-                    ? "bg-green-500/20 text-green-400 border border-green-500/30"
+                    ? `${getStatusColors("success").bg} ${getStatusColors("success").text} border ${getStatusColors("success").border}`
                     : "bg-surface-raised/50 text-text-muted border border-border-subtle"
                 }`}
               >
@@ -215,7 +218,7 @@ export function ContextCard({
               {/* Auto-Include Indicator */}
               {hasAutoInclude && (
                 <span
-                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-400 border border-amber-500/30"
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${getAccentColors("amber").bg} ${getAccentColors("amber").text} border ${getAccentColors("amber").border}`}
                   title="Has auto-include rules"
                 >
                   <Zap className="w-3 h-3 inline-block" />
@@ -225,7 +228,7 @@ export function ContextCard({
               {/* Web Sync Status for Project Contexts */}
               {context.scope === "project" && context.webSyncStatus === "synced" && (
                 <span
-                  className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/20 text-green-400 border border-green-500/30"
+                  className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${getStatusColors("success").bg} ${getStatusColors("success").text} border ${getStatusColors("success").border}`}
                   title="Synced to qontinui-web"
                 >
                   <Cloud className="w-3 h-3 inline-block mr-0.5" />
@@ -308,7 +311,7 @@ export function ContextCard({
               title={context.enabled ? "Disable" : "Enable"}
             >
               {context.enabled ? (
-                <ToggleRight className="w-4 h-4 text-green-500" />
+                <ToggleRight className={`w-4 h-4 ${getStatusColors("success").icon}`} />
               ) : (
                 <ToggleLeft className="w-4 h-4" />
               )}
@@ -357,7 +360,7 @@ export function ContextCard({
                           setShowMenu(false);
                           onDelete(context);
                         }}
-                        className="w-full flex items-center gap-2 px-3 py-2 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
+                        className={`w-full flex items-center gap-2 px-3 py-2 text-sm ${getAccentColors("red").text} hover:${getAccentColors("red").bg} transition-colors`}
                       >
                         <Trash2 className="w-4 h-4" />
                         Delete
@@ -441,7 +444,9 @@ export function ContextCard({
 
           {/* Built-in Warning */}
           {context.scope === "builtin" && (
-            <div className="flex items-center gap-2 text-xs text-amber-400 bg-amber-500/10 p-2 rounded">
+            <div
+              className={`flex items-center gap-2 text-xs ${getAccentColors("amber").text} ${getAccentColors("amber").bg} p-2 rounded`}
+            >
               <AlertTriangle className="w-4 h-4" />
               Built-in contexts cannot be edited or deleted. Use duplicate to create an editable
               copy.

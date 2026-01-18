@@ -2,12 +2,17 @@
  * AiDataViewerTab.tsx
  *
  * Displays all data that is accessible to AI via MCP tools.
- * Organized by category: Task Runs | Automation Runs | JSONL Logs
+ * Organized into grouped sidebar navigation:
+ * - AI Session: Prompt, AI Output, Contexts
+ * - Execution Logs: Events, API Requests, Image Recognition, Playwright
+ * - Captures: Screenshots, DOM Snapshots
+ * - Configuration: Loaded Config, Automation Runs, Dev Logs
  *
  * This helps users see exactly what data the AI receives.
  */
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import {
   Loader2,
   AlertCircle,
@@ -24,6 +29,21 @@ import {
   Settings,
   MessageSquare,
   BookOpen,
+  Code,
+  Globe,
+  SkipForward,
+  Timer,
+  Eye,
+  Cpu,
+  Camera,
+  Cog,
+  Sparkles,
+  List,
+  TestTube,
+  Bot,
+  Smartphone,
+  Terminal,
+  Wifi,
 } from "lucide-react";
 import { useExecution } from "../../contexts/ExecutionContext";
 import { useRunSelection } from "../../contexts/RunSelectionContext";
@@ -37,6 +57,14 @@ import {
   useLoadedConfig,
   useAiPrompts,
   useContexts,
+  // SQLite migrated logs
+  useTaskRunEvents,
+  useTaskRunMigratedLogsSummary,
+  useTaskRunPlaywrightResults,
+  useTaskRunScreenshotsFromDb,
+  useTaskRunApiRequests,
+  useTaskRunAwasSteps,
+  useTaskRunMcpCalls,
 } from "../../hooks/useAiData";
 import type {
   JsonlLogType,
@@ -44,58 +72,217 @@ import type {
   ScreenshotInfo,
   ContextInfo,
   AiOutputChunk,
+  TaskRunEvent,
+  TaskRunPlaywrightResultDb,
+  TaskRunScreenshotDb,
+  TaskRunApiRequestDb,
+  TaskRunAwasStepDb,
 } from "../../types/aiData";
+import type { TaskRunMcpCallDb } from "../../types/mcp-config";
 import type { RunDetails } from "../../types/statistics";
 import { MarkdownViewer } from "../MarkdownViewer";
+import { DomSnapshotsPanel } from "../dom-captures";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
+// New flat category structure for sidebar navigation
 type DataCategory =
+  // AI Session group
   | "ai-prompt"
-  | "jsonl-logs"
-  | "dev-logs"
-  | "automation-runs"
+  | "ai-output"
+  | "contexts"
+  // Execution Logs group
+  | "events"
+  | "api-requests"
+  | "mcp-calls"
+  | "image-recognition"
+  | "playwright-tests"
+  | "awas-steps"
+  // Captures group
   | "screenshots"
+  | "dom-snapshots"
+  // Mobile group
+  | "mobile-state"
+  | "mobile-screenshots"
+  | "mobile-logs"
+  | "mobile-errors"
+  // Configuration group
   | "loaded-config"
-  | "contexts";
+  | "automation-runs"
+  | "dev-logs";
 
-interface CategoryTabProps {
+// Navigation group definition
+interface NavGroup {
+  id: string;
+  label: string;
+  icon: React.ReactNode;
+  items: NavItem[];
+}
+
+interface NavItem {
   id: DataCategory;
   label: string;
   icon: React.ReactNode;
-  active: boolean;
-  onClick: () => void;
-  count?: number;
 }
 
-function CategoryTab({ id: _id, label, icon, active, onClick, count }: CategoryTabProps) {
+// Sidebar navigation component
+function SidebarNav({
+  activeCategory,
+  onCategoryChange,
+  automationRunsCount,
+}: {
+  activeCategory: DataCategory;
+  onCategoryChange: (category: DataCategory) => void;
+  automationRunsCount?: number;
+}) {
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
+    new Set(["ai-session", "execution-logs", "captures", "mobile", "configuration"]),
+  );
+
+  const toggleGroup = (groupId: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
+  };
+
+  const navGroups: NavGroup[] = [
+    {
+      id: "ai-session",
+      label: "AI Session",
+      icon: <Sparkles className="w-4 h-4" />,
+      items: [
+        { id: "ai-prompt", label: "Prompt", icon: <MessageSquare className="w-4 h-4" /> },
+        { id: "ai-output", label: "AI Output", icon: <FileText className="w-4 h-4" /> },
+        { id: "contexts", label: "Contexts", icon: <BookOpen className="w-4 h-4" /> },
+      ],
+    },
+    {
+      id: "execution-logs",
+      label: "Execution Logs",
+      icon: <Cpu className="w-4 h-4" />,
+      items: [
+        { id: "events", label: "Events", icon: <List className="w-4 h-4" /> },
+        { id: "api-requests", label: "API Requests", icon: <Globe className="w-4 h-4" /> },
+        { id: "mcp-calls", label: "MCP Calls", icon: <Wifi className="w-4 h-4" /> },
+        { id: "image-recognition", label: "Image Recognition", icon: <Eye className="w-4 h-4" /> },
+        {
+          id: "playwright-tests",
+          label: "Playwright Tests",
+          icon: <TestTube className="w-4 h-4" />,
+        },
+        { id: "awas-steps", label: "AWAS Steps", icon: <Bot className="w-4 h-4" /> },
+      ],
+    },
+    {
+      id: "captures",
+      label: "Captures",
+      icon: <Camera className="w-4 h-4" />,
+      items: [
+        { id: "screenshots", label: "Screenshots", icon: <Image className="w-4 h-4" /> },
+        { id: "dom-snapshots", label: "DOM Snapshots", icon: <Code className="w-4 h-4" /> },
+      ],
+    },
+    {
+      id: "mobile",
+      label: "Mobile",
+      icon: <Smartphone className="w-4 h-4" />,
+      items: [
+        { id: "mobile-state", label: "App State", icon: <Activity className="w-4 h-4" /> },
+        { id: "mobile-screenshots", label: "Screenshots", icon: <Camera className="w-4 h-4" /> },
+        { id: "mobile-logs", label: "Logs", icon: <Terminal className="w-4 h-4" /> },
+        { id: "mobile-errors", label: "Errors", icon: <AlertCircle className="w-4 h-4" /> },
+      ],
+    },
+    {
+      id: "configuration",
+      label: "Configuration",
+      icon: <Cog className="w-4 h-4" />,
+      items: [
+        { id: "loaded-config", label: "Loaded Config", icon: <Settings className="w-4 h-4" /> },
+        { id: "automation-runs", label: "Automation Runs", icon: <Activity className="w-4 h-4" /> },
+        { id: "dev-logs", label: "Dev Logs", icon: <FileJson className="w-4 h-4" /> },
+      ],
+    },
+  ];
+
   return (
-    <button
-      onClick={onClick}
-      className={`flex items-center gap-2 px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-        active
-          ? "border-blue-500 text-blue-400"
-          : "border-transparent text-muted-foreground hover:text-foreground hover:border-border"
-      }`}
-    >
-      {icon}
-      {label}
-      {count !== undefined && count > 0 && (
-        <span className="px-1.5 py-0.5 text-xs rounded-full bg-muted">{count}</span>
-      )}
-    </button>
+    <div className="w-56 flex-shrink-0 border-r border-border bg-muted/30 overflow-y-auto">
+      <div className="p-2 space-y-1">
+        {navGroups.map((group) => {
+          const isExpanded = expandedGroups.has(group.id);
+          const hasActiveItem = group.items.some((item) => item.id === activeCategory);
+
+          return (
+            <div key={group.id}>
+              {/* Group header */}
+              <button
+                onClick={() => toggleGroup(group.id)}
+                className={`w-full flex items-center gap-2 px-3 py-2 text-sm font-medium rounded-md transition-colors ${
+                  hasActiveItem ? "text-foreground" : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {isExpanded ? (
+                  <ChevronDown className="w-4 h-4 flex-shrink-0" />
+                ) : (
+                  <ChevronRight className="w-4 h-4 flex-shrink-0" />
+                )}
+                {group.icon}
+                <span className="flex-1 text-left">{group.label}</span>
+              </button>
+
+              {/* Group items */}
+              {isExpanded && (
+                <div className="ml-4 space-y-0.5">
+                  {group.items.map((item) => {
+                    const isActive = item.id === activeCategory;
+                    const count = item.id === "automation-runs" ? automationRunsCount : undefined;
+
+                    return (
+                      <button
+                        key={item.id}
+                        onClick={() => onCategoryChange(item.id)}
+                        className={`w-full flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors ${
+                          isActive
+                            ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
+                            : "text-muted-foreground hover:text-foreground hover:bg-muted"
+                        }`}
+                      >
+                        {item.icon}
+                        <span className="flex-1 text-left">{item.label}</span>
+                        {count !== undefined && count > 0 && (
+                          <span className="px-1.5 py-0.5 text-xs rounded-full bg-muted/50">
+                            {count}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
 function getStatusIcon(status: string) {
   switch (status) {
     case "running":
-      return <Loader2 className="w-3 h-3 animate-spin text-blue-400" />;
+      return <Loader2 className={`w-3 h-3 animate-spin ${getStatusColors("running").icon}`} />;
     case "complete":
     case "completed":
-      return <CheckCircle className="w-3 h-3 text-green-400" />;
+      return <CheckCircle className={`w-3 h-3 ${getStatusColors("success").icon}`} />;
     case "failed":
-      return <XCircle className="w-3 h-3 text-red-400" />;
+      return <XCircle className={`w-3 h-3 ${getStatusColors("error").icon}`} />;
     case "stopped":
-      return <Pause className="w-3 h-3 text-orange-400" />;
+      return <Pause className={`w-3 h-3 ${getStatusColors("cancelled").icon}`} />;
     default:
       return <Clock className="w-3 h-3 text-muted-foreground" />;
   }
@@ -136,7 +323,7 @@ function AutomationRunsSection() {
 
   if (error) {
     return (
-      <div className="flex items-center justify-center py-8 text-red-400">
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         Error: {error.message}
       </div>
@@ -230,8 +417,12 @@ function AutomationRunsSection() {
               )}
               {run.error_message && (
                 <div>
-                  <div className="text-xs font-medium text-red-400 mb-1">Error</div>
-                  <pre className="text-xs bg-red-500/10 text-red-400 p-2 rounded overflow-x-auto">
+                  <div className={`text-xs font-medium ${getStatusColors("error").text} mb-1`}>
+                    Error
+                  </div>
+                  <pre
+                    className={`text-xs ${getStatusColors("error").bg} ${getStatusColors("error").text} p-2 rounded overflow-x-auto`}
+                  >
                     {run.error_message}
                   </pre>
                 </div>
@@ -268,9 +459,9 @@ function AiOutputChunkItem({
         <span
           className={`px-2 py-0.5 text-xs font-medium rounded ${
             chunk.source === "claude"
-              ? "bg-blue-500/20 text-blue-400"
+              ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
               : chunk.source === "prompt"
-                ? "bg-green-500/20 text-green-400"
+                ? `${getAccentColors("green").bg} ${getAccentColors("green").text}`
                 : "bg-muted text-muted-foreground"
           }`}
         >
@@ -328,71 +519,843 @@ function ConsolidatedAiOutputDisplay({
   );
 }
 
-// JSONL Logs Section (filtered by task run time range)
-function JsonlLogsSection() {
-  const { selectedRunId, selectedRun } = useRunSelection();
-  const [activeLogType, setActiveLogType] = useState<JsonlLogType>("ai-output");
+// Map UI log types to SQLite event_type values
+function getEventTypeForLogType(logType: JsonlLogType): string | undefined {
+  switch (logType) {
+    case "ai-output":
+      return "ai_output";
+    case "general":
+      return "general";
+    case "actions":
+      return "action";
+    case "image-recognition":
+      return "image_recognition";
+    default:
+      return undefined; // playwright and api-requests need special handling
+  }
+}
 
-  // Use consolidated format for AI output, raw JSONL for others
-  const {
-    data: consolidatedOutput,
-    isLoading: consolidatedLoading,
-    error: consolidatedError,
-  } = useConsolidatedAiOutput(activeLogType === "ai-output" ? selectedRunId : null);
-  const {
-    data: logs,
-    isLoading: logsLoading,
-    error: logsError,
-  } = useJsonlLogsForTaskRun(
-    activeLogType !== "ai-output" ? activeLogType : "general",
-    activeLogType !== "ai-output" ? selectedRunId : null,
+// Display SQLite events in a readable format
+function EventsDisplay({ events }: { events: TaskRunEvent[] }) {
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+
+  const toggleExpanded = (id: number) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  return (
+    <div className="space-y-2">
+      {events.map((event) => (
+        <div key={event.id} className="border border-border rounded-lg overflow-hidden">
+          <button
+            onClick={() => toggleExpanded(event.id)}
+            className="w-full flex items-center gap-2 px-3 py-2 bg-card hover:bg-muted/50 transition-colors text-left"
+          >
+            {expandedIds.has(event.id) ? (
+              <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            ) : (
+              <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            )}
+            <span
+              className={`px-2 py-0.5 text-xs font-medium rounded ${
+                event.event_type === "ai_output"
+                  ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
+                  : event.event_type === "action"
+                    ? `${getAccentColors("green").bg} ${getAccentColors("green").text}`
+                    : event.event_type === "image_recognition"
+                      ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
+                      : "bg-muted text-muted-foreground"
+              }`}
+            >
+              {event.event_subtype || event.event_type}
+            </span>
+            <span className="text-xs text-muted-foreground">
+              {formatTimestamp(event.timestamp)}
+            </span>
+            <span className="flex-1 text-sm truncate">{event.message}</span>
+            {event.duration_ms && (
+              <span className="text-xs text-muted-foreground">{event.duration_ms}ms</span>
+            )}
+          </button>
+          {expandedIds.has(event.id) && (
+            <div className="px-3 py-2 bg-muted/30 border-t border-border space-y-2">
+              {event.workflow_name && (
+                <div className="text-xs">
+                  <span className="font-medium text-muted-foreground">Workflow:</span>{" "}
+                  {event.workflow_name}
+                </div>
+              )}
+              {event.state_name && (
+                <div className="text-xs">
+                  <span className="font-medium text-muted-foreground">State:</span>{" "}
+                  {event.state_name}
+                </div>
+              )}
+              {event.action_id && (
+                <div className="text-xs">
+                  <span className="font-medium text-muted-foreground">Action:</span>{" "}
+                  {event.action_id}
+                </div>
+              )}
+              {event.data && (
+                <div>
+                  <div className="text-xs font-medium text-muted-foreground mb-1">Data</div>
+                  <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto">
+                    {(() => {
+                      try {
+                        return JSON.stringify(JSON.parse(event.data), null, 2);
+                      } catch {
+                        return event.data;
+                      }
+                    })()}
+                  </pre>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
   );
+}
 
-  const isLoading = activeLogType === "ai-output" ? consolidatedLoading : logsLoading;
-  const error = activeLogType === "ai-output" ? consolidatedError : logsError;
+// Playwright Results Display - shows SQLite-stored test results
+function PlaywrightResultsDisplay({ taskRunId }: { taskRunId: string }) {
+  const { data: playwrightData, isLoading, error } = useTaskRunPlaywrightResults(taskRunId);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
-  const logTypes: { type: JsonlLogType; label: string }[] = [
-    { type: "ai-output", label: "AI Output" },
-    { type: "general", label: "General" },
-    { type: "actions", label: "Actions" },
-    { type: "image-recognition", label: "Image Recognition" },
-    { type: "playwright", label: "Playwright" },
-  ];
+  // Convert file paths to Tauri asset URLs for failure screenshots
+  const getImageSrc = useMemo(() => {
+    return (path: string) => {
+      try {
+        return convertFileSrc(path);
+      } catch {
+        return `file://${path}`;
+      }
+    };
+  }, []);
 
-  if (!selectedRunId) {
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  // Get status badge styling
+  const getTestStatusStyle = (status: string) => {
+    switch (status) {
+      case "passed":
+        return {
+          bg: getStatusColors("success").bg,
+          text: getStatusColors("success").text,
+          icon: <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />,
+        };
+      case "failed":
+        return {
+          bg: getStatusColors("error").bg,
+          text: getStatusColors("error").text,
+          icon: <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />,
+        };
+      case "skipped":
+        return {
+          bg: "bg-muted",
+          text: "text-muted-foreground",
+          icon: <SkipForward className="w-4 h-4 text-muted-foreground" />,
+        };
+      case "timeout":
+        return {
+          bg: getAccentColors("yellow").bg,
+          text: getAccentColors("yellow").text,
+          icon: <Timer className={`w-4 h-4 ${getAccentColors("yellow").text}`} />,
+        };
+      default:
+        return {
+          bg: "bg-muted",
+          text: "text-muted-foreground",
+          icon: <Clock className="w-4 h-4 text-muted-foreground" />,
+        };
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading Playwright results...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  if (!playwrightData || playwrightData.results.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
         <FileJson className="w-8 h-8 mb-3 opacity-50" />
-        <p className="text-sm">Select a task run to view JSONL logs</p>
+        <p className="text-sm">No Playwright test results for this task run</p>
       </div>
     );
   }
 
   return (
     <div className="space-y-4">
-      {/* Show time range info */}
+      {/* Summary stats */}
+      <div className="flex items-center gap-4 px-3 py-2 bg-muted/30 rounded-md">
+        <span className="text-sm font-medium">Test Results:</span>
+        <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
+          <CheckCircle className="w-4 h-4" />
+          {playwrightData.passed} passed
+        </span>
+        <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
+          <XCircle className="w-4 h-4" />
+          {playwrightData.failed} failed
+        </span>
+        <span className="text-xs text-muted-foreground ml-auto">
+          {playwrightData.count} total tests
+        </span>
+      </div>
+
+      {/* Test results list */}
+      <div className="space-y-2">
+        {playwrightData.results.map((result: TaskRunPlaywrightResultDb) => {
+          const statusStyle = getTestStatusStyle(result.status);
+          const isExpanded = expandedIds.has(result.id);
+          const hasExpandableContent =
+            result.error_message ||
+            result.console_output ||
+            result.stdout ||
+            result.stderr ||
+            result.failure_screenshot_path ||
+            result.page_snapshot;
+
+          return (
+            <div key={result.id} className="border border-border rounded-lg overflow-hidden">
+              <button
+                onClick={() => hasExpandableContent && toggleExpanded(result.id)}
+                className={`w-full flex items-center gap-3 px-4 py-3 bg-card transition-colors text-left ${
+                  hasExpandableContent ? "hover:bg-muted/50 cursor-pointer" : "cursor-default"
+                }`}
+              >
+                {hasExpandableContent ? (
+                  isExpanded ? (
+                    <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  )
+                ) : (
+                  <div className="w-4 h-4 flex-shrink-0" />
+                )}
+                {statusStyle.icon}
+                <span className="font-medium flex-1 truncate">{result.test_name}</span>
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${statusStyle.bg} ${statusStyle.text}`}
+                >
+                  {result.status}
+                </span>
+                {result.duration_ms !== null && result.duration_ms !== undefined && (
+                  <span className="text-xs text-muted-foreground">
+                    {(result.duration_ms / 1000).toFixed(2)}s
+                  </span>
+                )}
+              </button>
+              {isExpanded && hasExpandableContent && (
+                <div className="px-4 py-3 bg-muted/30 border-t border-border space-y-3">
+                  {result.spec_file && (
+                    <div className="text-xs">
+                      <span className="font-medium text-muted-foreground">Spec file:</span>{" "}
+                      <span className="font-mono">{result.spec_file}</span>
+                    </div>
+                  )}
+                  {(result.assertions_passed > 0 || result.assertions_failed > 0) && (
+                    <div className="text-xs">
+                      <span className="font-medium text-muted-foreground">Assertions:</span>{" "}
+                      <span className={getStatusColors("success").text}>
+                        {result.assertions_passed} passed
+                      </span>
+                      {result.assertions_failed > 0 && (
+                        <>
+                          {" / "}
+                          <span className={getStatusColors("error").text}>
+                            {result.assertions_failed} failed
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  )}
+                  {result.error_message && (
+                    <div>
+                      <div className={`text-xs font-medium ${getStatusColors("error").text} mb-1`}>
+                        Error Message
+                      </div>
+                      <pre
+                        className={`text-xs ${getStatusColors("error").bg} ${getStatusColors("error").text} p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap`}
+                      >
+                        {result.error_message}
+                      </pre>
+                    </div>
+                  )}
+                  {result.console_output && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Console Output
+                      </div>
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                        {result.console_output}
+                      </pre>
+                    </div>
+                  )}
+                  {result.stdout && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Standard Output
+                      </div>
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap">
+                        {result.stdout}
+                      </pre>
+                    </div>
+                  )}
+                  {result.stderr && (
+                    <div>
+                      <div className={`text-xs font-medium ${getAccentColors("yellow").text} mb-1`}>
+                        Standard Error
+                      </div>
+                      <pre
+                        className={`text-xs ${getAccentColors("yellow").bg} p-2 rounded overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap`}
+                      >
+                        {result.stderr}
+                      </pre>
+                    </div>
+                  )}
+                  {result.page_snapshot && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Page Snapshot
+                      </div>
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                        {result.page_snapshot}
+                      </pre>
+                    </div>
+                  )}
+                  {result.failure_screenshot_path && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Failure Screenshot
+                      </div>
+                      <div className="text-xs text-muted-foreground mb-2 font-mono truncate">
+                        {result.failure_screenshot_path}
+                      </div>
+                      <img
+                        src={getImageSrc(result.failure_screenshot_path)}
+                        alt="Failure screenshot"
+                        className="max-w-full max-h-64 object-contain rounded border border-border"
+                        onError={(e) => {
+                          (e.target as HTMLImageElement).style.display = "none";
+                        }}
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// API Requests Display - shows SQLite-stored API request results
+function ApiRequestsDisplay({ taskRunId }: { taskRunId: string }) {
+  const { data: apiData, isLoading, error } = useTaskRunApiRequests(taskRunId);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  // Get method badge styling
+  const getMethodStyle = (method: string) => {
+    switch (method.toUpperCase()) {
+      case "GET":
+        return {
+          bg: getAccentColors("green").bg,
+          text: getAccentColors("green").text,
+        };
+      case "POST":
+        return {
+          bg: getAccentColors("blue").bg,
+          text: getAccentColors("blue").text,
+        };
+      case "PUT":
+      case "PATCH":
+        return {
+          bg: getAccentColors("yellow").bg,
+          text: getAccentColors("yellow").text,
+        };
+      case "DELETE":
+        return {
+          bg: getAccentColors("red").bg,
+          text: getAccentColors("red").text,
+        };
+      default:
+        return { bg: "bg-muted", text: "text-muted-foreground" };
+    }
+  };
+
+  // Get status code badge styling
+  const getStatusCodeStyle = (statusCode: number) => {
+    if (statusCode >= 200 && statusCode < 300) {
+      return {
+        bg: getStatusColors("success").bg,
+        text: getStatusColors("success").text,
+      };
+    } else if (statusCode >= 400 && statusCode < 500) {
+      return {
+        bg: getAccentColors("yellow").bg,
+        text: getAccentColors("yellow").text,
+      };
+    } else if (statusCode >= 500) {
+      return {
+        bg: getStatusColors("error").bg,
+        text: getStatusColors("error").text,
+      };
+    }
+    return { bg: "bg-muted", text: "text-muted-foreground" };
+  };
+
+  // Truncate URL for display
+  const truncateUrl = (url: string, maxLength: number = 60) => {
+    if (url.length <= maxLength) return url;
+    return url.substring(0, maxLength - 3) + "...";
+  };
+
+  // Parse JSON safely
+  const parseJson = (jsonStr: string | null | undefined): unknown => {
+    if (!jsonStr) return null;
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      return jsonStr;
+    }
+  };
+
+  // Format JSON for display
+  const formatJson = (data: unknown): string => {
+    if (data === null || data === undefined) return "";
+    if (typeof data === "string") return data;
+    try {
+      return JSON.stringify(data, null, 2);
+    } catch {
+      return String(data);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading API requests...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  if (!apiData || apiData.requests.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Globe className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">No API requests for this task run</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Summary stats */}
+      <div className="flex items-center gap-4 px-3 py-2 bg-muted/30 rounded-md">
+        <span className="text-sm font-medium">API Requests:</span>
+        <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
+          <CheckCircle className="w-4 h-4" />
+          {apiData.success_count} successful
+        </span>
+        <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
+          <XCircle className="w-4 h-4" />
+          {apiData.failed_count} failed
+        </span>
+        <span className="text-xs text-muted-foreground ml-auto">
+          {apiData.count} total requests
+        </span>
+      </div>
+
+      {/* Request list */}
+      <div className="space-y-2">
+        {apiData.requests.map((request: TaskRunApiRequestDb) => {
+          const methodStyle = getMethodStyle(request.method);
+          const statusStyle = getStatusCodeStyle(request.status_code);
+          const isExpanded = expandedIds.has(request.id);
+
+          // Parse JSON fields
+          const requestHeaders = parseJson(request.request_headers);
+          const responseHeaders = parseJson(request.response_headers);
+          const extractions = parseJson(request.extractions) as Array<{
+            variable_name: string;
+            extracted_value?: string;
+            success: boolean;
+          }> | null;
+          const assertions = parseJson(request.assertions) as Array<{
+            type: string;
+            expected: string;
+            actual: string;
+            passed: boolean;
+          }> | null;
+
+          const hasExpandableContent =
+            request.resolved_url !== request.url ||
+            requestHeaders ||
+            request.request_body ||
+            responseHeaders ||
+            request.response_body ||
+            extractions ||
+            assertions ||
+            request.error_message;
+
+          return (
+            <div key={request.id} className="border border-border rounded-lg overflow-hidden">
+              <button
+                onClick={() => hasExpandableContent && toggleExpanded(request.id)}
+                className={`w-full flex items-center gap-3 px-4 py-3 bg-card transition-colors text-left ${
+                  hasExpandableContent ? "hover:bg-muted/50 cursor-pointer" : "cursor-default"
+                }`}
+              >
+                {hasExpandableContent ? (
+                  isExpanded ? (
+                    <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  )
+                ) : (
+                  <div className="w-4 h-4 flex-shrink-0" />
+                )}
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${methodStyle.bg} ${methodStyle.text}`}
+                >
+                  {request.method}
+                </span>
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${statusStyle.bg} ${statusStyle.text}`}
+                >
+                  {request.status_code}
+                </span>
+                <span className="flex-1 truncate text-sm font-mono">
+                  {truncateUrl(request.resolved_url || request.url)}
+                </span>
+                <span className="text-xs text-muted-foreground">{request.response_time_ms}ms</span>
+              </button>
+              {isExpanded && hasExpandableContent && (
+                <div className="px-4 py-3 bg-muted/30 border-t border-border space-y-3">
+                  {request.step_name && (
+                    <div className="text-xs">
+                      <span className="font-medium text-muted-foreground">Step:</span>{" "}
+                      {request.step_name}
+                    </div>
+                  )}
+                  <div className="text-xs">
+                    <span className="font-medium text-muted-foreground">Full URL:</span>{" "}
+                    <span className="font-mono break-all">
+                      {request.resolved_url || request.url}
+                    </span>
+                  </div>
+                  {requestHeaders && Object.keys(requestHeaders as object).length > 0 && (
+                    <CollapsibleSection title="Request Headers">
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-32 overflow-y-auto">
+                        {formatJson(requestHeaders)}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  {request.request_body && (
+                    <CollapsibleSection title="Request Body">
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                        {(() => {
+                          try {
+                            return JSON.stringify(JSON.parse(request.request_body), null, 2);
+                          } catch {
+                            return request.request_body;
+                          }
+                        })()}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  {responseHeaders && Object.keys(responseHeaders as object).length > 0 && (
+                    <CollapsibleSection title="Response Headers">
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-32 overflow-y-auto">
+                        {formatJson(responseHeaders)}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  {request.response_body && (
+                    <CollapsibleSection title={`Response Body (${request.response_body_type})`}>
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                        {(() => {
+                          try {
+                            if (request.response_body_type === "json") {
+                              return JSON.stringify(JSON.parse(request.response_body), null, 2);
+                            }
+                            const truncated = request.response_body.substring(0, 2000);
+                            return (
+                              truncated +
+                              (request.response_body.length > 2000 ? "\n... (truncated)" : "")
+                            );
+                          } catch {
+                            const truncated = request.response_body.substring(0, 2000);
+                            return (
+                              truncated +
+                              (request.response_body.length > 2000 ? "\n... (truncated)" : "")
+                            );
+                          }
+                        })()}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  {extractions && extractions.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Extractions ({extractions.length})
+                      </div>
+                      <div className="space-y-1">
+                        {extractions.map((ext, i) => (
+                          <div key={i} className="flex items-center gap-2 text-xs">
+                            {ext.success ? (
+                              <CheckCircle
+                                className={`w-3 h-3 ${getStatusColors("success").icon}`}
+                              />
+                            ) : (
+                              <XCircle className={`w-3 h-3 ${getStatusColors("error").icon}`} />
+                            )}
+                            <span className="font-mono font-medium">{ext.variable_name}</span>
+                            <span className="text-muted-foreground">=</span>
+                            <span className="font-mono truncate max-w-xs">
+                              {ext.extracted_value ?? "(failed)"}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {assertions && assertions.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Assertions ({assertions.length})
+                      </div>
+                      <div className="space-y-1">
+                        {assertions.map((a, i) => (
+                          <div key={i} className="flex items-center gap-2 text-xs flex-wrap">
+                            {a.passed ? (
+                              <CheckCircle
+                                className={`w-3 h-3 ${getStatusColors("success").icon}`}
+                              />
+                            ) : (
+                              <XCircle className={`w-3 h-3 ${getStatusColors("error").icon}`} />
+                            )}
+                            <span className="font-medium">{a.type}</span>
+                            <span className="text-muted-foreground">expected:</span>
+                            <span className="font-mono">{a.expected}</span>
+                            <span className="text-muted-foreground">actual:</span>
+                            <span className="font-mono">{a.actual}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {request.error_message && (
+                    <div>
+                      <div className={`text-xs font-medium ${getStatusColors("error").text} mb-1`}>
+                        Error
+                      </div>
+                      <pre
+                        className={`text-xs ${getStatusColors("error").bg} ${getStatusColors("error").text} p-2 rounded overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap`}
+                      >
+                        {request.error_message}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// Collapsible section helper for API request details
+function CollapsibleSection({
+  title,
+  children,
+  defaultOpen = false,
+}: {
+  title: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [isOpen, setIsOpen] = useState(defaultOpen);
+
+  return (
+    <div>
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors mb-1"
+      >
+        {isOpen ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
+        {title}
+      </button>
+      {isOpen && children}
+    </div>
+  );
+}
+
+// JSONL Logs Section - uses SQLite for completed tasks, JSONL for running tasks
+function JsonlLogsSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const [activeLogType, setActiveLogType] = useState<JsonlLogType>("ai-output");
+
+  // Determine if task is completed (logs migrated to SQLite)
+  const isCompleted = selectedRun?.completed_at != null;
+
+  // Get SQLite event type for current log type
+  const sqliteEventType = getEventTypeForLogType(activeLogType);
+
+  // SQLite queries for completed tasks
+  const {
+    data: sqliteEvents,
+    isLoading: sqliteLoading,
+    error: sqliteError,
+  } = useTaskRunEvents(isCompleted && sqliteEventType ? selectedRunId : null, sqliteEventType);
+  const { data: migratedSummary } = useTaskRunMigratedLogsSummary(
+    isCompleted ? selectedRunId : null,
+  );
+
+  // JSONL queries for running tasks (real-time)
+  const {
+    data: consolidatedOutput,
+    isLoading: consolidatedLoading,
+    error: consolidatedError,
+  } = useConsolidatedAiOutput(!isCompleted && activeLogType === "ai-output" ? selectedRunId : null);
+  const {
+    data: jsonlLogs,
+    isLoading: jsonlLoading,
+    error: jsonlError,
+  } = useJsonlLogsForTaskRun(
+    !isCompleted && activeLogType !== "ai-output" ? activeLogType : "general",
+    !isCompleted && activeLogType !== "ai-output" ? selectedRunId : null,
+  );
+
+  // Select appropriate loading/error state
+  const isLoading = isCompleted
+    ? sqliteLoading
+    : activeLogType === "ai-output"
+      ? consolidatedLoading
+      : jsonlLoading;
+  const error = isCompleted
+    ? sqliteError
+    : activeLogType === "ai-output"
+      ? consolidatedError
+      : jsonlError;
+
+  const logTypes: { type: JsonlLogType; label: string; count?: number }[] = [
+    {
+      type: "ai-output",
+      label: "AI Output",
+      count: migratedSummary?.events_by_type["ai_output"],
+    },
+    { type: "general", label: "General", count: migratedSummary?.events_by_type["general"] },
+    { type: "actions", label: "Actions", count: migratedSummary?.events_by_type["action"] },
+    {
+      type: "image-recognition",
+      label: "Image Recognition",
+      count: migratedSummary?.events_by_type["image_recognition"],
+    },
+    { type: "playwright", label: "Playwright" },
+    { type: "api-requests", label: "API Requests" },
+  ];
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <FileJson className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view logs</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Show data source info */}
       {selectedRun && (
         <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
           <span className="font-medium">Time range:</span> {formatTimestamp(selectedRun.created_at)}
           {selectedRun.completed_at
             ? ` → ${formatTimestamp(selectedRun.completed_at)}`
             : " → (still running)"}
+          <span className="ml-2 px-2 py-0.5 rounded bg-muted">
+            {isCompleted ? "📦 SQLite" : "📄 JSONL (real-time)"}
+          </span>
         </div>
       )}
 
-      {/* Log type tabs */}
+      {/* Log type tabs with counts for completed tasks */}
       <div className="flex gap-2 flex-wrap">
-        {logTypes.map(({ type, label }) => (
+        {logTypes.map(({ type, label, count }) => (
           <button
             key={type}
             onClick={() => setActiveLogType(type)}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
               activeLogType === type
-                ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+                ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
                 : "bg-muted text-muted-foreground hover:text-foreground"
             }`}
           >
             {label}
+            {isCompleted && count !== undefined && count > 0 && (
+              <span className="ml-1.5 opacity-60">({count})</span>
+            )}
           </button>
         ))}
       </div>
@@ -404,12 +1367,39 @@ function JsonlLogsSection() {
           Loading logs...
         </div>
       ) : error ? (
-        <div className="flex items-center justify-center py-8 text-red-400">
+        <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
           <AlertCircle className="w-5 h-5 mr-2" />
           Error: {error.message}
         </div>
+      ) : isCompleted && sqliteEventType ? (
+        // Completed task: show SQLite events
+        sqliteEvents && sqliteEvents.events.length > 0 ? (
+          <div className="space-y-2">
+            <div className="text-xs text-muted-foreground mb-2">
+              Showing {sqliteEvents.count} events from database
+            </div>
+            <EventsDisplay events={sqliteEvents.events} />
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+            <FileJson className="w-8 h-8 mb-3 opacity-50" />
+            <p className="text-sm">No {activeLogType} events for this task run</p>
+          </div>
+        )
+      ) : isCompleted && activeLogType === "playwright" ? (
+        // Completed task: show Playwright results from SQLite
+        <PlaywrightResultsDisplay taskRunId={selectedRunId} />
+      ) : isCompleted && activeLogType === "api-requests" ? (
+        // Completed task: show API requests from SQLite
+        <ApiRequestsDisplay taskRunId={selectedRunId} />
+      ) : isCompleted && !sqliteEventType ? (
+        // Completed task but unsupported log type
+        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+          <FileJson className="w-8 h-8 mb-3 opacity-50" />
+          <p className="text-sm">{activeLogType} logs are not yet migrated to SQLite</p>
+        </div>
       ) : activeLogType === "ai-output" ? (
-        // Consolidated AI Output display
+        // Running task: Consolidated AI Output display
         consolidatedOutput && consolidatedOutput.chunks.length > 0 ? (
           <ConsolidatedAiOutputDisplay
             chunks={consolidatedOutput.chunks}
@@ -421,15 +1411,15 @@ function JsonlLogsSection() {
             <p className="text-sm">No AI output during this task run</p>
           </div>
         )
-      ) : logs && logs.entries.length > 0 ? (
-        // Other log types - show raw entries in more readable format
+      ) : jsonlLogs && jsonlLogs.entries.length > 0 ? (
+        // Running task: Other log types - show raw JSONL entries
         <div className="space-y-2">
           <div className="text-xs text-muted-foreground mb-2">
-            Showing {logs.count} entries during this task run
+            Showing {jsonlLogs.count} entries (real-time from JSONL)
           </div>
           <div className="border border-border rounded-lg overflow-hidden">
             <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
-              {logs.entries.map((entry, i) => (
+              {jsonlLogs.entries.map((entry, i) => (
                 <div key={i} className="py-1 border-b border-border/50 last:border-0">
                   {JSON.stringify(entry, null, 2)}
                 </div>
@@ -458,8 +1448,6 @@ function DevLogsSection() {
   const logTypes: { type: TextLogType; label: string }[] = [
     { type: "backend", label: "Backend" },
     { type: "backend-err", label: "Backend Errors" },
-    { type: "qontinui-api", label: "Qontinui API" },
-    { type: "qontinui-api-err", label: "API Errors" },
   ];
 
   const getLogCount = (type: TextLogType): number => {
@@ -497,7 +1485,7 @@ function DevLogsSection() {
             onClick={() => setActiveLogType(type)}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
               activeLogType === type
-                ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+                ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
                 : "bg-muted text-muted-foreground hover:text-foreground"
             }`}
           >
@@ -514,7 +1502,7 @@ function DevLogsSection() {
           Loading logs...
         </div>
       ) : error ? (
-        <div className="flex items-center justify-center py-8 text-red-400">
+        <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
           <AlertCircle className="w-5 h-5 mr-2" />
           Error: {error.message}
         </div>
@@ -539,10 +1527,77 @@ function DevLogsSection() {
   );
 }
 
-// Screenshots Section
+// Screenshots Section - uses SQLite for completed tasks, file system for running tasks
 function ScreenshotsSection() {
-  const { data: screenshots, isLoading, error } = useScreenshots();
+  const { selectedRunId, selectedRun } = useRunSelection();
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [imageLoadErrors, setImageLoadErrors] = useState<Set<string>>(new Set());
+
+  // Determine if task is completed (screenshots migrated to SQLite)
+  const isCompleted = selectedRun?.completed_at != null;
+
+  // SQLite query for completed tasks
+  const {
+    data: dbScreenshots,
+    isLoading: dbLoading,
+    error: dbError,
+  } = useTaskRunScreenshotsFromDb(isCompleted ? selectedRunId : null);
+
+  // File system query for running tasks (real-time)
+  const { data: fsScreenshots, isLoading: fsLoading, error: fsError } = useScreenshots();
+
+  // Select appropriate loading/error state
+  const isLoading = isCompleted ? dbLoading : fsLoading;
+  const error = isCompleted ? dbError : fsError;
+
+  // Convert file paths to Tauri asset URLs
+  const getImageSrc = useMemo(() => {
+    return (path: string) => {
+      try {
+        return convertFileSrc(path);
+      } catch {
+        // Fallback to file:// protocol
+        return `file://${path}`;
+      }
+    };
+  }, []);
+
+  // Helper to get screenshot type badge styling
+  const getScreenshotTypeBadge = (type: string) => {
+    switch (type) {
+      case "annotated":
+        return {
+          bg: getAccentColors("blue").bg,
+          text: getAccentColors("blue").text,
+          label: "Annotated",
+        };
+      case "raw":
+        return { bg: "bg-muted", text: "text-muted-foreground", label: "Raw" };
+      case "diff":
+        return {
+          bg: getAccentColors("purple").bg,
+          text: getAccentColors("purple").text,
+          label: "Diff",
+        };
+      case "failure":
+        return {
+          bg: getStatusColors("error").bg,
+          text: getStatusColors("error").text,
+          label: "Failure",
+        };
+      default:
+        return { bg: "bg-muted", text: "text-muted-foreground", label: type };
+    }
+  };
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Image className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view screenshots</p>
+      </div>
+    );
+  }
 
   if (isLoading) {
     return (
@@ -555,26 +1610,110 @@ function ScreenshotsSection() {
 
   if (error) {
     return (
-      <div className="flex items-center justify-center py-8 text-red-400">
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         Error: {error.message}
       </div>
     );
   }
 
-  const hasScreenshots =
-    screenshots && (screenshots.annotated.length > 0 || screenshots.playwright.length > 0);
+  const handleImageError = (path: string) => {
+    setImageLoadErrors((prev) => new Set(prev).add(path));
+  };
 
-  if (!hasScreenshots) {
+  // Render screenshots from SQLite (completed tasks)
+  const renderDbScreenshotGrid = (items: TaskRunScreenshotDb[]) => {
+    if (items.length === 0) return null;
+
+    // Group by screenshot type
+    const groupedByType = items.reduce(
+      (acc, item) => {
+        const type = item.screenshot_type || "unknown";
+        if (!acc[type]) acc[type] = [];
+        acc[type].push(item);
+        return acc;
+      },
+      {} as Record<string, TaskRunScreenshotDb[]>,
+    );
+
     return (
-      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-        <Image className="w-8 h-8 mb-3 opacity-50" />
-        <p className="text-sm">No screenshots found</p>
+      <div className="space-y-6">
+        {Object.entries(groupedByType).map(([type, screenshots]) => {
+          const badge = getScreenshotTypeBadge(type);
+          return (
+            <div key={type} className="space-y-2">
+              <h3 className="text-sm font-medium text-muted-foreground flex items-center gap-2">
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${badge.bg} ${badge.text}`}
+                >
+                  {badge.label}
+                </span>
+                <span>({screenshots.length})</span>
+              </h3>
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                {screenshots.map((img) => {
+                  const filename = img.file_path.split(/[/\\]/).pop() || img.file_path;
+                  return (
+                    <button
+                      key={img.id}
+                      onClick={() => setSelectedImage(img.file_path)}
+                      className="border border-border rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors text-left"
+                    >
+                      <div className="aspect-video bg-muted flex items-center justify-center overflow-hidden">
+                        {imageLoadErrors.has(img.file_path) ? (
+                          <Image className="w-8 h-8 text-muted-foreground opacity-50" />
+                        ) : (
+                          <img
+                            src={getImageSrc(img.file_path)}
+                            alt={filename}
+                            className="w-full h-full object-cover"
+                            onError={() => handleImageError(img.file_path)}
+                          />
+                        )}
+                      </div>
+                      <div className="p-2 space-y-1">
+                        <div className="text-xs font-medium truncate">{filename}</div>
+                        {img.template_name && (
+                          <div className="text-xs text-muted-foreground truncate">
+                            Template: {img.template_name}
+                          </div>
+                        )}
+                        {img.confidence != null && (
+                          <div className="text-xs text-muted-foreground">
+                            Confidence: {(img.confidence * 100).toFixed(1)}%
+                          </div>
+                        )}
+                        {img.match_location && (
+                          <div className="text-xs text-muted-foreground">
+                            {(() => {
+                              try {
+                                const loc = JSON.parse(img.match_location);
+                                return `Location: (${loc.x}, ${loc.y})`;
+                              } catch {
+                                return null;
+                              }
+                            })()}
+                          </div>
+                        )}
+                        {img.file_size_bytes && (
+                          <div className="text-xs text-muted-foreground">
+                            {(img.file_size_bytes / 1024).toFixed(1)} KB
+                          </div>
+                        )}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
       </div>
     );
-  }
+  };
 
-  const renderScreenshotList = (items: ScreenshotInfo[], title: string) => {
+  // Render screenshots from file system (running tasks)
+  const renderFsScreenshotList = (items: ScreenshotInfo[], title: string) => {
     if (items.length === 0) return null;
     return (
       <div className="space-y-2">
@@ -586,8 +1725,17 @@ function ScreenshotsSection() {
               onClick={() => setSelectedImage(img.path)}
               className="border border-border rounded-lg overflow-hidden hover:border-blue-500/50 transition-colors"
             >
-              <div className="aspect-video bg-muted flex items-center justify-center">
-                <Image className="w-8 h-8 text-muted-foreground opacity-50" />
+              <div className="aspect-video bg-muted flex items-center justify-center overflow-hidden">
+                {imageLoadErrors.has(img.path) ? (
+                  <Image className="w-8 h-8 text-muted-foreground opacity-50" />
+                ) : (
+                  <img
+                    src={getImageSrc(img.path)}
+                    alt={img.filename}
+                    className="w-full h-full object-cover"
+                    onError={() => handleImageError(img.path)}
+                  />
+                )}
               </div>
               <div className="p-2">
                 <div className="text-xs font-medium truncate">{img.filename}</div>
@@ -602,24 +1750,106 @@ function ScreenshotsSection() {
     );
   };
 
+  // Check if we have any screenshots
+  const hasDbScreenshots = dbScreenshots && dbScreenshots.screenshots.length > 0;
+  const hasFsScreenshots =
+    fsScreenshots && (fsScreenshots.annotated.length > 0 || fsScreenshots.playwright.length > 0);
+
+  if (isCompleted && !hasDbScreenshots) {
+    return (
+      <div className="space-y-4">
+        {selectedRun && (
+          <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+            <span className="font-medium">Time range:</span>{" "}
+            {formatTimestamp(selectedRun.created_at)}
+            {selectedRun.completed_at
+              ? ` -> ${formatTimestamp(selectedRun.completed_at)}`
+              : " -> (still running)"}
+            <span className="ml-2 px-2 py-0.5 rounded bg-muted">SQLite</span>
+          </div>
+        )}
+        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+          <Image className="w-8 h-8 mb-3 opacity-50" />
+          <p className="text-sm">No screenshots found for this task run</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!isCompleted && !hasFsScreenshots) {
+    return (
+      <div className="space-y-4">
+        {selectedRun && (
+          <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+            <span className="font-medium">Time range:</span>{" "}
+            {formatTimestamp(selectedRun.created_at)}
+            {" -> (still running)"}
+            <span className="ml-2 px-2 py-0.5 rounded bg-muted">File System (real-time)</span>
+          </div>
+        )}
+        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+          <Image className="w-8 h-8 mb-3 opacity-50" />
+          <p className="text-sm">No screenshots found yet</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="space-y-6">
-      {renderScreenshotList(screenshots.annotated, "Annotated Screenshots")}
-      {renderScreenshotList(screenshots.playwright, "Playwright Screenshots")}
+    <div className="space-y-4">
+      {/* Show data source info */}
+      {selectedRun && (
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="font-medium">Time range:</span> {formatTimestamp(selectedRun.created_at)}
+          {selectedRun.completed_at
+            ? ` -> ${formatTimestamp(selectedRun.completed_at)}`
+            : " -> (still running)"}
+          <span className="ml-2 px-2 py-0.5 rounded bg-muted">
+            {isCompleted ? "SQLite" : "File System (real-time)"}
+          </span>
+          {isCompleted && dbScreenshots && (
+            <span className="ml-2">{dbScreenshots.count} screenshots</span>
+          )}
+        </div>
+      )}
+
+      {/* Screenshots content */}
+      {isCompleted && dbScreenshots ? (
+        renderDbScreenshotGrid(dbScreenshots.screenshots)
+      ) : (
+        <div className="space-y-6">
+          {fsScreenshots &&
+            renderFsScreenshotList(fsScreenshots.annotated, "Annotated Screenshots")}
+          {fsScreenshots &&
+            renderFsScreenshotList(fsScreenshots.playwright, "Playwright Screenshots")}
+        </div>
+      )}
 
       {/* Image preview modal */}
       {selectedImage && (
         <div
-          className="fixed inset-0 bg-black/80 flex items-center justify-center z-50"
+          className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 p-4"
           onClick={() => setSelectedImage(null)}
         >
-          <div className="max-w-[90vw] max-h-[90vh] overflow-auto">
-            <div className="text-xs text-muted-foreground mb-2">{selectedImage}</div>
-            <div className="bg-muted p-4 rounded-lg text-center text-muted-foreground">
-              Image preview not available in this view.
-              <br />
-              Use the Read tool to view: {selectedImage}
-            </div>
+          <div
+            className="max-w-[90vw] max-h-[90vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="text-xs text-muted-foreground mb-2 truncate">{selectedImage}</div>
+            {imageLoadErrors.has(selectedImage) ? (
+              <div className="bg-muted p-4 rounded-lg text-center text-muted-foreground">
+                Image failed to load.
+                <br />
+                <span className="text-xs">Path: {selectedImage}</span>
+              </div>
+            ) : (
+              <img
+                src={getImageSrc(selectedImage)}
+                alt="Screenshot preview"
+                className="max-w-full max-h-[calc(90vh-2rem)] object-contain rounded-lg"
+                onError={() => handleImageError(selectedImage)}
+              />
+            )}
           </div>
         </div>
       )}
@@ -642,7 +1872,7 @@ function LoadedConfigSection() {
 
   if (error) {
     return (
-      <div className="flex items-center justify-center py-8 text-red-400">
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         Error: {error.message}
       </div>
@@ -715,7 +1945,7 @@ function AiPromptSection() {
 
   if (error) {
     return (
-      <div className="flex items-center justify-center py-8 text-red-400">
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         Error: {error.message}
       </div>
@@ -779,7 +2009,7 @@ function ContextsSection() {
 
   if (error) {
     return (
-      <div className="flex items-center justify-center py-8 text-red-400">
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
         <AlertCircle className="w-5 h-5 mr-2" />
         Error: {error.message}
       </div>
@@ -815,7 +2045,7 @@ function ContextsSection() {
           onClick={() => setFilter("all")}
           className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
             filter === "all"
-              ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+              ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
               : "bg-muted text-muted-foreground hover:text-foreground"
           }`}
         >
@@ -825,7 +2055,7 @@ function ContextsSection() {
           onClick={() => setFilter("user")}
           className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
             filter === "user"
-              ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+              ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
               : "bg-muted text-muted-foreground hover:text-foreground"
           }`}
         >
@@ -835,7 +2065,7 @@ function ContextsSection() {
           onClick={() => setFilter("builtin")}
           className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
             filter === "builtin"
-              ? "bg-blue-500/20 text-blue-400 border border-blue-500/30"
+              ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
               : "bg-muted text-muted-foreground hover:text-foreground"
           }`}
         >
@@ -858,7 +2088,9 @@ function ContextsSection() {
               )}
               <BookOpen
                 className={`w-4 h-4 ${
-                  ctx.context_type === "builtin" ? "text-purple-400" : "text-green-400"
+                  ctx.context_type === "builtin"
+                    ? getAccentColors("purple").text
+                    : getAccentColors("green").text
                 }`}
               />
               <span className="font-medium flex-1 truncate">{ctx.name}</span>
@@ -868,15 +2100,17 @@ function ContextsSection() {
               <span
                 className={`px-2 py-0.5 text-xs rounded-full ${
                   ctx.context_type === "builtin"
-                    ? "bg-purple-500/20 text-purple-400"
-                    : "bg-green-500/20 text-green-400"
+                    ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
+                    : `${getAccentColors("green").bg} ${getAccentColors("green").text}`
                 }`}
               >
                 {ctx.context_type}
               </span>
               <span
                 className={`px-2 py-0.5 text-xs rounded-full ${
-                  ctx.enabled ? "bg-green-500/20 text-green-400" : "bg-muted text-muted-foreground"
+                  ctx.enabled
+                    ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                    : "bg-muted text-muted-foreground"
                 }`}
               >
                 {ctx.enabled ? "enabled" : "disabled"}
@@ -923,85 +2157,1638 @@ function ContextsSection() {
   );
 }
 
+// API Requests Section - dedicated view for API request/response data
+function ApiRequestsSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const { data: logs, isLoading, error } = useJsonlLogsForTaskRun("api-requests", selectedRunId);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Globe className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view API requests</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading API requests...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  if (!logs || logs.entries.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Globe className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">No API requests during this task run</p>
+      </div>
+    );
+  }
+
+  // Type for API request log entries
+  interface ApiRequestEntry {
+    id: string;
+    timestamp: string;
+    step_name?: string;
+    method: string;
+    url: string;
+    resolved_url?: string;
+    status_code: number;
+    status_text?: string;
+    response_time_ms: number;
+    response_body_type: string;
+    response_body?: string;
+    response_file_path?: string;
+    response_size_bytes?: number;
+    success: boolean;
+    error?: string;
+    extractions?: { variable_name: string; extracted_value?: string; success: boolean }[];
+    assertions?: { assertion_type: string; expected: string; actual: string; passed: boolean }[];
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Show time range info */}
+      {selectedRun && (
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="font-medium">Time range:</span> {formatTimestamp(selectedRun.created_at)}
+          {selectedRun.completed_at
+            ? ` → ${formatTimestamp(selectedRun.completed_at)}`
+            : " → (still running)"}
+        </div>
+      )}
+
+      <div className="text-xs text-muted-foreground mb-2">
+        Showing {logs.count} API requests during this task run
+      </div>
+
+      <div className="space-y-2">
+        {logs.entries.map((entry, index) => {
+          const req = entry as ApiRequestEntry;
+          const isExpanded = expandedId === (req.id || index.toString());
+
+          return (
+            <div key={req.id || index} className="border border-border rounded-lg overflow-hidden">
+              <button
+                onClick={() => setExpandedId(isExpanded ? null : req.id || index.toString())}
+                className="w-full flex items-center gap-3 px-4 py-3 bg-card hover:bg-muted/50 transition-colors text-left"
+              >
+                {isExpanded ? (
+                  <ChevronDown className="w-4 h-4 text-muted-foreground" />
+                ) : (
+                  <ChevronRight className="w-4 h-4 text-muted-foreground" />
+                )}
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${
+                    req.method === "GET"
+                      ? `${getAccentColors("green").bg} ${getAccentColors("green").text}`
+                      : req.method === "POST"
+                        ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
+                        : req.method === "PUT" || req.method === "PATCH"
+                          ? `${getAccentColors("yellow").bg} ${getAccentColors("yellow").text}`
+                          : `${getAccentColors("red").bg} ${getAccentColors("red").text}`
+                  }`}
+                >
+                  {req.method}
+                </span>
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${
+                    req.status_code >= 200 && req.status_code < 300
+                      ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                      : req.status_code >= 400
+                        ? `${getStatusColors("error").bg} ${getStatusColors("error").text}`
+                        : "bg-muted text-muted-foreground"
+                  }`}
+                >
+                  {req.status_code}
+                </span>
+                <span className="flex-1 truncate text-sm font-mono">
+                  {req.resolved_url || req.url}
+                </span>
+                <span className="text-xs text-muted-foreground">{req.response_time_ms}ms</span>
+              </button>
+              {isExpanded && (
+                <div className="px-4 py-3 bg-muted/30 border-t border-border space-y-3">
+                  {req.step_name && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">Step:</span>
+                      <span className="text-xs">{req.step_name}</span>
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-muted-foreground">URL:</span>
+                    <span className="text-xs font-mono break-all">
+                      {req.resolved_url || req.url}
+                    </span>
+                  </div>
+                  {req.response_body && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Response Body ({req.response_body_type})
+                      </div>
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto">
+                        {req.response_body_type === "json"
+                          ? JSON.stringify(JSON.parse(req.response_body), null, 2)
+                          : req.response_body.substring(0, 1000)}
+                        {req.response_body.length > 1000 && "... (truncated)"}
+                      </pre>
+                    </div>
+                  )}
+                  {req.response_file_path && (
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-medium text-muted-foreground">
+                        Binary saved to:
+                      </span>
+                      <span className="text-xs font-mono">{req.response_file_path}</span>
+                    </div>
+                  )}
+                  {req.extractions && req.extractions.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Variable Extractions
+                      </div>
+                      <div className="space-y-1">
+                        {req.extractions.map((ext, i) => (
+                          <div key={i} className="flex items-center gap-2 text-xs">
+                            {ext.success ? (
+                              <CheckCircle
+                                className={`w-3 h-3 ${getStatusColors("success").icon}`}
+                              />
+                            ) : (
+                              <XCircle className={`w-3 h-3 ${getStatusColors("error").icon}`} />
+                            )}
+                            <span className="font-mono">{ext.variable_name}</span>
+                            <span className="text-muted-foreground">=</span>
+                            <span className="font-mono">{ext.extracted_value ?? "(failed)"}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {req.assertions && req.assertions.length > 0 && (
+                    <div>
+                      <div className="text-xs font-medium text-muted-foreground mb-1">
+                        Assertions
+                      </div>
+                      <div className="space-y-1">
+                        {req.assertions.map((a, i) => (
+                          <div key={i} className="flex items-center gap-2 text-xs">
+                            {a.passed ? (
+                              <CheckCircle
+                                className={`w-3 h-3 ${getStatusColors("success").icon}`}
+                              />
+                            ) : (
+                              <XCircle className={`w-3 h-3 ${getStatusColors("error").icon}`} />
+                            )}
+                            <span>{a.assertion_type}</span>
+                            <span className="text-muted-foreground">expected:</span>
+                            <span className="font-mono">{a.expected}</span>
+                            <span className="text-muted-foreground">actual:</span>
+                            <span className="font-mono">{a.actual}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {req.error && (
+                    <div>
+                      <div className={`text-xs font-medium ${getStatusColors("error").text} mb-1`}>
+                        Error
+                      </div>
+                      <pre
+                        className={`text-xs ${getStatusColors("error").bg} ${getStatusColors("error").text} p-2 rounded overflow-x-auto`}
+                      >
+                        {req.error}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// AI Output Section - shows consolidated AI output (uses SQLite for completed, JSONL for running)
+function AiOutputSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const isCompleted = selectedRun?.completed_at != null;
+
+  // SQLite query for completed tasks
+  const {
+    data: sqliteEvents,
+    isLoading: sqliteLoading,
+    error: sqliteError,
+  } = useTaskRunEvents(isCompleted ? selectedRunId : null, "ai_output");
+
+  // JSONL query for running tasks (real-time)
+  const {
+    data: consolidatedOutput,
+    isLoading: consolidatedLoading,
+    error: consolidatedError,
+  } = useConsolidatedAiOutput(!isCompleted ? selectedRunId : null);
+
+  const isLoading = isCompleted ? sqliteLoading : consolidatedLoading;
+  const error = isCompleted ? sqliteError : consolidatedError;
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <FileText className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view AI output</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading AI output...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  // Show SQLite events for completed tasks
+  if (isCompleted && sqliteEvents) {
+    if (sqliteEvents.events.length === 0) {
+      return (
+        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+          <FileText className="w-8 h-8 mb-3 opacity-50" />
+          <p className="text-sm">No AI output for this task run</p>
+        </div>
+      );
+    }
+    return (
+      <div className="space-y-4">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="px-2 py-0.5 rounded bg-muted">SQLite</span>
+          <span className="ml-2">{sqliteEvents.count} entries</span>
+        </div>
+        <EventsDisplay events={sqliteEvents.events} />
+      </div>
+    );
+  }
+
+  // Show consolidated output for running tasks
+  if (consolidatedOutput && consolidatedOutput.chunks.length > 0) {
+    return (
+      <div className="space-y-4">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="px-2 py-0.5 rounded bg-muted">JSONL (real-time)</span>
+        </div>
+        <ConsolidatedAiOutputDisplay
+          chunks={consolidatedOutput.chunks}
+          totalEntries={consolidatedOutput.total_entries}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+      <FileText className="w-8 h-8 mb-3 opacity-50" />
+      <p className="text-sm">No AI output during this task run</p>
+    </div>
+  );
+}
+
+// Events Section - shows general and action events
+function EventsSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const isCompleted = selectedRun?.completed_at != null;
+  const [eventFilter, setEventFilter] = useState<string | undefined>(undefined);
+
+  // SQLite query for completed tasks
+  const {
+    data: sqliteEvents,
+    isLoading: sqliteLoading,
+    error: sqliteError,
+  } = useTaskRunEvents(isCompleted ? selectedRunId : null, eventFilter);
+
+  // Summary for counts
+  const { data: migratedSummary } = useTaskRunMigratedLogsSummary(
+    isCompleted ? selectedRunId : null,
+  );
+
+  // JSONL queries for running tasks
+  const {
+    data: generalLogs,
+    isLoading: generalLoading,
+    error: generalError,
+  } = useJsonlLogsForTaskRun("general", !isCompleted ? selectedRunId : null);
+  const {
+    data: actionLogs,
+    isLoading: actionLoading,
+    error: actionError,
+  } = useJsonlLogsForTaskRun(
+    "actions",
+    !isCompleted && eventFilter === "action" ? selectedRunId : null,
+  );
+
+  const isLoading = isCompleted ? sqliteLoading : generalLoading || actionLoading;
+  const error = isCompleted ? sqliteError : generalError || actionError;
+
+  const eventTypes = [
+    { type: undefined, label: "All", count: migratedSummary?.events_count },
+    { type: "general", label: "General", count: migratedSummary?.events_by_type["general"] },
+    { type: "action", label: "Actions", count: migratedSummary?.events_by_type["action"] },
+  ];
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <List className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view events</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading events...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Filter buttons */}
+      {isCompleted && (
+        <div className="flex gap-2 flex-wrap">
+          {eventTypes.map(({ type, label, count }) => (
+            <button
+              key={label}
+              onClick={() => setEventFilter(type)}
+              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                eventFilter === type
+                  ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} border ${getAccentColors("blue").border}`
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {label}
+              {count !== undefined && <span className="ml-1.5 opacity-60">({count})</span>}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Events content */}
+      {isCompleted && sqliteEvents ? (
+        sqliteEvents.events.length > 0 ? (
+          <div className="space-y-2">
+            <div className="text-xs text-muted-foreground">Showing {sqliteEvents.count} events</div>
+            <EventsDisplay events={sqliteEvents.events} />
+          </div>
+        ) : (
+          <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+            <List className="w-8 h-8 mb-3 opacity-50" />
+            <p className="text-sm">No events for this task run</p>
+          </div>
+        )
+      ) : generalLogs && generalLogs.entries.length > 0 ? (
+        <div className="space-y-2">
+          <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+            <span className="px-2 py-0.5 rounded bg-muted">JSONL (real-time)</span>
+            <span className="ml-2">{generalLogs.count} entries</span>
+          </div>
+          <div className="border border-border rounded-lg overflow-hidden">
+            <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
+              {generalLogs.entries.map((entry, i) => (
+                <div key={i} className="py-1 border-b border-border/50 last:border-0">
+                  {JSON.stringify(entry, null, 2)}
+                </div>
+              ))}
+            </pre>
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+          <List className="w-8 h-8 mb-3 opacity-50" />
+          <p className="text-sm">No events during this task run</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Image Recognition Section
+function ImageRecognitionSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const isCompleted = selectedRun?.completed_at != null;
+
+  // SQLite query for completed tasks
+  const {
+    data: sqliteEvents,
+    isLoading: sqliteLoading,
+    error: sqliteError,
+  } = useTaskRunEvents(isCompleted ? selectedRunId : null, "image_recognition");
+
+  // JSONL query for running tasks
+  const {
+    data: jsonlLogs,
+    isLoading: jsonlLoading,
+    error: jsonlError,
+  } = useJsonlLogsForTaskRun("image-recognition", !isCompleted ? selectedRunId : null);
+
+  const isLoading = isCompleted ? sqliteLoading : jsonlLoading;
+  const error = isCompleted ? sqliteError : jsonlError;
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Eye className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view image recognition results</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading image recognition results...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  // Show SQLite events for completed tasks
+  if (isCompleted && sqliteEvents) {
+    if (sqliteEvents.events.length === 0) {
+      return (
+        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+          <Eye className="w-8 h-8 mb-3 opacity-50" />
+          <p className="text-sm">No image recognition results for this task run</p>
+        </div>
+      );
+    }
+    return (
+      <div className="space-y-4">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="px-2 py-0.5 rounded bg-muted">SQLite</span>
+          <span className="ml-2">{sqliteEvents.count} results</span>
+        </div>
+        <EventsDisplay events={sqliteEvents.events} />
+      </div>
+    );
+  }
+
+  // Show JSONL logs for running tasks
+  if (jsonlLogs && jsonlLogs.entries.length > 0) {
+    return (
+      <div className="space-y-4">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="px-2 py-0.5 rounded bg-muted">JSONL (real-time)</span>
+          <span className="ml-2">{jsonlLogs.count} entries</span>
+        </div>
+        <div className="border border-border rounded-lg overflow-hidden">
+          <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
+            {jsonlLogs.entries.map((entry, i) => (
+              <div key={i} className="py-1 border-b border-border/50 last:border-0">
+                {JSON.stringify(entry, null, 2)}
+              </div>
+            ))}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+      <Eye className="w-8 h-8 mb-3 opacity-50" />
+      <p className="text-sm">No image recognition results during this task run</p>
+    </div>
+  );
+}
+
+// Playwright Tests Section
+function PlaywrightTestsSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const isCompleted = selectedRun?.completed_at != null;
+
+  // JSONL query for running tasks
+  const {
+    data: jsonlLogs,
+    isLoading: jsonlLoading,
+    error: jsonlError,
+  } = useJsonlLogsForTaskRun("playwright", !isCompleted ? selectedRunId : null);
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <TestTube className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view Playwright test results</p>
+      </div>
+    );
+  }
+
+  // For completed tasks, use the PlaywrightResultsDisplay which queries SQLite
+  if (isCompleted) {
+    return <PlaywrightResultsDisplay taskRunId={selectedRunId} />;
+  }
+
+  // For running tasks, show JSONL logs
+  if (jsonlLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading Playwright results...
+      </div>
+    );
+  }
+
+  if (jsonlError) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {jsonlError.message}
+      </div>
+    );
+  }
+
+  if (jsonlLogs && jsonlLogs.entries.length > 0) {
+    return (
+      <div className="space-y-4">
+        <div className="text-xs text-muted-foreground bg-muted/30 px-3 py-2 rounded-md">
+          <span className="px-2 py-0.5 rounded bg-muted">JSONL (real-time)</span>
+          <span className="ml-2">{jsonlLogs.count} entries</span>
+        </div>
+        <div className="border border-border rounded-lg overflow-hidden">
+          <pre className="text-xs bg-background p-3 overflow-x-auto max-h-[500px] overflow-y-auto">
+            {jsonlLogs.entries.map((entry, i) => (
+              <div key={i} className="py-1 border-b border-border/50 last:border-0">
+                {JSON.stringify(entry, null, 2)}
+              </div>
+            ))}
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+      <TestTube className="w-8 h-8 mb-3 opacity-50" />
+      <p className="text-sm">No Playwright test results during this task run</p>
+    </div>
+  );
+}
+
+// AWAS Steps Section - displays AWAS step execution results from SQLite
+function AwasStepsSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const { data: awasData, isLoading, error } = useTaskRunAwasSteps(selectedRunId);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  // Get step type badge styling
+  const getStepTypeStyle = (stepType: string) => {
+    switch (stepType) {
+      case "awas_discover":
+        return {
+          bg: getAccentColors("blue").bg,
+          text: getAccentColors("blue").text,
+          label: "Discover",
+        };
+      case "awas_execute":
+        return {
+          bg: getAccentColors("green").bg,
+          text: getAccentColors("green").text,
+          label: "Execute",
+        };
+      case "awas_check_support":
+        return {
+          bg: getAccentColors("purple").bg,
+          text: getAccentColors("purple").text,
+          label: "Check Support",
+        };
+      case "awas_list_actions":
+        return {
+          bg: getAccentColors("yellow").bg,
+          text: getAccentColors("yellow").text,
+          label: "List Actions",
+        };
+      case "awas_extract_elements":
+        return {
+          bg: "bg-muted",
+          text: "text-foreground",
+          label: "Extract Elements",
+        };
+      default:
+        return {
+          bg: "bg-muted",
+          text: "text-muted-foreground",
+          label: stepType.replace("awas_", "").replace(/_/g, " "),
+        };
+    }
+  };
+
+  // Parse JSON safely
+  const parseJson = (jsonStr: string | null | undefined): unknown => {
+    if (!jsonStr) return null;
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      return jsonStr;
+    }
+  };
+
+  // Format JSON for display
+  const formatJson = (data: unknown): string => {
+    if (data === null || data === undefined) return "";
+    if (typeof data === "string") return data;
+    try {
+      return JSON.stringify(data, null, 2);
+    } catch {
+      return String(data);
+    }
+  };
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Bot className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view AWAS steps</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8 text-muted-foreground">
+        <Loader2 className="w-5 h-5 animate-spin mr-2" />
+        Loading AWAS steps...
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
+        <AlertCircle className="w-5 h-5 mr-2" />
+        Error: {error.message}
+      </div>
+    );
+  }
+
+  if (!awasData || awasData.steps.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Bot className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">No AWAS steps for this task run</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      {/* Summary stats */}
+      <div className="flex items-center gap-4 px-3 py-2 bg-muted/30 rounded-md">
+        <span className="text-sm font-medium">AWAS Steps:</span>
+        <span className={`flex items-center gap-1 text-sm ${getStatusColors("success").text}`}>
+          <CheckCircle className="w-4 h-4" />
+          {awasData.success_count} successful
+        </span>
+        <span className={`flex items-center gap-1 text-sm ${getStatusColors("error").text}`}>
+          <XCircle className="w-4 h-4" />
+          {awasData.failed_count} failed
+        </span>
+        <span className="text-xs text-muted-foreground ml-auto">{awasData.count} total steps</span>
+      </div>
+
+      {/* Steps list */}
+      <div className="space-y-2">
+        {awasData.steps.map((step: TaskRunAwasStepDb) => {
+          const stepTypeStyle = getStepTypeStyle(step.step_type);
+          const isExpanded = expandedIds.has(step.id);
+          const parameters = parseJson(step.parameters);
+          const responseData = parseJson(step.response_data);
+          const hasExpandableContent =
+            step.url || step.action_id || parameters || responseData || step.error_message;
+
+          return (
+            <div key={step.id} className="border border-border rounded-lg overflow-hidden">
+              <button
+                onClick={() => hasExpandableContent && toggleExpanded(step.id)}
+                className={`w-full flex items-center gap-3 px-4 py-3 bg-card transition-colors text-left ${
+                  hasExpandableContent ? "hover:bg-muted/50 cursor-pointer" : "cursor-default"
+                }`}
+              >
+                {hasExpandableContent ? (
+                  isExpanded ? (
+                    <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                  )
+                ) : (
+                  <div className="w-4 h-4 flex-shrink-0" />
+                )}
+                {step.success ? (
+                  <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />
+                ) : (
+                  <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />
+                )}
+                <span
+                  className={`px-2 py-0.5 text-xs font-medium rounded ${stepTypeStyle.bg} ${stepTypeStyle.text}`}
+                >
+                  {stepTypeStyle.label}
+                </span>
+                <span className="flex-1 truncate text-sm">
+                  {step.step_name || step.action_id || step.url || "Step"}
+                </span>
+                {step.duration_ms !== null && step.duration_ms !== undefined && (
+                  <span className="text-xs text-muted-foreground">{step.duration_ms}ms</span>
+                )}
+              </button>
+              {isExpanded && hasExpandableContent && (
+                <div className="px-4 py-3 bg-muted/30 border-t border-border space-y-3">
+                  {step.step_name && (
+                    <div className="text-xs">
+                      <span className="font-medium text-muted-foreground">Step Name:</span>{" "}
+                      {step.step_name}
+                    </div>
+                  )}
+                  {step.url && (
+                    <div className="text-xs">
+                      <span className="font-medium text-muted-foreground">URL:</span>{" "}
+                      <span className="font-mono break-all">{step.url}</span>
+                    </div>
+                  )}
+                  {step.action_id && (
+                    <div className="text-xs">
+                      <span className="font-medium text-muted-foreground">Action ID:</span>{" "}
+                      <span className="font-mono">{step.action_id}</span>
+                    </div>
+                  )}
+                  {parameters && (
+                    <CollapsibleSection title="Parameters">
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-48 overflow-y-auto whitespace-pre-wrap">
+                        {formatJson(parameters)}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  {responseData && (
+                    <CollapsibleSection title="Response Data" defaultOpen={!step.error_message}>
+                      <pre className="text-xs bg-background p-2 rounded overflow-x-auto max-h-64 overflow-y-auto whitespace-pre-wrap">
+                        {formatJson(responseData)}
+                      </pre>
+                    </CollapsibleSection>
+                  )}
+                  {step.error_message && (
+                    <div>
+                      <div className={`text-xs font-medium ${getStatusColors("error").text} mb-1`}>
+                        Error
+                      </div>
+                      <pre
+                        className={`text-xs ${getStatusColors("error").bg} ${getStatusColors("error").text} p-2 rounded overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap`}
+                      >
+                        {step.error_message}
+                      </pre>
+                    </div>
+                  )}
+                  <div className="text-xs text-muted-foreground">
+                    Created: {formatTimestamp(step.created_at)}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// Unified API Requests Section - uses SQLite for completed, JSONL for running
+function UnifiedApiRequestsSection() {
+  const { selectedRunId, selectedRun } = useRunSelection();
+  const isCompleted = selectedRun?.completed_at != null;
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Globe className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view API requests</p>
+      </div>
+    );
+  }
+
+  // For completed tasks, use the ApiRequestsDisplay which queries SQLite
+  if (isCompleted) {
+    return <ApiRequestsDisplay taskRunId={selectedRunId} />;
+  }
+
+  // For running tasks, use the ApiRequestsSection which reads JSONL
+  return <ApiRequestsSection />;
+}
+
+// =============================================================================
+// MCP Calls Section
+// =============================================================================
+
+// MCP Calls Display - shows SQLite-stored MCP call results
+function McpCallsDisplay({ taskRunId }: { taskRunId: string }) {
+  const { data: mcpData, isLoading, error } = useTaskRunMcpCalls(taskRunId);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  const toggleExpanded = (id: string) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <AlertCircle className="w-8 h-8 mb-3 text-destructive opacity-50" />
+        <p className="text-sm">Error loading MCP calls</p>
+      </div>
+    );
+  }
+
+  if (!mcpData || mcpData.calls.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Wifi className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">No MCP calls for this task run</p>
+      </div>
+    );
+  }
+
+  // Parse JSON fields safely
+  const parseJson = (jsonStr: string | null | undefined): unknown => {
+    if (!jsonStr) return null;
+    try {
+      return JSON.parse(jsonStr);
+    } catch {
+      return jsonStr;
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      {/* Summary stats */}
+      <div className="flex gap-4 text-xs text-muted-foreground">
+        <span>Total: {mcpData.count}</span>
+        <span className="text-green-400">Success: {mcpData.success_count}</span>
+        <span className="text-red-400">Failed: {mcpData.failed_count}</span>
+      </div>
+
+      {/* MCP calls list */}
+      <div className="space-y-3">
+        {mcpData.calls.map((call: TaskRunMcpCallDb) => {
+          const isExpanded = expandedIds.has(call.id);
+          const response = parseJson(call.response);
+          const args = parseJson(call.arguments);
+          const resolvedArgs = parseJson(call.resolved_arguments);
+
+          return (
+            <div key={call.id} className="border border-border rounded-lg overflow-hidden bg-card">
+              {/* Header row - clickable to expand */}
+              <button
+                onClick={() => toggleExpanded(call.id)}
+                className="w-full flex items-center gap-3 p-3 hover:bg-muted/50 transition-colors text-left"
+              >
+                {/* Status indicator */}
+                <div
+                  className={`w-2 h-2 rounded-full flex-shrink-0 ${
+                    call.success ? "bg-green-500" : "bg-red-500"
+                  }`}
+                />
+
+                {/* Server and tool info */}
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="px-2 py-0.5 text-xs font-medium rounded bg-purple-500/20 text-purple-400">
+                      {call.server_name || call.server_id}
+                    </span>
+                    <span className="text-sm font-mono text-foreground truncate">
+                      {call.tool_name}
+                    </span>
+                  </div>
+                  {call.step_name && (
+                    <p className="text-xs text-muted-foreground mt-1 truncate">
+                      Step: {call.step_name}
+                    </p>
+                  )}
+                </div>
+
+                {/* Duration */}
+                <span className="text-xs text-muted-foreground flex-shrink-0">
+                  {call.duration_ms}ms
+                </span>
+
+                {/* Expand chevron */}
+                {isExpanded ? (
+                  <ChevronDown className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                ) : (
+                  <ChevronRight className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                )}
+              </button>
+
+              {/* Expanded content */}
+              {isExpanded && (
+                <div className="border-t border-border p-3 space-y-3 bg-muted/30">
+                  {/* Arguments */}
+                  {args && (
+                    <div>
+                      <p className="text-xs font-medium text-muted-foreground mb-1">Arguments</p>
+                      <pre className="text-xs font-mono bg-background p-2 rounded overflow-auto max-h-32 text-foreground">
+                        {JSON.stringify(args, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+
+                  {/* Resolved arguments (if different) */}
+                  {resolvedArgs && JSON.stringify(resolvedArgs) !== JSON.stringify(args) && (
+                    <div>
+                      <p className="text-xs font-medium text-muted-foreground mb-1">
+                        Resolved Arguments
+                      </p>
+                      <pre className="text-xs font-mono bg-background p-2 rounded overflow-auto max-h-32 text-foreground">
+                        {JSON.stringify(resolvedArgs, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+
+                  {/* Response */}
+                  {response && (
+                    <div>
+                      <p className="text-xs font-medium text-muted-foreground mb-1">
+                        Response ({call.response_type})
+                      </p>
+                      <pre className="text-xs font-mono bg-background p-2 rounded overflow-auto max-h-48 text-foreground">
+                        {typeof response === "string"
+                          ? response
+                          : JSON.stringify(response, null, 2)}
+                      </pre>
+                    </div>
+                  )}
+
+                  {/* Error message */}
+                  {call.error_message && (
+                    <div>
+                      <p className="text-xs font-medium text-red-400 mb-1">Error</p>
+                      <p className="text-xs text-red-300 bg-red-900/20 p-2 rounded">
+                        {call.error_message}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Timestamp */}
+                  <div className="flex gap-4 text-xs text-muted-foreground pt-2 border-t border-border">
+                    <span>Created: {new Date(call.created_at).toLocaleString()}</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// MCP Calls Section - only shows SQLite data (MCP calls are only stored to SQLite)
+function McpCallsSection() {
+  const { selectedRunId } = useRunSelection();
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Wifi className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view MCP calls</p>
+      </div>
+    );
+  }
+
+  return <McpCallsDisplay taskRunId={selectedRunId} />;
+}
+
+// =============================================================================
+// Mobile Sections
+// =============================================================================
+
+import {
+  useMobileStates,
+  useMobileLogs,
+  useMobileErrors,
+  useMobileDevices,
+  useCaptureFeedback,
+} from "../../hooks/useMobileData";
+import type { MobileState, MobileLog } from "../../types/mobile";
+
+// Mobile State Section - displays device/app state captures
+function MobileStateSection() {
+  const { selectedRunId } = useRunSelection();
+  const { data: states, isLoading, error } = useMobileStates(selectedRunId, 50);
+  const { data: devices } = useMobileDevices();
+  const captureFeedback = useCaptureFeedback();
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+
+  const toggleExpanded = (id: number) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const handleCapture = async () => {
+    if (!selectedRunId || !devices?.length) return;
+    try {
+      await captureFeedback.mutateAsync({
+        taskRunId: selectedRunId,
+        deviceId: devices[0].device_id,
+      });
+    } catch (err) {
+      console.error("Failed to capture mobile feedback:", err);
+    }
+  };
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Smartphone className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view mobile state</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-destructive">
+        <AlertCircle className="w-8 h-8 mb-3" />
+        <p className="text-sm">Error loading mobile state: {String(error)}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-semibold">Mobile App State</h3>
+        <div className="flex items-center gap-2">
+          {devices && devices.length > 0 && (
+            <span className="text-xs text-muted-foreground">
+              {devices.length} device(s) connected
+            </span>
+          )}
+          <button
+            onClick={handleCapture}
+            disabled={captureFeedback.isPending || !devices?.length}
+            className="px-3 py-1.5 text-sm rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {captureFeedback.isPending ? "Capturing..." : "Capture Now"}
+          </button>
+        </div>
+      </div>
+
+      {!states || states.length === 0 ? (
+        <div className="text-center py-8 text-muted-foreground">
+          <Smartphone className="w-8 h-8 mx-auto mb-3 opacity-50" />
+          <p className="text-sm">No mobile state captures for this task run</p>
+          <p className="text-xs mt-1">Click "Capture Now" to capture device state</p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          {states.map((state) => (
+            <div key={state.id} className="border rounded-lg bg-card overflow-hidden">
+              <button
+                onClick={() => toggleExpanded(state.id)}
+                className="w-full flex items-center gap-3 p-3 hover:bg-muted/50 transition-colors"
+              >
+                {expandedIds.has(state.id) ? (
+                  <ChevronDown className="w-4 h-4 flex-shrink-0" />
+                ) : (
+                  <ChevronRight className="w-4 h-4 flex-shrink-0" />
+                )}
+                <div className="flex-1 flex items-center gap-3">
+                  <span
+                    className={`px-2 py-0.5 text-xs rounded-full ${
+                      state.device_type === "emulator"
+                        ? getAccentColors("blue").bg + " " + getAccentColors("blue").text
+                        : getAccentColors("green").bg + " " + getAccentColors("green").text
+                    }`}
+                  >
+                    {state.device_type || "unknown"}
+                  </span>
+                  <span className="text-sm font-medium">{state.device_id || "Unknown Device"}</span>
+                  {state.has_errors && <AlertCircle className="w-4 h-4 text-destructive" />}
+                </div>
+                <span className="text-xs text-muted-foreground">
+                  {new Date(state.timestamp).toLocaleTimeString()}
+                </span>
+              </button>
+
+              {expandedIds.has(state.id) && (
+                <div className="px-3 pb-3 pt-1 border-t bg-muted/20">
+                  <div className="grid grid-cols-2 gap-4 text-sm">
+                    <div>
+                      <div className="text-muted-foreground text-xs mb-1">App State</div>
+                      <div>{state.app_state || "-"}</div>
+                    </div>
+                    <div>
+                      <div className="text-muted-foreground text-xs mb-1">Metro</div>
+                      <div className="flex items-center gap-2">
+                        <span
+                          className={`w-2 h-2 rounded-full ${
+                            state.metro_connected ? "bg-green-500" : "bg-muted"
+                          }`}
+                        />
+                        {state.metro_connected ? "Connected" : "Disconnected"}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-muted-foreground text-xs mb-1">Bundle Status</div>
+                      <div>{state.bundle_status || "-"}</div>
+                    </div>
+                    <div>
+                      <div className="text-muted-foreground text-xs mb-1">Last Reload</div>
+                      <div>{state.last_reload_type || "-"}</div>
+                    </div>
+                    {state.screenshot_path && (
+                      <div className="col-span-2">
+                        <div className="text-muted-foreground text-xs mb-1">Screenshot</div>
+                        <div className="text-xs font-mono truncate">{state.screenshot_path}</div>
+                      </div>
+                    )}
+                    {state.error_summary && (
+                      <div className="col-span-2">
+                        <div className="text-muted-foreground text-xs mb-1">Error Summary</div>
+                        <div className="text-destructive text-sm">{state.error_summary}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Mobile Screenshots Section - displays captured screenshots
+function MobileScreenshotsSection() {
+  const { selectedRunId } = useRunSelection();
+  const { data: states, isLoading, error } = useMobileStates(selectedRunId, 100);
+
+  // Filter states that have screenshots
+  const statesWithScreenshots = useMemo(
+    () => states?.filter((s) => s.screenshot_path) || [],
+    [states],
+  );
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Camera className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view mobile screenshots</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-destructive">
+        <AlertCircle className="w-8 h-8 mb-3" />
+        <p className="text-sm">Error loading screenshots: {String(error)}</p>
+      </div>
+    );
+  }
+
+  if (statesWithScreenshots.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Camera className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">No mobile screenshots for this task run</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <h3 className="text-lg font-semibold">Mobile Screenshots</h3>
+      <div className="grid grid-cols-2 gap-4">
+        {statesWithScreenshots.map((state) => (
+          <div key={state.id} className="border rounded-lg bg-card overflow-hidden">
+            <div className="aspect-[9/16] bg-muted relative">
+              {state.screenshot_path && (
+                <img
+                  src={convertFileSrc(state.screenshot_path)}
+                  alt={`Screenshot at ${state.timestamp}`}
+                  className="w-full h-full object-contain"
+                  onError={(e) => {
+                    (e.target as HTMLImageElement).style.display = "none";
+                  }}
+                />
+              )}
+            </div>
+            <div className="p-2 border-t">
+              <div className="text-xs text-muted-foreground">
+                {new Date(state.timestamp).toLocaleString()}
+              </div>
+              <div className="text-xs truncate font-mono mt-1">
+                {state.device_id || "Unknown Device"}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Mobile Logs Section - displays parsed log entries
+function MobileLogsSection() {
+  const { selectedRunId } = useRunSelection();
+  const [logSource, setLogSource] = useState<string | undefined>(undefined);
+  const { data: logs, isLoading, error } = useMobileLogs(selectedRunId, logSource, false, 500);
+
+  const getLogLevelStyle = (level?: string) => {
+    const l = level?.toLowerCase() || "";
+    if (l === "e" || l === "error" || l === "fatal" || l === "f") {
+      return "text-destructive";
+    }
+    if (l === "w" || l === "warn" || l === "warning") {
+      return "text-yellow-600 dark:text-yellow-500";
+    }
+    if (l === "d" || l === "debug") {
+      return "text-muted-foreground";
+    }
+    return "text-foreground";
+  };
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <Terminal className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view mobile logs</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-destructive">
+        <AlertCircle className="w-8 h-8 mb-3" />
+        <p className="text-sm">Error loading logs: {String(error)}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-semibold">Mobile Logs</h3>
+        <select
+          value={logSource || "all"}
+          onChange={(e) => setLogSource(e.target.value === "all" ? undefined : e.target.value)}
+          className="text-sm border rounded-md px-2 py-1 bg-background"
+        >
+          <option value="all">All Sources</option>
+          <option value="logcat">Logcat</option>
+          <option value="metro">Metro</option>
+          <option value="build">Build</option>
+        </select>
+      </div>
+
+      {!logs || logs.length === 0 ? (
+        <div className="text-center py-8 text-muted-foreground">
+          <Terminal className="w-8 h-8 mx-auto mb-3 opacity-50" />
+          <p className="text-sm">No mobile logs for this task run</p>
+        </div>
+      ) : (
+        <div className="space-y-1 font-mono text-xs">
+          {logs.map((log) => (
+            <div
+              key={log.id}
+              className={`flex gap-2 p-1 hover:bg-muted/50 rounded ${getLogLevelStyle(log.log_level)}`}
+            >
+              <span className="text-muted-foreground flex-shrink-0 w-20">
+                {new Date(log.timestamp).toLocaleTimeString()}
+              </span>
+              <span className="flex-shrink-0 w-6 text-center font-bold">
+                {log.log_level?.charAt(0).toUpperCase() || "-"}
+              </span>
+              <span className="flex-shrink-0 w-24 truncate text-muted-foreground">
+                {log.log_tag || log.log_source}
+              </span>
+              <span className="flex-1 break-all">{log.message}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Mobile Errors Section - displays error logs specifically
+function MobileErrorsSection() {
+  const { selectedRunId } = useRunSelection();
+  const { data: errors, isLoading, error } = useMobileErrors(selectedRunId, 100);
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(new Set());
+
+  const toggleExpanded = (id: number) => {
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  if (!selectedRunId) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
+        <AlertCircle className="w-8 h-8 mb-3 opacity-50" />
+        <p className="text-sm">Select a task run to view mobile errors</p>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center py-8">
+        <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-destructive">
+        <AlertCircle className="w-8 h-8 mb-3" />
+        <p className="text-sm">Error loading mobile errors: {String(error)}</p>
+      </div>
+    );
+  }
+
+  if (!errors || errors.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-green-600 dark:text-green-500">
+        <CheckCircle className="w-8 h-8 mb-3" />
+        <p className="text-sm">No errors detected in mobile logs</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-semibold text-destructive">Mobile Errors ({errors.length})</h3>
+      </div>
+
+      <div className="space-y-2">
+        {errors.map((err) => (
+          <div
+            key={err.id}
+            className="border border-destructive/30 rounded-lg bg-destructive/5 overflow-hidden"
+          >
+            <button
+              onClick={() => toggleExpanded(err.id)}
+              className="w-full flex items-center gap-3 p-3 hover:bg-destructive/10 transition-colors text-left"
+            >
+              {expandedIds.has(err.id) ? (
+                <ChevronDown className="w-4 h-4 flex-shrink-0" />
+              ) : (
+                <ChevronRight className="w-4 h-4 flex-shrink-0" />
+              )}
+              <AlertCircle className="w-4 h-4 flex-shrink-0 text-destructive" />
+              <div className="flex-1 min-w-0">
+                <div className="text-sm font-medium truncate text-destructive">
+                  {err.error_type || err.log_tag || "Error"}
+                </div>
+                <div className="text-xs text-muted-foreground truncate">{err.message}</div>
+              </div>
+              <span className="text-xs text-muted-foreground flex-shrink-0">
+                {new Date(err.timestamp).toLocaleTimeString()}
+              </span>
+            </button>
+
+            {expandedIds.has(err.id) && (
+              <div className="px-3 pb-3 pt-1 border-t border-destructive/20 space-y-3">
+                <div>
+                  <div className="text-xs text-muted-foreground mb-1">Message</div>
+                  <div className="text-sm">{err.message}</div>
+                </div>
+
+                {err.stack_trace && (
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Stack Trace</div>
+                    <pre className="text-xs bg-muted p-2 rounded overflow-x-auto">
+                      {err.stack_trace}
+                    </pre>
+                  </div>
+                )}
+
+                {err.file_path && (
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Location</div>
+                    <div className="text-sm font-mono">
+                      {err.file_path}
+                      {err.line_number && `:${err.line_number}`}
+                      {err.column_number && `:${err.column_number}`}
+                    </div>
+                  </div>
+                )}
+
+                {err.raw_line && (
+                  <div>
+                    <div className="text-xs text-muted-foreground mb-1">Raw Log</div>
+                    <pre className="text-xs bg-muted p-2 rounded overflow-x-auto font-mono">
+                      {err.raw_line}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function AiDataViewerTab() {
   const [activeCategory, setActiveCategory] = useState<DataCategory>("ai-prompt");
   const { config } = useExecution();
   const configId = config?.path || "";
   const { data: automationRuns } = useAutomationRuns(configId, 50);
 
-  return (
-    <div className="h-full flex flex-col overflow-hidden">
-      {/* Category tabs - header is provided by RunPageLayout */}
-      <div className="flex-shrink-0 bg-background border-b border-border">
-        <div className="flex px-4 gap-4 overflow-x-auto">
-          <CategoryTab
-            id="ai-prompt"
-            label="AI Prompt"
-            icon={<MessageSquare className="w-4 h-4" />}
-            active={activeCategory === "ai-prompt"}
-            onClick={() => setActiveCategory("ai-prompt")}
-          />
-          <CategoryTab
-            id="jsonl-logs"
-            label="JSONL Logs"
-            icon={<FileJson className="w-4 h-4" />}
-            active={activeCategory === "jsonl-logs"}
-            onClick={() => setActiveCategory("jsonl-logs")}
-          />
-          <CategoryTab
-            id="dev-logs"
-            label="Dev Logs"
-            icon={<FileText className="w-4 h-4" />}
-            active={activeCategory === "dev-logs"}
-            onClick={() => setActiveCategory("dev-logs")}
-          />
-          <CategoryTab
-            id="automation-runs"
-            label="Automation Runs"
-            icon={<Activity className="w-4 h-4" />}
-            active={activeCategory === "automation-runs"}
-            onClick={() => setActiveCategory("automation-runs")}
-            count={automationRuns?.length}
-          />
-          <CategoryTab
-            id="screenshots"
-            label="Screenshots"
-            icon={<Image className="w-4 h-4" />}
-            active={activeCategory === "screenshots"}
-            onClick={() => setActiveCategory("screenshots")}
-          />
-          <CategoryTab
-            id="loaded-config"
-            label="Loaded Config"
-            icon={<Settings className="w-4 h-4" />}
-            active={activeCategory === "loaded-config"}
-            onClick={() => setActiveCategory("loaded-config")}
-          />
-          <CategoryTab
-            id="contexts"
-            label="Contexts"
-            icon={<BookOpen className="w-4 h-4" />}
-            active={activeCategory === "contexts"}
-            onClick={() => setActiveCategory("contexts")}
-          />
-        </div>
-      </div>
+  // Render the content for the active category
+  const renderContent = () => {
+    switch (activeCategory) {
+      // AI Session group
+      case "ai-prompt":
+        return <AiPromptSection />;
+      case "ai-output":
+        return <AiOutputSection />;
+      case "contexts":
+        return <ContextsSection />;
+      // Execution Logs group
+      case "events":
+        return <EventsSection />;
+      case "api-requests":
+        return <UnifiedApiRequestsSection />;
+      case "mcp-calls":
+        return <McpCallsSection />;
+      case "image-recognition":
+        return <ImageRecognitionSection />;
+      case "playwright-tests":
+        return <PlaywrightTestsSection />;
+      case "awas-steps":
+        return <AwasStepsSection />;
+      // Captures group
+      case "screenshots":
+        return <ScreenshotsSection />;
+      case "dom-snapshots":
+        return <DomSnapshotsPanel />;
+      // Mobile group
+      case "mobile-state":
+        return <MobileStateSection />;
+      case "mobile-screenshots":
+        return <MobileScreenshotsSection />;
+      case "mobile-logs":
+        return <MobileLogsSection />;
+      case "mobile-errors":
+        return <MobileErrorsSection />;
+      // Configuration group
+      case "loaded-config":
+        return <LoadedConfigSection />;
+      case "automation-runs":
+        return <AutomationRunsSection />;
+      case "dev-logs":
+        return <DevLogsSection />;
+      default:
+        return null;
+    }
+  };
 
-      {/* Content */}
+  // Check if the current category needs flex layout (for scrollable content)
+  const needsFlexLayout = ["ai-prompt", "loaded-config"].includes(activeCategory);
+
+  return (
+    <div className="h-full flex overflow-hidden">
+      {/* Sidebar navigation */}
+      <SidebarNav
+        activeCategory={activeCategory}
+        onCategoryChange={setActiveCategory}
+        automationRunsCount={automationRuns?.length}
+      />
+
+      {/* Content area */}
       <div
         className={`flex-1 min-h-0 p-4 ${
-          ["ai-prompt", "loaded-config"].includes(activeCategory)
-            ? "overflow-hidden flex flex-col"
-            : "overflow-auto"
+          needsFlexLayout ? "overflow-hidden flex flex-col" : "overflow-auto"
         }`}
       >
-        {activeCategory === "ai-prompt" && <AiPromptSection />}
-        {activeCategory === "jsonl-logs" && <JsonlLogsSection />}
-        {activeCategory === "dev-logs" && <DevLogsSection />}
-        {activeCategory === "automation-runs" && <AutomationRunsSection />}
-        {activeCategory === "screenshots" && <ScreenshotsSection />}
-        {activeCategory === "loaded-config" && <LoadedConfigSection />}
-        {activeCategory === "contexts" && <ContextsSection />}
+        {renderContent()}
       </div>
     </div>
   );

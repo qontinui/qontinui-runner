@@ -11,6 +11,7 @@
 import { useState } from "react";
 import * as Tabs from "@radix-ui/react-tabs";
 import { Calendar, History, Settings, Plus, RefreshCw, Wrench } from "lucide-react";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import { useScheduler } from "../../hooks/useScheduler";
 import { SchedulerTaskList } from "./SchedulerTaskList";
 import { SchedulerTaskForm } from "./SchedulerTaskForm";
@@ -82,11 +83,13 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
           {status && (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
               <span
-                className={`w-2 h-2 rounded-full ${status.enabled ? "bg-green-500" : "bg-text-muted"}`}
+                className={`w-2 h-2 rounded-full ${status.enabled ? getStatusColors("success").icon.replace("text-", "bg-") : "bg-text-muted"}`}
               />
               <span>{status.enabled ? "Running" : "Paused"}</span>
               {status.running_tasks > 0 && (
-                <span className="text-blue-500">({status.running_tasks} running)</span>
+                <span className={getStatusColors("running").text}>
+                  ({status.running_tasks} running)
+                </span>
               )}
             </div>
           )}
@@ -95,7 +98,7 @@ export function SchedulerTab({ className = "" }: SchedulerTabProps) {
           <button
             onClick={() => triggerAutoFix()}
             disabled={loading}
-            className="flex items-center gap-2 px-3 py-1.5 text-sm bg-orange-500/10 text-orange-500 rounded-lg hover:bg-orange-500/20 transition-colors"
+            className={`flex items-center gap-2 px-3 py-1.5 text-sm ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded-lg hover:bg-orange-500/20 transition-colors`}
             title="Trigger Auto-Fix Now"
           >
             <Wrench className="w-4 h-4" />

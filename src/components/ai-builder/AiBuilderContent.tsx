@@ -20,6 +20,7 @@ import { HistoryPanel } from "./HistoryPanel";
 import { AvailableImagesPanel } from "./AvailableImagesPanel";
 import { SaveWorkflowDialog } from "./SaveWorkflowDialog";
 import { NewWorkflowConfirmDialog } from "./NewWorkflowConfirmDialog";
+import { ExecutionStatusWidget } from "../execution-status";
 
 export function AiBuilderContent() {
   return (
@@ -63,6 +64,9 @@ export function AiBuilderContent() {
         <div className="space-y-4">
           {/* Running Indicator */}
           <RunningIndicator />
+
+          {/* Execution Status Panel */}
+          <ExecutionStatusWidget className="max-h-[500px]" />
 
           {/* Prompt Components View */}
           <PromptComponentsView />

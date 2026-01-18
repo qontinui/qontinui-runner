@@ -3,9 +3,7 @@
 This module provides functionality to trigger Claude Code analysis of automation
 results. It's designed to be called from SHELL actions or after workflow completion.
 
-The module handles platform-specific invocation:
-- On Windows: Invokes Claude Code via WSL (where MCP configuration exists)
-- On Linux/macOS: Invokes Claude Code directly
+Uses the shared Claude CLI runner for consistent execution across the runner.
 
 Usage from SHELL action:
     python -c "from claude_integration import trigger_analysis; trigger_analysis()"
@@ -15,16 +13,15 @@ Or import and use programmatically:
     result = trigger_analysis()
 """
 
-import contextlib
 import json
 import logging
 import os
-import platform
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+from services.claude_cli_runner import run_claude_cli
 
 logger = logging.getLogger(__name__)
 
@@ -107,10 +104,15 @@ def is_claude_available() -> bool:
     Returns:
         True if Claude Code CLI is available
     """
-    system = platform.system()
+    # Check if claude is available natively (preferred)
+    if shutil.which("claude") is not None or shutil.which("claude.cmd") is not None:
+        return True
 
-    if system == "Windows":
-        # On Windows, check if we can invoke via WSL
+    # On Windows, also check WSL as fallback
+    import platform
+    import subprocess
+
+    if platform.system() == "Windows":
         try:
             result = subprocess.run(
                 ["wsl.exe", "which", "claude"],
@@ -120,15 +122,15 @@ def is_claude_available() -> bool:
             )
             return result.returncode == 0
         except Exception:
-            return False
-    else:
-        # On Unix, check directly
-        return shutil.which("claude") is not None
+            pass
+
+    return False
 
 
 def trigger_analysis(
     timeout_seconds: int = 600,
     working_directory: str | None = None,
+    execution_mode: str = "auto",
 ) -> dict[str, Any]:
     """Trigger Claude Code to analyze automation results.
 
@@ -139,6 +141,7 @@ def trigger_analysis(
     Args:
         timeout_seconds: Maximum time to wait for analysis (default: 600s / 10min)
         working_directory: Working directory for Claude Code (default: auto-detect)
+        execution_mode: How to run Claude (auto, native, wsl)
 
     Returns:
         Dictionary with:
@@ -147,7 +150,7 @@ def trigger_analysis(
         - error: str - Error message (if failed)
         - execution_metadata: dict - Metadata from the automation run
     """
-    result = {
+    result: dict[str, Any] = {
         "success": False,
         "output": "",
         "error": "",
@@ -177,101 +180,33 @@ def trigger_analysis(
 
     # Determine working directory
     if working_directory:
-        cwd = Path(working_directory)
+        cwd = str(Path(working_directory))
     else:
         runner_dir = Path(__file__).parent.parent
-        cwd = runner_dir.parent  # qontinui_parent_directory
+        cwd = str(runner_dir.parent)  # qontinui_parent_directory
 
-    # Build the command based on platform
-    system = platform.system()
-
-    if system == "Windows":
-        # On Windows, invoke via WSL where Claude Code has MCP configured
-        # Convert Windows path to WSL path
-        wsl_cwd = str(cwd).replace("\\", "/")
-        if wsl_cwd[1] == ":":
-            # Convert C:\... to /mnt/c/...
-            drive = wsl_cwd[0].lower()
-            wsl_cwd = f"/mnt/{drive}/{wsl_cwd[3:]}"
-
-        cmd = [
-            "wsl.exe",
-            "bash",
-            "-c",
-            f'cd "{wsl_cwd}" && claude -p "{command_content[:1000]}..." --output-format text --permission-mode bypassPermissions 2>&1',
-        ]
-
-        # For very long prompts, we need to pass via a temp file
-        # Create a temp script that reads the full prompt
-        script_content = f"""#!/bin/bash
-cd "{wsl_cwd}"
-PROMPT=$(cat <<'ENDOFPROMPT'
-{command_content}
-ENDOFPROMPT
-)
-claude -p "$PROMPT" --output-format text --permission-mode bypassPermissions 2>&1
-"""
-
-        # Write script to temp file
-        import tempfile
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
-            f.write(script_content)
-            script_path = f.name
-
-        # Convert script path to WSL path
-        wsl_script = script_path.replace("\\", "/")
-        if wsl_script[1] == ":":
-            drive = wsl_script[0].lower()
-            wsl_script = f"/mnt/{drive}/{wsl_script[3:]}"
-
-        cmd = ["wsl.exe", "bash", wsl_script]
-
-    else:
-        # On Unix, invoke directly
-        cmd = [
-            "claude",
-            "-p",
-            command_content,
-            "--output-format",
-            "text",
-            "--permission-mode",
-            "bypassPermissions",
-        ]
-
-    # Execute Claude Code
+    # Execute Claude Code using the shared runner
     logger.info("Starting Claude Code analysis...")
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            cwd=str(cwd) if system != "Windows" else None,
-        )
+    cli_result = run_claude_cli(
+        prompt=command_content,
+        timeout_seconds=timeout_seconds,
+        execution_mode=execution_mode,
+        working_directory=cwd,
+        permission_mode="bypassPermissions",
+        fresh_context=True,
+        max_turns=None,  # No limit for analysis
+        output_format="text",
+    )
 
-        # Clean up temp script on Windows
-        if system == "Windows" and "script_path" in locals():
-            with contextlib.suppress(Exception):
-                os.unlink(script_path)
+    result["output"] = cli_result["output"]
+    result["success"] = cli_result["success"]
 
-        result["output"] = proc.stdout
-
-        if proc.returncode == 0:
-            result["success"] = True
-            logger.info("Claude Code analysis completed successfully")
-        else:
-            result["error"] = proc.stderr or f"Claude Code exited with code {proc.returncode}"
-            logger.error(f"Claude Code failed: {result['error']}")
-
-    except subprocess.TimeoutExpired:
-        result["error"] = f"Analysis timed out after {timeout_seconds} seconds"
-        logger.error(result["error"])
-
-    except Exception as e:
-        result["error"] = f"Failed to invoke Claude Code: {e}"
-        logger.error(result["error"])
+    if cli_result["success"]:
+        logger.info("Claude Code analysis completed successfully")
+    else:
+        result["error"] = cli_result["error"]
+        logger.error(f"Claude Code failed: {result['error']}")
 
     return result
 

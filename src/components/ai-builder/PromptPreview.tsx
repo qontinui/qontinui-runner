@@ -8,6 +8,7 @@ import { Sparkles } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
 import CollapsiblePanel from "../CollapsiblePanel";
 import { DEFAULT_DEVELOPER_PROMPT_TEMPLATE, getDeveloperPromptTemplate } from "./constants";
+import { getAccentColors } from "@/design-system";
 
 export function PromptPreview() {
   const {
@@ -31,7 +32,11 @@ export function PromptPreview() {
       headerExtra={
         <div className="flex items-center gap-2">
           {usingCustomTemplate && (
-            <span className="text-xs bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded">Custom</span>
+            <span
+              className={`text-xs ${getAccentColors("blue").bg} ${getAccentColors("blue").text} px-2 py-0.5 rounded`}
+            >
+              Custom
+            </span>
           )}
           {!isEditingPromptTemplate ? (
             <button
@@ -86,7 +91,7 @@ export function PromptPreview() {
                 handleResetPromptTemplate();
                 setEditedPromptTemplate(DEFAULT_DEVELOPER_PROMPT_TEMPLATE);
               }}
-              className="px-3 py-1.5 text-xs text-orange-400 hover:text-orange-300 hover:bg-orange-500/10 rounded"
+              className={`px-3 py-1.5 text-xs ${getAccentColors("orange").text} hover:opacity-80 hover:${getAccentColors("orange").bg} rounded`}
               title="Reset to the hardcoded default template"
             >
               Reset to Default

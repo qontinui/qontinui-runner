@@ -2,6 +2,7 @@
  * Test Builder Context
  *
  * Shared state management for the test builder components.
+ * Supports draft tests that are only saved when explicitly requested.
  */
 
 import { createContext, useContext, useReducer, useCallback, useEffect, ReactNode } from "react";
@@ -12,7 +13,22 @@ import type {
   CreateTestInput,
   TestType,
   CommandResponse,
+  CollectedAnalysisSet,
+  CollectedAnalysis,
 } from "./types";
+
+// Storage key for persisting draft test state
+const DRAFT_TEST_STORAGE_KEY = "qontinui-test-builder-draft";
+
+// Special ID for draft tests (not yet saved to database)
+const DRAFT_TEST_ID = "__draft__";
+
+// Draft test data shape (for localStorage persistence)
+interface DraftTestData {
+  input: CreateTestInput;
+  code: string;
+  createdAt: number;
+}
 
 // State shape
 interface TestBuilderState {
@@ -26,6 +42,11 @@ interface TestBuilderState {
   isDirty: boolean;
   searchQuery: string;
   filterType: TestType | "all";
+  // Draft test state
+  draftTest: DraftTestData | null;
+  isCreatingNew: boolean;
+  // Collected analyses for auto-populating test config
+  collectedAnalyses: CollectedAnalysisSet | null;
 }
 
 // Actions
@@ -42,12 +63,44 @@ type TestBuilderAction =
   | { type: "SET_FILTER_TYPE"; filterType: TestType | "all" }
   | { type: "ADD_TEST"; test: VerificationTest }
   | { type: "UPDATE_TEST"; test: VerificationTest }
-  | { type: "DELETE_TEST"; id: string };
+  | { type: "DELETE_TEST"; id: string }
+  | { type: "SET_DRAFT_TEST"; draft: DraftTestData | null }
+  | { type: "SET_CREATING_NEW"; isCreating: boolean }
+  | { type: "START_NEW_TEST"; draft: DraftTestData }
+  | { type: "CLEAR_DRAFT" }
+  | { type: "SET_COLLECTED_ANALYSES"; analyses: CollectedAnalysisSet | null };
 
-// Initial state
+// Load draft from localStorage
+function loadDraftFromStorage(): DraftTestData | null {
+  try {
+    const saved = localStorage.getItem(DRAFT_TEST_STORAGE_KEY);
+    if (saved) {
+      return JSON.parse(saved);
+    }
+  } catch {
+    // Ignore parse errors
+  }
+  return null;
+}
+
+// Save draft to localStorage
+function saveDraftToStorage(draft: DraftTestData | null): void {
+  try {
+    if (draft) {
+      localStorage.setItem(DRAFT_TEST_STORAGE_KEY, JSON.stringify(draft));
+    } else {
+      localStorage.removeItem(DRAFT_TEST_STORAGE_KEY);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+// Initial state - restore draft from localStorage if available
+const savedDraft = loadDraftFromStorage();
 const initialState: TestBuilderState = {
   tests: [],
-  selectedTestId: null,
+  selectedTestId: savedDraft ? DRAFT_TEST_ID : null,
   isLoading: false,
   isExecuting: false,
   isSaving: false,
@@ -56,6 +109,9 @@ const initialState: TestBuilderState = {
   isDirty: false,
   searchQuery: "",
   filterType: "all",
+  draftTest: savedDraft,
+  isCreatingNew: savedDraft !== null,
+  collectedAnalyses: null,
 };
 
 // Reducer
@@ -94,6 +150,32 @@ function testBuilderReducer(state: TestBuilderState, action: TestBuilderAction):
         tests: state.tests.filter((t) => t.id !== action.id),
         selectedTestId: state.selectedTestId === action.id ? null : state.selectedTestId,
       };
+    case "SET_DRAFT_TEST":
+      saveDraftToStorage(action.draft);
+      return { ...state, draftTest: action.draft };
+    case "SET_CREATING_NEW":
+      return { ...state, isCreatingNew: action.isCreating };
+    case "START_NEW_TEST":
+      saveDraftToStorage(action.draft);
+      return {
+        ...state,
+        draftTest: action.draft,
+        isCreatingNew: true,
+        selectedTestId: DRAFT_TEST_ID,
+        isDirty: true,
+      };
+    case "CLEAR_DRAFT":
+      saveDraftToStorage(null);
+      return {
+        ...state,
+        draftTest: null,
+        isCreatingNew: false,
+        selectedTestId: null,
+        isDirty: false,
+        collectedAnalyses: null,
+      };
+    case "SET_COLLECTED_ANALYSES":
+      return { ...state, collectedAnalyses: action.analyses };
     default:
       return state;
   }
@@ -115,6 +197,14 @@ interface TestBuilderContextValue {
   setFilterType: (filterType: TestType | "all") => void;
   setDirty: (dirty: boolean) => void;
   clearError: () => void;
+  // Draft test functions
+  startNewTest: (testType: TestType) => void;
+  updateDraft: (input: Partial<CreateTestInput>, code?: string) => void;
+  saveDraft: () => Promise<VerificationTest | null>;
+  discardDraft: () => void;
+  isDraftSelected: boolean;
+  // Collected analyses functions
+  setCollectedAnalyses: (analyses: CollectedAnalysisSet | null) => void;
 }
 
 // Create context
@@ -124,8 +214,37 @@ const TestBuilderContext = createContext<TestBuilderContextValue | null>(null);
 export function TestBuilderProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(testBuilderReducer, initialState);
 
-  // Get selected test
-  const selectedTest = state.tests.find((t) => t.id === state.selectedTestId) || null;
+  // Check if draft is selected
+  const isDraftSelected = state.selectedTestId === DRAFT_TEST_ID && state.draftTest !== null;
+
+  // Get selected test - return virtual test object for draft
+  const selectedTest: VerificationTest | null = (() => {
+    if (isDraftSelected && state.draftTest) {
+      // Create a virtual VerificationTest from draft data
+      const draft = state.draftTest;
+      return {
+        id: DRAFT_TEST_ID,
+        name: draft.input.name || "New Test",
+        description: draft.input.description,
+        test_type: draft.input.test_type,
+        category: draft.input.category || "custom",
+        playwright_code: draft.input.playwright_code,
+        vision_config: draft.input.vision_config,
+        python_code: draft.input.python_code,
+        repo_test_config: draft.input.repo_test_config,
+        success_criteria: draft.input.success_criteria,
+        config: draft.input.config || {},
+        timeout_seconds: draft.input.timeout_seconds || 60,
+        is_critical: draft.input.is_critical ?? true,
+        enabled: draft.input.enabled ?? true,
+        tags: draft.input.tags || [],
+        created_at: new Date(draft.createdAt).toISOString(),
+        updated_at: new Date().toISOString(),
+        ai_generated: false,
+      };
+    }
+    return state.tests.find((t) => t.id === state.selectedTestId) || null;
+  })();
 
   // Filter tests based on search and type
   const filteredTests = state.tests.filter((test) => {
@@ -384,6 +503,121 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
     dispatch({ type: "SET_ERROR", error: null });
   }, []);
 
+  // Start creating a new test (creates draft, does not save)
+  const startNewTest = useCallback((testType: TestType) => {
+    const testTypeLabels: Record<TestType, string> = {
+      playwright_cdp: "Playwright CDP",
+      qontinui_vision: "Vision",
+      python_script: "Python Script",
+      repository_test: "Repository Test",
+    };
+
+    const draft: DraftTestData = {
+      input: {
+        name: `New ${testTypeLabels[testType]}`,
+        test_type: testType,
+        category:
+          testType === "playwright_cdp"
+            ? "dom"
+            : testType === "qontinui_vision"
+              ? "visual"
+              : "custom",
+      },
+      code: "",
+      createdAt: Date.now(),
+    };
+    dispatch({ type: "START_NEW_TEST", draft });
+  }, []);
+
+  // Update draft test data
+  const updateDraft = useCallback(
+    (input: Partial<CreateTestInput>, code?: string) => {
+      if (!state.draftTest) return;
+
+      const updatedDraft: DraftTestData = {
+        ...state.draftTest,
+        input: { ...state.draftTest.input, ...input },
+        code: code !== undefined ? code : state.draftTest.code,
+      };
+      dispatch({ type: "SET_DRAFT_TEST", draft: updatedDraft });
+      dispatch({ type: "SET_DIRTY", dirty: true });
+    },
+    [state.draftTest],
+  );
+
+  // Save draft test to database
+  const saveDraft = useCallback(async (): Promise<VerificationTest | null> => {
+    if (!state.draftTest) return null;
+
+    dispatch({ type: "SET_SAVING", saving: true });
+    dispatch({ type: "SET_ERROR", error: null });
+
+    try {
+      const input = { ...state.draftTest.input };
+
+      // Auto-populate api_request_config from collected API request analysis
+      if (state.collectedAnalyses && input.test_type === "python_script") {
+        const apiAnalysis = state.collectedAnalyses.analyses.find(
+          (a): a is CollectedAnalysis & { type: "api_request" } => a.type === "api_request",
+        );
+        if (apiAnalysis?.data.source_request_config) {
+          // Only set if not already configured
+          const existingConfig = input.config as Record<string, unknown> | undefined;
+          if (!existingConfig?.api_request_config) {
+            input.config = {
+              ...existingConfig,
+              api_request_config: apiAnalysis.data.source_request_config,
+            };
+          }
+        }
+      }
+
+      const response = await invoke<CommandResponse<VerificationTest>>("create_verification_test", {
+        input: {
+          name: input.name,
+          description: input.description,
+          test_type: input.test_type,
+          category: input.category,
+          playwright_code: input.playwright_code,
+          vision_config: input.vision_config,
+          python_code: input.python_code,
+          repo_test_config: input.repo_test_config,
+          success_criteria: input.success_criteria,
+          config: input.config || {},
+          timeout_seconds: input.timeout_seconds || 60,
+          is_critical: input.is_critical ?? true,
+          enabled: input.enabled ?? true,
+          tags: input.tags || [],
+        },
+      });
+
+      if (response.success && response.data) {
+        dispatch({ type: "ADD_TEST", test: response.data });
+        dispatch({ type: "CLEAR_DRAFT" });
+        dispatch({ type: "SET_SELECTED_TEST", id: response.data.id });
+        return response.data;
+      } else {
+        dispatch({ type: "SET_ERROR", error: response.message || "Failed to save test" });
+        return null;
+      }
+    } catch (err) {
+      dispatch({ type: "SET_ERROR", error: String(err) });
+      return null;
+    } finally {
+      dispatch({ type: "SET_SAVING", saving: false });
+    }
+  }, [state.draftTest, state.collectedAnalyses]);
+
+  // Discard draft test
+  const discardDraft = useCallback(() => {
+    dispatch({ type: "CLEAR_DRAFT" });
+  }, []);
+
+  // Set collected analyses (from PageAnalyzer)
+  const setCollectedAnalyses = useCallback((analyses: CollectedAnalysisSet | null) => {
+    dispatch({ type: "SET_COLLECTED_ANALYSES", analyses });
+  }, []);
+
   // Load tests on mount
   useEffect(() => {
     loadTests();
@@ -404,6 +638,14 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
     setFilterType,
     setDirty,
     clearError,
+    // Draft test functions
+    startNewTest,
+    updateDraft,
+    saveDraft,
+    discardDraft,
+    isDraftSelected,
+    // Collected analyses functions
+    setCollectedAnalyses,
   };
 
   return <TestBuilderContext.Provider value={value}>{children}</TestBuilderContext.Provider>;

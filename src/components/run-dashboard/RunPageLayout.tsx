@@ -9,6 +9,7 @@ import { ReactNode } from "react";
 import { LucideIcon, Activity } from "lucide-react";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
+import { getStatusColors } from "@/design-system";
 
 interface RunPageLayoutProps {
   /** Child content to render */
@@ -89,7 +90,9 @@ export function RunPageLayout({ children, title, icon: Icon, badgeCount }: RunPa
           <div className="mt-2 text-xs text-muted-foreground">
             Viewing: <span className="font-medium">{selectedRun.task_name || "Unknown Task"}</span>
             {selectedRun.status === "running" && (
-              <span className="ml-2 px-1.5 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded">
+              <span
+                className={`ml-2 px-1.5 py-0.5 text-xs ${getStatusColors("running").bg} ${getStatusColors("running").text} rounded`}
+              >
                 In Progress
               </span>
             )}

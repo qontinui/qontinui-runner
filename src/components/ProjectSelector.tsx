@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { FolderOpen, RefreshCw, Loader2, Check, AlertCircle } from "lucide-react";
+import { getStatusColors } from "@/design-system";
 
 interface RAGProject {
   project_id: string;
@@ -132,7 +133,9 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
 
       {/* Error message */}
       {error && (
-        <div className="flex items-center gap-2 p-2 text-sm text-red-400 bg-red-950/30 rounded border border-red-900/50">
+        <div
+          className={`flex items-center gap-2 p-2 text-sm ${getStatusColors("error").text} ${getStatusColors("error").bg} rounded border ${getStatusColors("error").border}`}
+        >
           <AlertCircle className="w-4 h-4 flex-shrink-0" />
           <span className="truncate">{error}</span>
         </div>
@@ -189,7 +192,9 @@ export function ProjectSelector({ onProjectLoad, onLog }: ProjectSelectorProps) 
                     <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
                       <span>{project.element_count} elements</span>
                       <span>{project.screenshot_count} screenshots</span>
-                      {project.has_embeddings && <span className="text-green-400">RAG Ready</span>}
+                      {project.has_embeddings && (
+                        <span className={getStatusColors("success").text}>RAG Ready</span>
+                      )}
                     </div>
                   </div>
                 </div>

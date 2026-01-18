@@ -2,14 +2,15 @@
 AI Prompt Executor Module
 
 Handles execution of AI_PROMPT and RUN_PROMPT_SEQUENCE actions.
-Spawns Claude Code CLI as subprocess for AI execution.
+Uses the shared Claude CLI runner for consistent execution across the runner.
 """
 
 import logging
-import subprocess
 import time
 from collections.abc import Callable
 from typing import Any
+
+from services.claude_cli_runner import run_claude_cli
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,7 @@ class AIPromptExecutor:
         working_directory: str | None = None,
         timeout: int | None = 600000,
         output_variable: str | None = None,
+        execution_mode: str = "auto",
     ) -> dict[str, Any]:
         """
         Execute a single AI prompt.
@@ -51,6 +53,7 @@ class AIPromptExecutor:
             working_directory: Working directory for execution
             timeout: Timeout in milliseconds
             output_variable: Variable name to store output (for future use)
+            execution_mode: How to run Claude (auto, native, wsl)
 
         Returns:
             Dictionary with:
@@ -58,101 +61,42 @@ class AIPromptExecutor:
                 - output: str (Claude's response)
                 - error: str | None
                 - exit_code: int
+                - duration_seconds: float
         """
-        try:
-            self.emit_log("info", f"Executing AI prompt: {prompt[:100]}...")
+        self.emit_log("info", f"Executing AI prompt: {prompt[:100]}...")
 
-            # Build command with autonomous execution flags
-            # --permission-mode bypassPermissions: Run without user approval prompts
-            # --output-format text: Plain text output for easier parsing
-            base_args = [
-                "claude",
-                "--output-format",
-                "text",
-                "--permission-mode",
-                "bypassPermissions",
-            ]
+        context_mode = "fresh context" if fresh_context else "continuous context"
+        self.emit_log("debug", f"Using {context_mode} with bypassPermissions")
 
-            if fresh_context:
-                # Use --print for non-interactive execution with fresh context
-                cmd = base_args + ["--print", prompt]
-                self.emit_log("debug", "Using fresh context (--print, bypassPermissions)")
-            else:
-                # Use -c for continuing context
-                cmd = base_args + ["-c", prompt]
-                self.emit_log("debug", "Using continuous context (-c, bypassPermissions)")
+        if working_directory:
+            self.emit_log("debug", f"Working directory: {working_directory}")
 
-            # Convert timeout from ms to seconds
-            timeout_seconds = (timeout / 1000.0) if timeout else 600.0
+        # Convert timeout from ms to seconds
+        timeout_seconds = int((timeout / 1000.0) if timeout else 600.0)
 
-            # Set up subprocess options
-            kwargs: dict[str, Any] = {
-                "capture_output": True,
-                "text": True,
-                "timeout": timeout_seconds,
-            }
+        # Use the shared Claude CLI runner
+        result = run_claude_cli(
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            execution_mode=execution_mode,
+            working_directory=working_directory,
+            permission_mode="bypassPermissions",
+            fresh_context=fresh_context,
+            max_turns=None,  # No limit for AI prompts
+            output_format="text",
+        )
 
-            if working_directory:
-                kwargs["cwd"] = working_directory
-                self.emit_log("debug", f"Working directory: {working_directory}")
+        self.emit_log(
+            "info",
+            f"AI prompt completed in {result['duration_seconds']:.2f}s, exit code: {result['exit_code']}",
+        )
 
-            # Execute command
-            start_time = time.time()
-            result = subprocess.run(cmd, **kwargs)
-            duration = time.time() - start_time
+        if not result["success"]:
+            self.emit_log("error", f"AI prompt failed: {result['error'] or 'Unknown error'}")
+        else:
+            self.emit_log("debug", f"AI output length: {len(result['output'])} characters")
 
-            self.emit_log(
-                "info",
-                f"AI prompt completed in {duration:.2f}s, exit code: {result.returncode}",
-            )
-
-            # Process result
-            success = result.returncode == 0
-            output = result.stdout.strip() if result.stdout else ""
-            error = result.stderr.strip() if result.stderr and not success else None
-
-            if not success:
-                self.emit_log("error", f"AI prompt failed: {error or 'Unknown error'}")
-            else:
-                self.emit_log("debug", f"AI output length: {len(output)} characters")
-
-            return {
-                "success": success,
-                "output": output,
-                "error": error,
-                "exit_code": result.returncode,
-                "duration_seconds": duration,
-            }
-
-        except subprocess.TimeoutExpired:
-            self.emit_log("error", f"AI prompt timed out after {timeout_seconds}s")
-            return {
-                "success": False,
-                "output": "",
-                "error": f"Execution timed out after {timeout_seconds} seconds",
-                "exit_code": -1,
-                "duration_seconds": timeout_seconds,
-            }
-
-        except FileNotFoundError:
-            self.emit_log("error", "Claude CLI not found. Is Claude Code installed?")
-            return {
-                "success": False,
-                "output": "",
-                "error": "Claude CLI executable not found. Please ensure Claude Code is installed.",
-                "exit_code": -1,
-                "duration_seconds": 0.0,
-            }
-
-        except Exception as e:
-            self.emit_log("error", f"AI prompt execution failed: {e}")
-            return {
-                "success": False,
-                "output": "",
-                "error": str(e),
-                "exit_code": -1,
-                "duration_seconds": 0.0,
-            }
+        return result
 
     def execute_prompt_sequence(
         self,

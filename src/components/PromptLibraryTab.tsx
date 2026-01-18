@@ -26,6 +26,7 @@ import {
 } from "lucide-react";
 import { ContextSelector, useContexts } from "./contexts";
 import type { ContextSelection } from "../types/context";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 // Types for the prompt library
 // Simplified model: every task runs until [TASK_COMPLETE] marker is found
@@ -40,7 +41,7 @@ interface SavedPrompt {
   max_sessions: number | null;
   /** Optional AI provider override (e.g., "gemini_api", "claude_cli") */
   provider?: string | null;
-  /** Optional AI model override (e.g., "gemini-3-flash") */
+  /** Optional AI model override (e.g., "gemini-3-flash-preview") */
   model?: string | null;
   created_at: string;
   modified_at: string;
@@ -69,15 +70,15 @@ const MODELS_BY_PROVIDER: Record<string, { value: string; label: string }[]> = {
   ],
   gemini_cli: [
     { value: "", label: "Default" },
-    { value: "gemini-3-flash", label: "Gemini 3 Flash (Fast/Cheap)" },
-    { value: "gemini-3-pro", label: "Gemini 3 Pro" },
+    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash (Fast/Cheap)" },
+    { value: "gemini-3-pro-preview", label: "Gemini 3 Pro" },
     { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
     { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   ],
   gemini_api: [
     { value: "", label: "Default" },
-    { value: "gemini-3-flash", label: "Gemini 3 Flash (Fast/Cheap)" },
-    { value: "gemini-3-pro", label: "Gemini 3 Pro" },
+    { value: "gemini-3-flash-preview", label: "Gemini 3 Flash (Fast/Cheap)" },
+    { value: "gemini-3-pro-preview", label: "Gemini 3 Pro" },
     { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
     { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   ],
@@ -943,10 +944,10 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
 
       {/* Active Task Runs */}
       {taskRuns.length > 0 && (
-        <div className="card p-4 space-y-3 border-2 border-blue-500/30">
+        <div className={`card p-4 space-y-3 border-2 ${getAccentColors("blue").border}`}>
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-semibold flex items-center gap-2">
-              <Sparkles className="w-5 h-5 text-blue-500" />
+              <Sparkles className={`w-5 h-5 ${getAccentColors("blue").text}`} />
               Active Tasks
               <span className="text-sm text-muted-foreground">({taskRuns.length})</span>
             </h3>
@@ -1043,12 +1044,16 @@ function TaskCard({
               </span>
             )}
             {task.max_sessions && (
-              <span className="px-2 py-0.5 text-xs bg-blue-500/10 text-blue-500 rounded-full">
+              <span
+                className={`px-2 py-0.5 text-xs ${getAccentColors("blue").bg} ${getAccentColors("blue").text} rounded-full`}
+              >
                 Max {task.max_sessions} sessions
               </span>
             )}
             {task.provider && (
-              <span className="px-2 py-0.5 text-xs bg-purple-500/10 text-purple-500 rounded-full flex items-center gap-1">
+              <span
+                className={`px-2 py-0.5 text-xs ${getAccentColors("purple").bg} ${getAccentColors("purple").text} rounded-full flex items-center gap-1`}
+              >
                 <Sparkles className="w-3 h-3" />
                 {task.provider.replace("_", " ")}
                 {task.model && ` / ${task.model}`}
@@ -1156,13 +1161,13 @@ function TaskRunCard({ run, onStop, onDelete }: TaskRunCardProps) {
   const getStatusIcon = () => {
     switch (run.status) {
       case "running":
-        return <Loader2 className="w-4 h-4 animate-spin text-green-500" />;
+        return <Loader2 className={`w-4 h-4 animate-spin ${getStatusColors("success").icon}`} />;
       case "complete":
-        return <CheckCircle className="w-4 h-4 text-green-500" />;
+        return <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />;
       case "failed":
-        return <AlertCircle className="w-4 h-4 text-red-500" />;
+        return <AlertCircle className={`w-4 h-4 ${getStatusColors("error").text}`} />;
       case "stopped":
-        return <Square className="w-4 h-4 text-orange-500" />;
+        return <Square className={`w-4 h-4 ${getAccentColors("orange").text}`} />;
       default:
         return <Clock className="w-4 h-4 text-muted-foreground" />;
     }
@@ -1171,13 +1176,13 @@ function TaskRunCard({ run, onStop, onDelete }: TaskRunCardProps) {
   const getStatusColor = () => {
     switch (run.status) {
       case "running":
-        return "text-green-500";
+        return getStatusColors("success").icon;
       case "complete":
-        return "text-green-500";
+        return getStatusColors("success").icon;
       case "failed":
-        return "text-red-500";
+        return getStatusColors("error").text;
       case "stopped":
-        return "text-orange-500";
+        return getAccentColors("orange").text;
       default:
         return "text-muted-foreground";
     }
@@ -1223,7 +1228,7 @@ function TaskRunCard({ run, onStop, onDelete }: TaskRunCardProps) {
           )}
           <button
             onClick={onDelete}
-            className="btn-secondary p-2 hover:text-red-500"
+            className={`btn-secondary p-2 hover:${getStatusColors("error").text}`}
             title="Delete record"
           >
             <Trash2 className="w-4 h-4" />
@@ -1255,7 +1260,7 @@ function TaskRunCard({ run, onStop, onDelete }: TaskRunCardProps) {
                     <span className="text-muted-foreground">
                       {formatTimestamp(event.timestamp)}
                     </span>
-                    <span className="text-blue-500">[{event.event_type}]</span>
+                    <span className={getAccentColors("blue").text}>[{event.event_type}]</span>
                     <span>{event.message}</span>
                   </div>
                 ))}
@@ -1266,7 +1271,9 @@ function TaskRunCard({ run, onStop, onDelete }: TaskRunCardProps) {
       )}
 
       {run.error_message && (
-        <div className="mt-2 p-2 bg-red-500/10 text-red-500 text-sm rounded">
+        <div
+          className={`mt-2 p-2 ${getStatusColors("error").bg} ${getStatusColors("error").text} text-sm rounded`}
+        >
           {run.error_message}
         </div>
       )}

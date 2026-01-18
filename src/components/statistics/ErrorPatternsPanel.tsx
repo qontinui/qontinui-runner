@@ -5,6 +5,7 @@
  */
 
 import { Bug } from "lucide-react";
+import { getAccentColors } from "@/design-system";
 import type { ErrorPattern } from "../../types/statistics";
 
 interface ErrorPatternsPanelProps {
@@ -38,9 +39,11 @@ export function ErrorPatternsPanel({ patterns }: ErrorPatternsPanelProps) {
   return (
     <div className="bg-card rounded-lg border border-border p-4">
       <h3 className="font-semibold mb-4 flex items-center gap-2">
-        <Bug className="w-4 h-4 text-red-500" />
+        <Bug className={`w-4 h-4 ${getAccentColors("red").text}`} />
         Error Patterns
-        <span className="text-xs bg-red-500/20 text-red-400 px-2 py-0.5 rounded-full">
+        <span
+          className={`text-xs ${getAccentColors("red").bg} ${getAccentColors("red").text} px-2 py-0.5 rounded-full`}
+        >
           {patternList.length}
         </span>
       </h3>
@@ -56,7 +59,9 @@ export function ErrorPatternsPanel({ patterns }: ErrorPatternsPanelProps) {
                 </p>
               </div>
               <div className="text-right flex-shrink-0">
-                <div className="text-lg font-bold text-red-400">{pattern.count}</div>
+                <div className={`text-lg font-bold ${getAccentColors("red").text}`}>
+                  {pattern.count}
+                </div>
                 <span className="text-xs text-muted-foreground">occurrences</span>
               </div>
             </div>

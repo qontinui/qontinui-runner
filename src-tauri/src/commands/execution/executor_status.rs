@@ -89,7 +89,7 @@ pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandRespons
 /// Uses Tauri's window API to get **logical (DPI-scaled) coordinates**.
 ///
 /// Note: This is distinct from `get_screenshot_monitors` in screenshot.rs, which uses
-/// qontinui-api for physical pixel coordinates. Use this command for workflow execution
+/// Python IPC for physical pixel coordinates. Use this command for workflow execution
 /// monitor selection, and `get_screenshot_monitors` when capturing screenshots at
 /// physical resolution.
 ///

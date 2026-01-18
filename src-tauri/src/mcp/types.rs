@@ -269,6 +269,21 @@ pub struct ExecutionStepConfig {
     /// Playwright script ID
     #[serde(rename = "playwrightScriptId")]
     pub playwright_script_id: Option<String>,
+    /// Playwright script content (for combined/inline scripts)
+    #[serde(rename = "playwrightScriptContent")]
+    pub playwright_script_content: Option<String>,
+    /// Playwright target URL (for combined scripts)
+    #[serde(rename = "playwrightTargetUrl")]
+    pub playwright_target_url: Option<String>,
+    /// Whether this step is a setup step (brings app to target state) vs verification step.
+    /// Setup steps typically run on the first iteration only.
+    #[serde(rename = "isSetup", default)]
+    pub is_setup: Option<bool>,
+    /// Whether to run this step on subsequent iterations (after the first).
+    /// For GUI automation: default false (setup usually only needed on first iteration)
+    /// For Playwright: always true (Playwright closes environment, so setup is always needed)
+    #[serde(rename = "runOnSubsequentIterations", default)]
+    pub run_on_subsequent_iterations: Option<bool>,
 }
 
 /// Result of executing a single step

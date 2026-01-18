@@ -5,7 +5,7 @@
  * Consolidates all state and logic from the original monolithic component.
  */
 
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useExecution, useAutoContinue } from "../../contexts";
 import type { UseProjectLogsReturn } from "../../hooks/useProjectLogs";
@@ -47,13 +47,15 @@ interface UseAiBuilderStateProps {
   projectLogs: UseProjectLogsReturn;
   onNavigateToLogLocations: () => void;
   onNavigateToAiOutput?: () => void;
+  onNavigateToActive?: () => void;
   editWorkflowId?: string | null;
 }
 
 export function useAiBuilderState({
   projectLogs,
   onNavigateToLogLocations,
-  onNavigateToAiOutput,
+  onNavigateToAiOutput: _onNavigateToAiOutput,
+  onNavigateToActive,
   editWorkflowId,
 }: UseAiBuilderStateProps) {
   const execution = useExecution();
@@ -192,6 +194,8 @@ export function useAiBuilderState({
   const [showAddDropdown, setShowAddDropdown] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [lastResult, setLastResult] = useState<ResultMessage | null>(null);
+  // Track when session was started locally to prevent flickering during startup
+  const sessionStartTimestampRef = useRef<number | null>(null);
 
   // Resumable workflow state
   const [resumableWorkflow, setResumableWorkflow] = useState<ResumableWorkflow | null>(null);
@@ -559,12 +563,27 @@ export function useAiBuilderState({
             isRecent = startedAt > tenMinutesAgo;
           }
 
-          setIsRunning(isActiveStatus && isRecent);
+          const shouldBeRunning = isActiveStatus && isRecent;
+
+          // During the startup window (first 10 seconds after local start),
+          // don't downgrade isRunning to false to prevent button flickering
+          const isInStartupWindow =
+            sessionStartTimestampRef.current !== null &&
+            Date.now() - sessionStartTimestampRef.current < 10000;
+
+          if (shouldBeRunning) {
+            setIsRunning(true);
+          } else if (!isInStartupWindow) {
+            // Only set to false if we're past the startup window
+            setIsRunning(false);
+            sessionStartTimestampRef.current = null;
+          }
         } else if (!result.success) {
           console.log("Session not found, clearing session");
           setCurrentSessionId(null);
           setSessionState(null);
           setIsRunning(false);
+          sessionStartTimestampRef.current = null;
         }
       } catch (error) {
         console.error("Failed to read session state:", error);
@@ -622,6 +641,13 @@ export function useAiBuilderState({
       promptId?: string,
       promptContent?: string,
     ) => {
+      // Determine defaults based on step type
+      // GUI automation (workflow, state) defaults to setup; playwright is verification
+      const isGuiAutomation = type === "workflow" || type === "state";
+      const isSetup = isGuiAutomation; // GUI automation defaults to setup
+      // All steps run on each iteration by default for fresh data
+      const runOnSubsequentIterations = true;
+
       const newStep: ExecutionStep = {
         id: crypto.randomUUID(),
         type,
@@ -633,6 +659,8 @@ export function useAiBuilderState({
         playwrightTargetUrl: scriptTargetUrl,
         promptId,
         promptContent,
+        isSetup,
+        runOnSubsequentIterations,
       };
       setExecutionSteps((prev) => [...prev, newStep]);
       setShowAddDropdown(false);
@@ -658,6 +686,10 @@ export function useAiBuilderState({
         actionType,
         targetImageId: imageId,
         targetImageName: imageName,
+        // Action steps are GUI automation, default to setup
+        isSetup: true,
+        // All steps run on each iteration by default for fresh data
+        runOnSubsequentIterations: true,
       };
       setExecutionSteps((prev) => [...prev, newStep]);
       setShowAddDropdown(false);
@@ -675,6 +707,10 @@ export function useAiBuilderState({
       takeScreenshot: false,
       guiWorkflowId: workflowId,
       guiWorkflowName: workflowName,
+      // GUI workflow steps are GUI automation, default to setup
+      isSetup: true,
+      // All steps run on each iteration by default for fresh data
+      runOnSubsequentIterations: true,
     };
     setExecutionSteps((prev) => [...prev, newStep]);
     setShowAddDropdown(false);
@@ -690,6 +726,10 @@ export function useAiBuilderState({
       takeScreenshot: true,
       screenshotDelay: 0,
       screenshotMonitor: "all",
+      // Screenshot steps are verification, not setup
+      isSetup: false,
+      // Verification steps run on all iterations
+      runOnSubsequentIterations: true,
     };
     setExecutionSteps((prev) => [...prev, newStep]);
     setShowAddDropdown(false);
@@ -707,6 +747,10 @@ export function useAiBuilderState({
         testId,
         testType: testType as ExecutionStep["testType"],
         testIsCritical: isCritical,
+        // Test steps are verification, not setup
+        isSetup: false,
+        // Verification steps run on all iterations
+        runOnSubsequentIterations: true,
       };
       setExecutionSteps((prev) => [...prev, newStep]);
       setShowAddDropdown(false);
@@ -741,6 +785,52 @@ export function useAiBuilderState({
   const updateScreenshotDelay = useCallback((stepId: string, delay: number) => {
     setExecutionSteps((prev) =>
       prev.map((s) => (s.id === stepId ? { ...s, screenshotDelay: Math.max(0, delay) } : s)),
+    );
+    setHasUnsavedChanges(true);
+  }, []);
+
+  // Toggle isSetup for a step (setup vs verification)
+  const toggleStepIsSetup = useCallback((stepId: string) => {
+    setExecutionSteps((prev) =>
+      prev.map((s) => {
+        if (s.id !== stepId) return s;
+        const newIsSetup = !(s.isSetup ?? true);
+        return {
+          ...s,
+          isSetup: newIsSetup,
+          // When toggling to verification, always run on subsequent iterations
+          // When toggling to setup, default to NOT running on subsequent iterations
+          runOnSubsequentIterations: newIsSetup ? (s.runOnSubsequentIterations ?? false) : true,
+        };
+      }),
+    );
+    setHasUnsavedChanges(true);
+  }, []);
+
+  // Toggle runOnSubsequentIterations for a step
+  const toggleStepRunOnSubsequent = useCallback((stepId: string) => {
+    setExecutionSteps((prev) =>
+      prev.map((s) => {
+        if (s.id !== stepId) return s;
+        return {
+          ...s,
+          runOnSubsequentIterations: !(s.runOnSubsequentIterations ?? false),
+        };
+      }),
+    );
+    setHasUnsavedChanges(true);
+  }, []);
+
+  // Toggle testIsCritical for a test step
+  const toggleStepTestCritical = useCallback((stepId: string) => {
+    setExecutionSteps((prev) =>
+      prev.map((s) => {
+        if (s.id !== stepId || s.type !== "test") return s;
+        return {
+          ...s,
+          testIsCritical: !(s.testIsCritical ?? true),
+        };
+      }),
     );
     setHasUnsavedChanges(true);
   }, []);
@@ -1086,6 +1176,8 @@ ${step.promptContent || "(No content)"}
     console.log("[AI_BUILDER] Starting AI session...");
     setIsRunning(true);
     setLastResult(null);
+    // Mark startup time to prevent polling from flickering the button
+    sessionStartTimestampRef.current = Date.now();
 
     try {
       const sessionId = Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
@@ -1191,6 +1283,9 @@ ${step.promptContent || "(No content)"}
           // AI provider override
           provider: aiProvider || null,
           model: aiModel || null,
+          // Max cross-session iterations (when execution_steps are configured, each session runs 1 phase,
+          // so max_sessions controls the actual iteration limit)
+          max_sessions: maxIterations > 0 ? maxIterations : null,
         }),
       });
       const result = await response.json();
@@ -1204,8 +1299,8 @@ ${step.promptContent || "(No content)"}
           message: `AI Builder session ${session.id} started!`,
         });
         setHistory((prev) => prev.map((h) => (h.id === sessionId ? { ...h, success: true } : h)));
-        // Navigate to AI Output page after successful start
-        onNavigateToAiOutput?.();
+        // Navigate to Active page after successful start
+        onNavigateToActive?.();
       } else {
         throw new Error(result.error || "Failed to start AI Builder session");
       }
@@ -1222,6 +1317,7 @@ ${step.promptContent || "(No content)"}
         return prev;
       });
       setIsRunning(false);
+      sessionStartTimestampRef.current = null;
     }
   }, [
     generateDeveloperPrompt,
@@ -1236,7 +1332,7 @@ ${step.promptContent || "(No content)"}
     aiProvider,
     aiModel,
     projectLogs,
-    onNavigateToAiOutput,
+    onNavigateToActive,
   ]);
 
   // Stop the current session
@@ -1326,6 +1422,9 @@ ${step.promptContent || "(No content)"}
     toggleStepScreenshot,
     updateScreenshotDelay,
     updateScreenshotMonitor,
+    toggleStepIsSetup,
+    toggleStepRunOnSubsequent,
+    toggleStepTestCritical,
     moveStepUp,
     moveStepDown,
 

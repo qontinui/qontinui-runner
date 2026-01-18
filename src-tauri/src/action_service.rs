@@ -543,7 +543,7 @@ impl UnifiedActionService {
         })
     }
 
-    /// Capture a screenshot
+    /// Capture a screenshot via IPC to Python bridge
     ///
     /// # Arguments
     /// * `monitor_index` - Optional monitor index (None for all monitors)
@@ -558,7 +558,7 @@ impl UnifiedActionService {
         delay_seconds: Option<f64>,
     ) -> Result<ScreenshotResult, ActionError> {
         info!(
-            "Capturing screenshot (monitor: {:?}, delay: {:?}s)",
+            "Capturing screenshot via IPC (monitor: {:?}, delay: {:?}s)",
             monitor_index, delay_seconds
         );
 
@@ -571,64 +571,51 @@ impl UnifiedActionService {
             }
         }
 
-        // Get qontinui-api URL
-        let api_url = std::env::var("QONTINUI_API_URL_VISION")
-            .unwrap_or_else(|_| "http://localhost:8001".to_string());
+        // Capture screenshot via Python IPC
+        let app_state = self.app_state.clone();
+        let params = serde_json::json!({
+            "monitor": monitor_index,
+            "format": "png",
+        });
 
-        // Build URL with query parameters
-        let mut url = format!("{}/api/capture/screenshot/current", api_url);
-        let mut params = Vec::new();
-        if let Some(mon) = monitor_index {
-            params.push(format!("monitor={}", mon));
-        }
-        params.push("quality=95".to_string());
-        if !params.is_empty() {
-            url = format!("{}?{}", url, params.join("&"));
-        }
-
-        // Capture screenshot via qontinui-api
-        let client = reqwest::Client::new();
-        let response = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to capture screenshot: {}", e);
-                return Ok(ScreenshotResult {
-                    success: false,
-                    screenshot_path: None,
-                    absolute_path: None,
-                    width: None,
-                    height: None,
-                    monitor: monitor_index,
-                    error: Some(format!("Network error: {}", e)),
-                });
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "Screenshot capture failed with status {}: {}",
-                status, error_text
-            );
-            return Ok(ScreenshotResult {
-                success: false,
-                screenshot_path: None,
-                absolute_path: None,
-                width: None,
-                height: None,
-                monitor: monitor_index,
-                error: Some(format!("API error {}: {}", status, error_text)),
+        let result = tokio::task::spawn_blocking(move || {
+            let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+                warn!("python_bridge mutex was poisoned, recovering");
+                poisoned.into_inner()
             });
-        }
 
-        // Parse the response
-        let json_response: serde_json::Value = response.json().await.map_err(|e| {
-            ActionError::Internal(format!("Failed to parse screenshot response: {}", e))
-        })?;
+            if let Some(ref mut bridge) = *bridge_lock {
+                if !bridge.is_running() {
+                    return Err(ActionError::ExecutorNotRunning);
+                }
+
+                let timeout_duration = Duration::from_secs(30);
+                match bridge.send_command_and_wait(
+                    "capture_screenshot",
+                    Some(params),
+                    timeout_duration,
+                ) {
+                    Ok(response) => {
+                        if response.success {
+                            Ok(response.data)
+                        } else {
+                            Err(ActionError::ActionFailed(
+                                response
+                                    .error
+                                    .unwrap_or_else(|| "Screenshot capture failed".to_string()),
+                            ))
+                        }
+                    }
+                    Err(e) => Err(ActionError::ActionFailed(e)),
+                }
+            } else {
+                Err(ActionError::ExecutorNotInitialized)
+            }
+        })
+        .await
+        .map_err(|e| ActionError::Internal(format!("spawn_blocking error: {}", e)))??;
+
+        let json_response = result.unwrap_or(serde_json::json!({}));
 
         // Extract data from response
         let width = json_response
@@ -643,16 +630,11 @@ impl UnifiedActionService {
         // Generate filename and save
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f");
         let filename = format!("screenshot_{}.png", timestamp);
-        let screenshots_dir = std::path::PathBuf::from(
-            r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\screenshots",
-        );
-        std::fs::create_dir_all(&screenshots_dir).map_err(|e| {
-            ActionError::Internal(format!("Failed to create screenshots dir: {}", e))
-        })?;
+        let screenshots_dir = crate::paths::get_screenshots_dir();
 
         let screenshot_path = screenshots_dir.join(&filename);
 
-        // Save the image data if available (qontinui-api returns "screenshot_base64")
+        // Save the image data if available
         let screenshot_saved = if let Some(image_data) = json_response
             .get("screenshot_base64")
             .and_then(|v| v.as_str())
@@ -672,7 +654,7 @@ impl UnifiedActionService {
                 .map(|obj| obj.keys().map(|k| k.as_str()).collect())
                 .unwrap_or_default();
             warn!(
-                "No screenshot_base64 in API response. Available keys: {:?}",
+                "No screenshot_base64 in IPC response. Available keys: {:?}",
                 keys
             );
             false
@@ -696,7 +678,7 @@ impl UnifiedActionService {
                 width,
                 height,
                 monitor: monitor_index,
-                error: Some("API did not return screenshot_base64".to_string()),
+                error: Some("IPC response did not contain screenshot_base64".to_string()),
             })
         }
     }

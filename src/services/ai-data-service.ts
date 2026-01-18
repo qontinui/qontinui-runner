@@ -21,8 +21,16 @@ import type {
   AiPromptsResult,
   ContextsResult,
   ConsolidatedAiOutputResult,
+  // SQLite migrated log types
+  TaskRunEventsResult,
+  TaskRunScreenshotsDbResult,
+  TaskRunPlaywrightResultsDbResult,
+  TaskRunMigratedLogsSummary,
+  TaskRunApiRequestsDbResult,
+  TaskRunAwasStepsDbResult,
 } from "../types/aiData";
 import type { TieredInfoResponse, RunDetails } from "../types/statistics";
+import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
 
 /**
  * Service for accessing AI data viewer data via Tauri commands.
@@ -59,6 +67,45 @@ export const aiDataService = {
     additionalSessions: number,
   ): Promise<AiDataResponse<TaskRun>> {
     return invoke("reopen_task_run", { taskId, additionalSessions });
+  },
+
+  /**
+   * Generate an AI summary for a completed task run.
+   * This calls Claude CLI to analyze the task output and generate:
+   * - A paragraph summary of what was accomplished
+   * - Whether the stated goal was achieved
+   * - What remaining work exists (if goal not achieved)
+   *
+   * @param taskId - Task run ID
+   * @returns Summary generation result
+   */
+  async generateSummary(taskId: string): Promise<{
+    success: boolean;
+    summary?: string;
+    goal_achieved?: boolean;
+    remaining_work?: string | null;
+    error?: string;
+  }> {
+    try {
+      const response = await fetch(`http://localhost:9876/task-runs/${taskId}/generate-summary`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        return { success: false, error: errorText };
+      }
+
+      return await response.json();
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Failed to generate summary",
+      };
+    }
   },
 
   // ===========================================================================
@@ -198,5 +245,92 @@ export const aiDataService = {
    */
   async getContexts(): Promise<AiDataResponse<ContextsResult>> {
     return invoke("get_contexts_for_viewer");
+  },
+
+  // ===========================================================================
+  // SQLite Migrated Logs (replaces JSONL for historical queries)
+  // ===========================================================================
+
+  /**
+   * Get task run events from SQLite database.
+   * This replaces JSONL file reading for historical analysis.
+   * @param taskRunId - Task run ID to get events for
+   * @param eventType - Optional event type filter ('general', 'action', 'image_recognition', etc.)
+   * @param limit - Maximum number of events to return (default: 1000)
+   */
+  async getTaskRunEvents(
+    taskRunId: string,
+    eventType?: string,
+    limit?: number,
+  ): Promise<AiDataResponse<TaskRunEventsResult>> {
+    return invoke("get_task_run_events_from_db", { taskRunId, eventType, limit });
+  },
+
+  /**
+   * Get task run screenshots from SQLite database.
+   * @param taskRunId - Task run ID to get screenshots for
+   * @param screenshotType - Optional filter by screenshot type ('annotated', 'raw', 'diff', 'failure')
+   */
+  async getTaskRunScreenshotsFromDb(
+    taskRunId: string,
+    screenshotType?: string,
+  ): Promise<AiDataResponse<TaskRunScreenshotsDbResult>> {
+    return invoke("get_task_run_screenshots_from_db", { taskRunId, screenshotType });
+  },
+
+  /**
+   * Get Playwright test results from SQLite database.
+   * @param taskRunId - Task run ID to get results for
+   */
+  async getTaskRunPlaywrightResults(
+    taskRunId: string,
+  ): Promise<AiDataResponse<TaskRunPlaywrightResultsDbResult>> {
+    return invoke("get_task_run_playwright_results_from_db", { taskRunId });
+  },
+
+  /**
+   * Get summary of all migrated log data for a task run.
+   * @param taskRunId - Task run ID to get summary for
+   */
+  async getTaskRunMigratedLogsSummary(
+    taskRunId: string,
+  ): Promise<AiDataResponse<TaskRunMigratedLogsSummary>> {
+    return invoke("get_task_run_migrated_logs_summary", { taskRunId });
+  },
+
+  /**
+   * Get API requests for a task run from SQLite database.
+   * @param taskRunId - Task run ID to get API requests for
+   * @param successFilter - Optional filter by success status (true = success only, false = failures only)
+   */
+  async getTaskRunApiRequests(
+    taskRunId: string,
+    successFilter?: boolean,
+  ): Promise<AiDataResponse<TaskRunApiRequestsDbResult>> {
+    return invoke("get_task_run_api_requests_from_db", { taskRunId, successFilter });
+  },
+
+  /**
+   * Get AWAS steps for a task run from SQLite database.
+   * @param taskRunId - Task run ID to get AWAS steps for
+   * @param stepType - Optional filter by step type ('awas_discover', 'awas_execute', etc.)
+   */
+  async getTaskRunAwasSteps(
+    taskRunId: string,
+    stepType?: string,
+  ): Promise<AiDataResponse<TaskRunAwasStepsDbResult>> {
+    return invoke("get_task_run_awas_steps_from_db", { taskRunId, stepType });
+  },
+
+  /**
+   * Get MCP calls for a task run from SQLite database.
+   * @param taskRunId - Task run ID to get MCP calls for
+   * @param successFilter - Optional filter by success status (true = success only, false = failures only)
+   */
+  async getTaskRunMcpCalls(
+    taskRunId: string,
+    successFilter?: boolean,
+  ): Promise<AiDataResponse<TaskRunMcpCallsDbResult>> {
+    return invoke("get_task_run_mcp_calls", { taskRunId, successFilter });
   },
 };

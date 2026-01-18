@@ -24,6 +24,7 @@ import type { Scriptlet, CreateScriptletRequest, UpdateScriptletRequest } from "
 import type { AiOutputLine } from "./AiOutputTab";
 import { groupEntriesIntoLoops } from "../types/aiLoop";
 import { executeAiTask } from "../hooks";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 const API_BASE = "http://localhost:9876";
 
@@ -379,7 +380,7 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
             setIsCreating(true);
             setExpandedId(null);
           }}
-          className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+          className={`flex items-center gap-2 px-4 py-2 ${getAccentColors("green").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors`}
         >
           <Plus className="w-4 h-4" />
           New Scriptlet
@@ -414,7 +415,7 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
 
       {/* Create Form */}
       {isCreating && (
-        <div className="card p-4 mb-4 border-2 border-green-500/30">
+        <div className={`card p-4 mb-4 border-2 ${getAccentColors("green").border}`}>
           <h3 className="text-lg font-medium mb-4">Create New Scriptlet</h3>
           <ScriptletForm
             formName={formName}
@@ -495,7 +496,7 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
                     title="Copy content"
                   >
                     {copiedId === scriptlet.id ? (
-                      <Check className="w-4 h-4 text-green-500" />
+                      <Check className={`w-4 h-4 ${getStatusColors("success").icon}`} />
                     ) : (
                       <Copy className="w-4 h-4 text-muted-foreground" />
                     )}
@@ -519,10 +520,10 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
                   </button>
                   <button
                     onClick={() => deleteScriptlet(scriptlet.id, scriptlet.name)}
-                    className="p-2 hover:bg-red-500/10 rounded-lg transition-colors"
+                    className={`p-2 hover:${getStatusColors("error").bg} rounded-lg transition-colors`}
                     title="Delete"
                   >
-                    <Trash2 className="w-4 h-4 text-red-500" />
+                    <Trash2 className={`w-4 h-4 ${getStatusColors("error").icon}`} />
                   </button>
                 </div>
               </div>
@@ -601,7 +602,7 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
                         key={loop.id}
                         className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
                           selectedLogIds.has(loop.id)
-                            ? "border-purple-500 bg-purple-500/10"
+                            ? `${getAccentColors("purple").border} ${getAccentColors("purple").bg}`
                             : "border-border hover:bg-muted/50"
                         }`}
                       >
@@ -652,7 +653,7 @@ Keep it concise but comprehensive - typically 2-5 sentences.`;
               <button
                 onClick={generateFromLogs}
                 disabled={isGenerating || selectedLogIds.size === 0 || !generationPrompt.trim()}
-                className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className={`flex items-center gap-2 px-4 py-2 ${getAccentColors("purple").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
               >
                 {isGenerating ? (
                   <>
@@ -736,7 +737,7 @@ function ScriptletForm({
           <label className="text-sm font-medium">Content</label>
           <button
             onClick={onShowLogSelector}
-            className="flex items-center gap-1 text-xs text-purple-400 hover:text-purple-300"
+            className={`flex items-center gap-1 text-xs ${getAccentColors("purple").text} hover:opacity-80`}
           >
             <Sparkles className="w-3 h-3" />
             Generate from AI Logs
@@ -775,7 +776,7 @@ function ScriptletForm({
                   setShowNewCategoryInput(false);
                   setNewCategoryInput("");
                 }}
-                className="px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+                className={`px-3 py-2 ${getAccentColors("green").bgSolid} text-white rounded-lg hover:opacity-90`}
               >
                 <Check className="w-4 h-4" />
               </button>
@@ -837,7 +838,7 @@ function ScriptletForm({
         <button
           onClick={onSave}
           disabled={!formName.trim() || !formContent.trim()}
-          className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className={`flex items-center gap-2 px-4 py-2 ${getAccentColors("green").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
         >
           <Save className="w-4 h-4" />
           {saveLabel}

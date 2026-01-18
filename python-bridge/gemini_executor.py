@@ -30,8 +30,8 @@ class GeminiExecutor:
 
     # Available Gemini models
     MODELS = [
-        "gemini-3-flash",
-        "gemini-3-pro",
+        "gemini-3-flash-preview",
+        "gemini-3-pro-preview",
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-2.0-flash",
@@ -57,7 +57,7 @@ class GeminiExecutor:
     def execute_prompt_cli(
         self,
         prompt: str,
-        model: str = "gemini-3-flash",
+        model: str = "gemini-3-flash-preview",
         working_directory: str | None = None,
         timeout: int | None = 600000,
     ) -> dict[str, Any]:
@@ -66,7 +66,7 @@ class GeminiExecutor:
 
         Args:
             prompt: The prompt to send to Gemini
-            model: Model to use (e.g., "gemini-3-flash")
+            model: Model to use (e.g., "gemini-3-flash-preview")
             working_directory: Working directory for execution
             timeout: Timeout in milliseconds
 
@@ -180,7 +180,7 @@ class GeminiExecutor:
     def execute_prompt_api(
         self,
         prompt: str,
-        model: str = "gemini-3-flash",
+        model: str = "gemini-3-flash-preview",
         max_output_tokens: int = 8192,
         temperature: float = 0.7,
         timeout: int | None = 600000,
@@ -191,7 +191,7 @@ class GeminiExecutor:
 
         Args:
             prompt: The prompt to send to Gemini
-            model: Model to use (e.g., "gemini-3-flash")
+            model: Model to use (e.g., "gemini-3-flash-preview")
             max_output_tokens: Maximum output tokens
             temperature: Sampling temperature
             timeout: Timeout in milliseconds
@@ -360,7 +360,7 @@ class GeminiExecutor:
         self,
         prompt: str,
         provider: str = "gemini_cli",
-        model: str = "gemini-3-flash",
+        model: str = "gemini-3-flash-preview",
         working_directory: str | None = None,
         timeout: int | None = 600000,
         max_output_tokens: int = 8192,

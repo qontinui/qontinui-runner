@@ -1122,6 +1122,7 @@ fn import_single_test(
                 enabled: exported.enabled,
                 ai_generated: false,
                 ai_generation_prompt: None,
+                creation_analysis: None,
                 tags: exported.tags.clone(),
                 source_file: None,
             };
@@ -1166,6 +1167,7 @@ fn import_single_test(
             enabled: exported.enabled,
             ai_generated: false,
             ai_generation_prompt: None,
+            creation_analysis: None,
             tags: exported.tags.clone(),
             source_file: None,
         };
@@ -1183,6 +1185,409 @@ fn import_single_test(
                 message: Some(format!("Failed to create: {}", e)),
                 new_id: None,
             },
+        }
+    }
+}
+
+// ========================================================================
+// Page Analysis Commands for AI-Powered Test Generation
+// ========================================================================
+
+/// Response from page analysis
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PageAnalysisResponse {
+    pub success: bool,
+    pub analysis: Option<serde_json::Value>,
+    pub error: Option<String>,
+}
+
+/// Analyze a page via Playwright CDP for AI test generation.
+///
+/// Connects to an existing browser via Chrome DevTools Protocol,
+/// captures a screenshot, and extracts DOM elements with bounding boxes,
+/// text content, and CSS selectors.
+///
+/// # Arguments
+/// * `cdp_port` - CDP port number (default: 9222)
+/// * `state` - Application state containing the Python bridge
+#[tauri::command]
+pub fn analyze_page_playwright(
+    cdp_port: Option<u16>,
+    state: State<'_, Arc<AppState>>,
+) -> CommandResponse {
+    let port = cdp_port.unwrap_or(9222);
+    info!("Analyzing page via Playwright CDP on port {}", port);
+
+    let mut bridge_lock = match state.python_bridge.lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to acquire lock: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return CommandResponse {
+                success: false,
+                message: Some("Python executor not running. Please start the executor first.".to_string()),
+                data: None,
+            };
+        }
+
+        let params = serde_json::json!({
+            "cdp_port": port,
+        });
+
+        // Use send_command_and_wait for synchronous response
+        match bridge.send_command_and_wait(
+            "analyze_page_playwright",
+            Some(params),
+            std::time::Duration::from_secs(60),
+        ) {
+            Ok(response) => {
+                if response.success {
+                    CommandResponse {
+                        success: true,
+                        message: Some("Page analysis completed".to_string()),
+                        data: response.data,
+                    }
+                } else {
+                    CommandResponse {
+                        success: false,
+                        message: Some(response.error.unwrap_or_else(|| "Analysis failed".to_string())),
+                        data: None,
+                    }
+                }
+            }
+            Err(e) => CommandResponse {
+                success: false,
+                message: Some(format!("Command failed: {}", e)),
+                data: None,
+            },
+        }
+    } else {
+        CommandResponse {
+            success: false,
+            message: Some("Python executor not initialized".to_string()),
+            data: None,
+        }
+    }
+}
+
+/// Analyze a page by running a Playwright script for AI test generation.
+///
+/// Executes the provided Playwright script to navigate to a page,
+/// then captures DOM elements with their bounding boxes, text content,
+/// and CSS selectors.
+///
+/// # Arguments
+/// * `script` - Playwright TypeScript/JavaScript code to navigate to the page
+/// * `state` - Application state containing the Python bridge
+#[tauri::command]
+pub fn analyze_page_playwright_script(
+    script: String,
+    state: State<'_, Arc<AppState>>,
+) -> CommandResponse {
+    info!(
+        "Analyzing page via Playwright script ({} chars)",
+        script.len()
+    );
+
+    let mut bridge_lock = match state.python_bridge.lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to acquire lock: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return CommandResponse {
+                success: false,
+                message: Some(
+                    "Python executor not running. Please start the executor first.".to_string(),
+                ),
+                data: None,
+            };
+        }
+
+        let params = serde_json::json!({
+            "script": script,
+        });
+
+        // Use longer timeout for script execution (may include navigation, waiting, etc.)
+        match bridge.send_command_and_wait(
+            "analyze_page_playwright_script",
+            Some(params),
+            std::time::Duration::from_secs(120),
+        ) {
+            Ok(response) => {
+                if response.success {
+                    CommandResponse {
+                        success: true,
+                        message: Some("Page analysis completed".to_string()),
+                        data: response.data,
+                    }
+                } else {
+                    CommandResponse {
+                        success: false,
+                        message: Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "Analysis failed".to_string()),
+                        ),
+                        data: None,
+                    }
+                }
+            }
+            Err(e) => CommandResponse {
+                success: false,
+                message: Some(format!("Command failed: {}", e)),
+                data: None,
+            },
+        }
+    } else {
+        CommandResponse {
+            success: false,
+            message: Some("Python executor not initialized".to_string()),
+            data: None,
+        }
+    }
+}
+
+/// Analyze a page via Qontinui Vision for AI test generation.
+///
+/// Captures a screenshot from the specified monitor and runs OCR,
+/// edge detection, and SAM3 segmentation to detect UI elements.
+///
+/// # Arguments
+/// * `monitor_index` - Monitor index to capture (default: 0)
+/// * `state` - Application state containing the Python bridge
+#[tauri::command]
+pub fn analyze_page_vision(
+    monitor_index: Option<i32>,
+    state: State<'_, Arc<AppState>>,
+) -> CommandResponse {
+    let monitor = monitor_index.unwrap_or(0);
+    info!("Analyzing page via Vision on monitor {}", monitor);
+
+    let mut bridge_lock = match state.python_bridge.lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to acquire lock: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return CommandResponse {
+                success: false,
+                message: Some("Python executor not running. Please start the executor first.".to_string()),
+                data: None,
+            };
+        }
+
+        let params = serde_json::json!({
+            "monitor_index": monitor,
+        });
+
+        // Use send_command_and_wait for synchronous response
+        match bridge.send_command_and_wait(
+            "analyze_page_vision",
+            Some(params),
+            std::time::Duration::from_secs(120), // Vision analysis can take longer
+        ) {
+            Ok(response) => {
+                if response.success {
+                    CommandResponse {
+                        success: true,
+                        message: Some("Page analysis completed".to_string()),
+                        data: response.data,
+                    }
+                } else {
+                    CommandResponse {
+                        success: false,
+                        message: Some(response.error.unwrap_or_else(|| "Analysis failed".to_string())),
+                        data: None,
+                    }
+                }
+            }
+            Err(e) => CommandResponse {
+                success: false,
+                message: Some(format!("Command failed: {}", e)),
+                data: None,
+            },
+        }
+    } else {
+        CommandResponse {
+            success: false,
+            message: Some("Python executor not initialized".to_string()),
+            data: None,
+        }
+    }
+}
+
+// ========================================================================
+// AI Test Generation
+// ========================================================================
+
+/// Input for AI test generation
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateTestInput {
+    /// User's natural language description of the test
+    pub user_prompt: String,
+    /// Test type to generate
+    pub test_type: String,
+    /// Optional page analysis context (single page)
+    pub page_analysis: Option<serde_json::Value>,
+    /// Optional multi-request analysis context (multiple API responses)
+    pub multi_request_analysis: Option<serde_json::Value>,
+    /// Optional collected analyses (multiple analyses of different types)
+    pub collected_analyses: Option<serde_json::Value>,
+}
+
+/// Generate test code using AI.
+///
+/// Uses the configured AI provider (Claude CLI, Claude API, etc.) to generate
+/// test code from a natural language description and optional page analysis context.
+///
+/// # Arguments
+/// * `input` - Generation parameters including prompt and test type
+/// * `state` - Application state containing Python bridge and settings
+#[tauri::command]
+pub fn generate_test_with_ai(
+    input: GenerateTestInput,
+    state: State<'_, Arc<AppState>>,
+) -> CommandResponse {
+    use crate::settings;
+
+    info!(
+        "Generating {} test with AI: {}",
+        input.test_type,
+        input.user_prompt.chars().take(50).collect::<String>()
+    );
+
+    // Get AI settings
+    let ai_settings = settings::get_ai_settings();
+
+    // Map provider to Python format
+    let ai_provider = match ai_settings.provider {
+        settings::AiProvider::ClaudeCli => "claude_cli",
+        settings::AiProvider::ClaudeApi => "claude_api",
+        settings::AiProvider::GeminiCli => "gemini_cli",
+        settings::AiProvider::GeminiApi => "gemini_api",
+    };
+
+    // Build provider-specific settings
+    let provider_settings = match ai_settings.provider {
+        settings::AiProvider::ClaudeCli => {
+            let execution_mode = match ai_settings.claude_cli.execution_mode {
+                settings::CliExecutionMode::Auto => "auto",
+                settings::CliExecutionMode::WindowsNative => "native",
+                settings::CliExecutionMode::Wsl => "wsl",
+                settings::CliExecutionMode::Native => "native",
+            };
+            serde_json::json!({
+                "execution_mode": execution_mode,
+                "timeout_seconds": ai_settings.claude_cli.timeout_seconds,
+            })
+        }
+        settings::AiProvider::ClaudeApi => {
+            // Get API key from keychain
+            let api_key = super::ai_settings::get_provider_api_key("claude_api")
+                .unwrap_or(None)
+                .unwrap_or_default();
+            serde_json::json!({
+                "api_key": api_key,
+                "model": ai_settings.claude_api.model,
+                "max_tokens": ai_settings.claude_api.max_tokens,
+            })
+        }
+        settings::AiProvider::GeminiCli | settings::AiProvider::GeminiApi => {
+            serde_json::json!({})
+        }
+    };
+
+    let mut bridge_lock = match state.python_bridge.lock() {
+        Ok(lock) => lock,
+        Err(e) => {
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to acquire lock: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    if let Some(ref mut bridge) = *bridge_lock {
+        if !bridge.is_running() {
+            return CommandResponse {
+                success: false,
+                message: Some(
+                    "Python executor not running. Please start the executor first.".to_string(),
+                ),
+                data: None,
+            };
+        }
+
+        let params = serde_json::json!({
+            "user_prompt": input.user_prompt,
+            "test_type": input.test_type,
+            "page_analysis": input.page_analysis,
+            "multi_request_analysis": input.multi_request_analysis,
+            "collected_analyses": input.collected_analyses,
+            "ai_provider": ai_provider,
+            "ai_settings": provider_settings,
+        });
+
+        // Use longer timeout for AI generation (can take time)
+        match bridge.send_command_and_wait(
+            "generate_test_with_ai",
+            Some(params),
+            std::time::Duration::from_secs(180),
+        ) {
+            Ok(response) => {
+                if response.success {
+                    CommandResponse {
+                        success: true,
+                        message: Some("Test generated successfully".to_string()),
+                        data: response.data,
+                    }
+                } else {
+                    CommandResponse {
+                        success: false,
+                        message: Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "Generation failed".to_string()),
+                        ),
+                        data: None,
+                    }
+                }
+            }
+            Err(e) => CommandResponse {
+                success: false,
+                message: Some(format!("Command failed: {}", e)),
+                data: None,
+            },
+        }
+    } else {
+        CommandResponse {
+            success: false,
+            message: Some("Python executor not initialized".to_string()),
+            data: None,
         }
     }
 }

@@ -100,6 +100,8 @@ export interface ClaudeCliSettings {
   execution_mode: CliExecutionMode;
   custom_path?: string;
   timeout_seconds: number;
+  /** Custom CLAUDE_CONFIG_DIR for multi-account support */
+  config_dir?: string;
 }
 
 export interface ClaudeApiSettings {
@@ -135,4 +137,67 @@ export interface AiConnectionTestResult {
   success: boolean;
   message: string;
   provider: string;
+}
+
+// Agentic Settings Types
+
+export interface CompressionSettings {
+  enabled: boolean;
+  threshold_tokens: number;
+  target_tokens: number;
+  keep_recent_items: number;
+  summarize_batch_size: number;
+  tokens_per_char: number;
+}
+
+export interface RetrySettings {
+  enabled: boolean;
+  max_retries: number;
+  base_delay_ms: number;
+  max_delay_ms: number;
+  exponential_base: number;
+  jitter: boolean;
+  feedback_injection: boolean;
+  retryable_errors: string[];
+}
+
+export interface RoutingSettings {
+  enabled: boolean;
+  simple_model: string;
+  medium_model: string;
+  complex_model: string;
+  file_count_thresholds: [number, number];
+  prompt_length_thresholds: [number, number];
+  complex_keywords: string[];
+  simple_keywords: string[];
+}
+
+export interface AgenticSettings {
+  compression: CompressionSettings;
+  retry: RetrySettings;
+  routing: RoutingSettings;
+}
+
+// Self-Healing Settings Types
+
+/** LLM mode for self-healing operations */
+export type SelfHealingLlmMode = "disabled" | "local_ollama" | "remote_api";
+
+/** API provider for remote LLM in self-healing */
+export type SelfHealingApiProvider = "open_ai" | "anthropic";
+
+/** Settings for self-healing automation features */
+export interface SelfHealingSettings {
+  /** Enable action caching to avoid redundant operations */
+  action_caching_enabled: boolean;
+  /** Cache TTL in seconds (how long cached actions remain valid) */
+  cache_ttl_seconds: number;
+  /** Enable visual validation of actions */
+  visual_validation_enabled: boolean;
+  /** LLM mode for self-healing assistance */
+  llm_mode: SelfHealingLlmMode;
+  /** Ollama model name (used when llm_mode is LocalOllama) */
+  ollama_model: string;
+  /** API provider (used when llm_mode is RemoteApi) */
+  api_provider: SelfHealingApiProvider;
 }

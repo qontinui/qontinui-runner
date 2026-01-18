@@ -17,6 +17,7 @@ import {
   Loader,
 } from "lucide-react";
 import { DisplayNode } from "../types/treeEvents";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 /**
  * Type for action config target with optional properties
@@ -281,7 +282,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
       return <FolderOpen className="w-4 h-4 text-primary" />;
     }
     if (isTransition) {
-      return <Activity className="w-4 h-4 text-purple-500" />;
+      return <Activity className={`w-4 h-4 ${getAccentColors("purple").text}`} />;
     }
     return <Activity className="w-4 h-4 text-secondary" />;
   };
@@ -292,11 +293,11 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
   const renderStatusIndicator = () => {
     switch (node.status) {
       case "success":
-        return <CheckCircle2 className="w-4 h-4 text-green-500" />;
+        return <CheckCircle2 className={`w-4 h-4 ${getStatusColors("success").icon}`} />;
       case "failed":
-        return <XCircle className="w-4 h-4 text-red-500" />;
+        return <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />;
       case "running":
-        return <Loader className="w-4 h-4 text-blue-500 animate-spin" />;
+        return <Loader className={`w-4 h-4 ${getStatusColors("running").icon} animate-spin`} />;
       case "pending":
       default:
         return null;
@@ -408,7 +409,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
         {/* Label */}
         <span
           className={`flex-1 font-mono text-sm ${
-            node.status === "failed" ? "text-red-400" : "text-foreground"
+            node.status === "failed" ? getStatusColors("error").text : "text-foreground"
           }`}
         >
           {getNodeLabel()}
@@ -433,7 +434,7 @@ export const TreeNode: React.FC<TreeNodeProps> = ({
       {/* Error Message */}
       {node.error && (
         <div
-          className="text-xs text-red-400 ml-7 px-2 py-1 bg-red-500/10 rounded border-l-2 border-red-500/50"
+          className={`text-xs ${getStatusColors("error").text} ml-7 px-2 py-1 ${getStatusColors("error").bg} rounded border-l-2 ${getStatusColors("error").border}`}
           style={{ marginLeft: `${16 + indentation}px` }}
         >
           {node.error}

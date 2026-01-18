@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import type { LogSourceContent, ProjectLogConfig } from "../types/projectLogs";
 import { useAutoScroll } from "../hooks";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 interface ExternalLogsTabProps {
   /** Project configuration with log sources */
@@ -175,7 +176,9 @@ export function ExternalLogsTab({
                       : undefined
                   }
                 >
-                  {hasError && <AlertCircle className="w-3 h-3 text-yellow-500" />}
+                  {hasError && (
+                    <AlertCircle className={`w-3 h-3 ${getStatusColors("warning").icon}`} />
+                  )}
                   {source.sourceName}
                   <span className="text-xs opacity-70">({source.totalLines})</span>
                 </button>
@@ -248,7 +251,7 @@ export function ExternalLogsTab({
           <div className="grid grid-cols-1 md:grid-cols-3 gap-2 text-xs">
             {/* Logs directory */}
             <div className="flex items-center gap-2 p-2 bg-background rounded border border-border">
-              <FileText className="w-4 h-4 text-blue-500 flex-shrink-0" />
+              <FileText className={`w-4 h-4 ${getAccentColors("blue").text} flex-shrink-0`} />
               <div className="flex-1 min-w-0">
                 <div className="text-muted-foreground mb-0.5">Runner Logs</div>
                 <div className="truncate font-mono" title={config.logDirectory}>
@@ -261,7 +264,7 @@ export function ExternalLogsTab({
                 title="Copy path"
               >
                 {copiedPath === config.logDirectory ? (
-                  <Check className="w-3 h-3 text-green-500" />
+                  <Check className={`w-3 h-3 ${getStatusColors("success").icon}`} />
                 ) : (
                   <Copy className="w-3 h-3 text-muted-foreground" />
                 )}
@@ -270,7 +273,7 @@ export function ExternalLogsTab({
 
             {/* Screenshots directory */}
             <div className="flex items-center gap-2 p-2 bg-background rounded border border-border">
-              <Camera className="w-4 h-4 text-purple-500 flex-shrink-0" />
+              <Camera className={`w-4 h-4 ${getAccentColors("purple").text} flex-shrink-0`} />
               <div className="flex-1 min-w-0">
                 <div className="text-muted-foreground mb-0.5">Screenshots</div>
                 <div className="truncate font-mono" title={config.screenshotDirectory}>
@@ -283,7 +286,7 @@ export function ExternalLogsTab({
                 title="Copy path"
               >
                 {copiedPath === config.screenshotDirectory ? (
-                  <Check className="w-3 h-3 text-green-500" />
+                  <Check className={`w-3 h-3 ${getStatusColors("success").icon}`} />
                 ) : (
                   <Copy className="w-3 h-3 text-muted-foreground" />
                 )}
@@ -292,7 +295,7 @@ export function ExternalLogsTab({
 
             {/* AI Output directory */}
             <div className="flex items-center gap-2 p-2 bg-background rounded border border-border">
-              <Sparkles className="w-4 h-4 text-amber-500 flex-shrink-0" />
+              <Sparkles className={`w-4 h-4 ${getAccentColors("amber").text} flex-shrink-0`} />
               <div className="flex-1 min-w-0">
                 <div className="text-muted-foreground mb-0.5">AI Output</div>
                 <div className="truncate font-mono" title={config.aiOutputDirectory}>
@@ -305,7 +308,7 @@ export function ExternalLogsTab({
                 title="Copy path"
               >
                 {copiedPath === config.aiOutputDirectory ? (
-                  <Check className="w-3 h-3 text-green-500" />
+                  <Check className={`w-3 h-3 ${getStatusColors("success").icon}`} />
                 ) : (
                   <Copy className="w-3 h-3 text-muted-foreground" />
                 )}
@@ -345,7 +348,9 @@ export function ExternalLogsTab({
         {selectedSource ? (
           <div className="space-y-1">
             {selectedSource.error ? (
-              <div className="flex items-center gap-2 text-yellow-500 text-sm p-4">
+              <div
+                className={`flex items-center gap-2 ${getStatusColors("warning").icon} text-sm p-4`}
+              >
                 <AlertCircle className="w-4 h-4" />
                 {selectedSource.error}
               </div>

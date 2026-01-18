@@ -1,10 +1,16 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use tauri::Manager;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Handles Python process spawning and management.
-/// Always uses poetry to run qontinui_executor.py from the python-bridge directory.
+///
+/// Python execution priority:
+/// 1. QONTINUI_PYTHON_PATH environment variable (for advanced users)
+/// 2. Bundled executor (for production builds)
+/// 3. Poetry (for development)
+/// 4. Virtual environment (.venv or venv)
+/// 5. System Python (fallback with warning)
 pub struct ProcessManager {
     app_handle: tauri::AppHandle,
 }
@@ -15,11 +21,40 @@ impl ProcessManager {
     }
 
     /// Spawns the Python executor process.
-    /// Tries bundled executor first (for production builds), falls back to poetry.
+    ///
+    /// Priority:
+    /// 1. QONTINUI_PYTHON_PATH env var - allows advanced users to override
+    /// 2. Bundled executor - for production builds
+    /// 3. Poetry - for development with full dependency management
+    /// 4. Venv - for custom virtual environments
+    /// 5. System Python - last resort fallback
     pub fn spawn_process(&self) -> Result<Child, String> {
         info!("Starting Python executor");
 
-        // Try bundled executor first, fall back to Python
+        // Priority 1: Check for QONTINUI_PYTHON_PATH environment variable
+        if let Ok(custom_python) = std::env::var("QONTINUI_PYTHON_PATH") {
+            let custom_path = PathBuf::from(&custom_python);
+            if custom_path.exists() {
+                info!(
+                    "Using custom Python from QONTINUI_PYTHON_PATH: {:?}",
+                    custom_path
+                );
+                let bridge_script = self.find_bridge_script()?;
+                let mut cmd = Command::new(&custom_path);
+                cmd.arg("-u"); // Unbuffered output
+                cmd.arg(&bridge_script);
+                return self.spawn_with_command(cmd);
+            } else {
+                error!(
+                    "QONTINUI_PYTHON_PATH set but path does not exist: {:?}",
+                    custom_path
+                );
+                // Fall through to other methods
+            }
+        }
+
+        // Priority 2: Try bundled executor (for production builds)
+        // Priority 3-5: Fall back to Python interpreter
         let mut cmd = if let Some(bundled_path) = self.find_bundled_executor() {
             info!("Using bundled executor mode");
             self.build_bundled_command(&bundled_path)
@@ -30,7 +65,7 @@ impl ProcessManager {
             let bridge_script = self.find_bridge_script()?;
             info!("Using Python executor: {:?}", bridge_script);
 
-            // Build Python command using poetry
+            // Build Python command using poetry/venv/system
             self.build_python_command(&bridge_script)?
         };
 
@@ -44,6 +79,15 @@ impl ProcessManager {
         // Set environment variable as backup
         cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
 
+        // Set the model cache directory for lazy loading
+        if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+            let models_dir = app_data_dir.join("models");
+            cmd.env(
+                "QONTINUI_MODELS_DIR",
+                models_dir.to_string_lossy().to_string(),
+            );
+        }
+
         // Spawn Python process
         let child = cmd
             .stdin(Stdio::piped())
@@ -54,6 +98,35 @@ impl ProcessManager {
 
         info!("Python process spawned successfully");
 
+        Ok(child)
+    }
+
+    /// Helper to spawn with common configuration applied
+    fn spawn_with_command(&self, mut cmd: Command) -> Result<Child, String> {
+        // Disable console logging to prevent JSON parse errors
+        cmd.arg("--disable-console-logging");
+
+        // Set PYTHONUNBUFFERED to force immediate output
+        cmd.env("PYTHONUNBUFFERED", "1");
+
+        // Set environment variable as backup
+        cmd.env("QONTINUI_DISABLE_CONSOLE_LOGGING", "1");
+
+        // Set the model cache directory for lazy loading
+        if let Ok(app_data_dir) = self.app_handle.path().app_data_dir() {
+            let models_dir = app_data_dir.join("models");
+            cmd.env("QONTINUI_MODELS_DIR", models_dir.to_string_lossy().to_string());
+        }
+
+        // Spawn Python process
+        let child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start Python process: {}", e))?;
+
+        info!("Python process spawned successfully");
         Ok(child)
     }
 
@@ -193,7 +266,15 @@ impl ProcessManager {
 
     /// Finds the bundled executor sidecar executable.
     /// Returns None if running in development mode (executable not found).
+    ///
+    /// Validation:
+    /// - File must exist
+    /// - File must be larger than 1MB (to skip placeholder/empty files)
     fn find_bundled_executor(&self) -> Option<PathBuf> {
+        // Minimum file size for a valid bundled executor (1MB)
+        // A real PyInstaller bundle with Python + dependencies is ~100MB+
+        const MIN_EXECUTOR_SIZE: u64 = 1_000_000;
+
         // Get the platform-specific executable name
         let exe_name = if cfg!(target_os = "windows") {
             "qontinui-executor.exe"
@@ -225,11 +306,36 @@ impl ProcessManager {
             format!("qontinui-executor-{}", target_triple)
         };
 
+        // Helper to validate a path
+        let is_valid_executor = |path: &PathBuf| -> bool {
+            if !path.exists() {
+                return false;
+            }
+            match std::fs::metadata(path) {
+                Ok(metadata) => {
+                    let size = metadata.len();
+                    if size < MIN_EXECUTOR_SIZE {
+                        debug!(
+                            "Executor at {:?} is too small ({} bytes), skipping",
+                            path, size
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(e) => {
+                    debug!("Could not read metadata for {:?}: {}", path, e);
+                    false
+                }
+            }
+        };
+
         // Try to resolve using Tauri's resource directory
         if let Ok(resource_dir) = self.app_handle.path().resource_dir() {
             let sidecar_path = resource_dir.join(&sidecar_name);
             debug!("Checking bundled sidecar at: {:?}", sidecar_path);
-            if sidecar_path.exists() {
+            if is_valid_executor(&sidecar_path) {
                 info!("Found bundled executor at: {:?}", sidecar_path);
                 return Some(sidecar_path);
             }
@@ -254,18 +360,14 @@ impl ProcessManager {
         ];
 
         for path in possible_paths.into_iter().flatten() {
-            debug!(
-                "Checking sidecar path: {:?}, exists: {}",
-                path,
-                path.exists()
-            );
-            if path.exists() {
+            debug!("Checking sidecar path: {:?}", path);
+            if is_valid_executor(&path) {
                 info!("Found bundled executor at: {:?}", path);
                 return Some(path);
             }
         }
 
-        debug!("Bundled executor not found, will use Python mode");
+        debug!("Bundled executor not found or invalid, will use Python mode");
         None
     }
 

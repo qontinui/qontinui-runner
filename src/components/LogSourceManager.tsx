@@ -22,12 +22,18 @@ import {
   Edit3,
   Check,
   Layers,
+  Sparkles,
+  Loader2,
+  AlertCircle,
 } from "lucide-react";
+import { getStatusColors } from "@/design-system";
+import { invoke } from "@tauri-apps/api/core";
 import type {
   LogSource,
   LogSourceProfile,
   ProjectLogConfig,
   CommonLogPath,
+  AiSuggestedLogSource,
 } from "../types/projectLogs";
 import {
   LOG_SOURCE_TEMPLATES,
@@ -84,8 +90,15 @@ export function LogSourceManager({
   const [newProfileName, setNewProfileName] = useState("");
   const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
   const [editingProfileName, setEditingProfileName] = useState("");
+  // AI discovery state
+  const [showAiDiscovery, setShowAiDiscovery] = useState(false);
+  const [aiSearchQuery, setAiSearchQuery] = useState("");
+  const [aiSuggestions, setAiSuggestions] = useState<AiSuggestedLogSource[]>([]);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
   const quickAddRef = useRef<HTMLDivElement>(null);
   const profileMenuRef = useRef<HTMLDivElement>(null);
+  const aiDiscoveryRef = useRef<HTMLDivElement>(null);
 
   // Update sources when active profile changes
   useEffect(() => {
@@ -94,7 +107,7 @@ export function LogSourceManager({
     setHasChanges(false);
   }, [config.activeProfileId, config]);
 
-  // Close quick add dropdown when clicking outside
+  // Close dropdowns when clicking outside
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (quickAddRef.current && !quickAddRef.current.contains(event.target as Node)) {
@@ -102,6 +115,9 @@ export function LogSourceManager({
       }
       if (profileMenuRef.current && !profileMenuRef.current.contains(event.target as Node)) {
         setShowProfileMenu(false);
+      }
+      if (aiDiscoveryRef.current && !aiDiscoveryRef.current.contains(event.target as Node)) {
+        setShowAiDiscovery(false);
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
@@ -210,6 +226,69 @@ export function LogSourceManager({
     setShowQuickAdd(false);
   };
 
+  // AI Discovery handlers
+  const handleAiFindSources = async () => {
+    if (!aiSearchQuery.trim()) return;
+
+    setAiLoading(true);
+    setAiError(null);
+    setAiSuggestions([]);
+
+    try {
+      const response = await invoke<{
+        success: boolean;
+        message?: string;
+        data?: AiSuggestedLogSource[];
+      }>("find_log_sources_with_ai", {
+        applicationName: aiSearchQuery.trim(),
+        projectDirectory: projectDirectory || null,
+      });
+
+      if (response.success && response.data) {
+        setAiSuggestions(response.data);
+      } else {
+        setAiError(response.message || "Failed to get AI suggestions");
+      }
+    } catch (error) {
+      setAiError(error instanceof Error ? error.message : "Failed to connect to AI");
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const handleAddAiSuggestion = (suggestion: AiSuggestedLogSource) => {
+    const newSource = createLogSource({
+      name: suggestion.name,
+      type: suggestion.type,
+      path: suggestion.path,
+      pattern: suggestion.pattern,
+      color: suggestion.color || "#8b5cf6",
+      enabled: true,
+    });
+
+    setSources([...sources, newSource]);
+    setHasChanges(true);
+    // Remove the added suggestion from the list
+    setAiSuggestions(aiSuggestions.filter((s) => s.path !== suggestion.path));
+  };
+
+  const handleAddAllAiSuggestions = () => {
+    const newSources = aiSuggestions.map((suggestion) =>
+      createLogSource({
+        name: suggestion.name,
+        type: suggestion.type,
+        path: suggestion.path,
+        pattern: suggestion.pattern,
+        color: suggestion.color || "#8b5cf6",
+        enabled: true,
+      }),
+    );
+
+    setSources([...sources, ...newSources]);
+    setHasChanges(true);
+    setAiSuggestions([]);
+  };
+
   // Group common paths by category
   const commonPathsByCategory = COMMON_LOG_PATHS.reduce(
     (acc, path) => {
@@ -302,7 +381,7 @@ export function LogSourceManager({
                             />
                             <button
                               onClick={handleFinishRename}
-                              className="p-1 text-green-500 hover:bg-green-500/10 rounded"
+                              className={`p-1 ${getStatusColors("success").icon} hover:${getStatusColors("success").bg} rounded`}
                             >
                               <Check className="w-4 h-4" />
                             </button>
@@ -364,7 +443,7 @@ export function LogSourceManager({
                           <button
                             onClick={handleCreateProfile}
                             disabled={!newProfileName.trim()}
-                            className="p-1 text-green-500 hover:bg-green-500/10 rounded disabled:opacity-50"
+                            className={`p-1 ${getStatusColors("success").icon} hover:${getStatusColors("success").bg} rounded disabled:opacity-50`}
                           >
                             <Check className="w-4 h-4" />
                           </button>
@@ -493,7 +572,7 @@ export function LogSourceManager({
                         onClick={() => handleToggleSource(source.id)}
                         className={`p-1 rounded transition-colors ${
                           source.enabled
-                            ? "text-green-500 hover:bg-green-500/10"
+                            ? `${getStatusColors("success").icon} hover:${getStatusColors("success").bg}`
                             : "text-muted-foreground hover:bg-muted"
                         }`}
                         title={
@@ -631,7 +710,129 @@ export function LogSourceManager({
           </div>
 
           {/* Add source buttons */}
-          <div className="mt-4 flex gap-2">
+          <div className="mt-4 flex gap-2 flex-wrap">
+            {/* AI Discovery dropdown */}
+            <div ref={aiDiscoveryRef} className="relative">
+              <button
+                onClick={() => setShowAiDiscovery(!showAiDiscovery)}
+                className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 transition-all"
+              >
+                <Sparkles className="w-4 h-4" />
+                Find with AI
+                <ChevronDown
+                  className={`w-4 h-4 transition-transform ${showAiDiscovery ? "rotate-180" : ""}`}
+                />
+              </button>
+
+              {/* AI Discovery panel */}
+              {showAiDiscovery && (
+                <div className="absolute top-full left-0 mt-2 w-96 bg-background border border-border rounded-lg shadow-xl z-50">
+                  <div className="p-4 border-b border-border">
+                    <div className="flex items-center gap-2 mb-2">
+                      <Sparkles className="w-4 h-4 text-purple-500" />
+                      <span className="text-sm font-medium">AI Log Source Discovery</span>
+                    </div>
+                    <p className="text-xs text-muted-foreground mb-3">
+                      Enter an application name and AI will suggest common log file locations.
+                    </p>
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={aiSearchQuery}
+                        onChange={(e) => setAiSearchQuery(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleAiFindSources()}
+                        placeholder="e.g., Docker, PostgreSQL, nginx..."
+                        className="flex-1 bg-muted border border-border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500"
+                        disabled={aiLoading}
+                      />
+                      <button
+                        onClick={handleAiFindSources}
+                        disabled={aiLoading || !aiSearchQuery.trim()}
+                        className="px-4 py-2 bg-purple-500 text-white rounded-md hover:bg-purple-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                      >
+                        {aiLoading ? (
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                        ) : (
+                          <Sparkles className="w-4 h-4" />
+                        )}
+                        Find
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Error display */}
+                  {aiError && (
+                    <div className="p-3 bg-destructive/10 border-b border-border flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-destructive flex-shrink-0 mt-0.5" />
+                      <span className="text-sm text-destructive">{aiError}</span>
+                    </div>
+                  )}
+
+                  {/* Suggestions list */}
+                  {aiSuggestions.length > 0 && (
+                    <div className="max-h-80 overflow-auto">
+                      <div className="p-2 bg-muted/50 border-b border-border flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">
+                          {aiSuggestions.length} suggestion{aiSuggestions.length !== 1 ? "s" : ""}{" "}
+                          found
+                        </span>
+                        <button
+                          onClick={handleAddAllAiSuggestions}
+                          className="text-xs text-purple-500 hover:text-purple-600 font-medium"
+                        >
+                          Add All
+                        </button>
+                      </div>
+                      {aiSuggestions.map((suggestion, index) => (
+                        <div
+                          key={`${suggestion.path}-${index}`}
+                          className="p-3 hover:bg-muted transition-colors border-b border-border last:border-b-0"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-1">
+                                <div
+                                  className="w-3 h-3 rounded-full flex-shrink-0"
+                                  style={{ backgroundColor: suggestion.color || "#8b5cf6" }}
+                                />
+                                <span className="font-medium text-sm truncate">
+                                  {suggestion.name}
+                                </span>
+                                <span className="text-xs text-muted-foreground px-1.5 py-0.5 bg-muted rounded">
+                                  {suggestion.type}
+                                </span>
+                              </div>
+                              <p className="text-xs text-muted-foreground mb-1 line-clamp-2">
+                                {suggestion.description}
+                              </p>
+                              <code className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded block truncate">
+                                {suggestion.path}
+                                {suggestion.pattern ? ` (${suggestion.pattern})` : ""}
+                              </code>
+                            </div>
+                            <button
+                              onClick={() => handleAddAiSuggestion(suggestion)}
+                              className="flex-shrink-0 p-1.5 text-purple-500 hover:text-purple-600 hover:bg-purple-500/10 rounded transition-colors"
+                              title="Add this log source"
+                            >
+                              <Plus className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* Empty state when no suggestions and not loading */}
+                  {!aiLoading && !aiError && aiSuggestions.length === 0 && aiSearchQuery && (
+                    <div className="p-4 text-center text-sm text-muted-foreground">
+                      Enter an application name and click Find to get AI suggestions.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Quick add dropdown */}
             <div ref={quickAddRef} className="relative">
               <button

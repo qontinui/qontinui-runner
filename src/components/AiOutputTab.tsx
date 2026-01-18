@@ -11,12 +11,13 @@
 
 import { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Brain, MessageSquare, Bot, Loader2, Send, Square, Copy, Check } from "lucide-react";
+import { Brain, MessageSquare, Loader2, Send, Square, Copy, Check } from "lucide-react";
+import { getAccentColors } from "@/design-system";
 // Note: Issue and findings detection is now done in EventHandlers.ts to ensure
 // ALL lines are processed, not just filtered ones displayed in this component.
 import { groupEntriesIntoLoops /* type AiLoop */ } from "../types/aiLoop";
 import { useAiTaskPolling } from "../hooks";
-import { MarkdownViewer } from "./MarkdownViewer";
+import { AiMessageDisplay, groupEntriesBySource } from "./shared";
 
 export interface AiOutputLine {
   id: string;
@@ -460,14 +461,16 @@ export function AiOutputTab({
                   onClick={() => !isDragging && handleSelectLoop(loop.id)}
                   className={`flex-shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
                     isSelected
-                      ? "bg-purple-500/20 text-purple-400"
+                      ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
                       : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
                   }`}
                 >
                   <Brain className="w-3 h-3" />
                   <span>{loop.label}</span>
                   {isLatest && (
-                    <span className="px-1 py-0.5 text-[10px] bg-purple-500/30 text-purple-300 rounded">
+                    <span
+                      className={`px-1 py-0.5 text-[10px] rounded ${getAccentColors("purple").bg} ${getAccentColors("purple").text}`}
+                    >
                       Latest
                     </span>
                   )}
@@ -480,13 +483,17 @@ export function AiOutputTab({
           <div className="flex-shrink-0 flex items-center gap-2">
             {isAiWorking && (
               <>
-                <div className="flex items-center gap-1.5 px-2 py-1 bg-emerald-500/10 rounded-lg">
-                  <Loader2 className="w-3 h-3 text-emerald-400 animate-spin" />
-                  <span className="text-xs text-emerald-400 font-medium">Working</span>
+                <div
+                  className={`flex items-center gap-1.5 px-2 py-1 rounded-lg ${getAccentColors("emerald").bg}`}
+                >
+                  <Loader2 className={`w-3 h-3 animate-spin ${getAccentColors("emerald").text}`} />
+                  <span className={`text-xs font-medium ${getAccentColors("emerald").text}`}>
+                    Working
+                  </span>
                 </div>
                 <button
                   onClick={handleStopAi}
-                  className="flex items-center gap-1 px-2 py-1 text-xs bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg transition-colors"
+                  className={`flex items-center gap-1 px-2 py-1 text-xs rounded-lg transition-colors ${getAccentColors("red").bg} ${getAccentColors("red").text} hover:opacity-80`}
                   title="Stop AI analysis"
                 >
                   <Square className="w-3 h-3" />
@@ -499,7 +506,11 @@ export function AiOutputTab({
               className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground rounded-lg hover:bg-muted/50 transition-colors disabled:opacity-50"
               title="Copy all text in this session"
             >
-              {copied ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3" />}
+              {copied ? (
+                <Check className={`w-3 h-3 ${getAccentColors("green").text}`} />
+              ) : (
+                <Copy className="w-3 h-3" />
+              )}
             </button>
           </div>
         </div>
@@ -510,88 +521,13 @@ export function AiOutputTab({
         ref={containerRef}
         className="flex-1 min-h-0 overflow-auto bg-background/50 rounded-lg border border-border p-4 font-mono text-sm"
       >
-        {currentLoop?.entries.map((entry, index) => {
-          const isPrompt = entry.source === "prompt";
-          const isUserHint = entry.source === "user_hint";
-          const prevEntry = index > 0 ? currentLoop.entries[index - 1] : null;
-          const isFirstResponse = !isPrompt && !isUserHint && prevEntry?.source === "prompt";
-
-          // User hint styling (purple like the script auto-refine hints)
-          if (isUserHint) {
-            return (
-              <div
-                key={entry.id}
-                className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-3 mb-3"
-              >
-                <div className="flex items-center gap-2 text-purple-400 text-xs font-semibold mb-2">
-                  <MessageSquare className="w-4 h-4" />
-                  <span>USER HINT</span>
-                  <span className="text-muted-foreground font-normal ml-auto">
-                    {new Date(entry.timestamp).toLocaleTimeString()}
-                  </span>
-                </div>
-                <MarkdownViewer content={entry.line} />
-              </div>
-            );
-          }
-
-          // Group consecutive response lines together (claude responses only)
-          if (!isPrompt && !isUserHint) {
-            // Find all consecutive response lines starting from this entry
-            let responseLines: string[] = [];
-            let _endIndex = index;
-            for (let i = index; i < currentLoop.entries.length; i++) {
-              const src = currentLoop.entries[i].source;
-              // Only group claude responses, not prompts or hints
-              if (src !== "prompt" && src !== "user_hint") {
-                responseLines.push(currentLoop.entries[i].line);
-                _endIndex = i;
-              } else {
-                break;
-              }
-            }
-
-            // Only render the grouped response at the first response line
-            if (index > 0 && prevEntry?.source !== "prompt" && prevEntry?.source !== "user_hint") {
-              return null; // Skip - will be rendered as part of the group
-            }
-
-            const fullResponse = responseLines.join("\n");
-            const lineCount = fullResponse.split("\n").length;
-
-            return (
-              <div key={entry.id}>
-                {isFirstResponse && (
-                  <div className="flex items-center gap-2 text-emerald-400 text-xs font-semibold mb-2 mt-1">
-                    <Bot className="w-4 h-4" />
-                    <span>RESPONSE</span>
-                    <span className="text-muted-foreground font-normal">{lineCount} lines</span>
-                  </div>
-                )}
-                <div className="py-0.5 pl-6">
-                  <MarkdownViewer content={fullResponse} isAnimated />
-                </div>
-              </div>
-            );
-          }
-
-          // Prompt styling
-          return (
-            <div
-              key={entry.id}
-              className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 mb-3"
-            >
-              <div className="flex items-center gap-2 text-blue-400 text-xs font-semibold mb-2">
-                <MessageSquare className="w-4 h-4" />
-                <span>PROMPT</span>
-                <span className="text-muted-foreground font-normal ml-auto">
-                  {new Date(entry.timestamp).toLocaleTimeString()}
-                </span>
-              </div>
-              <MarkdownViewer content={entry.line} />
-            </div>
-          );
-        })}
+        {currentLoop && (
+          <AiMessageDisplay
+            groups={groupEntriesBySource(currentLoop.entries)}
+            mode="log"
+            isAnimated
+          />
+        )}
       </div>
 
       {/* Prompt/Hint input */}
@@ -612,16 +548,16 @@ export function AiOutputTab({
           disabled={isSending}
           className={`flex-1 px-3 py-2 bg-background border rounded-lg text-sm resize-none min-h-[40px] max-h-[120px] focus:outline-none focus:ring-2 disabled:opacity-50 disabled:cursor-not-allowed ${
             isAiWorking
-              ? "border-purple-500/50 focus:ring-purple-500"
+              ? `${getAccentColors("purple").border} focus:ring-purple-500`
               : "border-border focus:ring-primary"
-          } ${hintQueued ? "border-green-500" : ""}`}
+          } ${hintQueued ? getAccentColors("green").border : ""}`}
           rows={1}
         />
         {isAiWorking ? (
           <button
             onClick={handleQueueHint}
             disabled={!promptInput.trim()}
-            className="px-4 py-2 bg-purple-600 text-white rounded-lg font-medium hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+            className={`px-4 py-2 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-2 ${getAccentColors("purple").bgSolid} text-white hover:opacity-90`}
             title="Queue hint for AI (Enter)"
           >
             <MessageSquare className="w-4 h-4" />

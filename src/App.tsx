@@ -21,18 +21,20 @@
  * Other: Configure, Schedule, System
  */
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, createContext, useContext, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Zap,
   Image,
   ClipboardList,
+  ClipboardCheck,
   FileText,
   FileSearch,
   Bot,
   BarChart3,
   Database,
   TestTube,
+  Accessibility,
 } from "lucide-react";
 
 // Contexts
@@ -43,6 +45,44 @@ import {
   AutoContinueProvider,
 } from "./contexts";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
+import { TutorialProvider } from "./contexts/TutorialContext";
+import { ContextualTutorial } from "./components/tutorial";
+
+// Navigation context for tutorials to navigate to pages
+interface NavigationContextValue {
+  navigate: (page: string) => void;
+  registerNavigate: (fn: (page: string) => void) => void;
+}
+
+const NavigationContext = createContext<NavigationContextValue | null>(null);
+
+function NavigationProvider({ children }: { children: React.ReactNode }) {
+  const navigateFnRef = useRef<((page: string) => void) | null>(null);
+
+  const navigate = useCallback((page: string) => {
+    if (navigateFnRef.current) {
+      navigateFnRef.current(page);
+    }
+  }, []);
+
+  const registerNavigate = useCallback((fn: (page: string) => void) => {
+    navigateFnRef.current = fn;
+  }, []);
+
+  return (
+    <NavigationContext.Provider value={{ navigate, registerNavigate }}>
+      {children}
+    </NavigationContext.Provider>
+  );
+}
+
+function useNavigation() {
+  const context = useContext(NavigationContext);
+  if (!context) {
+    throw new Error("useNavigation must be used within NavigationProvider");
+  }
+  return context;
+}
 
 // Managers
 import { setupEventHandlers, eventRouter } from "./managers";
@@ -59,6 +99,7 @@ import {
   useWebSocketAutoConnect,
   useBackgroundActivities,
 } from "./hooks";
+import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 
 // Components
 import StatusIndicator from "./components/StatusIndicator";
@@ -72,21 +113,29 @@ import { Settings } from "./components/Settings";
 import { LoginScreen } from "./components/LoginScreen";
 import { LogSourceManager } from "./components/LogSourceManager";
 import { AiTab } from "./components/AiTab";
-import { LibraryTab } from "./components/LibraryTab";
+import { LibraryDashboard } from "./components/LibraryDashboard";
 import { HelpTab } from "./components/HelpTab";
 import { SchedulerTab } from "./components/scheduler";
 import { Sidebar } from "./components/navigation";
-import { AiBuilderTab, AiBuilderProvider } from "./components/AiBuilderTab";
-import { ScriptBuilderTab } from "./components/ScriptBuilderTab";
+import { AiBuilderTab } from "./components/AiBuilderTab";
+import { WorkflowBuilderTab } from "./components/workflow-builder";
+import { ScriptsPage } from "./components/ScriptsPage";
 import { GuiWorkflowBuilderTab } from "./components/gui-workflow-builder";
 import { TestBuilderTab } from "./components/test-builder";
+import { CheckBuilderTab } from "./components/check-builder";
+import { ShellCommandBuilderTab } from "./components/shell-command-builder";
+import { TaskBuilderTab } from "./components/TaskBuilderTab";
+import { ContextBuilderTab } from "./components/ContextBuilderTab";
+import { StateExplorerBuilderTab } from "./components/StateExplorerBuilderTab";
+import { ApiRequestBuilderTab } from "./components/ApiRequestBuilderTab";
+import { AwasBuilderTab } from "./components/AwasBuilderTab";
 import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 // Monitor/Observe components
 import { ExecutionSummaryTab } from "./components/ai-workflows/ExecutionSummaryTab";
 import { ExecutionReport } from "./components/findings";
-import { VerificationTab } from "./components/verification";
+import { StateExplorerTab } from "./components/state-explorer";
 import { TestResultsTab } from "./components/test-results";
 import { StatisticsTab } from "./components/statistics";
 import { DiscoverySyncPanel } from "./components/discoveries";
@@ -94,13 +143,20 @@ import { DiscoverySyncPanel } from "./components/discoveries";
 import { RunSelectionProvider } from "./contexts/RunSelectionContext";
 import { RunDashboard } from "./components/run-dashboard/RunDashboard";
 import { RunPageLayout } from "./components/run-dashboard/RunPageLayout";
-import { GeneralLogsTab } from "./components/GeneralLogsTab";
 import { RunActionsTab } from "./components/run-logs/RunActionsTab";
 import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitionTab";
 import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
+import { RunRecapTab } from "./components/run-recap";
+// Accessibility components
+import { AccessibilityExplorerPanel } from "./components/accessibility";
+// New dashboard components
+import { LearningDashboard } from "./components/learning-dashboard";
+import { CheckpointBrowser } from "./components/checkpoint-browser";
+import { FlowDesigner } from "./components/flow-designer";
 // Configure components
 import { ExternalLogsTab } from "./components/ExternalLogsTab";
 import { CategoryManager } from "./components/findings/CategoryManager";
+import { HooksManagerPanel } from "./components/hooks";
 
 // Styles
 import "./index.css";
@@ -113,18 +169,22 @@ type MainTabId =
   | "active"
   | "history"
   // Observe group - new structure
-  | "general-logs"
   | "run-dashboard"
+  | "run-recap"
   | "run-actions"
   | "run-image"
   | "run-summary"
   | "run-findings"
-  | "run-verification"
+  | "run-state-explorer"
   | "run-tests"
   | "run-ai-output"
   | "run-statistics"
   | "run-ai-data"
+  | "run-accessibility"
+  | "learning"
+  | "checkpoints"
   | "discoveries"
+  | "flow-designer"
   // Legacy tab IDs for migration
   | "ai"
   | "logs"
@@ -132,22 +192,36 @@ type MainTabId =
   | "monitor-findings"
   | "monitor-issues"
   | "monitor-learnings"
-  | "monitor-verification"
+  | "monitor-state-explorer"
   | "monitor-statistics"
   | "monitor-discoveries"
   | "library"
+  | "task-builder"
+  | "unified-workflow-builder"
   | "workflow-builder"
   | "gui-workflow-builder"
   | "script-builder"
+  | "context-builder"
+  | "state-explorer-builder"
+  | "api-request-builder"
+  | "awas-builder"
   | "test-builder"
+  | "check-builder"
+  | "shell-command-builder"
   | "capture"
   | "config-log-sources"
   | "config-findings"
+  | "config-hooks"
   | "tasks"
   | "settings"
   | "settings-account"
   | "settings-ai"
+  | "settings-agentic"
+  | "settings-self-healing"
   | "settings-playwright"
+  | "settings-mobile"
+  | "settings-mcp"
+  | "settings-log-sources"
   | "settings-general"
   | "settings-storage"
   | "settings-backup"
@@ -160,18 +234,22 @@ const VALID_TAB_IDS: MainTabId[] = [
   "active",
   "history",
   // New observe tabs
-  "general-logs",
   "run-dashboard",
+  "run-recap",
   "run-actions",
   "run-image",
   "run-summary",
   "run-findings",
-  "run-verification",
+  "run-state-explorer",
   "run-tests",
   "run-ai-output",
   "run-statistics",
   "run-ai-data",
+  "run-accessibility",
+  "learning",
+  "checkpoints",
   "discoveries",
+  "flow-designer",
   // Legacy (for migration)
   "ai",
   "logs",
@@ -179,22 +257,36 @@ const VALID_TAB_IDS: MainTabId[] = [
   "monitor-findings",
   "monitor-issues",
   "monitor-learnings",
-  "monitor-verification",
+  "monitor-state-explorer",
   "monitor-statistics",
   "monitor-discoveries",
   "library",
+  "task-builder",
+  "unified-workflow-builder",
   "workflow-builder",
   "gui-workflow-builder",
   "script-builder",
+  "context-builder",
+  "state-explorer-builder",
+  "api-request-builder",
+  "awas-builder",
   "test-builder",
+  "check-builder",
+  "shell-command-builder",
   "capture",
   "config-log-sources",
   "config-findings",
+  "config-hooks",
   "tasks",
   "settings",
   "settings-account",
   "settings-ai",
+  "settings-agentic",
+  "settings-self-healing",
   "settings-playwright",
+  "settings-mobile",
+  "settings-mcp",
+  "settings-log-sources",
   "settings-general",
   "settings-storage",
   "settings-backup",
@@ -224,13 +316,14 @@ function migrateTabId(stored: string | null): MainTabId {
     dataset: "capture", // Dataset is now part of capture
     extract: "capture",
     // Old observe tab migrations to new structure
-    logs: "general-logs",
+    logs: "run-dashboard",
     ai: "run-ai-output",
     "monitor-summary": "run-summary",
     "monitor-findings": "run-findings",
     "monitor-issues": "run-findings", // Issues merged into Findings
     "monitor-learnings": "run-summary", // Learnings removed, map to summary
-    "monitor-verification": "run-verification",
+    "monitor-verification": "run-state-explorer",
+    "monitor-state-explorer": "run-state-explorer",
     "monitor-statistics": "run-statistics",
     "monitor-discoveries": "discoveries",
     // Legacy monitor tab migrations
@@ -238,7 +331,10 @@ function migrateTabId(stored: string | null): MainTabId {
     issues: "run-findings", // Issues merged into Findings
     "run-issues": "run-findings", // Issues merged into Findings
     learnings: "run-summary",
-    verification: "run-verification",
+    verification: "run-state-explorer",
+    "run-verification": "run-state-explorer",
+    "run-exploration": "run-state-explorer",
+    "verification-builder": "state-explorer-builder",
     statistics: "run-statistics",
     // Configure tab migrations
     "log-sources": "config-log-sources",
@@ -267,11 +363,38 @@ function AppContent() {
   // Execution state from context
   const execution = useExecution();
 
+  // Navigation context for tutorials
+  const { registerNavigate } = useNavigation();
+
   // Main tab state
   const [activeTab, setActiveTab] = useState<MainTabId>(() => {
     const stored = localStorage.getItem(MAIN_TAB_STORAGE_KEY);
     return migrateTabId(stored);
   });
+
+  // Register navigation function for tutorials
+  useEffect(() => {
+    registerNavigate((page: string) => {
+      // Map tutorial focus pages to actual tab IDs
+      const pageToTab: Record<string, MainTabId> = {
+        run: "run",
+        active: "active",
+        "unified-workflow-builder": "unified-workflow-builder",
+        "workflow-builder": "workflow-builder",
+        "gui-workflow-builder": "gui-workflow-builder",
+        "script-builder": "script-builder",
+        "check-builder": "check-builder",
+        library: "library",
+        ai: "ai",
+        settings: "settings",
+        help: "help",
+      };
+      const tabId = pageToTab[page];
+      if (tabId) {
+        setActiveTab(tabId);
+      }
+    });
+  }, [registerNavigate]);
 
   // Script ID to edit (when navigating from Library to Script Builder)
   const [editScriptId, setEditScriptId] = useState<string | null>(null);
@@ -281,6 +404,14 @@ function AppContent() {
 
   // GUI Workflow ID to edit (when navigating from Library to GUI Workflow Builder)
   const [editGuiWorkflowId, setEditGuiWorkflowId] = useState<string | null>(null);
+
+  // Builder edit IDs (when navigating from Library Dashboard to builders)
+  const [editTaskId, setEditTaskId] = useState<string | null>(null);
+  const [editScriptletId, setEditScriptletId] = useState<string | null>(null);
+  const [editContextId, setEditContextId] = useState<string | null>(null);
+  const [editExplorationId, setEditExplorationId] = useState<string | null>(null);
+  const [editApiRequestId, setEditApiRequestId] = useState<string | null>(null);
+  const [editAwasConfigId, setEditAwasConfigId] = useState<string | null>(null);
 
   // Handle editing a script from Library
   const handleEditScript = useCallback((scriptId: string) => {
@@ -299,6 +430,48 @@ function AppContent() {
     setEditGuiWorkflowId(workflowId);
     setActiveTab("gui-workflow-builder");
   }, []);
+
+  // Handle navigation from Library Dashboard to any builder
+  const handleNavigateToBuilder = useCallback(
+    (builderTab: string, itemId: string, itemType: string) => {
+      // Set the appropriate edit ID based on item type
+      switch (itemType) {
+        case "task":
+          setEditTaskId(itemId);
+          break;
+        case "scriptlet":
+          setEditScriptletId(itemId);
+          break;
+        case "context":
+          setEditContextId(itemId);
+          break;
+        case "exploration":
+        case "state-explorer":
+          setEditExplorationId(itemId);
+          break;
+        case "api-request":
+          setEditApiRequestId(itemId);
+          break;
+        case "awas":
+        case "awas-config":
+          setEditAwasConfigId(itemId);
+          break;
+        case "script":
+          setEditScriptId(itemId);
+          break;
+        case "workflow":
+        case "unified-workflow":
+          setEditWorkflowId(itemId);
+          break;
+        case "gui-workflow":
+          setEditGuiWorkflowId(itemId);
+          break;
+      }
+      // Navigate to the builder tab
+      setActiveTab(builderTab as MainTabId);
+    },
+    [],
+  );
 
   // Clear script ID when navigating away from script builder
   useEffect(() => {
@@ -319,6 +492,16 @@ function AppContent() {
     if (activeTab !== "gui-workflow-builder") {
       setEditGuiWorkflowId(null);
     }
+  }, [activeTab]);
+
+  // Clear builder edit IDs when navigating away
+  useEffect(() => {
+    if (activeTab !== "task-builder") setEditTaskId(null);
+    if (activeTab !== "script-builder") setEditScriptletId(null);
+    if (activeTab !== "context-builder") setEditContextId(null);
+    if (activeTab !== "state-explorer-builder") setEditExplorationId(null);
+    if (activeTab !== "api-request-builder") setEditApiRequestId(null);
+    if (activeTab !== "awas-builder") setEditAwasConfigId(null);
   }, [activeTab]);
 
   // Sidebar collapsed state
@@ -374,6 +557,9 @@ function AppContent() {
 
   // Project logs (external logs from target application)
   const projectLogs = useProjectLogs();
+
+  // Global log sources (shared across all projects)
+  const globalLogSources = useGlobalLogSources();
 
   // Background activities aggregation
   // Note: Extraction tracking handled internally via executor events
@@ -533,30 +719,21 @@ function AppContent() {
         );
 
       // ========== NEW OBSERVE TABS ==========
-      case "general-logs":
-        return (
-          <div className="flex-1 flex flex-col min-h-0 p-4 h-full overflow-hidden">
-            <div className="flex-1 flex flex-col min-h-0 card overflow-hidden">
-              <GeneralLogsTab
-                logs={logs}
-                filteredLogs={filteredLogs}
-                logLevel={logLevel}
-                onLogLevelChange={setLogLevel}
-                showLogFilter={uiState.showLogFilter}
-                onToggleLogFilter={uiState.setShowLogFilter}
-                logCount={logCount}
-                onClearGeneralLogs={clearGeneralLogs}
-                onCopyLogs={handleCopyLogs}
-                copySuccess={uiState.copySuccess}
-              />
-            </div>
-          </div>
-        );
-
       case "run-dashboard":
         return (
           <RunSelectionProvider>
             <RunDashboard onNavigate={(tabId) => setActiveTab(tabId as MainTabId)} />
+          </RunSelectionProvider>
+        );
+
+      case "run-recap":
+        return (
+          <RunSelectionProvider>
+            <RunPageLayout title="Recap" icon={ClipboardCheck}>
+              <div className="h-full overflow-hidden">
+                <RunRecapTab />
+              </div>
+            </RunPageLayout>
           </RunSelectionProvider>
         );
 
@@ -622,12 +799,12 @@ function AppContent() {
           </RunSelectionProvider>
         );
 
-      case "run-verification":
+      case "run-state-explorer":
         return (
           <RunSelectionProvider>
-            <RunPageLayout title="Verification" icon={FileSearch}>
+            <RunPageLayout title="State Explorer" icon={FileSearch}>
               <div className="h-full overflow-hidden">
-                <VerificationTab />
+                <StateExplorerTab />
               </div>
             </RunPageLayout>
           </RunSelectionProvider>
@@ -691,10 +868,42 @@ function AppContent() {
           </RunSelectionProvider>
         );
 
+      case "run-accessibility":
+        return (
+          <RunSelectionProvider>
+            <RunPageLayout title="Accessibility Explorer" icon={Accessibility}>
+              <div className="h-full overflow-hidden">
+                <AccessibilityExplorerPanel />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        );
+
       case "discoveries":
         return (
           <div className="h-full overflow-y-auto p-4">
             <DiscoverySyncPanel />
+          </div>
+        );
+
+      case "learning":
+        return (
+          <div className="h-full overflow-hidden">
+            <LearningDashboard />
+          </div>
+        );
+
+      case "checkpoints":
+        return (
+          <div className="h-full overflow-hidden">
+            <CheckpointBrowser />
+          </div>
+        );
+
+      case "flow-designer":
+        return (
+          <div className="h-full overflow-hidden">
+            <FlowDesigner />
           </div>
         );
 
@@ -751,36 +960,39 @@ function AppContent() {
         );
 
       case "library":
+        return <LibraryDashboard onNavigateToBuilder={handleNavigateToBuilder} onLog={addLog} />;
+
+      case "task-builder":
         return (
-          <LibraryTab
-            onLog={addLog}
-            onNavigateToActive={() => setActiveTab("active")}
-            onNavigateToBuilder={() => setActiveTab("workflow-builder")}
-            onNavigateToScriptBuilder={() => setActiveTab("script-builder")}
-            onNavigateToGuiWorkflowBuilder={() => setActiveTab("gui-workflow-builder")}
-            onEditScript={handleEditScript}
-            onEditWorkflow={handleEditWorkflow}
-            onEditGuiWorkflow={handleEditGuiWorkflow}
-            aiOutputLines={aiOutputLogs}
-          />
+          <div className="h-full overflow-hidden">
+            <TaskBuilderTab
+              onLog={addLog}
+              editTaskId={editTaskId}
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </div>
+        );
+
+      case "unified-workflow-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <WorkflowBuilderTab
+              editWorkflowId={editWorkflowId}
+              onNavigateToActive={() => setActiveTab("active")}
+            />
+          </div>
         );
 
       case "workflow-builder":
         return (
           <div className="h-full overflow-y-auto">
-            <AiBuilderProvider
+            <AiBuilderTab
               projectLogs={projectLogs}
               onNavigateToLogLocations={() => setActiveTab("logs")}
               onNavigateToAiOutput={() => setActiveTab("ai")}
+              onNavigateToActive={() => setActiveTab("active")}
               editWorkflowId={editWorkflowId}
-            >
-              <AiBuilderTab
-                projectLogs={projectLogs}
-                onNavigateToLogLocations={() => setActiveTab("logs")}
-                onNavigateToAiOutput={() => setActiveTab("ai")}
-                editWorkflowId={editWorkflowId}
-              />
-            </AiBuilderProvider>
+            />
           </div>
         );
 
@@ -794,9 +1006,54 @@ function AppContent() {
       case "script-builder":
         return (
           <div className="h-full overflow-hidden">
-            <ScriptBuilderTab
+            <ScriptsPage
               onLog={addLog}
               editScriptId={editScriptId}
+              editScriptletId={editScriptletId}
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </div>
+        );
+
+      case "context-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <ContextBuilderTab
+              onLog={addLog}
+              editContextId={editContextId}
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </div>
+        );
+
+      case "state-explorer-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <StateExplorerBuilderTab
+              onLog={addLog}
+              editExplorationId={editExplorationId}
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </div>
+        );
+
+      case "api-request-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <ApiRequestBuilderTab
+              onLog={addLog}
+              editRequestId={editApiRequestId}
+              onNavigateToLibrary={() => setActiveTab("library")}
+            />
+          </div>
+        );
+
+      case "awas-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <AwasBuilderTab
+              onLog={addLog}
+              editConfigId={editAwasConfigId}
               onNavigateToLibrary={() => setActiveTab("library")}
             />
           </div>
@@ -806,6 +1063,20 @@ function AppContent() {
         return (
           <div className="h-full overflow-hidden">
             <TestBuilderTab onLog={addLog} />
+          </div>
+        );
+
+      case "check-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <CheckBuilderTab onLog={addLog} />
+          </div>
+        );
+
+      case "shell-command-builder":
+        return (
+          <div className="h-full overflow-hidden">
+            <ShellCommandBuilderTab onLog={addLog} />
           </div>
         );
 
@@ -826,10 +1097,10 @@ function AppContent() {
 
       // monitor-issues removed - merged into Findings
 
-      case "monitor-verification":
+      case "monitor-state-explorer":
         return (
           <div className="h-full overflow-hidden">
-            <VerificationTab />
+            <StateExplorerTab />
           </div>
         );
 
@@ -851,25 +1122,109 @@ function AppContent() {
         );
 
       // ========== CONFIGURE TABS ==========
-      case "config-log-sources":
+      case "config-log-sources": {
+        // Show list of configured global log sources with their paths
+        const sources = globalLogSources.settings?.sources || [];
+
         return (
           <div className="h-full overflow-y-auto p-4">
-            <ExternalLogsTab
-              config={projectLogs.config}
-              sources={projectLogs.logsState.sources}
-              loading={projectLogs.logsState.loading}
-              error={projectLogs.logsState.error}
-              lastRefresh={projectLogs.logsState.lastRefresh}
-              onRefresh={projectLogs.refreshLogs}
-              onConfigureSources={() => setShowLogSourceManager(true)}
-            />
+            <div className="max-w-4xl mx-auto">
+              {/* Header */}
+              <div className="flex items-center justify-between mb-6">
+                <div>
+                  <h1 className="text-2xl font-bold">Log Sources</h1>
+                  <p className="text-muted-foreground text-sm mt-1">
+                    External log files configured for monitoring
+                  </p>
+                </div>
+                <button
+                  onClick={() => setActiveTab("settings-log-sources")}
+                  className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
+                >
+                  <FileText className="w-4 h-4" />
+                  Configure Sources
+                </button>
+              </div>
+
+              {/* Sources list */}
+              {sources.length === 0 ? (
+                <div className="text-center py-12 text-muted-foreground">
+                  <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                  <p className="text-lg font-medium mb-2">No Log Sources Configured</p>
+                  <p className="text-sm mb-4">
+                    Add external log files to monitor your applications
+                  </p>
+                  <button
+                    onClick={() => setActiveTab("settings-log-sources")}
+                    className="px-4 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90"
+                  >
+                    Configure Log Sources
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {sources.map((source) => (
+                    <div
+                      key={source.id}
+                      className="flex items-center gap-4 p-4 bg-card border border-border rounded-lg"
+                      style={{ borderLeftWidth: "4px", borderLeftColor: source.color || "#6b7280" }}
+                    >
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="font-medium">{source.name}</span>
+                          <span
+                            className={`text-xs px-2 py-0.5 rounded ${source.enabled ? "bg-green-500/20 text-green-500" : "bg-muted text-muted-foreground"}`}
+                          >
+                            {source.enabled ? "Enabled" : "Disabled"}
+                          </span>
+                          <span className="text-xs px-2 py-0.5 bg-muted text-muted-foreground rounded">
+                            {source.category}
+                          </span>
+                        </div>
+                        <p className="text-sm text-muted-foreground truncate" title={source.path}>
+                          {source.path}
+                        </p>
+                        {source.description && (
+                          <p className="text-xs text-muted-foreground mt-1">{source.description}</p>
+                        )}
+                      </div>
+                      <div className="text-xs text-muted-foreground">{source.tail_lines} lines</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* View logs link */}
+              {sources.length > 0 && (
+                <div className="mt-6 pt-6 border-t border-border">
+                  <p className="text-sm text-muted-foreground">
+                    To view log content during workflow runs, use the{" "}
+                    <button
+                      onClick={() => setActiveTab("run-dashboard")}
+                      className="text-primary hover:underline"
+                    >
+                      Sessions Dashboard
+                    </button>
+                    .
+                  </p>
+                </div>
+              )}
+            </div>
           </div>
         );
+      }
 
       case "config-findings":
         return (
           <div className="h-full overflow-y-auto">
             <CategoryManager onLog={addLog} />
+          </div>
+        );
+
+      case "config-hooks":
+        return (
+          <div className="h-full overflow-hidden">
+            <HooksManagerPanel />
           </div>
         );
 
@@ -886,7 +1241,12 @@ function AppContent() {
       case "settings":
       case "settings-account":
       case "settings-ai":
+      case "settings-agentic":
+      case "settings-self-healing":
       case "settings-playwright":
+      case "settings-mobile":
+      case "settings-mcp":
+      case "settings-log-sources":
       case "settings-general":
       case "settings-storage":
       case "settings-backup":
@@ -897,7 +1257,12 @@ function AppContent() {
           settings: "account",
           "settings-account": "account",
           "settings-ai": "ai",
+          "settings-agentic": "agentic",
+          "settings-self-healing": "self-healing",
           "settings-playwright": "playwright",
+          "settings-mobile": "mobile",
+          "settings-mcp": "mcp",
+          "settings-log-sources": "log-sources",
           "settings-general": "general",
           "settings-storage": "storage",
           "settings-backup": "backup",
@@ -991,9 +1356,24 @@ function AppContent() {
             projectLogs.saveConfig(sources); // Pass sources directly to avoid React async state issue
             setShowLogSourceManager(false);
           }}
+          projectDirectory={projectLogs.directories?.base}
         />
       )}
     </div>
+  );
+}
+
+/**
+ * Inner app with navigation-aware tutorial provider
+ */
+function AppWithTutorials() {
+  const { navigate } = useNavigation();
+
+  return (
+    <TutorialProvider onNavigate={navigate}>
+      <AppContent />
+      <ContextualTutorial />
+    </TutorialProvider>
   );
 }
 
@@ -1003,18 +1383,20 @@ function AppContent() {
 export default function App() {
   return (
     <AuthProvider>
-      <EventManagerProvider>
-        <ExecutionProvider
-          onLog={(level, message) => {
-            // Logs are now handled by LogManager through event handlers
-            console.log(`[LOG] ${level}: ${message}`);
-          }}
-        >
-          <AutoContinueProvider>
-            <AppContent />
-          </AutoContinueProvider>
-        </ExecutionProvider>
-      </EventManagerProvider>
+      <NavigationProvider>
+        <EventManagerProvider>
+          <ExecutionProvider
+            onLog={(level, message) => {
+              // Logs are now handled by LogManager through event handlers
+              console.log(`[LOG] ${level}: ${message}`);
+            }}
+          >
+            <AutoContinueProvider>
+              <AppWithTutorials />
+            </AutoContinueProvider>
+          </ExecutionProvider>
+        </EventManagerProvider>
+      </NavigationProvider>
     </AuthProvider>
   );
 }

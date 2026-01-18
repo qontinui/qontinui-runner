@@ -9,6 +9,7 @@
 import { useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import { FileText, FolderOpen, Sparkles, ChevronDown } from "lucide-react";
+import { getAccentColors } from "@/design-system";
 
 export interface ConfigurationLoadMenuProps {
   onLoadFromFile: () => void;
@@ -21,7 +22,10 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
   return (
     <DropdownMenu.Root open={open} onOpenChange={setOpen}>
       <DropdownMenu.Trigger asChild>
-        <button className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 transition-colors">
+        <button
+          data-tutorial-id="load-config-button"
+          className={`w-full flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg ${getAccentColors("blue").bg} ${getAccentColors("blue").text} hover:opacity-80 transition-colors`}
+        >
           <FileText className="w-3.5 h-3.5" />
           Load Configuration
           <ChevronDown className="w-3.5 h-3.5 ml-auto" />
@@ -42,7 +46,7 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
               onLoadFromFile();
             }}
           >
-            <FolderOpen className="w-3.5 h-3.5 text-blue-400" />
+            <FolderOpen className={`w-3.5 h-3.5 ${getAccentColors("blue").text}`} />
             <span className="flex-1">Load from File</span>
           </DropdownMenu.Item>
 
@@ -57,7 +61,7 @@ export function ConfigurationLoadMenu({ onLoadFromFile, onLoadRAG }: Configurati
               onLoadRAG();
             }}
           >
-            <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+            <Sparkles className={`w-3.5 h-3.5 ${getAccentColors("purple").text}`} />
             <span className="flex-1">Load RAG Project</span>
           </DropdownMenu.Item>
         </DropdownMenu.Content>

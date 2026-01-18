@@ -8,6 +8,7 @@
  */
 
 import { History, CheckCircle2, XCircle, Clock, AlertTriangle, ChevronRight } from "lucide-react";
+import { getStatusColors, getAccentColors } from "@/design-system";
 import type { RunDetails } from "../../types/statistics";
 
 interface RunHistoryPanelProps {
@@ -29,15 +30,15 @@ export function RunHistoryPanel({ runs, onRunClick }: RunHistoryPanelProps) {
 
   const getStatusIcon = (status: string, success?: boolean) => {
     if (status === "completed" && success) {
-      return <CheckCircle2 className="w-4 h-4 text-green-500" />;
+      return <CheckCircle2 className={`w-4 h-4 ${getStatusColors("success").icon}`} />;
     }
     if (status === "failed" || success === false) {
-      return <XCircle className="w-4 h-4 text-red-500" />;
+      return <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />;
     }
     if (status === "timeout") {
-      return <Clock className="w-4 h-4 text-orange-500" />;
+      return <Clock className={`w-4 h-4 ${getAccentColors("orange").text}`} />;
     }
-    return <AlertTriangle className="w-4 h-4 text-yellow-500" />;
+    return <AlertTriangle className={`w-4 h-4 ${getStatusColors("warning").icon}`} />;
   };
 
   // Calculate stats for the header
@@ -76,10 +77,10 @@ export function RunHistoryPanel({ runs, onRunClick }: RunHistoryPanelProps) {
             key={run.id}
             className={`flex-1 rounded-sm transition-colors ${
               run.success
-                ? "bg-green-500 hover:bg-green-400"
+                ? `${getAccentColors("green").bgSolid} hover:bg-green-400`
                 : run.status === "timeout"
-                  ? "bg-orange-500 hover:bg-orange-400"
-                  : "bg-red-500 hover:bg-red-400"
+                  ? `${getAccentColors("orange").bgSolid} hover:bg-orange-400`
+                  : `${getAccentColors("red").bgSolid} hover:bg-red-400`
             }`}
             title={`${run.workflow_name || "Run"}: ${run.status}`}
           />

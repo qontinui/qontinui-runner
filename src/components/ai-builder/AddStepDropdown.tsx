@@ -20,6 +20,7 @@ import {
   ArrowLeft,
 } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getAccentColors } from "@/design-system";
 
 type CategoryId =
   | "workflows"
@@ -46,14 +47,14 @@ const CATEGORIES: CategoryConfig[] = [
     id: "workflows",
     label: "Workflows",
     icon: Workflow,
-    color: "text-purple-500",
+    color: getAccentColors("purple").text,
     requiresConfig: true,
   },
   {
     id: "gui-workflows",
     label: "GUI Workflows",
     icon: MousePointer2,
-    color: "text-orange-500",
+    color: getAccentColors("orange").text,
     requiresConfig: false,
   },
   { id: "states", label: "States", icon: Target, color: "text-primary", requiresConfig: true },
@@ -61,28 +62,28 @@ const CATEGORIES: CategoryConfig[] = [
     id: "playwright",
     label: "Playwright Tests",
     icon: TestTube,
-    color: "text-green-500",
+    color: getAccentColors("green").text,
     requiresConfig: false,
   },
   {
     id: "prompts",
     label: "Prompts",
     icon: FileText,
-    color: "text-amber-500",
+    color: getAccentColors("amber").text,
     requiresConfig: false,
   },
   {
     id: "actions",
     label: "Click Actions",
     icon: MousePointer2,
-    color: "text-blue-500",
+    color: getAccentColors("blue").text,
     requiresConfig: true,
   },
   {
     id: "capture",
     label: "Capture",
     icon: Camera,
-    color: "text-cyan-500",
+    color: getAccentColors("cyan").text,
     requiresConfig: false,
     alwaysShow: true,
   },
@@ -90,8 +91,9 @@ const CATEGORIES: CategoryConfig[] = [
     id: "tests",
     label: "Verification Tests",
     icon: ClipboardCheck,
-    color: "text-emerald-500",
+    color: getAccentColors("emerald").text,
     requiresConfig: false,
+    alwaysShow: true,
   },
 ];
 
@@ -154,7 +156,7 @@ export function AddStepDropdown() {
       {/* No config loaded warning */}
       {!configLoaded && (
         <div className="px-3 py-3 border-b border-border">
-          <div className="flex items-center gap-2 text-amber-500 mb-2">
+          <div className={`flex items-center gap-2 ${getAccentColors("amber").text} mb-2`}>
             <AlertTriangle className="w-4 h-4" />
             <span className="text-sm font-medium">No Config Loaded</span>
           </div>
@@ -226,7 +228,7 @@ export function AddStepDropdown() {
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
               >
-                <Workflow className="w-4 h-4 text-purple-500" />
+                <Workflow className={`w-4 h-4 ${getAccentColors("purple").text}`} />
                 <span className="truncate">{workflow.name}</span>
               </button>
             ))}
@@ -241,7 +243,7 @@ export function AddStepDropdown() {
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
               >
-                <MousePointer2 className="w-4 h-4 text-orange-500" />
+                <MousePointer2 className={`w-4 h-4 ${getAccentColors("orange").text}`} />
                 <span className="truncate flex-1">{workflow.name}</span>
                 <span className="text-xs text-muted-foreground">{workflow.stepCount} steps</span>
               </button>
@@ -281,7 +283,7 @@ export function AddStepDropdown() {
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
               >
-                <TestTube className="w-4 h-4 text-green-500" />
+                <TestTube className={`w-4 h-4 ${getAccentColors("green").text}`} />
                 <span className="truncate flex-1">{script.name}</span>
                 {script.target_url && (
                   <span className="text-xs text-muted-foreground truncate max-w-24">
@@ -309,7 +311,7 @@ export function AddStepDropdown() {
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
               >
-                <FileText className="w-4 h-4 text-amber-500" />
+                <FileText className={`w-4 h-4 ${getAccentColors("amber").text}`} />
                 <span className="truncate flex-1">{prompt.name}</span>
                 {prompt.category && (
                   <span className="text-xs text-muted-foreground">{prompt.category}</span>
@@ -327,7 +329,7 @@ export function AddStepDropdown() {
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
               >
-                <MousePointer2 className="w-4 h-4 text-blue-500" />
+                <MousePointer2 className={`w-4 h-4 ${getAccentColors("blue").text}`} />
                 <span className="truncate flex-1">{image.name}</span>
                 <span className="text-xs text-muted-foreground">{image.stateName}</span>
               </button>
@@ -341,10 +343,20 @@ export function AddStepDropdown() {
               }}
               className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
             >
-              <Camera className="w-4 h-4 text-cyan-500" />
+              <Camera className={`w-4 h-4 ${getAccentColors("cyan").text}`} />
               <span className="flex-1">Screenshot</span>
               <span className="text-xs text-muted-foreground">for AI analysis</span>
             </button>
+          )}
+
+          {activeCategory === "tests" && verificationTests.length === 0 && (
+            <div className="px-3 py-4 text-center text-muted-foreground">
+              <ClipboardCheck className="w-8 h-8 mx-auto mb-2 opacity-50" />
+              <p className="text-sm font-medium">No Tests Available</p>
+              <p className="text-xs mt-1">
+                Create tests in the Test Builder to add them as workflow steps.
+              </p>
+            </div>
           )}
 
           {activeCategory === "tests" &&
@@ -357,10 +369,12 @@ export function AddStepDropdown() {
                 }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/30 transition-colors"
               >
-                <ClipboardCheck className="w-4 h-4 text-emerald-500" />
+                <ClipboardCheck className={`w-4 h-4 ${getAccentColors("emerald").text}`} />
                 <span className="truncate flex-1">{test.name}</span>
                 {test.is_critical && (
-                  <span className="text-xs text-amber-500 font-medium">Critical</span>
+                  <span className={`text-xs ${getAccentColors("amber").text} font-medium`}>
+                    Critical
+                  </span>
                 )}
                 {test.category && (
                   <span className="text-xs text-muted-foreground">{test.category}</span>

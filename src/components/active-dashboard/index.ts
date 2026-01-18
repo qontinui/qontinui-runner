@@ -2,30 +2,69 @@
  * Active Dashboard Components
  *
  * Live execution dashboard for viewing real-time workflow execution.
- * These components display the current state of automation while it's running.
+ * Uses a dynamic widget-based system that shows only activities relevant
+ * to the currently running task.
  *
  * @example
- * import { ControlBar, LiveExecutionView, StatusPanel, useDashboardState } from '@/components/active-dashboard';
+ * import { ActiveDashboardPage } from '@/components/active-dashboard';
+ * <ActiveDashboardPage onGoToExecute={() => navigate('/execute')} />
  */
 
-// Main components
+// Main page components
+export { ActiveDashboardPage } from "./ActiveDashboardPage";
+export { DashboardPage } from "./DashboardPage";
+export { DashboardLayout } from "./DashboardLayout";
+export { WidgetHeader } from "./WidgetHeader";
+
+// Layout components (backward compatibility)
 export { ControlBar } from "./ControlBar";
+export { BottomBar } from "./BottomBar";
+export { IdleState } from "./IdleState";
+
+// Legacy components (may be deprecated in future)
 export { LiveExecutionView } from "./LiveExecutionView";
 export { ScreenshotView } from "./ScreenshotView";
 export { ActionStream } from "./ActionStream";
 export { StatusPanel } from "./StatusPanel";
-export { BottomBar } from "./BottomBar";
-export { IdleState } from "./IdleState";
-export { ActiveDashboardPage } from "./ActiveDashboardPage";
 
-// Hooks
-export { useDashboardState } from "./useDashboardState";
-export type { DashboardState } from "./useDashboardState";
+// Widget registration
+export { registerAllWidgets, areWidgetsRegistered } from "./widgets";
 
-// Types
+// Widgets
+export * from "./widgets";
+
+// New dashboard hooks
+export {
+  useDashboardState,
+  useDashboardLayout,
+  useTaskDetection,
+  usePhaseTracking,
+  type DashboardState,
+  type DashboardStatus,
+  type UseDashboardStateResult,
+  type DashboardLayoutState,
+  type UseTaskDetectionResult,
+} from "../../hooks/dashboard";
+
+// Legacy dashboard state hook (backward compatibility)
+export { useDashboardState as useLegacyDashboardState } from "./useDashboardState";
+
+// Dashboard types
 export type {
-  ActionType,
-  ActionStatus,
+  ActivityType,
+  ActivityStatus,
+  ActivityState,
+  TaskPhase,
+} from "../../types/dashboard/activity-types";
+
+export type { TaskActivityInfo, WidgetConfig } from "../../types/dashboard/widget-registry";
+
+export type { BaseWidgetProps, WidgetHeaderProps } from "../../types/dashboard/widget-props";
+
+// Legacy types (backward compatibility)
+export type {
+  ActionType as LegacyActionType,
+  ActionStatus as LegacyActionStatus,
   ExecutionStatus,
   AnomalyType,
   AnomalySeverity,
@@ -37,14 +76,19 @@ export type {
   ScreenshotInfo,
   ScreenshotsResult,
   ExecutionState,
-  ControlBarProps,
+  ControlBarProps as LegacyControlBarProps,
   LiveExecutionViewProps,
   ScreenshotViewProps,
   ActionStreamProps,
   StatusPanelProps,
-  BottomBarProps,
+  BottomBarProps as LegacyBottomBarProps,
   IdleStateProps,
 } from "./types";
 
 // Constants
 export { ACTION_TYPES } from "./types";
+export {
+  ACTIVITY_DISPLAY_CONFIG,
+  PHASE_DISPLAY_CONFIG,
+  ACTIVITY_PRIORITIES,
+} from "../../types/dashboard/activity-types";

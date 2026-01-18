@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { X, Upload, Download, FileJson, Check, AlertCircle, Info } from "lucide-react";
 import type { CommandResponse, VerificationTest } from "./types";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
 interface ImportExportDialogProps {
   mode: "import" | "export";
@@ -226,9 +227,13 @@ export function ImportExportDialog({
               </label>
 
               {!updateExisting && (
-                <div className="flex items-start gap-2 p-2 bg-blue-500/10 border border-blue-500/20 rounded-md">
-                  <Info className="w-4 h-4 text-blue-500 flex-shrink-0 mt-0.5" />
-                  <p className="text-xs text-blue-500">
+                <div
+                  className={`flex items-start gap-2 p-2 ${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-md`}
+                >
+                  <Info
+                    className={`w-4 h-4 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`}
+                  />
+                  <p className={`text-xs ${getAccentColors("blue").text}`}>
                     Tests with duplicate names will be skipped. Enable update to replace them.
                   </p>
                 </div>
@@ -246,19 +251,29 @@ export function ImportExportDialog({
 
           {/* Success message */}
           {success && !importSummary && (
-            <div className="flex items-start gap-2 p-3 bg-green-500/10 border border-green-500/20 rounded-md">
-              <Check className="w-4 h-4 text-green-500 flex-shrink-0 mt-0.5" />
-              <p className="text-sm text-green-500">{success}</p>
+            <div
+              className={`flex items-start gap-2 p-3 ${getStatusColors("success").bg} border ${getStatusColors("success").border} rounded-md`}
+            >
+              <Check
+                className={`w-4 h-4 ${getStatusColors("success").icon} flex-shrink-0 mt-0.5`}
+              />
+              <p className={`text-sm ${getStatusColors("success").text}`}>{success}</p>
             </div>
           )}
 
           {/* Import summary */}
           {importSummary && (
             <div className="space-y-3">
-              <div className="flex items-start gap-2 p-3 bg-green-500/10 border border-green-500/20 rounded-md">
-                <Check className="w-4 h-4 text-green-500 flex-shrink-0 mt-0.5" />
+              <div
+                className={`flex items-start gap-2 p-3 ${getStatusColors("success").bg} border ${getStatusColors("success").border} rounded-md`}
+              >
+                <Check
+                  className={`w-4 h-4 ${getStatusColors("success").icon} flex-shrink-0 mt-0.5`}
+                />
                 <div className="text-sm">
-                  <p className="font-medium text-green-500">Import Complete</p>
+                  <p className={`font-medium ${getStatusColors("success").text}`}>
+                    Import Complete
+                  </p>
                   <p className="text-muted-foreground mt-1">
                     {importSummary.created} created, {importSummary.updated} updated,{" "}
                     {importSummary.skipped} skipped
@@ -285,12 +300,12 @@ export function ImportExportDialog({
                             <span
                               className={`px-2 py-0.5 rounded text-xs font-medium ${
                                 result.status === "created"
-                                  ? "bg-green-500/20 text-green-500"
+                                  ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
                                   : result.status === "updated"
-                                    ? "bg-blue-500/20 text-blue-500"
+                                    ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
                                     : result.status === "skipped"
-                                      ? "bg-yellow-500/20 text-yellow-500"
-                                      : "bg-red-500/20 text-red-500"
+                                      ? `${getStatusColors("warning").bg} ${getStatusColors("warning").text}`
+                                      : `${getStatusColors("error").bg} ${getStatusColors("error").text}`
                               }`}
                             >
                               {result.status}

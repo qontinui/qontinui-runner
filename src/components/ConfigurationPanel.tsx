@@ -11,6 +11,7 @@ import CollapsiblePanel from "./CollapsiblePanel";
 import { ConfigurationLoadMenu } from "./ConfigurationLoadMenu";
 import { RAGProjectModal } from "./RAGProjectModal";
 import type { Config } from "../contexts/ExecutionContext";
+import { getAccentColors } from "@/design-system";
 
 export interface ConfigurationPanelProps {
   config: Config | null;
@@ -70,8 +71,10 @@ export function ConfigurationPanel({
           </button>
 
           {config && (
-            <div className="p-3 rounded-lg bg-blue-500/10">
-              <p className="font-medium text-sm text-blue-400 mb-1">{config.name}</p>
+            <div className={`p-3 rounded-lg ${getAccentColors("blue").bg}`}>
+              <p className={`font-medium text-sm ${getAccentColors("blue").text} mb-1`}>
+                {config.name}
+              </p>
               <div className="text-xs text-muted-foreground flex gap-3">
                 <span>States: {config.statesCount}</span>
                 <span>Workflows: {config.workflowsCount}</span>

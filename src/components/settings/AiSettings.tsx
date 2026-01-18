@@ -2,6 +2,8 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Bot, Check, X, Play, Eye, EyeOff, Zap, Terminal, Video, Sparkles } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { getAccentColors, getStatusColors } from "@/design-system";
+import { TutorialTrigger } from "../tutorial";
 import type {
   AiSettings as AiSettingsType,
   AiProvider,
@@ -30,6 +32,7 @@ const DEFAULT_AI_SETTINGS: AiSettingsType = {
   claude_cli: {
     execution_mode: "auto",
     timeout_seconds: 600,
+    config_dir: undefined,
   },
   claude_api: {
     model: "claude-sonnet-4-20250514",
@@ -39,10 +42,10 @@ const DEFAULT_AI_SETTINGS: AiSettingsType = {
     execution_mode: "auto",
     timeout_seconds: 600,
     auth_method: "oauth",
-    model: "gemini-3-flash",
+    model: "gemini-3-flash-preview",
   },
   gemini_api: {
-    model: "gemini-3-flash",
+    model: "gemini-3-flash-preview",
     max_output_tokens: 8192,
     temperature: 0.7,
   },
@@ -103,8 +106,8 @@ const MODEL_OPTIONS = [
 ];
 
 const GEMINI_MODEL_OPTIONS = [
-  { value: "gemini-3-flash", label: "Gemini 3 Flash (Fast/Cheap)" },
-  { value: "gemini-3-pro", label: "Gemini 3 Pro" },
+  { value: "gemini-3-flash-preview", label: "Gemini 3 Flash (Fast/Cheap)" },
+  { value: "gemini-3-pro-preview", label: "Gemini 3 Pro" },
   { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
   { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
   { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
@@ -170,6 +173,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             timeout_seconds:
               result.data.claude_cli?.timeout_seconds ||
               DEFAULT_AI_SETTINGS.claude_cli.timeout_seconds,
+            config_dir: result.data.claude_cli?.config_dir,
           },
           claude_api: {
             model: result.data.claude_api?.model || DEFAULT_AI_SETTINGS.claude_api.model,
@@ -249,6 +253,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         executionMode: settings.claude_cli.execution_mode,
         customPath: settings.claude_cli.custom_path || null,
         timeoutSeconds: settings.claude_cli.timeout_seconds,
+        configDir: settings.claude_cli.config_dir || null,
         model: settings.claude_api.model,
         maxTokens: settings.claude_api.max_tokens,
         autoRefineVideoAfterIterations: settings.auto_refine_video_after_iterations,
@@ -261,16 +266,15 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         return;
       }
 
-      // Also save Gemini settings
+      // Also save Gemini settings (provider is preserved by the backend)
       const geminiResult = await invoke<TauriResult<null>>("save_gemini_settings", {
-        cliExecutionMode: settings.gemini_cli?.execution_mode || "auto",
-        cliCustomPath: settings.gemini_cli?.custom_path || null,
-        cliTimeoutSeconds: settings.gemini_cli?.timeout_seconds || 600,
-        cliAuthMethod: settings.gemini_cli?.auth_method || "oauth",
-        cliModel: settings.gemini_cli?.model || "gemini-3-flash",
-        apiModel: settings.gemini_api?.model || "gemini-3-flash",
-        apiMaxOutputTokens: settings.gemini_api?.max_output_tokens || 8192,
-        apiTemperature: settings.gemini_api?.temperature ?? 0.7,
+        executionMode: settings.gemini_cli?.execution_mode || "auto",
+        customPath: settings.gemini_cli?.custom_path || null,
+        timeoutSeconds: settings.gemini_cli?.timeout_seconds || 600,
+        authMethod: settings.gemini_cli?.auth_method || "oauth",
+        model: settings.gemini_cli?.model || "gemini-3-flash-preview",
+        maxOutputTokens: settings.gemini_api?.max_output_tokens || 8192,
+        temperature: settings.gemini_api?.temperature ?? 0.7,
       });
 
       if (geminiResult && geminiResult.success) {
@@ -437,24 +441,34 @@ export function AiSettings({ onLog }: AiSettingsProps) {
   }
 
   return (
-    <div className="space-y-6">
-      <SectionHeader
-        title="AI Provider"
-        description="Configure how the runner connects to AI for automation analysis and assistance. Choose between Claude Code CLI (subscription-based) or direct API access."
-        icon={<Bot className="w-6 h-6" />}
-      />
+    <div className="space-y-6" data-tutorial-id="ai-settings-panel">
+      <div className="flex items-start justify-between">
+        <SectionHeader
+          title="AI Provider"
+          description="Configure how the runner connects to AI for automation analysis and assistance. Choose between Claude Code CLI (subscription-based) or direct API access."
+          icon={<Bot className="w-6 h-6" />}
+        />
+        <TutorialTrigger
+          tutorialId="ai-analysis"
+          tooltip="Learn about AI analysis features"
+          variant="button"
+          size="sm"
+        />
+      </div>
 
       {error && (
-        <div className="p-3 bg-red-500/10 rounded-lg flex items-start gap-2">
-          <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-          <span className="text-red-400 text-xs">{error}</span>
+        <div className={`p-3 ${getAccentColors("red").bg} rounded-lg flex items-start gap-2`}>
+          <X className={`w-4 h-4 ${getAccentColors("red").text} shrink-0 mt-0.5`} />
+          <span className={`${getAccentColors("red").text} text-xs`}>{error}</span>
         </div>
       )}
 
       {saveSuccess && (
-        <div className="p-3 bg-green-500/10 rounded-lg flex items-start gap-2">
-          <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
-          <span className="text-green-400 text-xs">Settings saved successfully!</span>
+        <div className={`p-3 ${getAccentColors("green").bg} rounded-lg flex items-start gap-2`}>
+          <Check className={`w-4 h-4 ${getAccentColors("green").text} shrink-0 mt-0.5`} />
+          <span className={`${getAccentColors("green").text} text-xs`}>
+            Settings saved successfully!
+          </span>
         </div>
       )}
 
@@ -550,6 +564,29 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             </div>
 
             <div className="space-y-1.5">
+              <label className="text-xs font-medium">Config Directory (Optional)</label>
+              <input
+                type="text"
+                value={settings.claude_cli.config_dir || ""}
+                onChange={(e) =>
+                  setSettings((prev) => ({
+                    ...prev,
+                    claude_cli: {
+                      ...prev.claude_cli,
+                      config_dir: e.target.value || undefined,
+                    },
+                  }))
+                }
+                placeholder="e.g., C:\Users\Name\.claude-work"
+                className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              />
+              <p className="text-[10px] text-muted-foreground">
+                Set CLAUDE_CONFIG_DIR to use a different Claude account. Useful for multi-account
+                setups (e.g., work vs personal).
+              </p>
+            </div>
+
+            <div className="space-y-1.5">
               <label className="text-xs font-medium">Timeout (seconds)</label>
               <input
                 type="number"
@@ -596,7 +633,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   </div>
                   <button
                     onClick={deleteApiKey}
-                    className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors text-xs"
+                    className={`px-3 py-1.5 ${getAccentColors("red").bg} hover:bg-red-500/30 ${getAccentColors("red").text} rounded-md transition-colors text-xs`}
                   >
                     Delete
                   </button>
@@ -691,8 +728,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </p>
             </div>
 
-            <div className="p-3 bg-yellow-500/10 rounded-lg">
-              <div className="text-xs text-yellow-400">
+            <div className={`p-3 ${getAccentColors("yellow").bg} rounded-lg`}>
+              <div className={`text-xs ${getAccentColors("yellow").text}`}>
                 <strong>Note:</strong> Using the Claude API incurs per-token costs. Consider using
                 Claude Code CLI with your subscription for unlimited usage.
               </div>
@@ -750,7 +787,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             <div className="space-y-1.5">
               <label className="text-xs font-medium">Model</label>
               <select
-                value={settings.gemini_cli?.model || "gemini-3-flash"}
+                value={settings.gemini_cli?.model || "gemini-3-flash-preview"}
                 onChange={(e) =>
                   setSettings((prev) => ({
                     ...prev,
@@ -816,8 +853,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               />
             </div>
 
-            <div className="p-3 bg-blue-500/10 rounded-lg">
-              <div className="text-sm text-blue-400">
+            <div className={`p-3 ${getAccentColors("blue").bg} rounded-lg`}>
+              <div className={`text-sm ${getAccentColors("blue").text}`}>
                 <strong>Tip:</strong> Install Gemini CLI with:{" "}
                 <code className="bg-blue-500/20 px-1 rounded">
                   npm install -g @google/gemini-cli
@@ -846,7 +883,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   </div>
                   <button
                     onClick={deleteGeminiApiKey}
-                    className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md transition-colors text-xs"
+                    className={`px-3 py-1.5 ${getAccentColors("red").bg} hover:bg-red-500/30 ${getAccentColors("red").text} rounded-md transition-colors text-xs`}
                   >
                     Delete
                   </button>
@@ -898,7 +935,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             <div className="space-y-1.5">
               <label className="text-xs font-medium">Model</label>
               <select
-                value={settings.gemini_api?.model || "gemini-3-flash"}
+                value={settings.gemini_api?.model || "gemini-3-flash-preview"}
                 onChange={(e) =>
                   setSettings((prev) => ({
                     ...prev,
@@ -965,8 +1002,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
               </p>
             </div>
 
-            <div className="p-3 bg-green-500/10 rounded-lg">
-              <div className="text-xs text-green-400">
+            <div className={`p-3 ${getAccentColors("green").bg} rounded-lg`}>
+              <div className={`text-xs ${getAccentColors("green").text}`}>
                 <strong>Cost Savings:</strong> Gemini Flash is significantly cheaper than Claude for
                 simple tasks like linting and formatting.
               </div>
@@ -1007,8 +1044,8 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             </p>
           </div>
 
-          <div className="p-3 bg-yellow-500/10 rounded-lg">
-            <div className="text-xs text-yellow-400">
+          <div className={`p-3 ${getAccentColors("yellow").bg} rounded-lg`}>
+            <div className={`text-xs ${getAccentColors("yellow").text}`}>
               <strong>Note:</strong> Video frames use significantly more tokens than screenshots.
               Only recommended for complex failures where screenshots alone aren't sufficient.
             </div>
@@ -1048,15 +1085,17 @@ export function AiSettings({ onLog }: AiSettingsProps) {
         {testResult && (
           <div
             className={`p-3 rounded-lg flex items-start gap-2 ${
-              testResult.success ? "bg-green-500/10" : "bg-red-500/10"
+              testResult.success ? getStatusColors("success").bg : getStatusColors("error").bg
             }`}
           >
             {testResult.success ? (
-              <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
+              <Check className={`w-4 h-4 ${getStatusColors("success").icon} shrink-0 mt-0.5`} />
             ) : (
-              <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+              <X className={`w-4 h-4 ${getStatusColors("error").icon} shrink-0 mt-0.5`} />
             )}
-            <span className={`text-xs ${testResult.success ? "text-green-400" : "text-red-400"}`}>
+            <span
+              className={`text-xs ${testResult.success ? getStatusColors("success").text : getStatusColors("error").text}`}
+            >
               {testResult.message}
             </span>
           </div>

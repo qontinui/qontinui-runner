@@ -13,6 +13,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import * as Dialog from "@radix-ui/react-dialog";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import {
   Package,
   FolderOpen,
@@ -427,14 +428,18 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
       {scanResult && (
         <div className="p-4 bg-card border border-border/50 rounded-lg space-y-3">
           <div className="flex items-center gap-2 font-medium">
-            <CheckCircle className="w-5 h-5 text-green-500" />
+            <CheckCircle className={`w-5 h-5 ${getStatusColors("success").icon}`} />
             Scan Complete
           </div>
           <div className="grid grid-cols-2 gap-3">
-            <div className="p-3 rounded-lg bg-green-500/10 border border-green-500/20">
+            <div
+              className={`p-3 rounded-lg ${getStatusColors("success").bg} border ${getStatusColors("success").border}`}
+            >
               <div className="flex items-center gap-2 mb-1">
-                <CheckCircle className="w-4 h-4 text-green-500" />
-                <span className="text-sm font-medium text-green-500">Matched</span>
+                <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />
+                <span className={`text-sm font-medium ${getStatusColors("success").icon}`}>
+                  Matched
+                </span>
               </div>
               <p className="text-xl font-bold text-foreground">{scanResult.matched.length}</p>
               <p className="text-xs text-muted-foreground">
@@ -453,8 +458,12 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
             </div>
           </div>
           {scanResult.unmatched.length > 0 && (
-            <div className="p-3 rounded-lg bg-orange-500/10 border border-orange-500/20 flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-orange-500 flex-shrink-0 mt-0.5" />
+            <div
+              className={`p-3 rounded-lg ${getAccentColors("orange").bg} border ${getAccentColors("orange").border} flex items-start gap-2`}
+            >
+              <AlertCircle
+                className={`w-4 h-4 ${getAccentColors("orange").text} flex-shrink-0 mt-0.5`}
+              />
               <p className="text-xs text-muted-foreground">
                 {scanResult.unmatched.length} images from the manifest were not found locally.
               </p>
@@ -611,7 +620,7 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
           <button
             onClick={packageDataset}
             disabled={packaging}
-            className="w-full px-4 py-3 bg-green-600 hover:bg-green-700 disabled:bg-muted disabled:cursor-not-allowed text-white rounded-md font-medium transition-colors flex items-center justify-center gap-2"
+            className={`w-full px-4 py-3 ${getAccentColors("green").bgSolid} hover:opacity-90 disabled:bg-muted disabled:cursor-not-allowed text-white rounded-md font-medium transition-colors flex items-center justify-center gap-2`}
           >
             <Package className="w-5 h-5" />
             Package Dataset
@@ -646,10 +655,16 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
       {/* Package Success */}
       {packageResult && (
         <div className="space-y-4">
-          <div className="p-4 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-3">
-            <CheckCircle className="w-6 h-6 text-green-500 flex-shrink-0 mt-0.5" />
+          <div
+            className={`p-4 ${getAccentColors("green").bg} border ${getAccentColors("green").border} rounded-lg flex items-start gap-3`}
+          >
+            <CheckCircle
+              className={`w-6 h-6 ${getStatusColors("success").icon} flex-shrink-0 mt-0.5`}
+            />
             <div>
-              <p className="font-semibold text-green-500">Dataset Packaged Successfully!</p>
+              <p className={`font-semibold ${getStatusColors("success").icon}`}>
+                Dataset Packaged Successfully!
+              </p>
               <p className="text-sm text-muted-foreground mt-1">
                 Your YOLO dataset is ready for training.
               </p>

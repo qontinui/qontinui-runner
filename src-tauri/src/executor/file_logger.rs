@@ -18,7 +18,7 @@ static SCREENSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Base directory for all dev logs
 fn get_dev_logs_dir() -> PathBuf {
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 /// Directory for screenshots
@@ -31,11 +31,17 @@ fn get_playwright_screenshots_dir() -> PathBuf {
     get_dev_logs_dir().join("playwright-screenshots")
 }
 
+/// Directory for API response images
+fn get_api_images_dir() -> PathBuf {
+    get_dev_logs_dir().join("api-images")
+}
+
 /// Ensure directories exist
 fn ensure_dirs() -> std::io::Result<()> {
     fs::create_dir_all(get_dev_logs_dir())?;
     fs::create_dir_all(get_screenshots_dir())?;
     fs::create_dir_all(get_playwright_screenshots_dir())?;
+    fs::create_dir_all(get_api_images_dir())?;
     Ok(())
 }
 
@@ -146,6 +152,97 @@ pub struct PlaywrightTestSpec {
     pub duration_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// API request log entry for file storage
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApiRequestFileEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub step_id: String,
+    pub step_name: String,
+
+    // Request details
+    pub method: String,
+    pub url: String,
+    pub resolved_url: String,
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+
+    // Response details
+    pub status_code: u16,
+    pub status_text: String,
+    pub response_headers: std::collections::HashMap<String, String>,
+    pub response_time_ms: u64,
+
+    // Response body handling
+    pub response_body_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_file_path: Option<String>,
+    pub response_size_bytes: usize,
+
+    // Variable extractions performed
+    pub extractions: Vec<ApiExtractionResult>,
+
+    // Assertion results
+    pub assertions: Vec<ApiAssertionResult>,
+
+    // Overall result
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Extraction result for API request logging
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApiExtractionResult {
+    pub variable_name: String,
+    pub json_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extracted_value: Option<String>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Assertion result for API request logging
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApiAssertionResult {
+    pub assertion_type: String,
+    pub expected: String,
+    pub actual: String,
+    pub passed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Parameters for logging an API request execution
+pub struct ApiRequestLogParams<'a> {
+    pub step_id: &'a str,
+    pub step_name: &'a str,
+    pub method: &'a str,
+    pub url: &'a str,
+    pub resolved_url: &'a str,
+    pub headers: &'a std::collections::HashMap<String, String>,
+    pub body: Option<&'a str>,
+    pub content_type: Option<&'a str>,
+    pub status_code: u16,
+    pub status_text: &'a str,
+    pub response_headers: &'a std::collections::HashMap<String, String>,
+    pub response_time_ms: u64,
+    pub response_body_type: &'a str,
+    pub response_body: Option<&'a str>,
+    pub response_file_path: Option<&'a str>,
+    pub response_size_bytes: usize,
+    pub extractions: &'a [(String, String, Option<String>, bool, Option<String>)],
+    pub assertions: &'a [(String, String, String, bool, Option<String>)],
+    pub success: bool,
+    pub error: Option<&'a str>,
 }
 
 /// Parameters for logging a Playwright test execution
@@ -404,6 +501,69 @@ impl FileLogger {
         );
     }
 
+    /// Log an API request execution
+    pub fn log_api_request(params: &ApiRequestLogParams<'_>) {
+        if let Err(e) = ensure_dirs() {
+            error!("Failed to ensure log directories: {}", e);
+            return;
+        }
+
+        let extraction_entries: Vec<ApiExtractionResult> = params
+            .extractions
+            .iter()
+            .map(|(var_name, json_path, value, success, err)| ApiExtractionResult {
+                variable_name: var_name.clone(),
+                json_path: json_path.clone(),
+                extracted_value: value.clone(),
+                success: *success,
+                error: err.clone(),
+            })
+            .collect();
+
+        let assertion_entries: Vec<ApiAssertionResult> = params
+            .assertions
+            .iter()
+            .map(|(assertion_type, expected, actual, passed, err)| ApiAssertionResult {
+                assertion_type: assertion_type.clone(),
+                expected: expected.clone(),
+                actual: actual.clone(),
+                passed: *passed,
+                error: err.clone(),
+            })
+            .collect();
+
+        let entry = ApiRequestFileEntry {
+            id: format!("api-{}", uuid::Uuid::new_v4()),
+            timestamp: format_timestamp_now(),
+            step_id: params.step_id.to_string(),
+            step_name: params.step_name.to_string(),
+            method: params.method.to_string(),
+            url: params.url.to_string(),
+            resolved_url: params.resolved_url.to_string(),
+            headers: params.headers.clone(),
+            body: params.body.map(String::from),
+            content_type: params.content_type.map(String::from),
+            status_code: params.status_code,
+            status_text: params.status_text.to_string(),
+            response_headers: params.response_headers.clone(),
+            response_time_ms: params.response_time_ms,
+            response_body_type: params.response_body_type.to_string(),
+            response_body: params.response_body.map(String::from),
+            response_file_path: params.response_file_path.map(String::from),
+            response_size_bytes: params.response_size_bytes,
+            extractions: extraction_entries,
+            assertions: assertion_entries,
+            success: params.success,
+            error: params.error.map(String::from),
+        };
+
+        Self::append_to_jsonl("runner-api-requests.jsonl", &entry);
+        debug!(
+            "Logged API request: {} {} -> {} ({} ms)",
+            params.method, params.url, params.status_code, params.response_time_ms
+        );
+    }
+
     /// Save a base64-encoded image to a file
     fn save_base64_image(base64_data: &str, filename: &str) -> Option<String> {
         // Handle data URL prefix if present
@@ -475,6 +635,7 @@ impl FileLogger {
             "runner-image-recognition.jsonl",
             "runner-actions.jsonl",
             "runner-playwright.jsonl",
+            "runner-api-requests.jsonl",
         ];
 
         for filename in files {
@@ -505,6 +666,17 @@ impl FileLogger {
             }
             if let Err(e) = fs::create_dir_all(&pw_screenshots_dir) {
                 warn!("Failed to recreate playwright screenshots directory: {}", e);
+            }
+        }
+
+        // Clear API images directory
+        let api_images_dir = get_api_images_dir();
+        if api_images_dir.exists() {
+            if let Err(e) = fs::remove_dir_all(&api_images_dir) {
+                warn!("Failed to clear api-images directory: {}", e);
+            }
+            if let Err(e) = fs::create_dir_all(&api_images_dir) {
+                warn!("Failed to recreate api-images directory: {}", e);
             }
         }
 

@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { Settings as SettingsIcon } from "lucide-react";
+import { Settings as SettingsIcon, Wrench, Code } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
 import type { AppSettings, LogFunction } from "./types";
+import { type AppMode, STORAGE_KEYS } from "qontinui-navigation";
 
 interface TauriResult<T> {
   success: boolean;
@@ -22,10 +23,45 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
   const [appSettings, setAppSettings] = useState<AppSettings>({
     auto_load_last_config: false,
   });
+  const [defaultProfile, setDefaultProfile] = useState<AppMode>("developer");
 
   useEffect(() => {
     loadAppSettings();
+    loadDefaultProfile();
   }, []);
+
+  const loadDefaultProfile = () => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEYS.appMode);
+      if (stored === "automation" || stored === "developer") {
+        setDefaultProfile(stored);
+      }
+    } catch (err) {
+      console.error("Failed to load default profile:", err);
+    }
+  };
+
+  const handleProfileChange = (profile: AppMode) => {
+    setDefaultProfile(profile);
+    localStorage.setItem(STORAGE_KEYS.appMode, profile);
+
+    // Also update the navigation state to apply immediately
+    try {
+      const navStateStr = localStorage.getItem(STORAGE_KEYS.state);
+      if (navStateStr) {
+        const navState = JSON.parse(navStateStr);
+        navState.appMode = profile;
+        localStorage.setItem(STORAGE_KEYS.state, JSON.stringify(navState));
+      }
+    } catch (err) {
+      console.error("Failed to update navigation state:", err);
+    }
+
+    onLog(
+      "success",
+      `Default profile set to ${profile === "automation" ? "Automation" : "Developer"}`,
+    );
+  };
 
   const loadAppSettings = async () => {
     try {
@@ -110,6 +146,62 @@ export function GeneralSettings({ onLog }: GeneralSettingsProps) {
             <strong className="text-foreground">Tip:</strong> When enabled, the runner will
             automatically load your last configuration and selected workflow, saving time when you
             restart the application.
+          </div>
+        </div>
+      </div>
+
+      {/* Default Profile Setting */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <h4 className="font-medium text-sm">Default Profile</h4>
+
+        <div className="space-y-2">
+          <div className="p-3 rounded-lg bg-muted/30">
+            <div className="space-y-3">
+              <div className="space-y-1">
+                <div className="text-sm font-medium">Startup Profile</div>
+                <div className="text-xs text-muted-foreground">
+                  Choose which profile to use when the application starts
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                <button
+                  onClick={() => handleProfileChange("automation")}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-sm font-medium transition-all ${
+                    defaultProfile === "automation"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  }`}
+                >
+                  <Wrench className="w-4 h-4" />
+                  Automation
+                </button>
+                <button
+                  onClick={() => handleProfileChange("developer")}
+                  className={`flex-1 flex items-center justify-center gap-2 py-2 px-3 rounded-lg text-sm font-medium transition-all ${
+                    defaultProfile === "developer"
+                      ? "bg-primary text-primary-foreground"
+                      : "bg-muted/50 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  }`}
+                >
+                  <Code className="w-4 h-4" />
+                  Developer
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-3 bg-primary/5 rounded-lg">
+          <div className="text-xs text-muted-foreground space-y-2">
+            <div>
+              <strong className="text-foreground">Automation:</strong> Simplified UI for executing
+              pre-built workflows. Shows only execution and monitoring features.
+            </div>
+            <div>
+              <strong className="text-foreground">Developer:</strong> Full UI with workflow
+              builders, debugging tools, and AI configuration options.
+            </div>
           </div>
         </div>
       </div>

@@ -61,6 +61,18 @@ impl SecureStorage {
         Ok(Self { storage_path })
     }
 
+    /// Creates a SecureStorage instance with a custom storage path.
+    ///
+    /// This is primarily used for testing to ensure test isolation.
+    #[cfg(test)]
+    pub fn with_path(storage_path: PathBuf) -> Result<Self> {
+        // Ensure parent directory exists
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).context("Failed to create data directory")?;
+        }
+        Ok(Self { storage_path })
+    }
+
     /// Derives an encryption key from machine-specific identifiers.
     ///
     /// Uses hostname and a salt to create a deterministic key that's
@@ -246,10 +258,21 @@ impl Default for SecureStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+
+    /// Create an isolated storage instance for testing.
+    /// Each test gets its own unique storage file to avoid test interference.
+    fn create_test_storage(test_name: &str) -> SecureStorage {
+        let temp_dir = env::temp_dir().join("qontinui_test_storage");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        // Clean up any existing file from previous test runs
+        let _ = fs::remove_file(&storage_path);
+        SecureStorage::with_path(storage_path).unwrap()
+    }
 
     #[test]
     fn test_encrypt_decrypt() {
-        let storage = SecureStorage::new().unwrap();
+        let storage = create_test_storage("test_encrypt_decrypt");
         let plaintext = b"Hello, World!";
 
         let encrypted = storage.encrypt(plaintext).unwrap();
@@ -260,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_store_and_retrieve_tokens() {
-        let storage = SecureStorage::new().unwrap();
+        let storage = create_test_storage("test_store_and_retrieve_tokens");
 
         // Store tokens
         storage.store_tokens("test_access", "test_refresh").unwrap();
@@ -277,9 +300,22 @@ mod tests {
 
     #[test]
     fn test_device_id() {
-        let storage = SecureStorage::new().unwrap();
+        let storage = create_test_storage("test_device_id");
 
-        storage.store_device_id("test-device-123").unwrap();
-        assert_eq!(storage.get_device_id().unwrap(), "test-device-123");
+        // Use a valid UUID format
+        let test_uuid = "550e8400-e29b-41d4-a716-446655440000";
+        storage.store_device_id(test_uuid).unwrap();
+
+        // Verify the device ID was stored and can be retrieved
+        let retrieved = storage.get_device_id().unwrap();
+
+        // The retrieved value should be the UUID we stored
+        assert_eq!(retrieved, test_uuid);
+
+        // Also verify it's a valid UUID
+        assert!(
+            uuid::Uuid::parse_str(&retrieved).is_ok(),
+            "Device ID should be a valid UUID"
+        );
     }
 }

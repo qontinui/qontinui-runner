@@ -44,6 +44,7 @@ import {
   Pencil,
   ShieldCheck,
   MousePointer2,
+  Globe,
 } from "lucide-react";
 import { useContexts } from "./contexts/hooks/useContexts";
 import { ContextCard } from "./contexts/ContextCard";
@@ -53,27 +54,49 @@ import type {
   CreateContextRequest,
   UpdateContextRequest,
 } from "../types/context";
-import type { Scriptlet, SavedVerification, VerificationTaskConfig } from "../types";
+import type {
+  Scriptlet,
+  SavedExploration,
+  ExplorationConfig,
+  SavedApiRequest,
+  ApiVariableExtraction,
+  ApiAssertion,
+} from "../types";
 import type { SavedGuiWorkflow } from "../types/gui-workflow";
+import type { HttpMethod, ApiContentType, UnifiedWorkflow } from "../types/unified-workflow";
 import type { AiOutputLine } from "./AiOutputTab";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
 // Category definitions
 type LibraryCategory =
   | "tasks"
+  | "unified-workflows"
   | "workflows"
   | "gui-workflows"
   | "scripts"
   | "scriptlets"
   | "contexts"
-  | "verifications";
+  | "state-explorer"
+  | "api-requests";
+
+// Accent color type for categories
+type CategoryAccentColor =
+  | "amber"
+  | "green"
+  | "orange"
+  | "purple"
+  | "cyan"
+  | "blue"
+  | "emerald"
+  | "indigo";
 
 interface CategoryConfig {
   id: LibraryCategory;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
-  color: string;
+  accentColor: CategoryAccentColor;
   description: string;
 }
 
@@ -82,50 +105,64 @@ const CATEGORIES: CategoryConfig[] = [
     id: "tasks",
     label: "Tasks",
     icon: FileText,
-    color: "text-amber-500",
+    accentColor: "amber",
     description: "Single-step AI tasks",
   },
   {
-    id: "workflows",
-    label: "AI Workflows",
+    id: "unified-workflows",
+    label: "Workflows",
     icon: Sparkles,
-    color: "text-green-500",
-    description: "Multi-step AI workflows",
+    accentColor: "green",
+    description: "Phase-based automation workflows",
+  },
+  {
+    id: "workflows",
+    label: "AI Workflows (Legacy)",
+    icon: Sparkles,
+    accentColor: "green",
+    description: "Legacy multi-step AI workflows",
   },
   {
     id: "gui-workflows",
     label: "GUI Workflows",
     icon: MousePointer2,
-    color: "text-orange-500",
+    accentColor: "orange",
     description: "Sequential GUI automation",
   },
   {
     id: "scripts",
     label: "Scripts",
     icon: TestTube,
-    color: "text-purple-500",
+    accentColor: "purple",
     description: "Playwright scripts",
   },
   {
     id: "scriptlets",
     label: "Scriptlets",
     icon: Puzzle,
-    color: "text-cyan-500",
+    accentColor: "cyan",
     description: "Reusable snippets",
   },
   {
     id: "contexts",
     label: "Contexts",
     icon: BookOpen,
-    color: "text-blue-500",
+    accentColor: "blue",
     description: "AI knowledge base",
   },
   {
-    id: "verifications",
-    label: "Verifications",
+    id: "state-explorer",
+    label: "State Explorer",
     icon: ShieldCheck,
-    color: "text-emerald-500",
-    description: "State verification configs",
+    accentColor: "emerald",
+    description: "State exploration configs",
+  },
+  {
+    id: "api-requests",
+    label: "API Requests",
+    icon: Globe,
+    accentColor: "indigo",
+    description: "Saved HTTP request templates",
   },
 ];
 
@@ -231,7 +268,9 @@ export function LibraryTab({
   const [guiWorkflows, setGuiWorkflows] = useState<SavedGuiWorkflow[]>([]);
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
   const [scriptlets, setScriptlets] = useState<Scriptlet[]>([]);
-  const [verifications, setVerifications] = useState<SavedVerification[]>([]);
+  const [explorations, setExplorations] = useState<SavedExploration[]>([]);
+  const [savedApiRequests, setSavedApiRequests] = useState<SavedApiRequest[]>([]);
+  const [unifiedWorkflows, setUnifiedWorkflows] = useState<UnifiedWorkflow[]>([]);
 
   // Loading states
   const [loading, setLoading] = useState(true);
@@ -248,8 +287,9 @@ export function LibraryTab({
   const [_showCreateForm, _setShowCreateForm] = useState(false);
   const [_editingItem, _setEditingItem] = useState<unknown | null>(null);
 
-  // Task creation dialog state
+  // Task creation/editing dialog state
   const [showTaskDialog, setShowTaskDialog] = useState(false);
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
   const [taskForm, setTaskForm] = useState({
     name: "",
     description: "",
@@ -260,8 +300,9 @@ export function LibraryTab({
   });
   const [isSavingTask, setIsSavingTask] = useState(false);
 
-  // Scriptlet creation dialog state
+  // Scriptlet creation/editing dialog state
   const [showScriptletDialog, setShowScriptletDialog] = useState(false);
+  const [editingScriptletId, setEditingScriptletId] = useState<string | null>(null);
   const [scriptletForm, setScriptletForm] = useState({
     name: "",
     content: "",
@@ -270,12 +311,13 @@ export function LibraryTab({
   });
   const [isSavingScriptlet, setIsSavingScriptlet] = useState(false);
 
-  // Verification creation dialog state
-  const [showVerificationDialog, setShowVerificationDialog] = useState(false);
-  const [verificationForm, setVerificationForm] = useState<{
+  // Exploration creation/editing dialog state
+  const [showExplorationDialog, setShowExplorationDialog] = useState(false);
+  const [editingExplorationId, setEditingExplorationId] = useState<string | null>(null);
+  const [explorationForm, setExplorationForm] = useState<{
     name: string;
     description: string;
-    strategy: VerificationTaskConfig["strategy"];
+    strategy: ExplorationConfig["strategy"];
     max_states: number;
     max_duration_seconds: number;
     capture_screenshots: boolean;
@@ -293,7 +335,28 @@ export function LibraryTab({
     state_delay_ms: 500,
     tags: [],
   });
-  const [isSavingVerification, setIsSavingVerification] = useState(false);
+  const [isSavingExploration, setIsSavingExploration] = useState(false);
+
+  // API Request creation/editing dialog state
+  const [showApiRequestDialog, setShowApiRequestDialog] = useState(false);
+  const [editingApiRequestId, setEditingApiRequestId] = useState<string | null>(null);
+  const [apiRequestForm, setApiRequestForm] = useState({
+    name: "",
+    description: "",
+    category: "general",
+    tags: [] as string[],
+    method: "GET" as HttpMethod,
+    url: "",
+    headers: {} as Record<string, string>,
+    body: "",
+    body_content_type: "application/json" as ApiContentType,
+    timeout_ms: 30000,
+    follow_redirects: true,
+    variable_extractions: [] as ApiVariableExtraction[],
+    assertions: [] as ApiAssertion[],
+    credential_id: undefined as string | undefined,
+  });
+  const [isSavingApiRequest, setIsSavingApiRequest] = useState(false);
 
   // Context hook
   const {
@@ -347,14 +410,18 @@ export function LibraryTab({
           guiWorkflowsRes,
           scriptsRes,
           scriptletsRes,
-          verificationsRes,
+          explorationsRes,
+          savedApiRequestsRes,
+          unifiedWorkflowsRes,
         ] = await Promise.all([
           fetch(`${API_BASE}/prompts`),
           fetch(`${API_BASE}/ai-workflows`),
           fetch(`${API_BASE}/gui-workflows`),
           fetch(`${API_BASE}/playwright/scripts`),
           fetch(`${API_BASE}/scriptlets`),
-          fetch(`${API_BASE}/verifications`),
+          fetch(`${API_BASE}/saved-explorations`),
+          fetch(`${API_BASE}/saved-api-requests`),
+          fetch(`${API_BASE}/unified-workflows`),
         ]);
 
         const [
@@ -363,14 +430,18 @@ export function LibraryTab({
           guiWorkflowsData,
           scriptsData,
           scriptletsData,
-          verificationsData,
+          explorationsData,
+          savedApiRequestsData,
+          unifiedWorkflowsData,
         ] = await Promise.all([
           promptsRes.json(),
           workflowsRes.json(),
           guiWorkflowsRes.json(),
           scriptsRes.json(),
           scriptletsRes.json(),
-          verificationsRes.json().catch(() => ({ success: false })),
+          explorationsRes.json().catch(() => ({ success: false })),
+          savedApiRequestsRes.json().catch(() => ({ success: false })),
+          unifiedWorkflowsRes.json().catch(() => ({ success: false })),
         ]);
 
         if (promptsData.success) setPrompts(promptsData.data || []);
@@ -378,7 +449,9 @@ export function LibraryTab({
         if (guiWorkflowsData.success) setGuiWorkflows(guiWorkflowsData.data || []);
         if (scriptsData.success) setScripts(scriptsData.data || []);
         if (scriptletsData.success) setScriptlets(scriptletsData.data || []);
-        if (verificationsData.success) setVerifications(verificationsData.data || []);
+        if (explorationsData.success) setExplorations(explorationsData.data || []);
+        if (savedApiRequestsData.success) setSavedApiRequests(savedApiRequestsData.data || []);
+        if (unifiedWorkflowsData.success) setUnifiedWorkflows(unifiedWorkflowsData.data || []);
       } catch (error) {
         onLog("error", `Failed to fetch library data: ${error}`);
       } finally {
@@ -472,8 +545,8 @@ export function LibraryTab({
           createScope: "user",
         });
         break;
-      case "verifications":
-        setVerificationForm({
+      case "state-explorer":
+        setExplorationForm({
           name: "",
           description: "",
           strategy: "smoke_test",
@@ -484,12 +557,36 @@ export function LibraryTab({
           state_delay_ms: 500,
           tags: [],
         });
-        setShowVerificationDialog(true);
+        setShowExplorationDialog(true);
+        break;
+      case "api-requests":
+        setApiRequestForm({
+          name: "",
+          description: "",
+          category: "general",
+          tags: [],
+          method: "GET",
+          url: "",
+          headers: {},
+          body: "",
+          body_content_type: "application/json",
+          timeout_ms: 30000,
+          follow_redirects: true,
+          variable_extractions: [],
+          assertions: [],
+          credential_id: undefined,
+        });
+        setEditingApiRequestId(null);
+        setShowApiRequestDialog(true);
+        break;
+      case "unified-workflows":
+        // Navigate to Workflow Builder for creation
+        onLog("info", "Open Workflow Builder to create a new workflow");
         break;
     }
   };
 
-  // Save new task
+  // Save task (create or update)
   const handleSaveTask = async () => {
     if (!taskForm.name.trim() || !taskForm.content.trim()) {
       onLog("warning", "Task name and content are required");
@@ -498,8 +595,10 @@ export function LibraryTab({
 
     setIsSavingTask(true);
     try {
-      const response = await fetch(`${API_BASE}/prompts`, {
-        method: "POST",
+      const isEditing = editingTaskId !== null;
+      const url = isEditing ? `${API_BASE}/prompts/${editingTaskId}` : `${API_BASE}/prompts`;
+      const response = await fetch(url, {
+        method: isEditing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: taskForm.name.trim(),
@@ -513,20 +612,26 @@ export function LibraryTab({
 
       const result = await response.json();
       if (result.success && result.data) {
-        setPrompts((prev) => [...prev, result.data]);
+        if (isEditing) {
+          setPrompts((prev) => prev.map((p) => (p.id === editingTaskId ? result.data : p)));
+          onLog("success", `Updated task: ${taskForm.name}`);
+        } else {
+          setPrompts((prev) => [...prev, result.data]);
+          onLog("success", `Created task: ${taskForm.name}`);
+        }
         setShowTaskDialog(false);
-        onLog("success", `Created task: ${taskForm.name}`);
+        setEditingTaskId(null);
       } else {
-        throw new Error(result.error || "Failed to create task");
+        throw new Error(result.error || `Failed to ${isEditing ? "update" : "create"} task`);
       }
     } catch (error) {
-      onLog("error", `Failed to create task: ${error}`);
+      onLog("error", `Failed to ${editingTaskId ? "update" : "create"} task: ${error}`);
     } finally {
       setIsSavingTask(false);
     }
   };
 
-  // Save new scriptlet
+  // Save scriptlet (create or update)
   const handleSaveScriptlet = async () => {
     if (!scriptletForm.name.trim() || !scriptletForm.content.trim()) {
       onLog("warning", "Scriptlet name and content are required");
@@ -535,8 +640,12 @@ export function LibraryTab({
 
     setIsSavingScriptlet(true);
     try {
-      const response = await fetch(`${API_BASE}/scriptlets`, {
-        method: "POST",
+      const isEditing = editingScriptletId !== null;
+      const url = isEditing
+        ? `${API_BASE}/scriptlets/${editingScriptletId}`
+        : `${API_BASE}/scriptlets`;
+      const response = await fetch(url, {
+        method: isEditing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name: scriptletForm.name.trim(),
@@ -548,77 +657,262 @@ export function LibraryTab({
 
       const result = await response.json();
       if (result.success && result.data) {
-        setScriptlets((prev) => [...prev, result.data]);
+        if (isEditing) {
+          setScriptlets((prev) => prev.map((s) => (s.id === editingScriptletId ? result.data : s)));
+          onLog("success", `Updated scriptlet: ${scriptletForm.name}`);
+        } else {
+          setScriptlets((prev) => [...prev, result.data]);
+          onLog("success", `Created scriptlet: ${scriptletForm.name}`);
+        }
         setShowScriptletDialog(false);
-        onLog("success", `Created scriptlet: ${scriptletForm.name}`);
+        setEditingScriptletId(null);
       } else {
-        throw new Error(result.error || "Failed to create scriptlet");
+        throw new Error(result.error || `Failed to ${isEditing ? "update" : "create"} scriptlet`);
       }
     } catch (error) {
-      onLog("error", `Failed to create scriptlet: ${error}`);
+      onLog("error", `Failed to ${editingScriptletId ? "update" : "create"} scriptlet: ${error}`);
     } finally {
       setIsSavingScriptlet(false);
     }
   };
 
-  // Save new verification
-  const handleSaveVerification = async () => {
-    if (!verificationForm.name.trim()) {
-      onLog("warning", "Verification name is required");
+  // Save exploration (create or update)
+  const handleSaveExploration = async () => {
+    if (!explorationForm.name.trim()) {
+      onLog("warning", "Exploration name is required");
       return;
     }
 
-    setIsSavingVerification(true);
+    setIsSavingExploration(true);
     try {
-      const response = await fetch(`${API_BASE}/verifications`, {
-        method: "POST",
+      const isEditing = editingExplorationId !== null;
+      const url = isEditing
+        ? `${API_BASE}/saved-explorations/${editingExplorationId}`
+        : `${API_BASE}/saved-explorations`;
+      const response = await fetch(url, {
+        method: isEditing ? "PUT" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          name: verificationForm.name.trim(),
-          description: verificationForm.description.trim(),
+          name: explorationForm.name.trim(),
+          description: explorationForm.description.trim(),
           config: {
-            strategy: verificationForm.strategy,
-            max_states: verificationForm.max_states,
-            max_duration_seconds: verificationForm.max_duration_seconds,
+            strategy: explorationForm.strategy,
+            max_states: explorationForm.max_states,
+            max_duration_seconds: explorationForm.max_duration_seconds,
             target_state_ids: [],
             target_transition_ids: [],
-            capture_screenshots: verificationForm.capture_screenshots,
+            capture_screenshots: explorationForm.capture_screenshots,
             capture_transition_screenshots: false,
-            state_delay_ms: verificationForm.state_delay_ms,
-            stop_on_first_failure: verificationForm.stop_on_first_failure,
+            state_delay_ms: explorationForm.state_delay_ms,
+            stop_on_first_failure: explorationForm.stop_on_first_failure,
           },
-          tags: verificationForm.tags,
+          tags: explorationForm.tags,
         }),
       });
 
       const result = await response.json();
       if (result.success && result.data) {
-        setVerifications((prev) => [...prev, result.data]);
-        setShowVerificationDialog(false);
-        onLog("success", `Created verification: ${verificationForm.name}`);
+        if (isEditing) {
+          setExplorations((prev) =>
+            prev.map((v) => (v.id === editingExplorationId ? result.data : v)),
+          );
+          onLog("success", `Updated exploration: ${explorationForm.name}`);
+        } else {
+          setExplorations((prev) => [...prev, result.data]);
+          onLog("success", `Created exploration: ${explorationForm.name}`);
+        }
+        setShowExplorationDialog(false);
+        setEditingExplorationId(null);
       } else {
-        throw new Error(result.error || "Failed to create verification");
+        throw new Error(result.error || `Failed to ${isEditing ? "update" : "create"} exploration`);
       }
     } catch (error) {
-      onLog("error", `Failed to create verification: ${error}`);
+      onLog(
+        "error",
+        `Failed to ${editingExplorationId ? "update" : "create"} exploration: ${error}`,
+      );
     } finally {
-      setIsSavingVerification(false);
+      setIsSavingExploration(false);
     }
   };
 
-  // Delete verification
-  const deleteVerification = async (id: string) => {
+  // Delete exploration
+  const deleteExploration = async (id: string) => {
     try {
-      const response = await fetch(`${API_BASE}/verifications/${id}`, { method: "DELETE" });
+      const response = await fetch(`${API_BASE}/saved-explorations/${id}`, { method: "DELETE" });
       const result = await response.json();
       if (result.success) {
-        setVerifications((prev) => prev.filter((v) => v.id !== id));
-        onLog("success", "Verification deleted");
+        setExplorations((prev) => prev.filter((v) => v.id !== id));
+        onLog("success", "Exploration deleted");
       } else {
-        throw new Error(result.error || "Failed to delete verification");
+        throw new Error(result.error || "Failed to delete exploration");
       }
     } catch (error) {
-      onLog("error", `Failed to delete verification: ${error}`);
+      onLog("error", `Failed to delete exploration: ${error}`);
+    }
+  };
+
+  // Edit handlers
+  const handleEditTask = (task: SavedPrompt) => {
+    setTaskForm({
+      name: task.name,
+      description: task.description || "",
+      content: task.content,
+      max_sessions: task.max_sessions,
+      category: task.category || "general",
+      tags: task.tags || [],
+    });
+    setEditingTaskId(task.id);
+    setShowTaskDialog(true);
+  };
+
+  const handleEditScriptlet = (scriptlet: Scriptlet) => {
+    setScriptletForm({
+      name: scriptlet.name,
+      content: scriptlet.content,
+      category: scriptlet.category || "general",
+      tags: scriptlet.tags || [],
+    });
+    setEditingScriptletId(scriptlet.id);
+    setShowScriptletDialog(true);
+  };
+
+  const handleEditExploration = (exploration: SavedExploration) => {
+    setExplorationForm({
+      name: exploration.name,
+      description: exploration.description || "",
+      strategy: exploration.config.strategy,
+      max_states: exploration.config.max_states,
+      max_duration_seconds: exploration.config.max_duration_seconds,
+      capture_screenshots: exploration.config.capture_screenshots,
+      stop_on_first_failure: exploration.config.stop_on_first_failure || false,
+      state_delay_ms: exploration.config.state_delay_ms,
+      tags: exploration.tags || [],
+    });
+    setEditingExplorationId(exploration.id);
+    setShowExplorationDialog(true);
+  };
+
+  const handleEditApiRequest = (apiRequest: SavedApiRequest) => {
+    setApiRequestForm({
+      name: apiRequest.name,
+      description: apiRequest.description || "",
+      category: apiRequest.category || "general",
+      tags: apiRequest.tags || [],
+      method: apiRequest.method,
+      url: apiRequest.url,
+      headers: apiRequest.headers || {},
+      body: apiRequest.body || "",
+      body_content_type: apiRequest.body_content_type || "application/json",
+      timeout_ms: apiRequest.timeout_ms || 30000,
+      follow_redirects: apiRequest.follow_redirects ?? true,
+      variable_extractions: apiRequest.variable_extractions || [],
+      assertions: apiRequest.assertions || [],
+      credential_id: apiRequest.credential_id,
+    });
+    setEditingApiRequestId(apiRequest.id);
+    setShowApiRequestDialog(true);
+  };
+
+  // Save API request (create or update)
+  const handleSaveApiRequest = async () => {
+    if (!apiRequestForm.name.trim()) {
+      onLog("warning", "API request name is required");
+      return;
+    }
+    if (!apiRequestForm.url.trim()) {
+      onLog("warning", "API request URL is required");
+      return;
+    }
+
+    setIsSavingApiRequest(true);
+    try {
+      const isEditing = editingApiRequestId !== null;
+      const url = isEditing
+        ? `${API_BASE}/saved-api-requests/${editingApiRequestId}`
+        : `${API_BASE}/saved-api-requests`;
+      const response = await fetch(url, {
+        method: isEditing ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: apiRequestForm.name.trim(),
+          description: apiRequestForm.description.trim(),
+          category: apiRequestForm.category,
+          tags: apiRequestForm.tags,
+          method: apiRequestForm.method,
+          url: apiRequestForm.url.trim(),
+          headers: apiRequestForm.headers,
+          body: apiRequestForm.body || undefined,
+          body_content_type: apiRequestForm.body_content_type,
+          timeout_ms: apiRequestForm.timeout_ms,
+          follow_redirects: apiRequestForm.follow_redirects,
+          variable_extractions: apiRequestForm.variable_extractions,
+          assertions: apiRequestForm.assertions,
+          credential_id: apiRequestForm.credential_id || undefined,
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success && result.data) {
+        if (isEditing) {
+          setSavedApiRequests((prev) =>
+            prev.map((r) => (r.id === editingApiRequestId ? result.data : r)),
+          );
+          onLog("success", `Updated API request: ${apiRequestForm.name}`);
+        } else {
+          setSavedApiRequests((prev) => [result.data, ...prev]);
+          onLog("success", `Created API request: ${apiRequestForm.name}`);
+        }
+        setShowApiRequestDialog(false);
+        setEditingApiRequestId(null);
+      } else {
+        throw new Error(result.error || `Failed to ${isEditing ? "update" : "create"} API request`);
+      }
+    } catch (error) {
+      onLog(
+        "error",
+        `Failed to ${editingApiRequestId ? "update" : "create"} API request: ${error}`,
+      );
+    } finally {
+      setIsSavingApiRequest(false);
+    }
+  };
+
+  const handleDuplicateApiRequest = async (id: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/saved-api-requests/${id}/duplicate`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (data.success) {
+        setSavedApiRequests((prev) => [data.data, ...prev]);
+        onLog("success", "API request duplicated");
+      } else {
+        onLog("error", `Failed to duplicate: ${data.error}`);
+      }
+    } catch (error) {
+      onLog("error", `Failed to duplicate API request: ${error}`);
+    }
+  };
+
+  const deleteApiRequest = async (id: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/saved-api-requests/${id}`, {
+        method: "DELETE",
+      });
+      const data = await response.json();
+      if (data.success) {
+        setSavedApiRequests((prev) => prev.filter((r) => r.id !== id));
+        onLog("success", "API request deleted");
+        if (selectedItemId === id) {
+          setSelectedItemId(null);
+          setShowDetailPanel(false);
+        }
+      } else {
+        onLog("error", `Failed to delete: ${data.error}`);
+      }
+    } catch (error) {
+      onLog("error", `Failed to delete API request: ${error}`);
     }
   };
 
@@ -649,12 +943,33 @@ export function LibraryTab({
         }
         break;
       }
-      case "verifications":
-        await deleteVerification(selectedItemId);
+      case "state-explorer":
+        await deleteExploration(selectedItemId);
+        break;
+      case "api-requests":
+        await deleteApiRequest(selectedItemId);
+        break;
+      case "unified-workflows":
+        await deleteUnifiedWorkflow(selectedItemId);
         break;
     }
     setSelectedItemId(null);
     setShowDetailPanel(false);
+  };
+
+  // Delete unified workflow
+  const deleteUnifiedWorkflow = async (id: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/unified-workflows/${id}`, {
+        method: "DELETE",
+      });
+      if (response.ok) {
+        setUnifiedWorkflows((prev) => prev.filter((w) => w.id !== id));
+        onLog("success", "Workflow deleted");
+      }
+    } catch (error) {
+      onLog("error", `Failed to delete workflow: ${error}`);
+    }
   };
 
   // Run selected item
@@ -682,9 +997,9 @@ export function LibraryTab({
         if (script) runScript(script);
         break;
       }
-      case "verifications": {
-        const verification = verifications.find((v) => v.id === selectedItemId);
-        if (verification) runVerification(verification);
+      case "state-explorer": {
+        const exploration = explorations.find((v) => v.id === selectedItemId);
+        if (exploration) runExploration(exploration);
         break;
       }
     }
@@ -836,11 +1151,11 @@ export function LibraryTab({
     [onLog, onNavigateToActive],
   );
 
-  const runVerification = useCallback(
-    async (verification: SavedVerification) => {
-      setRunningId(verification.id);
+  const runExploration = useCallback(
+    async (exploration: SavedExploration) => {
+      setRunningId(exploration.id);
       try {
-        const response = await fetch(`${API_BASE}/verifications/${verification.id}/run`, {
+        const response = await fetch(`${API_BASE}/saved-explorations/${exploration.id}/run`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
@@ -848,20 +1163,20 @@ export function LibraryTab({
 
         const result = await response.json();
         if (result.success) {
-          onLog("success", `Started verification: ${verification.name}`);
+          onLog("success", `Started exploration: ${exploration.name}`);
           // Update last_run_at and run_count
-          setVerifications((prev) =>
+          setExplorations((prev) =>
             prev.map((v) =>
-              v.id === verification.id
+              v.id === exploration.id
                 ? { ...v, last_run_at: new Date().toISOString(), run_count: v.run_count + 1 }
                 : v,
             ),
           );
         } else {
-          throw new Error(result.error || "Failed to run verification");
+          throw new Error(result.error || "Failed to run exploration");
         }
       } catch (error) {
-        onLog("error", `Failed to run verification: ${error}`);
+        onLog("error", `Failed to run exploration: ${error}`);
       } finally {
         setRunningId(null);
       }
@@ -1049,6 +1364,12 @@ export function LibraryTab({
       case "contexts":
         contexts.forEach((c) => c.tags?.forEach((t) => tags.add(t)));
         break;
+      case "api-requests":
+        savedApiRequests.forEach((r) => r.tags?.forEach((t) => tags.add(t)));
+        break;
+      case "unified-workflows":
+        unifiedWorkflows.forEach((w) => w.tags?.forEach((t) => tags.add(t)));
+        break;
     }
     return Array.from(tags).sort();
   };
@@ -1081,10 +1402,21 @@ export function LibraryTab({
     (s) => [s.name, s.description, s.target_url],
   );
   const filteredScriptlets = filterItems(scriptlets, (s) => [s.name, s.content, s.category]);
-  const filteredVerifications = filterItems(verifications, (v) => [
+  const filteredExplorations = filterItems(explorations, (v) => [
     v.name,
     v.description || "",
     v.config.strategy,
+  ]);
+  const filteredSavedApiRequests = filterItems(savedApiRequests, (r) => [
+    r.name,
+    r.description,
+    r.url,
+    r.category,
+  ]);
+  const filteredUnifiedWorkflows = filterItems(unifiedWorkflows, (w) => [
+    w.name,
+    w.description,
+    w.category,
   ]);
 
   const formatDate = (dateStr: string) => {
@@ -1194,8 +1526,12 @@ export function LibraryTab({
         return filteredScriptlets;
       case "contexts":
         return filteredContexts;
-      case "verifications":
-        return filteredVerifications;
+      case "state-explorer":
+        return filteredExplorations;
+      case "api-requests":
+        return filteredSavedApiRequests;
+      case "unified-workflows":
+        return filteredUnifiedWorkflows;
       default:
         return [];
     }
@@ -1235,12 +1571,16 @@ export function LibraryTab({
             }}
           >
             <div className="flex items-start gap-3">
-              <FileText className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+              <FileText
+                className={`w-5 h-5 ${getAccentColors("amber").text} flex-shrink-0 mt-0.5`}
+              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-medium truncate">{task.name}</span>
                   {task.max_sessions && (
-                    <span className="text-xs bg-blue-500/20 text-blue-600 px-1.5 py-0.5 rounded">
+                    <span
+                      className={`text-xs ${getAccentColors("blue").bg} ${getAccentColors("blue").text} px-1.5 py-0.5 rounded`}
+                    >
                       Max {task.max_sessions}
                     </span>
                   )}
@@ -1259,10 +1599,21 @@ export function LibraryTab({
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
+                    handleEditTask(task);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Edit task"
+                >
+                  <Pencil className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
                     runPrompt(task);
                   }}
                   disabled={runningId === task.id}
-                  className="p-1.5 bg-amber-500/10 text-amber-600 rounded hover:bg-amber-500/20 transition-colors disabled:opacity-50"
+                  className={`p-1.5 ${getAccentColors("amber").bg} ${getAccentColors("amber").text} rounded hover:opacity-80 transition-colors disabled:opacity-50`}
+                  title="Run task"
                 >
                   {runningId === task.id ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -1303,7 +1654,9 @@ export function LibraryTab({
             }}
           >
             <div className="flex items-start gap-3">
-              <Sparkles className="w-5 h-5 text-green-500 flex-shrink-0 mt-0.5" />
+              <Sparkles
+                className={`w-5 h-5 ${getAccentColors("green").text} flex-shrink-0 mt-0.5`}
+              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-medium truncate">{workflow.name}</span>
@@ -1338,7 +1691,7 @@ export function LibraryTab({
                     runWorkflow(workflow);
                   }}
                   disabled={runningId === workflow.id}
-                  className="p-1.5 bg-green-500/10 text-green-600 rounded hover:bg-green-500/20 transition-colors disabled:opacity-50"
+                  className={`p-1.5 ${getAccentColors("green").bg} ${getAccentColors("green").text} rounded hover:opacity-80 transition-colors disabled:opacity-50`}
                   title="Run workflow"
                 >
                   {runningId === workflow.id ? (
@@ -1380,7 +1733,9 @@ export function LibraryTab({
             }}
           >
             <div className="flex items-start gap-3">
-              <MousePointer2 className="w-5 h-5 text-orange-500 flex-shrink-0 mt-0.5" />
+              <MousePointer2
+                className={`w-5 h-5 ${getAccentColors("orange").text} flex-shrink-0 mt-0.5`}
+              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-medium truncate">{guiWorkflow.name}</span>
@@ -1415,7 +1770,7 @@ export function LibraryTab({
                     runGuiWorkflow(guiWorkflow);
                   }}
                   disabled={runningId === guiWorkflow.id}
-                  className="p-1.5 bg-orange-500/10 text-orange-600 rounded hover:bg-orange-500/20 transition-colors disabled:opacity-50"
+                  className={`p-1.5 ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded hover:${getAccentColors("orange").bgSolid}/20 transition-colors disabled:opacity-50`}
                   title="Run GUI workflow"
                 >
                   {runningId === guiWorkflow.id ? (
@@ -1459,7 +1814,9 @@ export function LibraryTab({
             }}
           >
             <div className="flex items-start gap-3">
-              <TestTube className="w-5 h-5 text-purple-500 flex-shrink-0 mt-0.5" />
+              <TestTube
+                className={`w-5 h-5 ${getAccentColors("purple").text} flex-shrink-0 mt-0.5`}
+              />
               <div className="flex-1 min-w-0">
                 <span className="font-medium truncate block">{script.name}</span>
                 {script.target_url && (
@@ -1489,7 +1846,7 @@ export function LibraryTab({
                     runScript(script);
                   }}
                   disabled={runningId === script.id}
-                  className="p-1.5 bg-purple-500/10 text-purple-600 rounded hover:bg-purple-500/20 transition-colors disabled:opacity-50"
+                  className={`p-1.5 ${getAccentColors("purple").bg} ${getAccentColors("purple").text} rounded hover:${getAccentColors("purple").bgSolid}/20 transition-colors disabled:opacity-50`}
                   title="Run script"
                 >
                   {runningId === script.id ? (
@@ -1516,7 +1873,7 @@ export function LibraryTab({
             }}
           >
             <div className="flex items-start gap-3">
-              <Puzzle className="w-5 h-5 text-cyan-500 flex-shrink-0 mt-0.5" />
+              <Puzzle className={`w-5 h-5 ${getAccentColors("cyan").text} flex-shrink-0 mt-0.5`} />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-medium truncate">{scriptlet.name}</span>
@@ -1531,6 +1888,18 @@ export function LibraryTab({
                   <Clock className="w-3 h-3" />
                   {formatRelativeDate(scriptlet.modified_at)}
                 </div>
+              </div>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleEditScriptlet(scriptlet);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Edit scriptlet"
+                >
+                  <Pencil className="w-4 h-4" />
+                </button>
               </div>
             </div>
             {scriptlet.tags && scriptlet.tags.length > 0 && (
@@ -1554,40 +1923,44 @@ export function LibraryTab({
         );
       }
 
-      case "verifications": {
-        const verification = item as SavedVerification;
+      case "state-explorer": {
+        const exploration = item as SavedExploration;
         return (
           <div
-            key={verification.id}
+            key={exploration.id}
             className={baseClasses}
             onClick={() => {
-              setSelectedItemId(verification.id);
+              setSelectedItemId(exploration.id);
               setShowDetailPanel(true);
             }}
           >
             <div className="flex items-start gap-3">
-              <ShieldCheck className="w-5 h-5 text-emerald-500 flex-shrink-0 mt-0.5" />
+              <ShieldCheck
+                className={`w-5 h-5 ${getAccentColors("emerald").text} flex-shrink-0 mt-0.5`}
+              />
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="font-medium truncate">{verification.name}</span>
-                  <span className="text-xs bg-emerald-500/20 text-emerald-600 px-1.5 py-0.5 rounded">
-                    {verification.config.strategy}
+                  <span className="font-medium truncate">{exploration.name}</span>
+                  <span
+                    className={`text-xs ${getAccentColors("emerald").bg} ${getAccentColors("emerald").text} px-1.5 py-0.5 rounded`}
+                  >
+                    {exploration.config.strategy}
                   </span>
                 </div>
-                {verification.description && (
+                {exploration.description && (
                   <p className="text-xs text-muted-foreground truncate mt-0.5">
-                    {verification.description}
+                    {exploration.description}
                   </p>
                 )}
                 <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground">
                   <span className="flex items-center gap-1">
                     <Clock className="w-3 h-3" />
-                    {formatRelativeDate(verification.modified_at)}
+                    {formatRelativeDate(exploration.modified_at)}
                   </span>
-                  {verification.run_count > 0 && (
+                  {exploration.run_count > 0 && (
                     <span className="flex items-center gap-1">
                       <Play className="w-3 h-3" />
-                      {verification.run_count} runs
+                      {exploration.run_count} runs
                     </span>
                   )}
                 </div>
@@ -1596,12 +1969,23 @@ export function LibraryTab({
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    runVerification(verification);
+                    handleEditExploration(exploration);
                   }}
-                  disabled={runningId === verification.id}
-                  className="p-1.5 bg-emerald-500/10 text-emerald-600 rounded hover:bg-emerald-500/20 transition-colors disabled:opacity-50"
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Edit exploration"
                 >
-                  {runningId === verification.id ? (
+                  <Pencil className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    runExploration(exploration);
+                  }}
+                  disabled={runningId === exploration.id}
+                  className={`p-1.5 ${getAccentColors("emerald").bg} ${getAccentColors("emerald").text} rounded hover:${getAccentColors("emerald").bgSolid}/20 transition-colors disabled:opacity-50`}
+                  title="Run exploration"
+                >
+                  {runningId === exploration.id ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
                   ) : (
                     <Play className="w-4 h-4" />
@@ -1609,9 +1993,9 @@ export function LibraryTab({
                 </button>
               </div>
             </div>
-            {verification.tags && verification.tags.length > 0 && (
+            {exploration.tags && exploration.tags.length > 0 && (
               <div className="flex flex-wrap gap-1 mt-2">
-                {verification.tags.slice(0, 3).map((tag) => (
+                {exploration.tags.slice(0, 3).map((tag) => (
                   <span
                     key={tag}
                     className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded"
@@ -1619,10 +2003,181 @@ export function LibraryTab({
                     {tag}
                   </span>
                 ))}
-                {verification.tags.length > 3 && (
+                {exploration.tags.length > 3 && (
                   <span className="text-xs text-muted-foreground">
-                    +{verification.tags.length - 3}
+                    +{exploration.tags.length - 3}
                   </span>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      case "api-requests": {
+        const apiRequest = item as SavedApiRequest;
+        return (
+          <div
+            key={apiRequest.id}
+            className={baseClasses}
+            onClick={() => {
+              setSelectedItemId(apiRequest.id);
+              setShowDetailPanel(true);
+            }}
+          >
+            <div className="flex items-start gap-3">
+              <Globe className={`w-5 h-5 ${getAccentColors("indigo").text} flex-shrink-0 mt-0.5`} />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium truncate">{apiRequest.name}</span>
+                  <span
+                    className={`text-xs ${getAccentColors("indigo").bg} ${getAccentColors("indigo").text} px-1.5 py-0.5 rounded font-mono`}
+                  >
+                    {apiRequest.method}
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground truncate mt-0.5 font-mono">
+                  {apiRequest.url}
+                </p>
+                <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground">
+                  <span className="flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    {formatRelativeDate(apiRequest.updated_at)}
+                  </span>
+                  {apiRequest.category && (
+                    <span className="flex items-center gap-1">
+                      <FolderOpen className="w-3 h-3" />
+                      {apiRequest.category}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleEditApiRequest(apiRequest);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Edit API request"
+                >
+                  <Pencil className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDuplicateApiRequest(apiRequest.id);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Duplicate API request"
+                >
+                  <Copy className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            {apiRequest.tags && apiRequest.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-2">
+                {apiRequest.tags.slice(0, 3).map((tag) => (
+                  <span
+                    key={tag}
+                    className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded"
+                  >
+                    {tag}
+                  </span>
+                ))}
+                {apiRequest.tags.length > 3 && (
+                  <span className="text-xs text-muted-foreground">
+                    +{apiRequest.tags.length - 3}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      case "unified-workflows": {
+        const workflow = item as UnifiedWorkflow;
+        const stepCount =
+          workflow.setup_steps.length +
+          workflow.verification_steps.length +
+          workflow.agentic_steps.length;
+        return (
+          <div
+            key={workflow.id}
+            className={baseClasses}
+            onClick={() => {
+              setSelectedItemId(workflow.id);
+              setShowDetailPanel(true);
+            }}
+          >
+            <div className="flex items-start gap-3">
+              <Sparkles
+                className={`w-5 h-5 ${getAccentColors("green").text} flex-shrink-0 mt-0.5`}
+              />
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-medium truncate">{workflow.name || "Untitled"}</span>
+                  <span
+                    className={`text-xs ${getAccentColors("green").bg} ${getAccentColors("green").text} px-1.5 py-0.5 rounded`}
+                  >
+                    {stepCount} steps
+                  </span>
+                </div>
+                {workflow.description && (
+                  <p className="text-xs text-muted-foreground truncate mt-0.5">
+                    {workflow.description}
+                  </p>
+                )}
+                <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground">
+                  <span className="flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    {formatRelativeDate(workflow.modified_at)}
+                  </span>
+                  {workflow.category && workflow.category !== "general" && (
+                    <span className="flex items-center gap-1">
+                      <FolderOpen className="w-3 h-3" />
+                      {workflow.category}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    // Navigate to Workflow Builder with this workflow ID
+                    onLog("info", `Open Workflow Builder for workflow: ${workflow.id}`);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Edit workflow"
+                >
+                  <Pencil className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleDuplicateUnifiedWorkflow(workflow.id);
+                  }}
+                  className="p-1.5 bg-muted text-muted-foreground rounded hover:bg-muted/80 hover:text-foreground transition-colors"
+                  title="Duplicate workflow"
+                >
+                  <Copy className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+            {workflow.tags && workflow.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-2">
+                {workflow.tags.slice(0, 3).map((tag) => (
+                  <span
+                    key={tag}
+                    className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded"
+                  >
+                    {tag}
+                  </span>
+                ))}
+                {workflow.tags.length > 3 && (
+                  <span className="text-xs text-muted-foreground">+{workflow.tags.length - 3}</span>
                 )}
               </div>
             )}
@@ -1632,6 +2187,22 @@ export function LibraryTab({
 
       default:
         return null;
+    }
+  };
+
+  // Duplicate unified workflow
+  const handleDuplicateUnifiedWorkflow = async (id: string) => {
+    try {
+      const response = await fetch(`${API_BASE}/unified-workflows/${id}/duplicate`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (data.success && data.data) {
+        setUnifiedWorkflows((prev) => [data.data, ...prev]);
+        onLog("success", "Workflow duplicated");
+      }
+    } catch (error) {
+      onLog("error", `Failed to duplicate workflow: ${error}`);
     }
   };
 
@@ -1685,7 +2256,7 @@ export function LibraryTab({
               <button
                 onClick={() => runPrompt(task)}
                 disabled={runningId === task.id}
-                className="flex-1 flex items-center justify-center gap-2 py-2 bg-amber-500 text-white rounded-lg hover:bg-amber-600 transition-colors disabled:opacity-50"
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("amber").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
               >
                 {runningId === task.id ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -1695,6 +2266,14 @@ export function LibraryTab({
                 Run Task
               </button>
               <button
+                onClick={() => handleEditTask(task)}
+                className="flex items-center justify-center gap-2 px-4 py-2 border border-border rounded-lg hover:bg-muted transition-colors"
+                title="Edit task"
+              >
+                <Pencil className="w-4 h-4" />
+                Edit
+              </button>
+              <button
                 onClick={() => duplicateItem(task.id)}
                 className="p-2 border border-border rounded-lg hover:bg-muted transition-colors"
               >
@@ -1702,7 +2281,7 @@ export function LibraryTab({
               </button>
               <button
                 onClick={() => deletePrompt(task.id)}
-                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -1758,12 +2337,12 @@ export function LibraryTab({
                     <span
                       className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium ${
                         step.type === "workflow"
-                          ? "bg-green-500/20 text-green-600"
+                          ? `${getAccentColors("green").bg} ${getAccentColors("green").text}`
                           : step.type === "playwright"
-                            ? "bg-purple-500/20 text-purple-600"
+                            ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
                             : step.type === "prompt"
-                              ? "bg-amber-500/20 text-amber-600"
-                              : "bg-blue-500/20 text-blue-600"
+                              ? `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
+                              : `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
                       }`}
                     >
                       {step.type}
@@ -1781,7 +2360,7 @@ export function LibraryTab({
               <button
                 onClick={() => runWorkflow(workflow)}
                 disabled={runningId === workflow.id}
-                className="flex-1 flex items-center justify-center gap-2 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition-colors disabled:opacity-50"
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("green").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
               >
                 {runningId === workflow.id ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -1798,7 +2377,7 @@ export function LibraryTab({
               </button>
               <button
                 onClick={() => deleteWorkflow(workflow.id)}
-                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -1848,12 +2427,12 @@ export function LibraryTab({
                     <span
                       className={`px-1.5 py-0.5 rounded text-[10px] uppercase font-medium ${
                         step.action_type === "click"
-                          ? "bg-orange-500/20 text-orange-600"
+                          ? `${getAccentColors("orange").bg} ${getAccentColors("orange").text}`
                           : step.action_type === "type"
-                            ? "bg-blue-500/20 text-blue-600"
+                            ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
                             : step.action_type === "hotkey"
-                              ? "bg-purple-500/20 text-purple-600"
-                              : "bg-green-500/20 text-green-600"
+                              ? `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
+                              : `${getAccentColors("green").bg} ${getAccentColors("green").text}`
                       }`}
                     >
                       {step.action_type}
@@ -1871,7 +2450,7 @@ export function LibraryTab({
               <button
                 onClick={() => runGuiWorkflow(guiWorkflow)}
                 disabled={runningId === guiWorkflow.id}
-                className="flex-1 flex items-center justify-center gap-2 py-2 bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors disabled:opacity-50"
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("orange").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
               >
                 {runningId === guiWorkflow.id ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -1882,7 +2461,7 @@ export function LibraryTab({
               </button>
               <button
                 onClick={() => deleteGuiWorkflow(guiWorkflow.id)}
-                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -1936,7 +2515,7 @@ export function LibraryTab({
               <button
                 onClick={() => runScript(script)}
                 disabled={runningId === script.id}
-                className="flex-1 flex items-center justify-center gap-2 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition-colors disabled:opacity-50"
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("purple").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
               >
                 {runningId === script.id ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -1961,7 +2540,7 @@ export function LibraryTab({
               </button>
               <button
                 onClick={() => deleteScript(script.id)}
-                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -2015,10 +2594,18 @@ export function LibraryTab({
                   await navigator.clipboard.writeText(scriptlet.content);
                   onLog("success", "Copied to clipboard");
                 }}
-                className="flex-1 flex items-center justify-center gap-2 py-2 bg-cyan-500 text-white rounded-lg hover:bg-cyan-600 transition-colors"
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("cyan").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors`}
               >
                 <Copy className="w-4 h-4" />
                 Copy Content
+              </button>
+              <button
+                onClick={() => handleEditScriptlet(scriptlet)}
+                className="flex items-center justify-center gap-2 px-4 py-2 border border-border rounded-lg hover:bg-muted transition-colors"
+                title="Edit scriptlet"
+              >
+                <Pencil className="w-4 h-4" />
+                Edit
               </button>
               <button
                 onClick={() => duplicateItem(scriptlet.id)}
@@ -2028,7 +2615,7 @@ export function LibraryTab({
               </button>
               <button
                 onClick={() => deleteScriptlet(scriptlet.id)}
-                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -2063,13 +2650,13 @@ export function LibraryTab({
         );
       }
 
-      case "verifications": {
-        const verification = verifications.find((v) => v.id === selectedItemId);
-        if (!verification) return null;
+      case "state-explorer": {
+        const exploration = explorations.find((v) => v.id === selectedItemId);
+        if (!exploration) return null;
         return (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold">{verification.name}</h3>
+              <h3 className="text-lg font-semibold">{exploration.name}</h3>
               <button
                 onClick={() => setShowDetailPanel(false)}
                 className="p-1 hover:bg-muted rounded"
@@ -2077,12 +2664,12 @@ export function LibraryTab({
                 <X className="w-5 h-5" />
               </button>
             </div>
-            {verification.description && (
-              <p className="text-muted-foreground">{verification.description}</p>
+            {exploration.description && (
+              <p className="text-muted-foreground">{exploration.description}</p>
             )}
-            {verification.tags && verification.tags.length > 0 && (
+            {exploration.tags && exploration.tags.length > 0 && (
               <div className="flex flex-wrap gap-1">
-                {verification.tags.map((tag) => (
+                {exploration.tags.map((tag) => (
                   <span key={tag} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
                     {tag}
                   </span>
@@ -2094,49 +2681,239 @@ export function LibraryTab({
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">Strategy:</span>
-                  <span className="font-medium">{verification.config.strategy}</span>
+                  <span className="font-medium">{exploration.config.strategy}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">Max States:</span>
                   <span className="font-medium">
-                    {verification.config.max_states || "Unlimited"}
+                    {exploration.config.max_states || "Unlimited"}
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">State Delay:</span>
-                  <span className="font-medium">{verification.config.state_delay_ms}ms</span>
+                  <span className="font-medium">{exploration.config.state_delay_ms}ms</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-muted-foreground">Screenshots:</span>
                   <span className="font-medium">
-                    {verification.config.capture_screenshots ? "Yes" : "No"}
+                    {exploration.config.capture_screenshots ? "Yes" : "No"}
                   </span>
                 </div>
               </div>
             </div>
             <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
-              <span>Created: {formatDate(verification.created_at)}</span>
-              <span>Modified: {formatDate(verification.modified_at)}</span>
-              {verification.last_run_at && (
-                <span>Last Run: {formatDate(verification.last_run_at)}</span>
+              <span>Created: {formatDate(exploration.created_at)}</span>
+              <span>Modified: {formatDate(exploration.modified_at)}</span>
+              {exploration.last_run_at && (
+                <span>Last Run: {formatDate(exploration.last_run_at)}</span>
               )}
             </div>
             <div className="flex items-center gap-2 pt-2">
               <button
-                onClick={() => runVerification(verification)}
-                disabled={runningId === verification.id}
-                className="flex-1 flex items-center justify-center gap-2 py-2 bg-emerald-500 text-white rounded-lg hover:bg-emerald-600 transition-colors disabled:opacity-50"
+                onClick={() => runExploration(exploration)}
+                disabled={runningId === exploration.id}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("emerald").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50`}
               >
-                {runningId === verification.id ? (
+                {runningId === exploration.id ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
                   <Play className="w-4 h-4" />
                 )}
-                Run Verification
+                Run Exploration
               </button>
               <button
-                onClick={() => deleteVerification(verification.id)}
-                className="p-2 border border-border rounded-lg hover:bg-red-500/10 hover:text-red-500 transition-colors"
+                onClick={() => handleEditExploration(exploration)}
+                className="flex items-center justify-center gap-2 px-4 py-2 border border-border rounded-lg hover:bg-muted transition-colors"
+                title="Edit exploration"
+              >
+                <Pencil className="w-4 h-4" />
+                Edit
+              </button>
+              <button
+                onClick={() => deleteExploration(exploration.id)}
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      case "api-requests": {
+        const apiRequest = savedApiRequests.find((r) => r.id === selectedItemId);
+        if (!apiRequest) return null;
+        return (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold">{apiRequest.name}</h3>
+              <button
+                onClick={() => setShowDetailPanel(false)}
+                className="p-1 hover:bg-muted rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            {apiRequest.description && (
+              <p className="text-muted-foreground">{apiRequest.description}</p>
+            )}
+            {apiRequest.tags && apiRequest.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {apiRequest.tags.map((tag) => (
+                  <span key={tag} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="space-y-2">
+              <h4 className="text-sm font-medium">Request Details</h4>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`px-2 py-1 text-xs font-medium rounded ${
+                    apiRequest.method === "GET"
+                      ? "bg-green-500/20 text-green-400"
+                      : apiRequest.method === "POST"
+                        ? "bg-blue-500/20 text-blue-400"
+                        : apiRequest.method === "PUT"
+                          ? "bg-amber-500/20 text-amber-400"
+                          : apiRequest.method === "DELETE"
+                            ? "bg-red-500/20 text-red-400"
+                            : "bg-purple-500/20 text-purple-400"
+                  }`}
+                >
+                  {apiRequest.method}
+                </span>
+                <span className="text-sm font-mono text-muted-foreground truncate">
+                  {apiRequest.url}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-sm">
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">Timeout:</span>
+                  <span className="font-medium">{apiRequest.timeout_ms}ms</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">Follow Redirects:</span>
+                  <span className="font-medium">{apiRequest.follow_redirects ? "Yes" : "No"}</span>
+                </div>
+              </div>
+            </div>
+            {apiRequest.body && (
+              <div>
+                <h4 className="text-sm font-medium mb-2">Request Body</h4>
+                <pre className="text-sm bg-muted p-3 rounded-lg overflow-x-auto max-h-32 overflow-y-auto whitespace-pre-wrap font-mono">
+                  {apiRequest.body}
+                </pre>
+              </div>
+            )}
+            <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
+              <span>Created: {formatDate(apiRequest.created_at)}</span>
+              <span>Modified: {formatDate(apiRequest.updated_at)}</span>
+            </div>
+            <div className="flex items-center gap-2 pt-2">
+              <button
+                onClick={() => handleEditApiRequest(apiRequest)}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("indigo").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors`}
+              >
+                <Pencil className="w-4 h-4" />
+                Edit
+              </button>
+              <button
+                onClick={() => handleDuplicateApiRequest(apiRequest.id)}
+                className="p-2 border border-border rounded-lg hover:bg-muted transition-colors"
+              >
+                <Copy className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => deleteApiRequest(apiRequest.id)}
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        );
+      }
+
+      case "unified-workflows": {
+        const workflow = unifiedWorkflows.find((w) => w.id === selectedItemId);
+        if (!workflow) return null;
+        const stepCount =
+          workflow.setup_steps.length +
+          workflow.verification_steps.length +
+          workflow.agentic_steps.length;
+        return (
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-lg font-semibold">{workflow.name || "Untitled"}</h3>
+              <button
+                onClick={() => setShowDetailPanel(false)}
+                className="p-1 hover:bg-muted rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            {workflow.description && (
+              <p className="text-muted-foreground">{workflow.description}</p>
+            )}
+            {workflow.tags && workflow.tags.length > 0 && (
+              <div className="flex flex-wrap gap-1">
+                {workflow.tags.map((tag) => (
+                  <span key={tag} className="text-xs bg-primary/10 text-primary px-2 py-1 rounded">
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="space-y-2">
+              <h4 className="text-sm font-medium">Workflow Phases</h4>
+              <div className="grid grid-cols-3 gap-2 text-sm">
+                <div className="p-2 bg-blue-500/10 rounded text-center">
+                  <div className="text-blue-400 font-medium">{workflow.setup_steps.length}</div>
+                  <div className="text-xs text-muted-foreground">Setup</div>
+                </div>
+                <div className="p-2 bg-green-500/10 rounded text-center">
+                  <div className="text-green-400 font-medium">
+                    {workflow.verification_steps.length}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Verification</div>
+                </div>
+                <div className="p-2 bg-amber-500/10 rounded text-center">
+                  <div className="text-amber-400 font-medium">{workflow.agentic_steps.length}</div>
+                  <div className="text-xs text-muted-foreground">Agentic</div>
+                </div>
+              </div>
+              {workflow.max_iterations && (
+                <div className="text-sm text-muted-foreground">
+                  Max Iterations: {workflow.max_iterations}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center gap-4 text-xs text-muted-foreground pt-2 border-t">
+              <span>Created: {formatDate(workflow.created_at)}</span>
+              <span>Modified: {formatDate(workflow.modified_at)}</span>
+            </div>
+            <div className="flex items-center gap-2 pt-2">
+              <button
+                onClick={() => {
+                  // Navigate to Workflow Builder
+                  onLog("info", `Open Workflow Builder for workflow: ${workflow.id}`);
+                }}
+                className={`flex-1 flex items-center justify-center gap-2 py-2 ${getAccentColors("green").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors`}
+              >
+                <Pencil className="w-4 h-4" />
+                Edit
+              </button>
+              <button
+                onClick={() => handleDuplicateUnifiedWorkflow(workflow.id)}
+                className="p-2 border border-border rounded-lg hover:bg-muted transition-colors"
+              >
+                <Copy className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => deleteUnifiedWorkflow(workflow.id)}
+                className={`p-2 border border-border rounded-lg hover:${getStatusColors("error").bg} hover:${getStatusColors("error").text} transition-colors`}
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -2166,13 +2943,23 @@ export function LibraryTab({
             const count =
               category.id === "tasks"
                 ? prompts.length
-                : category.id === "workflows"
-                  ? workflows.length
-                  : category.id === "scripts"
-                    ? scripts.length
-                    : category.id === "scriptlets"
-                      ? scriptlets.length
-                      : contexts.length;
+                : category.id === "unified-workflows"
+                  ? unifiedWorkflows.length
+                  : category.id === "workflows"
+                    ? workflows.length
+                    : category.id === "gui-workflows"
+                      ? guiWorkflows.length
+                      : category.id === "scripts"
+                        ? scripts.length
+                        : category.id === "scriptlets"
+                          ? scriptlets.length
+                          : category.id === "contexts"
+                            ? contexts.length
+                            : category.id === "state-explorer"
+                              ? explorations.length
+                              : category.id === "api-requests"
+                                ? savedApiRequests.length
+                                : 0;
 
             return (
               <button
@@ -2190,7 +2977,7 @@ export function LibraryTab({
                     : "hover:bg-muted text-foreground"
                 }`}
               >
-                <Icon className={`w-4 h-4 ${category.color}`} />
+                <Icon className={`w-4 h-4 ${getAccentColors(category.accentColor).text}`} />
                 <span className="flex-1 text-left text-sm">{category.label}</span>
                 <span className="text-xs text-muted-foreground">{count}</span>
               </button>
@@ -2213,7 +3000,9 @@ export function LibraryTab({
         {/* Header with Search and Filters */}
         <div className="p-4 border-b border-border flex items-center gap-3">
           <div className="flex items-center gap-2">
-            <CategoryIcon className={`w-5 h-5 ${categoryConfig.color}`} />
+            <CategoryIcon
+              className={`w-5 h-5 ${getAccentColors(categoryConfig.accentColor).text}`}
+            />
             <h3 className="font-semibold">{categoryConfig.label}</h3>
             <span className="text-sm text-muted-foreground">({currentItems.length})</span>
           </div>
@@ -2378,18 +3167,29 @@ export function LibraryTab({
         isSaving={isSavingContext}
       />
 
-      {/* Task Creation Dialog */}
+      {/* Task Creation/Edit Dialog */}
       {showTaskDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setShowTaskDialog(false)} />
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => {
+              setShowTaskDialog(false);
+              setEditingTaskId(null);
+            }}
+          />
           <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-lg mx-4 p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <FileText className="w-5 h-5 text-amber-500" />
-                <h3 className="text-lg font-semibold">New Task</h3>
+                <FileText className={`w-5 h-5 ${getAccentColors("amber").text}`} />
+                <h3 className="text-lg font-semibold">
+                  {editingTaskId ? "Edit Task" : "New Task"}
+                </h3>
               </div>
               <button
-                onClick={() => setShowTaskDialog(false)}
+                onClick={() => {
+                  setShowTaskDialog(false);
+                  setEditingTaskId(null);
+                }}
                 className="p-1 text-muted-foreground hover:text-foreground transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -2397,7 +3197,9 @@ export function LibraryTab({
             </div>
 
             <p className="text-sm text-muted-foreground">
-              Create a new single-step AI task. Tasks can be run directly from the Library.
+              {editingTaskId
+                ? "Edit the task details below."
+                : "Create a new single-step AI task. Tasks can be run directly from the Library."}
             </p>
 
             <div className="space-y-3">
@@ -2466,7 +3268,10 @@ export function LibraryTab({
 
             <div className="flex gap-3 pt-2">
               <button
-                onClick={() => setShowTaskDialog(false)}
+                onClick={() => {
+                  setShowTaskDialog(false);
+                  setEditingTaskId(null);
+                }}
                 className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
               >
                 Cancel
@@ -2474,17 +3279,17 @@ export function LibraryTab({
               <button
                 onClick={handleSaveTask}
                 disabled={isSavingTask || !taskForm.name.trim() || !taskForm.content.trim()}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-amber-500 text-white rounded-md font-medium hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("amber").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
               >
                 {isSavingTask ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Creating...
+                    {editingTaskId ? "Saving..." : "Creating..."}
                   </>
                 ) : (
                   <>
-                    <Plus className="w-4 h-4" />
-                    Create Task
+                    {editingTaskId ? <Pencil className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                    {editingTaskId ? "Save Changes" : "Create Task"}
                   </>
                 )}
               </button>
@@ -2493,21 +3298,29 @@ export function LibraryTab({
         </div>
       )}
 
-      {/* Scriptlet Creation Dialog */}
+      {/* Scriptlet Creation/Edit Dialog */}
       {showScriptletDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div
             className="absolute inset-0 bg-black/50"
-            onClick={() => setShowScriptletDialog(false)}
+            onClick={() => {
+              setShowScriptletDialog(false);
+              setEditingScriptletId(null);
+            }}
           />
           <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-lg mx-4 p-6 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <Puzzle className="w-5 h-5 text-cyan-500" />
-                <h3 className="text-lg font-semibold">New Scriptlet</h3>
+                <Puzzle className={`w-5 h-5 ${getAccentColors("cyan").text}`} />
+                <h3 className="text-lg font-semibold">
+                  {editingScriptletId ? "Edit Scriptlet" : "New Scriptlet"}
+                </h3>
               </div>
               <button
-                onClick={() => setShowScriptletDialog(false)}
+                onClick={() => {
+                  setShowScriptletDialog(false);
+                  setEditingScriptletId(null);
+                }}
                 className="p-1 text-muted-foreground hover:text-foreground transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -2515,7 +3328,9 @@ export function LibraryTab({
             </div>
 
             <p className="text-sm text-muted-foreground">
-              Create a reusable snippet that can be referenced in other tasks and workflows.
+              {editingScriptletId
+                ? "Edit the scriptlet details below."
+                : "Create a reusable snippet that can be referenced in other tasks and workflows."}
             </p>
 
             <div className="space-y-3">
@@ -2555,7 +3370,10 @@ export function LibraryTab({
 
             <div className="flex gap-3 pt-2">
               <button
-                onClick={() => setShowScriptletDialog(false)}
+                onClick={() => {
+                  setShowScriptletDialog(false);
+                  setEditingScriptletId(null);
+                }}
                 className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
               >
                 Cancel
@@ -2565,17 +3383,21 @@ export function LibraryTab({
                 disabled={
                   isSavingScriptlet || !scriptletForm.name.trim() || !scriptletForm.content.trim()
                 }
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-cyan-500 text-white rounded-md font-medium hover:bg-cyan-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("cyan").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
               >
                 {isSavingScriptlet ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Creating...
+                    {editingScriptletId ? "Saving..." : "Creating..."}
                   </>
                 ) : (
                   <>
-                    <Plus className="w-4 h-4" />
-                    Create Scriptlet
+                    {editingScriptletId ? (
+                      <Pencil className="w-4 h-4" />
+                    ) : (
+                      <Plus className="w-4 h-4" />
+                    )}
+                    {editingScriptletId ? "Save Changes" : "Create Scriptlet"}
                   </>
                 )}
               </button>
@@ -2584,21 +3406,29 @@ export function LibraryTab({
         </div>
       )}
 
-      {/* Verification Creation Dialog */}
-      {showVerificationDialog && (
+      {/* Exploration Creation/Edit Dialog */}
+      {showExplorationDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div
             className="absolute inset-0 bg-black/50"
-            onClick={() => setShowVerificationDialog(false)}
+            onClick={() => {
+              setShowExplorationDialog(false);
+              setEditingExplorationId(null);
+            }}
           />
           <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-lg mx-4 p-6 space-y-4 max-h-[90vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <ShieldCheck className="w-5 h-5 text-emerald-500" />
-                <h3 className="text-lg font-semibold">New Verification</h3>
+                <ShieldCheck className={`w-5 h-5 ${getAccentColors("emerald").text}`} />
+                <h3 className="text-lg font-semibold">
+                  {editingExplorationId ? "Edit Exploration" : "New Exploration"}
+                </h3>
               </div>
               <button
-                onClick={() => setShowVerificationDialog(false)}
+                onClick={() => {
+                  setShowExplorationDialog(false);
+                  setEditingExplorationId(null);
+                }}
                 className="p-1 text-muted-foreground hover:text-foreground transition-colors"
               >
                 <X className="w-5 h-5" />
@@ -2606,8 +3436,9 @@ export function LibraryTab({
             </div>
 
             <p className="text-sm text-muted-foreground">
-              Create a reusable verification configuration that can be run against any loaded
-              config.
+              {editingExplorationId
+                ? "Edit the exploration configuration below."
+                : "Create a reusable exploration configuration that can be run against any loaded config."}
             </p>
 
             <div className="space-y-3">
@@ -2615,11 +3446,9 @@ export function LibraryTab({
                 <label className="block text-sm font-medium mb-1">Name *</label>
                 <input
                   type="text"
-                  value={verificationForm.name}
-                  onChange={(e) =>
-                    setVerificationForm({ ...verificationForm, name: e.target.value })
-                  }
-                  placeholder="Enter verification name..."
+                  value={explorationForm.name}
+                  onChange={(e) => setExplorationForm({ ...explorationForm, name: e.target.value })}
+                  placeholder="Enter exploration name..."
                   className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
                   autoFocus
                 />
@@ -2628,9 +3457,9 @@ export function LibraryTab({
               <div>
                 <label className="block text-sm font-medium mb-1">Description</label>
                 <textarea
-                  value={verificationForm.description}
+                  value={explorationForm.description}
                   onChange={(e) =>
-                    setVerificationForm({ ...verificationForm, description: e.target.value })
+                    setExplorationForm({ ...explorationForm, description: e.target.value })
                   }
                   placeholder="Optional description..."
                   className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none h-16 focus:outline-none focus:ring-2 focus:ring-primary"
@@ -2640,11 +3469,11 @@ export function LibraryTab({
               <div>
                 <label className="block text-sm font-medium mb-1">Strategy</label>
                 <select
-                  value={verificationForm.strategy}
+                  value={explorationForm.strategy}
                   onChange={(e) =>
-                    setVerificationForm({
-                      ...verificationForm,
-                      strategy: e.target.value as VerificationTaskConfig["strategy"],
+                    setExplorationForm({
+                      ...explorationForm,
+                      strategy: e.target.value as ExplorationConfig["strategy"],
                     })
                   }
                   className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
@@ -2663,10 +3492,10 @@ export function LibraryTab({
                   <input
                     type="number"
                     min="0"
-                    value={verificationForm.max_states}
+                    value={explorationForm.max_states}
                     onChange={(e) =>
-                      setVerificationForm({
-                        ...verificationForm,
+                      setExplorationForm({
+                        ...explorationForm,
                         max_states: parseInt(e.target.value) || 0,
                       })
                     }
@@ -2678,10 +3507,10 @@ export function LibraryTab({
                   <input
                     type="number"
                     min="0"
-                    value={verificationForm.state_delay_ms}
+                    value={explorationForm.state_delay_ms}
                     onChange={(e) =>
-                      setVerificationForm({
-                        ...verificationForm,
+                      setExplorationForm({
+                        ...explorationForm,
                         state_delay_ms: parseInt(e.target.value) || 500,
                       })
                     }
@@ -2694,10 +3523,10 @@ export function LibraryTab({
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={verificationForm.capture_screenshots}
+                    checked={explorationForm.capture_screenshots}
                     onChange={(e) =>
-                      setVerificationForm({
-                        ...verificationForm,
+                      setExplorationForm({
+                        ...explorationForm,
                         capture_screenshots: e.target.checked,
                       })
                     }
@@ -2708,10 +3537,10 @@ export function LibraryTab({
                 <label className="flex items-center gap-2 cursor-pointer">
                   <input
                     type="checkbox"
-                    checked={verificationForm.stop_on_first_failure}
+                    checked={explorationForm.stop_on_first_failure}
                     onChange={(e) =>
-                      setVerificationForm({
-                        ...verificationForm,
+                      setExplorationForm({
+                        ...explorationForm,
                         stop_on_first_failure: e.target.checked,
                       })
                     }
@@ -2724,25 +3553,223 @@ export function LibraryTab({
 
             <div className="flex gap-3 pt-2">
               <button
-                onClick={() => setShowVerificationDialog(false)}
+                onClick={() => {
+                  setShowExplorationDialog(false);
+                  setEditingExplorationId(null);
+                }}
                 className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
               >
                 Cancel
               </button>
               <button
-                onClick={handleSaveVerification}
-                disabled={isSavingVerification || !verificationForm.name.trim()}
-                className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-emerald-500 text-white rounded-md font-medium hover:bg-emerald-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                onClick={handleSaveExploration}
+                disabled={isSavingExploration || !explorationForm.name.trim()}
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("emerald").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
               >
-                {isSavingVerification ? (
+                {isSavingExploration ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    Creating...
+                    {editingExplorationId ? "Saving..." : "Creating..."}
                   </>
                 ) : (
                   <>
-                    <Plus className="w-4 h-4" />
-                    Create Verification
+                    {editingExplorationId ? (
+                      <Pencil className="w-4 h-4" />
+                    ) : (
+                      <Plus className="w-4 h-4" />
+                    )}
+                    {editingExplorationId ? "Save Changes" : "Create Exploration"}
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* API Request Creation/Edit Dialog */}
+      {showApiRequestDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => {
+              setShowApiRequestDialog(false);
+              setEditingApiRequestId(null);
+            }}
+          />
+          <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 p-6 space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Globe className={`w-5 h-5 ${getAccentColors("indigo").text}`} />
+                <h3 className="text-lg font-semibold">
+                  {editingApiRequestId ? "Edit API Request" : "New API Request"}
+                </h3>
+              </div>
+              <button
+                onClick={() => {
+                  setShowApiRequestDialog(false);
+                  setEditingApiRequestId(null);
+                }}
+                className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <p className="text-sm text-muted-foreground">
+              {editingApiRequestId
+                ? "Edit the saved API request template."
+                : "Create a reusable API request template that can be used in workflows."}
+            </p>
+
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Name *</label>
+                  <input
+                    type="text"
+                    value={apiRequestForm.name}
+                    onChange={(e) => setApiRequestForm({ ...apiRequestForm, name: e.target.value })}
+                    placeholder="Enter request name..."
+                    className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                    autoFocus
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Category</label>
+                  <input
+                    type="text"
+                    value={apiRequestForm.category}
+                    onChange={(e) =>
+                      setApiRequestForm({ ...apiRequestForm, category: e.target.value })
+                    }
+                    placeholder="general"
+                    className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Description</label>
+                <textarea
+                  value={apiRequestForm.description}
+                  onChange={(e) =>
+                    setApiRequestForm({ ...apiRequestForm, description: e.target.value })
+                  }
+                  placeholder="Optional description..."
+                  className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none h-16 focus:outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+
+              <div className="grid grid-cols-[120px_1fr] gap-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Method *</label>
+                  <select
+                    value={apiRequestForm.method}
+                    onChange={(e) =>
+                      setApiRequestForm({
+                        ...apiRequestForm,
+                        method: e.target.value as typeof apiRequestForm.method,
+                      })
+                    }
+                    className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  >
+                    <option value="GET">GET</option>
+                    <option value="POST">POST</option>
+                    <option value="PUT">PUT</option>
+                    <option value="PATCH">PATCH</option>
+                    <option value="DELETE">DELETE</option>
+                    <option value="HEAD">HEAD</option>
+                    <option value="OPTIONS">OPTIONS</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">URL *</label>
+                  <input
+                    type="text"
+                    value={apiRequestForm.url}
+                    onChange={(e) => setApiRequestForm({ ...apiRequestForm, url: e.target.value })}
+                    placeholder="https://api.example.com/endpoint"
+                    className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Request Body</label>
+                <textarea
+                  value={apiRequestForm.body}
+                  onChange={(e) => setApiRequestForm({ ...apiRequestForm, body: e.target.value })}
+                  placeholder='{"key": "value"}'
+                  className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm font-mono resize-none h-24 focus:outline-none focus:ring-2 focus:ring-primary"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Timeout (ms)</label>
+                  <input
+                    type="number"
+                    min="1000"
+                    value={apiRequestForm.timeout_ms}
+                    onChange={(e) =>
+                      setApiRequestForm({
+                        ...apiRequestForm,
+                        timeout_ms: parseInt(e.target.value) || 30000,
+                      })
+                    }
+                    className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                  />
+                </div>
+                <div className="flex items-end">
+                  <label className="flex items-center gap-2 cursor-pointer pb-2">
+                    <input
+                      type="checkbox"
+                      checked={apiRequestForm.follow_redirects}
+                      onChange={(e) =>
+                        setApiRequestForm({
+                          ...apiRequestForm,
+                          follow_redirects: e.target.checked,
+                        })
+                      }
+                      className="rounded border-border"
+                    />
+                    <span className="text-sm">Follow Redirects</span>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex gap-3 pt-2">
+              <button
+                onClick={() => {
+                  setShowApiRequestDialog(false);
+                  setEditingApiRequestId(null);
+                }}
+                className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSaveApiRequest}
+                disabled={
+                  isSavingApiRequest || !apiRequestForm.name.trim() || !apiRequestForm.url.trim()
+                }
+                className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("indigo").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
+              >
+                {isSavingApiRequest ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {editingApiRequestId ? "Saving..." : "Creating..."}
+                  </>
+                ) : (
+                  <>
+                    {editingApiRequestId ? (
+                      <Pencil className="w-4 h-4" />
+                    ) : (
+                      <Plus className="w-4 h-4" />
+                    )}
+                    {editingApiRequestId ? "Save Changes" : "Create API Request"}
                   </>
                 )}
               </button>

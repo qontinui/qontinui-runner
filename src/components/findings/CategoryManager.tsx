@@ -36,6 +36,7 @@ import {
   RotateCcw,
   Lock,
 } from "lucide-react";
+import { getAccentColors } from "@/design-system";
 import type { FindingCategory, ActionType } from "../../types/findings";
 import {
   getAllCategories,
@@ -465,10 +466,10 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
                       {!isBuiltIn && (
                         <button
                           onClick={() => handleDelete(category.id, category.name)}
-                          className="p-2 hover:bg-red-500/10 rounded-lg transition-colors"
+                          className={`p-2 hover:${getAccentColors("red").bg} rounded-lg transition-colors`}
                           title="Delete category"
                         >
-                          <Trash2 className="w-4 h-4 text-red-500" />
+                          <Trash2 className={`w-4 h-4 ${getAccentColors("red").text}`} />
                         </button>
                       )}
                     </div>

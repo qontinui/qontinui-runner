@@ -10,6 +10,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { AlertTriangle, ImageIcon, X } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, Badge, ScrollArea, Progress } from "../ui";
 import type { StatusPanelProps } from "./types";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 export function StatusPanel({ executionState }: StatusPanelProps) {
   const [selectedScreenshot, setSelectedScreenshot] = useState<string | null>(null);
@@ -74,13 +75,13 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                 </div>
                 <div>
                   <p className="text-muted-foreground">Success Rate</p>
-                  <p className="font-mono text-lg text-green-400">
+                  <p className={`font-mono text-lg ${getAccentColors("green").text}`}>
                     {executionState.successRate.toFixed(1)}%
                   </p>
                 </div>
                 <div>
                   <p className="text-muted-foreground">Avg Confidence</p>
-                  <p className="font-mono text-lg text-blue-400">
+                  <p className={`font-mono text-lg ${getAccentColors("blue").text}`}>
                     {executionState.averageConfidence.toFixed(1)}%
                   </p>
                 </div>
@@ -112,8 +113,8 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                         <Badge
                           className={`absolute top-1 right-1 text-[10px] px-1.5 py-0 ${
                             screenshot.type === "annotated"
-                              ? "bg-blue-500/20 text-blue-400 border border-blue-500/50"
-                              : "bg-purple-500/20 text-purple-400 border border-purple-500/50"
+                              ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text} ${getAccentColors("blue").border}`
+                              : `${getAccentColors("purple").bg} ${getAccentColors("purple").text} ${getAccentColors("purple").border}`
                           }`}
                         >
                           {screenshot.type === "annotated" ? "A" : "P"}
@@ -127,7 +128,9 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                     ))}
                   </div>
                   {totalScreenshots > 6 && (
-                    <button className="mt-3 text-sm text-blue-400 hover:text-blue-300 transition-colors">
+                    <button
+                      className={`mt-3 text-sm ${getAccentColors("blue").text} hover:opacity-80 transition-colors`}
+                    >
                       View All ({totalScreenshots})
                     </button>
                   )}
@@ -157,8 +160,8 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                       <Badge
                         className={`text-xs ${
                           match.found
-                            ? "bg-green-500/20 text-green-400 border border-green-500/50"
-                            : "bg-red-500/20 text-red-400 border border-red-500/50"
+                            ? `${getStatusColors("success").bg} ${getStatusColors("success").text} ${getStatusColors("success").border}`
+                            : `${getStatusColors("error").bg} ${getStatusColors("error").text} ${getStatusColors("error").border}`
                         }`}
                       >
                         {match.found ? "FOUND" : "NOT FOUND"}
@@ -186,7 +189,9 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between">
                 <CardTitle className="text-sm font-semibold">Warnings & Anomalies</CardTitle>
-                <Badge className="bg-amber-500/20 text-amber-400 border border-amber-500/50">
+                <Badge
+                  className={`${getAccentColors("amber").bg} ${getAccentColors("amber").text} ${getAccentColors("amber").border}`}
+                >
                   <AlertTriangle className="mr-1 h-3 w-3" />
                   {warnings.length}
                 </Badge>
@@ -197,7 +202,9 @@ export function StatusPanel({ executionState }: StatusPanelProps) {
                 <div key={i} className="flex items-start gap-2 rounded-lg bg-muted/30 p-3">
                   <AlertTriangle
                     className={`h-4 w-4 flex-shrink-0 ${
-                      warning.severity === "amber" ? "text-amber-400" : "text-red-400"
+                      warning.severity === "amber"
+                        ? getAccentColors("amber").text
+                        : getAccentColors("red").text
                     }`}
                   />
                   <p className="flex-1 text-sm text-foreground">{warning.message}</p>

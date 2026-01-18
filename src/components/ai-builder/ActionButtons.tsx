@@ -15,6 +15,7 @@ import {
   Square,
 } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 export function ActionButtons() {
   const {
@@ -57,7 +58,7 @@ export function ActionButtons() {
         // Stop button when THIS task has a running session
         <button
           onClick={stopSession}
-          className="flex-1 flex items-center justify-center gap-2 px-4 py-3 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
+          className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 ${getAccentColors("red").bgSolid} text-white rounded-md font-medium hover:bg-red-600 transition-colors`}
         >
           <Square className="w-4 h-4" />
           Stop Session
@@ -80,7 +81,7 @@ export function ActionButtons() {
           className={`flex-1 flex items-center justify-center gap-2 px-4 py-3 rounded-md font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors ${
             canRun
               ? "bg-primary text-primary-foreground hover:bg-primary/90"
-              : "bg-amber-500/20 text-amber-600 hover:bg-amber-500/30"
+              : `${getAccentColors("amber").bg} ${getAccentColors("amber").text} hover:bg-amber-500/30`
           }`}
           title={canRun ? "Start AI analysis" : "Select a config before running"}
         >
@@ -91,7 +92,7 @@ export function ActionButtons() {
 
       <button
         onClick={handleNewWorkflow}
-        className="flex items-center gap-2 px-4 py-3 bg-blue-500/10 text-blue-600 rounded-md font-medium hover:bg-blue-500/20 transition-colors"
+        className={`flex items-center gap-2 px-4 py-3 ${getAccentColors("blue").bg} ${getAccentColors("blue").text} rounded-md font-medium hover:bg-blue-500/20 transition-colors`}
         title="Create new workflow"
       >
         <FilePlus2 className="w-4 h-4" />
@@ -108,7 +109,7 @@ export function ActionButtons() {
       <button
         onClick={handleSaveWorkflow}
         disabled={isSaving}
-        className="flex items-center gap-2 px-4 py-3 bg-green-500/10 text-green-600 rounded-md font-medium hover:bg-green-500/20 disabled:opacity-50 transition-colors"
+        className={`flex items-center gap-2 px-4 py-3 ${getStatusColors("success").bg} ${getStatusColors("success").text} rounded-md font-medium hover:bg-green-500/20 disabled:opacity-50 transition-colors`}
         title={currentWorkflowId ? `Save "${currentWorkflowName}"` : "Save workflow"}
       >
         {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}

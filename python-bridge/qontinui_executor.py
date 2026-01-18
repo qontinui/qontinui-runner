@@ -85,9 +85,18 @@ from executor_core import ExecutorCore  # noqa: E402
 from gui_automation import GUIAutomation  # noqa: E402
 from services.input_monitor_service import InputMonitorService  # noqa: E402
 from services.screenshot_service import ScreenshotService  # noqa: E402
+from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
+from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
+from services.integration_testing_service import IntegrationTestingService  # noqa: E402
+from services.test_analysis_service import TestAnalysisService  # noqa: E402
 from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
 from services.vision_extraction_service import VisionExtractionService  # noqa: E402
 from services.web_extraction_service import WebExtractionService  # noqa: E402
+from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
+from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
+from services.model_manager import get_model_manager, ModelManager  # noqa: E402
+from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
+from services.uitars_extraction_service import get_uitars_extraction_service, UITarsExtractionService  # noqa: E402
 from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
@@ -204,6 +213,27 @@ class QontinuiExecutor:
 
         # Vision extraction service (lazy-loaded when needed)
         self._vision_extraction_service = None
+
+        # Playwright collector service (lazy-loaded when needed)
+        self._playwright_collector_service = None
+
+        # Test analysis service for AI-powered test generation (lazy-loaded when needed)
+        self._test_analysis_service = None
+
+        # AI test generator service (lazy-loaded when needed)
+        self._ai_test_generator_service = None
+
+        # AI shell command generator service (lazy-loaded when needed)
+        self._ai_shell_command_generator_service = None
+
+        # Integration testing service (lazy-loaded when needed)
+        self._integration_testing_service = None
+
+        # Accessibility capture service (lazy-loaded when needed)
+        self._accessibility_capture_service = None
+
+        # UI-TARS extraction service (lazy-loaded when needed)
+        self._uitars_extraction_service: UITarsExtractionService | None = None
 
         # Dedicated event loop for async operations (avoids conflicts with WebSocket thread's loop)
         # Runs in a background thread to allow run_coroutine_threadsafe()
@@ -1360,6 +1390,32 @@ class QontinuiExecutor:
         elif cmd_type == "get_extraction_status":
             return self._handle_get_extraction_status()
 
+        # Playwright State Collector commands
+        elif cmd_type == "start_playwright_collection":
+            return self._handle_start_playwright_collection(params)
+
+        elif cmd_type == "get_playwright_collection_status":
+            return self._handle_get_playwright_collection_status(params)
+
+        elif cmd_type == "get_playwright_collection_results":
+            return self._handle_get_playwright_collection_results(params)
+
+        elif cmd_type == "stop_playwright_collection":
+            return self._handle_stop_playwright_collection()
+
+        # UI-TARS extraction commands
+        elif cmd_type == "start_uitars_extraction":
+            return self._handle_start_uitars_extraction(params)
+
+        elif cmd_type == "stop_uitars_extraction":
+            return self._handle_stop_uitars_extraction()
+
+        elif cmd_type == "get_uitars_extraction_status":
+            return self._handle_get_uitars_extraction_status()
+
+        elif cmd_type == "get_uitars_extraction_results":
+            return self._handle_get_uitars_extraction_results()
+
         # Vision extraction commands
         elif cmd_type == "run_vision_extraction":
             return self._handle_run_vision_extraction(params)
@@ -1371,6 +1427,10 @@ class QontinuiExecutor:
         # Screenshot capture command (for direct capture via Python)
         elif cmd_type == "capture_screenshot":
             return self._handle_capture_screenshot(params)
+
+        # Get available monitors
+        elif cmd_type == "get_monitors":
+            return self._handle_get_monitors()
 
         # SAM3 segmentation command
         elif cmd_type == "segment_screenshot":
@@ -1399,6 +1459,157 @@ class QontinuiExecutor:
 
         elif cmd_type == "get_interaction_recording_status":
             return self._handle_get_interaction_recording_status()
+
+        # Page analysis commands for AI-powered test generation
+        elif cmd_type == "analyze_page_playwright":
+            return self._handle_analyze_page_playwright(params)
+
+        elif cmd_type == "analyze_page_playwright_script":
+            return self._handle_analyze_page_playwright_script(params)
+
+        elif cmd_type == "analyze_page_vision":
+            return self._handle_analyze_page_vision(params)
+
+        elif cmd_type == "generate_test_with_ai":
+            return self._handle_generate_test_with_ai(params)
+
+        # AI shell command generation
+        elif cmd_type == "generate_shell_command_with_ai":
+            return self._handle_generate_shell_command_with_ai(params)
+
+        # Pattern matching commands
+        elif cmd_type == "pattern_find":
+            return self._handle_pattern_find(params)
+
+        elif cmd_type == "pattern_find_all":
+            return self._handle_pattern_find_all(params)
+
+        # Integration testing commands
+        elif cmd_type == "testing_get_states":
+            return self._handle_testing_get_states()
+
+        elif cmd_type == "testing_get_transitions":
+            return self._handle_testing_get_transitions()
+
+        elif cmd_type == "testing_find_path":
+            return self._handle_testing_find_path(params)
+
+        elif cmd_type == "testing_traverse_to_state":
+            return self._handle_testing_traverse_to_state(params)
+
+        elif cmd_type == "testing_get_active_states":
+            return self._handle_testing_get_active_states()
+
+        elif cmd_type == "testing_set_mock_mode":
+            return self._handle_testing_set_mock_mode(params)
+
+        elif cmd_type == "testing_mock_click":
+            return self._handle_testing_mock_click(params)
+
+        elif cmd_type == "testing_mock_type":
+            return self._handle_testing_mock_type(params)
+
+        elif cmd_type == "testing_mock_screenshot":
+            return self._handle_testing_mock_screenshot(params)
+
+        elif cmd_type == "testing_get_mocked_actions":
+            return self._handle_testing_get_mocked_actions()
+
+        elif cmd_type == "testing_clear_mocked_actions":
+            return self._handle_testing_clear_mocked_actions()
+
+        elif cmd_type == "testing_start_run":
+            return self._handle_testing_start_run(params)
+
+        elif cmd_type == "testing_run_assertion":
+            return self._handle_testing_run_assertion(params)
+
+        elif cmd_type == "testing_run_test_case":
+            return self._handle_testing_run_test_case(params)
+
+        elif cmd_type == "testing_end_run":
+            return self._handle_testing_end_run()
+
+        elif cmd_type == "testing_get_run":
+            return self._handle_testing_get_run(params)
+
+        elif cmd_type == "testing_get_status":
+            return self._handle_testing_get_status(params)
+
+        elif cmd_type == "testing_get_results":
+            return self._handle_testing_get_results(params)
+
+        elif cmd_type == "testing_list_runs":
+            return self._handle_testing_list_runs(params)
+
+        # Model management commands
+        elif cmd_type == "models_list":
+            return self._handle_models_list()
+
+        elif cmd_type == "models_download":
+            return self._handle_models_download(params)
+
+        elif cmd_type == "models_delete":
+            return self._handle_models_delete(params)
+
+        elif cmd_type == "models_status":
+            return self._handle_models_status(params)
+
+        elif cmd_type == "models_disk_usage":
+            return self._handle_models_disk_usage()
+
+        # Accessibility capture commands
+        elif cmd_type == "capture_accessibility":
+            return self._handle_capture_accessibility(params)
+
+        elif cmd_type == "click_ref":
+            return self._handle_click_ref(params)
+
+        elif cmd_type == "fill_ref":
+            return self._handle_fill_ref(params)
+
+        elif cmd_type == "focus_ref":
+            return self._handle_focus_ref(params)
+
+        elif cmd_type == "get_ref":
+            return self._handle_get_ref(params)
+
+        elif cmd_type == "get_accessibility_snapshot":
+            return self._handle_get_accessibility_snapshot()
+
+        elif cmd_type == "get_accessibility_ai_context":
+            return self._handle_get_accessibility_ai_context(params)
+
+        elif cmd_type == "find_accessibility_elements":
+            return self._handle_find_accessibility_elements(params)
+
+        elif cmd_type == "disconnect_accessibility":
+            return self._handle_disconnect_accessibility()
+
+        elif cmd_type == "scan_cdp_ports":
+            return self._handle_scan_cdp_ports(params)
+
+        elif cmd_type == "list_browser_targets":
+            return self._handle_list_browser_targets(params)
+
+        elif cmd_type == "auto_connect_accessibility":
+            return self._handle_auto_connect_accessibility(params)
+
+        # AWAS (AI Web Action Standard) commands
+        elif cmd_type == "awas_discover":
+            return self._handle_awas_discover(params)
+
+        elif cmd_type == "awas_execute":
+            return self._handle_awas_execute(params)
+
+        elif cmd_type == "awas_check_support":
+            return self._handle_awas_check_support(params)
+
+        elif cmd_type == "awas_list_actions":
+            return self._handle_awas_list_actions(params)
+
+        elif cmd_type == "awas_extract_elements":
+            return self._handle_awas_extract_elements(params)
 
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
@@ -1468,8 +1679,9 @@ class QontinuiExecutor:
             )
 
             # Emit the screenshot as an event for the Rust bridge
+            # Note: EventType is already imported at module level
             self.event_manager.emit_event(
-                "screenshot_captured",
+                EventType.SCREENSHOT_TAKEN,
                 {
                     "screenshot_base64": screenshot_base64,
                     "width": pil_image.width,
@@ -1501,6 +1713,84 @@ class QontinuiExecutor:
                 flush=True,
             )
             self.event_manager.emit_log("error", f"Failed to capture screenshot: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_monitors(self) -> dict[str, Any]:
+        """Handle get monitors command.
+
+        Returns information about all connected monitors using the qontinui
+        library's MonitorManager.
+
+        Returns:
+            Dictionary with:
+                - success: True
+                - monitors: List of monitor info dictionaries
+                - count: Number of monitors
+        """
+        import sys
+
+        print(
+            "[info    ] EXECUTOR: _handle_get_monitors called",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            from qontinui.monitor.monitor_manager import MonitorManager
+
+            # Create monitor manager to detect monitors
+            manager = MonitorManager()
+            all_monitors = manager.get_all_monitor_info()
+
+            # Convert to serializable format
+            monitors = []
+            for info in all_monitors:
+                # Determine position based on x coordinate
+                if len(all_monitors) == 1:
+                    position = "center"
+                elif info.x < 0:
+                    position = "left"
+                elif info.index == 0:
+                    position = "center"
+                else:
+                    position = "right"
+
+                monitors.append({
+                    "index": info.index,
+                    "x": info.x,
+                    "y": info.y,
+                    "width": info.width,
+                    "height": info.height,
+                    "position": position,
+                    "is_primary": info.index == manager.get_primary_monitor_index(),
+                    "name": info.device_id,
+                    "scale_factor": 1.0,  # MSS captures at physical resolution
+                })
+
+            self.event_manager.emit_log(
+                "info",
+                f"Retrieved {len(monitors)} monitor(s)",
+            )
+
+            return {
+                "success": True,
+                "monitors": monitors,
+                "count": len(monitors),
+            }
+
+        except Exception as e:
+            print(
+                f"[error   ] EXECUTOR: Failed to get monitors: {e}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self.event_manager.emit_log("error", f"Failed to get monitors: {e}")
             return {"success": False, "error": str(e)}
 
     def _handle_segment_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1688,6 +1978,382 @@ class QontinuiExecutor:
                 event_manager=self.event_manager,
             )
         return self._vision_extraction_service  # type: ignore[no-any-return]
+
+    def _get_test_analysis_service(self) -> TestAnalysisService:
+        """Get or create the test analysis service for AI-powered test generation."""
+        if self._test_analysis_service is None:
+            self._test_analysis_service = TestAnalysisService(
+                event_manager=self.event_manager,
+            )
+        return self._test_analysis_service  # type: ignore[no-any-return]
+
+    def _get_accessibility_capture_service(self) -> AccessibilityCaptureService:
+        """Get or create the accessibility capture service."""
+        if self._accessibility_capture_service is None:
+            self._accessibility_capture_service = AccessibilityCaptureService()
+        return self._accessibility_capture_service
+
+    def _handle_analyze_page_playwright(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Analyze page via Playwright CDP for AI test generation.
+
+        Connects to an existing browser via Chrome DevTools Protocol,
+        captures a screenshot, and extracts DOM elements with their
+        bounding boxes, text content, and CSS selectors.
+
+        Args:
+            params: Configuration with:
+                - cdp_port: CDP port number (default: 9222)
+
+        Returns:
+            Dict with:
+                - success: Whether analysis succeeded
+                - analysis: PageAnalysis data if success
+                - error: Error message if failed
+        """
+        import asyncio
+        import sys
+
+        cdp_port = params.get("cdp_port", 9222)
+
+        print(
+            f"[info    ] EXECUTOR: _handle_analyze_page_playwright called with cdp_port={cdp_port}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_test_analysis_service()
+
+            # Run async analysis using the async loop
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.analyze_via_playwright(cdp_port=cdp_port),
+                loop,
+            )
+            result = future.result(timeout=60)  # 60 second timeout for CDP connection
+
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "analysis": result.get("data"),  # Return the actual analysis data
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": result.get("error", "Unknown error during Playwright analysis"),
+                }
+
+        except TimeoutError:
+            return {
+                "success": False,
+                "error": f"Timeout connecting to browser via CDP on port {cdp_port}. Make sure a browser is running with --remote-debugging-port={cdp_port}",
+            }
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Playwright analysis failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _handle_analyze_page_playwright_script(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Analyze page by running a Playwright script.
+
+        Executes the provided Playwright script to navigate to a page,
+        then captures DOM elements with bounding boxes, text content,
+        and CSS selectors.
+
+        Args:
+            params: Configuration with:
+                - script: Playwright TypeScript/JavaScript code
+
+        Returns:
+            Dict with:
+                - success: Whether analysis succeeded
+                - analysis: PageAnalysis data if success
+                - error: Error message if failed
+        """
+        import asyncio
+        import sys
+
+        script = params.get("script", "")
+
+        print(
+            f"[info    ] EXECUTOR: _handle_analyze_page_playwright_script called with script ({len(script)} chars)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        if not script.strip():
+            return {
+                "success": False,
+                "error": "Playwright script is required",
+            }
+
+        try:
+            service = self._get_test_analysis_service()
+
+            # Run async analysis using the async loop
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.analyze_via_playwright_script(script=script),
+                loop,
+            )
+            result = future.result(timeout=120)  # 2 minute timeout for script execution
+
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "analysis": result.get("data"),
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": result.get("error", "Unknown error during Playwright script analysis"),
+                }
+
+        except TimeoutError:
+            return {
+                "success": False,
+                "error": "Timeout running Playwright script. Check for infinite loops or slow navigation.",
+            }
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Playwright script analysis failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _handle_analyze_page_vision(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Analyze page via Qontinui Vision for AI test generation.
+
+        Captures a screenshot from the specified monitor and runs
+        OCR, edge detection, and SAM3 segmentation to detect UI elements.
+
+        Args:
+            params: Configuration with:
+                - monitor_index: Monitor index to capture (default: 0)
+                - screenshot_base64: Optional pre-captured screenshot
+
+        Returns:
+            Dict with:
+                - success: Whether analysis succeeded
+                - analysis: PageAnalysis data if success
+                - error: Error message if failed
+        """
+        import sys
+
+        monitor_index = params.get("monitor_index", 0)
+        screenshot_base64 = params.get("screenshot_base64")
+
+        print(
+            f"[info    ] EXECUTOR: _handle_analyze_page_vision called with monitor_index={monitor_index}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_test_analysis_service()
+
+            # Vision analysis is synchronous
+            result = service.analyze_via_vision(
+                screenshot_base64=screenshot_base64,
+                monitor_index=monitor_index,
+            )
+
+            if result.get("success"):
+                return {
+                    "success": True,
+                    "analysis": result.get("data"),  # Return the actual analysis data
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": result.get("error", "Unknown error during Vision analysis"),
+                }
+
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Vision analysis failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _get_ai_test_generator_service(self) -> AiTestGeneratorService:
+        """Get or create the AI test generator service."""
+        if self._ai_test_generator_service is None:
+            self._ai_test_generator_service = AiTestGeneratorService(
+                event_manager=self.event_manager,
+            )
+        return self._ai_test_generator_service
+
+    def _handle_generate_test_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Handle AI test generation command.
+
+        Uses the configured AI provider to generate test code from a natural
+        language description and optional page analysis context.
+
+        Args:
+            params: Dict with:
+                - user_prompt: str - User's description of the test
+                - test_type: str - Type of test (playwright_cdp, qontinui_vision, etc.)
+                - page_analysis: dict | None - Optional page analysis data
+                - multi_request_analysis: dict | None - Optional multi-request ground truth
+                - collected_analyses: dict | None - Optional collected analyses (multiple types)
+                - ai_provider: str - AI provider (claude_cli, claude_api, gemini_cli, gemini_api)
+                - ai_settings: dict | None - Provider-specific settings
+
+        Returns:
+            Dict with success, code, and error fields.
+        """
+        import sys
+
+        user_prompt = params.get("user_prompt", "")
+        test_type = params.get("test_type", "playwright_cdp")
+        page_analysis = params.get("page_analysis")
+        multi_request_analysis = params.get("multi_request_analysis")
+        collected_analyses = params.get("collected_analyses")
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        print(
+            f"[info    ] EXECUTOR: _handle_generate_test_with_ai called with provider={ai_provider}, test_type={test_type}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        if not user_prompt:
+            return {
+                "success": False,
+                "error": "user_prompt is required",
+            }
+
+        try:
+            service = self._get_ai_test_generator_service()
+
+            result = service.generate_test(
+                user_prompt=user_prompt,
+                test_type=test_type,
+                page_analysis=page_analysis,
+                multi_request_analysis=multi_request_analysis,
+                collected_analyses=collected_analyses,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+
+            return result
+
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"AI test generation failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _get_ai_shell_command_generator_service(self) -> AiShellCommandGeneratorService:
+        """Get or create the AI shell command generator service."""
+        if self._ai_shell_command_generator_service is None:
+            self._ai_shell_command_generator_service = AiShellCommandGeneratorService(
+                event_manager=self.event_manager,
+            )
+        return self._ai_shell_command_generator_service
+
+    def _handle_generate_shell_command_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+        """
+        Handle AI shell command generation.
+
+        Uses the configured AI provider to generate shell commands from a natural
+        language description.
+
+        Args:
+            params: Dict with:
+                - user_prompt: str - User's description of the command
+                - target_os: str - Target OS (windows, linux, macos)
+                - category: str | None - Command category (git, npm, docker, etc.)
+                - ai_provider: str - AI provider (claude_cli, claude_api, gemini_cli, gemini_api)
+                - ai_settings: dict | None - Provider-specific settings
+
+        Returns:
+            Dict with success, command, description, and error fields.
+        """
+        import datetime
+        import os
+        import sys
+
+        # Debug log file
+        debug_log = os.path.join(os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log")
+        os.makedirs(os.path.dirname(debug_log), exist_ok=True)
+
+        def debug(msg):
+            ts = datetime.datetime.now().isoformat()
+            line = f"[{ts}] {msg}\n"
+            with open(debug_log, "a", encoding="utf-8") as f:
+                f.write(line)
+            print(f"[DEBUG] {msg}", file=sys.stderr, flush=True)
+
+        debug("=" * 60)
+        debug("_handle_generate_shell_command_with_ai CALLED")
+        debug(f"params keys: {list(params.keys())}")
+
+        user_prompt = params.get("user_prompt", "")
+        target_os = params.get("target_os", "windows")
+        category = params.get("category")
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        debug(f"user_prompt (first 100 chars): {user_prompt[:100]!r}")
+        debug(f"target_os: {target_os}")
+        debug(f"category: {category}")
+        debug(f"ai_provider: {ai_provider}")
+        debug(f"ai_settings: {ai_settings}")
+
+        if not user_prompt:
+            debug("ERROR: user_prompt is empty")
+            return {
+                "success": False,
+                "error": "user_prompt is required",
+            }
+
+        try:
+            debug("Getting AI shell command generator service...")
+            service = self._get_ai_shell_command_generator_service()
+            debug(f"Service obtained: {type(service)}")
+
+            debug("Calling service.generate_command()...")
+            result = service.generate_command(
+                user_prompt=user_prompt,
+                target_os=target_os,
+                category=category,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+            debug(f"service.generate_command() returned: success={result.get('success')}, error={result.get('error')!r}")
+            debug(f"command (first 200 chars): {str(result.get('command', ''))[:200]!r}")
+
+            return result
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            debug(f"EXCEPTION: {e}")
+            debug(f"TRACEBACK:\n{tb}")
+
+            return {
+                "success": False,
+                "error": f"AI shell command generation failed: {e}",
+                "traceback": tb,
+            }
 
     def _handle_run_vision_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -1891,6 +2557,199 @@ class QontinuiExecutor:
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to get extraction status: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _get_playwright_collector_service(self) -> PlaywrightCollectorService:
+        """Get or create the Playwright collector service."""
+        if self._playwright_collector_service is None:
+            self._playwright_collector_service = PlaywrightCollectorService(
+                event_manager=self.event_manager,
+            )
+        return self._playwright_collector_service
+
+    def _handle_start_playwright_collection(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle start Playwright collection command."""
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_start_playwright_collection called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_playwright_collector_service()
+            result = service.start_collection(params)
+
+            print(
+                f"[info    ] EXECUTOR: start_playwright_collection result: {result}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return result
+
+        except Exception as e:
+            self.event_manager.emit_log(
+                "error", f"Failed to start Playwright collection: {e}"
+            )
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_playwright_collection_status(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Handle get Playwright collection status command."""
+        try:
+            if self._playwright_collector_service is None:
+                return {
+                    "success": True,
+                    "status": "idle",
+                    "job_id": None,
+                }
+
+            job_id = params.get("job_id")
+            return self._playwright_collector_service.get_job_status(job_id)
+
+        except Exception as e:
+            self.event_manager.emit_log(
+                "error", f"Failed to get Playwright collection status: {e}"
+            )
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_playwright_collection_results(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Handle get Playwright collection results command."""
+        try:
+            if self._playwright_collector_service is None:
+                return {"success": False, "error": "No Playwright collection service"}
+
+            job_id = params.get("job_id")
+            return self._playwright_collector_service.get_results(job_id)
+
+        except Exception as e:
+            self.event_manager.emit_log(
+                "error", f"Failed to get Playwright collection results: {e}"
+            )
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_playwright_collection(self) -> dict[str, Any]:
+        """Handle stop Playwright collection command."""
+        try:
+            if self._playwright_collector_service is None:
+                return {"success": False, "error": "No collection in progress"}
+
+            return self._playwright_collector_service.stop_collection()
+
+        except Exception as e:
+            self.event_manager.emit_log(
+                "error", f"Failed to stop Playwright collection: {e}"
+            )
+            return {"success": False, "error": str(e)}
+
+    # =========================================================================
+    # UI-TARS Extraction Handlers
+    # =========================================================================
+
+    def _get_uitars_extraction_service(self) -> UITarsExtractionService:
+        """Get or create the UI-TARS extraction service."""
+        if self._uitars_extraction_service is None:
+            self._uitars_extraction_service = get_uitars_extraction_service(
+                emit_log_fn=self.event_manager.emit_log,
+                emit_event_fn=self._emit_event_wrapper,
+            )
+        return self._uitars_extraction_service
+
+    def _handle_start_uitars_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle start UI-TARS extraction command."""
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_start_uitars_extraction called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_uitars_extraction_service()
+
+            # Check if UI-TARS is available
+            if not service.is_available():
+                self.event_manager.emit_log(
+                    "warning", "[UI-TARS] UI-TARS not available, will run simulated extraction"
+                )
+
+            # Start extraction
+            config = params.get("config", params)
+            result = service.start_extraction(config)
+
+            print(
+                f"[info    ] EXECUTOR: start_uitars_extraction result: {result}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return result
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to start UI-TARS extraction: {e}")
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_uitars_extraction(self) -> dict[str, Any]:
+        """Handle stop UI-TARS extraction command."""
+        try:
+            if self._uitars_extraction_service is None:
+                return {"success": False, "error": "No UI-TARS extraction in progress"}
+
+            return self._uitars_extraction_service.stop_extraction()
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to stop UI-TARS extraction: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_uitars_extraction_status(self) -> dict[str, Any]:
+        """Handle get UI-TARS extraction status command."""
+        try:
+            if self._uitars_extraction_service is None:
+                return {
+                    "success": True,
+                    "status": "idle",
+                    "current_step": 0,
+                    "max_steps": 0,
+                    "elapsed_seconds": 0,
+                    "states_discovered": 0,
+                    "transitions_discovered": 0,
+                    "uitars_available": False,
+                }
+
+            status = self._uitars_extraction_service.get_status()
+            return {"success": True, **status}
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to get UI-TARS extraction status: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_uitars_extraction_results(self) -> dict[str, Any]:
+        """Handle get UI-TARS extraction results command."""
+        try:
+            if self._uitars_extraction_service is None:
+                return {
+                    "success": True,
+                    "states": [],
+                    "transitions": [],
+                    "total_steps": 0,
+                    "total_screenshots": 0,
+                    "exploration_time_seconds": 0,
+                }
+
+            results = self._uitars_extraction_service.get_results()
+            return {"success": True, **results}
+
+        except Exception as e:
+            self.event_manager.emit_log("error", f"Failed to get UI-TARS extraction results: {e}")
             return {"success": False, "error": str(e)}
 
     def _handle_execute_workflow(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -2510,8 +3369,8 @@ class QontinuiExecutor:
             self._interaction_start_time = time.time()
             self._interaction_fps = fps
 
-            # Emit recording started event
-            self.event_manager.emit_event(
+            # Emit recording started event (use emit_event_wrapper for string event types)
+            self.event_manager.emit_event_wrapper(
                 "interaction_recording_started",
                 {
                     "session_id": session_id,
@@ -2577,8 +3436,8 @@ class QontinuiExecutor:
                 f"duration={duration:.1f}s, file={events_file}",
             )
 
-            # Emit recording stopped event
-            self.event_manager.emit_event(
+            # Emit recording stopped event (use emit_event_wrapper for string event types)
+            self.event_manager.emit_event_wrapper(
                 "interaction_recording_stopped",
                 {
                     "session_id": session_id,
@@ -2651,6 +3510,1206 @@ class QontinuiExecutor:
         if hasattr(self, "executor_core") and self.executor_core:
             self.executor_core.cleanup()
 
+    def _handle_pattern_find(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle pattern find (best match) command.
+
+        Args:
+            params: Command parameters:
+                - screenshot: Base64 encoded screenshot or file path
+                - template: Base64 encoded template image or file path
+                - similarity: Minimum similarity threshold (0.0 to 1.0)
+                - search_region: Optional {x, y, width, height}
+
+        Returns:
+            Dictionary with match results
+        """
+        import asyncio
+
+        try:
+            service = get_pattern_matching_service()
+
+            screenshot = params.get("screenshot", "")
+            template = params.get("template", "")
+            similarity = params.get("similarity", 0.8)
+            search_region = params.get("search_region")
+
+            if not screenshot:
+                return {"success": False, "error": "screenshot is required"}
+            if not template:
+                return {"success": False, "error": "template is required"}
+
+            # Run async method
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(
+                    service.find(
+                        screenshot=screenshot,
+                        template=template,
+                        similarity=similarity,
+                        search_region=search_region,
+                    )
+                )
+            finally:
+                loop.close()
+
+            return {
+                "success": result.success,
+                "matches": result.matches,
+                "search_time_ms": result.search_time_ms,
+                "screenshot_width": result.screenshot_width,
+                "screenshot_height": result.screenshot_height,
+                "template_width": result.template_width,
+                "template_height": result.template_height,
+                "error": result.error,
+            }
+
+        except Exception as e:
+            logger.exception(f"Pattern find failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_pattern_find_all(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle pattern find all command.
+
+        Args:
+            params: Command parameters:
+                - screenshot: Base64 encoded screenshot or file path
+                - template: Base64 encoded template image or file path
+                - similarity: Minimum similarity threshold (0.0 to 1.0)
+                - search_region: Optional {x, y, width, height}
+                - max_matches: Maximum number of matches (default 100)
+
+        Returns:
+            Dictionary with all match results
+        """
+        import asyncio
+
+        try:
+            service = get_pattern_matching_service()
+
+            screenshot = params.get("screenshot", "")
+            template = params.get("template", "")
+            similarity = params.get("similarity", 0.8)
+            search_region = params.get("search_region")
+            max_matches = params.get("max_matches", 100)
+
+            if not screenshot:
+                return {"success": False, "error": "screenshot is required"}
+            if not template:
+                return {"success": False, "error": "template is required"}
+
+            # Run async method
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                result = loop.run_until_complete(
+                    service.find_all(
+                        screenshot=screenshot,
+                        template=template,
+                        similarity=similarity,
+                        search_region=search_region,
+                        max_matches=max_matches,
+                    )
+                )
+            finally:
+                loop.close()
+
+            return {
+                "success": result.success,
+                "matches": result.matches,
+                "search_time_ms": result.search_time_ms,
+                "screenshot_width": result.screenshot_width,
+                "screenshot_height": result.screenshot_height,
+                "template_width": result.template_width,
+                "template_height": result.template_height,
+                "error": result.error,
+            }
+
+        except Exception as e:
+            logger.exception(f"Pattern find all failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    # =========================================================================
+    # Integration Testing Handlers
+    # =========================================================================
+
+    def _get_integration_testing_service(self) -> IntegrationTestingService:
+        """Get or create the integration testing service."""
+        if self._integration_testing_service is None:
+            self._integration_testing_service = IntegrationTestingService(
+                emit_log_fn=self.event_manager.emit_log,
+                emit_event_fn=self.event_manager.emit_event,
+            )
+        return self._integration_testing_service
+
+    def _handle_testing_get_states(self) -> dict[str, Any]:
+        """Handle get states command for integration testing."""
+        service = self._get_integration_testing_service()
+        states = service.get_states()
+        return {"success": True, "states": states}
+
+    def _handle_testing_get_transitions(self) -> dict[str, Any]:
+        """Handle get transitions command for integration testing."""
+        service = self._get_integration_testing_service()
+        transitions = service.get_transitions()
+        return {"success": True, "transitions": transitions}
+
+    def _handle_testing_find_path(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle find path command for integration testing."""
+        service = self._get_integration_testing_service()
+        from_state = params.get("from_state", "")
+        to_state = params.get("to_state", "")
+
+        if not from_state or not to_state:
+            return {"success": False, "error": "from_state and to_state are required"}
+
+        result = service.find_path(from_state, to_state)
+        return result
+
+    def _handle_testing_traverse_to_state(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle traverse to state command for integration testing."""
+        service = self._get_integration_testing_service()
+        target_state = params.get("target_state", "")
+        execute = params.get("execute", True)
+
+        if not target_state:
+            return {"success": False, "error": "target_state is required"}
+
+        result = service.traverse_to_state(target_state, execute=execute)
+        return result
+
+    def _handle_testing_get_active_states(self) -> dict[str, Any]:
+        """Handle get active states command for integration testing."""
+        service = self._get_integration_testing_service()
+        active_states = service.get_active_states()
+        return {"success": True, "active_states": active_states}
+
+    def _handle_testing_set_mock_mode(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle set mock mode command for integration testing."""
+        service = self._get_integration_testing_service()
+        mode = params.get("mode", "disabled")
+        return service.set_mock_mode(mode)
+
+    def _handle_testing_mock_click(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle mock click command for integration testing."""
+        service = self._get_integration_testing_service()
+        x = params.get("x", 0)
+        y = params.get("y", 0)
+        button = params.get("button", "left")
+        clicks = params.get("clicks", 1)
+        return service.mock_click(x, y, button, clicks)
+
+    def _handle_testing_mock_type(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle mock type command for integration testing."""
+        service = self._get_integration_testing_service()
+        text = params.get("text", "")
+        delay_ms = params.get("delay_ms", 50)
+        return service.mock_type(text, delay_ms)
+
+    def _handle_testing_mock_screenshot(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle mock screenshot command for integration testing."""
+        service = self._get_integration_testing_service()
+        monitor_index = params.get("monitor_index")
+        return service.mock_screenshot(monitor_index)
+
+    def _handle_testing_get_mocked_actions(self) -> dict[str, Any]:
+        """Handle get mocked actions command for integration testing."""
+        service = self._get_integration_testing_service()
+        actions = service.get_mocked_actions()
+        return {"success": True, "actions": actions}
+
+    def _handle_testing_clear_mocked_actions(self) -> dict[str, Any]:
+        """Handle clear mocked actions command for integration testing."""
+        service = self._get_integration_testing_service()
+        return service.clear_mocked_actions()
+
+    def _handle_testing_start_run(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle start test run command for integration testing."""
+        service = self._get_integration_testing_service()
+        name = params.get("name", "Test Run")
+        config_path = params.get("config_path")
+        metadata = params.get("metadata")
+        return service.start_test_run(name, config_path, metadata)
+
+    def _handle_testing_run_assertion(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle run assertion command for integration testing."""
+        service = self._get_integration_testing_service()
+        assertion_type = params.get("assertion_type", "")
+        target = params.get("target", "")
+        expected = params.get("expected")
+        timeout_seconds = params.get("timeout_seconds", 30.0)
+
+        if not assertion_type or not target:
+            return {"success": False, "error": "assertion_type and target are required"}
+
+        return service.run_assertion(assertion_type, target, expected, timeout_seconds)
+
+    def _handle_testing_run_test_case(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle run test case command for integration testing."""
+        service = self._get_integration_testing_service()
+        test_case = params.get("test_case", {})
+        return service.run_test_case(test_case)
+
+    def _handle_testing_end_run(self) -> dict[str, Any]:
+        """Handle end test run command for integration testing."""
+        service = self._get_integration_testing_service()
+        return service.end_test_run()
+
+    def _handle_testing_get_run(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle get test run command for integration testing."""
+        service = self._get_integration_testing_service()
+        run_id = params.get("run_id", "")
+        if not run_id:
+            return {"success": False, "error": "run_id is required"}
+        return service.get_test_run(run_id)
+
+    def _handle_testing_get_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle get test status command for integration testing."""
+        service = self._get_integration_testing_service()
+        run_id = params.get("run_id", "")
+        if not run_id:
+            return {"success": False, "error": "run_id is required"}
+        return service.get_test_status(run_id)
+
+    def _handle_testing_get_results(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle get test results command for integration testing."""
+        service = self._get_integration_testing_service()
+        run_id = params.get("run_id", "")
+        if not run_id:
+            return {"success": False, "error": "run_id is required"}
+        return service.get_test_results(run_id)
+
+    def _handle_testing_list_runs(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle list test runs command for integration testing."""
+        service = self._get_integration_testing_service()
+        limit = params.get("limit", 50)
+        runs = service.list_test_runs(limit)
+        return {"success": True, "runs": runs}
+
+    # =========================================================================
+    # Model Management Handlers
+    # =========================================================================
+
+    def _handle_models_list(self) -> dict[str, Any]:
+        """List all available models with their download status.
+
+        Returns:
+            Dictionary with:
+                - success: True
+                - models: List of model info dictionaries with:
+                    - id: Model identifier
+                    - name: Human-readable name
+                    - type: Model type (sam3, clip, easyocr)
+                    - description: Model description
+                    - size_bytes: Model size in bytes
+                    - available: Whether model is downloaded
+        """
+        try:
+            manager = get_model_manager()
+            models = manager.list_models()
+            return {"success": True, "models": models}
+        except Exception as e:
+            logger.exception(f"Failed to list models: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_models_download(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Download a model.
+
+        Note: This is a synchronous download. For large models, progress
+        events are emitted during download.
+
+        Args:
+            params:
+                - model_id: Model identifier (e.g., "sam3", "clip_vit_b32")
+                - force: Re-download even if already available (default: False)
+
+        Returns:
+            Dictionary with:
+                - success: Whether download succeeded
+                - path: Path to the downloaded model
+                - error: Error message (if failed)
+        """
+        try:
+            model_id = params.get("model_id", "")
+            force = params.get("force", False)
+
+            if not model_id:
+                return {"success": False, "error": "model_id is required"}
+
+            manager = get_model_manager()
+
+            # Progress callback that emits events (use emit_event_wrapper for string event types)
+            def on_progress(progress: int) -> None:
+                self.event_manager.emit_event_wrapper(
+                    "model_download_progress",
+                    {
+                        "model_id": model_id,
+                        "progress": progress,
+                    },
+                )
+
+            path = manager.download(model_id, progress_callback=on_progress, force=force)
+
+            return {
+                "success": True,
+                "path": str(path),
+                "model_id": model_id,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to download model {params.get('model_id')}: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_models_delete(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Delete a downloaded model.
+
+        Args:
+            params:
+                - model_id: Model identifier
+
+        Returns:
+            Dictionary with:
+                - success: Whether deletion succeeded
+                - deleted: True if model was deleted
+                - error: Error message (if failed)
+        """
+        try:
+            model_id = params.get("model_id", "")
+
+            if not model_id:
+                return {"success": False, "error": "model_id is required"}
+
+            manager = get_model_manager()
+            deleted = manager.delete(model_id)
+
+            return {
+                "success": True,
+                "deleted": deleted,
+                "model_id": model_id,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to delete model {params.get('model_id')}: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_models_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Get status of a specific model.
+
+        Args:
+            params:
+                - model_id: Model identifier
+
+        Returns:
+            Dictionary with:
+                - success: True
+                - model_id: Model identifier
+                - available: Whether model is downloaded
+                - path: Path to model (if available)
+                - info: Model info (name, type, size, etc.)
+        """
+        try:
+            model_id = params.get("model_id", "")
+
+            if not model_id:
+                return {"success": False, "error": "model_id is required"}
+
+            manager = get_model_manager()
+            available = manager.is_available(model_id)
+            path = manager.get_model_path(model_id)
+            info = manager.get_model_info(model_id)
+
+            return {
+                "success": True,
+                "model_id": model_id,
+                "available": available,
+                "path": str(path) if path else None,
+                "info": {
+                    "name": info.name,
+                    "type": info.model_type.value,
+                    "description": info.description,
+                    "size_bytes": info.size_bytes,
+                } if info else None,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to get model status {params.get('model_id')}: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_models_disk_usage(self) -> dict[str, Any]:
+        """Get disk usage for all downloaded models.
+
+        Returns:
+            Dictionary with:
+                - success: True
+                - total_bytes: Total disk usage in bytes
+                - models: Dictionary of model_id -> size in bytes
+                - models_dir: Path to models directory
+        """
+        try:
+            manager = get_model_manager()
+            usage = manager.get_disk_usage()
+
+            return {
+                "success": True,
+                **usage,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to get disk usage: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ============================================================================
+    # Accessibility Capture Handlers
+    # ============================================================================
+
+    def _handle_capture_accessibility(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Capture accessibility tree from a browser via CDP.
+
+        Args:
+            params: Command parameters:
+                - target: Target to capture ("auto", URL, or page index)
+                - cdp_host: CDP host (default: localhost)
+                - cdp_port: CDP port (default: 9222)
+                - interactive_only: Only include interactive elements
+                - include_hidden: Include hidden elements
+                - max_depth: Maximum tree depth
+
+        Returns:
+            Dictionary with:
+                - success: Whether capture succeeded
+                - snapshot: Serialized AccessibilitySnapshot
+                - ai_context: AI-friendly text representation
+                - stats: Capture statistics
+                - error: Error message if failed
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+
+            target = params.get("target", "auto")
+            cdp_host = params.get("cdp_host", "localhost")
+            cdp_port = params.get("cdp_port", 9222)
+            interactive_only = params.get("interactive_only", False)
+            include_hidden = params.get("include_hidden", False)
+            max_depth = params.get("max_depth")
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.capture_accessibility_tree(
+                    target=target,
+                    cdp_host=cdp_host,
+                    cdp_port=cdp_port,
+                    interactive_only=interactive_only,
+                    include_hidden=include_hidden,
+                    max_depth=max_depth,
+                ),
+                loop,
+            )
+            result = future.result(timeout=60)
+
+            self.event_manager.emit_log(
+                "info" if result.get("success") else "error",
+                f"Accessibility capture: {'success' if result.get('success') else result.get('error', 'failed')}",
+            )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to capture accessibility tree: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_click_ref(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Click an element by its accessibility ref.
+
+        Args:
+            params: Command parameters:
+                - ref: Reference ID (e.g., "@e3")
+
+        Returns:
+            Dictionary with success status and element info
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+            ref = params.get("ref")
+
+            if not ref:
+                return {"success": False, "error": "ref parameter is required"}
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(service.click_ref(ref), loop)
+            result = future.result(timeout=30)
+
+            self.event_manager.emit_log(
+                "info" if result.get("success") else "warning",
+                f"Click ref {ref}: {'success' if result.get('success') else result.get('error', 'failed')}",
+            )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to click ref: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_fill_ref(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Type text into an element by its accessibility ref.
+
+        Args:
+            params: Command parameters:
+                - ref: Reference ID (e.g., "@e2")
+                - value: Text to type
+                - clear_first: Clear existing content first
+
+        Returns:
+            Dictionary with success status and element info
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+            ref = params.get("ref")
+            value = params.get("value", "")
+            clear_first = params.get("clear_first", False)
+
+            if not ref:
+                return {"success": False, "error": "ref parameter is required"}
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.fill_ref(ref, value, clear_first=clear_first), loop
+            )
+            result = future.result(timeout=30)
+
+            self.event_manager.emit_log(
+                "info" if result.get("success") else "warning",
+                f"Fill ref {ref}: {'success' if result.get('success') else result.get('error', 'failed')}",
+            )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to fill ref: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_focus_ref(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Focus an element by its accessibility ref.
+
+        Args:
+            params: Command parameters:
+                - ref: Reference ID (e.g., "@e5")
+
+        Returns:
+            Dictionary with success status and element info
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+            ref = params.get("ref")
+
+            if not ref:
+                return {"success": False, "error": "ref parameter is required"}
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(service.focus_ref(ref), loop)
+            result = future.result(timeout=30)
+
+            self.event_manager.emit_log(
+                "info" if result.get("success") else "warning",
+                f"Focus ref {ref}: {'success' if result.get('success') else result.get('error', 'failed')}",
+            )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to focus ref: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_ref(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Get element details by its accessibility ref.
+
+        Args:
+            params: Command parameters:
+                - ref: Reference ID (e.g., "@e1")
+
+        Returns:
+            Dictionary with element details or error
+        """
+        try:
+            service = self._get_accessibility_capture_service()
+            ref = params.get("ref")
+
+            if not ref:
+                return {"success": False, "error": "ref parameter is required"}
+
+            return service.get_element_by_ref(ref)
+
+        except Exception as e:
+            logger.exception(f"Failed to get ref: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_accessibility_snapshot(self) -> dict[str, Any]:
+        """Get the current cached accessibility snapshot.
+
+        Returns:
+            Dictionary with snapshot data or error
+        """
+        try:
+            service = self._get_accessibility_capture_service()
+            return service.get_current_snapshot()
+
+        except Exception as e:
+            logger.exception(f"Failed to get accessibility snapshot: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_accessibility_ai_context(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Get AI-friendly context from the current accessibility snapshot.
+
+        Args:
+            params: Command parameters:
+                - max_elements: Maximum number of elements to include
+                - interactive_only: Only include interactive elements
+
+        Returns:
+            Dictionary with AI context string
+        """
+        try:
+            service = self._get_accessibility_capture_service()
+            max_elements = params.get("max_elements", 100)
+            interactive_only = params.get("interactive_only", True)
+
+            return service.get_ai_context(
+                max_elements=max_elements, interactive_only=interactive_only
+            )
+
+        except Exception as e:
+            logger.exception(f"Failed to get accessibility AI context: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_find_accessibility_elements(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Find elements matching criteria in the accessibility tree.
+
+        Args:
+            params: Command parameters:
+                - role: Role(s) to match
+                - name: Exact name to match
+                - name_contains: Partial name match
+                - is_interactive: Filter by interactivity
+
+        Returns:
+            Dictionary with matching elements
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+
+            role = params.get("role")
+            name = params.get("name")
+            name_contains = params.get("name_contains")
+            is_interactive = params.get("is_interactive")
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.find_elements(
+                    role=role,
+                    name=name,
+                    name_contains=name_contains,
+                    is_interactive=is_interactive,
+                ),
+                loop,
+            )
+            result = future.result(timeout=30)
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to find accessibility elements: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_disconnect_accessibility(self) -> dict[str, Any]:
+        """Disconnect from the accessibility source.
+
+        Returns:
+            Dictionary with disconnect status
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(service.disconnect(), loop)
+            result = future.result(timeout=10)
+
+            self.event_manager.emit_log("info", "Accessibility capture disconnected")
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to disconnect accessibility: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_scan_cdp_ports(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Scan common CDP ports to find available browsers.
+
+        Args:
+            params: Command parameters:
+                - host: Host to scan (default: localhost)
+                - ports: List of ports to scan (default: common ports)
+                - timeout: Timeout per port in seconds
+
+        Returns:
+            Dictionary with available ports and targets
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+
+            host = params.get("host", "localhost")
+            ports = params.get("ports")
+            timeout = params.get("timeout", 2.0)
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.scan_cdp_ports(host, ports, timeout),
+                loop,
+            )
+            result = future.result(timeout=30)
+
+            self.event_manager.emit_log(
+                "info",
+                f"CDP port scan complete: {len(result.get('available_ports', []))} ports found",
+            )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to scan CDP ports: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_list_browser_targets(self, params: dict[str, Any]) -> dict[str, Any]:
+        """List available browser page targets on a CDP port.
+
+        Args:
+            params: Command parameters:
+                - host: CDP host (default: localhost)
+                - port: CDP port (default: 9222)
+
+        Returns:
+            Dictionary with list of page targets
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+
+            host = params.get("host", "localhost")
+            port = params.get("port", 9222)
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.list_browser_targets(host, port),
+                loop,
+            )
+            result = future.result(timeout=10)
+
+            self.event_manager.emit_log(
+                "info",
+                f"Listed {result.get('count', 0)} browser targets on port {port}",
+            )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to list browser targets: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_auto_connect_accessibility(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Automatically connect to the first available CDP target.
+
+        Args:
+            params: Command parameters:
+                - host: Host to scan (default: localhost)
+                - preferred_ports: List of ports to try in order
+
+        Returns:
+            Dictionary with connection result and captured snapshot
+        """
+        import asyncio
+
+        try:
+            service = self._get_accessibility_capture_service()
+
+            host = params.get("host", "localhost")
+            preferred_ports = params.get("preferred_ports")
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.auto_connect(host, preferred_ports),
+                loop,
+            )
+            result = future.result(timeout=60)
+
+            if result.get("success"):
+                target = result.get("target", {})
+                self.event_manager.emit_log(
+                    "info",
+                    f"Auto-connected to CDP on port {result.get('port')}: {target.get('title', 'Unknown')}",
+                )
+            else:
+                self.event_manager.emit_log(
+                    "warning",
+                    f"Auto-connect failed: {result.get('error')}",
+                )
+
+            return result
+
+        except Exception as e:
+            logger.exception(f"Failed to auto-connect accessibility: {e}")
+            return {"success": False, "error": str(e)}
+
+    # ============================================================================
+    # AWAS (AI Web Action Standard) Handlers
+    # ============================================================================
+
+    def _get_awas_discovery_service(self):
+        """Get or create the AWAS discovery service instance."""
+        if not hasattr(self, "_awas_discovery_service"):
+            try:
+                from qontinui.awas import AwasDiscoveryService
+
+                self._awas_discovery_service = AwasDiscoveryService()
+            except ImportError:
+                self._awas_discovery_service = None
+        return self._awas_discovery_service
+
+    def _get_awas_executor(self):
+        """Get or create the AWAS executor instance."""
+        if not hasattr(self, "_awas_executor"):
+            try:
+                from qontinui.awas import AwasExecutor
+
+                self._awas_executor = AwasExecutor()
+            except ImportError:
+                self._awas_executor = None
+        return self._awas_executor
+
+    def _handle_awas_discover(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Discover AWAS manifest for a website.
+
+        Args:
+            params: Command parameters:
+                - url: Base URL of the website to discover (required)
+                - force_refresh: Whether to bypass cache (default: False)
+
+        Returns:
+            Dictionary with:
+                - success: Whether discovery succeeded
+                - manifest: Parsed AWAS manifest data (if success)
+                - error: Error message (if failed)
+        """
+        import asyncio
+
+        try:
+            service = self._get_awas_discovery_service()
+            if not service:
+                return {"success": False, "error": "AWAS module not available"}
+
+            url = params.get("url")
+            if not url:
+                return {"success": False, "error": "url parameter is required"}
+
+            force_refresh = params.get("force_refresh", False)
+
+            # Clear cache if force refresh
+            if force_refresh:
+                service.clear_cache(url)
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.discover(url),
+                loop,
+            )
+            manifest = future.result(timeout=30)
+
+            if manifest is None:
+                return {
+                    "success": False,
+                    "error": f"No AWAS manifest found at {url}",
+                }
+
+            # Convert manifest to dict for JSON serialization
+            manifest_data = manifest.model_dump(by_alias=True, exclude_none=True)
+
+            self.event_manager.emit_log(
+                "info",
+                f"Discovered AWAS manifest for {manifest.app_name} with {len(manifest.actions)} actions",
+            )
+
+            return {
+                "success": True,
+                "manifest": manifest_data,
+                "app_name": manifest.app_name,
+                "action_count": len(manifest.actions),
+                "conformance_level": manifest.conformance_level.value,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to discover AWAS manifest: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_awas_execute(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Execute an AWAS action.
+
+        Args:
+            params: Command parameters:
+                - url: Base URL of the website (required)
+                - action_id: ID of the action to execute (required)
+                - action_params: Parameters for the action (optional)
+                - credentials: Authentication credentials (optional)
+                - timeout_seconds: Request timeout (optional)
+
+        Returns:
+            Dictionary with:
+                - success: Whether execution succeeded
+                - status_code: HTTP status code
+                - response_body: Response data
+                - response_time_ms: Response time in milliseconds
+                - error: Error message (if failed)
+        """
+        import asyncio
+
+        try:
+            discovery_service = self._get_awas_discovery_service()
+            executor = self._get_awas_executor()
+
+            if not discovery_service or not executor:
+                return {"success": False, "error": "AWAS module not available"}
+
+            url = params.get("url")
+            action_id = params.get("action_id")
+            action_params = params.get("action_params", {})
+            credentials = params.get("credentials", {})
+            timeout_seconds = params.get("timeout_seconds")
+
+            if not url:
+                return {"success": False, "error": "url parameter is required"}
+            if not action_id:
+                return {"success": False, "error": "action_id parameter is required"}
+
+            # First discover the manifest
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                discovery_service.discover(url),
+                loop,
+            )
+            manifest = future.result(timeout=30)
+
+            if manifest is None:
+                return {"success": False, "error": f"No AWAS manifest found at {url}"}
+
+            # Execute the action
+            execute_kwargs = {
+                "manifest": manifest,
+                "action_id": action_id,
+                "params": action_params,
+                "credentials": credentials,
+            }
+            if timeout_seconds is not None:
+                execute_kwargs["timeout_seconds"] = timeout_seconds
+
+            future = asyncio.run_coroutine_threadsafe(
+                executor.execute(**execute_kwargs),
+                loop,
+            )
+            result = future.result(timeout=timeout_seconds or 60)
+
+            self.event_manager.emit_log(
+                "info" if result.success else "warning",
+                f"AWAS action '{action_id}' {'succeeded' if result.success else 'failed'}: "
+                f"status={result.status_code}, time={result.response_time_ms}ms",
+            )
+
+            return {
+                "success": result.success,
+                "action_id": result.action_id,
+                "status_code": result.status_code,
+                "response_body": result.response_body,
+                "response_time_ms": result.response_time_ms,
+                "error": result.error,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to execute AWAS action: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_awas_check_support(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Check if a website supports AWAS.
+
+        Args:
+            params: Command parameters:
+                - url: Base URL of the website (required)
+
+        Returns:
+            Dictionary with:
+                - success: Whether check completed
+                - supported: Whether AWAS is supported
+                - app_name: Application name (if supported)
+                - action_count: Number of available actions
+                - conformance_level: AWAS conformance level
+        """
+        import asyncio
+
+        try:
+            service = self._get_awas_discovery_service()
+            if not service:
+                return {"success": False, "error": "AWAS module not available"}
+
+            url = params.get("url")
+            if not url:
+                return {"success": False, "error": "url parameter is required"}
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.check_awas_support(url),
+                loop,
+            )
+            result = future.result(timeout=30)
+
+            self.event_manager.emit_log(
+                "info",
+                f"AWAS support check for {url}: {'supported' if result.get('supported') else 'not supported'}",
+            )
+
+            return {"success": True, **result}
+
+        except Exception as e:
+            logger.exception(f"Failed to check AWAS support: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_awas_list_actions(self, params: dict[str, Any]) -> dict[str, Any]:
+        """List available AWAS actions for a website.
+
+        Args:
+            params: Command parameters:
+                - url: Base URL of the website (required)
+                - read_only_only: Only return read-only actions (default: False)
+
+        Returns:
+            Dictionary with:
+                - success: Whether listing succeeded
+                - actions: List of action summaries
+                - app_name: Application name
+        """
+        import asyncio
+
+        try:
+            service = self._get_awas_discovery_service()
+            if not service:
+                return {"success": False, "error": "AWAS module not available"}
+
+            url = params.get("url")
+            if not url:
+                return {"success": False, "error": "url parameter is required"}
+
+            read_only_only = params.get("read_only_only", False)
+
+            loop = self._get_or_create_async_loop()
+            future = asyncio.run_coroutine_threadsafe(
+                service.discover(url),
+                loop,
+            )
+            manifest = future.result(timeout=30)
+
+            if manifest is None:
+                return {"success": False, "error": f"No AWAS manifest found at {url}"}
+
+            # Get actions (filtered if requested)
+            if read_only_only:
+                actions = manifest.get_read_only_actions()
+            else:
+                actions = manifest.actions
+
+            # Build action summaries
+            action_summaries = []
+            for action in actions:
+                summary = {
+                    "id": action.id,
+                    "name": action.name,
+                    "method": action.method.value,
+                    "endpoint": action.endpoint,
+                    "intent": action.intent,
+                    "side_effect": action.side_effect,
+                    "is_read_only": action.is_read_only,
+                    "parameter_count": len(action.parameters),
+                }
+                action_summaries.append(summary)
+
+            self.event_manager.emit_log(
+                "info",
+                f"Listed {len(action_summaries)} AWAS actions for {manifest.app_name}",
+            )
+
+            return {
+                "success": True,
+                "app_name": manifest.app_name,
+                "actions": action_summaries,
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to list AWAS actions: {e}")
+            return {"success": False, "error": str(e)}
+
+    def _handle_awas_extract_elements(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Extract AWAS elements from HTML content.
+
+        Args:
+            params: Command parameters:
+                - html: HTML content to parse (required)
+                - page_url: URL of the page (optional, for context)
+
+        Returns:
+            Dictionary with:
+                - success: Whether extraction succeeded
+                - elements: List of extracted AWAS elements
+        """
+        try:
+            service = self._get_awas_discovery_service()
+            if not service:
+                return {"success": False, "error": "AWAS module not available"}
+
+            html = params.get("html")
+            if not html:
+                return {"success": False, "error": "html parameter is required"}
+
+            page_url = params.get("page_url")
+
+            elements = service.extract_elements(html, page_url)
+
+            # Convert elements to dicts for JSON serialization
+            element_data = []
+            for elem in elements:
+                element_data.append(elem.model_dump(exclude_none=True))
+
+            self.event_manager.emit_log(
+                "info",
+                f"Extracted {len(elements)} AWAS elements from HTML",
+            )
+
+            return {
+                "success": True,
+                "elements": element_data,
+                "element_count": len(elements),
+            }
+
+        except Exception as e:
+            logger.exception(f"Failed to extract AWAS elements: {e}")
+            return {"success": False, "error": str(e)}
+
 
 def main():
     """Main entry point for the Qontinui executor."""
@@ -2671,9 +4730,16 @@ def main():
                 executor.event_manager.emit_log("info", f"Received command: {cmd_name}")
 
             if command.get("type") == "command":
-                response = executor.handle_command(command)
-                response["id"] = command.get("id")
-                response["type"] = "response"
+                result = executor.handle_command(command)
+                # Wrap response data in the format expected by Rust:
+                # { type: "response", id: "...", success: bool, data: {...}, error: Option<String> }
+                response = {
+                    "type": "response",
+                    "id": command.get("id"),
+                    "success": result.get("success", False),
+                    "data": {k: v for k, v in result.items() if k not in ("success", "error")},
+                    "error": result.get("error"),
+                }
 
                 with executor.event_manager._output_lock:
                     sys.stdout.write(json.dumps(response) + "\n")

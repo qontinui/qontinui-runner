@@ -16,6 +16,7 @@ import { useAutoScroll } from "../hooks";
 import type { LogEntry, ImageRecognitionEntry } from "../managers/LogManager";
 import type { ActionLogEntry } from "../types/displayProfile";
 import type { LogLevel } from "../hooks/useLogFilter";
+import { getStatusColors } from "@/design-system";
 
 type LogSubTab = "general" | "image" | "actions";
 
@@ -173,7 +174,9 @@ export function LogsTab({
             <div className="text-center text-muted-foreground py-8">Loading action log...</div>
           )}
           {actionLogError && (
-            <div className="text-center text-red-600 py-8">Error: {actionLogError}</div>
+            <div className={`text-center ${getStatusColors("error").text} py-8`}>
+              Error: {actionLogError}
+            </div>
           )}
           {!actionLogLoading && !actionLogError && actionLogData && (
             <ActionLogTable actions={actionLogData.actions} onRowClick={onActionRowClick} />

@@ -23,6 +23,7 @@
 
 import React, { useState, useMemo } from "react";
 import { ActionLogEntry } from "../types/displayProfile";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 /**
  * Props for the ActionLogTable component
@@ -288,7 +289,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
   // Check status first
   if (action.status === "failed") {
     return (
-      <span className="text-red-500 font-medium">
+      <span className={`${getStatusColors("error").text} font-medium`}>
         <span className="mr-1">✗</span>
         {action.error || "Failed"}
       </span>
@@ -308,7 +309,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
             if (best && typeof best === "object" && "confidence" in best) {
               const typedBest = best as { confidence: number };
               return (
-                <span className="text-green-500">
+                <span className={getStatusColors("success").text}>
                   <span className="mr-1">✓</span>
                   found {matchResult.length} matches, best:{" "}
                   {(typedBest.confidence * 100).toFixed(1)}%
@@ -333,7 +334,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
               confidence: number;
             };
             return (
-              <span className="text-green-500">
+              <span className={getStatusColors("success").text}>
                 <span className="mr-1">✓</span>
                 found [{typedMatch.x},{typedMatch.y},{typedMatch.w},{typedMatch.h}]{" "}
                 {(typedMatch.confidence * 100).toFixed(1)}%
@@ -342,7 +343,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
           }
         }
         return (
-          <span className="text-green-500">
+          <span className={getStatusColors("success").text}>
             <span className="mr-1">✓</span>found
           </span>
         );
@@ -351,7 +352,7 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
       case "TYPE":
         // Text is already shown in Target column, just show success indicator
         return (
-          <span className="text-green-500">
+          <span className={getStatusColors("success").text}>
             <span className="mr-1">✓</span>typed
           </span>
         );
@@ -366,14 +367,14 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
         ) {
           const typedPosition = clickPosition as { x: number; y: number };
           return (
-            <span className="text-green-500">
+            <span className={getStatusColors("success").text}>
               <span className="mr-1">✓</span>
               clicked ({typedPosition.x},{typedPosition.y})
             </span>
           );
         }
         return (
-          <span className="text-green-500">
+          <span className={getStatusColors("success").text}>
             <span className="mr-1">✓</span>clicked
           </span>
         );
@@ -382,20 +383,20 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
       case "GO_TO_STATE":
         if (config.stateNames && Array.isArray(config.stateNames)) {
           return (
-            <span className="text-green-500">
+            <span className={getStatusColors("success").text}>
               <span className="mr-1">✓</span>→ {config.stateNames.join(", ")}
             </span>
           );
         }
         return (
-          <span className="text-green-500">
+          <span className={getStatusColors("success").text}>
             <span className="mr-1">✓</span>state activated
           </span>
         );
 
       default:
         return (
-          <span className="text-green-500">
+          <span className={getStatusColors("success").text}>
             <span className="mr-1">✓</span>success
           </span>
         );
@@ -403,10 +404,10 @@ function formatResult(action: ActionLogEntry): React.ReactNode {
   }
 
   if (action.status === "running") {
-    return <span className="text-blue-500">running...</span>;
+    return <span className={getStatusColors("running").text}>running...</span>;
   }
 
-  return <span className="text-text-muted">pending</span>;
+  return <span className={getStatusColors("pending").text}>pending</span>;
 }
 
 /**
@@ -862,7 +863,7 @@ export default function ActionLogTable({
                 key={action.id}
                 className={`
                   cursor-pointer transition-colors
-                  hover:bg-blue-500/10
+                  hover:bg-primary/10
                   ${isEven ? "bg-surface-canvas/20" : "bg-surface-canvas/5"}
                 `}
               >
@@ -894,8 +895,8 @@ export default function ActionLogTable({
                         transition-all hover:scale-125 hover:opacity-100
                         ${
                           childrenAreHidden
-                            ? "bg-green-700/40 hover:bg-green-600/60"
-                            : "bg-red-700/40 hover:bg-red-600/60"
+                            ? `${getAccentColors("green").bg} hover:opacity-80`
+                            : `${getAccentColors("red").bg} hover:opacity-80`
                         }
                       `}
                       style={{ fontSize: "8px" }}

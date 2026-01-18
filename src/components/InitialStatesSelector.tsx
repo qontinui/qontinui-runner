@@ -10,6 +10,7 @@ import { useMemo } from "react";
 import { Check, Info, RotateCcw, CircleDot } from "lucide-react";
 import type { ConfigState } from "../hooks/useConfiguration";
 import type { InitialStatesSource, ResolvedInitialStates } from "../types/state-machine";
+import { getAccentColors } from "@/design-system";
 
 interface InitialStatesSelectorProps {
   /** All available states from loaded config */
@@ -55,9 +56,9 @@ function getSourceColor(source: InitialStatesSource): string {
     case "defaults":
       return "text-muted-foreground bg-muted/50";
     case "workflow":
-      return "text-blue-600 bg-blue-500/10";
+      return `${getAccentColors("blue").text} ${getAccentColors("blue").bg}`;
     case "override":
-      return "text-amber-600 bg-amber-500/10";
+      return `${getAccentColors("amber").text} ${getAccentColors("amber").bg}`;
     default:
       return "text-muted-foreground bg-muted/50";
   }
@@ -161,9 +162,11 @@ export function InitialStatesSelector({
 
       {/* Override info */}
       {hasOverride && (
-        <div className="flex items-start gap-2 p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs">
-          <Info className="w-4 h-4 flex-shrink-0 text-amber-600 mt-0.5" />
-          <div className="text-amber-600">
+        <div
+          className={`flex items-start gap-2 p-2 ${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded-lg text-xs`}
+        >
+          <Info className={`w-4 h-4 flex-shrink-0 ${getAccentColors("amber").text} mt-0.5`} />
+          <div className={getAccentColors("amber").text}>
             Session override active. Changes reset when config reloads or workflow changes.
           </div>
         </div>
@@ -198,7 +201,9 @@ export function InitialStatesSelector({
               <span className="text-sm truncate flex-1">{stateName}</span>
               {/* Show if this state is from override vs resolved */}
               {hasOverride && resolvedStates.stateIds.includes(state.id) !== isSelected && (
-                <span className="text-xs text-amber-600 bg-amber-500/10 px-1.5 py-0.5 rounded">
+                <span
+                  className={`text-xs ${getAccentColors("amber").text} ${getAccentColors("amber").bg} px-1.5 py-0.5 rounded`}
+                >
                   {isSelected ? "added" : "removed"}
                 </span>
               )}

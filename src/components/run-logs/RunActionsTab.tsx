@@ -7,6 +7,7 @@
 
 import { Zap, Loader2, AlertCircle } from "lucide-react";
 import ActionLogTable from "../ActionLogTable";
+import { getStatusColors } from "@/design-system";
 import type { ActionLogEntry } from "../../types/displayProfile";
 
 interface RunActionsTabProps {
@@ -43,7 +44,7 @@ export function RunActionsTab({
         )}
 
         {actionLogError && (
-          <div className="flex items-center justify-center py-8 text-red-400">
+          <div className={`flex items-center justify-center py-8 ${getStatusColors("error").text}`}>
             <AlertCircle className="w-5 h-5 mr-2" />
             <span>Error: {actionLogError}</span>
           </div>

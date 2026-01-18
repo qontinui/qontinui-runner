@@ -45,6 +45,15 @@ impl AuthManager {
         }
     }
 
+    /// Creates an AuthManager with a custom SecureStorage for testing.
+    #[cfg(test)]
+    pub fn with_storage(secure_storage: SecureStorage) -> Self {
+        Self {
+            secure_storage,
+            service_name: SERVICE_NAME.to_string(),
+        }
+    }
+
     /// Stores both access and refresh tokens.
     ///
     /// Uses encrypted file storage as the primary mechanism.
@@ -301,10 +310,23 @@ impl Default for AuthManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+
+    /// Create an isolated AuthManager for testing.
+    /// Each test gets its own unique storage file to avoid test interference.
+    fn create_test_auth_manager(test_name: &str) -> AuthManager {
+        let temp_dir = env::temp_dir().join("qontinui_test_auth");
+        let storage_path = temp_dir.join(format!("{}.enc", test_name));
+        // Clean up any existing file from previous test runs
+        let _ = fs::remove_file(&storage_path);
+        let storage = SecureStorage::with_path(storage_path).unwrap();
+        AuthManager::with_storage(storage)
+    }
 
     #[test]
     fn test_device_id_generation() {
-        let auth_manager = AuthManager::new();
+        let auth_manager = create_test_auth_manager("test_device_id_generation");
         let device_id = auth_manager.get_device_id().unwrap();
         assert!(!device_id.is_empty());
         assert!(Uuid::parse_str(&device_id).is_ok());
@@ -312,7 +334,7 @@ mod tests {
 
     #[test]
     fn test_device_id_persistence() {
-        let auth_manager = AuthManager::new();
+        let auth_manager = create_test_auth_manager("test_device_id_persistence");
         let device_id1 = auth_manager.get_device_id().unwrap();
 
         // First call should generate a valid UUID
@@ -326,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_token_storage() {
-        let auth_manager = AuthManager::new();
+        let auth_manager = create_test_auth_manager("test_token_storage");
 
         // Store tokens
         auth_manager

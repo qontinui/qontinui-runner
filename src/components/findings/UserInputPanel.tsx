@@ -16,6 +16,7 @@ import {
   ChevronDown,
   ChevronUp,
 } from "lucide-react";
+import { getAccentColors } from "@/design-system";
 import type { Finding, UserInputRequest, UserInputOption } from "../../types/findings";
 import { findingsTracker } from "../../services";
 import { getCategoryById, getCategoryColorClasses } from "../../services/FindingCategories";
@@ -74,15 +75,17 @@ function InputControl({
         </div>
       );
 
-    case "boolean":
+    case "boolean": {
+      const greenColors = getAccentColors("green");
+      const redColors = getAccentColors("red");
       return (
         <div className="flex gap-2">
           <button
             onClick={() => onChange("yes")}
             className={`flex-1 px-3 py-2 text-sm rounded border transition-colors ${
               value === "yes"
-                ? "bg-green-500/30 border-green-500 text-green-400"
-                : "bg-green-500/10 border-green-500/30 text-green-400 hover:bg-green-500/20"
+                ? `bg-green-500/30 border-green-500 ${greenColors.text}`
+                : `${greenColors.bg} ${greenColors.border} ${greenColors.text} hover:bg-green-500/20`
             }`}
           >
             Yes
@@ -91,14 +94,15 @@ function InputControl({
             onClick={() => onChange("no")}
             className={`flex-1 px-3 py-2 text-sm rounded border transition-colors ${
               value === "no"
-                ? "bg-red-500/30 border-red-500 text-red-400"
-                : "bg-red-500/10 border-red-500/30 text-red-400 hover:bg-red-500/20"
+                ? `bg-red-500/30 border-red-500 ${redColors.text}`
+                : `${redColors.bg} ${redColors.border} ${redColors.text} hover:bg-red-500/20`
             }`}
           >
             No
           </button>
         </div>
       );
+    }
 
     case "code":
       return (
@@ -175,10 +179,13 @@ function QuestionCard({
 
   if (!question) return null;
 
+  const greenColors = getAccentColors("green");
+  const purpleColors = getAccentColors("purple");
+
   return (
     <div
       className={`rounded-lg border transition-all ${
-        isAnswered ? "border-green-500/30 bg-green-500/5" : "border-border bg-card"
+        isAnswered ? `${greenColors.border} bg-green-500/5` : "border-border bg-card"
       }`}
     >
       {/* Question Header */}
@@ -189,9 +196,9 @@ function QuestionCard({
         {/* Status Icon */}
         <div className="flex-shrink-0 mt-0.5">
           {isAnswered ? (
-            <CheckCircle className="w-5 h-5 text-green-400" />
+            <CheckCircle className={`w-5 h-5 ${greenColors.text}`} />
           ) : (
-            <MessageSquare className="w-5 h-5 text-purple-400" />
+            <MessageSquare className={`w-5 h-5 ${purpleColors.text}`} />
           )}
         </div>
 
@@ -210,11 +217,11 @@ function QuestionCard({
           {/* Question */}
           <p className="text-sm text-foreground mt-2">
             {question.question}
-            {question.required && <span className="text-red-400 ml-1">*</span>}
+            {question.required && <span className={`${getAccentColors("red").text} ml-1`}>*</span>}
           </p>
 
           {/* Answered Status */}
-          {isAnswered && <p className="text-xs text-green-400 mt-1">Answered: {answer}</p>}
+          {isAnswered && <p className={`text-xs ${greenColors.text} mt-1`}>Answered: {answer}</p>}
         </div>
 
         {/* Expand/Collapse */}
@@ -374,8 +381,8 @@ export function UserInputPanel({
       <div className="flex-shrink-0 border-b border-border p-4 space-y-3">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-purple-500/20 rounded-lg">
-              <MessageSquare className="w-5 h-5 text-purple-400" />
+            <div className={`p-2 ${getAccentColors("purple").bg} rounded-lg`}>
+              <MessageSquare className={`w-5 h-5 ${getAccentColors("purple").text}`} />
             </div>
             <div>
               <h2 className="font-semibold text-foreground">Questions for You</h2>
@@ -390,8 +397,8 @@ export function UserInputPanel({
             <span
               className={`px-3 py-1.5 rounded-lg text-sm font-medium ${
                 stats.allRequiredAnswered
-                  ? "bg-green-500/20 text-green-400"
-                  : "bg-amber-500/20 text-amber-400"
+                  ? `${getAccentColors("green").bg} ${getAccentColors("green").text}`
+                  : `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
               }`}
             >
               {stats.answered} / {stats.total} answered
@@ -424,7 +431,7 @@ export function UserInputPanel({
 
         {/* Validation Message */}
         {!stats.allRequiredAnswered && (
-          <div className="flex items-center gap-2 text-xs text-amber-400">
+          <div className={`flex items-center gap-2 text-xs ${getAccentColors("amber").text}`}>
             <AlertCircle className="w-4 h-4" />
             Please answer all required questions before continuing
           </div>

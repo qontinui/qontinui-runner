@@ -16,6 +16,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { useExecution } from "../contexts/ExecutionContext";
+import { getAccentColors } from "@/design-system";
 
 const API_BASE = "http://localhost:9876";
 
@@ -224,7 +225,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
       <div className="panel">
         <div className="panel-header">
           <div className="panel-title">
-            <MousePointer2 className="w-4 h-4 text-orange-500" />
+            <MousePointer2 className={`w-4 h-4 ${getAccentColors("orange").text}`} />
             <span>Quick Actions</span>
           </div>
         </div>
@@ -242,7 +243,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
     <div className="panel">
       <div className="panel-header">
         <div className="panel-title">
-          <MousePointer2 className="w-4 h-4 text-orange-500" />
+          <MousePointer2 className={`w-4 h-4 ${getAccentColors("orange").text}`} />
           <span>Quick Actions</span>
         </div>
       </div>
@@ -250,7 +251,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
         {/* Click Action */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 min-w-[100px]">
-            <MousePointer2 className="w-3.5 h-3.5 text-blue-400" />
+            <MousePointer2 className={`w-3.5 h-3.5 ${getAccentColors("blue").text}`} />
             <select
               value={clickAction}
               onChange={(e) => setClickAction(e.target.value as typeof clickAction)}
@@ -276,7 +277,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
           <button
             onClick={executeClick}
             disabled={!selectedImageId || runningAction !== null}
-            className="flex items-center gap-1 px-2 py-1 text-xs rounded bg-blue-500/20 text-blue-400 hover:bg-blue-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${getAccentColors("blue").bg} ${getAccentColors("blue").text} hover:opacity-80`}
           >
             {runningAction === clickAction ? (
               <Loader2 className="w-3 h-3 animate-spin" />
@@ -289,7 +290,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
         {/* Type Action */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 min-w-[100px]">
-            <Type className="w-3.5 h-3.5 text-amber-400" />
+            <Type className={`w-3.5 h-3.5 ${getAccentColors("amber").text}`} />
             <span className="text-xs">Type</span>
           </div>
           <input
@@ -307,7 +308,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
           <button
             onClick={executeType}
             disabled={!typeText.trim() || runningAction !== null}
-            className="flex items-center gap-1 px-2 py-1 text-xs rounded bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${getAccentColors("amber").bg} ${getAccentColors("amber").text} hover:opacity-80`}
           >
             {runningAction === "type" ? (
               <Loader2 className="w-3 h-3 animate-spin" />
@@ -320,7 +321,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
         {/* Hotkey Action */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 min-w-[100px]">
-            <Keyboard className="w-3.5 h-3.5 text-purple-400" />
+            <Keyboard className={`w-3.5 h-3.5 ${getAccentColors("purple").text}`} />
             <span className="text-xs">Hotkey</span>
           </div>
           <input
@@ -338,7 +339,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
           <button
             onClick={executeHotkey}
             disabled={!hotkeyText.trim() || runningAction !== null}
-            className="flex items-center gap-1 px-2 py-1 text-xs rounded bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${getAccentColors("purple").bg} ${getAccentColors("purple").text} hover:opacity-80`}
           >
             {runningAction === "hotkey" ? (
               <Loader2 className="w-3 h-3 animate-spin" />
@@ -351,7 +352,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
         {/* Go To State Action */}
         <div className="flex items-center gap-2">
           <div className="flex items-center gap-1.5 min-w-[100px]">
-            <Navigation className="w-3.5 h-3.5 text-green-400" />
+            <Navigation className={`w-3.5 h-3.5 ${getAccentColors("green").text}`} />
             <span className="text-xs">Go To</span>
           </div>
           <select
@@ -369,7 +370,7 @@ export function QuickActionsPanel({ onLog }: QuickActionsPanelProps) {
           <button
             onClick={executeGoToState}
             disabled={!selectedStateId || runningAction !== null}
-            className="flex items-center gap-1 px-2 py-1 text-xs rounded bg-green-500/20 text-green-400 hover:bg-green-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${getAccentColors("green").bg} ${getAccentColors("green").text} hover:opacity-80`}
           >
             {runningAction === "go_to_state" ? (
               <Loader2 className="w-3 h-3 animate-spin" />

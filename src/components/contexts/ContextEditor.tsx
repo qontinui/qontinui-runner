@@ -20,6 +20,7 @@ import {
   Eye,
   HelpCircle,
 } from "lucide-react";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import type {
   ContextWithMetadata,
   ContextAutoInclude,
@@ -246,8 +247,8 @@ export function ContextEditor({
               <span
                 className={`px-2 py-0.5 text-xs rounded ${
                   createScope === "project"
-                    ? "bg-blue-500/20 text-blue-400"
-                    : "bg-purple-500/20 text-purple-400"
+                    ? `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`
+                    : `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`
                 }`}
                 title={
                   createScope === "project"
@@ -272,7 +273,7 @@ export function ContextEditor({
           {/* Name */}
           <div>
             <label className="block text-sm font-medium mb-1">
-              Name <span className="text-red-500">*</span>
+              Name <span className={getStatusColors("error").text}>*</span>
             </label>
             <input
               type="text"
@@ -281,10 +282,12 @@ export function ContextEditor({
               disabled={isReadOnly}
               placeholder="Context name"
               className={`w-full px-3 py-2 bg-background border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary ${
-                errors.name ? "border-red-500" : "border-border"
+                errors.name ? getStatusColors("error").border : "border-border"
               }`}
             />
-            {errors.name && <p className="text-xs text-red-500 mt-1">{errors.name}</p>}
+            {errors.name && (
+              <p className={`text-xs ${getStatusColors("error").text} mt-1`}>{errors.name}</p>
+            )}
           </div>
 
           {/* Category */}
@@ -341,7 +344,10 @@ export function ContextEditor({
                 >
                   {tag}
                   {!isReadOnly && (
-                    <button onClick={() => removeTag(tag)} className="hover:text-red-500">
+                    <button
+                      onClick={() => removeTag(tag)}
+                      className={`hover:${getStatusColors("error").text}`}
+                    >
                       <X className="w-3 h-3" />
                     </button>
                   )}
@@ -385,7 +391,7 @@ export function ContextEditor({
             <div className="flex items-center justify-between mb-1">
               <label className="text-sm font-medium flex items-center gap-1">
                 <FileText className="w-4 h-4" />
-                Content <span className="text-red-500">*</span>
+                Content <span className={getStatusColors("error").text}>*</span>
               </label>
               <button
                 onClick={() => setShowPreview(!showPreview)}
@@ -407,18 +413,20 @@ export function ContextEditor({
                 placeholder="Enter markdown content that will be injected into AI prompts..."
                 rows={10}
                 className={`w-full px-3 py-2 bg-background border rounded-md text-sm font-mono resize-y focus:outline-none focus:ring-2 focus:ring-primary ${
-                  errors.content ? "border-red-500" : "border-border"
+                  errors.content ? getStatusColors("error").border : "border-border"
                 }`}
               />
             )}
-            {errors.content && <p className="text-xs text-red-500 mt-1">{errors.content}</p>}
+            {errors.content && (
+              <p className={`text-xs ${getStatusColors("error").text} mt-1`}>{errors.content}</p>
+            )}
           </div>
 
           {/* Auto-Include Rules */}
           <div className="border border-border rounded-lg p-4 space-y-4">
             <div className="flex items-center justify-between">
               <h4 className="text-sm font-medium flex items-center gap-2">
-                <Zap className="w-4 h-4 text-amber-500" />
+                <Zap className={`w-4 h-4 ${getAccentColors("amber").text}`} />
                 Auto-Include Rules
               </h4>
               <button
@@ -444,13 +452,13 @@ export function ContextEditor({
                 {taskMentions.map((mention) => (
                   <span
                     key={mention}
-                    className="flex items-center gap-1 px-2 py-0.5 text-xs bg-blue-500/20 text-blue-400 rounded"
+                    className={`flex items-center gap-1 px-2 py-0.5 text-xs ${getAccentColors("blue").bg} ${getAccentColors("blue").text} rounded`}
                   >
                     {mention}
                     {!isReadOnly && (
                       <button
                         onClick={() => setTaskMentions(taskMentions.filter((m) => m !== mention))}
-                        className="hover:text-red-500"
+                        className={`hover:${getStatusColors("error").text}`}
                       >
                         <X className="w-3 h-3" />
                       </button>
@@ -503,7 +511,7 @@ export function ContextEditor({
                     disabled={isReadOnly}
                     className={`px-2 py-0.5 text-xs rounded border transition-colors ${
                       actionTypes.includes(type)
-                        ? "bg-green-500/20 text-green-400 border-green-500/30"
+                        ? `${getStatusColors("success").bg} ${getStatusColors("success").text} ${getStatusColors("success").border}`
                         : "bg-muted text-muted-foreground border-border hover:bg-muted/80"
                     }`}
                   >
@@ -522,13 +530,13 @@ export function ContextEditor({
                 {errorPatterns.map((pattern) => (
                   <span
                     key={pattern}
-                    className="flex items-center gap-1 px-2 py-0.5 text-xs bg-red-500/20 text-red-400 rounded font-mono"
+                    className={`flex items-center gap-1 px-2 py-0.5 text-xs ${getAccentColors("red").bg} ${getAccentColors("red").text} rounded font-mono`}
                   >
                     {pattern}
                     {!isReadOnly && (
                       <button
                         onClick={() => setErrorPatterns(errorPatterns.filter((p) => p !== pattern))}
-                        className="hover:text-red-500"
+                        className={`hover:${getStatusColors("error").text}`}
                       >
                         <X className="w-3 h-3" />
                       </button>
@@ -550,7 +558,7 @@ export function ContextEditor({
                     }}
                     placeholder="e.g., TypeError|ReferenceError"
                     className={`flex-1 px-2 py-1 bg-background border rounded text-xs font-mono focus:outline-none focus:ring-2 focus:ring-primary ${
-                      errors.errorPatterns ? "border-red-500" : "border-border"
+                      errors.errorPatterns ? getStatusColors("error").border : "border-border"
                     }`}
                   />
                   <button
@@ -563,7 +571,9 @@ export function ContextEditor({
                 </div>
               )}
               {errors.errorPatterns && (
-                <p className="text-xs text-red-500 mt-1">{errors.errorPatterns}</p>
+                <p className={`text-xs ${getStatusColors("error").text} mt-1`}>
+                  {errors.errorPatterns}
+                </p>
               )}
             </div>
 
@@ -576,13 +586,13 @@ export function ContextEditor({
                 {filePatterns.map((pattern) => (
                   <span
                     key={pattern}
-                    className="flex items-center gap-1 px-2 py-0.5 text-xs bg-purple-500/20 text-purple-400 rounded font-mono"
+                    className={`flex items-center gap-1 px-2 py-0.5 text-xs ${getAccentColors("purple").bg} ${getAccentColors("purple").text} rounded font-mono`}
                   >
                     {pattern}
                     {!isReadOnly && (
                       <button
                         onClick={() => setFilePatterns(filePatterns.filter((p) => p !== pattern))}
-                        className="hover:text-red-500"
+                        className={`hover:${getStatusColors("error").text}`}
                       >
                         <X className="w-3 h-3" />
                       </button>
@@ -619,7 +629,9 @@ export function ContextEditor({
 
           {/* Built-in Warning */}
           {context?.scope === "builtin" && (
-            <div className="flex items-center gap-2 text-sm text-amber-400 bg-amber-500/10 p-3 rounded-lg">
+            <div
+              className={`flex items-center gap-2 text-sm ${getAccentColors("amber").text} ${getAccentColors("amber").bg} p-3 rounded-lg`}
+            >
               <AlertTriangle className="w-5 h-5 flex-shrink-0" />
               <span>
                 Built-in contexts are read-only. Use the duplicate feature to create an editable

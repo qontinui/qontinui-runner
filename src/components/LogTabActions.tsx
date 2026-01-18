@@ -8,6 +8,7 @@
 import { Filter, Trash2, Copy, Check } from "lucide-react";
 import type { LogTab } from "../hooks/useUIState";
 import type { LogLevel } from "../hooks/useLogFilter";
+import { getStatusColors } from "@/design-system";
 
 export interface LogTabActionsProps {
   activeTab: LogTab;
@@ -126,7 +127,11 @@ export function LogTabActions({
         className="p-2 hover:bg-accent rounded-lg transition-colors"
         title="Copy to clipboard"
       >
-        {copySuccess ? <Check className="w-4 h-4 text-green-600" /> : <Copy className="w-4 h-4" />}
+        {copySuccess ? (
+          <Check className={`w-4 h-4 ${getStatusColors("success").icon}`} />
+        ) : (
+          <Copy className="w-4 h-4" />
+        )}
       </button>
     </div>
   );

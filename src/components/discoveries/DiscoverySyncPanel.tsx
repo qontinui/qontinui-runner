@@ -17,6 +17,7 @@ import {
   ChevronRight,
   X,
 } from "lucide-react";
+import { getStatusColors } from "@/design-system";
 import {
   useDiscoverySummary,
   useSyncDiscoveries,
@@ -68,7 +69,7 @@ export function DiscoverySyncPanel() {
       <div className="flex items-center justify-between p-4 border-b border-border">
         <div className="flex items-center gap-3">
           {summary.can_sync ? (
-            <Cloud className="w-5 h-5 text-green-500" />
+            <Cloud className={`w-5 h-5 ${getStatusColors("success").icon}`} />
           ) : (
             <CloudOff className="w-5 h-5 text-muted-foreground" />
           )}
@@ -121,32 +122,51 @@ export function DiscoverySyncPanel() {
       </div>
 
       {/* Sync result message */}
-      {syncMutation.isSuccess && (
-        <div className="px-4 py-2 bg-green-500/10 border-b border-green-500/20 flex items-center gap-2 text-sm text-green-500">
-          <CheckCircle2 className="w-4 h-4" />
-          <span>
-            Synced {syncMutation.data.sent} discoveries
-            {syncMutation.data.failed > 0 && `, ${syncMutation.data.failed} failed`}
-          </span>
-        </div>
-      )}
+      {syncMutation.isSuccess &&
+        (() => {
+          const colors = getStatusColors("success");
+          return (
+            <div
+              className={`px-4 py-2 ${colors.bg} border-b ${colors.border} flex items-center gap-2 text-sm ${colors.text}`}
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>
+                Synced {syncMutation.data.sent} discoveries
+                {syncMutation.data.failed > 0 && `, ${syncMutation.data.failed} failed`}
+              </span>
+            </div>
+          );
+        })()}
 
-      {syncMutation.isError && (
-        <div className="px-4 py-2 bg-destructive/10 border-b border-destructive/20 flex items-center gap-2 text-sm text-destructive">
-          <AlertCircle className="w-4 h-4" />
-          <span>
-            {syncMutation.error instanceof Error ? syncMutation.error.message : "Sync failed"}
-          </span>
-        </div>
-      )}
+      {syncMutation.isError &&
+        (() => {
+          const colors = getStatusColors("error");
+          return (
+            <div
+              className={`px-4 py-2 ${colors.bg} border-b ${colors.border} flex items-center gap-2 text-sm ${colors.text}`}
+            >
+              <AlertCircle className="w-4 h-4" />
+              <span>
+                {syncMutation.error instanceof Error ? syncMutation.error.message : "Sync failed"}
+              </span>
+            </div>
+          );
+        })()}
 
       {/* Not authenticated warning */}
-      {!summary.can_sync && summary.pending_count > 0 && (
-        <div className="px-4 py-2 bg-yellow-500/10 border-b border-yellow-500/20 flex items-center gap-2 text-sm text-yellow-600">
-          <AlertCircle className="w-4 h-4" />
-          <span>Not authenticated. Connect to qontinui-web to sync discoveries.</span>
-        </div>
-      )}
+      {!summary.can_sync &&
+        summary.pending_count > 0 &&
+        (() => {
+          const colors = getStatusColors("warning");
+          return (
+            <div
+              className={`px-4 py-2 ${colors.bg} border-b ${colors.border} flex items-center gap-2 text-sm ${colors.text}`}
+            >
+              <AlertCircle className="w-4 h-4" />
+              <span>Not authenticated. Connect to qontinui-web to sync discoveries.</span>
+            </div>
+          );
+        })()}
 
       {/* Recent discoveries list */}
       {summary.recent.length > 0 && (

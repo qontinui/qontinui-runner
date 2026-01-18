@@ -31,10 +31,23 @@ import {
   Play,
   FolderOpen,
   Bot,
+  GraduationCap,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getAccentColors, getStatusColors } from "@/design-system";
+import { useTutorial, useTutorialProgress } from "../contexts/TutorialContext";
+import { TutorialCard } from "./tutorial/TutorialCard";
+import { TutorialTrigger } from "./tutorial";
+import { tutorials, getFeaturedTutorials } from "./tutorial/data";
+import { Star } from "lucide-react";
 
-type HelpSubPage = "shortcuts" | "getting-started" | "documentation" | "troubleshooting" | "about";
+type HelpSubPage =
+  | "tutorials"
+  | "shortcuts"
+  | "getting-started"
+  | "documentation"
+  | "troubleshooting"
+  | "about";
 
 const STORAGE_KEY = "qontinui-help-active-tab";
 
@@ -90,6 +103,17 @@ interface TroubleshootingItem {
 }
 
 const TROUBLESHOOTING_ITEMS: TroubleshootingItem[] = [
+  {
+    title: "Code check fails to run",
+    description: "A lint, format, or type check fails to execute.",
+    solution: [
+      "Verify the tool is installed (e.g., npm install -g eslint, pip install ruff)",
+      "Check that the working directory is correct",
+      "Ensure any config files (eslintrc, pyproject.toml) are valid",
+      "Try running the command manually in a terminal to see the full error",
+      "Check the timeout setting - type checks can take longer",
+    ],
+  },
   {
     title: "Python executor won't start",
     description: "The executor shows as stopped or fails to initialize.",
@@ -224,11 +248,13 @@ function ShortcutsPage() {
       </div>
 
       {/* Tips section */}
-      <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
+      <div
+        className={`${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg p-4`}
+      >
         <div className="flex items-start gap-3">
-          <HelpCircle className="w-5 h-5 text-blue-500 flex-shrink-0 mt-0.5" />
+          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
           <div>
-            <h4 className="font-medium text-blue-500">Tip: Using Scriptlets</h4>
+            <h4 className={`font-medium ${getAccentColors("blue").text}`}>Tip: Using Scriptlets</h4>
             <p className="text-sm text-muted-foreground mt-1">
               Scriptlets are reusable text snippets that capture learnings from AI debugging
               sessions. Create them in the <strong>Scriptlets</strong> tab, then insert them into
@@ -255,7 +281,7 @@ function ChecklistItem({ label, description, icon: Icon, completed = false }: Ch
     <div className="flex items-start gap-3 p-3 rounded-lg hover:bg-muted/50 transition-colors">
       <div className="mt-0.5">
         {completed ? (
-          <CheckCircle2 className="w-5 h-5 text-green-500" />
+          <CheckCircle2 className={`w-5 h-5 ${getStatusColors("success").icon}`} />
         ) : (
           <Circle className="w-5 h-5 text-muted-foreground" />
         )}
@@ -333,6 +359,17 @@ function GettingStartedPage() {
               </p>
             </div>
           </div>
+          <div className="flex items-start gap-3">
+            <div className="p-1.5 bg-primary/10 rounded">
+              <Wrench className="w-4 h-4 text-primary" />
+            </div>
+            <div>
+              <div className="font-medium">Code Quality Checks</div>
+              <p className="text-sm text-muted-foreground">
+                Run linters, formatters, and type checkers with auto-fix support
+              </p>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -364,11 +401,13 @@ function GettingStartedPage() {
       </div>
 
       {/* Tip */}
-      <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4">
+      <div
+        className={`${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg p-4`}
+      >
         <div className="flex items-start gap-3">
-          <HelpCircle className="w-5 h-5 text-blue-500 flex-shrink-0 mt-0.5" />
+          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
           <div>
-            <h4 className="font-medium text-blue-500">Need Help?</h4>
+            <h4 className={`font-medium ${getAccentColors("blue").text}`}>Need Help?</h4>
             <p className="text-sm text-muted-foreground mt-1">
               Check the <strong>Troubleshooting</strong> section for common issues, or visit the{" "}
               <strong>Documentation</strong> for in-depth guides.
@@ -531,11 +570,13 @@ function TroubleshootingPage() {
       </div>
 
       {/* Still Need Help */}
-      <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-4">
+      <div
+        className={`${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded-lg p-4`}
+      >
         <div className="flex items-start gap-3">
-          <Bug className="w-5 h-5 text-amber-500 flex-shrink-0 mt-0.5" />
+          <Bug className={`w-5 h-5 ${getAccentColors("amber").text} flex-shrink-0 mt-0.5`} />
           <div>
-            <h4 className="font-medium text-amber-600 dark:text-amber-400">Still Having Issues?</h4>
+            <h4 className={`font-medium ${getAccentColors("amber").text}`}>Still Having Issues?</h4>
             <p className="text-sm text-muted-foreground mt-1">
               If your issue isn't listed here, check the Logs tab for detailed error messages or{" "}
               <a
@@ -547,6 +588,105 @@ function TroubleshootingPage() {
                 report a bug on GitHub
               </a>
               .
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TutorialsPage() {
+  const { openTutorial, resetProgress } = useTutorial();
+  const { isCompleted, isInProgress } = useTutorialProgress();
+
+  const featuredTutorials = getFeaturedTutorials();
+  const regularTutorials = tutorials.filter((t) => !t.tags.includes("featured"));
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-primary/10 rounded-lg">
+            <GraduationCap className="w-5 h-5 text-primary" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold">Interactive Tutorials</h2>
+            <p className="text-sm text-muted-foreground">
+              Step-by-step guides to help you master Qontinui Runner
+            </p>
+          </div>
+        </div>
+        <button
+          onClick={resetProgress}
+          className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+        >
+          Reset progress
+        </button>
+      </div>
+
+      {/* Featured tutorial - highlighted section */}
+      {featuredTutorials.length > 0 && (
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <Star className={`w-4 h-4 ${getAccentColors("amber").text}`} />
+            <h3 className="text-sm font-medium">Featured</h3>
+          </div>
+          <div
+            className={`p-1 rounded-xl bg-gradient-to-r ${getAccentColors("amber").bg} border ${getAccentColors("amber").border}`}
+          >
+            <div className="bg-card rounded-lg">
+              {featuredTutorials.map((tutorial) => (
+                <TutorialCard
+                  key={tutorial.id}
+                  tutorial={tutorial}
+                  isCompleted={isCompleted(tutorial.id)}
+                  isInProgress={isInProgress(tutorial.id)}
+                  onStart={() => openTutorial(tutorial)}
+                  onResume={() => openTutorial(tutorial)}
+                  onRestart={() => openTutorial(tutorial)}
+                  featured
+                />
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Regular tutorial list */}
+      <div className="space-y-3">
+        <h3 className="text-sm font-medium text-muted-foreground">All Tutorials</h3>
+        <div className="space-y-4">
+          {regularTutorials.map((tutorial) => (
+            <TutorialCard
+              key={tutorial.id}
+              tutorial={tutorial}
+              isCompleted={isCompleted(tutorial.id)}
+              isInProgress={isInProgress(tutorial.id)}
+              onStart={() => openTutorial(tutorial)}
+              onResume={() => openTutorial(tutorial)}
+              onRestart={() => openTutorial(tutorial)}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Tips */}
+      <div
+        className={`${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg p-4`}
+      >
+        <div className="flex items-start gap-3">
+          <HelpCircle className={`w-5 h-5 ${getAccentColors("blue").text} flex-shrink-0 mt-0.5`} />
+          <div>
+            <h4 className={`font-medium ${getAccentColors("blue").text}`}>
+              Tip: Keyboard Navigation
+            </h4>
+            <p className="text-sm text-muted-foreground mt-1">
+              Use the arrow keys to navigate between tutorial steps. Press{" "}
+              <kbd className="px-1.5 py-0.5 text-xs bg-muted border border-border rounded">
+                Escape
+              </kbd>{" "}
+              to close the tutorial at any time.
             </p>
           </div>
         </div>
@@ -692,11 +832,18 @@ export function HelpTab() {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (
       stored &&
-      ["shortcuts", "getting-started", "documentation", "troubleshooting", "about"].includes(stored)
+      [
+        "tutorials",
+        "shortcuts",
+        "getting-started",
+        "documentation",
+        "troubleshooting",
+        "about",
+      ].includes(stored)
     ) {
       return stored as HelpSubPage;
     }
-    return "getting-started";
+    return "tutorials";
   });
 
   // Persist active tab
@@ -705,6 +852,7 @@ export function HelpTab() {
   }, [activeSubPage]);
 
   const subPages = [
+    { id: "tutorials" as const, label: "Tutorials", icon: GraduationCap },
     { id: "shortcuts" as const, label: "Shortcuts", icon: Keyboard },
     { id: "getting-started" as const, label: "Getting Started", icon: Rocket },
     { id: "documentation" as const, label: "Documentation", icon: BookOpen },
@@ -722,10 +870,18 @@ export function HelpTab() {
       {/* Left sidebar with tabs */}
       <Tabs.List className="flex flex-col w-44 shrink-0 border-r border-border/50 bg-card/50 p-2 gap-1">
         <div className="px-3 py-2 mb-2">
-          <h3 className="text-lg font-semibold flex items-center gap-2">
-            <HelpCircle className="w-5 h-5 text-primary" />
-            Help
-          </h3>
+          <div className="flex items-center justify-between">
+            <h3 className="text-lg font-semibold flex items-center gap-2">
+              <HelpCircle className="w-5 h-5 text-primary" />
+              Help
+            </h3>
+            <TutorialTrigger
+              tutorialId="getting-started"
+              tooltip="Start the getting started tutorial"
+              icon="lightbulb"
+              size="sm"
+            />
+          </div>
         </div>
 
         {subPages.map((page) => {
@@ -759,6 +915,10 @@ export function HelpTab() {
 
       {/* Content area */}
       <div className="flex-1 overflow-y-auto p-6">
+        <Tabs.Content value="tutorials" className="outline-none">
+          <TutorialsPage />
+        </Tabs.Content>
+
         <Tabs.Content value="shortcuts" className="outline-none">
           <ShortcutsPage />
         </Tabs.Content>

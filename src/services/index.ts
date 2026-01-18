@@ -109,3 +109,18 @@ export {
 
 // Discoveries Service (Discovery Push mechanism)
 export { discoveriesService } from "./discoveries-service";
+
+// AI Data Service (Task runs, logs, screenshots for AI Data Viewer)
+export { aiDataService } from "./ai-data-service";
+
+// DOM Capture Service (browser DOM snapshot capture for AI debugging)
+export { domCaptureService } from "./dom-capture-service";
+
+// Learning Service (Learning Insights Dashboard)
+export { learningService } from "./learning-service";
+
+// Flow Service (Flow Designer for deterministic workflows)
+export { flowService } from "./flow-service";
+
+// Checkpoint Service (Checkpoint Browser for time-travel debugging)
+export { checkpointService } from "./checkpoint-service";

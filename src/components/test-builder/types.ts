@@ -50,6 +50,49 @@ export interface RepoTestConfig {
   env_vars?: Record<string, string>;
 }
 
+// Bounding box for detected elements
+export interface BoundingBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// Detected element from page analysis
+export interface DetectedElement {
+  id: string;
+  label: string;
+  element_type: string;
+  text_content?: string;
+  bounding_box: BoundingBox;
+  confidence: number;
+  selector?: string;
+  attributes: Record<string, unknown>;
+}
+
+// Page analysis result
+export interface PageAnalysis {
+  screenshot_base64: string;
+  annotated_screenshot_base64: string;
+  elements: DetectedElement[];
+  source: "playwright" | "vision";
+  captured_at: string;
+  monitor_index?: number;
+  url?: string;
+}
+
+// Visual evidence stored with test results
+export interface VisualEvidence {
+  annotated_screenshot_base64?: string;
+  assertion_overlays?: Array<{
+    element_id: string;
+    result: "pass" | "fail";
+    message?: string;
+    bounding_box?: BoundingBox;
+  }>;
+  captured_at?: string;
+}
+
 // Verification test definition (from database)
 export interface VerificationTest {
   id: string;
@@ -68,6 +111,7 @@ export interface VerificationTest {
   enabled: boolean;
   ai_generated: boolean;
   ai_generation_prompt?: string;
+  creation_analysis?: PageAnalysis;
   tags: string[];
   source_file?: string;
   last_exported_at?: string;
@@ -118,6 +162,7 @@ export interface TestResult {
   assertions_passed: number;
   assertions_failed: number;
   screenshots: string[];
+  visual_evidence?: VisualEvidence;
   ai_analysis?: string;
   created_at: string;
 }
@@ -137,6 +182,9 @@ export interface CreateTestInput {
   timeout_seconds?: number;
   is_critical?: boolean;
   enabled?: boolean;
+  ai_generated?: boolean;
+  ai_generation_prompt?: string;
+  creation_analysis?: PageAnalysis;
   tags?: string[];
 }
 
@@ -172,3 +220,86 @@ export interface TestAssociation {
   created_at: string;
   updated_at: string;
 }
+
+// ============================================================================
+// Collected Analysis Types (for AI Test Generation)
+// ============================================================================
+
+// Analysis source type
+export type AnalysisSourceType = "playwright" | "vision" | "api_request";
+
+// API Request analysis result (from executing a saved API request)
+export interface ApiRequestAnalysis {
+  /** Unique ID for this analysis */
+  id: string;
+  /** Name of the saved API request used */
+  request_name: string;
+  /** HTTP method */
+  method: string;
+  /** Request URL */
+  url: string;
+  /** Response data */
+  response: unknown;
+  /** Response status code */
+  status_code?: number;
+  /** Duration in milliseconds */
+  duration_ms?: number;
+  /** When the request was executed */
+  executed_at: string;
+  /** Error message if failed */
+  error?: string;
+  /** Source request configuration (for auto-populating api_request_config in tests) */
+  source_request_config?: {
+    method: string;
+    url: string;
+    headers?: Record<string, string>;
+    body?: string;
+    timeout_ms?: number;
+    follow_redirects?: boolean;
+  };
+}
+
+// A single collected analysis (can be any type)
+export type CollectedAnalysis =
+  | { type: "playwright"; id: string; name: string; data: PageAnalysis }
+  | { type: "vision"; id: string; name: string; data: PageAnalysis }
+  | { type: "api_request"; id: string; name: string; data: ApiRequestAnalysis };
+
+// All collected analyses for AI test generation
+export interface CollectedAnalysisSet {
+  analyses: CollectedAnalysis[];
+  collected_at: string;
+}
+
+// Legacy types for backward compatibility
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE";
+export type ApiRequestStatus = "pending" | "running" | "complete" | "error";
+
+export interface ApiRequestConfig {
+  id: string;
+  name: string;
+  method: HttpMethod;
+  endpoint: string;
+  body?: Record<string, unknown>;
+  headers?: Record<string, string>;
+}
+
+export interface ApiRequestWithState extends ApiRequestConfig {
+  status: ApiRequestStatus;
+  response?: unknown;
+  error?: string;
+  duration_ms?: number;
+  executed_at?: string;
+}
+
+export interface MultiRequestAnalysis {
+  requests: ApiRequestWithState[];
+  total_elements?: number;
+  collected_at: string;
+}
+
+// Combined analysis type (for backward compatibility)
+export type AnalysisData =
+  | { type: "single"; data: PageAnalysis }
+  | { type: "multi"; data: MultiRequestAnalysis }
+  | { type: "collected"; data: CollectedAnalysisSet };

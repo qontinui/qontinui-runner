@@ -8,6 +8,7 @@
  */
 
 import { AlertTriangle, ArrowRightLeft, Image } from "lucide-react";
+import { getAccentColors, getSeverityColors } from "@/design-system";
 import type { FlakyItem } from "../../types/statistics";
 
 interface FlakyItemsListProps {
@@ -16,15 +17,28 @@ interface FlakyItemsListProps {
 
 export function FlakyItemsList({ items }: FlakyItemsListProps) {
   const getSeverityColor = (rate: number) => {
-    if (rate < 0.5) return "text-red-500 bg-red-500/10";
-    if (rate < 0.7) return "text-orange-500 bg-orange-500/10";
-    return "text-yellow-500 bg-yellow-500/10";
+    if (rate < 0.5) {
+      const colors = getSeverityColors("high");
+      return `${colors.text} ${colors.bg}`;
+    }
+    if (rate < 0.7) {
+      const colors = getSeverityColors("medium");
+      return `${colors.text} ${colors.bg}`;
+    }
+    const colors = getSeverityColors("low");
+    return `${colors.text} ${colors.bg}`;
   };
 
   const getSeverityLabel = (rate: number) => {
     if (rate < 0.5) return "High";
     if (rate < 0.7) return "Medium";
     return "Low";
+  };
+
+  const getSeverityTextColor = (rate: number) => {
+    if (rate < 0.5) return getSeverityColors("high").text;
+    if (rate < 0.7) return getSeverityColors("medium").text;
+    return getSeverityColors("low").text;
   };
 
   if (items.length === 0) {
@@ -45,9 +59,11 @@ export function FlakyItemsList({ items }: FlakyItemsListProps) {
   return (
     <div className="bg-card rounded-lg border border-border p-4">
       <h3 className="font-semibold mb-4 flex items-center gap-2">
-        <AlertTriangle className="w-4 h-4 text-orange-500" />
+        <AlertTriangle className={`w-4 h-4 ${getAccentColors("orange").text}`} />
         Flaky Items
-        <span className="text-xs bg-orange-500/20 text-orange-400 px-2 py-0.5 rounded-full">
+        <span
+          className={`text-xs ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-2 py-0.5 rounded-full`}
+        >
           {items.length}
         </span>
       </h3>
@@ -71,9 +87,7 @@ export function FlakyItemsList({ items }: FlakyItemsListProps) {
                 </div>
               </div>
               <div className="text-right flex-shrink-0">
-                <div
-                  className={`text-sm font-medium ${getSeverityColor(item.success_rate).split(" ")[0]}`}
-                >
+                <div className={`text-sm font-medium ${getSeverityTextColor(item.success_rate)}`}>
                   {(item.success_rate * 100).toFixed(0)}%
                 </div>
                 <span

@@ -30,6 +30,7 @@ import { useRunSelection } from "../../contexts/RunSelectionContext";
 import { RunSelector } from "../run-selection/RunSelector";
 import { useReopenTaskRun } from "../../hooks/useAiData";
 import type { TaskRunStatus } from "../../types/aiData";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
 interface RunDashboardProps {
   /** Callback to navigate to a specific tab */
@@ -37,34 +38,46 @@ interface RunDashboardProps {
 }
 
 // Status display configuration for TaskRun statuses
-const statusConfig: Record<
-  TaskRunStatus,
-  { icon: typeof CheckCircle; color: string; bgColor: string; label: string }
-> = {
-  running: {
-    icon: Loader2,
-    color: "text-blue-400",
-    bgColor: "bg-blue-500/10",
-    label: "In Progress",
-  },
-  complete: {
-    icon: CheckCircle,
-    color: "text-green-400",
-    bgColor: "bg-green-500/10",
-    label: "Complete",
-  },
-  failed: {
-    icon: XCircle,
-    color: "text-red-400",
-    bgColor: "bg-red-500/10",
-    label: "Failed",
-  },
-  stopped: {
-    icon: StopCircle,
-    color: "text-slate-400",
-    bgColor: "bg-slate-500/10",
-    label: "Stopped",
-  },
+const getStatusConfig = (
+  status: TaskRunStatus,
+): { icon: typeof CheckCircle; color: string; bgColor: string; label: string } => {
+  switch (status) {
+    case "running":
+      return {
+        icon: Loader2,
+        color: getStatusColors("running").text,
+        bgColor: getStatusColors("running").bg,
+        label: "In Progress",
+      };
+    case "complete":
+      return {
+        icon: CheckCircle,
+        color: getStatusColors("success").text,
+        bgColor: getStatusColors("success").bg,
+        label: "Complete",
+      };
+    case "failed":
+      return {
+        icon: XCircle,
+        color: getStatusColors("error").text,
+        bgColor: getStatusColors("error").bg,
+        label: "Failed",
+      };
+    case "stopped":
+      return {
+        icon: StopCircle,
+        color: getStatusColors("cancelled").text,
+        bgColor: getStatusColors("cancelled").bg,
+        label: "Stopped",
+      };
+    default:
+      return {
+        icon: Activity,
+        color: "text-muted-foreground",
+        bgColor: "bg-muted",
+        label: "Unknown",
+      };
+  }
 };
 
 /**
@@ -199,7 +212,7 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
     );
   }
 
-  const statusInfo = selectedRun ? statusConfig[selectedRun.status] : null;
+  const statusInfo = selectedRun ? getStatusConfig(selectedRun.status) : null;
   const StatusIcon = statusInfo?.icon || Activity;
   const duration = selectedRun
     ? calculateDuration(selectedRun.created_at, selectedRun.completed_at)
@@ -277,8 +290,10 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
 
           {/* Error Message (if failed) */}
           {selectedRun.status === "failed" && selectedRun.error_message && (
-            <div className="p-4 rounded-lg border border-red-500/30 bg-red-500/10">
-              <div className="flex items-center gap-2 text-red-400 mb-2">
+            <div
+              className={`p-4 rounded-lg border ${getStatusColors("error").border} ${getStatusColors("error").bg}`}
+            >
+              <div className={`flex items-center gap-2 ${getStatusColors("error").text} mb-2`}>
                 <XCircle className="w-4 h-4" />
                 <span className="font-medium">Error</span>
               </div>
@@ -332,9 +347,9 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               />
               <QuickLinkCard
                 icon={FileSearch}
-                title="Verification"
-                description="Verification history"
-                onClick={() => onNavigate?.("run-verification")}
+                title="State Exploration"
+                description="Exploration history"
+                onClick={() => onNavigate?.("run-exploration")}
               />
               <QuickLinkCard
                 icon={TestTube}
@@ -369,7 +384,9 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
               <div className="p-4 rounded-lg border border-border bg-card">
                 <div className="flex items-center gap-2 mb-2">
                   {selectedRun?.goal_achieved === false && (
-                    <span className="flex items-center gap-1.5 px-2 py-1 text-xs rounded bg-amber-500/10 text-amber-400">
+                    <span
+                      className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded ${getAccentColors("amber").bg} ${getAccentColors("amber").text}`}
+                    >
                       <Target className="w-3 h-3" />
                       Goal Not Achieved
                     </span>
@@ -417,12 +434,12 @@ export function RunDashboard({ onNavigate }: RunDashboardProps) {
                   </button>
                 </div>
                 {reopenMutation.isError && (
-                  <p className="mt-2 text-sm text-red-400">
+                  <p className={`mt-2 text-sm ${getStatusColors("error").text}`}>
                     Error: {reopenMutation.error?.message || "Failed to reopen run"}
                   </p>
                 )}
                 {reopenMutation.isSuccess && (
-                  <p className="mt-2 text-sm text-green-400">
+                  <p className={`mt-2 text-sm ${getStatusColors("success").text}`}>
                     Run reopened successfully! It will continue automatically.
                   </p>
                 )}

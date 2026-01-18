@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, X, Wrench, Settings as SettingsIcon, Monitor, Copy, RefreshCw } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { getStatusColors } from "@/design-system";
 import type { DebugSettings, LogFunction } from "./types";
 
 interface DeviceInfo {
@@ -155,16 +156,18 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       />
 
       {error && (
-        <div className="p-3 bg-red-500/10 rounded-lg flex items-start gap-2">
-          <X className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
-          <span className="text-red-400 text-xs">{error}</span>
+        <div className={`p-3 ${getStatusColors("error").bg} rounded-lg flex items-start gap-2`}>
+          <X className={`w-4 h-4 ${getStatusColors("error").icon} shrink-0 mt-0.5`} />
+          <span className={`${getStatusColors("error").text} text-xs`}>{error}</span>
         </div>
       )}
 
       {saveSuccess && (
-        <div className="p-3 bg-green-500/10 rounded-lg flex items-start gap-2">
-          <Check className="w-4 h-4 text-green-400 shrink-0 mt-0.5" />
-          <span className="text-green-400 text-xs">Settings saved successfully!</span>
+        <div className={`p-3 ${getStatusColors("success").bg} rounded-lg flex items-start gap-2`}>
+          <Check className={`w-4 h-4 ${getStatusColors("success").icon} shrink-0 mt-0.5`} />
+          <span className={`${getStatusColors("success").text} text-xs`}>
+            Settings saved successfully!
+          </span>
         </div>
       )}
 
@@ -293,7 +296,9 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               >
                 <span className="font-mono text-xs truncate">{deviceInfo.device_id}</span>
                 {copiedField === "Device ID" ? (
-                  <Check className="w-3.5 h-3.5 text-green-400 shrink-0 ml-2" />
+                  <Check
+                    className={`w-3.5 h-3.5 ${getStatusColors("success").icon} shrink-0 ml-2`}
+                  />
                 ) : (
                   <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
                 )}
@@ -309,7 +314,9 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               >
                 <span className="text-xs truncate">{deviceInfo.device_name}</span>
                 {copiedField === "Device Name" ? (
-                  <Check className="w-3.5 h-3.5 text-green-400 shrink-0 ml-2" />
+                  <Check
+                    className={`w-3.5 h-3.5 ${getStatusColors("success").icon} shrink-0 ml-2`}
+                  />
                 ) : (
                   <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
                 )}
@@ -325,7 +332,9 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               >
                 <span className="text-xs capitalize">{deviceInfo.platform}</span>
                 {copiedField === "Platform" ? (
-                  <Check className="w-3.5 h-3.5 text-green-400 shrink-0 ml-2" />
+                  <Check
+                    className={`w-3.5 h-3.5 ${getStatusColors("success").icon} shrink-0 ml-2`}
+                  />
                 ) : (
                   <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary shrink-0 ml-2" />
                 )}

@@ -10,6 +10,7 @@ import * as Dialog from "@radix-ui/react-dialog";
 import { X, Maximize2, CheckCircle2, XCircle, Target, Monitor } from "lucide-react";
 import { ImageRecognitionEntry } from "../managers/LogManager";
 import { cn } from "../lib/utils";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 interface ImageDetailModalProps {
   entry: ImageRecognitionEntry | null;
@@ -113,15 +114,13 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                 <div
                   className={cn(
                     "p-2 rounded-lg",
-                    entry.found
-                      ? "bg-green-100 dark:bg-green-900/30"
-                      : "bg-red-100 dark:bg-red-900/30",
+                    entry.found ? getStatusColors("success").bg : getStatusColors("error").bg,
                   )}
                 >
                   {entry.found ? (
-                    <CheckCircle2 className="w-5 h-5 text-green-600 dark:text-green-400" />
+                    <CheckCircle2 className={`w-5 h-5 ${getStatusColors("success").icon}`} />
                   ) : (
-                    <XCircle className="w-5 h-5 text-red-600 dark:text-red-400" />
+                    <XCircle className={`w-5 h-5 ${getStatusColors("error").icon}`} />
                   )}
                 </div>
                 <div>
@@ -159,8 +158,8 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                         className={cn(
                           "inline-flex items-center px-3 py-1 rounded-full text-sm font-medium",
                           entry.found
-                            ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
-                            : "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
+                            ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                            : `${getStatusColors("error").bg} ${getStatusColors("error").text}`,
                         )}
                       >
                         {entry.found ? "FOUND" : "NOT FOUND"}
@@ -174,8 +173,8 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                         className={cn(
                           "font-semibold",
                           entry.confidence >= entry.threshold
-                            ? "text-green-600 dark:text-green-400"
-                            : "text-red-600 dark:text-red-400",
+                            ? getStatusColors("success").text
+                            : getStatusColors("error").text,
                         )}
                       >
                         {(entry.confidence * 100).toFixed(2)}%
@@ -212,11 +211,13 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                 </div>
 
                 {!entry.found && entry.gap !== undefined && (
-                  <div className="mt-4 p-3 bg-orange-100 dark:bg-orange-900/20 rounded-lg border border-orange-200 dark:border-orange-800">
-                    <div className="text-sm font-medium text-orange-900 dark:text-orange-300">
+                  <div
+                    className={`mt-4 p-3 ${getAccentColors("orange").bg} rounded-lg border ${getAccentColors("orange").border}`}
+                  >
+                    <div className={`text-sm font-medium ${getAccentColors("orange").text}`}>
                       Match Quality
                     </div>
-                    <div className="text-sm text-orange-800 dark:text-orange-400 mt-1">
+                    <div className={`text-sm ${getAccentColors("orange").text} mt-1`}>
                       Gap: {(entry.gap * 100).toFixed(2)}% ({entry.percentOff?.toFixed(2)}% below
                       threshold)
                     </div>
@@ -372,8 +373,8 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                                 className={cn(
                                   "p-2 rounded border font-mono",
                                   meetsThreshold
-                                    ? "bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800"
-                                    : "bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800",
+                                    ? `${getStatusColors("success").bg} ${getStatusColors("success").border}`
+                                    : `${getStatusColors("error").bg} ${getStatusColors("error").border}`,
                                 )}
                               >
                                 <div className="flex items-center justify-between">
@@ -381,8 +382,8 @@ export default function ImageDetailModal({ entry, isOpen, onClose }: ImageDetail
                                     className={cn(
                                       "font-semibold",
                                       meetsThreshold
-                                        ? "text-green-700 dark:text-green-400"
-                                        : "text-red-700 dark:text-red-400",
+                                        ? getStatusColors("success").text
+                                        : getStatusColors("error").text,
                                     )}
                                   >
                                     #{idx + 1}: {(confidence * 100).toFixed(2)}%

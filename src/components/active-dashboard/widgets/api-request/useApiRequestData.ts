@@ -1,0 +1,159 @@
+/**
+ * useApiRequestData Hook
+ *
+ * Fetches and manages data for the API Request widget.
+ * Polls the step execution API for API request data.
+ */
+
+import { useState, useEffect, useCallback, useMemo } from "react";
+import type { ApiRequestData } from "./types";
+import type { ApiRequestExecution, StepStats } from "../shared/types";
+
+const API_BASE = "http://localhost:9876";
+const POLL_INTERVAL_MS = 2000;
+
+/**
+ * Response from the step executions API.
+ */
+interface StepExecutionResponse {
+  success: boolean;
+  data?: {
+    executions: Array<{
+      id: string;
+      step_type: string;
+      step_name: string;
+      status: string;
+      start_time?: number;
+      end_time?: number;
+      duration_ms?: number;
+      error?: string;
+      output?: string;
+      // API request specific
+      method?: string;
+      url?: string;
+      request_headers?: Record<string, string>;
+      request_body?: string;
+      status_code?: number;
+      response_headers?: Record<string, string>;
+      response_body?: string;
+      content_type?: string;
+    }>;
+  };
+}
+
+/**
+ * Hook that provides API request data for the widget.
+ */
+export function useApiRequestData(): ApiRequestData {
+  const [requests, setRequests] = useState<ApiRequestExecution[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [elapsedTime, setElapsedTime] = useState(0);
+
+  // Fetch API request executions
+  const fetchRequests = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/step-executions?type=api_request`);
+      if (response.ok) {
+        const data: StepExecutionResponse = await response.json();
+        if (data.success && data.data?.executions) {
+          const apiRequests: ApiRequestExecution[] = data.data.executions.map((exec) => ({
+            id: exec.id,
+            name: exec.step_name || `${exec.method} ${exec.url}` || "API Request",
+            status: exec.status as ApiRequestExecution["status"],
+            startTime: exec.start_time,
+            endTime: exec.end_time,
+            durationMs: exec.duration_ms,
+            error: exec.error,
+            output: exec.response_body || exec.output,
+            method: exec.method || "GET",
+            url: exec.url || "",
+            requestHeaders: exec.request_headers,
+            requestBody: exec.request_body,
+            statusCode: exec.status_code,
+            responseHeaders: exec.response_headers,
+            responseBody: exec.response_body,
+            contentType: exec.content_type,
+          }));
+          setRequests(apiRequests);
+
+          // Set start time from first request
+          if (apiRequests.length > 0 && !startTime) {
+            const earliest = Math.min(
+              ...apiRequests.filter((r) => r.startTime).map((r) => r.startTime!),
+            );
+            if (earliest && earliest !== Infinity) {
+              setStartTime(earliest);
+            }
+          }
+        }
+      }
+    } catch {
+      // Silently ignore - API may not be available
+    } finally {
+      setIsLoading(false);
+    }
+  }, [startTime]);
+
+  // Initial fetch and polling
+  useEffect(() => {
+    fetchRequests();
+    const interval = setInterval(fetchRequests, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [fetchRequests]);
+
+  // Update elapsed time
+  useEffect(() => {
+    if (!startTime) {
+      setElapsedTime(0);
+      return;
+    }
+
+    const updateElapsed = () => {
+      const now = Date.now();
+      setElapsedTime(Math.floor((now - startTime) / 1000));
+    };
+
+    updateElapsed();
+    const interval = setInterval(updateElapsed, 1000);
+    return () => clearInterval(interval);
+  }, [startTime]);
+
+  // Get currently running request
+  const currentRequest = useMemo(() => {
+    return requests.find((r) => r.status === "running") || null;
+  }, [requests]);
+
+  // Calculate statistics
+  const stats: StepStats = useMemo(() => {
+    const total = requests.length;
+    const completed = requests.filter(
+      (r) => r.status === "success" || r.status === "failed",
+    ).length;
+    const successful = requests.filter((r) => r.status === "success").length;
+    const failed = requests.filter((r) => r.status === "failed").length;
+    const pending = requests.filter((r) => r.status === "pending" || r.status === "running").length;
+    const successRate = completed > 0 ? (successful / completed) * 100 : 100;
+
+    return {
+      total,
+      completed,
+      successful,
+      failed,
+      pending,
+      elapsedTime,
+      successRate,
+    };
+  }, [requests, elapsedTime]);
+
+  return {
+    requests,
+    currentRequest,
+    stats,
+    isLoading,
+    error,
+  };
+}
+
+export default useApiRequestData;

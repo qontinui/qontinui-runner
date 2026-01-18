@@ -7,6 +7,7 @@
 import { useState, useEffect } from "react";
 import { X, Save, Loader2, Trash2, Plus, FolderOpen } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getAccentColors } from "@/design-system";
 import type {
   ScheduledTask,
   ScheduleExpression,
@@ -693,7 +694,7 @@ export function SchedulerTaskForm({ task, onSubmit, onCancel, loading }: Schedul
                     <button
                       type="button"
                       onClick={() => removeRepository(idx)}
-                      className="p-2 rounded text-red-500 hover:bg-red-500/10 transition-colors"
+                      className={`p-2 rounded ${getAccentColors("red").text} hover:${getAccentColors("red").bg} transition-colors`}
                       title="Remove repository"
                     >
                       <Trash2 className="w-4 h-4" />

@@ -6,26 +6,46 @@
  */
 
 import { CheckCircle2, XCircle, Loader2, ChevronRight } from "lucide-react";
+import { cn } from "../../lib/utils";
 import { Badge, ScrollArea } from "../ui";
 import type { ActionStreamProps, ActionItem, ActionType, ActionStatus } from "./types";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
-const actionTypeColors: Record<ActionType, string> = {
-  FIND: "bg-blue-500/20 text-blue-400 border border-blue-500/50",
-  CLICK: "bg-green-500/20 text-green-400 border border-green-500/50",
-  TYPE: "bg-purple-500/20 text-purple-400 border border-purple-500/50",
-  WAIT: "bg-zinc-500/20 text-zinc-400 border border-zinc-500/50",
-  GO_TO_STATE: "bg-cyan-500/20 text-cyan-400 border border-cyan-500/50",
-  RUN_WORKFLOW: "bg-indigo-500/20 text-indigo-400 border border-indigo-500/50",
-};
+/**
+ * Get action type color class using design system.
+ */
+function getActionTypeColorClass(actionType: ActionType): string {
+  const blueColors = getAccentColors("blue");
+  const greenColors = getAccentColors("green");
+  const purpleColors = getAccentColors("purple");
+  const slateColors = getAccentColors("slate");
+  const cyanColors = getAccentColors("cyan");
+
+  const colorMap: Record<ActionType, string> = {
+    FIND: cn(blueColors.bg, blueColors.text, "border", blueColors.border),
+    CLICK: cn(greenColors.bg, greenColors.text, "border", greenColors.border),
+    TYPE: cn(purpleColors.bg, purpleColors.text, "border", purpleColors.border),
+    WAIT: cn(slateColors.bg, slateColors.text, "border", slateColors.border),
+    GO_TO_STATE: cn(cyanColors.bg, cyanColors.text, "border", cyanColors.border),
+    // indigo not in design system, using purple as closest
+    RUN_WORKFLOW: cn(purpleColors.bg, purpleColors.text, "border", purpleColors.border),
+  };
+
+  return colorMap[actionType] || cn(slateColors.bg, slateColors.text, "border", slateColors.border);
+}
 
 function StatusIcon({ status }: { status: ActionStatus }) {
+  const pendingColors = getStatusColors("pending");
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
+
   switch (status) {
     case "running":
-      return <Loader2 className="h-4 w-4 animate-spin text-blue-400" />;
+      return <Loader2 className={cn("h-4 w-4 animate-spin", pendingColors.text)} />;
     case "success":
-      return <CheckCircle2 className="h-4 w-4 text-green-400" />;
+      return <CheckCircle2 className={cn("h-4 w-4", successColors.text)} />;
     case "failed":
-      return <XCircle className="h-4 w-4 text-red-400" />;
+      return <XCircle className={cn("h-4 w-4", errorColors.text)} />;
     default:
       return <div className="h-4 w-4 rounded-full border-2 border-muted-foreground/50" />;
   }
@@ -36,20 +56,23 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
     ? `+${((Date.now() - action.timestamp) / 1000).toFixed(1)}s`
     : "0.0s";
 
+  const pendingColors = getStatusColors("pending");
+  const errorColors = getStatusColors("error");
+  const colorClass = getActionTypeColorClass(action.action_type);
+
   return (
     <div
-      className={`flex items-start gap-3 border-l-2 px-4 py-3 transition-colors hover:bg-muted/30 ${
-        isActive ? "border-blue-500 bg-blue-500/5" : "border-transparent"
-      }`}
+      className={cn(
+        "flex items-start gap-3 border-l-2 px-4 py-3 transition-colors hover:bg-muted/30",
+        isActive ? cn(pendingColors.border, pendingColors.bg) : "border-transparent",
+      )}
       style={{ paddingLeft: `${action.level * 24 + 16}px` }}
     >
       <StatusIcon status={action.status} />
 
       <span className="w-16 font-mono text-xs text-muted-foreground">{relativeTime}</span>
 
-      <Badge className={`${actionTypeColors[action.action_type]} text-xs`}>
-        {action.action_type}
-      </Badge>
+      <Badge className={cn(colorClass, "text-xs")}>{action.action_type}</Badge>
 
       <div className="flex-1">
         <div className="flex items-center gap-2">
@@ -59,7 +82,7 @@ function ActionRow({ action, isActive }: { action: ActionItem; isActive: boolean
           )}
         </div>
         {action.result && <p className="mt-1 text-xs text-muted-foreground">{action.result}</p>}
-        {action.error && <p className="mt-1 text-xs text-red-400">{action.error}</p>}
+        {action.error && <p className={cn("mt-1 text-xs", errorColors.text)}>{action.error}</p>}
       </div>
 
       {action.duration && (

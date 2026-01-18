@@ -9,6 +9,7 @@ import Editor, { Monaco } from "@monaco-editor/react";
 import { FileCode, FlaskConical, Copy, Check } from "lucide-react";
 import { useTestBuilder } from "./TestBuilderContext";
 import type { TestType } from "./types";
+import { getStatusColors } from "@/design-system";
 
 // Language mapping for Monaco
 const testTypeLanguages: Record<TestType, string> = {
@@ -208,7 +209,11 @@ export function TestEditorPanel({ onCodeChange, code }: TestEditorPanelProps) {
           className="p-1.5 hover:bg-muted rounded-md transition-colors flex items-center gap-1 text-sm"
           onClick={handleCopy}
         >
-          {copied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
+          {copied ? (
+            <Check className={`w-4 h-4 ${getStatusColors("success").icon}`} />
+          ) : (
+            <Copy className="w-4 h-4" />
+          )}
           <span className="text-xs">{copied ? "Copied" : "Copy"}</span>
         </button>
       </div>

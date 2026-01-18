@@ -25,7 +25,7 @@ from qontinui_schemas.common import utc_now
 
 # Debug log file path - hardcoded to ensure it works
 _WS_CLIENT_DEBUG_LOG = (
-    r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\ws-client-debug.log"
+    r"D:\qontinui_parent_directory\.dev-logs\ws-client-debug.log"
 )
 
 

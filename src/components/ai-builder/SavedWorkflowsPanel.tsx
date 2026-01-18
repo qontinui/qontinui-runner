@@ -6,6 +6,7 @@
 
 import { BookOpen, ChevronDown, Sparkles, Trash2 } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getStatusColors } from "@/design-system";
 
 export function SavedWorkflowsPanel() {
   const {
@@ -20,13 +21,13 @@ export function SavedWorkflowsPanel() {
     <div className="card p-4 space-y-3">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <BookOpen className="w-4 h-4 text-green-500" />
+          <BookOpen className={`w-4 h-4 ${getStatusColors("success").text}`} />
           <span className="font-medium">Saved Workflows</span>
           <span className="text-xs text-muted-foreground">({savedAiWorkflows.length})</span>
         </div>
         <button
           onClick={() => setShowWorkflowsPanel(!showWorkflowsPanel)}
-          className="flex items-center gap-1 px-2 py-1 text-xs bg-green-500/10 text-green-600 rounded hover:bg-green-500/20 transition-colors"
+          className={`flex items-center gap-1 px-2 py-1 text-xs ${getStatusColors("success").bg} ${getStatusColors("success").text} rounded hover:bg-green-500/20 transition-colors`}
         >
           {showWorkflowsPanel ? "Hide" : "Show"}
           <ChevronDown
@@ -47,7 +48,7 @@ export function SavedWorkflowsPanel() {
                 key={workflow.id}
                 className="flex items-center gap-2 p-2 bg-background rounded-md border border-border/50 hover:border-green-500/30 transition-colors"
               >
-                <Sparkles className="w-4 h-4 text-green-500 flex-shrink-0" />
+                <Sparkles className={`w-4 h-4 ${getStatusColors("success").text} flex-shrink-0`} />
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium truncate">{workflow.name}</p>
                   <p className="text-xs text-muted-foreground truncate">
@@ -56,13 +57,13 @@ export function SavedWorkflowsPanel() {
                 </div>
                 <button
                   onClick={() => loadAiWorkflow(workflow)}
-                  className="px-2 py-1 text-xs bg-green-500/10 text-green-600 rounded hover:bg-green-500/20 transition-colors"
+                  className={`px-2 py-1 text-xs ${getStatusColors("success").bg} ${getStatusColors("success").text} rounded hover:bg-green-500/20 transition-colors`}
                 >
                   Load
                 </button>
                 <button
                   onClick={() => deleteAiWorkflow(workflow.id)}
-                  className="p-1 text-muted-foreground hover:text-red-500 transition-colors"
+                  className={`p-1 text-muted-foreground hover:${getStatusColors("error").text} transition-colors`}
                   title="Delete workflow"
                 >
                   <Trash2 className="w-4 h-4" />

@@ -139,6 +139,34 @@ pub struct IterationLogs {
 
     /// Input validation data (only if "Capture Input for Validation" is enabled)
     pub input_validation: Option<InputValidationLogs>,
+
+    /// DOM captures (HTML snapshots from browser pages)
+    pub dom_captures: Option<Vec<DomCaptureRef>>,
+}
+
+/// Reference to a DOM capture for inclusion in the iteration bundle
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomCaptureRef {
+    /// Unique identifier
+    pub id: String,
+    /// Page URL
+    pub url: String,
+    /// Document title
+    pub page_title: String,
+    /// Size of HTML in bytes
+    pub html_size_bytes: usize,
+    /// Path to the HTML file (AI can Read this file)
+    pub html_file_path: String,
+    /// Type: "full" or "selector"
+    pub capture_type: String,
+    /// CSS selector if partial capture
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    /// Source: "playwright" or "extension"
+    pub source: String,
+    /// Linked screenshot path
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_screenshot: Option<String>,
 }
 
 /// Captured log content with extracted errors
@@ -369,8 +397,7 @@ pub fn iteration_screenshots_dir(task_run_id: &str) -> PathBuf {
 
 /// Get the .dev-logs directory
 fn get_dev_logs_dir() -> PathBuf {
-    // Use the same path as file_logger.rs
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 // ============================================================================
@@ -504,6 +531,13 @@ impl IterationBundle {
             self.previous_output_summary = Some(output[output.len() - max_chars..].to_string());
         } else {
             self.previous_output_summary = Some(output);
+        }
+    }
+
+    /// Add DOM captures (HTML snapshots from browser pages)
+    pub fn add_dom_captures(&mut self, captures: Vec<DomCaptureRef>) {
+        if !captures.is_empty() {
+            self.logs.dom_captures = Some(captures);
         }
     }
 }
@@ -834,6 +868,12 @@ impl IterationBundle {
             self.render_input_validation_logs(&mut md, input_validation);
         }
 
+        // DOM captures (if any)
+        if let Some(ref dom_captures) = self.logs.dom_captures {
+            md.push_str("---\n\n### DOM Snapshots\n\n");
+            self.render_dom_captures(&mut md, dom_captures);
+        }
+
         // Previous findings
         if !self.previous_findings.is_empty() {
             md.push_str("---\n\n### Previous Iteration Findings\n\n");
@@ -1102,6 +1142,60 @@ impl IterationBundle {
                 md.push_str(console);
                 md.push_str("\n```\n\n");
             }
+        }
+    }
+
+    fn render_dom_captures(&self, md: &mut String, captures: &[DomCaptureRef]) {
+        // Summary table
+        md.push_str("| URL | Title | Size | Type | File |\n");
+        md.push_str("|-----|-------|------|------|------|\n");
+
+        for capture in captures {
+            let size = if capture.html_size_bytes < 1024 {
+                format!("{} B", capture.html_size_bytes)
+            } else if capture.html_size_bytes < 1024 * 1024 {
+                format!("{:.1} KB", capture.html_size_bytes as f64 / 1024.0)
+            } else {
+                format!(
+                    "{:.1} MB",
+                    capture.html_size_bytes as f64 / (1024.0 * 1024.0)
+                )
+            };
+
+            let capture_type = if capture.capture_type == "selector" {
+                format!("Selector: {}", capture.selector.as_deref().unwrap_or("?"))
+            } else {
+                "Full page".to_string()
+            };
+
+            // Truncate long URLs
+            let url_display = if capture.url.len() > 50 {
+                format!("{}...", &capture.url[..47])
+            } else {
+                capture.url.clone()
+            };
+
+            md.push_str(&format!(
+                "| {} | {} | {} | {} | `{}` |\n",
+                url_display, capture.page_title, size, capture_type, capture.html_file_path
+            ));
+        }
+
+        md.push('\n');
+
+        // Provide guidance for AI
+        md.push_str("**Note:** Use the Read tool to view HTML content if needed for debugging UI/styling issues.\n\n");
+
+        // List linked screenshots
+        let with_screenshots: Vec<_> = captures.iter().filter(|c| c.linked_screenshot.is_some()).collect();
+        if !with_screenshots.is_empty() {
+            md.push_str("**Linked Screenshots:**\n");
+            for capture in with_screenshots {
+                if let Some(ref screenshot) = capture.linked_screenshot {
+                    md.push_str(&format!("- {} -> `{}`\n", capture.page_title, screenshot));
+                }
+            }
+            md.push('\n');
         }
     }
 

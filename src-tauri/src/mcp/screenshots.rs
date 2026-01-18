@@ -1,13 +1,57 @@
 //! Screenshot capture handlers for MCP API
 //!
 //! Provides screenshot capture capabilities for AI automation.
+//! Uses IPC to the Python bridge for screenshot capture.
 
 use axum::{extract::State, http::StatusCode, Json};
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tracing::{error, info, warn};
 
 use super::sessions::emit_ai_output;
 use super::types::{api_error, ApiResponse, ApiState, CaptureScreenshotRequest, CaptureScreenshotResponse};
+
+/// Capture a screenshot via IPC to Python bridge
+async fn capture_screenshot_ipc(
+    app_state: Arc<crate::AppState>,
+    monitor: Option<i32>,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "monitor": monitor,
+        "format": "png",
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("IPC: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = Duration::from_secs(30);
+            bridge.send_command_and_wait("capture_screenshot", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                Ok(response.data.unwrap_or(serde_json::json!({"success": true})))
+            } else {
+                Err(response.error.unwrap_or_else(|| "Screenshot capture failed".to_string()))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Capture a screenshot and save it to .dev-logs/screenshots/ with task-identifiable naming.
 /// Also logs the screenshot to ai-output.jsonl for AI analysis.
@@ -24,7 +68,7 @@ pub async fn capture_screenshot_step(
     use std::io::Write;
 
     info!(
-        "MCP API: Capturing screenshot (monitor: {:?}, delay: {:?}s, task: {:?}, step: {:?})",
+        "MCP API: Capturing screenshot via IPC (monitor: {:?}, delay: {:?}s, task: {:?}, step: {:?})",
         request.monitor, request.delay_seconds, request.task_id, request.step_index
     );
 
@@ -40,28 +84,11 @@ pub async fn capture_screenshot_step(
         }
     }
 
-    // Get qontinui-api URL
-    let api_url = std::env::var("QONTINUI_API_URL_VISION")
-        .unwrap_or_else(|_| "http://localhost:8001".to_string());
-
-    // Build URL with query parameters
-    let mut url = format!("{}/api/capture/screenshot/current", api_url);
-    let mut params = Vec::new();
-    if let Some(mon) = request.monitor {
-        params.push(format!("monitor={}", mon));
-    }
-    // Always request high quality for AI analysis
-    params.push("quality=95".to_string());
-    if !params.is_empty() {
-        url = format!("{}?{}", url, params.join("&"));
-    }
-
-    // Capture screenshot via qontinui-api
-    let client = reqwest::Client::new();
-    let response = match client.get(&url).send().await {
-        Ok(r) => r,
+    // Capture screenshot via Python IPC
+    let capture_response = match capture_screenshot_ipc(state.app_state.clone(), request.monitor).await {
+        Ok(response) => response,
         Err(e) => {
-            error!("MCP API: Failed to capture screenshot: {}", e);
+            error!("MCP API: Failed to capture screenshot via IPC: {}", e);
             return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
                 success: false,
                 screenshot_path: None,
@@ -69,45 +96,7 @@ pub async fn capture_screenshot_step(
                 width: None,
                 height: None,
                 monitor: request.monitor,
-                error: Some(format!("Network error: {}", e)),
-            })));
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!(
-            "MCP API: Screenshot capture failed with status {}: {}",
-            status, error_text
-        );
-        return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
-            success: false,
-            screenshot_path: None,
-            absolute_path: None,
-            width: None,
-            height: None,
-            monitor: request.monitor,
-            error: Some(format!("Capture failed: {}", error_text)),
-        })));
-    }
-
-    // Parse response
-    let capture_response: serde_json::Value = match response.json().await {
-        Ok(j) => j,
-        Err(e) => {
-            error!("MCP API: Failed to parse screenshot response: {}", e);
-            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
-                success: false,
-                screenshot_path: None,
-                absolute_path: None,
-                width: None,
-                height: None,
-                monitor: request.monitor,
-                error: Some(format!("Invalid API response: {}", e)),
+                error: Some(format!("IPC error: {}", e)),
             })));
         }
     };
@@ -118,7 +107,7 @@ pub async fn capture_screenshot_step(
     {
         Some(s) => s.to_string(),
         None => {
-            error!("MCP API: No screenshot_base64 in response");
+            error!("MCP API: No screenshot_base64 in IPC response");
             return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
                 success: false,
                 screenshot_path: None,
@@ -174,9 +163,7 @@ pub async fn capture_screenshot_step(
     );
 
     // Save to .dev-logs/screenshots/
-    let dev_logs_path =
-        std::path::PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
-    let screenshots_dir = dev_logs_path.join("screenshots");
+    let screenshots_dir = crate::paths::get_screenshots_dir();
     if let Err(e) = fs::create_dir_all(&screenshots_dir) {
         error!("MCP API: Failed to create screenshots directory: {}", e);
         return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {

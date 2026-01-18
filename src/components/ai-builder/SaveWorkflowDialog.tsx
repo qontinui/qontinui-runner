@@ -6,6 +6,7 @@
 
 import { Loader2, Save, X } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 export function SaveWorkflowDialog() {
   const {
@@ -35,7 +36,7 @@ export function SaveWorkflowDialog() {
       <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Save className="w-5 h-5 text-green-500" />
+            <Save className={`w-5 h-5 ${getStatusColors("success").text}`} />
             <h3 className="text-lg font-semibold">Save Workflow</h3>
           </div>
           <button
@@ -97,7 +98,7 @@ export function SaveWorkflowDialog() {
           <button
             onClick={saveAsNewWorkflow}
             disabled={isSaving || !saveName.trim()}
-            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-500 text-white rounded-md font-medium hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("green").bgSolid} text-white rounded-md font-medium hover:bg-green-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
           >
             {isSaving ? (
               <>

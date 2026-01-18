@@ -10,11 +10,56 @@ Built with Tauri (Rust) + React (TypeScript) for a native, performant desktop ex
 
 ## Features
 
-- 🚀 Execute automation configurations locally
-- 📊 Real-time execution monitoring
+- Execute automation configurations locally
+- Real-time execution monitoring
+- Load and manage JSON configurations
+- Cross-platform support (Windows, macOS, Linux)
 
-- 💾 Load and manage JSON configurations
-- 🖥️ Cross-platform support (Windows, macOS, Linux)
+### Agentic Features
+
+Qontinui Runner includes advanced agentic capabilities for robust AI-assisted automation:
+
+| Feature | Description |
+|---------|-------------|
+| [Memory Compression](docs/features/memory-compression.md) | Prevents context overflow by compressing historical data |
+| [Retry with Feedback](docs/features/retry-feedback.md) | Recovers from transient failures with error context injection |
+| [Task Routing](docs/features/task-routing.md) | Routes tasks to appropriate AI models by complexity |
+| [Context Propagation](docs/features/context-propagation.md) | Passes data between execution steps with expression syntax |
+| [Lifecycle Hooks](docs/features/lifecycle-hooks.md) | Triggers custom actions at execution milestones |
+| [Accessibility Explorer](docs/features/accessibility-explorer.md) | Captures and interacts with accessibility trees |
+
+See [Agentic Features Overview](docs/features/agentic-features.md) for details.
+
+### Developer Tools
+
+Advanced features for workflow design, debugging, and optimization:
+
+| Feature | Description |
+|---------|-------------|
+| [Learning Dashboard](docs/LEARNING_DASHBOARD.md) | Track AI learning patterns, strategy performance, and insights |
+| [Flow Designer](docs/FLOW_DESIGNER.md) | Visual editor for deterministic, step-by-step workflows |
+| [Checkpoint Browser](docs/CHECKPOINT_BROWSER.md) | Time-travel debugging with replay functionality |
+
+See [Features Overview](docs/FEATURES.md) for details and [API Reference](docs/API_REFERENCE.md) for complete API documentation.
+
+### AWAS Integration
+
+AWAS (AI Web Action Standard) enables AI-driven web automation through standardized action manifests:
+
+| Feature | Description |
+|---------|-------------|
+| [AWAS Builder](docs/features/awas-builder.md) | Discover, configure, and test AWAS actions |
+| AWAS Steps | Five step types for workflows (discover, execute, check support, list, extract) |
+| Manifest Discovery | Automatic detection of `/.well-known/ai-actions.json` |
+| Action Execution | Execute AWAS actions with typed parameters |
+
+**Benefits over vision-based automation:**
+- 10-100x faster execution
+- No visual template maintenance
+- Structured input/output validation
+- Clear action documentation
+
+See the [AWAS Builder Guide](docs/features/awas-builder.md) for usage details.
 
 ## Installation
 
@@ -235,7 +280,6 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 - **[qontinui](https://github.com/qontinui/qontinui)** - Core automation library (Python)
 - **[multistate](https://github.com/qontinui/multistate)** - State machine library | [Docs](https://qontinui.github.io/multistate/)
-- **[qontinui-api](https://github.com/qontinui/qontinui-api)** - REST API bridge
 - **[qontinui-web](https://qontinui.com)** - Web-based visual builder (launching Feb 2026)
 - **[Brobot](https://github.com/jspinak/brobot)** - Original Java implementation
 

@@ -1,0 +1,279 @@
+/**
+ * useDashboardState Hook
+ *
+ * Main orchestration hook for the Active Dashboard.
+ * Combines task detection, layout management, and phase tracking.
+ */
+
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useDashboardLayout, type DashboardLayoutState } from "./useDashboardLayout";
+import { useTaskDetection } from "./useTaskDetection";
+import { usePhaseTracking } from "./usePhaseTracking";
+import type { ActivityType, ActivityState, TaskPhase } from "../../types/dashboard/activity-types";
+import type { TaskActivityInfo } from "../../types/dashboard/widget-registry";
+import {
+  type OrchestratorAgent,
+  detectCurrentOrchestratorAgent,
+} from "../../components/shared/AiMessageDisplay";
+
+const API_BASE = "http://localhost:9876";
+const ACTIVITY_POLL_INTERVAL_MS = 1000;
+
+/**
+ * Overall dashboard status.
+ */
+export type DashboardStatus = "idle" | "running" | "completed" | "failed" | "stopped";
+
+/**
+ * Complete dashboard state.
+ */
+export interface DashboardState {
+  /** Layout state (active widget, summaries, activities) */
+  layout: DashboardLayoutState;
+  /** Current task information */
+  taskInfo: TaskActivityInfo | null;
+  /** Whether any task is running */
+  isRunning: boolean;
+  /** Overall dashboard status */
+  status: DashboardStatus;
+  /** Current phase in the iteration */
+  currentPhase: TaskPhase;
+  /** Whether to show phase badge */
+  showPhaseBadge: boolean;
+  /** Error message if any */
+  error: string | null;
+  /** Whether initial loading is in progress */
+  isLoading: boolean;
+  /** Current orchestrator agent (if using orchestrated workflow) */
+  currentOrchestratorAgent: OrchestratorAgent;
+}
+
+/**
+ * Result returned by useDashboardState hook.
+ */
+export interface UseDashboardStateResult {
+  /** Current dashboard state */
+  state: DashboardState;
+  /** Switch active widget */
+  setActiveWidget: (type: ActivityType) => void;
+  /** Update a specific activity's state */
+  updateActivityState: (type: ActivityType, update: Partial<ActivityState>) => void;
+  /** Manual refresh */
+  refresh: () => Promise<void>;
+  /** Navigate to detail page for an activity */
+  navigateToDetail: (type: ActivityType) => void;
+  /** Get the active widget config */
+  getActiveWidgetConfig: () => ReturnType<
+    typeof import("../../types/dashboard/widget-registry").widgetRegistry.get
+  >;
+}
+
+/**
+ * Main hook for managing the Active Dashboard state.
+ *
+ * This hook:
+ * 1. Detects the current running task
+ * 2. Manages which widgets to show
+ * 3. Tracks the current phase
+ * 4. Provides state updates for real-time changes
+ */
+export function useDashboardState(): UseDashboardStateResult {
+  const [error, setError] = useState<string | null>(null);
+
+  // Detect current task and its activities
+  const {
+    taskInfo,
+    isRunning,
+    isLoading: taskLoading,
+    error: taskError,
+    refresh: refreshTask,
+  } = useTaskDetection();
+
+  // Layout management - pass isRunning to avoid false idle detection
+  const { layout, setActiveWidget, updateActivityState, resetLayoutForTask, getWidgetConfig } =
+    useDashboardLayout(taskInfo, isRunning);
+
+  // Reset layout when task changes
+  useEffect(() => {
+    if (taskInfo) {
+      resetLayoutForTask(taskInfo);
+    }
+  }, [taskInfo?.taskId, resetLayoutForTask]);
+
+  // Phase tracking
+  const { currentPhase, showPhaseBadge } = usePhaseTracking({
+    activities: layout.activities,
+    isRunning,
+    hasGuiSetup: taskInfo?.hasConfig ?? false,
+    hasPlaywrightSetup: taskInfo?.hasPlaywrightScripts ?? false,
+    hasVerification: taskInfo?.hasVerificationTests ?? false,
+    hasAiWork: taskInfo?.hasPrompt ?? false,
+  });
+
+  // Track last AI output timestamp to detect AI activity
+  const lastAiTimestampRef = useRef<number>(0);
+
+  // Track current orchestrator agent
+  const [currentOrchestratorAgent, setCurrentOrchestratorAgent] = useState<OrchestratorAgent>(null);
+
+  /**
+   * Poll for activity status and update activity states.
+   * This enables auto-switching of the active widget based on what's running.
+   */
+  useEffect(() => {
+    if (!isRunning) return;
+
+    const pollActivityStatus = async () => {
+      try {
+        // Check for running GUI actions
+        const actionResponse = await fetch(`${API_BASE}/action-log/view`);
+        let guiRunning = false;
+        if (actionResponse.ok) {
+          const actionData = await actionResponse.json();
+          if (actionData.actions && Array.isArray(actionData.actions)) {
+            guiRunning = actionData.actions.some((a: { status: string }) => a.status === "running");
+          }
+        }
+
+        // Check for AI activity by looking at recent AI output
+        let aiRunning = false;
+        try {
+          // Use logManager to check AI activity - import it dynamically to avoid circular deps
+          const { logManager } = await import("../../managers");
+          const aiLogs = logManager.getAiOutputLogs();
+          if (aiLogs.length > 0) {
+            const lastLog = aiLogs[aiLogs.length - 1];
+            const lastTimestamp = lastLog.timestamp || 0;
+            // AI is "running" if there's been output in the last 5 seconds
+            const timeSinceLastOutput = Date.now() - lastTimestamp;
+            if (timeSinceLastOutput < 5000 && lastTimestamp > lastAiTimestampRef.current) {
+              aiRunning = true;
+            }
+            lastAiTimestampRef.current = lastTimestamp;
+
+            // Detect current orchestrator agent from recent AI output
+            const detectedAgent = detectCurrentOrchestratorAgent(
+              aiLogs.map((log) => ({ source: log.source, timestamp: log.timestamp })),
+            );
+            setCurrentOrchestratorAgent(detectedAgent);
+          }
+        } catch {
+          // Ignore errors checking AI status
+        }
+
+        // Update activity states based on what's running
+        // Priority: GUI running > AI running > default to AI if prompt exists
+        if (guiRunning) {
+          updateActivityState("gui_automation", { status: "running" });
+          updateActivityState("ai_conversation", { status: "idle" });
+        } else if (aiRunning) {
+          updateActivityState("gui_automation", { status: "idle" });
+          updateActivityState("ai_conversation", { status: "running" });
+        } else if (taskInfo?.hasPrompt) {
+          // Default to AI conversation when nothing else is running
+          updateActivityState("gui_automation", { status: "idle" });
+          updateActivityState("ai_conversation", { status: "running" });
+        }
+      } catch {
+        // Silently ignore polling errors
+      }
+    };
+
+    // Initial poll
+    pollActivityStatus();
+
+    // Set up polling interval
+    const interval = setInterval(pollActivityStatus, ACTIVITY_POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [isRunning, taskInfo?.hasPrompt, updateActivityState]);
+
+  // Derive overall status
+  const status: DashboardStatus = useMemo(() => {
+    if (!isRunning && layout.isIdle) return "idle";
+    if (isRunning) return "running";
+
+    // Check for failures
+    const hasError = Array.from(layout.activities.values()).some((a) => a.status === "failed");
+    if (hasError) return "failed";
+
+    // Check if stopped
+    const hasStopped = Array.from(layout.activities.values()).some((a) => a.status === "stopped");
+    if (hasStopped) return "stopped";
+
+    return "completed";
+  }, [isRunning, layout.isIdle, layout.activities]);
+
+  // Combined error
+  const combinedError = error || taskError;
+
+  /**
+   * Manual refresh.
+   */
+  const refresh = useCallback(async () => {
+    setError(null);
+    try {
+      await refreshTask();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to refresh");
+    }
+  }, [refreshTask]);
+
+  /**
+   * Navigate to detail page for an activity.
+   */
+  const navigateToDetail = useCallback(
+    (type: ActivityType) => {
+      const config = getWidgetConfig(type);
+      if (config?.detailRoute) {
+        // Use hash-based navigation for the runner app
+        window.location.hash = `#${config.detailRoute}`;
+      }
+    },
+    [getWidgetConfig],
+  );
+
+  /**
+   * Get the active widget configuration.
+   */
+  const getActiveWidgetConfig = useCallback(() => {
+    if (!layout.activeWidget) return undefined;
+    return getWidgetConfig(layout.activeWidget);
+  }, [layout.activeWidget, getWidgetConfig]);
+
+  // Build complete state
+  const state: DashboardState = useMemo(
+    () => ({
+      layout,
+      taskInfo,
+      isRunning,
+      status,
+      currentPhase,
+      showPhaseBadge,
+      error: combinedError,
+      isLoading: taskLoading,
+      currentOrchestratorAgent,
+    }),
+    [
+      layout,
+      taskInfo,
+      isRunning,
+      status,
+      currentPhase,
+      showPhaseBadge,
+      combinedError,
+      taskLoading,
+      currentOrchestratorAgent,
+    ],
+  );
+
+  return {
+    state,
+    setActiveWidget,
+    updateActivityState,
+    refresh,
+    navigateToDetail,
+    getActiveWidgetConfig,
+  };
+}
+
+export default useDashboardState;

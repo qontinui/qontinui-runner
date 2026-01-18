@@ -6,6 +6,7 @@
 
 import { AlertTriangle, Trash2, X } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 export function NewWorkflowConfirmDialog() {
   const {
@@ -32,7 +33,7 @@ export function NewWorkflowConfirmDialog() {
       <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <AlertTriangle className="w-5 h-5 text-yellow-500" />
+            <AlertTriangle className={`w-5 h-5 ${getStatusColors("warning").text}`} />
             <h3 className="text-lg font-semibold">Unsaved Changes</h3>
           </div>
           <button
@@ -48,7 +49,9 @@ export function NewWorkflowConfirmDialog() {
           these changes.
         </p>
 
-        <div className="text-xs text-muted-foreground bg-yellow-500/10 border border-yellow-500/20 p-3 rounded">
+        <div
+          className={`text-xs text-muted-foreground ${getStatusColors("warning").bg} border ${getStatusColors("warning").border} p-3 rounded`}
+        >
           <p>
             <strong>Current workflow includes:</strong>
           </p>
@@ -74,7 +77,7 @@ export function NewWorkflowConfirmDialog() {
           </button>
           <button
             onClick={resetToNewWorkflow}
-            className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-red-500 text-white rounded-md font-medium hover:bg-red-600 transition-colors"
+            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("red").bgSolid} text-white rounded-md font-medium hover:bg-red-600 transition-colors`}
           >
             <Trash2 className="w-4 h-4" />
             Discard & Create New

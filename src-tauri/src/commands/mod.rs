@@ -5,7 +5,7 @@
 //!
 //! # Module Organization
 //!
-//! - `ai_verification` - AI verification agent for state machine exploration
+//! - `state_explorer` - State explorer for AI-driven state machine exploration
 //! - `auth` - Authentication and device management
 //! - `config` - Configuration file loading and management
 //! - `dataset` - Dataset packaging and YOLO format export
@@ -30,6 +30,7 @@ use crate::config::QontinuiConfig;
 use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
 use crate::executor::PythonBridge;
+use crate::mcp_client::McpClientManager;
 use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
 use crate::video_recorder::VideoRecordingService;
@@ -39,13 +40,17 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
 
 // Command modules organized by domain
+pub mod accessibility;
 pub mod ai_data;
 pub mod ai_settings;
-pub mod ai_verification;
 pub mod auth;
+pub mod backup; // Comprehensive backup and restore
+pub mod checkpoint_browser; // Orchestrator checkpoint browser (time-travel debugging)
 pub mod checkpoints;
+pub mod checks; // Code quality checks (linting, formatting, type checking)
 pub mod config;
 pub mod context;
+pub mod database; // Database maintenance and optimization
 pub mod dataset;
 pub mod debug;
 pub mod discoveries;
@@ -53,20 +58,31 @@ pub mod execution;
 pub mod execution_reporting;
 pub mod extraction;
 pub mod findings;
+pub mod flow; // Flow designer commands
+pub mod global_log_sources; // Global log source management
 pub mod interaction;
 pub mod issues;
+pub mod learning; // Learning insights dashboard commands
 pub mod logging;
+pub mod mcp; // MCP client management and tool calling
 pub mod playwright_settings;
 pub mod project_logs;
+pub mod self_healing_settings;
 pub mod rag;
 pub mod screenshot;
 pub mod screenshots;
+pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
 pub mod storage;
 pub mod task_sync; // renamed from ai_task_reporting
 pub mod testing;
 pub mod tiered_info;
 pub mod verification;
+pub mod hooks;
+pub mod shell_commands; // Shell command management and execution
+pub mod mobile; // Mobile development feedback (ADB, screenshots, logcat)
+pub mod mobile_settings; // Mobile settings (ADB path, device config)
+pub mod recap; // Session recap overview
 pub mod video;
 pub mod websocket;
 
@@ -97,6 +113,8 @@ pub struct AppState {
     /// Run recording handler for automatic workflow execution recording.
     /// Records runs to the Tiered Information system.
     pub run_recording_handler: Arc<RunRecordingHandler>,
+    /// MCP client manager for calling external MCP servers from workflows.
+    pub mcp_client_manager: TokioMutex<McpClientManager>,
 }
 
 /// Standard response structure for command handlers.

@@ -165,7 +165,7 @@ export function ExecutionControlPanel({
     >
       <div className="space-y-3">
         {/* Workflow Selector */}
-        <div className="relative">
+        <div className="relative" data-tutorial-id="workflow-selector">
           <button
             onClick={() => onWorkflowDropdownToggle(!showWorkflowDropdown)}
             disabled={!configLoaded || workflows.length === 0}
@@ -249,7 +249,7 @@ export function ExecutionControlPanel({
         </div>
 
         {/* Monitor Selector */}
-        <div className="space-y-1.5">
+        <div className="space-y-1.5" data-tutorial-id="monitor-selector">
           {selectedWorkflow && (
             <div className="text-[10px] text-muted-foreground">
               {isCalculating ? (
@@ -325,6 +325,7 @@ export function ExecutionControlPanel({
         {/* Start/Stop Buttons */}
         <div className="flex gap-2">
           <button
+            data-tutorial-id="start-execution-button"
             onClick={() => {
               onStartExecution();
               onNavigateToActive?.();

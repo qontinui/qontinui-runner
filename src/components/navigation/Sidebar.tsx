@@ -1,29 +1,27 @@
 /**
  * Sidebar.tsx
  *
- * Collapsible left sidebar navigation for the qontinui-runner application.
+ * Two-level sidebar navigation for the qontinui-runner application.
+ * Uses the shared qontinui-navigation package for navigation structure and state management.
  *
  * Features:
- * - Collapsible sidebar (220px expanded, 56px collapsed icons-only)
- * - 6 collapsible groups: RUN, OBSERVE, BUILD, CONFIGURE, SCHEDULE, SYSTEM
- * - Active state with distinct background and colored left border
- * - Group expand/collapse on header click
+ * - Main sidebar with collapsible groups
+ * - Secondary flyout sidebar that slides out for items with children
+ * - Matches the qontinui-web navigation pattern
  * - Persistent expanded/collapsed state in localStorage
- * - Keyboard navigation (arrow keys, Enter to select)
+ * - Keyboard navigation support
  * - Tooltips on hover when collapsed
- * - Smooth transitions for expand/collapse animations
- * - Indented items for visual grouping (run-specific pages under Run Dashboard)
- *
- * Navigation Structure:
- * - RUN: Execute, Active (unified monitoring), History
- * - OBSERVE: General Logs, Run Dashboard (+ indented run-specific pages), Discoveries
- * - BUILD: Library, Workflows, Scripts, Capture
- * - CONFIGURE: Log Sources, Findings
- * - SCHEDULE: Tasks
- * - SYSTEM: Settings, Help
  */
 
-import { useEffect, useState, useCallback, useRef, KeyboardEvent } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  useReducer,
+  useMemo,
+  KeyboardEvent,
+} from "react";
 import {
   Play,
   Bot,
@@ -43,8 +41,8 @@ import {
   Activity,
   History,
   MousePointer2,
-  // Observe icons
   LayoutDashboard,
+  ClipboardCheck,
   Zap,
   Image,
   ClipboardList,
@@ -52,18 +50,118 @@ import {
   FileSearch,
   BarChart3,
   Cloud,
-  // Configure icons
   FolderOpen,
   Tag,
   Database,
-  // Settings sub-page icons
   User,
   HardDrive,
   Wrench,
   Download,
   Archive,
   FlaskConical,
+  Globe,
+  Code,
+  Puzzle,
+  ShieldCheck,
+  GitBranch,
+  Monitor,
+  Palette,
+  Bell,
+  Key,
+  CreditCard,
+  X,
+  Accessibility,
+  Brain,
+  Webhook,
+  Wifi,
+  Terminal,
 } from "lucide-react";
+
+// Import shared navigation structure and state management
+import {
+  type NavigationItem as SharedNavigationItem,
+  type NavigationGroup as SharedNavigationGroup,
+  type IconName,
+  type NavigationState,
+  type NavigationAction,
+  type AppMode,
+  getRunnerNavigation,
+  getRunnerNavigationForMode,
+  getChildrenForPlatformAndMode,
+  isItemAvailableForMode,
+  findItemById,
+  CHILDREN_MAP,
+  STORAGE_KEYS,
+  createInitialState,
+  navigationReducer,
+  navigationActions,
+  isGroupExpanded,
+  isSecondaryOpenFor,
+  serializeState,
+  deserializeState,
+} from "qontinui-navigation";
+
+// Import ModeSwitcher component
+import { ModeSwitcher } from "./ModeSwitcher";
+
+// ============================================================================
+// Icon Mapping
+// ============================================================================
+
+const ICON_MAP: Record<IconName, LucideIcon> = {
+  Play,
+  Activity,
+  History,
+  Bot,
+  Settings,
+  HelpCircle,
+  ChevronDown,
+  ChevronRight,
+  ScrollText,
+  LayoutDashboard,
+  ClipboardCheck,
+  Zap,
+  Image,
+  ClipboardList,
+  FileText,
+  FileSearch,
+  TestTube,
+  BarChart3,
+  Database,
+  Cloud,
+  BookOpen,
+  Sparkles,
+  MousePointer2,
+  FlaskConical,
+  Camera,
+  GitBranch,
+  Globe,
+  Code,
+  Puzzle,
+  ShieldCheck,
+  FolderOpen,
+  Tag,
+  Calendar,
+  User,
+  HardDrive,
+  Wrench,
+  Download,
+  Archive,
+  Monitor,
+  Palette,
+  Bell,
+  Key,
+  CreditCard,
+  Accessibility,
+  Brain,
+  Webhook,
+  Wifi,
+  Terminal,
+};
+
+function getIconComponent(iconName: IconName): LucideIcon {
+  return ICON_MAP[iconName] || HelpCircle;
+}
 
 // ============================================================================
 // Types
@@ -76,187 +174,80 @@ export interface SidebarProps {
   onCollapsedChange: (collapsed: boolean) => void;
 }
 
-interface NavigationItem {
+interface ResolvedNavigationItem {
   id: string;
   label: string;
   icon: LucideIcon;
-  /** Whether this item should be visually indented (for sub-items) */
-  indent?: boolean;
-  /** If set, this item is a child of another item and will be collapsed with it */
-  parentId?: string;
-  /** If true, this item has children and can be toggled to show/hide them */
+  description?: string;
   hasChildren?: boolean;
+  selectsFirstChild?: boolean;
 }
 
-interface NavigationGroup {
+interface ResolvedNavigationGroup {
   id: string;
   label: string;
-  items: NavigationItem[];
+  items: ResolvedNavigationItem[];
   defaultExpanded?: boolean;
+}
+
+// ============================================================================
+// Navigation Data Transformation
+// ============================================================================
+
+function transformItem(item: SharedNavigationItem): ResolvedNavigationItem {
+  return {
+    id: item.id,
+    label: item.label,
+    icon: getIconComponent(item.icon),
+    description: item.description,
+    hasChildren: item.hasChildren,
+    selectsFirstChild: item.selectsFirstChild,
+  };
+}
+
+function transformGroup(group: SharedNavigationGroup): ResolvedNavigationGroup {
+  return {
+    id: group.id,
+    label: group.label,
+    items: group.items.map(transformItem),
+    defaultExpanded: group.defaultExpanded,
+  };
+}
+
+function getChildItems(parentId: string, mode?: AppMode): ResolvedNavigationItem[] {
+  // If mode is provided, filter children by mode
+  const children = mode
+    ? getChildrenForPlatformAndMode(parentId, "runner", mode)
+    : CHILDREN_MAP[parentId] || [];
+  return children.map(transformItem);
+}
+
+function buildNavigationGroups(mode: AppMode): ResolvedNavigationGroup[] {
+  const sharedGroups = getRunnerNavigationForMode(mode);
+  return sharedGroups.map(transformGroup);
+}
+
+/**
+ * Check if a navigation item ID requires developer mode.
+ * Returns true if the item is only available in developer mode.
+ */
+function requiresDeveloperMode(itemId: string): boolean {
+  const item = findItemById(itemId);
+  if (!item) return false;
+  // If item has modes defined and doesn't include "automation", it requires developer mode
+  if (item.modes && item.modes.length > 0 && !item.modes.includes("automation")) {
+    return true;
+  }
+  return false;
 }
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-const SIDEBAR_COLLAPSED_KEY = "qontinui-sidebar-collapsed";
-const SIDEBAR_GROUPS_KEY = "qontinui-sidebar-groups";
-const SIDEBAR_SUBGROUPS_KEY = "qontinui-sidebar-subgroups";
-
-const SIDEBAR_WIDTH_EXPANDED = 220;
+const SIDEBAR_WIDTH_EXPANDED = 200;
 const SIDEBAR_WIDTH_COLLAPSED = 56;
-
-const NAVIGATION_GROUPS: NavigationGroup[] = [
-  {
-    id: "run",
-    label: "RUN",
-    defaultExpanded: true,
-    items: [
-      { id: "run", label: "Execute", icon: Play },
-      { id: "active", label: "Active", icon: Activity },
-      { id: "history", label: "History", icon: History },
-    ],
-  },
-  {
-    id: "observe",
-    label: "OBSERVE",
-    defaultExpanded: false,
-    items: [
-      // Standalone: General logs (not run-specific)
-      { id: "general-logs", label: "General Logs", icon: ScrollText },
-      // Run Dashboard + collapsible run-specific pages
-      { id: "run-dashboard", label: "Run Dashboard", icon: LayoutDashboard, hasChildren: true },
-      { id: "run-actions", label: "Actions", icon: Zap, indent: true, parentId: "run-dashboard" },
-      {
-        id: "run-image",
-        label: "Image Recognition",
-        icon: Image,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-summary",
-        label: "Summary",
-        icon: ClipboardList,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-findings",
-        label: "Findings",
-        icon: FileText,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-verification",
-        label: "Verification",
-        icon: FileSearch,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-tests",
-        label: "Test Results",
-        icon: TestTube,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-ai-output",
-        label: "AI Output",
-        icon: Bot,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-statistics",
-        label: "Statistics",
-        icon: BarChart3,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      {
-        id: "run-ai-data",
-        label: "AI Data View",
-        icon: Database,
-        indent: true,
-        parentId: "run-dashboard",
-      },
-      // Standalone: Discoveries sync queue
-      { id: "discoveries", label: "Discoveries", icon: Cloud },
-    ],
-  },
-  {
-    id: "build",
-    label: "BUILD",
-    defaultExpanded: false,
-    items: [
-      { id: "library", label: "Library", icon: BookOpen },
-      { id: "workflow-builder", label: "AI Workflows", icon: Sparkles },
-      { id: "gui-workflow-builder", label: "GUI Workflows", icon: MousePointer2 },
-      { id: "script-builder", label: "Scripts", icon: TestTube },
-      { id: "test-builder", label: "Tests", icon: FlaskConical },
-      { id: "capture", label: "Capture", icon: Camera },
-    ],
-  },
-  {
-    id: "configure",
-    label: "CONFIGURE",
-    defaultExpanded: false,
-    items: [
-      { id: "config-log-sources", label: "Log Sources", icon: FolderOpen },
-      { id: "config-findings", label: "Findings", icon: Tag },
-    ],
-  },
-  {
-    id: "schedule",
-    label: "SCHEDULE",
-    defaultExpanded: false,
-    items: [{ id: "tasks", label: "Tasks", icon: Calendar }],
-  },
-  {
-    id: "system",
-    label: "SYSTEM",
-    defaultExpanded: true,
-    items: [
-      { id: "settings", label: "Settings", icon: Settings, hasChildren: true },
-      { id: "settings-account", label: "Account", icon: User, indent: true, parentId: "settings" },
-      { id: "settings-ai", label: "AI Providers", icon: Bot, indent: true, parentId: "settings" },
-      {
-        id: "settings-playwright",
-        label: "Playwright",
-        icon: FlaskConical,
-        indent: true,
-        parentId: "settings",
-      },
-      {
-        id: "settings-general",
-        label: "Preferences",
-        icon: Settings,
-        indent: true,
-        parentId: "settings",
-      },
-      {
-        id: "settings-storage",
-        label: "Storage",
-        icon: HardDrive,
-        indent: true,
-        parentId: "settings",
-      },
-      { id: "settings-backup", label: "Backup", icon: Archive, indent: true, parentId: "settings" },
-      { id: "settings-debug", label: "Debug", icon: Wrench, indent: true, parentId: "settings" },
-      {
-        id: "settings-updates",
-        label: "Updates",
-        icon: Download,
-        indent: true,
-        parentId: "settings",
-      },
-      { id: "help", label: "Help", icon: HelpCircle },
-    ],
-  },
-];
+const FLYOUT_WIDTH = 260;
 
 // ============================================================================
 // Tooltip Component
@@ -270,7 +261,7 @@ interface TooltipProps {
 
 function Tooltip({ content, children, disabled }: TooltipProps) {
   const [visible, setVisible] = useState(false);
-  const [position, setPosition] = useState({ top: 0 });
+  const [position, setPosition] = useState({ top: 0, left: 0 });
   const triggerRef = useRef<HTMLDivElement>(null);
   const timeoutRef = useRef<number | null>(null);
 
@@ -279,7 +270,7 @@ function Tooltip({ content, children, disabled }: TooltipProps) {
     timeoutRef.current = window.setTimeout(() => {
       if (triggerRef.current) {
         const rect = triggerRef.current.getBoundingClientRect();
-        setPosition({ top: rect.top + rect.height / 2 });
+        setPosition({ top: rect.top + rect.height / 2, left: rect.right + 8 });
       }
       setVisible(true);
     }, 200);
@@ -317,7 +308,7 @@ function Tooltip({ content, children, disabled }: TooltipProps) {
                      border border-border rounded-md shadow-lg whitespace-nowrap
                      animate-in fade-in-0 zoom-in-95 duration-100"
           style={{
-            left: SIDEBAR_WIDTH_COLLAPSED + 8,
+            left: position.left,
             top: position.top,
             transform: "translateY(-50%)",
           }}
@@ -334,43 +325,33 @@ function Tooltip({ content, children, disabled }: TooltipProps) {
 // ============================================================================
 
 interface NavItemProps {
-  item: NavigationItem;
+  item: ResolvedNavigationItem;
   isActive: boolean;
+  isParentActive?: boolean;
   collapsed: boolean;
   onClick: () => void;
   onKeyDown: (e: KeyboardEvent) => void;
   tabIndex: number;
   dataNavItem: string;
-  /** For parent items: callback to toggle children visibility */
-  onToggleSubgroup?: () => void;
 }
 
 function NavItem({
   item,
   isActive,
+  isParentActive,
   collapsed,
   onClick,
   onKeyDown,
   tabIndex,
   dataNavItem,
-  onToggleSubgroup,
 }: NavItemProps) {
   const Icon = item.icon;
-  const isIndented = item.indent && !collapsed;
-  const hasChildren = item.hasChildren && !collapsed;
-
-  const handleClick = () => {
-    onClick();
-    // If this is a parent item, also toggle its children
-    if (hasChildren && onToggleSubgroup) {
-      onToggleSubgroup();
-    }
-  };
+  const showActiveState = isActive || isParentActive;
 
   const button = (
     <button
       data-nav-item={dataNavItem}
-      onClick={handleClick}
+      onClick={onClick}
       onKeyDown={onKeyDown}
       tabIndex={tabIndex}
       className={`
@@ -378,9 +359,9 @@ function NavItem({
         transition-all duration-200 outline-none
         focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
         focus-visible:ring-offset-background
-        ${isIndented ? "pl-6 pr-3" : "px-3"}
+        px-3
         ${
-          isActive
+          showActiveState
             ? "bg-primary/15 text-primary border-l-2 border-primary ml-[-1px]"
             : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
         }
@@ -388,10 +369,13 @@ function NavItem({
       `}
       aria-current={isActive ? "page" : undefined}
     >
-      <Icon
-        className={`w-4 h-4 flex-shrink-0 ${isActive ? "text-primary" : ""} ${isIndented ? "w-3.5 h-3.5" : ""}`}
-      />
-      {!collapsed && <span className="truncate">{item.label}</span>}
+      <Icon className={`w-4 h-4 flex-shrink-0 ${showActiveState ? "text-primary" : ""}`} />
+      {!collapsed && (
+        <>
+          <span className="truncate flex-1 text-left">{item.label}</span>
+          {item.hasChildren && <ChevronRight className="w-3 h-3 opacity-50" />}
+        </>
+      )}
     </button>
   );
 
@@ -403,22 +387,83 @@ function NavItem({
 }
 
 // ============================================================================
+// Flyout Item Component (for secondary sidebar)
+// ============================================================================
+
+interface FlyoutItemProps {
+  item: ResolvedNavigationItem;
+  isActive: boolean;
+  onClick: () => void;
+  index: number;
+}
+
+function FlyoutItem({ item, isActive, onClick, index }: FlyoutItemProps) {
+  const Icon = item.icon;
+
+  return (
+    <button
+      onClick={onClick}
+      className={`
+        w-full p-3 rounded-lg flex items-start gap-3 transition-all duration-200 text-left group
+        animate-in fade-in slide-in-from-left-2
+        ${isActive ? "bg-primary/10" : "hover:bg-muted/30"}
+      `}
+      style={{
+        animationDelay: `${index * 30}ms`,
+        animationFillMode: "backwards",
+      }}
+      aria-current={isActive ? "page" : undefined}
+    >
+      {/* Icon */}
+      <div
+        className={`
+          flex-shrink-0 p-2 rounded-lg transition-all duration-200
+          ${isActive ? "bg-primary/15" : "bg-muted/30 group-hover:bg-muted/50"}
+        `}
+      >
+        <Icon
+          className={`w-4 h-4 ${isActive ? "text-primary" : "text-muted-foreground group-hover:text-foreground"}`}
+        />
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 min-w-0 pt-0.5">
+        <div className="flex items-center gap-2">
+          <span
+            className={`
+              font-medium truncate
+              ${isActive ? "text-primary" : "text-muted-foreground group-hover:text-foreground"}
+            `}
+          >
+            {item.label}
+          </span>
+        </div>
+        {item.description && (
+          <p className="text-xs text-muted-foreground/70 mt-0.5 line-clamp-2">{item.description}</p>
+        )}
+      </div>
+
+      {/* Active indicator */}
+      {isActive && <div className="flex-shrink-0 w-1.5 h-1.5 rounded-full bg-primary mt-2" />}
+    </button>
+  );
+}
+
+// ============================================================================
 // Navigation Group Component
 // ============================================================================
 
 interface NavGroupProps {
-  group: NavigationGroup;
+  group: ResolvedNavigationGroup;
   isExpanded: boolean;
   onToggle: () => void;
   activeTab: string;
-  onTabChange: (tab: string) => void;
+  onItemClick: (item: ResolvedNavigationItem) => void;
   collapsed: boolean;
   onKeyDown: (e: KeyboardEvent, itemId: string) => void;
   getTabIndex: (itemId: string) => number;
-  /** State for which subgroups (parent items) are expanded */
-  expandedSubgroups: Record<string, boolean>;
-  /** Callback to toggle a subgroup */
-  onToggleSubgroup: (parentId: string) => void;
+  openFlyoutId: string | null;
+  appMode: AppMode;
 }
 
 function NavGroup({
@@ -426,48 +471,43 @@ function NavGroup({
   isExpanded,
   onToggle,
   activeTab,
-  onTabChange,
+  onItemClick,
   collapsed,
   onKeyDown,
   getTabIndex,
-  expandedSubgroups,
-  onToggleSubgroup,
+  openFlyoutId,
+  appMode,
 }: NavGroupProps) {
   const ChevronIcon = isExpanded ? ChevronDown : ChevronRight;
 
-  // Filter items based on parent expansion state (only when not collapsed sidebar)
-  const visibleItems = collapsed
-    ? group.items
-    : group.items.filter((item) => {
-        // If item has no parent, always show it
-        if (!item.parentId) return true;
-        // If parent is expanded, show the child
-        return expandedSubgroups[item.parentId] ?? false;
-      });
-
-  // In collapsed mode, only show icons without headers
   if (collapsed) {
     return (
       <div className="space-y-1">
-        {visibleItems.map((item) => (
-          <NavItem
-            key={item.id}
-            item={item}
-            isActive={activeTab === item.id}
-            collapsed={collapsed}
-            onClick={() => onTabChange(item.id)}
-            onKeyDown={(e) => onKeyDown(e, item.id)}
-            tabIndex={getTabIndex(item.id)}
-            dataNavItem={item.id}
-          />
-        ))}
+        {group.items.map((item) => {
+          const isParentActive =
+            item.hasChildren &&
+            getChildItems(item.id, appMode).some((child) => child.id === activeTab);
+
+          return (
+            <NavItem
+              key={item.id}
+              item={item}
+              isActive={activeTab === item.id}
+              isParentActive={isParentActive}
+              collapsed={collapsed}
+              onClick={() => onItemClick(item)}
+              onKeyDown={(e) => onKeyDown(e, item.id)}
+              tabIndex={getTabIndex(item.id)}
+              dataNavItem={item.id}
+            />
+          );
+        })}
       </div>
     );
   }
 
   return (
     <div className="space-y-1">
-      {/* Group Header */}
       <button
         onClick={onToggle}
         className="w-full flex items-center justify-between px-2 py-1.5 text-xs
@@ -480,27 +520,134 @@ function NavGroup({
         <ChevronIcon className="w-3 h-3" />
       </button>
 
-      {/* Group Items */}
       <div
         className={`
           space-y-0.5 overflow-hidden transition-all duration-200
           ${isExpanded ? "opacity-100 max-h-[600px]" : "opacity-0 max-h-0"}
         `}
       >
-        {visibleItems.map((item) => (
-          <NavItem
+        {group.items.map((item) => {
+          const isParentActive =
+            item.hasChildren &&
+            getChildItems(item.id, appMode).some((child) => child.id === activeTab);
+          const isFlyoutOpen = openFlyoutId === item.id;
+
+          return (
+            <NavItem
+              key={item.id}
+              item={item}
+              isActive={activeTab === item.id}
+              isParentActive={isParentActive || isFlyoutOpen}
+              collapsed={collapsed}
+              onClick={() => onItemClick(item)}
+              onKeyDown={(e) => onKeyDown(e, item.id)}
+              tabIndex={getTabIndex(item.id)}
+              dataNavItem={item.id}
+            />
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// Flyout Sidebar Component
+// ============================================================================
+
+interface FlyoutSidebarProps {
+  isOpen: boolean;
+  parentId: string | null;
+  parentLabel: string;
+  items: ResolvedNavigationItem[];
+  activeTab: string;
+  onTabChange: (tab: string) => void;
+  onClose: () => void;
+}
+
+function FlyoutSidebar({
+  isOpen,
+  parentLabel,
+  items,
+  activeTab,
+  onTabChange,
+  onClose,
+}: FlyoutSidebarProps) {
+  const flyoutRef = useRef<HTMLDivElement>(null);
+
+  // Handle click outside to close
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (flyoutRef.current && !flyoutRef.current.contains(event.target as Node)) {
+        const sidebar = document.querySelector('[data-sidebar="true"]');
+        if (sidebar && sidebar.contains(event.target as Node)) {
+          return;
+        }
+        onClose();
+      }
+    };
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+
+    if (isOpen) {
+      document.addEventListener("mousedown", handleClickOutside);
+      document.addEventListener("keydown", handleEscape as unknown as EventListener);
+    }
+
+    return () => {
+      document.removeEventListener("mousedown", handleClickOutside);
+      document.removeEventListener("keydown", handleEscape as unknown as EventListener);
+    };
+  }, [isOpen, onClose]);
+
+  return (
+    <div
+      ref={flyoutRef}
+      className={`
+        h-full flex flex-col bg-card border-r border-border/50
+        transition-all duration-300 ease-in-out overflow-hidden
+        ${isOpen ? "opacity-100" : "opacity-0 pointer-events-none"}
+      `}
+      style={{ width: isOpen ? FLYOUT_WIDTH : 0 }}
+    >
+      {/* Header */}
+      <div className="h-12 border-b border-border/50 flex items-center justify-between px-4 bg-gradient-to-r from-primary/5 to-transparent">
+        <div className="flex items-center gap-3">
+          <div className="w-1 h-6 rounded-full bg-primary" />
+          <h2 className="text-sm font-semibold text-foreground">{parentLabel}</h2>
+        </div>
+        <button
+          onClick={onClose}
+          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground
+                     hover:bg-muted/50 transition-colors"
+          aria-label="Close flyout"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* Items */}
+      <div className="flex-1 overflow-y-auto p-3 space-y-1">
+        {items.map((item, index) => (
+          <FlyoutItem
             key={item.id}
             item={item}
             isActive={activeTab === item.id}
-            collapsed={collapsed}
-            onClick={() => onTabChange(item.id)}
-            onKeyDown={(e) => onKeyDown(e, item.id)}
-            tabIndex={getTabIndex(item.id)}
-            dataNavItem={item.id}
-            onToggleSubgroup={item.hasChildren ? () => onToggleSubgroup(item.id) : undefined}
+            onClick={() => {
+              onTabChange(item.id);
+              onClose();
+            }}
+            index={index}
           />
         ))}
       </div>
+
+      {/* Bottom gradient */}
+      <div className="absolute bottom-0 left-0 right-0 h-16 pointer-events-none bg-gradient-to-t from-primary/5 to-transparent" />
     </div>
   );
 }
@@ -510,78 +657,118 @@ function NavGroup({
 // ============================================================================
 
 export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }: SidebarProps) {
-  // Load expanded groups from localStorage
-  const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>(() => {
+  // Use shared navigation state management
+  const [navState, dispatch] = useReducer(navigationReducer, undefined, () => {
     try {
-      const stored = localStorage.getItem(SIDEBAR_GROUPS_KEY);
+      const stored = localStorage.getItem(STORAGE_KEYS.state);
       if (stored) {
-        return JSON.parse(stored);
+        const parsed = deserializeState(stored);
+        if (parsed) {
+          return {
+            activeItemId: activeTab,
+            expandedGroups: parsed.expandedGroups ?? new Set(["run", "system"]),
+            expandedItems: parsed.expandedItems ?? new Set(),
+            secondarySidebar: { isOpen: false, parentId: null, items: [] },
+            isCollapsed: collapsed,
+            appMode: parsed.appMode ?? "developer",
+          };
+        }
       }
     } catch {
-      // Ignore parse errors
+      // Ignore
     }
-    // Default state: use defaultExpanded from groups
-    return NAVIGATION_GROUPS.reduce(
-      (acc, group) => {
-        acc[group.id] = group.defaultExpanded ?? false;
-        return acc;
-      },
-      {} as Record<string, boolean>,
-    );
+    return createInitialState({
+      activeItemId: activeTab,
+      isCollapsed: collapsed,
+      appMode: "developer",
+    });
   });
 
-  // Load expanded subgroups (parent items like "Run Dashboard") from localStorage
-  const [expandedSubgroups, setExpandedSubgroups] = useState<Record<string, boolean>>(() => {
-    try {
-      const stored = localStorage.getItem(SIDEBAR_SUBGROUPS_KEY);
-      if (stored) {
-        return JSON.parse(stored);
-      }
-    } catch {
-      // Ignore parse errors
-    }
-    // Default: Run Dashboard and Settings are expanded
-    return { "run-dashboard": true, settings: true };
-  });
+  // Get current app mode from state
+  const appMode = navState.appMode;
 
-  // Track focused item for keyboard navigation
+  // Build navigation groups based on current mode
+  const navigationGroups = useMemo(() => buildNavigationGroups(appMode), [appMode]);
+
+  // Handle mode change
+  const handleModeChange = useCallback((mode: AppMode) => {
+    dispatch(navigationActions.setAppMode(mode));
+  }, []);
+
+  // Auto-switch to developer mode when active tab requires it
+  useEffect(() => {
+    if (appMode === "automation" && requiresDeveloperMode(activeTab)) {
+      dispatch(navigationActions.setAppMode("developer"));
+    }
+  }, [activeTab, appMode]);
+
+  // Flyout state
+  const [openFlyout, setOpenFlyout] = useState<{
+    id: string;
+    label: string;
+    items: ResolvedNavigationItem[];
+  } | null>(null);
+
   const [focusedItemId, setFocusedItemId] = useState<string | null>(null);
 
-  // Persist expanded groups
+  // Persist state changes
   useEffect(() => {
-    localStorage.setItem(SIDEBAR_GROUPS_KEY, JSON.stringify(expandedGroups));
-  }, [expandedGroups]);
+    localStorage.setItem(STORAGE_KEYS.state, serializeState(navState));
+  }, [navState]);
 
-  // Persist expanded subgroups
-  useEffect(() => {
-    localStorage.setItem(SIDEBAR_SUBGROUPS_KEY, JSON.stringify(expandedSubgroups));
-  }, [expandedSubgroups]);
-
-  // Toggle group expansion
   const toggleGroup = useCallback((groupId: string) => {
-    setExpandedGroups((prev) => ({
-      ...prev,
-      [groupId]: !prev[groupId],
-    }));
+    dispatch(navigationActions.toggleGroup(groupId));
   }, []);
 
-  // Toggle subgroup expansion (for parent items like Run Dashboard)
-  const toggleSubgroup = useCallback((parentId: string) => {
-    setExpandedSubgroups((prev) => ({
-      ...prev,
-      [parentId]: !prev[parentId],
-    }));
-  }, []);
-
-  // Flatten items for keyboard navigation
-  const flattenedItems = NAVIGATION_GROUPS.flatMap((group) =>
-    group.items.map((item) => ({
-      ...item,
-      groupId: group.id,
-    })),
+  const openFlyoutSidebar = useCallback(
+    (item: ResolvedNavigationItem) => {
+      const children = getChildItems(item.id, appMode);
+      setOpenFlyout({
+        id: item.id,
+        label: item.label,
+        items: children,
+      });
+    },
+    [appMode],
   );
 
-  // Handle keyboard navigation
+  const closeFlyout = useCallback(() => {
+    setOpenFlyout(null);
+  }, []);
+
+  const handleItemClick = useCallback(
+    (item: ResolvedNavigationItem) => {
+      if (item.hasChildren) {
+        if (openFlyout?.id === item.id) {
+          closeFlyout();
+        } else {
+          openFlyoutSidebar(item);
+          if (item.selectsFirstChild) {
+            const children = getChildItems(item.id, appMode);
+            if (children.length > 0) {
+              onTabChange(children[0].id);
+            }
+          }
+        }
+      } else {
+        onTabChange(item.id);
+        closeFlyout();
+      }
+    },
+    [openFlyout, closeFlyout, openFlyoutSidebar, onTabChange, appMode],
+  );
+
+  const flattenedItems = useMemo(
+    () =>
+      navigationGroups.flatMap((group) =>
+        group.items.map((item) => ({
+          ...item,
+          groupId: group.id,
+        })),
+      ),
+    [navigationGroups],
+  );
+
   const handleKeyDown = useCallback(
     (e: KeyboardEvent, currentItemId: string) => {
       const currentIndex = flattenedItems.findIndex((item) => item.id === currentItemId);
@@ -593,9 +780,8 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
           const nextItem = flattenedItems[nextIndex];
           if (nextItem) {
             setFocusedItemId(nextItem.id);
-            // Ensure group is expanded
-            if (!expandedGroups[nextItem.groupId] && !collapsed) {
-              setExpandedGroups((prev) => ({ ...prev, [nextItem.groupId]: true }));
+            if (!isGroupExpanded(navState, nextItem.groupId) && !collapsed) {
+              dispatch(navigationActions.expandGroup(nextItem.groupId));
             }
           }
           break;
@@ -606,47 +792,49 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
           const prevItem = flattenedItems[prevIndex];
           if (prevItem) {
             setFocusedItemId(prevItem.id);
-            // Ensure group is expanded
-            if (!expandedGroups[prevItem.groupId] && !collapsed) {
-              setExpandedGroups((prev) => ({ ...prev, [prevItem.groupId]: true }));
+            if (!isGroupExpanded(navState, prevItem.groupId) && !collapsed) {
+              dispatch(navigationActions.expandGroup(prevItem.groupId));
             }
+          }
+          break;
+        }
+        case "ArrowRight": {
+          e.preventDefault();
+          const currentItem = flattenedItems[currentIndex];
+          if (currentItem?.hasChildren) {
+            openFlyoutSidebar(currentItem);
+          }
+          break;
+        }
+        case "ArrowLeft": {
+          e.preventDefault();
+          if (openFlyout) {
+            closeFlyout();
           }
           break;
         }
         case "Enter":
         case " ": {
           e.preventDefault();
-          onTabChange(currentItemId);
-          break;
-        }
-        case "Home": {
-          e.preventDefault();
-          const firstItem = flattenedItems[0];
-          if (firstItem) {
-            setFocusedItemId(firstItem.id);
-            if (!expandedGroups[firstItem.groupId] && !collapsed) {
-              setExpandedGroups((prev) => ({ ...prev, [firstItem.groupId]: true }));
-            }
-          }
-          break;
-        }
-        case "End": {
-          e.preventDefault();
-          const lastItem = flattenedItems[flattenedItems.length - 1];
-          if (lastItem) {
-            setFocusedItemId(lastItem.id);
-            if (!expandedGroups[lastItem.groupId] && !collapsed) {
-              setExpandedGroups((prev) => ({ ...prev, [lastItem.groupId]: true }));
-            }
+          const currentItem = flattenedItems[currentIndex];
+          if (currentItem) {
+            handleItemClick(currentItem);
           }
           break;
         }
       }
     },
-    [flattenedItems, expandedGroups, collapsed, onTabChange],
+    [
+      flattenedItems,
+      navState,
+      collapsed,
+      openFlyout,
+      openFlyoutSidebar,
+      closeFlyout,
+      handleItemClick,
+    ],
   );
 
-  // Focus management effect
   useEffect(() => {
     if (focusedItemId) {
       const element = document.querySelector(
@@ -656,7 +844,6 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
     }
   }, [focusedItemId]);
 
-  // Get tab index for an item (first item gets 0, rest get -1 for roving tabindex)
   const getTabIndex = useCallback(
     (itemId: string) => {
       const firstItem = flattenedItems[0];
@@ -666,60 +853,81 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
   );
 
   return (
-    <nav
-      className={`
-        h-full flex flex-col bg-card border-r border-border/50
-        transition-all duration-300 ease-in-out
-      `}
-      style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
-      aria-label="Main navigation"
-    >
-      {/* Navigation Groups */}
-      <div className="flex-1 overflow-y-auto py-4 px-2 space-y-4">
-        {NAVIGATION_GROUPS.map((group) => (
-          <NavGroup
-            key={group.id}
-            group={group}
-            isExpanded={collapsed || expandedGroups[group.id]}
-            onToggle={() => toggleGroup(group.id)}
-            activeTab={activeTab}
-            onTabChange={onTabChange}
-            collapsed={collapsed}
-            onKeyDown={handleKeyDown}
-            getTabIndex={getTabIndex}
-            expandedSubgroups={expandedSubgroups}
-            onToggleSubgroup={toggleSubgroup}
-          />
-        ))}
-      </div>
+    <div className="flex h-full" data-sidebar="true">
+      {/* Main Sidebar */}
+      <nav
+        data-tutorial-id="sidebar"
+        className={`
+          h-full flex flex-col bg-card border-r border-border/50
+          transition-all duration-300 ease-in-out flex-shrink-0
+        `}
+        style={{ width: collapsed ? SIDEBAR_WIDTH_COLLAPSED : SIDEBAR_WIDTH_EXPANDED }}
+        aria-label="Main navigation"
+      >
+        {/* Mode Switcher */}
+        <ModeSwitcher mode={appMode} onModeChange={handleModeChange} collapsed={collapsed} />
 
-      {/* Collapse Toggle Button */}
-      <div className="border-t border-border/50 p-2">
-        <Tooltip content={collapsed ? "Expand sidebar" : "Collapse sidebar"} disabled={!collapsed}>
-          <button
-            onClick={() => onCollapsedChange(!collapsed)}
-            className={`
-              w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm
-              text-muted-foreground hover:text-foreground hover:bg-muted/30
-              transition-colors outline-none
-              focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
-              focus-visible:ring-offset-background
-              ${collapsed ? "justify-center px-0" : ""}
-            `}
-            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        {/* Navigation Groups */}
+        <div className="flex-1 overflow-y-auto py-2 px-2 space-y-4">
+          {navigationGroups.map((group) => (
+            <NavGroup
+              key={group.id}
+              group={group}
+              isExpanded={collapsed || isGroupExpanded(navState, group.id)}
+              onToggle={() => toggleGroup(group.id)}
+              activeTab={activeTab}
+              onItemClick={handleItemClick}
+              collapsed={collapsed}
+              onKeyDown={handleKeyDown}
+              getTabIndex={getTabIndex}
+              openFlyoutId={openFlyout?.id ?? null}
+              appMode={appMode}
+            />
+          ))}
+        </div>
+
+        {/* Collapse Toggle Button */}
+        <div className="border-t border-border/50 p-2">
+          <Tooltip
+            content={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            disabled={!collapsed}
           >
-            {collapsed ? (
-              <PanelLeft className="w-4 h-4" />
-            ) : (
-              <>
-                <PanelLeftClose className="w-4 h-4" />
-                <span>Collapse</span>
-              </>
-            )}
-          </button>
-        </Tooltip>
-      </div>
-    </nav>
+            <button
+              onClick={() => onCollapsedChange(!collapsed)}
+              className={`
+                w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm
+                text-muted-foreground hover:text-foreground hover:bg-muted/30
+                transition-colors outline-none
+                focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2
+                focus-visible:ring-offset-background
+                ${collapsed ? "justify-center px-0" : ""}
+              `}
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              {collapsed ? (
+                <PanelLeft className="w-4 h-4" />
+              ) : (
+                <>
+                  <PanelLeftClose className="w-4 h-4" />
+                  <span>Collapse</span>
+                </>
+              )}
+            </button>
+          </Tooltip>
+        </div>
+      </nav>
+
+      {/* Flyout Sidebar */}
+      <FlyoutSidebar
+        isOpen={!!openFlyout}
+        parentId={openFlyout?.id ?? null}
+        parentLabel={openFlyout?.label ?? ""}
+        items={openFlyout?.items ?? []}
+        activeTab={activeTab}
+        onTabChange={onTabChange}
+        onClose={closeFlyout}
+      />
+    </div>
   );
 }
 
@@ -730,7 +938,7 @@ export function Sidebar({ activeTab, onTabChange, collapsed, onCollapsedChange }
 export function useSidebarState() {
   const [collapsed, setCollapsed] = useState<boolean>(() => {
     try {
-      const stored = localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+      const stored = localStorage.getItem(STORAGE_KEYS.collapsed);
       return stored ? JSON.parse(stored) : false;
     } catch {
       return false;
@@ -739,7 +947,7 @@ export function useSidebarState() {
 
   const handleCollapsedChange = useCallback((value: boolean) => {
     setCollapsed(value);
-    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(value));
+    localStorage.setItem(STORAGE_KEYS.collapsed, JSON.stringify(value));
   }, []);
 
   return {

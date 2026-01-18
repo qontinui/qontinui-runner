@@ -3,6 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use tracing::{error, info};
 
+use crate::ai_router::RoutingConfig;
+use crate::orchestrator::{CompressionConfig, RetryConfig};
+
 const SETTINGS_FILE: &str = "settings.json";
 
 // ============================================================================
@@ -37,6 +40,10 @@ pub struct ClaudeCliSettings {
     pub execution_mode: CliExecutionMode,
     pub custom_path: Option<String>, // Custom path to claude executable
     pub timeout_seconds: u64,
+    /// Custom CLAUDE_CONFIG_DIR for multi-account support
+    /// e.g., "C:\\Users\\Name\\.claude-work" or "/home/user/.claude-personal"
+    #[serde(default)]
+    pub config_dir: Option<String>,
 }
 
 impl Default for ClaudeCliSettings {
@@ -45,6 +52,7 @@ impl Default for ClaudeCliSettings {
             execution_mode: CliExecutionMode::Auto,
             custom_path: None,
             timeout_seconds: 600,
+            config_dir: None,
         }
     }
 }
@@ -82,7 +90,7 @@ pub struct GeminiCliSettings {
     pub custom_path: Option<String>, // Custom path to gemini executable
     pub timeout_seconds: u64,
     pub auth_method: GeminiAuthMethod,
-    pub model: String, // Model to use (e.g., "gemini-2.5-flash")
+    pub model: String, // Model to use (e.g., "gemini-3-flash-preview")
 }
 
 impl Default for GeminiCliSettings {
@@ -92,7 +100,7 @@ impl Default for GeminiCliSettings {
             custom_path: None,
             timeout_seconds: 600,
             auth_method: GeminiAuthMethod::OAuth,
-            model: "gemini-3-flash".to_string(),
+            model: "gemini-3-flash-preview".to_string(),
         }
     }
 }
@@ -109,7 +117,7 @@ pub struct GeminiApiSettings {
 impl Default for GeminiApiSettings {
     fn default() -> Self {
         Self {
-            model: "gemini-3-flash".to_string(),
+            model: "gemini-3-flash-preview".to_string(),
             max_output_tokens: 8192,
             temperature: 0.7,
         }
@@ -129,6 +137,15 @@ pub struct AiSettings {
     /// Default iteration threshold for including video in auto-refine (0 = never)
     #[serde(default = "default_auto_refine_video_after_iterations")]
     pub auto_refine_video_after_iterations: u32,
+    /// Memory compression configuration for context management
+    #[serde(default)]
+    pub compression: CompressionConfig,
+    /// Retry configuration for handling transient failures
+    #[serde(default)]
+    pub retry: RetryConfig,
+    /// Task routing configuration for model selection based on complexity
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 fn default_auto_refine_video_after_iterations() -> u32 {
@@ -144,6 +161,9 @@ impl Default for AiSettings {
             gemini_cli: GeminiCliSettings::default(),
             gemini_api: GeminiApiSettings::default(),
             auto_refine_video_after_iterations: default_auto_refine_video_after_iterations(),
+            compression: CompressionConfig::default(),
+            retry: RetryConfig::default(),
+            routing: RoutingConfig::default(),
         }
     }
 }
@@ -183,6 +203,323 @@ impl Default for PlaywrightSettings {
             skip_web_server: default_skip_web_server(),
         }
     }
+}
+
+// ============================================================================
+// Self-Healing Settings
+// ============================================================================
+
+/// LLM mode for self-healing operations
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfHealingLlmMode {
+    #[default]
+    Disabled,   // No LLM assistance
+    LocalOllama, // Use local Ollama instance
+    RemoteApi,   // Use remote API (OpenAI/Anthropic)
+}
+
+/// API provider for remote LLM
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfHealingApiProvider {
+    #[default]
+    OpenAi,
+    Anthropic,
+}
+
+/// Settings for self-healing automation features
+/// These settings are passed to the qontinui Python library when executing workflows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfHealingSettings {
+    /// Enable action caching to avoid redundant operations
+    #[serde(default = "default_action_caching_enabled")]
+    pub action_caching_enabled: bool,
+    /// Cache TTL in seconds (how long cached actions remain valid)
+    #[serde(default = "default_cache_ttl_seconds")]
+    pub cache_ttl_seconds: u32,
+    /// Enable visual validation of actions
+    #[serde(default = "default_visual_validation_enabled")]
+    pub visual_validation_enabled: bool,
+    /// LLM mode for self-healing assistance
+    #[serde(default)]
+    pub llm_mode: SelfHealingLlmMode,
+    /// Ollama model name (used when llm_mode is LocalOllama)
+    #[serde(default = "default_ollama_model")]
+    pub ollama_model: String,
+    /// API provider (used when llm_mode is RemoteApi)
+    #[serde(default)]
+    pub api_provider: SelfHealingApiProvider,
+    // Note: API key stored separately in OS keychain
+}
+
+fn default_action_caching_enabled() -> bool {
+    true
+}
+
+fn default_cache_ttl_seconds() -> u32 {
+    300 // 5 minutes
+}
+
+fn default_visual_validation_enabled() -> bool {
+    true
+}
+
+fn default_ollama_model() -> String {
+    "llava".to_string()
+}
+
+impl Default for SelfHealingSettings {
+    fn default() -> Self {
+        Self {
+            action_caching_enabled: default_action_caching_enabled(),
+            cache_ttl_seconds: default_cache_ttl_seconds(),
+            visual_validation_enabled: default_visual_validation_enabled(),
+            llm_mode: SelfHealingLlmMode::default(),
+            ollama_model: default_ollama_model(),
+            api_provider: SelfHealingApiProvider::default(),
+        }
+    }
+}
+
+// ============================================================================
+// Accessibility Settings
+// ============================================================================
+
+/// Settings for accessibility capture and Chrome DevTools Protocol
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessibilitySettings {
+    /// Path to Chrome/Chromium executable for launching with remote debugging
+    /// If None, will try to auto-detect common installation paths
+    pub chrome_path: Option<String>,
+    /// Default CDP port for remote debugging (default: 9222)
+    #[serde(default = "default_cdp_port")]
+    pub cdp_port: u16,
+}
+
+fn default_cdp_port() -> u16 {
+    9222
+}
+
+impl Default for AccessibilitySettings {
+    fn default() -> Self {
+        Self {
+            chrome_path: None, // Auto-detect
+            cdp_port: default_cdp_port(),
+        }
+    }
+}
+
+// ============================================================================
+// Mobile Settings
+// ============================================================================
+
+/// Settings for mobile development feedback (ADB, Android devices)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileSettings {
+    /// Custom path to ADB executable (None = auto-detect)
+    /// Example: "C:\\Users\\Name\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe"
+    #[serde(default)]
+    pub adb_path: Option<String>,
+
+    /// Default device ID to use when multiple devices are connected (None = use first)
+    #[serde(default)]
+    pub default_device_id: Option<String>,
+
+    /// App package name for filtering logcat output
+    /// Example: "com.myapp" or "com.myapp.debug"
+    #[serde(default)]
+    pub app_package: Option<String>,
+
+    /// Default number of logcat lines to capture
+    #[serde(default = "default_logcat_lines")]
+    pub logcat_lines: u32,
+
+    /// Filter to React Native / Metro logs only when capturing logcat
+    #[serde(default)]
+    pub filter_react_native: bool,
+
+    /// Custom output directory for mobile captures (screenshots, logs)
+    /// If None, uses the project's screenshot/log directory
+    #[serde(default)]
+    pub output_dir: Option<String>,
+}
+
+fn default_logcat_lines() -> u32 {
+    500
+}
+
+impl Default for MobileSettings {
+    fn default() -> Self {
+        Self {
+            adb_path: None,
+            default_device_id: None,
+            app_package: None,
+            logcat_lines: default_logcat_lines(),
+            filter_react_native: false,
+            output_dir: None,
+        }
+    }
+}
+
+// ============================================================================
+// Global Log Source Settings
+// ============================================================================
+
+/// AI selection mode for log sources
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogSourceAiSelectionMode {
+    /// AI selects relevant sources at the start of each verification round
+    #[default]
+    Dynamic,
+    /// AI selects relevant sources once at workflow setup
+    Static,
+    /// No AI selection - use explicit profile or all enabled sources
+    Disabled,
+}
+
+/// Category for log sources to help AI understand their purpose
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogSourceCategory {
+    /// Web frontend logs (Next.js, React, Vite, etc.)
+    Frontend,
+    /// Web backend logs (FastAPI, Express, Django, etc.)
+    Backend,
+    /// API/service logs
+    Api,
+    /// Mobile app logs (logcat, Metro bundler, etc.)
+    Mobile,
+    /// Database logs
+    Database,
+    /// Build/CI logs
+    Build,
+    /// Test runner logs (Playwright, Jest, pytest, etc.)
+    Testing,
+    /// Qontinui runner internal logs
+    Runner,
+    /// General/uncategorized logs
+    #[default]
+    General,
+}
+
+/// A single global log source configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalLogSource {
+    /// Unique identifier
+    pub id: String,
+    /// Human-readable name (e.g., "Backend", "Metro Bundler")
+    pub name: String,
+    /// Description for AI to understand what this source contains
+    /// e.g., "FastAPI backend logs including HTTP requests and errors"
+    pub description: String,
+    /// Category to help AI filter relevant sources
+    #[serde(default)]
+    pub category: LogSourceCategory,
+    /// Type: "file" or "directory"
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// Absolute path to log file or directory
+    pub path: String,
+    /// Glob pattern for directory type (e.g., "*.log")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Number of lines to tail (default: 100)
+    #[serde(default = "default_tail_lines")]
+    pub tail_lines: u32,
+    /// Whether this source is globally enabled
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Optional color for UI display
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Keywords that help AI identify when this source is relevant
+    /// e.g., ["python", "fastapi", "http", "api"]
+    #[serde(default)]
+    pub keywords: Vec<String>,
+}
+
+fn default_tail_lines() -> u32 {
+    100
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A named profile grouping log source IDs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalLogSourceProfile {
+    /// Unique identifier
+    pub id: String,
+    /// Human-readable name (e.g., "Web Development", "Mobile Development")
+    pub name: String,
+    /// Description of what this profile is for
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// IDs of log sources included in this profile
+    pub source_ids: Vec<String>,
+    /// When this profile was created
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    /// When this profile was last modified
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Global log source settings - shared across all projects
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobalLogSourceSettings {
+    /// All available log sources
+    #[serde(default)]
+    pub sources: Vec<GlobalLogSource>,
+    /// Named profiles for grouping sources
+    #[serde(default)]
+    pub profiles: Vec<GlobalLogSourceProfile>,
+    /// Default profile to use when no explicit selection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_profile_id: Option<String>,
+    /// How AI should select relevant log sources
+    #[serde(default)]
+    pub ai_selection_mode: LogSourceAiSelectionMode,
+    /// Whether to include all enabled sources when AI selection is disabled and no profile is set
+    #[serde(default = "default_true")]
+    pub include_all_when_no_profile: bool,
+}
+
+impl Default for GlobalLogSourceSettings {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            profiles: Vec::new(),
+            default_profile_id: None,
+            ai_selection_mode: LogSourceAiSelectionMode::Dynamic,
+            include_all_when_no_profile: true,
+        }
+    }
+}
+
+// ============================================================================
+// Path Settings
+// ============================================================================
+
+/// Configurable paths for file system operations.
+///
+/// All paths have sensible cross-platform defaults but can be overridden
+/// for development or custom deployments.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PathSettings {
+    /// Base directory for development/debug logs (JSONL files, screenshots, etc.)
+    ///
+    /// Default (when None):
+    /// - Windows: `C:\Users\<user>\AppData\Local\qontinui-runner\dev-logs`
+    /// - macOS: `~/Library/Application Support/qontinui-runner/dev-logs`
+    /// - Linux: `~/.local/share/qontinui-runner/dev-logs`
+    ///
+    /// Override example: `D:\qontinui_parent_directory\.dev-logs`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_logs_dir: Option<String>,
 }
 
 // ============================================================================
@@ -233,6 +570,16 @@ pub struct Settings {
     pub ai: AiSettings,
     #[serde(default)]
     pub playwright: PlaywrightSettings,
+    #[serde(default)]
+    pub accessibility: AccessibilitySettings,
+    #[serde(default)]
+    pub self_healing: SelfHealingSettings,
+    #[serde(default)]
+    pub paths: PathSettings,
+    #[serde(default)]
+    pub mobile: MobileSettings,
+    #[serde(default)]
+    pub log_sources: GlobalLogSourceSettings,
 }
 
 fn default_auto_load_last_config() -> bool {
@@ -456,4 +803,159 @@ pub fn save_session_auto_fix_on_failure(enabled: bool) -> Result<(), String> {
     settings.session_auto_fix_on_failure = enabled;
     save_settings(&settings)?;
     Ok(())
+}
+
+/// Get the current Accessibility settings
+pub fn get_accessibility_settings() -> AccessibilitySettings {
+    let settings = load_settings();
+    settings.accessibility
+}
+
+/// Save Accessibility settings
+pub fn save_accessibility_settings(accessibility_settings: AccessibilitySettings) -> Result<(), String> {
+    info!("Saving Accessibility settings: {:?}", accessibility_settings);
+    let mut settings = load_settings();
+    settings.accessibility = accessibility_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the current Self-Healing settings
+pub fn get_self_healing_settings() -> SelfHealingSettings {
+    let settings = load_settings();
+    settings.self_healing
+}
+
+/// Save Self-Healing settings
+pub fn save_self_healing_settings(self_healing_settings: SelfHealingSettings) -> Result<(), String> {
+    info!("Saving Self-Healing settings: {:?}", self_healing_settings);
+    let mut settings = load_settings();
+    settings.self_healing = self_healing_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+// ============================================================================
+// Path Settings
+// ============================================================================
+
+/// Get the current Path settings
+pub fn get_path_settings() -> PathSettings {
+    let settings = load_settings();
+    settings.paths
+}
+
+/// Get the dev_logs_dir override (used by paths module)
+pub fn get_dev_logs_dir_override() -> Option<String> {
+    let settings = load_settings();
+    settings.paths.dev_logs_dir
+}
+
+/// Save Path settings
+pub fn save_path_settings(path_settings: PathSettings) -> Result<(), String> {
+    info!("Saving Path settings: {:?}", path_settings);
+    let mut settings = load_settings();
+    settings.paths = path_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Save the dev_logs_dir override
+pub fn save_dev_logs_dir(dev_logs_dir: Option<String>) -> Result<(), String> {
+    info!("Saving dev_logs_dir: {:?}", dev_logs_dir);
+    let mut settings = load_settings();
+    settings.paths.dev_logs_dir = dev_logs_dir;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+// ============================================================================
+// Mobile Settings
+// ============================================================================
+
+/// Get the current Mobile settings
+pub fn get_mobile_settings() -> MobileSettings {
+    let settings = load_settings();
+    settings.mobile
+}
+
+/// Save Mobile settings
+pub fn save_mobile_settings(mobile_settings: MobileSettings) -> Result<(), String> {
+    info!("Saving Mobile settings: {:?}", mobile_settings);
+    let mut settings = load_settings();
+    settings.mobile = mobile_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+// ============================================================================
+// Global Log Source Settings
+// ============================================================================
+
+/// Get the current Global Log Source settings
+pub fn get_global_log_source_settings() -> GlobalLogSourceSettings {
+    let settings = load_settings();
+    settings.log_sources
+}
+
+/// Save Global Log Source settings
+pub fn save_global_log_source_settings(
+    log_source_settings: GlobalLogSourceSettings,
+) -> Result<(), String> {
+    info!(
+        "Saving Global Log Source settings: {} sources, {} profiles",
+        log_source_settings.sources.len(),
+        log_source_settings.profiles.len()
+    );
+    let mut settings = load_settings();
+    settings.log_sources = log_source_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get enabled log sources, optionally filtered by profile
+pub fn get_enabled_log_sources(profile_id: Option<&str>) -> Vec<GlobalLogSource> {
+    let settings = get_global_log_source_settings();
+
+    // If profile specified, filter by profile's source_ids
+    if let Some(pid) = profile_id {
+        if let Some(profile) = settings.profiles.iter().find(|p| p.id == pid) {
+            return settings
+                .sources
+                .into_iter()
+                .filter(|s| s.enabled && profile.source_ids.contains(&s.id))
+                .collect();
+        }
+    }
+
+    // If default profile is set and no explicit profile, use default
+    if let Some(default_pid) = &settings.default_profile_id {
+        if let Some(profile) = settings.profiles.iter().find(|p| p.id == *default_pid) {
+            return settings
+                .sources
+                .into_iter()
+                .filter(|s| s.enabled && profile.source_ids.contains(&s.id))
+                .collect();
+        }
+    }
+
+    // Fall back to all enabled sources if configured to do so
+    if settings.include_all_when_no_profile {
+        settings.sources.into_iter().filter(|s| s.enabled).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Get log sources for AI selection prompt
+/// Returns sources with their descriptions and categories for AI to choose from
+pub fn get_log_sources_for_ai_selection() -> Vec<GlobalLogSource> {
+    let settings = get_global_log_source_settings();
+    settings.sources.into_iter().filter(|s| s.enabled).collect()
+}
+
+/// Get the AI selection mode
+pub fn get_log_source_ai_selection_mode() -> LogSourceAiSelectionMode {
+    let settings = get_global_log_source_settings();
+    settings.ai_selection_mode
 }

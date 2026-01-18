@@ -1,300 +1,502 @@
 /**
  * BackupSettings.tsx
  *
- * Backup and restore functionality for user data including:
- * - Settings
- * - Prompts
- * - Playwright Scripts
- * - AI Workflows
+ * Comprehensive backup and restore functionality for all user data including:
+ * - Flows (orchestrator_flows)
+ * - Flow executions (flow_executions)
+ * - Checkpoints (orchestrator_checkpoints)
+ * - Learning outcomes and patterns
+ * - Settings, prompts, AI workflows
+ * - Verification tests, scheduled tasks, and more
  */
 
-import { useState } from "react";
-import { Archive, Download, Upload, FileArchive, AlertCircle, CheckCircle } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  Archive,
+  Download,
+  Upload,
+  FileArchive,
+  AlertCircle,
+  CheckCircle,
+  Database,
+  Settings,
+  ChevronDown,
+  ChevronUp,
+} from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import type { LogFunction } from "./types";
 
-const API_BASE = "http://localhost:9876";
-
-interface BackupResult {
-  success: boolean;
-  files_backed_up: string[];
-  errors: string[];
-}
-
-interface RestoreResult {
-  success: boolean;
-  files_restored: string[];
-  errors: string[];
-  backup_version: string;
-  backup_date: string;
-}
-
-interface BackupManifest {
+// Types for comprehensive export/import
+interface ExportManifest {
   version: string;
   created_at: string;
   app_version: string;
-  files: {
-    name: string;
-    original_path: string;
-    size: number;
-  }[];
 }
 
-interface BackupResponse {
-  data: string; // Base64-encoded ZIP
-  filename: string;
-  result: BackupResult;
+interface ExportSummary {
+  flows: number;
+  flow_executions: number;
+  checkpoints: number;
+  learning_outcomes: number;
+  learning_patterns: number;
+  settings: number;
+  prompts: number;
+  ai_workflows: number;
+  unified_workflows: number;
+  verification_tests: number;
+  task_hooks: number;
+  scheduled_tasks: number;
+  saved_api_requests: number;
+  configs: number;
 }
 
-interface ApiResponse<T> {
+interface ComprehensiveExport {
+  manifest: ExportManifest;
+  summary: ExportSummary;
+  flows: unknown[];
+  flow_executions: unknown[];
+  checkpoints: unknown[];
+  learning_outcomes: unknown[];
+  learning_patterns: unknown[];
+  settings: unknown[];
+  prompts: unknown[];
+  ai_workflows: unknown[];
+  unified_workflows: unknown[];
+  verification_tests: unknown[];
+  task_hooks: unknown[];
+  scheduled_tasks: unknown[];
+  saved_api_requests: unknown[];
+  configs: unknown[];
+}
+
+interface ExportOptions {
+  flows: boolean;
+  flow_executions: boolean;
+  checkpoints: boolean;
+  learning_outcomes: boolean;
+  learning_patterns: boolean;
+  settings: boolean;
+  prompts: boolean;
+  ai_workflows: boolean;
+  unified_workflows: boolean;
+  verification_tests: boolean;
+  task_hooks: boolean;
+  scheduled_tasks: boolean;
+  saved_api_requests: boolean;
+  configs: boolean;
+}
+
+interface ImportOptions {
+  conflict_mode: "skip" | "overwrite";
+  flows: boolean;
+  flow_executions: boolean;
+  checkpoints: boolean;
+  learning_outcomes: boolean;
+  learning_patterns: boolean;
+  settings: boolean;
+  prompts: boolean;
+  ai_workflows: boolean;
+  unified_workflows: boolean;
+  verification_tests: boolean;
+  task_hooks: boolean;
+  scheduled_tasks: boolean;
+  saved_api_requests: boolean;
+  configs: boolean;
+}
+
+interface ImportResult {
+  imported: number;
+  skipped: number;
+  errors: string[];
+}
+
+interface ComprehensiveImportResult {
   success: boolean;
-  data?: T;
-  message?: string;
+  results: Record<string, ImportResult>;
+  total_imported: number;
+  total_skipped: number;
+  total_errors: number;
+}
+
+interface ImportPreview {
+  manifest: ExportManifest;
+  counts: ExportSummary;
+  is_compatible: boolean;
+  compatibility_issues: string[];
 }
 
 interface BackupSettingsProps {
   onLog: LogFunction;
 }
 
-export function BackupSettings({ onLog }: BackupSettingsProps) {
-  const [isCreatingBackup, setIsCreatingBackup] = useState(false);
-  const [isRestoring, setIsRestoring] = useState(false);
-  const [lastBackupResult, setLastBackupResult] = useState<BackupResult | null>(null);
-  const [lastRestoreResult, setLastRestoreResult] = useState<RestoreResult | null>(null);
-  const [previewManifest, setPreviewManifest] = useState<BackupManifest | null>(null);
+const defaultExportOptions: ExportOptions = {
+  flows: true,
+  flow_executions: true,
+  checkpoints: true,
+  learning_outcomes: true,
+  learning_patterns: true,
+  settings: true,
+  prompts: true,
+  ai_workflows: true,
+  unified_workflows: true,
+  verification_tests: true,
+  task_hooks: true,
+  scheduled_tasks: true,
+  saved_api_requests: true,
+  configs: true,
+};
 
-  const handleCreateBackup = async () => {
-    setIsCreatingBackup(true);
-    setLastBackupResult(null);
+const defaultImportOptions: ImportOptions = {
+  conflict_mode: "skip",
+  flows: true,
+  flow_executions: false, // Execution history usually not wanted
+  checkpoints: false, // Checkpoints usually not wanted
+  learning_outcomes: true,
+  learning_patterns: true,
+  settings: true,
+  prompts: true,
+  ai_workflows: true,
+  unified_workflows: true,
+  verification_tests: true,
+  task_hooks: true,
+  scheduled_tasks: true,
+  saved_api_requests: true,
+  configs: true,
+};
+
+// Label mapping for better UI display
+const categoryLabels: Record<keyof ExportSummary, string> = {
+  flows: "Flows",
+  flow_executions: "Flow Executions",
+  checkpoints: "Checkpoints",
+  learning_outcomes: "Learning Outcomes",
+  learning_patterns: "Learning Patterns",
+  settings: "Settings",
+  prompts: "Prompts",
+  ai_workflows: "AI Workflows",
+  unified_workflows: "Unified Workflows",
+  verification_tests: "Verification Tests",
+  task_hooks: "Task Hooks",
+  scheduled_tasks: "Scheduled Tasks",
+  saved_api_requests: "Saved API Requests",
+  configs: "Configurations",
+};
+
+export function BackupSettings({ onLog }: BackupSettingsProps) {
+  const [exportSummary, setExportSummary] = useState<ExportSummary | null>(null);
+  const [isLoadingSummary, setIsLoadingSummary] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isImporting, setIsImporting] = useState(false);
+  const [exportOptions, setExportOptions] = useState<ExportOptions>(defaultExportOptions);
+  const [importOptions, setImportOptions] = useState<ImportOptions>(defaultImportOptions);
+  const [importPreview, setImportPreview] = useState<ImportPreview | null>(null);
+  const [importResult, setImportResult] = useState<ComprehensiveImportResult | null>(null);
+  const [pendingImportData, setPendingImportData] = useState<ComprehensiveExport | null>(null);
+  const [showExportOptions, setShowExportOptions] = useState(false);
+  const [showImportOptions, setShowImportOptions] = useState(false);
+  const [exportProgress, setExportProgress] = useState<string | null>(null);
+  const [importProgress, setImportProgress] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Load export summary on mount
+  useEffect(() => {
+    loadExportSummary();
+  }, []);
+
+  const loadExportSummary = async () => {
+    setIsLoadingSummary(true);
+    try {
+      const summary = await invoke<ExportSummary>("get_export_summary");
+      setExportSummary(summary);
+    } catch (err) {
+      console.error("Failed to load export summary:", err);
+      onLog("error", `Failed to load data summary: ${err}`);
+    } finally {
+      setIsLoadingSummary(false);
+    }
+  };
+
+  const handleExportAllData = async () => {
+    setIsExporting(true);
+    setExportProgress("Exporting data from database...");
 
     try {
-      const response = await fetch(`${API_BASE}/backup`);
-      const result: ApiResponse<BackupResponse> = await response.json();
+      // Export data using Tauri command
+      const exportData = await invoke<ComprehensiveExport>("export_all_data", {
+        options: exportOptions,
+      });
 
-      if (!result.success || !result.data) {
-        throw new Error(result.message || "Failed to create backup");
-      }
+      setExportProgress("Preparing download...");
 
-      const { data: base64Data, filename, result: backupResult } = result.data;
-
-      // Convert base64 to blob and trigger download
-      const byteCharacters = atob(base64Data);
-      const byteNumbers = new Array(byteCharacters.length);
-      for (let i = 0; i < byteCharacters.length; i++) {
-        byteNumbers[i] = byteCharacters.charCodeAt(i);
-      }
-      const byteArray = new Uint8Array(byteNumbers);
-      const blob = new Blob([byteArray], { type: "application/zip" });
-
-      // Create download link
+      // Create blob and trigger download
+      const jsonString = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([jsonString], { type: "application/json" });
       const url = URL.createObjectURL(blob);
+
       const a = document.createElement("a");
       a.href = url;
-      a.download = filename;
+      a.download = `qontinui-backup-${new Date().toISOString().split("T")[0]}.json`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
-      setLastBackupResult(backupResult);
-      onLog("success", `Backup created: ${backupResult.files_backed_up.length} files saved`);
+      const totalItems = Object.values(exportData.summary).reduce((a, b) => a + b, 0);
+      onLog("success", `Export complete: ${totalItems} items exported`);
     } catch (err) {
-      console.error("Failed to create backup:", err);
-      onLog("error", `Failed to create backup: ${err}`);
+      console.error("Failed to export data:", err);
+      onLog("error", `Failed to export data: ${err}`);
     } finally {
-      setIsCreatingBackup(false);
+      setIsExporting(false);
+      setExportProgress(null);
     }
   };
 
-  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleSelectImportFile = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleFileInputChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    // Reset previous results
-    setPreviewManifest(null);
-    setLastRestoreResult(null);
+    // Reset input so same file can be selected again
+    event.target.value = "";
 
     try {
-      // Read file as base64
-      const base64 = await fileToBase64(file);
+      setImportProgress("Reading file...");
 
-      // Get backup info first
-      const infoResponse = await fetch(`${API_BASE}/backup/info`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data: base64 }),
-      });
-      const infoResult: ApiResponse<BackupManifest> = await infoResponse.json();
+      // Read file content
+      const content = await file.text();
+      const data = JSON.parse(content) as ComprehensiveExport;
 
-      if (!infoResult.success || !infoResult.data) {
-        throw new Error(infoResult.message || "Invalid backup file");
-      }
+      // Get preview
+      const preview = await invoke<ImportPreview>("get_import_preview", { data });
 
-      setPreviewManifest(infoResult.data);
-
-      // Store base64 for later restore
-      (window as { _pendingRestore?: string })._pendingRestore = base64;
+      setImportPreview(preview);
+      setPendingImportData(data);
+      setImportResult(null);
+      setImportProgress(null);
     } catch (err) {
-      console.error("Failed to read backup file:", err);
-      onLog("error", `Failed to read backup file: ${err}`);
+      console.error("Failed to read import file:", err);
+      onLog("error", `Failed to read import file: ${err}`);
+      setImportProgress(null);
     }
-
-    // Reset the input so the same file can be selected again
-    event.target.value = "";
   };
 
-  const handleRestore = async () => {
-    const base64 = (window as { _pendingRestore?: string })._pendingRestore;
-    if (!base64) {
-      onLog("error", "No backup file selected");
+  const handleImportAllData = async () => {
+    if (!pendingImportData) {
+      onLog("error", "No import data loaded");
       return;
     }
 
-    if (
-      !confirm(
-        "Are you sure you want to restore from this backup? This will overwrite your current settings, prompts, scripts, and workflows.",
-      )
-    ) {
-      return;
-    }
-
-    setIsRestoring(true);
-    setLastRestoreResult(null);
+    setIsImporting(true);
+    setImportProgress("Importing data...");
 
     try {
-      const response = await fetch(`${API_BASE}/restore`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ data: base64 }),
+      const result = await invoke<ComprehensiveImportResult>("import_all_data", {
+        data: pendingImportData,
+        options: importOptions,
       });
-      const result: ApiResponse<RestoreResult> = await response.json();
 
-      if (!result.success || !result.data) {
-        throw new Error(result.message || "Failed to restore backup");
-      }
+      setImportResult(result);
+      setPendingImportData(null);
+      setImportPreview(null);
 
-      setLastRestoreResult(result.data);
-      setPreviewManifest(null);
-      delete (window as { _pendingRestore?: string })._pendingRestore;
-
-      if (result.data.success) {
-        onLog("success", `Restore complete: ${result.data.files_restored.length} files restored`);
-        // Suggest reload to apply settings
-        if (
-          confirm(
-            "Restore complete! The application needs to reload to apply the restored settings. Reload now?",
-          )
-        ) {
-          window.location.reload();
-        }
+      if (result.success) {
+        onLog(
+          "success",
+          `Import complete: ${result.total_imported} imported, ${result.total_skipped} skipped`,
+        );
       } else {
         onLog(
           "warning",
-          `Restore completed with errors: ${result.data.files_restored.length} files restored, ${result.data.errors.length} errors`,
+          `Import completed with ${result.total_errors} errors: ${result.total_imported} imported, ${result.total_skipped} skipped`,
         );
       }
+
+      // Refresh summary
+      await loadExportSummary();
     } catch (err) {
-      console.error("Failed to restore backup:", err);
-      onLog("error", `Failed to restore backup: ${err}`);
+      console.error("Failed to import data:", err);
+      onLog("error", `Failed to import data: ${err}`);
     } finally {
-      setIsRestoring(false);
+      setIsImporting(false);
+      setImportProgress(null);
     }
   };
 
-  const cancelRestore = () => {
-    setPreviewManifest(null);
-    delete (window as { _pendingRestore?: string })._pendingRestore;
+  const cancelImport = () => {
+    setImportPreview(null);
+    setPendingImportData(null);
+    setImportResult(null);
+  };
+
+  const getTotalExportCount = () => {
+    if (!exportSummary) return 0;
+    return Object.entries(exportSummary)
+      .filter(([key]) => exportOptions[key as keyof ExportOptions])
+      .reduce((sum, [, count]) => sum + count, 0);
   };
 
   return (
     <div className="space-y-6">
       <SectionHeader
         title="Backup & Restore"
-        description="Create backups of your settings, prompts, scripts, and workflows. Restore from a backup to recover your data or transfer to another machine."
+        description="Create comprehensive backups of all your data including flows, learning outcomes, settings, and more. Restore from a backup to recover your data or transfer to another machine."
         icon={<Archive className="w-6 h-6" />}
       />
 
-      {/* Create Backup Section */}
+      {/* Export Summary */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
-        <div className="flex items-center gap-2">
-          <Download className="w-4 h-4 text-primary" />
-          <h4 className="font-medium text-sm">Create Backup</h4>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Database className="w-4 h-4 text-primary" />
+            <h4 className="font-medium text-sm">Your Data</h4>
+          </div>
+          <button
+            onClick={loadExportSummary}
+            className="text-xs text-muted-foreground hover:text-foreground"
+            disabled={isLoadingSummary}
+          >
+            {isLoadingSummary ? "Loading..." : "Refresh"}
+          </button>
         </div>
 
-        <p className="text-xs text-muted-foreground">
-          Download a backup file containing all your user data. This includes settings, prompts,
-          Playwright scripts, and AI workflows.
-        </p>
-
-        <button
-          onClick={handleCreateBackup}
-          disabled={isCreatingBackup}
-          className="px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground rounded-md transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {isCreatingBackup ? (
-            <>
-              <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
-              Creating Backup...
-            </>
-          ) : (
-            <>
-              <FileArchive className="w-4 h-4" />
-              Download Backup
-            </>
-          )}
-        </button>
-
-        {lastBackupResult && (
-          <div className="p-3 bg-green-500/10 rounded-lg">
-            <div className="flex items-center gap-2 text-green-400 mb-2">
-              <CheckCircle className="w-3.5 h-3.5" />
-              <span className="text-xs font-medium">Backup Created Successfully</span>
-            </div>
-            <div className="text-xs text-muted-foreground">
-              <p>Files backed up: {lastBackupResult.files_backed_up.join(", ")}</p>
-              {lastBackupResult.errors.length > 0 && (
-                <p className="text-amber-500 mt-1">
-                  Warnings: {lastBackupResult.errors.join("; ")}
-                </p>
-              )}
-            </div>
+        {exportSummary && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 text-xs">
+            {Object.entries(exportSummary).map(([key, count]) => (
+              <div key={key} className="flex justify-between items-center p-2 bg-muted/30 rounded">
+                <span className="text-muted-foreground">
+                  {categoryLabels[key as keyof ExportSummary]}
+                </span>
+                <span className="font-medium">{count}</span>
+              </div>
+            ))}
           </div>
         )}
       </div>
 
-      {/* Restore Section */}
+      {/* Comprehensive Export Section */}
       <div className="space-y-4 rounded-lg bg-card/50 p-4">
         <div className="flex items-center gap-2">
-          <Upload className="w-4 h-4 text-primary" />
-          <h4 className="font-medium text-sm">Restore from Backup</h4>
+          <Download className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Export All Data</h4>
         </div>
 
         <p className="text-xs text-muted-foreground">
-          Select a backup file to restore your data. This will overwrite your current settings,
-          prompts, scripts, and workflows.
+          Export all your data to a single JSON file. This comprehensive backup includes flows,
+          learning data, settings, prompts, verification tests, and more.
         </p>
 
-        {!previewManifest && (
-          <label className="inline-flex items-center gap-2 px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md transition-colors cursor-pointer">
-            <Upload className="w-4 h-4" />
-            Select Backup File
-            <input
-              type="file"
-              accept=".zip"
-              onChange={handleFileSelect}
-              className="hidden"
-              disabled={isRestoring}
-            />
-          </label>
+        {/* Export Options Toggle */}
+        <button
+          onClick={() => setShowExportOptions(!showExportOptions)}
+          className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+        >
+          <Settings className="w-3 h-3" />
+          Export Options
+          {showExportOptions ? (
+            <ChevronUp className="w-3 h-3" />
+          ) : (
+            <ChevronDown className="w-3 h-3" />
+          )}
+        </button>
+
+        {showExportOptions && (
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 p-3 bg-muted/30 rounded-lg">
+            {Object.entries(exportOptions).map(([key, value]) => (
+              <label key={key} className="flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={value}
+                  onChange={(e) =>
+                    setExportOptions((prev) => ({
+                      ...prev,
+                      [key]: e.target.checked,
+                    }))
+                  }
+                  className="rounded border-muted-foreground"
+                />
+                <span>{categoryLabels[key as keyof ExportSummary]}</span>
+                {exportSummary && (
+                  <span className="text-muted-foreground">
+                    ({exportSummary[key as keyof ExportSummary]})
+                  </span>
+                )}
+              </label>
+            ))}
+          </div>
         )}
 
-        {/* Backup Preview */}
-        {previewManifest && (
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleExportAllData}
+            disabled={isExporting || getTotalExportCount() === 0}
+            className="px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground rounded-md transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            {isExporting ? (
+              <>
+                <div className="w-4 h-4 border-2 border-primary-foreground/30 border-t-primary-foreground rounded-full animate-spin" />
+                {exportProgress || "Exporting..."}
+              </>
+            ) : (
+              <>
+                <FileArchive className="w-4 h-4" />
+                Export ({getTotalExportCount()} items)
+              </>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Import Section */}
+      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="flex items-center gap-2">
+          <Upload className="w-4 h-4 text-primary" />
+          <h4 className="font-medium text-sm">Import Data</h4>
+        </div>
+
+        <p className="text-xs text-muted-foreground">
+          Import data from a backup file. You can choose to skip or overwrite existing items.
+        </p>
+
+        {!importPreview && (
+          <>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json"
+              onChange={handleFileInputChange}
+              className="hidden"
+            />
+            <button
+              onClick={handleSelectImportFile}
+              disabled={isImporting}
+              className="px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md transition-colors flex items-center gap-2 disabled:opacity-50"
+            >
+              <Upload className="w-4 h-4" />
+              Select Backup File
+            </button>
+          </>
+        )}
+
+        {importProgress && !importPreview && (
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <div className="w-3 h-3 border-2 border-muted-foreground/30 border-t-muted-foreground rounded-full animate-spin" />
+            {importProgress}
+          </div>
+        )}
+
+        {/* Import Preview */}
+        {importPreview && (
           <div className="p-4 bg-muted/30 rounded-lg space-y-4">
             <div className="flex items-center justify-between">
-              <h5 className="font-medium">Backup Preview</h5>
+              <h5 className="font-medium">Import Preview</h5>
               <button
-                onClick={cancelRestore}
+                onClick={cancelImport}
                 className="text-sm text-muted-foreground hover:text-foreground"
               >
                 Cancel
@@ -304,91 +506,198 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
             <div className="grid grid-cols-2 gap-4 text-sm">
               <div>
                 <span className="text-muted-foreground">Version:</span>{" "}
-                <span className="font-medium">{previewManifest.version}</span>
+                <span className="font-medium">{importPreview.manifest.version}</span>
               </div>
               <div>
                 <span className="text-muted-foreground">App Version:</span>{" "}
-                <span className="font-medium">{previewManifest.app_version}</span>
+                <span className="font-medium">{importPreview.manifest.app_version}</span>
               </div>
               <div className="col-span-2">
                 <span className="text-muted-foreground">Created:</span>{" "}
                 <span className="font-medium">
-                  {new Date(previewManifest.created_at).toLocaleString()}
+                  {new Date(importPreview.manifest.created_at).toLocaleString()}
                 </span>
               </div>
             </div>
 
-            <div>
-              <span className="text-sm text-muted-foreground">
-                Files ({previewManifest.files.length}):
-              </span>
-              <ul className="mt-1 space-y-1">
-                {previewManifest.files.map((file) => (
-                  <li key={file.name} className="text-sm flex items-center justify-between">
-                    <span>{file.name}</span>
-                    <span className="text-muted-foreground">
-                      {(file.size / 1024).toFixed(1)} KB
-                    </span>
-                  </li>
-                ))}
-              </ul>
+            {!importPreview.is_compatible && (
+              <div
+                className={`flex items-center gap-2 p-2 ${getStatusColors("error").bg} rounded ${getStatusColors("error").text} text-xs`}
+              >
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                <span>Compatibility issues: {importPreview.compatibility_issues.join(", ")}</span>
+              </div>
+            )}
+
+            {/* Import Options */}
+            <div className="space-y-3">
+              <button
+                onClick={() => setShowImportOptions(!showImportOptions)}
+                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+              >
+                <Settings className="w-3 h-3" />
+                Import Options
+                {showImportOptions ? (
+                  <ChevronUp className="w-3 h-3" />
+                ) : (
+                  <ChevronDown className="w-3 h-3" />
+                )}
+              </button>
+
+              {showImportOptions && (
+                <div className="space-y-3 p-3 bg-muted/50 rounded-lg">
+                  <div className="flex items-center gap-4 text-xs">
+                    <span className="text-muted-foreground">Conflict Resolution:</span>
+                    <label className="flex items-center gap-1 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="conflict_mode"
+                        checked={importOptions.conflict_mode === "skip"}
+                        onChange={() =>
+                          setImportOptions((prev) => ({
+                            ...prev,
+                            conflict_mode: "skip",
+                          }))
+                        }
+                      />
+                      Skip existing
+                    </label>
+                    <label className="flex items-center gap-1 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="conflict_mode"
+                        checked={importOptions.conflict_mode === "overwrite"}
+                        onChange={() =>
+                          setImportOptions((prev) => ({
+                            ...prev,
+                            conflict_mode: "overwrite",
+                          }))
+                        }
+                      />
+                      Overwrite
+                    </label>
+                  </div>
+
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {Object.entries(importOptions)
+                      .filter(([key]) => key !== "conflict_mode")
+                      .map(([key, value]) => (
+                        <label key={key} className="flex items-center gap-2 text-xs cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={value as boolean}
+                            onChange={(e) =>
+                              setImportOptions((prev) => ({
+                                ...prev,
+                                [key]: e.target.checked,
+                              }))
+                            }
+                            className="rounded border-muted-foreground"
+                          />
+                          <span>{categoryLabels[key as keyof ExportSummary]}</span>
+                          <span className="text-muted-foreground">
+                            ({importPreview.counts[key as keyof ExportSummary]})
+                          </span>
+                        </label>
+                      ))}
+                  </div>
+                </div>
+              )}
             </div>
 
-            <div className="flex items-center gap-2 p-2 bg-amber-500/10 rounded text-amber-500 text-xs">
+            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 text-xs">
+              {Object.entries(importPreview.counts).map(([key, count]) => (
+                <div
+                  key={key}
+                  className={`flex justify-between items-center p-2 rounded ${
+                    importOptions[key as keyof Omit<ImportOptions, "conflict_mode">]
+                      ? "bg-primary/10"
+                      : "bg-muted/30 opacity-50"
+                  }`}
+                >
+                  <span className="text-muted-foreground">
+                    {categoryLabels[key as keyof ExportSummary]}
+                  </span>
+                  <span className="font-medium">{count}</span>
+                </div>
+              ))}
+            </div>
+
+            <div
+              className={`flex items-center gap-2 p-2 ${getAccentColors("amber").bg} rounded ${getAccentColors("amber").text} text-xs`}
+            >
               <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-              <span>Restoring will overwrite your current data. This cannot be undone.</span>
+              <span>
+                {importOptions.conflict_mode === "overwrite"
+                  ? "Existing items will be overwritten. This cannot be undone."
+                  : "Existing items will be skipped. Only new items will be imported."}
+              </span>
             </div>
 
             <button
-              onClick={handleRestore}
-              disabled={isRestoring}
-              className="w-full px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-md transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              onClick={handleImportAllData}
+              disabled={isImporting || !importPreview.is_compatible}
+              className={`w-full px-4 py-2 ${
+                importOptions.conflict_mode === "overwrite"
+                  ? `${getAccentColors("amber").bgSolid} hover:bg-amber-700`
+                  : "bg-primary hover:bg-primary/90"
+              } text-white rounded-md transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed`}
             >
-              {isRestoring ? (
+              {isImporting ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  Restoring...
+                  {importProgress || "Importing..."}
                 </>
               ) : (
                 <>
                   <Upload className="w-4 h-4" />
-                  Restore Backup
+                  Import Data
                 </>
               )}
             </button>
           </div>
         )}
 
-        {/* Restore Result */}
-        {lastRestoreResult && (
+        {/* Import Result */}
+        {importResult && (
           <div
             className={`p-3 rounded-lg ${
-              lastRestoreResult.success ? "bg-green-500/10" : "bg-amber-500/10"
+              importResult.success ? getStatusColors("success").bg : getAccentColors("amber").bg
             }`}
           >
             <div
               className={`flex items-center gap-2 mb-2 ${
-                lastRestoreResult.success ? "text-green-400" : "text-amber-500"
+                importResult.success
+                  ? getStatusColors("success").text
+                  : getAccentColors("amber").text
               }`}
             >
-              {lastRestoreResult.success ? (
+              {importResult.success ? (
                 <CheckCircle className="w-3.5 h-3.5" />
               ) : (
                 <AlertCircle className="w-3.5 h-3.5" />
               )}
               <span className="text-xs font-medium">
-                {lastRestoreResult.success ? "Restore Successful" : "Restore Completed with Errors"}
+                {importResult.success ? "Import Successful" : "Import Completed with Errors"}
               </span>
             </div>
-            <div className="text-xs text-muted-foreground">
+            <div className="text-xs text-muted-foreground space-y-1">
               <p>
-                Restored from backup v{lastRestoreResult.backup_version} (
-                {new Date(lastRestoreResult.backup_date).toLocaleString()})
+                Imported: {importResult.total_imported} | Skipped: {importResult.total_skipped} |
+                Errors: {importResult.total_errors}
               </p>
-              <p className="mt-1">Files restored: {lastRestoreResult.files_restored.join(", ")}</p>
-              {lastRestoreResult.errors.length > 0 && (
-                <p className="text-red-400 mt-1">Errors: {lastRestoreResult.errors.join("; ")}</p>
-              )}
+              {Object.entries(importResult.results).map(([category, result]) => (
+                <p key={category} className="ml-2">
+                  {categoryLabels[category as keyof ExportSummary]}: {result.imported} imported
+                  {result.skipped > 0 && `, ${result.skipped} skipped`}
+                  {result.errors.length > 0 && (
+                    <span className={getStatusColors("error").text}>
+                      {" "}
+                      ({result.errors.length} errors)
+                    </span>
+                  )}
+                </p>
+              ))}
             </div>
           </div>
         )}
@@ -397,34 +706,22 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       {/* Info Section */}
       <div className="p-4 bg-primary/5 rounded-lg">
         <div className="text-xs text-muted-foreground">
-          <strong className="text-foreground">What's included in a backup:</strong>
+          <strong className="text-foreground">What's included in a comprehensive backup:</strong>
           <ul className="list-disc list-inside mt-2 space-y-1">
-            <li>Settings (debug options, AI settings, preferences)</li>
-            <li>Prompts (your saved prompt library)</li>
-            <li>Playwright Scripts (your automation test scripts)</li>
-            <li>AI Workflows (your AI-assisted automation workflows)</li>
+            <li>Flows and flow executions (workflow definitions and history)</li>
+            <li>Checkpoints (orchestrator state snapshots)</li>
+            <li>Learning outcomes and patterns (AI learning data)</li>
+            <li>Settings and configurations</li>
+            <li>Prompts and AI workflows</li>
+            <li>Verification tests and scheduled tasks</li>
+            <li>Saved API requests and task hooks</li>
           </ul>
           <p className="mt-3 text-[10px]">
             Note: API keys stored in the system keychain are not included in backups for security
-            reasons.
+            reasons. The backup file is in JSON format and can be inspected before importing.
           </p>
         </div>
       </div>
     </div>
   );
-}
-
-// Helper function to convert file to base64
-function fileToBase64(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = reader.result as string;
-      // Remove the data:application/zip;base64, prefix
-      const base64 = dataUrl.split(",")[1];
-      resolve(base64);
-    };
-    reader.onerror = reject;
-    reader.readAsDataURL(file);
-  });
 }

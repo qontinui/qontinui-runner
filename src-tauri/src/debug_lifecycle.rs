@@ -19,7 +19,7 @@ static HEARTBEAT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Get the debug log directory
 fn get_debug_dir() -> PathBuf {
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 /// Write a debug message to the lifecycle log

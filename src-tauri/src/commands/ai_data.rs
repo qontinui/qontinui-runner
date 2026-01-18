@@ -93,8 +93,7 @@ pub struct JsonlLogsResult {
 
 /// Get the .dev-logs directory path.
 fn get_dev_logs_dir() -> PathBuf {
-    // The .dev-logs directory is in the parent directory
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 /// Read JSONL log file and return entries.
@@ -685,8 +684,6 @@ fn get_log_filename(log_type: &str) -> Option<&'static str> {
     match log_type {
         "backend" => Some("backend.log"),
         "backend-err" => Some("backend.err.log"),
-        "qontinui-api" => Some("qontinui-api.log"),
-        "qontinui-api-err" => Some("qontinui-api.err.log"),
         _ => None,
     }
 }
@@ -727,7 +724,7 @@ pub async fn read_text_logs_for_viewer(
         Some(f) => f,
         None => {
             return Ok(AiDataResponse::err(format!(
-                "Unknown log type: {}. Valid types: backend, backend-err, qontinui-api, qontinui-api-err",
+                "Unknown log type: {}. Valid types: backend, backend-err",
                 log_type
             )));
         }
@@ -786,7 +783,7 @@ pub async fn get_text_logs_summary(
 
     let dev_logs_dir = get_dev_logs_dir();
 
-    let log_types = ["backend", "backend-err", "qontinui-api", "qontinui-api-err"];
+    let log_types = ["backend", "backend-err"];
     let mut logs = Vec::new();
 
     for log_type in log_types {
@@ -1112,4 +1109,245 @@ pub async fn get_contexts_for_viewer() -> Result<AiDataResponse<ContextsResult>,
     }
 
     Ok(AiDataResponse::ok(ContextsResult { contexts }))
+}
+
+// =============================================================================
+// SQLite Event Queries (migrated from JSONL)
+// =============================================================================
+
+use crate::database::{
+    TaskRunApiRequest, TaskRunAwasStep, TaskRunEvent, TaskRunPlaywrightResult, TaskRunScreenshot,
+};
+
+/// Result of querying task run events from SQLite.
+#[derive(Debug, Serialize)]
+pub struct TaskRunEventsResult {
+    pub task_run_id: String,
+    pub events: Vec<TaskRunEvent>,
+    pub count: usize,
+    pub event_type_filter: Option<String>,
+}
+
+/// Get task run events from SQLite database.
+/// This replaces JSONL file reading for historical analysis.
+#[tauri::command]
+pub async fn get_task_run_events_from_db(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+    event_type: Option<String>,
+    limit: Option<u32>,
+) -> Result<AiDataResponse<TaskRunEventsResult>, String> {
+    let limit = limit.unwrap_or(1000);
+
+    match state
+        .checkpoint_db
+        .get_task_run_events(&task_run_id, event_type.as_deref(), Some(limit))
+    {
+        Ok(events) => {
+            let count = events.len();
+            Ok(AiDataResponse::ok(TaskRunEventsResult {
+                task_run_id,
+                events,
+                count,
+                event_type_filter: event_type,
+            }))
+        }
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
+}
+
+/// Result of querying task run screenshots from SQLite.
+#[derive(Debug, Serialize)]
+pub struct TaskRunScreenshotsResult {
+    pub task_run_id: String,
+    pub screenshots: Vec<TaskRunScreenshot>,
+    pub count: usize,
+}
+
+/// Get task run screenshots from SQLite database.
+#[tauri::command]
+pub async fn get_task_run_screenshots_from_db(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+    screenshot_type: Option<String>,
+) -> Result<AiDataResponse<TaskRunScreenshotsResult>, String> {
+    match state
+        .checkpoint_db
+        .get_task_run_screenshots(&task_run_id, screenshot_type.as_deref())
+    {
+        Ok(screenshots) => {
+            let count = screenshots.len();
+            Ok(AiDataResponse::ok(TaskRunScreenshotsResult {
+                task_run_id,
+                screenshots,
+                count,
+            }))
+        }
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
+}
+
+/// Result of querying Playwright results from SQLite.
+#[derive(Debug, Serialize)]
+pub struct TaskRunPlaywrightResultsResult {
+    pub task_run_id: String,
+    pub results: Vec<TaskRunPlaywrightResult>,
+    pub count: usize,
+    pub passed: usize,
+    pub failed: usize,
+}
+
+/// Get Playwright test results from SQLite database.
+#[tauri::command]
+pub async fn get_task_run_playwright_results_from_db(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<TaskRunPlaywrightResultsResult>, String> {
+    match state
+        .checkpoint_db
+        .get_task_run_playwright_results(&task_run_id, None)
+    {
+        Ok(results) => {
+            let count = results.len();
+            let passed = results.iter().filter(|r| r.status == "passed").count();
+            let failed = results.iter().filter(|r| r.status == "failed").count();
+            Ok(AiDataResponse::ok(TaskRunPlaywrightResultsResult {
+                task_run_id,
+                results,
+                count,
+                passed,
+                failed,
+            }))
+        }
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
+}
+
+/// Combined summary of all migrated log data for a task run.
+#[derive(Debug, Serialize)]
+pub struct TaskRunMigratedLogsSummary {
+    pub task_run_id: String,
+    pub events_count: usize,
+    pub screenshots_count: usize,
+    pub playwright_results_count: usize,
+    pub events_by_type: std::collections::HashMap<String, usize>,
+}
+
+/// Get summary of migrated logs for a task run.
+#[tauri::command]
+pub async fn get_task_run_migrated_logs_summary(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<TaskRunMigratedLogsSummary>, String> {
+    // Get events
+    let events = state
+        .checkpoint_db
+        .get_task_run_events(&task_run_id, None, None)
+        .unwrap_or_default();
+
+    // Count events by type
+    let mut events_by_type = std::collections::HashMap::new();
+    for event in &events {
+        *events_by_type.entry(event.event_type.clone()).or_insert(0) += 1;
+    }
+
+    // Get screenshots
+    let screenshots = state
+        .checkpoint_db
+        .get_task_run_screenshots(&task_run_id, None)
+        .unwrap_or_default();
+
+    // Get Playwright results
+    let playwright_results = state
+        .checkpoint_db
+        .get_task_run_playwright_results(&task_run_id, None)
+        .unwrap_or_default();
+
+    Ok(AiDataResponse::ok(TaskRunMigratedLogsSummary {
+        task_run_id,
+        events_count: events.len(),
+        screenshots_count: screenshots.len(),
+        playwright_results_count: playwright_results.len(),
+        events_by_type,
+    }))
+}
+
+/// Result of querying API requests from SQLite.
+#[derive(Debug, Serialize)]
+pub struct TaskRunApiRequestsResult {
+    pub task_run_id: String,
+    pub requests: Vec<TaskRunApiRequest>,
+    pub count: usize,
+    pub success_count: usize,
+    pub failed_count: usize,
+}
+
+/// Get API requests for a task run from SQLite database.
+#[tauri::command]
+pub async fn get_task_run_api_requests_from_db(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+    success_filter: Option<bool>,
+) -> Result<AiDataResponse<TaskRunApiRequestsResult>, String> {
+    match state
+        .checkpoint_db
+        .get_task_run_api_requests(&task_run_id, success_filter)
+    {
+        Ok(requests) => {
+            let count = requests.len();
+            let success_count = requests.iter().filter(|r| r.success).count();
+            let failed_count = requests.iter().filter(|r| !r.success).count();
+            Ok(AiDataResponse::ok(TaskRunApiRequestsResult {
+                task_run_id,
+                requests,
+                count,
+                success_count,
+                failed_count,
+            }))
+        }
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
+}
+
+/// Result of querying AWAS steps from SQLite.
+#[derive(Debug, Serialize)]
+pub struct TaskRunAwasStepsResult {
+    pub task_run_id: String,
+    pub steps: Vec<TaskRunAwasStep>,
+    pub count: usize,
+    pub success_count: usize,
+    pub failed_count: usize,
+}
+
+/// Get AWAS steps for a task run from SQLite database.
+#[tauri::command]
+pub async fn get_task_run_awas_steps_from_db(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+    step_type: Option<String>,
+) -> Result<AiDataResponse<TaskRunAwasStepsResult>, String> {
+    match state.checkpoint_db.get_task_run_awas_steps(&task_run_id) {
+        Ok(steps) => {
+            // Filter by step_type if provided
+            let filtered_steps: Vec<TaskRunAwasStep> = if let Some(ref filter_type) = step_type {
+                steps
+                    .into_iter()
+                    .filter(|s| s.step_type == *filter_type)
+                    .collect()
+            } else {
+                steps
+            };
+            let count = filtered_steps.len();
+            let success_count = filtered_steps.iter().filter(|s| s.success).count();
+            let failed_count = filtered_steps.iter().filter(|s| !s.success).count();
+            Ok(AiDataResponse::ok(TaskRunAwasStepsResult {
+                task_run_id,
+                steps: filtered_steps,
+                count,
+                success_count,
+                failed_count,
+            }))
+        }
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
 }

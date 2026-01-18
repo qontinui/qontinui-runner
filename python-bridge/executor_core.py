@@ -248,8 +248,9 @@ class ExecutorCore:
                                         monitors=monitors,
                                     )
                                 # DEBUG: Verify monitors were registered
-                                print(
-                                    f"[EXECUTOR_CORE] Registered StateImage {state_image_id} with monitors={monitors}"
+                                self.emit_log(
+                                    "debug",
+                                    f"Registered StateImage {state_image_id} with monitors={monitors}",
                                 )
                         else:
                             self.emit_log(

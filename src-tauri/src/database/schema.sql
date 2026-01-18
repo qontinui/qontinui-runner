@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 14
+-- Version: 31
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -11,6 +11,22 @@
 -- Version 12 migrated existing run_details to task_run_automation table.
 -- Version 13 removes the deprecated run_details table.
 -- Version 14 adds verification test infrastructure (verification_tests, test_results, test_associations).
+-- Version 15 adds creation_analysis to verification_tests and visual_evidence to test_results.
+-- Version 17 adds API request step support (api_credentials, api_request_logs, workflow_variables).
+-- Version 18 adds saved_api_requests table for API Request Library.
+-- Version 19 adds unified_workflows table for phase-based workflow builder.
+-- Version 20 adds task_run_events, task_run_screenshots, task_run_playwright_results (hybrid logging).
+-- Version 21 adds completion_steps and skip_ai_summary to unified_workflows.
+-- Version 22 adds hybrid logging tables via migration (already in schema as of v20).
+-- Version 23 adds task_knowledge_summaries (compression) and retry_state_json to task_runs.
+-- Version 24 adds task_run_api_requests table for API request log migration.
+-- Version 25 adds runtime_context_json to task_runs (execution context propagation) and task_hooks table (lifecycle hooks).
+-- Version 26 adds task_run_awas_steps table (AWAS step execution results).
+-- Version 27 adds code quality checks infrastructure (checks, check_results tables).
+-- Version 28 adds performance optimization indexes for large datasets.
+-- Version 29 adds shell_commands and shell_command_results tables for shell command library.
+-- Version 30 adds mobile development feedback tables (task_run_mobile_state, task_run_mobile_logs).
+-- Version 31 adds MCP integration tables (mcp_servers, task_run_mcp_calls).
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -188,10 +204,17 @@ CREATE TABLE IF NOT EXISTS task_runs (
     workflow_name TEXT,  -- Workflow name being executed
 
     -- Summary (post-completion analysis)
-    summary TEXT,  -- AI-generated paragraph summary of the task run (was ai_summary)
+    summary TEXT,  -- AI-generated paragraph summary of the task run (canonical)
+    ai_summary TEXT,  -- Deprecated: kept for backward compatibility with COALESCE queries
     goal_achieved BOOLEAN,  -- Whether the stated goal was achieved
     remaining_work TEXT,  -- What remains to be done if goal was not achieved
     summary_generated_at TEXT,  -- Timestamp when the summary was generated
+
+    -- Retry state (for retry with feedback injection)
+    retry_state_json TEXT,  -- JSON: {attempt, last_error, error_history[], delay_history[]}
+
+    -- Runtime context (for execution context propagation)
+    runtime_context_json TEXT,  -- JSON: {variables, step_outputs, iteration}
 
     -- Timestamps
     created_at TEXT NOT NULL,
@@ -409,6 +432,9 @@ CREATE TABLE IF NOT EXISTS verification_tests (
     ai_generated BOOLEAN NOT NULL DEFAULT 0,
     ai_generation_prompt TEXT,
 
+    -- Page analysis captured during test creation (for AI debugging)
+    creation_analysis TEXT,   -- JSON: screenshot, annotated_screenshot, elements[], source, url, etc.
+
     -- Organization
     tags TEXT DEFAULT '[]',  -- JSON array
 
@@ -449,6 +475,9 @@ CREATE TABLE IF NOT EXISTS test_results (
     -- Screenshots (JSON array of paths)
     screenshots TEXT DEFAULT '[]',
 
+    -- Visual evidence (annotated screenshots with assertion overlays)
+    visual_evidence TEXT,     -- JSON: annotated_screenshot_base64, assertion_overlays[], etc.
+
     -- AI analysis
     ai_analysis TEXT,
 
@@ -486,7 +515,906 @@ CREATE TABLE IF NOT EXISTS test_associations (
 CREATE INDEX IF NOT EXISTS idx_test_associations_test_id ON test_associations(test_id);
 CREATE INDEX IF NOT EXISTS idx_test_associations_config_id ON test_associations(config_id);
 
+-- Verification Plans (orchestrator architecture)
+-- Created by the Planning Agent at task start, may be revised on replan
+CREATE TABLE IF NOT EXISTS verification_plans (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Plan version (incremented on replan)
+    version INTEGER NOT NULL DEFAULT 1,
+
+    -- The complete plan as JSON (VerificationPlan struct)
+    plan_json TEXT NOT NULL,
+
+    -- Summary fields for quick access
+    goal_summary TEXT NOT NULL,
+    criteria_count INTEGER NOT NULL DEFAULT 0,
+    has_ai_criteria BOOLEAN NOT NULL DEFAULT 0,
+
+    -- Replan tracking
+    replan_reason TEXT,           -- Why this version was created (null for v1)
+    previous_version_id TEXT,     -- Link to previous version (null for v1)
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (previous_version_id) REFERENCES verification_plans(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_verification_plans_task_run_id ON verification_plans(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_verification_plans_version ON verification_plans(version);
+
+-- Task Knowledge (findings, observations, context across iterations)
+-- Shared knowledge base for planning, worker, and verification agents
+CREATE TABLE IF NOT EXISTS task_knowledge (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Knowledge category
+    category TEXT NOT NULL,       -- 'finding', 'root_cause', 'observation', 'hypothesis', 'solution', 'context'
+
+    -- Which agent created this
+    agent_type TEXT NOT NULL,     -- 'planning', 'worker', 'verification', 'system'
+
+    -- Iteration when created
+    iteration INTEGER NOT NULL DEFAULT 1,
+
+    -- Content
+    content TEXT NOT NULL,        -- The finding/observation text
+    evidence TEXT,                -- Supporting evidence (file paths, log excerpts, etc.)
+    confidence TEXT DEFAULT 'medium',  -- 'high', 'medium', 'low'
+
+    -- Related entities
+    related_files TEXT DEFAULT '[]',   -- JSON array of file paths
+    related_criterion_id TEXT,         -- Links to success criterion if applicable
+
+    -- Resolution tracking
+    is_resolved BOOLEAN NOT NULL DEFAULT 0,
+    resolution_notes TEXT,
+    resolved_at TEXT,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_task_run_id ON task_knowledge(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_category ON task_knowledge(category);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_is_resolved ON task_knowledge(is_resolved);
+
+-- Task Knowledge Summaries (Memory Compression)
+-- Stores compressed summaries of old knowledge entries to prevent context overflow
+CREATE TABLE IF NOT EXISTS task_knowledge_summaries (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    category TEXT NOT NULL,           -- 'finding', 'observation', 'verification_feedback', 'solution'
+    summary TEXT NOT NULL,            -- Compressed summary of multiple entries
+    covered_iterations TEXT NOT NULL, -- JSON array of iteration numbers covered
+    item_count INTEGER NOT NULL,      -- Number of items summarized
+    original_tokens INTEGER,          -- Estimated token count before compression
+    compressed_tokens INTEGER,        -- Estimated token count after compression
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_summaries_task_run_id ON task_knowledge_summaries(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_summaries_category ON task_knowledge_summaries(category);
+
+-- Verification Results (per-iteration, per-criterion results)
+-- Tracks deterministic and AI verification outcomes
+CREATE TABLE IF NOT EXISTS orchestrator_verification_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+
+    -- Which iteration this result is from
+    iteration INTEGER NOT NULL,
+
+    -- Which criterion was verified
+    criterion_id TEXT NOT NULL,
+    criterion_type TEXT NOT NULL,  -- 'deterministic', 'ai_evaluated'
+
+    -- Result
+    passed BOOLEAN NOT NULL,
+    is_critical BOOLEAN NOT NULL DEFAULT 1,
+    confidence TEXT,              -- For AI verification: 'high', 'medium', 'low'
+
+    -- Details
+    observations TEXT DEFAULT '[]',    -- JSON array of observations
+    issues TEXT DEFAULT '[]',          -- JSON array of issues found
+    suggestions TEXT DEFAULT '[]',     -- JSON array of fix suggestions
+    raw_output TEXT,                   -- Full output from check/evaluation
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (plan_id) REFERENCES verification_plans(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_task_run_id ON orchestrator_verification_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_plan_id ON orchestrator_verification_results(plan_id);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_iteration ON orchestrator_verification_results(iteration);
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_passed ON orchestrator_verification_results(passed);
+
+-- API Credentials (metadata only, secrets in secure storage)
+-- Used for API request step authentication
+CREATE TABLE IF NOT EXISTS api_credentials (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    credential_type TEXT NOT NULL,  -- 'bearer_token', 'basic_auth', 'api_key', 'oauth2'
+    storage_type TEXT NOT NULL DEFAULT 'secure',  -- 'secure' (encrypted file) or 'session' (memory only)
+
+    -- OAuth2 specific
+    token_endpoint TEXT,    -- Token endpoint URL for refresh
+    client_id TEXT,
+
+    -- Timestamps
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    expires_at TEXT         -- When the credential expires (for tokens)
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_credentials_name ON api_credentials(name);
+CREATE INDEX IF NOT EXISTS idx_api_credentials_type ON api_credentials(credential_type);
+
+-- API Request Logs (persisted for history, supplements JSONL for DB queries)
+-- Stores API request execution results linked to task runs
+CREATE TABLE IF NOT EXISTS api_request_logs (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT,
+    step_id TEXT NOT NULL,
+    step_name TEXT,
+
+    -- Request info
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    resolved_url TEXT NOT NULL,  -- URL after variable substitution
+
+    -- Response info
+    status_code INTEGER NOT NULL,
+    response_time_ms INTEGER NOT NULL,
+    response_body_type TEXT NOT NULL,  -- 'json', 'text', 'binary'
+    response_file_path TEXT,           -- For binary responses saved to disk
+    response_size_bytes INTEGER,
+
+    -- Results
+    success BOOLEAN NOT NULL,
+    assertion_failures INTEGER DEFAULT 0,
+    extractions_json TEXT,   -- JSON array of extraction results
+    assertions_json TEXT,    -- JSON array of assertion results
+    error TEXT,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_request_logs_task_run_id ON api_request_logs(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_api_request_logs_created_at ON api_request_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_api_request_logs_step_id ON api_request_logs(step_id);
+
+-- Workflow Variables (session-scoped variables for API request substitution)
+-- Stores extracted values from API responses for use in subsequent steps
+CREATE TABLE IF NOT EXISTS workflow_variables (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    variable_name TEXT NOT NULL,
+    variable_value TEXT NOT NULL,
+    source TEXT NOT NULL,          -- 'api_extraction', 'step_output', 'user_defined'
+    source_step_id TEXT,           -- Step that created this variable
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    UNIQUE(task_run_id, variable_name)  -- Each variable unique per task run
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_variables_task_run_id ON workflow_variables(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_variables_name ON workflow_variables(variable_name);
+
+-- Saved API Request Templates (Library)
+-- Reusable API request configurations that can be inserted into workflows
+CREATE TABLE IF NOT EXISTS saved_api_requests (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    category TEXT DEFAULT 'general',
+    tags TEXT DEFAULT '[]',  -- JSON array
+
+    -- Request configuration (matches ApiRequestStep fields)
+    method TEXT NOT NULL DEFAULT 'GET',
+    url TEXT NOT NULL,
+    headers TEXT DEFAULT '{}',  -- JSON object {key: value}
+    body TEXT,
+    body_content_type TEXT DEFAULT 'application/json',
+    timeout_ms INTEGER DEFAULT 30000,
+    follow_redirects BOOLEAN DEFAULT 1,
+
+    -- Variable extractions (JSON array of ApiVariableExtraction)
+    variable_extractions TEXT DEFAULT '[]',
+    -- Assertions (JSON array of ApiAssertion)
+    assertions TEXT DEFAULT '[]',
+
+    -- Credential reference
+    credential_id TEXT,
+
+    -- Timestamps
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (credential_id) REFERENCES api_credentials(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_saved_api_requests_category ON saved_api_requests(category);
+CREATE INDEX IF NOT EXISTS idx_saved_api_requests_updated_at ON saved_api_requests(updated_at);
+CREATE INDEX IF NOT EXISTS idx_saved_api_requests_name ON saved_api_requests(name);
+
+-- =============================================================================
+-- Unified Workflows (Phase-based workflow builder)
+-- =============================================================================
+-- New workflow format with three phases: setup, verification, agentic
+-- Each phase contains an array of typed steps
+CREATE TABLE IF NOT EXISTS unified_workflows (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    category TEXT DEFAULT 'general',
+    tags TEXT DEFAULT '[]',  -- JSON array of strings
+
+    -- Phase steps (JSON arrays)
+    setup_steps TEXT DEFAULT '[]',         -- JSON array of SetupStep
+    verification_steps TEXT DEFAULT '[]',   -- JSON array of VerificationStep
+    agentic_steps TEXT DEFAULT '[]',        -- JSON array of AgenticStep
+
+    -- Agentic configuration
+    max_iterations INTEGER DEFAULT 10,
+    provider TEXT,  -- 'claude_cli', 'gemini_api', etc.
+    model TEXT,     -- Model identifier
+
+    -- Timestamps
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_category ON unified_workflows(category);
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_updated_at ON unified_workflows(updated_at);
+CREATE INDEX IF NOT EXISTS idx_unified_workflows_name ON unified_workflows(name);
+
+-- =============================================================================
+-- Task Run Event Logs (Phase 10: Hybrid Event Logging)
+-- =============================================================================
+-- Unified event storage for all execution events (replaces JSONL files for historical queries)
+-- JSONL files remain for real-time streaming, this table for post-execution persistence
+
+-- Task Run Events (unifies runner-general.jsonl, runner-actions.jsonl, runner-image-recognition.jsonl)
+CREATE TABLE IF NOT EXISTS task_run_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+
+    -- Event classification
+    event_type TEXT NOT NULL,           -- 'general', 'action', 'image_recognition', 'state_change', 'ai_output'
+    event_subtype TEXT,                 -- 'start', 'complete', 'error', 'match', 'transition', etc.
+
+    -- Content
+    message TEXT NOT NULL,
+    data TEXT,                          -- JSON payload (action details, match results, etc.)
+
+    -- Context
+    workflow_name TEXT,
+    state_name TEXT,
+    action_id TEXT,
+
+    -- Timing
+    timestamp TEXT NOT NULL,
+    duration_ms INTEGER,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_events_task_run_id ON task_run_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_events_event_type ON task_run_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_task_run_events_timestamp ON task_run_events(timestamp);
+
+-- Task Run Screenshots (from runner-image-recognition.jsonl annotated screenshots)
+CREATE TABLE IF NOT EXISTS task_run_screenshots (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+    event_id INTEGER,                   -- Links to task_run_events if applicable
+
+    -- Screenshot info
+    file_path TEXT NOT NULL,            -- Path to PNG file in .dev-logs/screenshots/
+    screenshot_type TEXT NOT NULL,      -- 'annotated', 'raw', 'diff', 'failure'
+
+    -- Context
+    template_name TEXT,
+    confidence REAL,
+    match_location TEXT,                -- JSON {x, y, width, height}
+
+    -- Metadata
+    width INTEGER,
+    height INTEGER,
+    file_size_bytes INTEGER,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (event_id) REFERENCES task_run_events(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_screenshots_task_run_id ON task_run_screenshots(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_screenshots_type ON task_run_screenshots(screenshot_type);
+
+-- Task Run Playwright Results (from runner-playwright.jsonl)
+CREATE TABLE IF NOT EXISTS task_run_playwright_results (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Test identification
+    test_name TEXT NOT NULL,
+    spec_file TEXT,
+
+    -- Results
+    status TEXT NOT NULL,               -- 'passed', 'failed', 'skipped', 'timeout'
+    duration_ms INTEGER,
+
+    -- Output
+    stdout TEXT,
+    stderr TEXT,
+    console_output TEXT,                -- JSON array of console messages
+    page_snapshot TEXT,                 -- YAML page snapshot
+
+    -- Failure details
+    error_message TEXT,
+    failure_screenshot_path TEXT,
+
+    -- Assertion summary
+    assertions_passed INTEGER DEFAULT 0,
+    assertions_failed INTEGER DEFAULT 0,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_playwright_task_run_id ON task_run_playwright_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_playwright_status ON task_run_playwright_results(status);
+
+-- Task Run API Requests (from runner-api-requests.jsonl)
+-- Stores API request execution results migrated from JSONL logs
+CREATE TABLE IF NOT EXISTS task_run_api_requests (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Step identification
+    step_id TEXT NOT NULL,
+    step_name TEXT,
+
+    -- Request details
+    method TEXT NOT NULL,
+    url TEXT NOT NULL,
+    resolved_url TEXT NOT NULL,           -- URL after variable substitution
+    request_headers TEXT,                 -- JSON object {header: value}
+    request_body TEXT,
+
+    -- Response details
+    status_code INTEGER NOT NULL,
+    status_text TEXT,
+    response_headers TEXT,                -- JSON object {header: value}
+    response_time_ms INTEGER NOT NULL,
+
+    -- Response body handling
+    response_body_type TEXT NOT NULL,     -- 'json', 'text', 'binary'
+    response_body TEXT,
+    response_size_bytes INTEGER,
+
+    -- Variable extractions (JSON array of extraction results)
+    extractions TEXT,                     -- JSON array of {variable_name, json_path, extracted_value, success, error}
+
+    -- Assertion results (JSON array of assertion results)
+    assertions TEXT,                      -- JSON array of {assertion_type, expected, actual, passed, error}
+
+    -- Overall result
+    success BOOLEAN NOT NULL,
+    error_message TEXT,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_api_requests_task_run_id ON task_run_api_requests(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_api_requests_step_id ON task_run_api_requests(step_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_api_requests_created_at ON task_run_api_requests(created_at);
+CREATE INDEX IF NOT EXISTS idx_task_run_api_requests_success ON task_run_api_requests(success);
+
+-- =============================================================================
+-- Task Hooks (Lifecycle hooks for execution events)
+-- =============================================================================
+-- Stores hook definitions that trigger on specific execution events
+CREATE TABLE IF NOT EXISTS task_hooks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+
+    -- Hook trigger: 'pre_execution', 'post_execution', 'on_error', 'on_verification_fail', 'on_complete', 'pre_iteration', 'post_iteration'
+    trigger TEXT NOT NULL,
+
+    -- Hook action configuration
+    action_type TEXT NOT NULL,          -- 'command', 'webhook', 'log', 'notification'
+    action_config TEXT NOT NULL,        -- JSON: {command, url, headers, body, message, etc.}
+
+    -- Execution settings
+    enabled BOOLEAN DEFAULT 1,
+    execution_order INTEGER DEFAULT 0,  -- Lower = executes earlier
+    continue_on_failure BOOLEAN DEFAULT 1,
+
+    -- Optional conditions (JSON array of {variable, operator, value})
+    conditions TEXT DEFAULT '[]',
+
+    -- Scope: NULL = global, or specific task_run_id for task-specific hooks
+    task_run_id TEXT,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_hooks_trigger ON task_hooks(trigger);
+CREATE INDEX IF NOT EXISTS idx_task_hooks_enabled ON task_hooks(enabled);
+CREATE INDEX IF NOT EXISTS idx_task_hooks_task_run_id ON task_hooks(task_run_id);
+
+-- =============================================================================
+-- Task Run AWAS Steps (AWAS step execution results)
+-- =============================================================================
+-- Stores execution results from AWAS (Automated Web Agent System) steps
+-- including discovery, execution, action listing, and element extraction
+CREATE TABLE IF NOT EXISTS task_run_awas_steps (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Step identification
+    step_id TEXT,                           -- Optional step ID from workflow
+    step_name TEXT,                         -- Optional human-readable step name
+    step_type TEXT NOT NULL,                -- 'awas_discover', 'awas_execute', 'awas_check_support', 'awas_list_actions', 'awas_extract_elements'
+
+    -- Context
+    url TEXT,                               -- URL where the step was executed
+
+    -- Execution parameters
+    action_id TEXT,                         -- For awas_execute: the action that was executed
+    parameters TEXT,                        -- JSON: step-specific parameters
+
+    -- Response data
+    response_data TEXT,                     -- JSON: contains manifest, actions, elements, etc. depending on step_type
+
+    -- Results
+    success INTEGER NOT NULL DEFAULT 0,
+    error_message TEXT,
+    duration_ms INTEGER,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_awas_steps_task_run_id ON task_run_awas_steps(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_awas_steps_step_type ON task_run_awas_steps(step_type);
+CREATE INDEX IF NOT EXISTS idx_task_run_awas_steps_created_at ON task_run_awas_steps(created_at);
+
+-- =============================================================================
+-- Orchestrator Learning System (Version 26)
+-- =============================================================================
+-- Learning outcomes, patterns, checkpoints, and flows for AI orchestration
+
+-- Learning Outcomes: Records task outcomes for learning system
+CREATE TABLE IF NOT EXISTS learning_outcomes (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    status TEXT NOT NULL,  -- 'success', 'failure', 'partial'
+    duration_secs REAL,
+    iterations INTEGER,
+    strategy TEXT,
+    tools_used TEXT,  -- JSON array
+    files_modified TEXT,  -- JSON array
+    error_type TEXT,
+    error_message TEXT,
+    feedback TEXT,  -- JSON array
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_learning_outcomes_task_id ON learning_outcomes(task_id);
+CREATE INDEX IF NOT EXISTS idx_learning_outcomes_status ON learning_outcomes(status);
+CREATE INDEX IF NOT EXISTS idx_learning_outcomes_created_at ON learning_outcomes(created_at);
+
+-- Learning Patterns: Identified patterns from task analysis
+CREATE TABLE IF NOT EXISTS learning_patterns (
+    id TEXT PRIMARY KEY,
+    pattern_type TEXT NOT NULL,  -- 'success', 'failure', 'tool_usage', etc.
+    description TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    context TEXT,  -- JSON with additional context
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_learning_patterns_type ON learning_patterns(pattern_type);
+CREATE INDEX IF NOT EXISTS idx_learning_patterns_confidence ON learning_patterns(confidence);
+
+-- Orchestrator Checkpoints: State snapshots for time-travel debugging
+CREATE TABLE IF NOT EXISTS orchestrator_checkpoints (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    iteration INTEGER NOT NULL,
+    trigger TEXT NOT NULL,  -- 'automatic', 'manual', 'iteration_boundary', etc.
+    state TEXT NOT NULL,  -- JSON serialized StateSnapshot
+    name TEXT,  -- Optional user-provided name
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_checkpoints_task_id ON orchestrator_checkpoints(task_id);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_checkpoints_task_iteration ON orchestrator_checkpoints(task_id, iteration);
+
+-- Orchestrator Flows: Flow definitions for deterministic workflows
+CREATE TABLE IF NOT EXISTS orchestrator_flows (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    steps TEXT NOT NULL,  -- JSON object of step definitions
+    start_step TEXT,
+    timeout_secs INTEGER,
+    inputs TEXT,  -- JSON array of input definitions
+    outputs TEXT,  -- JSON array of output definitions
+    tags TEXT,  -- JSON array
+    version TEXT NOT NULL DEFAULT '1.0.0',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_flows_name ON orchestrator_flows(name);
+
+-- Flow Executions: Runtime state for flow execution
+CREATE TABLE IF NOT EXISTS flow_executions (
+    instance_id TEXT PRIMARY KEY,
+    flow_id TEXT NOT NULL,
+    current_step TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'waiting_for_input', 'completed', 'failed', 'cancelled'
+    context TEXT,  -- JSON object of flow variables
+    history TEXT,  -- JSON array of step executions
+    error TEXT,
+    started_at TEXT NOT NULL,
+    completed_at TEXT,
+    FOREIGN KEY (flow_id) REFERENCES orchestrator_flows(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_flow_executions_flow_id ON flow_executions(flow_id);
+CREATE INDEX IF NOT EXISTS idx_flow_executions_status ON flow_executions(status);
+
+-- =============================================================================
+-- Code Quality Checks (Version 27)
+-- =============================================================================
+-- Check definitions stored in runner for code quality validation
+
+CREATE TABLE IF NOT EXISTS checks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    check_type TEXT NOT NULL,         -- 'lint', 'format', 'typecheck', 'custom_command'
+    tool TEXT NOT NULL,               -- 'black', 'isort', 'ruff', 'mypy', 'eslint', 'prettier', etc.
+    command TEXT,                     -- Custom command override
+    working_directory TEXT,
+    config_path TEXT,                 -- Path to config file (e.g., pyproject.toml)
+    auto_fix BOOLEAN NOT NULL DEFAULT 0,
+    fail_on_warning BOOLEAN NOT NULL DEFAULT 0,
+    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+    is_critical BOOLEAN NOT NULL DEFAULT 0,
+    enabled BOOLEAN NOT NULL DEFAULT 1,
+    ai_generated BOOLEAN NOT NULL DEFAULT 0,
+    ai_generation_prompt TEXT,
+    tags TEXT DEFAULT '[]',           -- JSON array
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_checks_check_type ON checks(check_type);
+CREATE INDEX IF NOT EXISTS idx_checks_tool ON checks(tool);
+CREATE INDEX IF NOT EXISTS idx_checks_enabled ON checks(enabled);
+
+-- Check Results (execution results linked to task runs)
+CREATE TABLE IF NOT EXISTS check_results (
+    id TEXT PRIMARY KEY,
+    check_id TEXT NOT NULL,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'passed', 'failed', 'error', 'timeout'
+    started_at TEXT,
+    completed_at TEXT,
+    duration_ms INTEGER,
+    output TEXT,                      -- stdout/stderr combined
+    error_message TEXT,
+    issues_found INTEGER DEFAULT 0,
+    issues_fixed INTEGER DEFAULT 0,
+    files_checked INTEGER DEFAULT 0,
+    structured_output TEXT,           -- JSON: parsed issues, file-by-file results
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_check_results_check_id ON check_results(check_id);
+CREATE INDEX IF NOT EXISTS idx_check_results_task_run_id ON check_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_check_results_status ON check_results(status);
+
+-- =============================================================================
+-- Shell Commands Library (Version 29)
+-- =============================================================================
+-- Reusable shell command definitions and execution history
+
+-- Shell Commands Library
+CREATE TABLE IF NOT EXISTS shell_commands (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    command TEXT NOT NULL,
+    working_directory TEXT,
+    timeout_seconds INTEGER NOT NULL DEFAULT 60,
+    fail_on_error BOOLEAN NOT NULL DEFAULT 1,
+    category TEXT DEFAULT 'general',  -- 'git', 'npm', 'poetry', 'docker', 'general'
+    tags TEXT DEFAULT '[]',           -- JSON array
+    enabled BOOLEAN NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_shell_commands_category ON shell_commands(category);
+CREATE INDEX IF NOT EXISTS idx_shell_commands_enabled ON shell_commands(enabled);
+CREATE INDEX IF NOT EXISTS idx_shell_commands_name ON shell_commands(name);
+CREATE INDEX IF NOT EXISTS idx_shell_commands_created_at ON shell_commands(created_at);
+CREATE INDEX IF NOT EXISTS idx_shell_commands_updated_at ON shell_commands(updated_at);
+
+-- Shell Command Results (execution history)
+CREATE TABLE IF NOT EXISTS shell_command_results (
+    id TEXT PRIMARY KEY,
+    shell_command_id TEXT NOT NULL,
+    task_run_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- 'pending', 'running', 'success', 'failed', 'error', 'timeout'
+    exit_code INTEGER,
+    stdout TEXT,
+    stderr TEXT,
+    duration_ms INTEGER,
+    started_at TEXT,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (shell_command_id) REFERENCES shell_commands(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_shell_command_id ON shell_command_results(shell_command_id);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_task_run_id ON shell_command_results(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_status ON shell_command_results(status);
+CREATE INDEX IF NOT EXISTS idx_shell_command_results_created_at ON shell_command_results(created_at);
+
+-- =============================================================================
+-- MOBILE DEVELOPMENT FEEDBACK (Version 30)
+-- =============================================================================
+
+-- Task Run Mobile State: Captures device/app state during mobile development
+-- Used for AI feedback loop during qontinui-mobile development
+CREATE TABLE IF NOT EXISTS task_run_mobile_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+
+    -- Device identification
+    device_id TEXT,                     -- e.g., 'emulator-5554' or physical device serial
+    device_type TEXT,                   -- 'emulator', 'physical'
+    device_model TEXT,                  -- e.g., 'sdk_gphone64_x86_64', 'Pixel 7'
+
+    -- App state
+    app_package TEXT,                   -- e.g., 'io.qontinui.mobile'
+    app_activity TEXT,                  -- Current activity/screen name
+    app_state TEXT,                     -- 'foreground', 'background', 'not_running', 'crashed'
+
+    -- Metro/Expo state
+    metro_connected INTEGER DEFAULT 0,  -- 0 or 1
+    bundle_status TEXT,                 -- 'bundling', 'ready', 'error'
+    last_reload_type TEXT,              -- 'hot', 'full', NULL
+    last_reload_time TEXT,
+
+    -- Capture paths (relative to .dev-logs/mobile/)
+    screenshot_path TEXT,               -- Path to screenshot PNG
+    logcat_path TEXT,                   -- Path to logcat capture
+
+    -- Error summary (if any errors detected)
+    has_errors INTEGER DEFAULT 0,
+    error_summary TEXT,                 -- Brief summary of detected errors
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_mobile_state_task_run_id ON task_run_mobile_state(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_mobile_state_timestamp ON task_run_mobile_state(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mobile_state_device_id ON task_run_mobile_state(device_id);
+CREATE INDEX IF NOT EXISTS idx_mobile_state_has_errors ON task_run_mobile_state(has_errors);
+
+-- Task Run Mobile Logs: Stores parsed log entries from Metro, Logcat, etc.
+-- Enables filtering and searching mobile-specific logs
+CREATE TABLE IF NOT EXISTS task_run_mobile_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id TEXT NOT NULL,
+    mobile_state_id INTEGER,            -- Links to task_run_mobile_state if applicable
+
+    -- Log classification
+    log_source TEXT NOT NULL,           -- 'metro', 'logcat', 'expo', 'gradle', 'eas'
+    log_level TEXT,                     -- 'error', 'warn', 'info', 'debug', 'verbose'
+    log_tag TEXT,                       -- e.g., 'ReactNative', 'ReactNativeJS', 'Expo'
+
+    -- Content
+    message TEXT NOT NULL,
+    raw_line TEXT,                      -- Original unparsed line
+    data TEXT,                          -- JSON: additional structured data (stack trace, etc.)
+
+    -- Error details (if log_level = 'error')
+    error_type TEXT,                    -- 'js_error', 'native_crash', 'build_error', 'bundle_error'
+    error_code TEXT,                    -- Error code if available
+    stack_trace TEXT,                   -- Full stack trace if available
+    file_path TEXT,                     -- Source file if available
+    line_number INTEGER,                -- Line number if available
+    column_number INTEGER,              -- Column number if available
+
+    -- Timing
+    timestamp TEXT NOT NULL,
+    device_timestamp TEXT,              -- Timestamp from device (may differ from capture time)
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (mobile_state_id) REFERENCES task_run_mobile_state(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_task_run_id ON task_run_mobile_logs(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_source ON task_run_mobile_logs(log_source);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_level ON task_run_mobile_logs(log_level);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_error_type ON task_run_mobile_logs(error_type);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_timestamp ON task_run_mobile_logs(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mobile_logs_state_id ON task_run_mobile_logs(mobile_state_id);
+
+-- =============================================================================
+-- MCP (Model Context Protocol) Integration (Version 31)
+-- =============================================================================
+-- MCP server configuration and call execution history
+
+-- MCP Server Configurations
+-- Stores configuration for MCP servers that can be called from workflows
+CREATE TABLE IF NOT EXISTS mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+
+    -- Transport configuration
+    transport TEXT NOT NULL,            -- 'stdio', 'http'
+
+    -- Stdio transport settings (JSON: {command, args, cwd, env})
+    stdio_config TEXT,
+
+    -- HTTP transport settings (JSON: {url, headers})
+    http_config TEXT,
+
+    -- Common settings
+    enabled BOOLEAN NOT NULL DEFAULT 1,
+    auto_start BOOLEAN NOT NULL DEFAULT 0,
+    timeout_seconds INTEGER NOT NULL DEFAULT 30,
+
+    -- Cached tool info (JSON array of tool definitions)
+    cached_tools TEXT,
+    tools_cached_at TEXT,
+
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_enabled ON mcp_servers(enabled);
+CREATE INDEX IF NOT EXISTS idx_mcp_servers_name ON mcp_servers(name);
+
+-- Task Run MCP Calls
+-- Stores MCP tool call execution results (similar to task_run_api_requests)
+CREATE TABLE IF NOT EXISTS task_run_mcp_calls (
+    id TEXT PRIMARY KEY,
+    task_run_id TEXT NOT NULL,
+
+    -- Step identification
+    step_id TEXT NOT NULL,
+    step_name TEXT,
+
+    -- Server identification
+    server_id TEXT NOT NULL,
+    server_name TEXT,
+
+    -- Tool call details
+    tool_name TEXT NOT NULL,
+    arguments TEXT,                     -- JSON: original arguments
+    resolved_arguments TEXT,            -- JSON: arguments after variable substitution
+
+    -- Response details
+    response TEXT,                      -- JSON: tool response content
+    response_type TEXT NOT NULL,        -- 'text', 'json', 'error'
+    duration_ms INTEGER NOT NULL,
+
+    -- Variable extractions (JSON array of extraction results)
+    extractions TEXT,                   -- JSON array of {variable_name, json_path, extracted_value, success, error}
+
+    -- Assertion results (JSON array of assertion results)
+    assertions TEXT,                    -- JSON array of {assertion_type, expected, actual, passed, error}
+
+    -- Overall result
+    success BOOLEAN NOT NULL,
+    error_message TEXT,
+
+    created_at TEXT NOT NULL,
+
+    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE,
+    FOREIGN KEY (server_id) REFERENCES mcp_servers(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_task_run_id ON task_run_mcp_calls(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_server_id ON task_run_mcp_calls(server_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_step_id ON task_run_mcp_calls(step_id);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_created_at ON task_run_mcp_calls(created_at);
+CREATE INDEX IF NOT EXISTS idx_task_run_mcp_calls_success ON task_run_mcp_calls(success);
+
+-- =============================================================================
+-- Performance Optimization Indexes (Version 28)
+-- =============================================================================
+-- Additional indexes for frequently filtered/sorted columns
+
+-- Learning outcomes: strategy filtering
+CREATE INDEX IF NOT EXISTS idx_learning_outcomes_strategy ON learning_outcomes(strategy);
+
+-- Learning patterns: updated_at ordering
+CREATE INDEX IF NOT EXISTS idx_learning_patterns_updated_at ON learning_patterns(updated_at);
+
+-- Orchestrator checkpoints: trigger and created_at filtering
+CREATE INDEX IF NOT EXISTS idx_orchestrator_checkpoints_trigger ON orchestrator_checkpoints(trigger);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_checkpoints_created_at ON orchestrator_checkpoints(created_at);
+
+-- Orchestrator flows: ordering support
+CREATE INDEX IF NOT EXISTS idx_orchestrator_flows_created_at ON orchestrator_flows(created_at);
+CREATE INDEX IF NOT EXISTS idx_orchestrator_flows_updated_at ON orchestrator_flows(updated_at);
+
+-- Flow executions: started_at ordering
+CREATE INDEX IF NOT EXISTS idx_flow_executions_started_at ON flow_executions(started_at);
+
+-- Task knowledge: composite and iteration indexes
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_task_run_iteration ON task_knowledge(task_run_id, iteration);
+CREATE INDEX IF NOT EXISTS idx_task_knowledge_iteration ON task_knowledge(iteration);
+
+-- Orchestrator verification results: criterion queries
+CREATE INDEX IF NOT EXISTS idx_orch_ver_results_criterion_id ON orchestrator_verification_results(criterion_id);
+
+-- Task run events: event filtering
+CREATE INDEX IF NOT EXISTS idx_task_run_events_subtype ON task_run_events(event_subtype);
+CREATE INDEX IF NOT EXISTS idx_task_run_events_workflow ON task_run_events(workflow_name);
+
+-- Checks: ordering support
+CREATE INDEX IF NOT EXISTS idx_checks_created_at ON checks(created_at);
+CREATE INDEX IF NOT EXISTS idx_checks_updated_at ON checks(updated_at);
+
+-- Check results: created_at ordering
+CREATE INDEX IF NOT EXISTS idx_check_results_created_at ON check_results(created_at);
+
+-- Sessions: additional filtering
+CREATE INDEX IF NOT EXISTS idx_sessions_completed ON sessions(completed);
+CREATE INDEX IF NOT EXISTS idx_sessions_session_type ON sessions(session_type);
+
+-- Scheduler history: status filtering
+CREATE INDEX IF NOT EXISTS idx_scheduler_history_status ON scheduler_history(status);
+
+-- Task runs: workflow_name filtering and updated_at ordering
+CREATE INDEX IF NOT EXISTS idx_task_runs_workflow_name ON task_runs(workflow_name);
+CREATE INDEX IF NOT EXISTS idx_task_runs_updated_at ON task_runs(updated_at);
+
+-- Verification plans: created_at ordering
+CREATE INDEX IF NOT EXISTS idx_verification_plans_created_at ON verification_plans(created_at);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (14, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (31, datetime('now'));

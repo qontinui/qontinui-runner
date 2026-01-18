@@ -136,6 +136,24 @@ export interface ProjectLogsState {
 }
 
 /**
+ * AI-suggested log source from the find_log_sources_with_ai command
+ */
+export interface AiSuggestedLogSource {
+  /** Suggested name for the log source */
+  name: string;
+  /** Type: "file" or "directory" */
+  type: "file" | "directory";
+  /** Suggested path (may contain placeholders) */
+  path: string;
+  /** Glob pattern for directory type */
+  pattern?: string;
+  /** Description of what this log source typically contains */
+  description: string;
+  /** Suggested color for UI display */
+  color?: string;
+}
+
+/**
  * Common log path definition for quick-add functionality
  */
 export interface CommonLogPath {
@@ -173,22 +191,6 @@ export const COMMON_LOG_PATHS: CommonLogPath[] = [
     name: "Qontinui Backend Errors",
     description: "qontinui-web backend stderr",
     relativePath: "../.dev-logs/backend.err.log",
-    type: "file",
-    category: "backend",
-    color: "#ef4444",
-  },
-  {
-    name: "Qontinui API",
-    description: "qontinui-api service (port 8001)",
-    relativePath: "../.dev-logs/qontinui-api.log",
-    type: "file",
-    category: "backend",
-    color: "#06b6d4",
-  },
-  {
-    name: "Qontinui API Errors",
-    description: "qontinui-api stderr",
-    relativePath: "../.dev-logs/qontinui-api.err.log",
     type: "file",
     category: "backend",
     color: "#ef4444",
@@ -272,7 +274,7 @@ export const LOG_SOURCE_TEMPLATES: Record<string, Omit<LogSource, "id">[]> = {
     {
       name: "Backend",
       type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/backend.log",
+      path: "D:/qontinui_parent_directory/.dev-logs/backend.log",
       tailLines: 200,
       enabled: true,
       color: "#22c55e",
@@ -280,23 +282,7 @@ export const LOG_SOURCE_TEMPLATES: Record<string, Omit<LogSource, "id">[]> = {
     {
       name: "Backend Errors",
       type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/backend.err.log",
-      tailLines: 100,
-      enabled: true,
-      color: "#ef4444",
-    },
-    {
-      name: "API",
-      type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/qontinui-api.log",
-      tailLines: 200,
-      enabled: true,
-      color: "#06b6d4",
-    },
-    {
-      name: "API Errors",
-      type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/qontinui-api.err.log",
+      path: "D:/qontinui_parent_directory/.dev-logs/backend.err.log",
       tailLines: 100,
       enabled: true,
       color: "#ef4444",
@@ -304,7 +290,7 @@ export const LOG_SOURCE_TEMPLATES: Record<string, Omit<LogSource, "id">[]> = {
     {
       name: "Frontend",
       type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/frontend.log",
+      path: "D:/qontinui_parent_directory/.dev-logs/frontend.log",
       tailLines: 200,
       enabled: true,
       color: "#3b82f6",
@@ -312,7 +298,7 @@ export const LOG_SOURCE_TEMPLATES: Record<string, Omit<LogSource, "id">[]> = {
     {
       name: "Frontend Errors",
       type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/frontend.err.log",
+      path: "D:/qontinui_parent_directory/.dev-logs/frontend.err.log",
       tailLines: 100,
       enabled: true,
       color: "#ef4444",
@@ -320,7 +306,7 @@ export const LOG_SOURCE_TEMPLATES: Record<string, Omit<LogSource, "id">[]> = {
     {
       name: "Runner (Tauri)",
       type: "file",
-      path: "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/runner-tauri.log",
+      path: "D:/qontinui_parent_directory/.dev-logs/runner-tauri.log",
       tailLines: 200,
       enabled: true,
       color: "#f97316",

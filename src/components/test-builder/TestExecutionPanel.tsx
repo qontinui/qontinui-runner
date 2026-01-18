@@ -18,6 +18,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { useTestBuilder } from "./TestBuilderContext";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
 export function TestExecutionPanel() {
   const { selectedTest, state, executeTest } = useTestBuilder();
@@ -33,20 +34,20 @@ export function TestExecutionPanel() {
   // Get status icon
   const getStatusIcon = () => {
     if (state.isExecuting) {
-      return <Loader2 className="w-5 h-5 animate-spin text-blue-500" />;
+      return <Loader2 className={`w-5 h-5 animate-spin ${getAccentColors("blue").text}`} />;
     }
     if (!state.lastResult) {
       return <Clock className="w-5 h-5 text-muted-foreground" />;
     }
     switch (state.lastResult.status) {
       case "passed":
-        return <CheckCircle2 className="w-5 h-5 text-green-500" />;
+        return <CheckCircle2 className={`w-5 h-5 ${getStatusColors("success").icon}`} />;
       case "failed":
-        return <XCircle className="w-5 h-5 text-red-500" />;
+        return <XCircle className={`w-5 h-5 ${getStatusColors("error").icon}`} />;
       case "error":
-        return <AlertTriangle className="w-5 h-5 text-red-500" />;
+        return <AlertTriangle className={`w-5 h-5 ${getStatusColors("error").icon}`} />;
       case "timeout":
-        return <Clock className="w-5 h-5 text-yellow-500" />;
+        return <Clock className={`w-5 h-5 ${getStatusColors("warning").icon}`} />;
       default:
         return <Clock className="w-5 h-5 text-muted-foreground" />;
     }
@@ -77,19 +78,19 @@ export function TestExecutionPanel() {
   // Get status color
   const getStatusColor = () => {
     if (state.isExecuting) {
-      return "text-blue-500";
+      return getAccentColors("blue").text;
     }
     if (!state.lastResult) {
       return "text-muted-foreground";
     }
     switch (state.lastResult.status) {
       case "passed":
-        return "text-green-500";
+        return getStatusColors("success").text;
       case "failed":
       case "error":
-        return "text-red-500";
+        return getStatusColors("error").text;
       case "timeout":
-        return "text-yellow-500";
+        return getStatusColors("warning").text;
       default:
         return "text-muted-foreground";
     }
@@ -183,11 +184,17 @@ export function TestExecutionPanel() {
             <div className="p-4 space-y-4">
               {/* Error message */}
               {state.lastResult.error && (
-                <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-md">
+                <div
+                  className={`p-3 ${getStatusColors("error").bg} border ${getStatusColors("error").border} rounded-md`}
+                >
                   <div className="flex items-start gap-2">
-                    <AlertTriangle className="w-4 h-4 text-red-500 flex-shrink-0 mt-0.5" />
+                    <AlertTriangle
+                      className={`w-4 h-4 ${getStatusColors("error").icon} flex-shrink-0 mt-0.5`}
+                    />
                     <div>
-                      <p className="text-sm font-medium text-red-500">Error</p>
+                      <p className={`text-sm font-medium ${getStatusColors("error").text}`}>
+                        Error
+                      </p>
                       <pre className="text-xs text-red-400 mt-1 whitespace-pre-wrap font-mono">
                         {state.lastResult.error}
                       </pre>
@@ -254,8 +261,10 @@ export function TestExecutionPanel() {
           {/* Error from context */}
           {state.error && (
             <div className="p-4 border-t border-border/50">
-              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-md">
-                <p className="text-sm text-red-500">{state.error}</p>
+              <div
+                className={`p-3 ${getStatusColors("error").bg} border ${getStatusColors("error").border} rounded-md`}
+              >
+                <p className={`text-sm ${getStatusColors("error").text}`}>{state.error}</p>
               </div>
             </div>
           )}

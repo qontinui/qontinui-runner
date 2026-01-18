@@ -39,9 +39,7 @@ pub struct AiOutputEntry {
 
 /// Get the path to the AI output log file
 fn get_ai_output_log_path() -> PathBuf {
-    // Use the same .dev-logs directory as other logs
-    let base_dir = PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
-    base_dir.join("ai-output.jsonl")
+    crate::paths::get_ai_output_jsonl_path()
 }
 
 /// Append an AI output entry to the log file
@@ -213,7 +211,7 @@ pub fn load_ai_output_log() -> CommandResponse {
 
 /// Get the base directory for dev logs
 fn get_dev_logs_dir() -> PathBuf {
-    PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+    crate::paths::get_dev_logs_dir()
 }
 
 /// List all session checkpoint files

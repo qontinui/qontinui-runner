@@ -30,6 +30,7 @@ import {
   Trash2,
   Calendar,
 } from "lucide-react";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import type { RunDetails, TieredInfoResponse } from "../types/statistics";
 
 // Storage key for filter preferences
@@ -339,7 +340,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
             <button
               onClick={handleDeleteSelected}
               disabled={isDeleting}
-              className="flex items-center gap-2 px-3 py-1.5 text-sm bg-red-500/10 text-red-500 rounded-lg hover:bg-red-500/20 transition-colors"
+              className={`flex items-center gap-2 px-3 py-1.5 text-sm ${getStatusColors("error").bg} ${getStatusColors("error").text} rounded-lg hover:${getStatusColors("error").bg} transition-colors`}
             >
               <Trash2 className="w-4 h-4" />
               Delete {selectedRuns.size}
@@ -421,8 +422,8 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
       {/* Stats bar */}
       <div className="flex items-center gap-6 text-sm text-muted-foreground">
         <span>{stats.total} runs</span>
-        <span className="text-green-500">{stats.success} passed</span>
-        <span className="text-red-500">{stats.failed} failed</span>
+        <span className={getStatusColors("success").text}>{stats.success} passed</span>
+        <span className={getStatusColors("error").text}>{stats.failed} failed</span>
         <span className="flex items-center gap-1">
           <Monitor className="w-3 h-3" /> {stats.guiCount}
         </span>
@@ -436,7 +437,7 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
         {loading && filteredRuns.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">Loading...</div>
         ) : error ? (
-          <div className="text-center py-8 text-red-500">{error}</div>
+          <div className={`text-center py-8 ${getStatusColors("error").text}`}>{error}</div>
         ) : filteredRuns.length === 0 ? (
           <div className="text-center py-8 text-muted-foreground">
             <History className="w-12 h-12 mx-auto mb-4 opacity-50" />
@@ -460,25 +461,31 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
                 {/* Type indicator */}
                 <div
                   className={`p-2 rounded-lg ${
-                    run.type === "gui" ? "bg-blue-500/10" : "bg-purple-500/10"
+                    run.type === "gui" ? getAccentColors("blue").bg : getAccentColors("purple").bg
                   }`}
                 >
                   {run.type === "gui" ? (
-                    <Monitor className="w-4 h-4 text-blue-500" />
+                    <Monitor className={`w-4 h-4 ${getAccentColors("blue").text}`} />
                   ) : (
-                    <Bot className="w-4 h-4 text-purple-500" />
+                    <Bot className={`w-4 h-4 ${getAccentColors("purple").text}`} />
                   )}
                 </div>
 
                 {/* Status icon */}
                 {run.success === true ? (
-                  <CheckCircle className="w-4 h-4 text-green-500 flex-shrink-0" />
+                  <CheckCircle
+                    className={`w-4 h-4 ${getStatusColors("success").text} flex-shrink-0`}
+                  />
                 ) : run.success === false ? (
-                  <XCircle className="w-4 h-4 text-red-500 flex-shrink-0" />
+                  <XCircle className={`w-4 h-4 ${getStatusColors("error").text} flex-shrink-0`} />
                 ) : run.status === "running" ? (
-                  <Clock className="w-4 h-4 text-blue-500 animate-pulse flex-shrink-0" />
+                  <Clock
+                    className={`w-4 h-4 ${getAccentColors("blue").text} animate-pulse flex-shrink-0`}
+                  />
                 ) : (
-                  <AlertTriangle className="w-4 h-4 text-yellow-500 flex-shrink-0" />
+                  <AlertTriangle
+                    className={`w-4 h-4 ${getAccentColors("yellow").text} flex-shrink-0`}
+                  />
                 )}
 
                 {/* Run info */}
@@ -505,7 +512,11 @@ export function HistoryTab({ onNavigateToRun, onNavigateToAi }: HistoryTabProps)
 
                 {/* Error preview */}
                 {run.error && (
-                  <div className="text-xs text-red-500 max-w-[200px] truncate">{run.error}</div>
+                  <div
+                    className={`text-xs ${getStatusColors("error").text} max-w-[200px] truncate`}
+                  >
+                    {run.error}
+                  </div>
                 )}
 
                 {/* Actions */}

@@ -1,23 +1,33 @@
 //! Step Executor Module
 //!
 //! Provides unified execution of automation steps (workflows, actions, states,
-//! screenshots, Playwright tests). This is the core execution layer used by:
+//! screenshots, Playwright tests, AWAS). This is the core execution layer used by:
 //! - Run page (single workflow execution)
 //! - AI Builder (multi-step execution before AI session)
 //! - MCP API (direct step execution)
 //!
 //! The design principle: multi-step execution is the foundation, and running
 //! a single workflow is just a special case (one step of type "workflow").
+//!
+//! ## Step Categories
+//!
+//! - **GUI Automation**: workflow, state, action
+//! - **Web Automation**: playwright
+//! - **AWAS Automation**: awas_discover, awas_execute, awas_check_support, awas_list_actions, awas_extract_elements
 
 use crate::action_service::UnifiedActionService;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
+use crate::database::CreateTaskRunAwasStepInput;
+use crate::mcp_client::CreateMcpCallInput;
+use crate::display::RawEvent;
 use crate::executor::file_logger::FileLogger;
 use crate::iteration_bundle::{
     parse_action_events, parse_image_recognition_events, ActionEvent, ImageRecognitionEvent,
     RelevantLogSources,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -67,6 +77,14 @@ pub struct ExecutionStepConfig {
     #[serde(rename = "playwrightScriptId")]
     pub playwright_script_id: Option<String>,
 
+    /// Playwright script content (for combined/inline scripts)
+    #[serde(rename = "playwrightScriptContent")]
+    pub playwright_script_content: Option<String>,
+
+    /// Playwright target URL (for combined scripts)
+    #[serde(rename = "playwrightTargetUrl")]
+    pub playwright_target_url: Option<String>,
+
     /// Prompt content (for prompt steps - not executed, passed to AI)
     #[serde(rename = "promptContent")]
     pub prompt_content: Option<String>,
@@ -78,6 +96,143 @@ pub struct ExecutionStepConfig {
     /// Initial state IDs for workflow steps (overrides default initial states)
     #[serde(rename = "initialStateIds", default)]
     pub initial_state_ids: Option<Vec<String>>,
+
+    /// Whether this step is a setup step (brings app to target state) vs verification step.
+    /// Setup steps typically run on the first iteration only.
+    /// Default: true for GUI automation steps (workflow, state, action, gui_workflow)
+    /// Default: false for verification steps (playwright, test, screenshot)
+    #[serde(rename = "isSetup", default)]
+    pub is_setup: Option<bool>,
+
+    /// Whether to run this step on subsequent iterations (after the first).
+    /// Default: true (all steps run on each iteration for fresh data)
+    /// Users can toggle off individual steps if they only need to run once (e.g., one-time setup)
+    #[serde(rename = "runOnSubsequentIterations", default)]
+    pub run_on_subsequent_iterations: Option<bool>,
+
+    /// Test ID for verification test steps
+    #[serde(rename = "testId")]
+    pub test_id: Option<String>,
+
+    /// Test type for verification test steps
+    #[serde(rename = "testType")]
+    pub test_type: Option<String>,
+
+    /// Whether test failure should fail the workflow
+    #[serde(rename = "testIsCritical", default)]
+    pub test_is_critical: Option<bool>,
+
+    // ========================================================================
+    // AWAS Step Fields
+    // ========================================================================
+
+    /// AWAS: URL for AWAS operations (discover, execute, check_support)
+    #[serde(rename = "awasUrl")]
+    pub awas_url: Option<String>,
+
+    /// AWAS: Action ID to execute (for awas_execute steps)
+    #[serde(rename = "awasActionId")]
+    pub awas_action_id: Option<String>,
+
+    /// AWAS: Parameters for action execution (for awas_execute steps)
+    #[serde(rename = "awasParams")]
+    pub awas_params: Option<serde_json::Value>,
+
+    /// AWAS: HTML content for element extraction (for awas_extract_elements steps)
+    #[serde(rename = "awasHtml")]
+    pub awas_html: Option<String>,
+
+    /// AWAS: Base URL for resolving relative URLs (for awas_extract_elements steps)
+    #[serde(rename = "awasBaseUrl")]
+    pub awas_base_url: Option<String>,
+
+    // ========================================================================
+    // MCP Call Step Fields
+    // ========================================================================
+
+    /// MCP: Server ID for the MCP server to call
+    #[serde(rename = "mcpServerId")]
+    pub mcp_server_id: Option<String>,
+
+    /// MCP: Server name for display purposes
+    #[serde(rename = "mcpServerName")]
+    pub mcp_server_name: Option<String>,
+
+    /// MCP: Tool name to call on the MCP server
+    #[serde(rename = "mcpToolName")]
+    pub mcp_tool_name: Option<String>,
+
+    /// MCP: Arguments to pass to the tool (JSON object)
+    #[serde(rename = "mcpArguments")]
+    pub mcp_arguments: Option<serde_json::Value>,
+
+    /// MCP: Whether to fail the workflow if the MCP call fails
+    #[serde(rename = "mcpFailOnError", default)]
+    pub mcp_fail_on_error: Option<bool>,
+
+    // ========================================================================
+    // Shell Command Step Fields
+    // ========================================================================
+
+    /// Shell Command: The command to execute
+    #[serde(alias = "shellCommand", alias = "command")]
+    pub shell_command: Option<String>,
+
+    /// Shell Command: Reference to a saved shell command ID
+    #[serde(alias = "shellCommandId", alias = "shell_command_id")]
+    pub shell_command_id: Option<String>,
+
+    /// Shell Command: Working directory for command execution
+    #[serde(alias = "shellCommandWorkingDirectory", alias = "working_directory")]
+    pub shell_command_working_directory: Option<String>,
+
+    /// Shell Command: Whether to fail the workflow if command returns non-zero
+    #[serde(alias = "shellCommandFailOnError", alias = "fail_on_error", default)]
+    pub shell_command_fail_on_error: Option<bool>,
+
+    // ========================================================================
+    // API Request Step Fields
+    // ========================================================================
+
+    /// API Request: HTTP method (GET, POST, PUT, PATCH, DELETE)
+    #[serde(alias = "apiMethod", alias = "method")]
+    pub api_method: Option<String>,
+
+    /// API Request: URL to request
+    #[serde(alias = "apiUrl", alias = "url")]
+    pub api_url: Option<String>,
+
+    /// API Request: Request headers as JSON object
+    #[serde(alias = "apiHeaders", alias = "headers")]
+    pub api_headers: Option<serde_json::Value>,
+
+    /// API Request: Request body
+    #[serde(alias = "apiBody", alias = "body")]
+    pub api_body: Option<String>,
+
+    /// API Request: Content type
+    #[serde(alias = "apiContentType", alias = "content_type")]
+    pub api_content_type: Option<String>,
+
+    // ========================================================================
+    // Check Step Fields
+    // ========================================================================
+
+    /// Check: Type of check (lint, format, typecheck, analyze, security, custom_command)
+    #[serde(alias = "checkType", alias = "check_type")]
+    pub check_type: Option<String>,
+
+    /// Check: Command to run (shares with shell_command)
+    #[serde(alias = "checkCommand")]
+    pub check_command: Option<String>,
+
+    /// Check: Working directory
+    #[serde(alias = "checkWorkingDirectory")]
+    pub check_working_directory: Option<String>,
+
+    /// Check: Whether to run auto-fix
+    #[serde(alias = "checkAutoFix", alias = "auto_fix", default)]
+    pub check_auto_fix: Option<bool>,
 }
 
 impl ExecutionStepConfig {
@@ -94,9 +249,44 @@ impl ExecutionStepConfig {
             screenshot_delay: 0,
             screenshot_monitor: None,
             playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
             prompt_content: None,
             timeout_seconds: Some(300),
             initial_state_ids: None,
+            is_setup: Some(true), // Workflow is setup by default
+            run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
         }
     }
 
@@ -113,9 +303,44 @@ impl ExecutionStepConfig {
             screenshot_delay: delay,
             screenshot_monitor: None,
             playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
             prompt_content: None,
             timeout_seconds: Some(300),
             initial_state_ids: None,
+            is_setup: Some(true), // Workflow is setup by default
+            run_on_subsequent_iterations: Some(true), // Default: run on all iterations for fresh data
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
         }
     }
 
@@ -132,10 +357,391 @@ impl ExecutionStepConfig {
             screenshot_delay: delay,
             screenshot_monitor: monitor.map(|m| serde_json::Value::Number(m.into())),
             playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
             prompt_content: None,
             timeout_seconds: Some(30),
             initial_state_ids: None,
+            is_setup: Some(false), // Screenshot is verification, not setup
+            run_on_subsequent_iterations: Some(true), // Verification runs on all iterations
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
         }
+    }
+
+    // ========================================================================
+    // AWAS Step Constructors
+    // ========================================================================
+
+    /// Create an AWAS discover step
+    pub fn awas_discover(url: &str) -> Self {
+        Self {
+            step_type: "awas_discover".to_string(),
+            name: Some(format!("AWAS Discover: {}", url)),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(30),
+            initial_state_ids: None,
+            is_setup: Some(true), // AWAS discover is typically setup
+            run_on_subsequent_iterations: Some(false), // Usually only discover once
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: Some(url.to_string()),
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        }
+    }
+
+    /// Create an AWAS execute step
+    pub fn awas_execute(url: &str, action_id: &str, params: Option<serde_json::Value>) -> Self {
+        Self {
+            step_type: "awas_execute".to_string(),
+            name: Some(format!("AWAS Execute: {}", action_id)),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(30),
+            initial_state_ids: None,
+            is_setup: Some(false), // AWAS execute is typically an action step
+            run_on_subsequent_iterations: Some(true),
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: Some(url.to_string()),
+            awas_action_id: Some(action_id.to_string()),
+            awas_params: params,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        }
+    }
+
+    /// Create an AWAS check support step
+    pub fn awas_check_support(url: &str) -> Self {
+        Self {
+            step_type: "awas_check_support".to_string(),
+            name: Some(format!("AWAS Check Support: {}", url)),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(30),
+            initial_state_ids: None,
+            is_setup: Some(true), // Check support is typically setup
+            run_on_subsequent_iterations: Some(false),
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: Some(url.to_string()),
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        }
+    }
+
+    /// Create an AWAS list actions step
+    pub fn awas_list_actions() -> Self {
+        Self {
+            step_type: "awas_list_actions".to_string(),
+            name: Some("AWAS List Actions".to_string()),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(30),
+            initial_state_ids: None,
+            is_setup: Some(false),
+            run_on_subsequent_iterations: Some(true),
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        }
+    }
+
+    /// Create an AWAS extract elements step
+    pub fn awas_extract_elements(html: &str, base_url: Option<&str>) -> Self {
+        Self {
+            step_type: "awas_extract_elements".to_string(),
+            name: Some("AWAS Extract Elements".to_string()),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(30),
+            initial_state_ids: None,
+            is_setup: Some(false),
+            run_on_subsequent_iterations: Some(true),
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: Some(html.to_string()),
+            awas_base_url: base_url.map(|s| s.to_string()),
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        }
+    }
+
+    // ========================================================================
+    // MCP Call Step Constructor
+    // ========================================================================
+
+    /// Create an MCP call step
+    pub fn mcp_call(server_id: &str, tool_name: &str, arguments: Option<serde_json::Value>) -> Self {
+        Self {
+            step_type: "mcp_call".to_string(),
+            name: Some(format!("MCP Call: {}", tool_name)),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: false,
+            screenshot_delay: 0,
+            screenshot_monitor: None,
+            playwright_script_id: None,
+            playwright_script_content: None,
+            playwright_target_url: None,
+            prompt_content: None,
+            timeout_seconds: Some(30),
+            initial_state_ids: None,
+            is_setup: Some(false),
+            run_on_subsequent_iterations: Some(true),
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: Some(server_id.to_string()),
+            mcp_server_name: None,
+            mcp_tool_name: Some(tool_name.to_string()),
+            mcp_arguments: arguments,
+            mcp_fail_on_error: Some(true),
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        }
+    }
+
+    /// Check if this step should run based on the current iteration number
+    /// Returns true if the step should be executed, false if it should be skipped
+    pub fn should_run_on_iteration(&self, iteration: u32) -> bool {
+        // First iteration always runs all steps
+        if iteration <= 1 {
+            return true;
+        }
+
+        // For subsequent iterations, check if the step is configured to run
+        // Default: all steps run on each iteration for fresh data
+        // Users can explicitly set run_on_subsequent_iterations: false to skip on subsequent iterations
+        self.run_on_subsequent_iterations.unwrap_or(true)
     }
 }
 
@@ -308,6 +914,10 @@ impl ExecutionResult {
 pub struct StepExecutor {
     action_service: UnifiedActionService,
     app_state: Arc<AppState>,
+    /// Optional app handle for emitting events to the Tauri frontend
+    app_handle: Option<tauri::AppHandle>,
+    /// Optional task run ID for database logging (AWAS steps, etc.)
+    task_run_id: Option<String>,
 }
 
 impl StepExecutor {
@@ -316,6 +926,48 @@ impl StepExecutor {
         Self {
             action_service: UnifiedActionService::new(app_state.clone(), config_storage),
             app_state,
+            app_handle: None,
+            task_run_id: None,
+        }
+    }
+
+    /// Create a new StepExecutor with an app handle for frontend event emission
+    pub fn with_app_handle(
+        app_state: Arc<AppState>,
+        config_storage: Arc<TokioMutex<ConfigStorage>>,
+        app_handle: tauri::AppHandle,
+    ) -> Self {
+        Self {
+            action_service: UnifiedActionService::new(app_state.clone(), config_storage),
+            app_state,
+            app_handle: Some(app_handle),
+            task_run_id: None,
+        }
+    }
+
+    /// Set the task run ID for database logging
+    ///
+    /// When set, AWAS step results will be saved to the database.
+    pub fn with_task_run_id(mut self, task_run_id: String) -> Self {
+        self.task_run_id = Some(task_run_id);
+        self
+    }
+
+    /// Emit a tree event to the Tauri frontend (if app_handle is available)
+    fn emit_tree_event(&self, event_type: &str, node: &serde_json::Value, timestamp: f64, sequence: u32) {
+        use tauri::Emitter;
+        if let Some(ref app_handle) = self.app_handle {
+            let tree_event = json!({
+                "type": "tree_event",
+                "event_type": event_type,
+                "node": node,
+                "path": [],
+                "timestamp": timestamp,
+                "sequence": sequence,
+            });
+            if let Err(e) = app_handle.emit("executor-event", &tree_event) {
+                warn!("Failed to emit tree event to frontend: {}", e);
+            }
         }
     }
 
@@ -348,6 +1000,52 @@ impl StepExecutor {
             .await;
     }
 
+    /// Save an AWAS step result to the database (if task_run_id is set)
+    ///
+    /// This method is called after each AWAS step execution to persist
+    /// the results for later analysis and debugging.
+    fn save_awas_step_result(
+        &self,
+        step_type: &str,
+        url: Option<&str>,
+        action_id: Option<&str>,
+        parameters: Option<&serde_json::Value>,
+        response: &AwasCommandResponse,
+        duration_ms: i64,
+        step_name: Option<&str>,
+    ) {
+        // Only save if we have a task_run_id
+        let Some(ref task_run_id) = self.task_run_id else {
+            return;
+        };
+
+        let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+        let input = CreateTaskRunAwasStepInput {
+            task_run_id: task_run_id.clone(),
+            step_id: None, // Step ID from workflow if available
+            step_name: step_name.map(|s| s.to_string()),
+            step_type: step_type.to_string(),
+            url: url.map(|s| s.to_string()),
+            action_id: action_id.map(|s| s.to_string()),
+            parameters: parameters.map(|p| serde_json::to_string(p).unwrap_or_default()),
+            response_data: response.data.as_ref().map(|d| serde_json::to_string(d).unwrap_or_default()),
+            success: response.success,
+            error_message: response.error.clone(),
+            duration_ms: Some(duration_ms),
+            timestamp,
+        };
+
+        match self.app_state.checkpoint_db.create_task_run_awas_step(&input) {
+            Ok(id) => {
+                info!("Saved AWAS step result to database: {} (type: {})", id, step_type);
+            }
+            Err(e) => {
+                warn!("Failed to save AWAS step result to database: {}", e);
+            }
+        }
+    }
+
     /// Execute a list of steps and return results
     ///
     /// This is the core execution function used by all consumers.
@@ -360,6 +1058,247 @@ impl StepExecutor {
     ) -> ExecutionResult {
         self.execute_steps_with_log_sources(steps, execution_id, &[])
             .await
+    }
+
+    /// Execute steps for a specific iteration
+    ///
+    /// For iterations > 1, filters out setup steps that aren't marked to run on
+    /// subsequent iterations. This is the iteration-aware version of execute_steps.
+    ///
+    /// For Playwright steps, all Playwright steps are combined (since Playwright
+    /// closes the browser after each run). Setup Playwright scripts are run first,
+    /// followed by verification Playwright scripts.
+    pub async fn execute_steps_for_iteration(
+        &self,
+        steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        log_sources: &[LogSourceConfig],
+        iteration: u32,
+    ) -> ExecutionResult {
+        // Preprocess steps for iteration:
+        // 1. Filter out setup steps that shouldn't run on subsequent iterations
+        // 2. Combine Playwright steps for efficiency (setup + verification)
+        let processed_steps = Self::preprocess_steps_for_iteration(steps, iteration);
+
+        if processed_steps.len() != steps.len() {
+            info!(
+                "Iteration {}: Preprocessed {} steps to {} (filtered/combined)",
+                iteration,
+                steps.len(),
+                processed_steps.len(),
+            );
+        }
+
+        self.execute_steps_with_log_sources(&processed_steps, execution_id, log_sources)
+            .await
+    }
+
+    /// Preprocess steps for a specific iteration
+    ///
+    /// This handles:
+    /// 1. Filtering out setup steps that shouldn't run on subsequent iterations
+    /// 2. For Playwright steps: combining multiple scripts into a single script
+    ///    (setup scripts first, then verification scripts) since Playwright closes
+    ///    the browser after each run
+    fn preprocess_steps_for_iteration(
+        steps: &[ExecutionStepConfig],
+        iteration: u32,
+    ) -> Vec<ExecutionStepConfig> {
+        // Separate Playwright steps from other steps
+        let (playwright_steps, other_steps): (Vec<_>, Vec<_>) = steps
+            .iter()
+            .partition(|s| s.step_type == "playwright");
+
+        // For first iteration, still combine Playwright scripts for efficiency
+        // For subsequent iterations, also filter non-Playwright steps
+
+        // Filter non-Playwright steps based on iteration
+        let filtered_other_steps: Vec<ExecutionStepConfig> = if iteration <= 1 {
+            other_steps.into_iter().cloned().collect()
+        } else {
+            other_steps
+                .into_iter()
+                .filter(|step| {
+                    let should_run = step.should_run_on_iteration(iteration);
+                    if !should_run {
+                        info!(
+                            "Iteration {}: Skipping setup step '{}' (type: {})",
+                            iteration,
+                            step.name.as_deref().unwrap_or("unnamed"),
+                            step.step_type
+                        );
+                    }
+                    should_run
+                })
+                .cloned()
+                .collect()
+        };
+
+        // Combine Playwright steps if there are multiple
+        let combined_playwright = Self::combine_playwright_steps(&playwright_steps);
+
+        // Reconstruct steps in original order, but with combined Playwright step
+        // placed at the position of the first Playwright step
+        let mut result = Vec::new();
+        let mut playwright_inserted = false;
+
+        for step in steps {
+            if step.step_type == "playwright" {
+                if !playwright_inserted {
+                    // Insert the combined Playwright step at the first Playwright position
+                    if let Some(ref combined) = combined_playwright {
+                        result.push(combined.clone());
+                    }
+                    playwright_inserted = true;
+                }
+                // Skip individual Playwright steps (they're now combined)
+            } else {
+                // Include non-Playwright steps that passed the filter
+                if filtered_other_steps.iter().any(|s| {
+                    s.name == step.name && s.step_type == step.step_type
+                }) {
+                    result.push(step.clone());
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Combine multiple Playwright steps into a single step with combined script content
+    ///
+    /// This ensures all Playwright scripts run in the same browser session.
+    /// Setup scripts are placed first, followed by verification scripts.
+    fn combine_playwright_steps(steps: &[&ExecutionStepConfig]) -> Option<ExecutionStepConfig> {
+        if steps.is_empty() {
+            return None;
+        }
+
+        // If only one step, return it as-is
+        if steps.len() == 1 {
+            return Some(steps[0].clone());
+        }
+
+        // Separate setup and verification Playwright steps
+        let (setup_steps, verification_steps): (Vec<&&ExecutionStepConfig>, Vec<&&ExecutionStepConfig>) = steps
+            .iter()
+            .partition(|s| s.is_setup.unwrap_or(false));
+
+        info!(
+            "Combining {} Playwright scripts ({} setup, {} verification) into single script",
+            steps.len(),
+            setup_steps.len(),
+            verification_steps.len()
+        );
+
+        // Collect script IDs for the combined step name
+        let script_names: Vec<String> = steps
+            .iter()
+            .filter_map(|s| s.name.clone())
+            .collect();
+
+        // Collect script contents (setup first, then verification)
+        let mut combined_content_parts: Vec<String> = Vec::new();
+        let mut target_url: Option<String> = None;
+        let mut script_ids: Vec<String> = Vec::<String>::new();
+
+        // Add setup scripts first
+        for step in &setup_steps {
+            if let Some(ref content) = step.playwright_script_content {
+                combined_content_parts.push(format!(
+                    "// === Setup: {} ===\n{}",
+                    step.name.as_deref().unwrap_or("unnamed"),
+                    content
+                ));
+            }
+            if let Some(id) = &step.playwright_script_id {
+                script_ids.push(id.to_string());
+            }
+            if target_url.is_none() {
+                target_url = step.playwright_target_url.clone();
+            }
+        }
+
+        // Add verification scripts
+        for step in &verification_steps {
+            if let Some(ref content) = step.playwright_script_content {
+                combined_content_parts.push(format!(
+                    "// === Verification: {} ===\n{}",
+                    step.name.as_deref().unwrap_or("unnamed"),
+                    content
+                ));
+            }
+            if let Some(id) = &step.playwright_script_id {
+                script_ids.push(id.to_string());
+            }
+            if target_url.is_none() {
+                target_url = step.playwright_target_url.clone();
+            }
+        }
+
+        // Create combined step
+        Some(ExecutionStepConfig {
+            step_type: "playwright".to_string(),
+            name: Some(format!("Combined: {}", script_names.join(" + "))),
+            action_type: None,
+            target_image_id: None,
+            target_image_name: None,
+            monitor_index: None,
+            take_screenshot: steps.iter().any(|s| s.take_screenshot),
+            screenshot_delay: steps.iter().map(|s| s.screenshot_delay).max().unwrap_or(0),
+            screenshot_monitor: None,
+            // Use the first script ID for fallback if no content is available
+            playwright_script_id: script_ids.first().cloned(),
+            // Combined script content
+            playwright_script_content: if combined_content_parts.is_empty() {
+                None
+            } else {
+                Some(combined_content_parts.join("\n\n"))
+            },
+            playwright_target_url: target_url,
+            prompt_content: None,
+            timeout_seconds: Some(
+                steps
+                    .iter()
+                    .filter_map(|s| s.timeout_seconds)
+                    .sum::<u64>()
+                    .max(60),
+            ),
+            initial_state_ids: None,
+            is_setup: Some(false), // Combined step is treated as verification
+            run_on_subsequent_iterations: Some(true), // Always runs
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            // AWAS fields
+            awas_url: None,
+            awas_action_id: None,
+            awas_params: None,
+            awas_html: None,
+            awas_base_url: None,
+            // MCP fields
+            mcp_server_id: None,
+            mcp_server_name: None,
+            mcp_tool_name: None,
+            mcp_arguments: None,
+            mcp_fail_on_error: None,
+            // Shell command fields
+            shell_command: None,
+            shell_command_id: None,
+            shell_command_working_directory: None,
+            shell_command_fail_on_error: None,
+            // API request fields
+            api_method: None,
+            api_url: None,
+            api_headers: None,
+            api_body: None,
+            api_content_type: None,
+            // Check fields
+            check_type: None,
+            check_command: None,
+            check_working_directory: None,
+            check_auto_fix: None,
+        })
     }
 
     /// Execute steps with log source configuration for log capture
@@ -559,7 +1498,7 @@ impl StepExecutor {
 
     /// Get the .dev-logs directory path
     fn get_dev_logs_dir() -> PathBuf {
-        PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs")
+        crate::paths::get_dev_logs_dir()
     }
 
     /// Get current file positions for runner log files (actions + image recognition)
@@ -734,16 +1673,23 @@ impl StepExecutor {
                 static SCREENSHOT_SEQUENCE: AtomicU32 = AtomicU32::new(1);
                 let sequence = SCREENSHOT_SEQUENCE.fetch_add(1, Ordering::SeqCst);
                 let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+                let action_id = format!("screenshot-{}", sequence);
 
                 // Build action node for tree events
-                let action_node = serde_json::json!({
-                    "action_type": "SCREENSHOT",
-                    "action_id": format!("screenshot-{}", sequence),
-                    "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
-                    "delay_seconds": delay.unwrap_or(0.0),
+                // Must include: id, node_type, name, timestamp, status for ActionLogProfile
+                let action_node = json!({
+                    "id": &action_id,
+                    "node_type": "action",
+                    "name": "SCREENSHOT",
+                    "timestamp": timestamp,
+                    "status": "pending",
+                    "metadata": {
+                        "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
+                        "delay_seconds": delay.unwrap_or(0.0),
+                    }
                 });
 
-                // Emit action_started tree event
+                // Emit action_started tree event to file log
                 FileLogger::log_tree_event(
                     "action_started",
                     &action_node,
@@ -751,6 +1697,22 @@ impl StepExecutor {
                     timestamp,
                     sequence,
                 );
+
+                // Also add to DisplayProcessor for Session/Actions page
+                {
+                    let raw_event = RawEvent {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        event_type: "action_started".to_string(),
+                        timestamp,
+                        data: json!({ "node": action_node.clone() }),
+                        sequence: sequence as u64,
+                    };
+                    let mut processor = self.app_state.display_processor.lock().await;
+                    processor.event_log_mut().add_event(raw_event);
+                }
+
+                // Emit to Tauri frontend for action log refresh
+                self.emit_tree_event("action_started", &action_node, timestamp, sequence);
 
                 let result = self.action_service.capture_screenshot(monitor, delay).await;
                 let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
@@ -762,25 +1724,48 @@ impl StepExecutor {
                         let file_path = res.absolute_path.clone().unwrap_or_default();
 
                         // Emit action_completed tree event
-                        let completed_node = serde_json::json!({
-                            "action_type": "SCREENSHOT",
-                            "action_id": format!("screenshot-{}", sequence),
-                            "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
-                            "delay_seconds": delay.unwrap_or(0.0),
-                            "success": res.success,
-                            "filename": &file_path,
+                        // Must include: id, node_type, name, timestamp, status for ActionLogProfile
+                        let completed_node = json!({
+                            "id": &action_id,
+                            "node_type": "action",
+                            "name": "SCREENSHOT",
+                            "timestamp": end_timestamp,
+                            "status": if res.success { "success" } else { "failed" },
+                            "duration": end_timestamp - timestamp,
+                            "metadata": {
+                                "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
+                                "delay_seconds": delay.unwrap_or(0.0),
+                                "filename": &file_path,
+                            }
                         });
+                        let event_type = if res.success {
+                            "action_completed"
+                        } else {
+                            "action_failed"
+                        };
                         FileLogger::log_tree_event(
-                            if res.success {
-                                "action_completed"
-                            } else {
-                                "action_failed"
-                            },
+                            event_type,
                             &completed_node,
                             &[],
                             end_timestamp,
                             sequence,
                         );
+
+                        // Also add to DisplayProcessor for Session/Actions page
+                        {
+                            let raw_event = RawEvent {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                event_type: event_type.to_string(),
+                                timestamp: end_timestamp,
+                                data: json!({ "node": completed_node.clone() }),
+                                sequence: sequence as u64,
+                            };
+                            let mut processor = self.app_state.display_processor.lock().await;
+                            processor.event_log_mut().add_event(raw_event);
+                        }
+
+                        // Emit to Tauri frontend for action log refresh
+                        self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
 
                         self.record_screenshot_event(
                             "standalone",
@@ -802,13 +1787,19 @@ impl StepExecutor {
                         let error_msg = format!("Screenshot error: {}", e);
 
                         // Emit action_failed tree event
-                        let failed_node = serde_json::json!({
-                            "action_type": "SCREENSHOT",
-                            "action_id": format!("screenshot-{}", sequence),
-                            "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
-                            "delay_seconds": delay.unwrap_or(0.0),
-                            "success": false,
+                        // Must include: id, node_type, name, timestamp, status for ActionLogProfile
+                        let failed_node = json!({
+                            "id": &action_id,
+                            "node_type": "action",
+                            "name": "SCREENSHOT",
+                            "timestamp": end_timestamp,
+                            "status": "failed",
+                            "duration": end_timestamp - timestamp,
                             "error": &error_msg,
+                            "metadata": {
+                                "monitor": monitor.map(|m| m.to_string()).unwrap_or_else(|| "all".to_string()),
+                                "delay_seconds": delay.unwrap_or(0.0),
+                            }
                         });
                         FileLogger::log_tree_event(
                             "action_failed",
@@ -817,6 +1808,22 @@ impl StepExecutor {
                             end_timestamp,
                             sequence,
                         );
+
+                        // Also add to DisplayProcessor for Session/Actions page
+                        {
+                            let raw_event = RawEvent {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                event_type: "action_failed".to_string(),
+                                timestamp: end_timestamp,
+                                data: json!({ "node": failed_node.clone() }),
+                                sequence: sequence as u64,
+                            };
+                            let mut processor = self.app_state.display_processor.lock().await;
+                            processor.event_log_mut().add_event(raw_event);
+                        }
+
+                        // Emit to Tauri frontend for action log refresh
+                        self.emit_tree_event("action_failed", &failed_node, end_timestamp, sequence);
 
                         // Record failed screenshot event
                         self.record_screenshot_event(
@@ -838,19 +1845,185 @@ impl StepExecutor {
                 }
             }
             "playwright" => {
-                if let Some(ref script_id) = step.playwright_script_id {
+                // If we have inline script content (from combined scripts), run it directly
+                if let Some(ref script_content) = step.playwright_script_content {
+                    self.run_playwright_inline(
+                        script_content,
+                        step.playwright_target_url.as_deref(),
+                        step.name.as_deref().unwrap_or("combined_script"),
+                    )
+                    .await
+                } else if let Some(ref script_id) = step.playwright_script_id {
+                    // Otherwise, run by script ID
                     self.run_playwright_script(script_id).await
                 } else {
                     (
                         false,
-                        Some("No Playwright script ID specified".to_string()),
+                        Some("No Playwright script ID or content specified".to_string()),
                         None,
                     )
+                }
+            }
+            "test" => {
+                // Execute verification test
+                if let Some(ref test_id) = step.test_id {
+                    match self.execute_verification_test(test_id, step.test_is_critical.unwrap_or(true)).await {
+                        Ok((success, error)) => (success, error, None),
+                        Err(e) => (false, Some(format!("Test execution error: {}", e)), None),
+                    }
+                } else {
+                    (false, Some("No test ID specified".to_string()), None)
                 }
             }
             "prompt" => {
                 // Prompt steps are text for the AI, not executed here
                 (true, None, None)
+            }
+            // ================================================================
+            // AWAS Step Types
+            // ================================================================
+            "awas_discover" => {
+                if let Some(ref url) = step.awas_url {
+                    self.execute_awas_discover(url, timeout).await
+                } else {
+                    (false, Some("No URL specified for AWAS discover".to_string()), None)
+                }
+            }
+            "awas_execute" => {
+                if let (Some(ref url), Some(ref action_id)) = (&step.awas_url, &step.awas_action_id) {
+                    self.execute_awas_action(url, action_id, step.awas_params.clone(), timeout).await
+                } else {
+                    (false, Some("URL and action_id required for AWAS execute".to_string()), None)
+                }
+            }
+            "awas_check_support" => {
+                if let Some(ref url) = step.awas_url {
+                    self.execute_awas_check_support(url, timeout).await
+                } else {
+                    (false, Some("No URL specified for AWAS check support".to_string()), None)
+                }
+            }
+            "awas_list_actions" => {
+                self.execute_awas_list_actions(timeout).await
+            }
+            "awas_extract_elements" => {
+                if let Some(ref html) = step.awas_html {
+                    self.execute_awas_extract_elements(html, step.awas_base_url.as_deref(), timeout).await
+                } else {
+                    (false, Some("No HTML specified for AWAS extract elements".to_string()), None)
+                }
+            }
+            // ================================================================
+            // MCP Call Step Type
+            // ================================================================
+            "mcp_call" => {
+                if let (Some(ref server_id), Some(ref tool_name)) = (&step.mcp_server_id, &step.mcp_tool_name) {
+                    self.execute_mcp_call(
+                        server_id,
+                        tool_name,
+                        step.mcp_arguments.clone().unwrap_or(serde_json::json!({})),
+                        timeout,
+                        step.name.as_deref(),
+                        step.mcp_fail_on_error.unwrap_or(true),
+                    ).await
+                } else {
+                    (false, Some("Server ID and tool name required for MCP call".to_string()), None)
+                }
+            }
+            // ================================================================
+            // Shell Command Step Type
+            // ================================================================
+            "shell_command" => {
+                self.execute_shell_command_step(step, timeout).await
+            }
+            // ================================================================
+            // Script Step Type (Playwright inline code)
+            // ================================================================
+            "script" => {
+                // Script steps contain inline Playwright code - treat like playwright
+                if let Some(ref script_content) = step.playwright_script_content {
+                    self.run_playwright_inline(
+                        script_content,
+                        step.playwright_target_url.as_deref(),
+                        step.name.as_deref().unwrap_or("script"),
+                    )
+                    .await
+                } else if let Some(ref script_id) = step.playwright_script_id {
+                    self.run_playwright_script(script_id).await
+                } else {
+                    (false, Some("No script code or script ID specified".to_string()), None)
+                }
+            }
+            // ================================================================
+            // Workflow Reference Step Type (by ID)
+            // ================================================================
+            "workflow_ref" => {
+                // workflow_ref runs another workflow by ID
+                // For now, we look up the workflow name and delegate to the workflow handler
+                if let Some(ref workflow_name) = step.name {
+                    match self
+                        .action_service
+                        .run_workflow(
+                            workflow_name,
+                            None,
+                            step.monitor_index,
+                            timeout,
+                            step.initial_state_ids.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(result) => (result.success, result.error, None),
+                        Err(e) => (false, Some(format!("Workflow ref error: {}", e)), None),
+                    }
+                } else {
+                    (false, Some("No workflow name specified for workflow_ref".to_string()), None)
+                }
+            }
+            // ================================================================
+            // GUI Action Step Type (vision-based)
+            // ================================================================
+            "gui_action" => {
+                // gui_action uses vision-based automation
+                // Map to action handler with appropriate field extraction
+                if let Some(ref action_type) = step.action_type {
+                    if let Some(ref image_id) = step.target_image_id {
+                        match self
+                            .action_service
+                            .execute_action(action_type, image_id, None, step.monitor_index)
+                            .await
+                        {
+                            Ok(result) => (
+                                result.success,
+                                result.message.filter(|_| !result.success),
+                                None,
+                            ),
+                            Err(e) => (false, Some(format!("GUI action error: {}", e)), None),
+                        }
+                    } else {
+                        // For type/hotkey actions that don't need a target image
+                        match action_type.as_str() {
+                            "type" | "hotkey" | "scroll" => {
+                                // These would need special handling via Python bridge
+                                (false, Some(format!("GUI action '{}' not yet implemented in step executor", action_type)), None)
+                            }
+                            _ => (false, Some("No target image ID specified for GUI action".to_string()), None)
+                        }
+                    }
+                } else {
+                    (false, Some("No action type specified for GUI action".to_string()), None)
+                }
+            }
+            // ================================================================
+            // API Request Step Type
+            // ================================================================
+            "api_request" => {
+                self.execute_api_request_step(step, timeout).await
+            }
+            // ================================================================
+            // Check Step Type (code quality checks)
+            // ================================================================
+            "check" => {
+                self.execute_check_step(step, timeout).await
             }
             _ => {
                 warn!("Unknown step type: {}", step.step_type);
@@ -974,6 +2147,1137 @@ impl StepExecutor {
             ),
         }
     }
+
+    /// Run inline Playwright script content (for combined scripts)
+    ///
+    /// This runs script content directly without needing a script ID.
+    /// Used for combined setup+verification scripts.
+    async fn run_playwright_inline(
+        &self,
+        content: &str,
+        target_url: Option<&str>,
+        script_name: &str,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!(
+            "Running inline Playwright script: {} ({} chars)",
+            script_name,
+            content.len()
+        );
+
+        // Run the inline script using the playwright executor
+        match crate::playwright::run_script_inline(content, target_url, script_name) {
+            Ok(result) => {
+                let error = if !result.passed {
+                    result.error.clone()
+                } else {
+                    None
+                };
+                (result.passed, error, None)
+            }
+            Err(e) => (false, Some(format!("Inline Playwright error: {}", e)), None),
+        }
+    }
+
+    /// Execute a verification test by ID
+    ///
+    /// Runs the test using the test_executor module and returns the result.
+    /// If is_critical is true, test failure will be reported as step failure.
+    async fn execute_verification_test(
+        &self,
+        test_id: &str,
+        is_critical: bool,
+    ) -> Result<(bool, Option<String>), String> {
+        use crate::database::TestType as DbTestType;
+        use crate::test_executor::{
+            self, TestCategory, TestDefinition, TestStatus, TestType, VisionConfig,
+        };
+
+        info!("Executing verification test: {} (critical: {})", test_id, is_critical);
+
+        // Get the test from database
+        let verification_test = self
+            .app_state
+            .checkpoint_db
+            .get_verification_test(test_id)?
+            .ok_or_else(|| format!("Verification test not found: {}", test_id))?;
+
+        // Convert database TestType to test_executor TestType
+        let test_type = match verification_test.test_type {
+            DbTestType::PlaywrightCdp => TestType::PlaywrightCdp,
+            DbTestType::QontinuiVision => TestType::QontinuiVision,
+            DbTestType::PythonScript => TestType::PythonScript,
+            DbTestType::RepositoryTest => TestType::RepositoryTest,
+        };
+
+        // Parse vision config if present
+        let vision_config: Option<VisionConfig> = verification_test
+            .vision_config
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        // Parse repo test config if present
+        let repo_test_config = verification_test
+            .repo_test_config
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        // Convert to TestDefinition
+        let test_def = TestDefinition {
+            id: verification_test.id.clone(),
+            name: verification_test.name.clone(),
+            test_type,
+            category: TestCategory::Custom, // Default to Custom
+            playwright_code: verification_test.playwright_code.clone(),
+            vision_config,
+            python_code: verification_test.python_code.clone(),
+            repo_test_config,
+            timeout_seconds: verification_test.timeout_seconds,
+            is_critical: verification_test.is_critical,
+            config: verification_test.config.clone(),
+        };
+
+        // Execute the test (synchronous)
+        let result = test_executor::execute_test(&test_def);
+
+        // Log the result
+        if result.status == TestStatus::Passed {
+            info!(
+                "Test '{}' passed in {}ms ({}/{} assertions)",
+                verification_test.name,
+                result.duration_ms,
+                result.assertions_passed,
+                result.assertions_passed + result.assertions_failed
+            );
+            Ok((true, None))
+        } else {
+            let error_msg = format!(
+                "Test '{}' {}: {} ({}/{} assertions passed)",
+                verification_test.name,
+                match result.status {
+                    TestStatus::Failed => "failed",
+                    TestStatus::Error => "errored",
+                    TestStatus::Timeout => "timed out",
+                    _ => "did not pass",
+                },
+                result.error.as_deref().unwrap_or("Unknown error"),
+                result.assertions_passed,
+                result.assertions_passed + result.assertions_failed
+            );
+
+            warn!("{}", error_msg);
+
+            // If critical, report as step failure; otherwise, log but succeed
+            if is_critical {
+                Ok((false, Some(error_msg)))
+            } else {
+                info!("Non-critical test failure - step continues");
+                Ok((true, Some(format!("(Non-critical) {}", error_msg))))
+            }
+        }
+    }
+
+    // ========================================================================
+    // AWAS Step Execution Methods
+    // ========================================================================
+
+    /// Execute AWAS discover step - discovers AWAS manifest from a URL
+    async fn execute_awas_discover(
+        &self,
+        url: &str,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!("AWAS Discover: {}", url);
+
+        let start_time = std::time::Instant::now();
+        let params = json!({
+            "url": url,
+        });
+
+        match self.execute_awas_command("awas_discover", Some(params.clone()), timeout_secs).await {
+            Ok(response) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+
+                // Save result to database
+                self.save_awas_step_result(
+                    "awas_discover",
+                    Some(url),
+                    None,
+                    Some(&params),
+                    &response,
+                    duration_ms,
+                    Some(&format!("AWAS Discover: {}", url)),
+                );
+
+                if response.success {
+                    info!("AWAS Discover completed successfully for {} in {}ms", url, duration_ms);
+                    (true, None, None)
+                } else {
+                    let error = response.error.unwrap_or_else(|| "AWAS discover failed".to_string());
+                    (false, Some(error), None)
+                }
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let error_msg = format!("AWAS discover error: {}", e);
+
+                // Save error result to database
+                let error_response = AwasCommandResponse {
+                    success: false,
+                    data: None,
+                    error: Some(error_msg.clone()),
+                };
+                self.save_awas_step_result(
+                    "awas_discover",
+                    Some(url),
+                    None,
+                    Some(&params),
+                    &error_response,
+                    duration_ms,
+                    Some(&format!("AWAS Discover: {}", url)),
+                );
+
+                (false, Some(error_msg), None)
+            }
+        }
+    }
+
+    /// Execute AWAS action step - executes an AWAS action on the target application
+    async fn execute_awas_action(
+        &self,
+        url: &str,
+        action_id: &str,
+        params: Option<serde_json::Value>,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!("AWAS Execute: {} on {}", action_id, url);
+
+        let start_time = std::time::Instant::now();
+        let command_params = json!({
+            "url": url,
+            "action_id": action_id,
+            "params": params,
+        });
+
+        match self.execute_awas_command("awas_execute", Some(command_params.clone()), timeout_secs).await {
+            Ok(response) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+
+                // Save result to database
+                self.save_awas_step_result(
+                    "awas_execute",
+                    Some(url),
+                    Some(action_id),
+                    Some(&command_params),
+                    &response,
+                    duration_ms,
+                    Some(&format!("AWAS Execute: {}", action_id)),
+                );
+
+                if response.success {
+                    info!("AWAS Execute '{}' completed successfully in {}ms", action_id, duration_ms);
+                    (true, None, None)
+                } else {
+                    let error = response.error.unwrap_or_else(|| "AWAS execute failed".to_string());
+                    (false, Some(error), None)
+                }
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let error_msg = format!("AWAS execute error: {}", e);
+
+                // Save error result to database
+                let error_response = AwasCommandResponse {
+                    success: false,
+                    data: None,
+                    error: Some(error_msg.clone()),
+                };
+                self.save_awas_step_result(
+                    "awas_execute",
+                    Some(url),
+                    Some(action_id),
+                    Some(&command_params),
+                    &error_response,
+                    duration_ms,
+                    Some(&format!("AWAS Execute: {}", action_id)),
+                );
+
+                (false, Some(error_msg), None)
+            }
+        }
+    }
+
+    /// Execute AWAS check support step - checks if a URL supports AWAS
+    async fn execute_awas_check_support(
+        &self,
+        url: &str,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!("AWAS Check Support: {}", url);
+
+        let start_time = std::time::Instant::now();
+        let params = json!({
+            "url": url,
+        });
+
+        match self.execute_awas_command("awas_check_support", Some(params.clone()), timeout_secs).await {
+            Ok(response) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+
+                // Save result to database
+                self.save_awas_step_result(
+                    "awas_check_support",
+                    Some(url),
+                    None,
+                    Some(&params),
+                    &response,
+                    duration_ms,
+                    Some(&format!("AWAS Check Support: {}", url)),
+                );
+
+                if response.success {
+                    // Extract support status from response data
+                    let supported = response.data
+                        .as_ref()
+                        .and_then(|d| d.get("supported"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    if supported {
+                        info!("AWAS is supported at {} (checked in {}ms)", url, duration_ms);
+                    } else {
+                        info!("AWAS is not supported at {} (checked in {}ms)", url, duration_ms);
+                    }
+                    (true, None, None)
+                } else {
+                    let error = response.error.unwrap_or_else(|| "AWAS check support failed".to_string());
+                    (false, Some(error), None)
+                }
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let error_msg = format!("AWAS check support error: {}", e);
+
+                // Save error result to database
+                let error_response = AwasCommandResponse {
+                    success: false,
+                    data: None,
+                    error: Some(error_msg.clone()),
+                };
+                self.save_awas_step_result(
+                    "awas_check_support",
+                    Some(url),
+                    None,
+                    Some(&params),
+                    &error_response,
+                    duration_ms,
+                    Some(&format!("AWAS Check Support: {}", url)),
+                );
+
+                (false, Some(error_msg), None)
+            }
+        }
+    }
+
+    /// Execute AWAS list actions step - lists available AWAS actions
+    async fn execute_awas_list_actions(
+        &self,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!("AWAS List Actions");
+
+        let start_time = std::time::Instant::now();
+
+        match self.execute_awas_command("awas_list_actions", None, timeout_secs).await {
+            Ok(response) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+
+                // Save result to database
+                self.save_awas_step_result(
+                    "awas_list_actions",
+                    None,
+                    None,
+                    None,
+                    &response,
+                    duration_ms,
+                    Some("AWAS List Actions"),
+                );
+
+                if response.success {
+                    let action_count = response.data
+                        .as_ref()
+                        .and_then(|d| d.get("actions"))
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    info!("AWAS List Actions: found {} actions in {}ms", action_count, duration_ms);
+                    (true, None, None)
+                } else {
+                    let error = response.error.unwrap_or_else(|| "AWAS list actions failed".to_string());
+                    (false, Some(error), None)
+                }
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let error_msg = format!("AWAS list actions error: {}", e);
+
+                // Save error result to database
+                let error_response = AwasCommandResponse {
+                    success: false,
+                    data: None,
+                    error: Some(error_msg.clone()),
+                };
+                self.save_awas_step_result(
+                    "awas_list_actions",
+                    None,
+                    None,
+                    None,
+                    &error_response,
+                    duration_ms,
+                    Some("AWAS List Actions"),
+                );
+
+                (false, Some(error_msg), None)
+            }
+        }
+    }
+
+    /// Execute AWAS extract elements step - extracts AWAS elements from HTML
+    async fn execute_awas_extract_elements(
+        &self,
+        html: &str,
+        base_url: Option<&str>,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!("AWAS Extract Elements (HTML length: {} bytes)", html.len());
+
+        let start_time = std::time::Instant::now();
+        let params = json!({
+            "html": html,
+            "base_url": base_url,
+        });
+
+        // For the database, we don't want to store the full HTML in parameters
+        // (could be very large), so we just store metadata
+        let params_for_db = json!({
+            "html_length": html.len(),
+            "base_url": base_url,
+        });
+
+        match self.execute_awas_command("awas_extract_elements", Some(params), timeout_secs).await {
+            Ok(response) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+
+                // Save result to database
+                self.save_awas_step_result(
+                    "awas_extract_elements",
+                    base_url,
+                    None,
+                    Some(&params_for_db),
+                    &response,
+                    duration_ms,
+                    Some("AWAS Extract Elements"),
+                );
+
+                if response.success {
+                    info!("AWAS Extract Elements completed successfully in {}ms", duration_ms);
+                    (true, None, None)
+                } else {
+                    let error = response.error.unwrap_or_else(|| "AWAS extract elements failed".to_string());
+                    (false, Some(error), None)
+                }
+            }
+            Err(e) => {
+                let duration_ms = start_time.elapsed().as_millis() as i64;
+                let error_msg = format!("AWAS extract elements error: {}", e);
+
+                // Save error result to database
+                let error_response = AwasCommandResponse {
+                    success: false,
+                    data: None,
+                    error: Some(error_msg.clone()),
+                };
+                self.save_awas_step_result(
+                    "awas_extract_elements",
+                    base_url,
+                    None,
+                    Some(&params_for_db),
+                    &error_response,
+                    duration_ms,
+                    Some("AWAS Extract Elements"),
+                );
+
+                (false, Some(error_msg), None)
+            }
+        }
+    }
+
+    /// Execute an AWAS command via the Python bridge
+    async fn execute_awas_command(
+        &self,
+        command: &str,
+        params: Option<serde_json::Value>,
+        timeout_secs: u64,
+    ) -> Result<AwasCommandResponse, String> {
+        let app_state = self.app_state.clone();
+        let command = command.to_string();
+        let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+
+        tokio::task::spawn_blocking(move || {
+            let mut bridge_lock = app_state.python_bridge.lock().map_err(|e| {
+                format!("Failed to acquire python_bridge lock: {}", e)
+            })?;
+
+            if let Some(ref mut bridge) = *bridge_lock {
+                if !bridge.is_running() {
+                    return Err("Python executor not running".to_string());
+                }
+
+                let result = bridge.send_command_and_wait(&command, params, timeout_duration)?;
+
+                Ok(AwasCommandResponse {
+                    success: result.success,
+                    data: result.data,
+                    error: result.error,
+                })
+            } else {
+                Err("Python executor not initialized".to_string())
+            }
+        })
+        .await
+        .map_err(|e| format!("Task join error: {}", e))?
+    }
+
+    // =========================================================================
+    // MCP Call Step Execution
+    // =========================================================================
+
+    /// Execute an MCP call step - calls a tool on an MCP server
+    async fn execute_mcp_call(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+        timeout_secs: u64,
+        step_name: Option<&str>,
+        fail_on_error: bool,
+    ) -> (bool, Option<String>, Option<String>) {
+        info!("MCP Call: {}.{}", server_id, tool_name);
+
+        let start_time = std::time::Instant::now();
+
+        // Get the MCP client manager from app state
+        let mcp_manager = self.app_state.mcp_client_manager.lock().await;
+
+        // Temporarily set timeout on the server config (not persisted)
+        // The actual timeout is handled by the MCP client implementation
+        let result = mcp_manager.call_tool(server_id, tool_name, arguments.clone()).await;
+        let duration_ms = start_time.elapsed().as_millis() as i64;
+
+        match result {
+            Ok(call_result) => {
+                // Save result to database
+                self.save_mcp_call_result(
+                    server_id,
+                    tool_name,
+                    &arguments,
+                    call_result.content.as_ref(),
+                    &call_result.response_type,
+                    call_result.success,
+                    call_result.error.as_deref(),
+                    duration_ms,
+                    step_name,
+                );
+
+                if call_result.success {
+                    info!("MCP Call '{}.{}' succeeded in {}ms", server_id, tool_name, duration_ms);
+                    // Return the content as a JSON string in the screenshot_path field
+                    // (repurposing this field for MCP result data)
+                    let result_data = call_result.content
+                        .map(|c| serde_json::to_string(&c).unwrap_or_default());
+                    (true, None, result_data)
+                } else {
+                    let error = call_result.error.unwrap_or_else(|| "MCP call failed".to_string());
+                    if fail_on_error {
+                        (false, Some(error), None)
+                    } else {
+                        // Return success but include the error message
+                        info!("MCP Call '{}.{}' failed but fail_on_error=false, continuing", server_id, tool_name);
+                        (true, Some(format!("(ignored) {}", error)), None)
+                    }
+                }
+            }
+            Err(e) => {
+                let error_msg = format!("MCP call error: {}", e);
+
+                // Save error result to database
+                self.save_mcp_call_result(
+                    server_id,
+                    tool_name,
+                    &arguments,
+                    None,
+                    "error",
+                    false,
+                    Some(&error_msg),
+                    duration_ms,
+                    step_name,
+                );
+
+                if fail_on_error {
+                    (false, Some(error_msg), None)
+                } else {
+                    info!("MCP Call '{}.{}' errored but fail_on_error=false, continuing", server_id, tool_name);
+                    (true, Some(format!("(ignored) {}", error_msg)), None)
+                }
+            }
+        }
+    }
+
+    /// Save an MCP call result to the database (if task_run_id is set)
+    fn save_mcp_call_result(
+        &self,
+        server_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        response: Option<&serde_json::Value>,
+        response_type: &str,
+        success: bool,
+        error: Option<&str>,
+        duration_ms: i64,
+        step_name: Option<&str>,
+    ) {
+        // Only save if we have a task_run_id
+        let Some(ref task_run_id) = self.task_run_id else {
+            return;
+        };
+
+        let input = CreateMcpCallInput {
+            task_run_id: task_run_id.clone(),
+            step_id: uuid::Uuid::new_v4().to_string(), // Generate a step ID if not provided
+            step_name: step_name.map(|s| s.to_string()),
+            server_id: server_id.to_string(),
+            server_name: None, // Could be resolved from MCP client manager if needed
+            tool_name: tool_name.to_string(),
+            arguments: Some(serde_json::to_string(arguments).unwrap_or_default()),
+            resolved_arguments: None, // Same as arguments in this case
+            response: response.map(|r| serde_json::to_string(r).unwrap_or_default()),
+            response_type: response_type.to_string(),
+            duration_ms,
+            extractions: None, // No variable extractions for now
+            assertions: None,  // No assertions for now
+            success,
+            error_message: error.map(|e| e.to_string()),
+        };
+
+        match self.app_state.checkpoint_db.create_task_run_mcp_call(&input) {
+            Ok(id) => {
+                info!("Saved MCP call result to database: {} (tool: {})", id, tool_name);
+            }
+            Err(e) => {
+                warn!("Failed to save MCP call result to database: {}", e);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Shell Command Step Execution
+    // =========================================================================
+
+    /// Execute a shell command step
+    async fn execute_shell_command_step(
+        &self,
+        step: &ExecutionStepConfig,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        use std::process::Stdio;
+        use tokio::process::Command;
+        use tokio::time::{timeout, Duration};
+
+        // Get the command - either directly or from shell_command_id (not implemented yet)
+        let command = match &step.shell_command {
+            Some(cmd) => cmd.clone(),
+            None => {
+                // If no direct command, check for shell_command_id
+                if let Some(_id) = &step.shell_command_id {
+                    // TODO: Look up saved shell command by ID from database
+                    return (false, Some("Shell command lookup by ID not yet implemented in step executor".to_string()), None);
+                }
+                return (false, Some("No shell command specified".to_string()), None);
+            }
+        };
+
+        let step_name = step.name.as_deref().unwrap_or("Shell Command");
+        let working_directory = step.shell_command_working_directory.clone();
+        let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
+
+        // Detect if command uses PowerShell syntax
+        let is_powershell = command.contains("Get-")
+            || command.contains("Set-")
+            || command.contains("New-")
+            || command.contains("Remove-")
+            || command.contains("Invoke-")
+            || command.contains("ForEach-Object")
+            || command.contains("Where-Object")
+            || command.contains("Select-Object")
+            || command.contains("$_")
+            || command.contains("$env:")
+            || command.contains("-ErrorAction")
+            || command.contains("| %")
+            || command.contains("| ?");
+
+        let shell_type = if cfg!(target_os = "windows") && is_powershell { "powershell" } else if cfg!(target_os = "windows") { "cmd" } else { "sh" };
+
+        info!(
+            "Executing shell command '{}': {} (shell: {}, timeout: {}s, working_dir: {:?})",
+            step_name, command, shell_type, timeout_secs, working_directory
+        );
+
+        // Generate sequence number and timestamp for tree events
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SHELL_COMMAND_SEQUENCE: AtomicU32 = AtomicU32::new(1);
+        let sequence = SHELL_COMMAND_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+        let timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let action_id = format!("shell-command-{}", sequence);
+
+        // Truncate command for display (first 50 chars)
+        let command_display = if command.len() > 50 {
+            format!("{}...", &command[..50])
+        } else {
+            command.clone()
+        };
+
+        // Build action node for tree events
+        let action_node = json!({
+            "id": &action_id,
+            "node_type": "action",
+            "name": format!("SHELL: {}", step_name),
+            "timestamp": timestamp,
+            "status": "pending",
+            "metadata": {
+                "command": &command_display,
+                "shell_type": shell_type,
+                "working_directory": working_directory.as_deref().unwrap_or(""),
+                "timeout_seconds": timeout_secs,
+            }
+        });
+
+        // Emit action_started tree event to file log
+        FileLogger::log_tree_event(
+            "action_started",
+            &action_node,
+            &[],
+            timestamp,
+            sequence,
+        );
+
+        // Also add to DisplayProcessor for Session/Actions page
+        {
+            let raw_event = RawEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: "action_started".to_string(),
+                timestamp,
+                data: json!({ "node": action_node.clone() }),
+                sequence: sequence as u64,
+            };
+            let mut processor = self.app_state.display_processor.lock().await;
+            processor.event_log_mut().add_event(raw_event);
+        }
+
+        // Emit to Tauri frontend for action log refresh
+        self.emit_tree_event("action_started", &action_node, timestamp, sequence);
+
+        // Build the command - use PowerShell for PowerShell syntax on Windows
+        let mut cmd = if cfg!(target_os = "windows") {
+            if is_powershell {
+                let mut c = Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &command]);
+                c
+            } else {
+                let mut c = Command::new("cmd");
+                c.args(["/C", &command]);
+                c
+            }
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", &command]);
+            c
+        };
+
+        // Set working directory if specified
+        if let Some(ref wd) = working_directory {
+            cmd.current_dir(wd);
+        }
+
+        // Capture stdout and stderr
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        // Execute with timeout
+        let start = std::time::Instant::now();
+        let timeout_duration = Duration::from_secs(timeout_secs);
+
+        let output_result = timeout(timeout_duration, cmd.output()).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Process the result
+        let (success, exit_code, stdout, stderr) = match output_result {
+            Ok(Ok(output)) => {
+                let exit_code = output.status.code();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let success = output.status.success();
+                (success, exit_code, stdout, stderr)
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to execute shell command '{}': {}", step_name, e);
+                (
+                    false,
+                    None,
+                    String::new(),
+                    format!("Failed to execute command: {}", e),
+                )
+            }
+            Err(_) => {
+                warn!(
+                    "Shell command '{}' timed out after {}s",
+                    step_name, timeout_secs
+                );
+                (
+                    false,
+                    None,
+                    String::new(),
+                    format!("Command timed out after {} seconds", timeout_secs),
+                )
+            }
+        };
+
+        info!(
+            "Shell command '{}' completed: success={}, exit_code={:?}, duration={}ms",
+            step_name, success, exit_code, duration_ms
+        );
+
+        // Log output if present
+        if !stdout.is_empty() {
+            info!("Shell command stdout:\n{}", stdout.trim());
+        }
+        if !stderr.is_empty() {
+            if success {
+                info!("Shell command stderr:\n{}", stderr.trim());
+            } else {
+                warn!("Shell command stderr:\n{}", stderr.trim());
+            }
+        }
+
+        // Determine overall success based on fail_on_error setting
+        let end_timestamp = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+        let duration = end_timestamp - timestamp;
+
+        // Truncate stdout/stderr for display
+        let stdout_display = if stdout.len() > 200 {
+            format!("{}...", &stdout[..200])
+        } else {
+            stdout.clone()
+        };
+        let stderr_display = if stderr.len() > 200 {
+            format!("{}...", &stderr[..200])
+        } else {
+            stderr.clone()
+        };
+
+        let (final_success, error_msg, output_data) = if success {
+            // Return stdout in the screenshot_path field (repurposed for output data)
+            let output_data = if stdout.is_empty() { None } else { Some(stdout) };
+            (true, None, output_data)
+        } else if fail_on_error {
+            let error_msg = if !stderr.is_empty() {
+                format!("Command failed (exit code {:?}): {}", exit_code, stderr.trim())
+            } else {
+                format!("Command failed with exit code {:?}", exit_code)
+            };
+            (false, Some(error_msg), None)
+        } else {
+            // Return success but include the error message
+            info!("Shell command '{}' failed but fail_on_error=false, continuing", step_name);
+            let error_msg = if !stderr.is_empty() {
+                format!("(ignored) Command failed: {}", stderr.trim())
+            } else {
+                format!("(ignored) Command failed with exit code {:?}", exit_code)
+            };
+            (true, Some(error_msg), Some(stdout))
+        };
+
+        // Build completed action node
+        let completed_node = json!({
+            "id": &action_id,
+            "node_type": "action",
+            "name": format!("SHELL: {}", step_name),
+            "timestamp": end_timestamp,
+            "status": if final_success { "success" } else { "failed" },
+            "duration": duration,
+            "metadata": {
+                "command": &command_display,
+                "shell_type": shell_type,
+                "working_directory": working_directory.as_deref().unwrap_or(""),
+                "exit_code": exit_code,
+                "stdout": &stdout_display,
+                "stderr": &stderr_display,
+                "duration_ms": duration_ms,
+            }
+        });
+
+        let event_type = if final_success { "action_completed" } else { "action_failed" };
+
+        // Emit completion tree event to file log
+        FileLogger::log_tree_event(
+            event_type,
+            &completed_node,
+            &[],
+            end_timestamp,
+            sequence,
+        );
+
+        // Also add to DisplayProcessor for Session/Actions page
+        {
+            let raw_event = RawEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                event_type: event_type.to_string(),
+                timestamp: end_timestamp,
+                data: json!({ "node": completed_node.clone() }),
+                sequence: sequence as u64,
+            };
+            let mut processor = self.app_state.display_processor.lock().await;
+            processor.event_log_mut().add_event(raw_event);
+        }
+
+        // Emit to Tauri frontend for action log refresh
+        self.emit_tree_event(event_type, &completed_node, end_timestamp, sequence);
+
+        (final_success, error_msg, output_data)
+    }
+
+    // =========================================================================
+    // API Request Step Execution
+    // =========================================================================
+
+    /// Execute an API request step
+    async fn execute_api_request_step(
+        &self,
+        step: &ExecutionStepConfig,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        let method = match &step.api_method {
+            Some(m) => m.to_uppercase(),
+            None => {
+                return (false, Some("No HTTP method specified for API request".to_string()), None);
+            }
+        };
+
+        let url = match &step.api_url {
+            Some(u) => u.clone(),
+            None => {
+                return (false, Some("No URL specified for API request".to_string()), None);
+            }
+        };
+
+        let step_name = step.name.as_deref().unwrap_or("API Request");
+        info!("Executing API request '{}': {} {}", step_name, method, url);
+
+        // Build the HTTP client with timeout
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return (false, Some(format!("Failed to create HTTP client: {}", e)), None);
+            }
+        };
+
+        // Build the request
+        let mut request = match method.as_str() {
+            "GET" => client.get(&url),
+            "POST" => client.post(&url),
+            "PUT" => client.put(&url),
+            "PATCH" => client.patch(&url),
+            "DELETE" => client.delete(&url),
+            _ => {
+                return (false, Some(format!("Unsupported HTTP method: {}", method)), None);
+            }
+        };
+
+        // Add headers
+        if let Some(headers) = &step.api_headers {
+            if let Some(obj) = headers.as_object() {
+                for (key, value) in obj {
+                    if let Some(v) = value.as_str() {
+                        request = request.header(key.as_str(), v);
+                    }
+                }
+            }
+        }
+
+        // Add content type
+        if let Some(content_type) = &step.api_content_type {
+            request = request.header("Content-Type", content_type.as_str());
+        }
+
+        // Add body
+        if let Some(body) = &step.api_body {
+            request = request.body(body.clone());
+        }
+
+        // Execute the request
+        let start = std::time::Instant::now();
+        match request.send().await {
+            Ok(response) => {
+                let duration_ms = start.elapsed().as_millis();
+                let status = response.status();
+                let status_code = status.as_u16();
+
+                match response.text().await {
+                    Ok(body) => {
+                        info!(
+                            "API request '{}' completed: status={}, duration={}ms",
+                            step_name, status_code, duration_ms
+                        );
+
+                        if status.is_success() {
+                            // Return response body in the output field
+                            (true, None, Some(body))
+                        } else {
+                            (false, Some(format!("HTTP {}: {}", status_code, body.chars().take(500).collect::<String>())), Some(body))
+                        }
+                    }
+                    Err(e) => {
+                        (false, Some(format!("Failed to read response body: {}", e)), None)
+                    }
+                }
+            }
+            Err(e) => {
+                (false, Some(format!("API request failed: {}", e)), None)
+            }
+        }
+    }
+
+    // =========================================================================
+    // Check Step Execution
+    // =========================================================================
+
+    /// Execute a code quality check step
+    async fn execute_check_step(
+        &self,
+        step: &ExecutionStepConfig,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        use std::process::Stdio;
+        use tokio::process::Command;
+        use tokio::time::{timeout, Duration};
+
+        let check_type = step.check_type.as_deref().unwrap_or("custom_command");
+        let step_name = step.name.as_deref().unwrap_or("Check");
+
+        // Get the command to run
+        let command = match &step.check_command {
+            Some(cmd) => cmd.clone(),
+            None => {
+                // Default commands based on check type
+                match check_type {
+                    "lint" => "npm run lint".to_string(),
+                    "format" => "npm run format:check".to_string(),
+                    "typecheck" => "npm run typecheck".to_string(),
+                    "analyze" => "npm run analyze".to_string(),
+                    "security" => "npm audit".to_string(),
+                    _ => {
+                        return (false, Some("No command specified for check step".to_string()), None);
+                    }
+                }
+            }
+        };
+
+        let working_directory = step.check_working_directory.clone();
+        let auto_fix = step.check_auto_fix.unwrap_or(false);
+
+        // Modify command for auto-fix if enabled
+        let final_command = if auto_fix {
+            match check_type {
+                "lint" => command.replace("lint", "lint:fix").replace(":check", ":fix"),
+                "format" => command.replace("format:check", "format").replace("--check", ""),
+                _ => command,
+            }
+        } else {
+            command
+        };
+
+        info!(
+            "Executing check '{}' ({}): {} (timeout: {}s, working_dir: {:?})",
+            step_name, check_type, final_command, timeout_secs, working_directory
+        );
+
+        // Build the command
+        let mut cmd = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.args(["/C", &final_command]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", &final_command]);
+            c
+        };
+
+        // Set working directory if specified
+        if let Some(ref wd) = working_directory {
+            cmd.current_dir(wd);
+        }
+
+        // Capture stdout and stderr
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        // Execute with timeout
+        let start = std::time::Instant::now();
+        let timeout_duration = Duration::from_secs(timeout_secs);
+
+        let output_result = timeout(timeout_duration, cmd.output()).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Process the result
+        match output_result {
+            Ok(Ok(output)) => {
+                let exit_code = output.status.code();
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let success = output.status.success();
+
+                info!(
+                    "Check '{}' completed: success={}, exit_code={:?}, duration={}ms",
+                    step_name, success, exit_code, duration_ms
+                );
+
+                if success {
+                    let output_data = if stdout.is_empty() { None } else { Some(stdout) };
+                    (true, None, output_data)
+                } else {
+                    let error_output = if !stderr.is_empty() { stderr } else { stdout };
+                    (false, Some(format!("Check failed: {}", error_output.trim())), None)
+                }
+            }
+            Ok(Err(e)) => {
+                warn!("Failed to execute check '{}': {}", step_name, e);
+                (false, Some(format!("Failed to execute check: {}", e)), None)
+            }
+            Err(_) => {
+                warn!("Check '{}' timed out after {}s", step_name, timeout_secs);
+                (false, Some(format!("Check timed out after {} seconds", timeout_secs)), None)
+            }
+        }
+    }
+}
+
+/// Response from AWAS command execution
+#[derive(Debug)]
+struct AwasCommandResponse {
+    success: bool,
+    data: Option<serde_json::Value>,
+    error: Option<String>,
 }
 
 #[cfg(test)]

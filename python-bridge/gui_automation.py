@@ -7,8 +7,10 @@ Single Responsibility: Handle GUI interaction and action execution
 - Track execution hierarchy with ExecutionTree
 - Collect execution data via UnifiedDataCollector
 - Handle special action types (RUN_WORKFLOW, GO_TO_STATE, FIND, AI_PROMPT, RUN_PROMPT_SEQUENCE)
+- Handle accessibility-based targeting via AccessibilityCaptureService
 """
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -16,6 +18,7 @@ from typing import Any
 
 from ai_prompt_executor import AIPromptExecutor
 from gemini_executor import GeminiExecutor
+from services.accessibility_capture_service import AccessibilityCaptureService
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,105 @@ class GUIAutomation:
         # Initialize AI prompt executors for AI_PROMPT and RUN_PROMPT_SEQUENCE actions
         self.ai_prompt_executor = AIPromptExecutor(emit_log_fn=emit_log_fn)
         self.gemini_executor = GeminiExecutor(emit_log_fn=emit_log_fn)
+
+        # Initialize accessibility capture service for ref-based actions
+        self._accessibility_service: AccessibilityCaptureService | None = None
+
+    def _get_accessibility_service(self) -> AccessibilityCaptureService:
+        """Get or create the accessibility capture service (lazy initialization)."""
+        if self._accessibility_service is None:
+            self._accessibility_service = AccessibilityCaptureService()
+        return self._accessibility_service
+
+    async def _handle_accessibility_action(
+        self, action_type: str, target: dict[str, Any]
+    ) -> bool:
+        """Handle actions with accessibility targets.
+
+        This method:
+        1. Captures accessibility tree if needed
+        2. Finds the element by ref or selector
+        3. Performs the action (click, type, focus)
+
+        Args:
+            action_type: The action type (CLICK, TYPE, FOCUS)
+            target: Accessibility target config with ref or selector
+
+        Returns:
+            True if action succeeded, False otherwise
+        """
+        service = self._get_accessibility_service()
+
+        # Extract target config
+        ref = target.get("ref")
+        role = target.get("role")
+        name = target.get("name")
+        name_contains = target.get("nameContains")
+        is_interactive = target.get("isInteractive")
+        capture_first = target.get("captureFirst", True)
+        cdp_host = target.get("cdpHost", "localhost")
+        cdp_port = target.get("cdpPort", 9222)
+
+        try:
+            # Capture tree if needed
+            if capture_first or not service.has_snapshot:
+                self.emit_log("info", f"Capturing accessibility tree from {cdp_host}:{cdp_port}")
+                result = await service.capture_accessibility_tree(
+                    cdp_host=cdp_host,
+                    cdp_port=cdp_port,
+                    interactive_only=True,
+                )
+                if not result.get("success"):
+                    self.emit_log("error", f"Failed to capture accessibility tree: {result.get('error')}")
+                    return False
+
+            # If we have a direct ref, use it
+            if ref:
+                target_ref = ref
+            else:
+                # Find element by selector
+                self.emit_log("info", f"Finding element by selector: role={role}, name={name}")
+                find_result = await service.find_elements(
+                    role=role,
+                    name=name,
+                    name_contains=name_contains,
+                    is_interactive=is_interactive,
+                )
+                if not find_result.get("success") or find_result.get("count", 0) == 0:
+                    self.emit_log("error", f"No elements found matching selector")
+                    return False
+
+                # Use the first match
+                elements = find_result.get("elements", [])
+                if not elements:
+                    return False
+                target_ref = elements[0].get("ref")
+                self.emit_log("info", f"Found element: {target_ref}")
+
+            # Perform the action
+            if action_type == "CLICK":
+                result = await service.click_ref(target_ref)
+            elif action_type == "TYPE":
+                # For TYPE actions, we need the text from the action config
+                # This will be passed separately - for now just focus
+                result = await service.focus_ref(target_ref)
+            elif action_type == "FOCUS":
+                result = await service.focus_ref(target_ref)
+            else:
+                self.emit_log("warning", f"Unknown accessibility action type: {action_type}")
+                return False
+
+            success = result.get("success", False)
+            if success:
+                self.emit_log("info", f"Accessibility action {action_type} on {target_ref} succeeded")
+            else:
+                self.emit_log("error", f"Accessibility action {action_type} on {target_ref} failed: {result.get('error')}")
+
+            return success
+
+        except Exception as e:
+            self.emit_log("error", f"Accessibility action failed: {e}")
+            return False
 
     async def execute_action(self, action_data: dict[str, Any]) -> bool:
         """
@@ -178,7 +280,7 @@ class GUIAutomation:
                     # Route to appropriate executor based on provider
                     if provider and provider.startswith("gemini"):
                         # Use Gemini executor
-                        gemini_model = model or "gemini-3-flash"
+                        gemini_model = model or "gemini-3-flash-preview"
                         self.emit_log(
                             "info", f"Using Gemini provider: {provider}, model: {gemini_model}"
                         )
@@ -240,6 +342,29 @@ class GUIAutomation:
                         "duration": result.get("total_duration_seconds"),
                     }
 
+            # Check for accessibility target before normal action delegation
+            elif action_type in ("CLICK", "TYPE", "FOCUS"):
+                # Check if action has an accessibility target
+                target = config.get("target", {})
+                if isinstance(target, dict) and target.get("type") == "accessibility":
+                    # Handle via accessibility service
+                    self.emit_log("info", f"Handling {action_type} with accessibility target")
+                    success = await self._handle_accessibility_action(action_type, target)
+
+                    # For TYPE actions with accessibility targets, also type the text
+                    if action_type == "TYPE" and success:
+                        text = config.get("text", "")
+                        if text:
+                            service = self._get_accessibility_service()
+                            target_ref = target.get("ref")
+                            if target_ref:
+                                fill_result = await service.fill_ref(
+                                    target_ref, text, clear_first=config.get("clearFirst", False)
+                                )
+                                success = fill_result.get("success", False)
+                else:
+                    # Normal action delegation to library
+                    success = await self.action_executor.execute_action(action)
             else:
                 # Normal action delegation to library
                 success = await self.action_executor.execute_action(action)

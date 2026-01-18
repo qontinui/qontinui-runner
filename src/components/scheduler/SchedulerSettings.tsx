@@ -6,6 +6,7 @@
 
 import { useState, useEffect } from "react";
 import { Save, Loader2, Play, Pause } from "lucide-react";
+import { getAccentColors, getStatusColors } from "@/design-system";
 import type {
   SchedulerSettings as SchedulerSettingsType,
   SchedulerStatus,
@@ -74,7 +75,7 @@ export function SchedulerSettings({
             <div className="flex items-center gap-2">
               <span className="text-muted-foreground">Status:</span>
               <span
-                className={`flex items-center gap-1 ${status.enabled ? "text-green-500" : "text-text-muted"}`}
+                className={`flex items-center gap-1 ${status.enabled ? getStatusColors("success").text : "text-text-muted"}`}
               >
                 {status.enabled ? (
                   <>
@@ -89,7 +90,7 @@ export function SchedulerSettings({
             </div>
             <div>
               <span className="text-muted-foreground">Running Tasks:</span>{" "}
-              <span className={status.running_tasks > 0 ? "text-blue-500" : ""}>
+              <span className={status.running_tasks > 0 ? getStatusColors("running").text : ""}>
                 {status.running_tasks}
               </span>
             </div>
@@ -163,7 +164,7 @@ export function SchedulerSettings({
           <button
             onClick={() => setDefaultAutoFix(!defaultAutoFix)}
             className={`relative w-12 h-6 rounded-full transition-colors ${
-              defaultAutoFix ? "bg-orange-500" : "bg-muted"
+              defaultAutoFix ? getAccentColors("orange").bgSolid : "bg-muted"
             }`}
           >
             <div

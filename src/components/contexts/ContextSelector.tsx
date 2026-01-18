@@ -34,6 +34,7 @@ import type {
   ContextScope,
 } from "../../types/context";
 import { useContexts, groupContextsByScope } from "./hooks/useContexts";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 // ============================================================================
 // Types
@@ -146,7 +147,9 @@ function ContextItem({
         <div className="flex items-center gap-2">
           <span className="font-medium text-sm truncate">{context.name}</span>
           {isAutoDetected && (
-            <span className="px-1.5 py-0.5 text-xs bg-amber-500/20 text-amber-500 rounded flex items-center gap-1">
+            <span
+              className={`px-1.5 py-0.5 text-xs ${getAccentColors("amber").bg} ${getAccentColors("amber").text} rounded flex items-center gap-1`}
+            >
               <Zap className="w-3 h-3" />
               auto
             </span>
@@ -381,7 +384,7 @@ export function ContextSelector({
           <span
             className={`
               px-1.5 py-0.5 text-xs rounded-full
-              ${selection.autoDetect ? "bg-amber-500/20 text-amber-500" : "bg-muted text-muted-foreground"}
+              ${selection.autoDetect ? `${getAccentColors("amber").bg} ${getAccentColors("amber").text}` : "bg-muted text-muted-foreground"}
             `}
           >
             {selection.autoDetect ? "Auto" : "Manual"}
@@ -422,7 +425,7 @@ export function ContextSelector({
             ${disabled ? "opacity-50 cursor-not-allowed" : "cursor-pointer"}
             ${
               selection.autoDetect
-                ? "bg-amber-500/20 text-amber-500 hover:bg-amber-500/30"
+                ? `${getAccentColors("amber").bg} ${getAccentColors("amber").text} hover:bg-amber-500/30`
                 : "bg-muted text-muted-foreground hover:bg-muted/80"
             }
           `}
@@ -440,7 +443,9 @@ export function ContextSelector({
 
       {/* Error State */}
       {error && (
-        <div className="flex items-center gap-2 p-2 text-sm text-red-500 bg-red-500/10 rounded-lg">
+        <div
+          className={`flex items-center gap-2 p-2 text-sm ${getStatusColors("error").text} ${getStatusColors("error").bg} rounded-lg`}
+        >
           <AlertCircle className="w-4 h-4 flex-shrink-0" />
           <span>{error}</span>
         </div>
@@ -455,7 +460,9 @@ export function ContextSelector({
 
       {/* Auto-detect Info */}
       {selection.autoDetect && autoDetectState.results.length > 0 && (
-        <div className="flex items-start gap-2 p-2 text-xs text-amber-500 bg-amber-500/10 rounded-lg">
+        <div
+          className={`flex items-start gap-2 p-2 text-xs ${getAccentColors("amber").text} ${getAccentColors("amber").bg} rounded-lg`}
+        >
           <Info className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
           <span>
             {autoDetectState.results.length} context(s) auto-detected based on your task. You can

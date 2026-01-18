@@ -15,3 +15,4 @@ export { StatusBanner, type StatusBannerProps } from "./StatusBanner";
 export { EmptyState, type EmptyStateProps } from "./EmptyState";
 export { ScrollArea, ScrollBar } from "./ScrollArea";
 export { Progress, type ProgressProps } from "./Progress";
+export { Tabs, TabsList, TabsTrigger, TabsContent } from "./Tabs";

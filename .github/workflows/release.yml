@@ -5,6 +5,15 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      include_bundled_python:
+        description: 'Bundle Python executor (zero-setup installation)'
+        type: boolean
+        default: true
+      include_cuda:
+        description: 'Include CUDA support in bundled Python'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -14,6 +23,15 @@ env:
   SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
 
 jobs:
+  # Build Python executor for bundling (optional)
+  build-python-executor:
+    if: ${{ github.event.inputs.include_bundled_python != 'false' }}
+    uses: ./.github/workflows/build-python-executor.yml
+    with:
+      include_cuda: ${{ github.event.inputs.include_cuda == 'true' }}
+      include_sam3: true
+    secrets: inherit
+
   create-release:
     runs-on: ubuntu-latest
     outputs:
@@ -69,7 +87,9 @@ jobs:
             Checksums will be added after the build completes.
 
   build:
-    needs: create-release
+    needs: [create-release, build-python-executor]
+    # Run even if build-python-executor was skipped (when include_bundled_python is false)
+    if: ${{ always() && needs.create-release.result == 'success' }}
     strategy:
       matrix:
         include:
@@ -117,6 +137,21 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      # Download bundled Python executor if it was built
+      - name: Download Python executor
+        if: ${{ needs.build-python-executor.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: python-executors
+          path: src-tauri/binaries/
+
+      - name: List bundled executors
+        if: ${{ needs.build-python-executor.result == 'success' }}
+        shell: bash
+        run: |
+          echo "Bundled Python executors:"
+          ls -la src-tauri/binaries/ || echo "No binaries directory"
 
       # Signing is disabled for alpha releases - will be enabled when certificates arrive
       # - name: Import Apple certificates (macOS)

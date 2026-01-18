@@ -42,13 +42,25 @@ This is an **iterative feedback loop**. The runner executes automation, you anal
 - Pre-Execution Results show ALL steps succeeded
 - Screenshots confirm the expected outcome
 - The goal has been VERIFIED achieved
+- You have ALREADY SEEN fresh results confirming your fix worked
 
 **❌ Do NOT output \`[TASK_COMPLETE]\` if:**
 - You just made a fix but haven't verified it works
 - Pre-Execution Results still show failures
 - You're waiting for the next iteration to verify
+- The screenshots you're looking at are from BEFORE your fix
 
-**After making a fix:** Let the session end WITHOUT \`[TASK_COMPLETE]\`. The runner will re-run automation and you can verify the fix worked in the next session.
+## 🚨 COMMON MISTAKE - READ THIS
+
+**If you say "the next iteration will verify" and then output \`[TASK_COMPLETE]\`, you are WRONG.**
+
+\`[TASK_COMPLETE]\` PREVENTS the next iteration from happening. You cannot both:
+1. Say "next iteration will verify my changes"
+2. Output \`[TASK_COMPLETE]\`
+
+These are contradictory. If you need verification, DO NOT output \`[TASK_COMPLETE]\`.
+
+**After making a fix:** Let the session end WITHOUT \`[TASK_COMPLETE]\`. The runner will re-run automation and you can verify the fix worked in the next session. Only output \`[TASK_COMPLETE]\` AFTER seeing fresh data that confirms the fix worked.
 
 ## Automation Steps (Already Executed)
 
@@ -80,23 +92,32 @@ Based on the Pre-Execution Results:
 1. Identify which steps failed and why
 2. Read the relevant source code
 3. Make the fix
-4. Restart affected services if needed:
+4. Restart affected services if needed (see "Service Restart Commands" context for your environment-specific commands)
 
-\`\`\`powershell
-cd {{WORKSPACE_ESCAPED}}; .\\dev-start.ps1 -Backend   # Backend
-cd {{WORKSPACE_ESCAPED}}; .\\dev-start.ps1 -Frontend  # Frontend
-cd {{WORKSPACE_ESCAPED}}; .\\dev-start.ps1 -Api       # API
+## Step 3: Wait for Verification (MANDATORY)
+
+**After making a fix, you MUST wait for verification. DO NOT output \`[TASK_COMPLETE]\`.**
+
+The data you have (screenshots, Pre-Execution Results) is from BEFORE your fix. You cannot verify your fix worked using old data.
+
+**What to do after making a fix:**
+1. Do NOT say "The next iteration will verify" and then output \`[TASK_COMPLETE]\` - this is a contradiction
+2. Simply stop outputting - let the session end naturally
+3. The runner will spawn a new session with fresh automation results
+4. In the NEW session, check if the fresh Pre-Execution Results show success
+5. Only output \`[TASK_COMPLETE]\` when you have SEEN fresh data confirming the fix
+
+**WRONG (common mistake):**
+\`\`\`
+I made the fix. The next iteration will verify if it works.
+[TASK_COMPLETE]  ← WRONG! This prevents the next iteration!
 \`\`\`
 
-## Step 3: Wait for Verification
-
-**After making a fix, DO NOT output \`[TASK_COMPLETE]\`.**
-
-Instead:
-- Let the session end naturally (just stop outputting)
-- The runner will spawn a new session and re-run the automation
-- In the next session, check if Pre-Execution Results show success
-- Only then output \`[TASK_COMPLETE]\`
+**CORRECT:**
+\`\`\`
+I made the fix. Ending session to trigger fresh automation for verification.
+(Session ends naturally - no [TASK_COMPLETE])
+\`\`\`
 
 ## Rules
 

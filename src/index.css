@@ -340,6 +340,271 @@
 
 @layer utilities {
   /* ============================================
+   * Tutorial System
+   * Animations and utilities for the tutorial framework
+   * ============================================ */
+
+  /* Tutorial Z-Index Scale (above all other content) */
+  .z-tutorial-backdrop {
+    z-index: 9999;
+  }
+  .z-tutorial-spotlight {
+    z-index: 10000;
+  }
+  .z-tutorial-panel {
+    z-index: 10001;
+  }
+  .z-tutorial-tooltip {
+    z-index: 10002;
+  }
+
+  /* Tutorial target highlighting */
+  .tutorial-target {
+    position: relative;
+  }
+
+  .tutorial-target-active {
+    position: relative;
+    z-index: 10001;
+    box-shadow: 0 0 0 4px hsl(var(--primary) / 0.5);
+    border-radius: var(--radius);
+    animation: tutorial-target-glow 2s ease-in-out infinite;
+  }
+
+  .tutorial-target-border {
+    position: relative;
+    z-index: 10001;
+    outline: 2px solid hsl(var(--primary));
+    outline-offset: 2px;
+    border-radius: var(--radius);
+  }
+
+  .tutorial-target-pulse {
+    position: relative;
+    z-index: 10001;
+    animation: tutorial-pulse 1.5s ease-in-out infinite;
+  }
+
+  /* Tutorial animations */
+  @keyframes tutorial-target-glow {
+    0%,
+    100% {
+      box-shadow: 0 0 0 4px hsl(var(--primary) / 0.5);
+    }
+    50% {
+      box-shadow: 0 0 0 6px hsl(var(--primary) / 0.3);
+    }
+  }
+
+  @keyframes tutorial-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+    50% {
+      transform: scale(1.02);
+      opacity: 0.9;
+    }
+  }
+
+  @keyframes tutorial-spotlight-pulse {
+    0%,
+    100% {
+      opacity: 0.6;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0;
+      transform: scale(1.05);
+    }
+  }
+
+  @keyframes tutorial-fade-in {
+    from {
+      opacity: 0;
+      transform: translateY(-8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes tutorial-slide-up {
+    from {
+      opacity: 0;
+      transform: translateY(16px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @keyframes tutorial-slide-in-right {
+    from {
+      opacity: 0;
+      transform: translateX(16px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes tutorial-scale-in {
+    from {
+      opacity: 0;
+      transform: scale(0.95);
+    }
+    to {
+      opacity: 1;
+      transform: scale(1);
+    }
+  }
+
+  .tutorial-fade-in {
+    animation: tutorial-fade-in 200ms ease-out forwards;
+  }
+
+  .tutorial-slide-up {
+    animation: tutorial-slide-up 300ms ease-out forwards;
+  }
+
+  .tutorial-slide-in-right {
+    animation: tutorial-slide-in-right 300ms ease-out forwards;
+  }
+
+  .tutorial-scale-in {
+    animation: tutorial-scale-in 200ms ease-out forwards;
+  }
+
+  .tutorial-spotlight-pulse {
+    animation: tutorial-spotlight-pulse 2s ease-in-out infinite;
+  }
+
+  /* Success checkmark animation */
+  @keyframes tutorial-success-pop {
+    0% {
+      transform: scale(0);
+      opacity: 0;
+    }
+    50% {
+      transform: scale(1.2);
+    }
+    100% {
+      transform: scale(1);
+      opacity: 1;
+    }
+  }
+
+  @keyframes tutorial-success-ring {
+    0% {
+      transform: scale(0.8);
+      opacity: 1;
+    }
+    100% {
+      transform: scale(1.5);
+      opacity: 0;
+    }
+  }
+
+  .tutorial-success-animation {
+    animation: tutorial-success-pop 400ms ease-out forwards;
+  }
+
+  .tutorial-success-ring {
+    animation: tutorial-success-ring 600ms ease-out forwards;
+  }
+
+  /* Waiting indicator pulse animation */
+  @keyframes tutorial-waiting-pulse {
+    0%,
+    100% {
+      opacity: 0.6;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+
+  @keyframes tutorial-waiting-dot {
+    0%,
+    20% {
+      opacity: 0.3;
+    }
+    50% {
+      opacity: 1;
+    }
+    80%,
+    100% {
+      opacity: 0.3;
+    }
+  }
+
+  .tutorial-waiting-pulse {
+    animation: tutorial-waiting-pulse 2s ease-in-out infinite;
+  }
+
+  .tutorial-waiting-dot-1 {
+    animation: tutorial-waiting-dot 1.4s ease-in-out infinite;
+  }
+
+  .tutorial-waiting-dot-2 {
+    animation: tutorial-waiting-dot 1.4s ease-in-out 0.2s infinite;
+  }
+
+  .tutorial-waiting-dot-3 {
+    animation: tutorial-waiting-dot 1.4s ease-in-out 0.4s infinite;
+  }
+
+  /* Tooltip position transition */
+  .tutorial-tooltip-positioned {
+    transition:
+      left 200ms ease-out,
+      top 200ms ease-out;
+  }
+
+  /* Step content transitions */
+  .tutorial-step-enter {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  .tutorial-step-active {
+    opacity: 1;
+    transform: translateY(0);
+    transition:
+      opacity 200ms ease-out,
+      transform 200ms ease-out;
+  }
+
+  .tutorial-step-exit {
+    opacity: 0;
+    transform: translateY(-8px);
+    transition:
+      opacity 150ms ease-in,
+      transform 150ms ease-in;
+  }
+
+  /* Spotlight overlay backdrop */
+  .tutorial-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    transition: opacity 300ms ease-out;
+  }
+
+  .tutorial-backdrop-enter {
+    opacity: 0;
+  }
+
+  .tutorial-backdrop-active {
+    opacity: 1;
+  }
+
+  /* ============================================
    * Z-Index Scale
    * Use these instead of arbitrary z-* values
    * ============================================ */

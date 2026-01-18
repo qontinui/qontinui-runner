@@ -177,23 +177,23 @@ export {
   isTaskFinished,
 } from "./taskRun";
 
-// Verification agent types (AI-driven state verification)
+// State explorer types (AI-driven state exploration)
 export type {
-  VerificationStrategy,
-  VerificationTaskConfig,
-  VerificationStatus,
+  ExplorationStrategy,
+  ExplorationConfig,
+  ExplorationStatus,
   ElementCheck,
-  StateVerification,
-  TransitionVerification,
-  VerificationResult,
-  VerificationHistoryItem,
-  VerificationPlan,
-  SavedVerification,
-  CreateSavedVerificationRequest,
-  UpdateSavedVerificationRequest,
-} from "./verification-agent";
+  StateExplorationResult,
+  TransitionExplorationResult,
+  ExplorationResult,
+  ExplorationHistoryItem,
+  ExplorationPlan,
+  SavedExploration,
+  CreateSavedExplorationRequest,
+  UpdateSavedExplorationRequest,
+} from "./state-explorer";
 
-export { getDefaultVerificationConfig, getDefaultSavedVerification } from "./verification-agent";
+export { getDefaultExplorationConfig, getDefaultSavedExploration } from "./state-explorer";
 
 // Statistics types (Tiered Information Model for dashboard)
 export type {
@@ -257,3 +257,200 @@ export {
   validateGuiWorkflowStep,
   validateGuiWorkflow,
 } from "./gui-workflow";
+
+// DOM Capture types (browser DOM snapshot capture)
+export type {
+  DomCaptureSource,
+  DomCaptureTrigger,
+  DomCaptureType,
+  DomCapture,
+  DomCaptureWithHtml,
+  CaptureFromExtensionRequest,
+  DomCaptureApiResponse,
+} from "./domCapture";
+
+// Unified Workflow types (phase-based workflow builder)
+export type {
+  WorkflowPhase,
+  LogSourceSelection,
+  ScriptStep,
+  StateStep,
+  WorkflowRefStep,
+  GuiActionStep,
+  TestStep,
+  ScreenshotStep,
+  PromptStep,
+  UnifiedStep,
+  SetupStep,
+  VerificationStep,
+  AgenticStep,
+  CompletionStep,
+  UnifiedWorkflow,
+  WorkflowFeatures,
+  StepTypeInfo,
+  GuiActionType as UnifiedGuiActionType,
+  TestType as UnifiedTestType,
+  PlaywrightExecutionMode,
+  ApiVariableExtraction,
+  ApiAssertion,
+  ApiRequestStep,
+  HttpMethod,
+  ApiContentType,
+} from "./unified-workflow";
+
+// Re-export unified workflow types with original names for internal use
+export type {
+  GuiActionType as WorkflowGuiActionType,
+  TestType as WorkflowTestType,
+} from "./unified-workflow";
+
+export {
+  detectWorkflowFeatures,
+  STEP_TYPES,
+  GUI_ACTION_TYPES,
+  PHASE_INFO,
+  generateStepId,
+  createDefaultStep,
+  createDefaultWorkflow,
+  isWorkflowEmpty,
+  getTotalStepCount,
+  getStepPhase,
+  canStepExistInPhase,
+} from "./unified-workflow";
+
+// Saved API Request types (Library templates)
+export type {
+  SavedApiRequest,
+  CreateSavedApiRequestRequest,
+  UpdateSavedApiRequestRequest,
+} from "./saved-api-request";
+
+// Saved Prompt types (AI prompt library)
+export type {
+  SavedPrompt,
+  CreateSavedPromptRequest,
+  UpdateSavedPromptRequest,
+} from "./saved-prompt";
+
+// Saved Shell Command types (shell command library)
+export type {
+  SavedShellCommand,
+  CreateSavedShellCommandRequest,
+  UpdateSavedShellCommandRequest,
+} from "./saved-shell-command";
+
+// Lifecycle Hooks types (execution event triggers)
+export type {
+  HookTrigger,
+  HookActionType,
+  CommandAction,
+  WebhookAction,
+  LogAction,
+  NotificationAction,
+  HookAction,
+  ConditionOperator,
+  HookCondition,
+  Hook,
+  CreateHookRequest,
+  UpdateHookRequest,
+  HookExecutionResult,
+} from "./hooks";
+
+export {
+  HOOK_TRIGGER_DISPLAY_NAMES,
+  HOOK_TRIGGER_DESCRIPTIONS,
+  HOOK_ACTION_TYPE_DISPLAY_NAMES,
+  HOOK_ACTION_TYPE_DESCRIPTIONS,
+  CONDITION_OPERATOR_DISPLAY_NAMES,
+  CONDITION_VARIABLES,
+  createDefaultCommandAction,
+  createDefaultWebhookAction,
+  createDefaultLogAction,
+  createDefaultNotificationAction,
+  createDefaultAction,
+  createDefaultHook,
+} from "./hooks";
+
+// Learning Insights Dashboard types
+export type {
+  OutcomeStatus,
+  DecisionOutcome,
+  PatternType,
+  InsightCategory,
+  Trend,
+  FeedbackType,
+  Decision,
+  TaskOutcome,
+  Pattern,
+  Insight,
+  AnalysisResult,
+  Feedback,
+  LearningSummary,
+  LearningDashboardData,
+  // Task run integration types
+  TaskRunInfo,
+  TaskLearningOutcome,
+  TaskRunWithOutcome,
+  CurrentRunningTask,
+  LearningStatsSummary,
+} from "./learning";
+
+// Flow Designer types (deterministic workflows)
+export type {
+  ParallelMerge,
+  FlowStatus,
+  StepType,
+  Condition,
+  FlowInput,
+  FlowOutput,
+  FlowStep,
+  Flow,
+  StepExecution,
+  FlowState,
+  FlowSummary,
+  FlowExecutionSummary,
+} from "./flow";
+
+export {
+  STEP_TYPE_LABELS,
+  STEP_TYPE_COLORS,
+  getStepTypeName,
+  createExpressionCondition,
+} from "./flow";
+
+// Checkpoint Browser types (time-travel debugging)
+export type {
+  ChannelSnapshot,
+  KnowledgeEntry,
+  CriterionResult,
+  VerificationSnapshot,
+  FindingSnapshot,
+  StateSnapshot,
+  CheckpointTrigger,
+  Checkpoint,
+  CheckpointSummary,
+  AutoCheckpointSettings,
+  ChannelChange,
+  CheckpointDiff,
+  ReplayStatus,
+  ModificationType,
+  ReplayModification,
+  ReplaySession,
+  CheckpointStats,
+} from "./checkpoint";
+
+export {
+  TRIGGER_TYPE_LABELS,
+  TRIGGER_TYPE_COLORS,
+  formatTimestamp,
+  formatDateTime,
+} from "./checkpoint";
+
+// Recap types (Session overview)
+export type {
+  RecapStep,
+  FailureInfo,
+  RecapStats,
+  RecapData,
+  RecapResponse,
+} from "./recap";

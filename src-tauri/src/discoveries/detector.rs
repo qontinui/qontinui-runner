@@ -401,15 +401,18 @@ fn detect_new_transitions(
 /// - More runs observed
 /// - Success rate closer to 50% (more clearly flaky)
 fn calculate_flaky_confidence(total_runs: u32, success_rate: f64) -> f64 {
-    // Base confidence from sample size (logarithmic growth)
-    let sample_confidence = (total_runs as f64).ln() / 10.0;
-    let sample_confidence = sample_confidence.min(0.3);
+    // Base confidence from sample size (logarithmic growth, scaled to allow differentiation)
+    // ln(10) ≈ 2.3, ln(20) ≈ 3.0, ln(100) ≈ 4.6
+    // Scale so that more samples always provide more confidence
+    let sample_confidence = (total_runs as f64).ln() / 15.0;
+    let sample_confidence = sample_confidence.min(0.35);
 
     // Higher confidence when rate is closer to 50% (clearly flaky)
+    // A 50% success rate is the clearest indicator of flakiness
     let rate_distance = (success_rate - 0.5).abs();
-    let rate_confidence = 0.7 - rate_distance;
+    let rate_confidence = 0.6 - rate_distance;
 
-    (sample_confidence + rate_confidence).min(0.95)
+    (sample_confidence + rate_confidence).max(0.0).min(0.95)
 }
 
 #[cfg(test)]

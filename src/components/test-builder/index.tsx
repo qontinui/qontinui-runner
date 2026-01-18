@@ -12,6 +12,11 @@ export { TestPropertiesPanel } from "./TestPropertiesPanel";
 export { TestExecutionPanel } from "./TestExecutionPanel";
 export { ImportExportDialog } from "./ImportExportDialog";
 
+// AI Test Generation components
+export { PageAnalyzer } from "./PageAnalyzer";
+export { ElementPicker } from "./ElementPicker";
+export { AiTestGenerator } from "./AiTestGenerator";
+
 // Re-export types
 export type {
   TestType,
@@ -29,4 +34,9 @@ export type {
   VisionConfig,
   VisionAssertion,
   RepoTestConfig,
+  // AI Test Generation types
+  BoundingBox,
+  DetectedElement,
+  PageAnalysis,
+  VisualEvidence,
 } from "./types";

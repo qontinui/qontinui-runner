@@ -5,5 +5,7 @@ export { StorageSettings } from "./StorageSettings";
 export { AdvancedSettings } from "./AdvancedSettings";
 export { UpdateSettings } from "./UpdateSettings";
 export { AiSettings } from "./AiSettings";
+export { AgenticSettings } from "./AgenticSettings";
+export { SelfHealingSettings } from "./SelfHealingSettings";
 export { SectionHeader } from "./SectionHeader";
 export * from "./types";

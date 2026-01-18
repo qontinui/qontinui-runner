@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Result storage locations
 AUTOMATION_RESULTS_DIR = Path.home() / ".automation-results"
-DEV_LOGS_DIR = Path("C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs")
+DEV_LOGS_DIR = Path("D:/qontinui_parent_directory/.dev-logs")
 MAX_HISTORY_RUNS = 10
 
 
@@ -105,7 +105,6 @@ def save_automation_results(
         log_files = [
             "backend.log",
             "frontend.log",
-            "qontinui-api.log",
             "runner.log",
             "runner-tauri.log",
         ]
@@ -163,11 +162,6 @@ def save_automation_results(
             "frontend": (
                 str(latest_logs_dir / "frontend.log")
                 if (latest_logs_dir / "frontend.log").exists()
-                else None
-            ),
-            "api": (
-                str(latest_logs_dir / "qontinui-api.log")
-                if (latest_logs_dir / "qontinui-api.log").exists()
                 else None
             ),
             "runner": (

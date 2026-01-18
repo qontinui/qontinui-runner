@@ -23,6 +23,7 @@ import {
   ChevronDown,
   ChevronRight,
 } from "lucide-react";
+import { getAccentColors } from "@/design-system";
 import type { Finding, FindingCategory } from "../../types/findings";
 import { getCategoryColorClasses } from "../../services/FindingCategories";
 import { FindingCard } from "./FindingCard";
@@ -114,12 +115,14 @@ export function CategorySection({
         {/* Stats */}
         <div className="flex-shrink-0 flex items-center gap-3 text-xs">
           {actionableCount > 0 && (
-            <span className="text-amber-400">{actionableCount} actionable</span>
+            <span className={getAccentColors("amber").text}>{actionableCount} actionable</span>
           )}
           {needsInputCount > 0 && (
-            <span className="text-purple-400">{needsInputCount} needs input</span>
+            <span className={getAccentColors("purple").text}>{needsInputCount} needs input</span>
           )}
-          {resolvedCount > 0 && <span className="text-green-400">{resolvedCount} resolved</span>}
+          {resolvedCount > 0 && (
+            <span className={getAccentColors("green").text}>{resolvedCount} resolved</span>
+          )}
         </div>
       </button>
 

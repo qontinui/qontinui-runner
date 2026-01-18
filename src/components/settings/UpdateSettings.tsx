@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Download, RefreshCw, CheckCircle, AlertCircle, Info } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { getStatusColors } from "@/design-system";
 import type { LogFunction, UpdateInfo, UpdateStatus } from "./types";
 
 interface UpdateSettingsProps {
@@ -195,10 +196,16 @@ export function UpdateSettings({ onLog }: UpdateSettingsProps) {
               </p>
             </div>
           ) : (
-            <div className="flex items-start gap-2 p-3 bg-green-500/10 rounded-lg">
-              <CheckCircle className="w-4 h-4 text-green-400 mt-0.5 shrink-0" />
+            <div
+              className={`flex items-start gap-2 p-3 ${getStatusColors("success").bg} rounded-lg`}
+            >
+              <CheckCircle
+                className={`w-4 h-4 ${getStatusColors("success").icon} mt-0.5 shrink-0`}
+              />
               <div>
-                <div className="text-sm font-medium text-green-400">Up to Date</div>
+                <div className={`text-sm font-medium ${getStatusColors("success").text}`}>
+                  Up to Date
+                </div>
                 <div className="text-xs text-muted-foreground">
                   You're running the latest version of Qontinui Runner.
                 </div>

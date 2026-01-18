@@ -271,12 +271,12 @@ mod tests {
     }
 
     #[test]
-    fn test_action_log_profile_includes_workflows() {
-        println!("\n[TEST] ActionLogProfile includes workflows");
+    fn test_action_log_profile_excludes_workflow_containers() {
+        println!("\n[TEST] ActionLogProfile excludes workflow containers (they're containers, not actions)");
 
         let mut event_log = EventLog::new();
 
-        // Add workflow_started event
+        // Add workflow_started event (workflow is a container, not an action)
         event_log.add_event(RawEvent {
             id: "test-wf-1".to_string(),
             event_type: "workflow_started".to_string(),
@@ -316,13 +316,17 @@ mod tests {
         let events = event_log.events();
         let view_data = profile.process(events);
 
-        // Verify workflow appears
-        assert!(view_data.visible_count > 0, "Workflows should be visible");
+        // Verify workflow containers are NOT shown in action log
+        // (workflows are containers that hold actions, they are not actions themselves)
+        assert_eq!(
+            view_data.visible_count, 0,
+            "Workflow containers should not appear in action log"
+        );
         assert!(
-            !view_data.actions.is_empty(),
-            "Should return workflow entries"
+            view_data.actions.is_empty(),
+            "Workflow containers should not be returned as actions"
         );
 
-        println!("✓ PASS: ActionLogProfile includes workflows");
+        println!("✓ PASS: ActionLogProfile correctly excludes workflow containers");
     }
 }

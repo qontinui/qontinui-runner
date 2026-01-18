@@ -992,8 +992,10 @@ The iteration lifecycle is:
 2. **Runner captures results** → Creates the Iteration Data Bundle
 3. **Runner spawns AI session** → Delivers the bundle to you
 4. **AI session works** → You analyze results, make code changes, debug
-5. **AI session ends** → Via [TASK_COMPLETE], context limit, or timeout
-6. **Go to step 1** for next iteration (if not complete)
+5. **AI session signals [WORK_COMPLETE]** → System runs verification
+6. **System verifies** → Deterministic checks (build, tests) + AI verification (if configured)
+7. **If verification fails** → Go to step 1 for next iteration with feedback
+8. **If verification passes** → System marks task complete
 
 **Key implications:**
 - The Pre-Execution Results you see are from steps that ALREADY RAN
@@ -1051,11 +1053,11 @@ When your session starts, the runner provides a complete **Iteration Data Bundle
 
 If you need new screenshots after making code changes:
 1. Complete your current work (make fixes, commit if needed)
-2. End the iteration by outputting `[TASK_COMPLETE]` or letting the session end naturally
-3. The runner will start a new iteration with fresh pre-execution results
-4. Your next AI session will receive updated screenshots and test results
+2. Signal `[WORK_COMPLETE]` to trigger verification (which includes fresh pre-execution)
+3. If verification fails, you'll get a new iteration with fresh screenshots and test results
+4. Your next AI session will receive updated data in the Iteration Bundle
 
-**Do NOT try to manually trigger screenshots or re-run automation steps** - that's not how the system works.
+**Do NOT try to manually trigger screenshots or re-run automation steps** - the system handles this as part of verification.
 
 ### Raw Log Files (Fallback Only)
 
@@ -1127,149 +1129,174 @@ If you need data NOT in the bundle (rare):
             name: "Multi-Step Task Guide".to_string(),
             content: r#"## Multi-Step Task Guide
 
-You are running as a multi-session task in the qontinui-runner.
+You are a **Worker Agent** running in the qontinui-runner orchestrator system.
 
-## ⚠️ CRITICAL: READ THIS FIRST
+## ⚠️ CRITICAL: WORKER AGENTS CANNOT MARK TASKS COMPLETE
 
-**[TASK_COMPLETE] ENDS THE ENTIRE TASK.** It does NOT start a new iteration.
+**You are a WORKER agent.** You signal when work is done, but the **SYSTEM** decides if the task is complete.
 
-If you need fresh pre-execution results, let your session end naturally WITHOUT outputting [TASK_COMPLETE].
+**How it works:**
+1. You do work and signal `[WORK_COMPLETE]` when you believe the work is done
+2. The system runs **deterministic verification** (build, tests, type checks)
+3. If needed, the system runs **AI verification** (screenshot evaluation by a separate agent)
+4. Only if ALL verification passes does the system mark the task complete
 
-### How It Works
+**You CANNOT declare task completion.** That's the orchestrator's job.
+
+## Output Markers
+
+### [WORK_COMPLETE] - Signal that you believe work is done
+
+Output this when you've completed your work and want the system to verify:
+```
+I've fixed the validation bug in auth.ts. Build passes locally.
+
+[WORK_COMPLETE]
+```
+
+**What happens after [WORK_COMPLETE]:**
+1. System runs deterministic checks (build, tests, linting)
+2. If deterministic checks pass, system may run AI verification (screenshot review)
+3. If ALL verification passes → Task marked complete
+4. If ANY verification fails → New iteration with feedback, you continue working
+
+### [NEED_REPLAN] - Request plan revision
+
+Output this when you discover the plan is fundamentally wrong:
+```
+[NEED_REPLAN] The validation errors aren't from the frontend. They're coming from
+the i18n service's locale configuration. The plan should target the backend.
+```
+
+### [FINDING:type] - Record discoveries
+
+Document important findings for the knowledge base:
+```
+[FINDING:root_cause] The login timeout is caused by a missing database index on user_sessions.created_at
+[FINDING:bug] The retry logic doesn't handle 503 responses correctly
+[FINDING:observation] The API returns stale cache data for 30 seconds after updates
+```
+
+## Key Architecture Rules
+
+### YOU are a WORKER - What you CAN do:
+- ✅ Make code changes
+- ✅ Run tests locally (to check your work)
+- ✅ Signal `[WORK_COMPLETE]` when you think you're done
+- ✅ Request `[NEED_REPLAN]` if the approach is wrong
+- ✅ Record `[FINDING:type]` discoveries
+
+### The SYSTEM decides - What you CANNOT do:
+- ❌ Declare the task complete (that's `[TASK_COMPLETE]` - deprecated, don't use)
+- ❌ Skip verification ("trust me it works")
+- ❌ Determine if your work is "good enough"
+
+### Verification is NOT Optional
+
+Even if you're confident your fix is correct, the system will verify:
+- **Deterministic checks**: Build must pass, tests must pass, no type errors
+- **AI verification** (if configured): Screenshot evaluation by isolated agent
+
+If verification fails, you get feedback and continue. The loop continues until verification passes or max iterations are reached.
+
+## How Iterations Work
 
 ```
 TASK START:
-  ├─ Pre-execution runs (screenshots, tests, GUI automation)
-  ├─ Session 1 starts with Iteration Bundle
-  ├─ Session 1 works... ends (context limit, timeout, OR you stop responding)
+  ├─ Planning phase (creates verification plan)
   │
-  ├─ Pre-execution runs AGAIN (fresh results!)
-  ├─ Session 2 continues with NEW Iteration Bundle
-  ├─ Session 2 works... outputs [TASK_COMPLETE]
-  └─ TASK ENDS (no more sessions)
+  ├─ ITERATION 1:
+  │   ├─ Pre-execution runs (screenshots, tests, GUI automation)
+  │   ├─ Worker session starts with Iteration Bundle
+  │   ├─ Worker works... outputs [WORK_COMPLETE]
+  │   ├─ DETERMINISTIC VERIFICATION runs (build, tests)
+  │   ├─ If fails → feedback generated, go to iteration 2
+  │   │
+  ├─ ITERATION 2:
+  │   ├─ Pre-execution runs AGAIN (fresh results)
+  │   ├─ Worker receives feedback from failed verification
+  │   ├─ Worker fixes issues... outputs [WORK_COMPLETE]
+  │   ├─ DETERMINISTIC VERIFICATION runs
+  │   ├─ If passes → AI VERIFICATION runs (if configured)
+  │   ├─ If passes → TASK COMPLETE (system decides)
+  │   └─ If fails → feedback, continue...
+  │
+  └─ (continues until verification passes or max iterations)
 ```
 
-### Key Rules
+### Verification Feedback
 
-| Action | What Happens |
-|--------|-------------|
-| Output `[TASK_COMPLETE]` | **Task ENDS entirely** - no more sessions, no fresh pre-execution |
-| Session ends naturally (no marker) | **New session starts** with fresh pre-execution |
-| Session times out | Same as above - new session with fresh pre-execution |
-
-### Getting Fresh Pre-Execution Results
-
-If you made code changes and need to verify with fresh screenshots/tests:
-
-1. **DO NOT output [TASK_COMPLETE]**
-2. Simply stop responding or let the session end naturally
-3. Runner will start a new session with fresh pre-execution
-4. You'll receive updated results in the new Iteration Bundle
-
-**Example - Correct approach:**
+When verification fails, your next iteration includes feedback like:
 ```
-I've fixed the bug in LibrarySubTab.tsx. The fix needs verification with fresh
-screenshots. Ending this session to trigger fresh pre-execution.
+## Deterministic Verification Failed
 
-(Session ends - no [TASK_COMPLETE] marker)
+### ❌ build_success
+- error: TS2345: Argument of type 'string' is not assignable to parameter of type 'number'
+  at src/auth.ts:42
+
+### ❌ unit_tests
+- FAIL src/__tests__/auth.test.ts
+  ● validateEmail › should reject invalid emails
+    Expected: false, Received: true
 ```
 
-**Example - WRONG approach (what the AI did):**
-```
-I've fixed the bug. Ending session for fresh pre-execution.
+Use this feedback to guide your next fix.
 
-[TASK_COMPLETE]  ← WRONG! This ends the task entirely!
-```
+## Iteration Data Bundle
 
-### Output Marker: [TASK_COMPLETE]
+Each session receives a complete **Iteration Data Bundle**:
 
-**CRITICAL**: Only output `[TASK_COMPLETE]` when the ENTIRE TASK is done - not when you want fresh results.
-
-**FORMAT**: The marker must be ALONE on its line:
-```
-All work complete. Tests pass. Changes committed.
-
-[TASK_COMPLETE]
-```
-
-**When to use [TASK_COMPLETE]:**
-- ✅ All requested work is FULLY done
-- ✅ No verification needed
-- ✅ Task goal is achieved
-
-**When NOT to use [TASK_COMPLETE]:**
-- ❌ You need fresh pre-execution results
-- ❌ You want to verify your changes work
-- ❌ There's more work to do
-- ❌ You hit an error and need to continue
-
-### What Happens on Session Resume
-
-When your session ends without `[TASK_COMPLETE]`:
-1. Runner captures your output
-2. **Pre-execution runs AGAIN** (fresh screenshots, tests, etc.)
-3. New session spawns with header "Resume After Runner Restart"
-4. You receive a NEW Iteration Bundle with fresh results
-5. Your previous output (last 4000 chars) is included for context
-6. Your structured findings are preserved
-
-### Iteration Data Bundle
-
-Each session receives a complete **Iteration Data Bundle** (look for `## Iteration N Data Bundle` in your prompt). It contains:
-
-1. **Pre-Execution Results** - Automation step results (ALREADY COMPLETED at iteration start)
-2. **Application Logs** - Captured from user-defined log sources during this iteration
-3. **GUI Automation Logs** - Image recognition and action events (if applicable)
+1. **Pre-Execution Results** - Automation step results (ALREADY COMPLETED)
+2. **Application Logs** - Captured from user-defined log sources
+3. **GUI Automation Logs** - Image recognition and action events
 4. **Playwright Results** - Test results (if applicable)
 5. **Previous Findings** - Your structured findings from prior iterations
+6. **Verification Feedback** - Details on what failed (if this isn't iteration 1)
 
-**Start with the bundle** - all relevant data is provided. Don't search for log files.
+**Start with the bundle** - all relevant data is provided.
 
-### Structured Findings
+## Getting Fresh Results
 
-Use the `[FINDING:category:severity]...[/FINDING]` format for all discoveries. Findings are:
-- Displayed in the Monitor tab
-- Preserved across sessions
-- Included in subsequent iteration bundles
-- Used to show progress to the user
+If you made changes and want fresh screenshots/test results:
 
-### Debugging Tips
+**Option 1: Signal work complete (recommended)**
+```
+I've fixed the CSS layout. Ready for verification.
 
-1. **Check the Iteration Bundle first** - All relevant logs are included
-2. **Review Pre-Execution Results** - See which automation steps succeeded/failed
-3. **Work autonomously** - Restart services as needed (except the runner itself)
-4. **Iterate until fixed** - Make changes, test, end iteration for fresh results
+[WORK_COMPLETE]
+```
+The system will run verification, which includes fresh pre-execution.
 
-### ❌ What You Should NEVER Do
+**Option 2: Let session end naturally**
+Simply stop responding. The system will start a new iteration with fresh data.
 
-**DO NOT manually trigger GUI automation.** The runner handles this via pre-execution.
+## ❌ What You Should NEVER Do
+
+**DO NOT manually trigger GUI automation.** The runner handles this.
 
 | ❌ WRONG | ✅ CORRECT |
 |----------|-----------|
-| "Let me reload the config and re-run automation" | "I've made the fix. Ending session to get fresh results." |
-| "I'll call the runner API to trigger a click" | "The pre-execution will click the button next session." |
-| "Let me load the workflow config..." | "I'll analyze the pre-execution results in my bundle." |
-| Calling `/load-config`, `/run-workflow`, etc. | Just make code fixes and let session end |
+| "Let me reload the config..." | "I've made the fix. [WORK_COMPLETE]" |
+| "I'll call the runner API..." | "The system will verify my changes." |
+| Output `[TASK_COMPLETE]` | Output `[WORK_COMPLETE]` |
 
 **Your job:**
-1. Analyze results from the Iteration Bundle (already captured)
-2. Make code fixes if needed
-3. Let session end to trigger fresh pre-execution
+1. Analyze results from the Iteration Bundle
+2. Make code fixes
+3. Signal `[WORK_COMPLETE]` when done
 
-**Runner's job (NOT yours):**
-1. Load configs
-2. Execute GUI automation (clicks, screenshots)
-3. Run Playwright tests
-4. Capture logs
+**System's job (NOT yours):**
+1. Run deterministic verification (build, tests)
+2. Run AI verification (if configured)
+3. Decide if task is complete
+4. Generate feedback if verification fails
 
-If you find yourself trying to "trigger" or "run" automation, STOP. That's pre-execution's job.
-
-### Avoiding Infinite Loops
+## Avoiding Infinite Loops
 
 - Don't repeat the same fix that already failed
 - Check Previous Findings - the issue may already be tracked
-- If stuck, explain what's blocking you instead of retrying endlessly
-- To get fresh pre-execution results, just let the session end (no [TASK_COMPLETE])
+- If the plan is wrong, request `[NEED_REPLAN]`
+- If stuck, explain what's blocking you
 "#
             .to_string(),
             category: Some("workflow".to_string()),
@@ -1339,6 +1366,75 @@ The raw input events are saved to `.dev-logs/input_events/{session_id}_events.js
             category: Some("debugging".to_string()),
             tags: vec!["debugging".to_string(), "input".to_string(), "coordinates".to_string(), "multi-monitor".to_string()],
             auto_include: None, // Explicitly added when "Capture Input for Validation" is enabled
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-service-restart".to_string(),
+            name: "Service Restart Commands".to_string(),
+            content: r#"## Service Restart Commands
+
+Use these commands to restart development services after making code changes.
+
+### Restart Commands
+
+**To restart services, use PowerShell:**
+
+```powershell
+# Restart backend (FastAPI)
+cd {{WORKSPACE}}; .\dev-start.ps1 -Backend
+
+# Restart frontend (Next.js)
+cd {{WORKSPACE}}; .\dev-start.ps1 -Frontend
+
+# Restart API service
+cd {{WORKSPACE}}; .\dev-start.ps1 -Api
+
+# Restart all services
+cd {{WORKSPACE}}; .\dev-start.ps1 -All
+```
+
+**Alternative (if dev-start.ps1 is not available):**
+
+```powershell
+# Backend - kill and restart
+Get-Process -Name python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -match 'backend' } | Stop-Process -Force
+cd {{WORKSPACE}}\backend && poetry run python run.py
+
+# Frontend - kill and restart
+Get-Process -Name node -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match 'next' } | Stop-Process -Force
+cd {{WORKSPACE}}\frontend && npm run dev
+
+# Tauri runner - restart
+Stop-Process -Name qontinui-runner -Force -ErrorAction SilentlyContinue
+cd {{WORKSPACE}}\qontinui-runner && npm run tauri dev
+```
+
+### Customization
+
+This is a built-in context. To customize for your environment:
+
+1. Go to **Contexts** tab in the runner
+2. Create a new User Context named "Service Restart Commands"
+3. Add your custom restart commands
+4. Your version will override this built-in version
+
+### Placeholder
+
+`{{WORKSPACE}}` is replaced with your workspace root path at runtime.
+"#
+            .to_string(),
+            category: Some("development".to_string()),
+            tags: vec!["restart".to_string(), "services".to_string(), "development".to_string()],
+            auto_include: Some(ContextAutoInclude {
+                task_mentions: Some(vec![
+                    "restart".to_string(),
+                    "service".to_string(),
+                    "backend".to_string(),
+                    "frontend".to_string(),
+                ]),
+                ..Default::default()
+            }),
             created_at: now.clone(),
             modified_at: now,
         },
@@ -1458,6 +1554,35 @@ pub fn create_project_context(
 
 /// ID of the builtin Multi-Step Task Guide context.
 pub const MULTI_STEP_GUIDE_ID: &str = "builtin-multi-step-guide";
+
+/// ID of the builtin Service Restart Commands context.
+pub const SERVICE_RESTART_ID: &str = "builtin-service-restart";
+
+/// Get the Service Restart Commands context, preferring user override if exists.
+///
+/// Checks if the user has a context with the same name ("Service Restart Commands").
+/// If so, returns the user's version (allowing customization).
+/// Otherwise, returns the builtin version.
+pub fn get_service_restart_commands() -> Context {
+    // Check for user override by name
+    let user_contexts = get_all_user_contexts();
+    if let Some(user_override) = user_contexts
+        .into_iter()
+        .find(|c| c.name == "Service Restart Commands")
+    {
+        info!(
+            "Using user-customized Service Restart Commands (id: {})",
+            user_override.id
+        );
+        return user_override;
+    }
+
+    // Return builtin version
+    get_builtin_contexts()
+        .into_iter()
+        .find(|c| c.id == SERVICE_RESTART_ID)
+        .expect("Builtin Service Restart Commands should exist")
+}
 
 /// Get the Multi-Step Task Guide context, preferring user override if exists.
 ///

@@ -942,6 +942,197 @@ pub fn list_log_source_profiles(project_id: String) -> CommandResponse {
     }
 }
 
+/// AI-suggested log source
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AiSuggestedLogSource {
+    /// Suggested name for the log source
+    pub name: String,
+    /// Type: "file" or "directory"
+    #[serde(rename = "type")]
+    pub source_type: String,
+    /// Suggested path (may contain placeholders like {project_dir})
+    pub path: String,
+    /// Glob pattern for directory type
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+    /// Description of what this log source typically contains
+    pub description: String,
+    /// Suggested color for UI
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// Find log sources using AI for a given application
+///
+/// This function uses AI to suggest log file locations based on:
+/// 1. The application name
+/// 2. The current operating system
+/// 3. The project directory (if provided)
+/// 4. Any existing log files found in the project directory
+#[tauri::command]
+pub fn find_log_sources_with_ai(
+    application_name: String,
+    project_directory: Option<String>,
+) -> CommandResponse {
+    use crate::ai_provider;
+    use std::path::Path;
+
+    info!(
+        "Finding log sources with AI for application: {} (project_dir: {:?})",
+        application_name, project_directory
+    );
+
+    // Get OS information
+    let os_name = std::env::consts::OS;
+    let os_info = match os_name {
+        "windows" => "Windows",
+        "macos" => "macOS",
+        "linux" => "Linux",
+        _ => os_name,
+    };
+
+    // Scan for existing log files in the project directory
+    let mut discovered_logs: Vec<String> = Vec::new();
+    if let Some(ref dir) = project_directory {
+        let project_path = Path::new(dir);
+        if project_path.exists() {
+            // Search for log files in common locations relative to project
+            let search_dirs = vec![
+                project_path.to_path_buf(),
+                project_path.join("logs"),
+                project_path.join("log"),
+                project_path.join(".logs"),
+                project_path.join("var/log"),
+                project_path.parent().map(|p| p.join(".dev-logs")).unwrap_or_default(),
+            ];
+
+            for search_dir in search_dirs {
+                if search_dir.exists() && search_dir.is_dir() {
+                    if let Ok(entries) = fs::read_dir(&search_dir) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_file() {
+                                if let Some(ext) = path.extension() {
+                                    if ext == "log" || ext == "txt" {
+                                        if let Some(path_str) = path.to_str() {
+                                            discovered_logs.push(path_str.replace("\\", "/"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Build context about discovered logs
+    let discovered_context = if discovered_logs.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nExisting log files found on this system:\n{}\n\
+            Include these files in your suggestions if they seem relevant to the application.",
+            discovered_logs.iter().take(20).map(|p| format!("- {}", p)).collect::<Vec<_>>().join("\n")
+        )
+    };
+
+    // Build project directory context
+    let project_context = project_directory
+        .as_ref()
+        .map(|dir| format!("\nProject directory: {}", dir))
+        .unwrap_or_default();
+
+    let prompt = format!(
+        "You are helping a developer find log file locations for an application.\n\n\
+        Application: {}\n\
+        Operating System: {}{}{}\n\n\
+        Please suggest log file locations for this application on this specific OS. Consider:\n\
+        1. Standard log locations for {} (e.g., {} for this OS)\n\
+        2. Application-specific log directories\n\
+        3. Development vs production log locations\n\
+        4. The project directory structure if provided\n\n\
+        Return ONLY a valid JSON array with no additional text, markdown, or explanation. Each object should have:\n\
+        - \"name\": A descriptive name for the log source\n\
+        - \"type\": Either \"file\" for a single file or \"directory\" for a folder with multiple logs\n\
+        - \"path\": The FULL ABSOLUTE path for this specific OS (use forward slashes)\n\
+        - \"pattern\": For directory types, the glob pattern to match log files (e.g., \"*.log\")\n\
+        - \"description\": A brief description of what this log contains\n\
+        - \"color\": A hex color code for UI display (e.g., \"#22c55e\")\n\n\
+        Example response format:\n\
+        [\n\
+          {{\"name\": \"Application Log\", \"type\": \"file\", \"path\": \"C:/ProgramData/AppName/logs/app.log\", \"description\": \"Main application log\", \"color\": \"#22c55e\"}},\n\
+          {{\"name\": \"Error Logs\", \"type\": \"directory\", \"path\": \"C:/ProgramData/AppName/logs/errors\", \"pattern\": \"*.log\", \"description\": \"Error log files\", \"color\": \"#ef4444\"}}\n\
+        ]\n\n\
+        Provide 3-8 relevant suggestions with FULL ABSOLUTE PATHS for {}. Focus on the most likely log locations for this specific application and OS combination.",
+        application_name,
+        os_info,
+        project_context,
+        discovered_context,
+        application_name,
+        if os_name == "windows" { "C:/ProgramData, %APPDATA%, etc." } else { "/var/log, ~/.local/share, etc." },
+        os_info
+    );
+
+    // Run the AI prompt
+    let response = ai_provider::run_prompt_sync(&prompt, 60);
+
+    if !response.success {
+        return CommandResponse {
+            success: false,
+            message: Some(response.error.unwrap_or_else(|| "AI request failed".to_string())),
+            data: None,
+        };
+    }
+
+    // Parse the AI response as JSON
+    let output = response.output.trim();
+
+    // Try to extract JSON array from the response (handle potential markdown code blocks)
+    let json_str = if output.starts_with("```") {
+        // Extract content between code blocks
+        output
+            .lines()
+            .skip(1)
+            .take_while(|line| !line.starts_with("```"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        output.to_string()
+    };
+
+    match serde_json::from_str::<Vec<AiSuggestedLogSource>>(&json_str) {
+        Ok(suggestions) => {
+            info!(
+                "AI suggested {} log sources for '{}'",
+                suggestions.len(),
+                application_name
+            );
+            CommandResponse {
+                success: true,
+                message: None,
+                data: Some(serde_json::to_value(suggestions).unwrap_or_default()),
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Failed to parse AI response as JSON: {}. Response was: {}",
+                e,
+                &json_str[..json_str.len().min(500)]
+            );
+            CommandResponse {
+                success: false,
+                message: Some(format!(
+                    "Failed to parse AI suggestions: {}. The AI may have returned an invalid format.",
+                    e
+                )),
+                data: Some(serde_json::json!({ "raw_response": output })),
+            }
+        }
+    }
+}
+
 /// Duplicate an existing profile with a new name
 #[tauri::command]
 pub fn duplicate_log_source_profile(

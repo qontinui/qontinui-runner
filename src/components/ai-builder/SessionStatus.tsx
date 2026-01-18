@@ -6,6 +6,7 @@
 
 import { Activity } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
 export function SessionStatus() {
   const { sessionState } = useAiBuilder();
@@ -17,13 +18,13 @@ export function SessionStatus() {
   const getStatusColor = () => {
     switch (sessionState.status) {
       case "running":
-        return "bg-green-500/20 text-green-500";
+        return `${getStatusColors("running").bg} ${getStatusColors("running").text}`;
       case "complete":
-        return "bg-blue-500/20 text-blue-500";
+        return `${getStatusColors("success").bg} ${getAccentColors("blue").text}`;
       case "stopped":
         return "bg-surface-raised/50 text-text-muted";
       default:
-        return "bg-yellow-500/20 text-yellow-500";
+        return `${getStatusColors("warning").bg} ${getStatusColors("warning").text}`;
     }
   };
 
@@ -48,7 +49,9 @@ export function SessionStatus() {
         </div>
         <div>
           <span className="text-muted-foreground">Errors Fixed:</span>{" "}
-          <span className="font-medium text-green-500">{sessionState.errors_fixed.length}</span>
+          <span className={`font-medium ${getStatusColors("success").text}`}>
+            {sessionState.errors_fixed.length}
+          </span>
         </div>
       </div>
 
@@ -60,7 +63,10 @@ export function SessionStatus() {
         <div className="space-y-1 max-h-24 overflow-y-auto">
           <span className="text-xs text-muted-foreground">Recent fixes:</span>
           {sessionState.errors_fixed.slice(-3).map((fix, i) => (
-            <div key={i} className="text-xs bg-green-500/10 text-green-600 p-1 rounded truncate">
+            <div
+              key={i}
+              className={`text-xs ${getStatusColors("success").bg} ${getStatusColors("success").text} p-1 rounded truncate`}
+            >
               {fix.file}: {fix.description}
             </div>
           ))}

@@ -31,6 +31,7 @@ import CollapsiblePanel from "../CollapsiblePanel";
 import type { ContextWithMetadata, AutoDetectResult } from "../../types/context";
 import type { LogSourceProfile } from "../../types/projectLogs";
 import { getActiveProfile, getActiveLogSources } from "../../types/projectLogs";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 /**
  * Represents a prompt component section
@@ -303,9 +304,9 @@ export function PromptComponentsView() {
   // Render the scope badge
   const renderScopeBadge = (scope: string) => {
     const colors: Record<string, string> = {
-      builtin: "bg-blue-500/20 text-blue-400",
-      user: "bg-green-500/20 text-green-400",
-      project: "bg-purple-500/20 text-purple-400",
+      builtin: `${getAccentColors("blue").bg} ${getAccentColors("blue").text}`,
+      user: `${getStatusColors("success").bg} ${getAccentColors("green").text}`,
+      project: `${getAccentColors("purple").bg} ${getAccentColors("purple").text}`,
     };
     return (
       <span className={`text-[10px] px-1.5 py-0.5 rounded ${colors[scope] || "bg-muted"}`}>
@@ -403,7 +404,7 @@ export function PromptComponentsView() {
               ) : (
                 <ChevronRight className="w-4 h-4" />
               )}
-              <BookOpen className="w-4 h-4 text-purple-400" />
+              <BookOpen className={`w-4 h-4 ${getAccentColors("purple").text}`} />
               <span className="font-medium text-sm">Included Contexts</span>
               <span className="ml-auto text-xs text-muted-foreground">
                 {includedContexts.length} context{includedContexts.length !== 1 ? "s" : ""}
@@ -434,7 +435,9 @@ export function PromptComponentsView() {
                       {showAutoIncludeInfo && (
                         <div className="absolute left-0 top-full mt-2 w-72 p-3 bg-popover border border-border rounded-lg shadow-xl z-50 text-sm">
                           <div className="flex items-start gap-2">
-                            <Lightbulb className="w-4 h-4 text-yellow-500 mt-0.5 flex-shrink-0" />
+                            <Lightbulb
+                              className={`w-4 h-4 ${getAccentColors("yellow").text} mt-0.5 flex-shrink-0`}
+                            />
                             <div>
                               <p className="font-medium mb-1">Auto-Include Contexts</p>
                               <p className="text-muted-foreground text-xs">
@@ -472,7 +475,7 @@ export function PromptComponentsView() {
                       >
                         <button
                           onClick={() => toggleContext(context.id, isAutoIncluded)}
-                          className="mt-0.5 text-green-500 hover:text-red-400"
+                          className={`mt-0.5 ${getStatusColors("success").text} hover:${getStatusColors("error").text}`}
                           title={isAutoIncluded ? "Disable this context" : "Remove this context"}
                         >
                           <Check className="w-4 h-4" />
@@ -572,14 +575,16 @@ export function PromptComponentsView() {
               ) : (
                 <ChevronRight className="w-4 h-4" />
               )}
-              <Terminal className="w-4 h-4 text-orange-400" />
+              <Terminal className={`w-4 h-4 ${getAccentColors("orange").text}`} />
               <span className="font-medium text-sm">Log Sources</span>
               <span className="ml-auto text-xs text-muted-foreground">
                 {activeLogSources.length > 0 ? (
                   <>
                     {activeLogSources.length} source{activeLogSources.length !== 1 ? "s" : ""}
                     {activeLogProfile && (
-                      <span className="ml-1 text-orange-400">({activeLogProfile.name})</span>
+                      <span className={`ml-1 ${getAccentColors("orange").text}`}>
+                        ({activeLogProfile.name})
+                      </span>
                     )}
                   </>
                 ) : (

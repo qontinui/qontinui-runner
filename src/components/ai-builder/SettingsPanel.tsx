@@ -15,6 +15,7 @@ import {
   ToggleRight,
 } from "lucide-react";
 import { useAiBuilder } from "./AiBuilderContext";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
 // Provider options for the UI
 const PROVIDER_OPTIONS = [
@@ -78,7 +79,7 @@ export function SettingsPanel() {
         {projectLogs.config?.logSources &&
         projectLogs.config.logSources.filter((s) => s.enabled).length > 0 ? (
           <>
-            <div className="flex items-center gap-2 text-green-600">
+            <div className={`flex items-center gap-2 ${getStatusColors("success").text}`}>
               <CheckCircle className="w-3 h-3" />
               <span>
                 {projectLogs.config.logSources.filter((s) => s.enabled).length} log source(s) will
@@ -93,13 +94,13 @@ export function SettingsPanel() {
             </div>
           </>
         ) : (
-          <div className="flex items-center gap-2 text-yellow-600">
+          <div className={`flex items-center gap-2 ${getStatusColors("warning").text}`}>
             <Info className="w-3 h-3" />
             <span>
               No log sources configured.{" "}
               <button
                 onClick={onNavigateToLogLocations}
-                className="underline hover:text-yellow-500 transition-colors"
+                className="underline hover:opacity-80 transition-colors"
               >
                 Configure in Log Locations
               </button>
@@ -139,7 +140,7 @@ export function SettingsPanel() {
       {/* AI Provider Override */}
       <div className="p-2 bg-muted/30 rounded-md space-y-2">
         <div className="flex items-center gap-2">
-          <Sparkles className="w-4 h-4 text-purple-500" />
+          <Sparkles className={`w-4 h-4 ${getAccentColors("purple").text}`} />
           <span className="text-sm font-medium">AI Provider</span>
           <div className="relative group">
             <Info className="w-3.5 h-3.5 text-muted-foreground hover:text-foreground cursor-help" />
@@ -185,7 +186,7 @@ export function SettingsPanel() {
       {/* Auto-Continue Toggle */}
       <div className="flex items-center justify-between p-2 bg-muted/30 rounded-md">
         <div className="flex items-center gap-2">
-          <RotateCcw className="w-4 h-4 text-orange-500" />
+          <RotateCcw className={`w-4 h-4 ${getAccentColors("orange").text}`} />
           <div>
             <span className="text-sm font-medium">Auto-Continue on Restart</span>
             <p className="text-xs text-muted-foreground">
@@ -198,7 +199,7 @@ export function SettingsPanel() {
         <button
           onClick={toggleAutoContinue}
           disabled={autoContinueLoading}
-          className={`flex items-center transition-colors ${autoContinueEnabled ? "text-orange-500" : "text-muted-foreground"} ${autoContinueLoading ? "opacity-50" : ""}`}
+          className={`flex items-center transition-colors ${autoContinueEnabled ? getAccentColors("orange").text : "text-muted-foreground"} ${autoContinueLoading ? "opacity-50" : ""}`}
           title={autoContinueEnabled ? "Auto-continue enabled" : "Auto-continue disabled"}
         >
           {autoContinueLoading ? (

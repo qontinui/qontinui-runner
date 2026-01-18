@@ -641,6 +641,66 @@ pub fn format_debugging_context_for_prompt(context: &DebuggingContext) -> String
     sections.join("")
 }
 
+/// Get a single run by ID from run_details table (used by tests).
+/// This function works with the legacy run_details table schema.
+pub fn get_run_details(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Option<RunDetails>, String> {
+    let result = conn
+        .query_row(
+            r#"
+            SELECT
+                id, config_id, workflow_name, started_at, ended_at, duration_ms,
+                status, success, error_type, error_message,
+                actions_summary, states_visited, transitions_executed,
+                template_matches, anomalies
+            FROM run_details
+            WHERE id = ?1
+            "#,
+            params![run_id],
+            |row| {
+                let status_str: String = row.get(6)?;
+                let actions_json: Option<String> = row.get(10)?;
+                let states_json: Option<String> = row.get(11)?;
+                let transitions_json: Option<String> = row.get(12)?;
+                let templates_json: Option<String> = row.get(13)?;
+                let anomalies_json: Option<String> = row.get(14)?;
+
+                Ok(RunDetails {
+                    id: row.get(0)?,
+                    config_id: row.get(1)?,
+                    workflow_name: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    duration_ms: row.get(5)?,
+                    status: RunStatus::from_str(&status_str).unwrap_or(RunStatus::Running),
+                    success: row.get(7)?,
+                    error_type: row.get(8)?,
+                    error_message: row.get(9)?,
+                    actions_summary: actions_json.and_then(|j| serde_json::from_str(&j).ok()),
+                    states_visited: states_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default(),
+                    transitions_executed: transitions_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default(),
+                    template_matches: templates_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default(),
+                    anomalies: anomalies_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default(),
+                    screenshots: Vec::new(),
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| format!("Failed to get run details: {}", e))?;
+
+    Ok(result)
+}
+
 // ==============================================================================
 // Helper Functions
 // ==============================================================================

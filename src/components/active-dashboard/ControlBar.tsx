@@ -2,70 +2,108 @@
  * ControlBar Component
  *
  * Top control bar for the active execution dashboard.
- * Displays workflow name, execution status, and playback controls.
+ * Displays task name, phase badge, execution status, and playback controls.
  */
 
 import { Play, Pause, Square, Settings } from "lucide-react";
 import { Button, Badge } from "../ui";
-import type { ControlBarProps, ExecutionStatus } from "./types";
+import type { ExecutionStatus } from "./types";
+import type { TaskPhase } from "../../types/dashboard/activity-types";
+import { PHASE_DISPLAY_CONFIG } from "../../types/dashboard/activity-types";
+import type { DashboardStatus } from "../../hooks/dashboard/useDashboardState";
+import { getAccentColors } from "@/design-system";
 
-const statusConfig: Record<ExecutionStatus, { label: string; className: string }> = {
-  running: {
-    label: "Running",
-    className: "bg-blue-500/20 text-blue-400 border border-blue-500/50 animate-pulse",
-  },
-  paused: {
-    label: "Paused",
-    className: "bg-amber-500/20 text-amber-400 border border-amber-500/50",
-  },
-  stopped: {
-    label: "Stopped",
-    className: "bg-zinc-500/20 text-zinc-400 border border-zinc-500/50",
-  },
-  completed: {
-    label: "Completed",
-    className: "bg-green-500/20 text-green-400 border border-green-500/50",
-  },
-  failed: {
-    label: "Failed",
-    className: "bg-red-500/20 text-red-400 border border-red-500/50",
-  },
-  idle: {
-    label: "Idle",
-    className: "bg-zinc-500/20 text-zinc-400 border border-zinc-500/50",
-  },
-  timeout: {
-    label: "Timeout",
-    className: "bg-orange-500/20 text-orange-400 border border-orange-500/50",
-  },
-  cancelled: {
-    label: "Cancelled",
-    className: "bg-zinc-500/20 text-zinc-400 border border-zinc-500/50",
-  },
+/**
+ * Props for ControlBar component.
+ */
+export interface ControlBarProps {
+  /** Task name to display */
+  taskName: string | null;
+  /** Current task phase */
+  phase?: TaskPhase;
+  /** Whether to show phase badge */
+  showPhaseBadge?: boolean;
+  /** Overall dashboard status */
+  status: DashboardStatus | ExecutionStatus;
+  /** Callback for play/pause button */
+  onPlayPause?: () => void;
+  /** Callback for stop button */
+  onStop?: () => void;
+}
+
+// Status configuration using design system colors
+const getStatusConfig = (status: string): { label: string; className: string } => {
+  const configs: Record<string, { label: string; color: string; animate?: boolean }> = {
+    running: { label: "Running", color: "blue", animate: true },
+    paused: { label: "Paused", color: "amber" },
+    stopped: { label: "Stopped", color: "zinc" },
+    completed: { label: "Completed", color: "green" },
+    failed: { label: "Failed", color: "red" },
+    idle: { label: "Idle", color: "zinc" },
+    timeout: { label: "Timeout", color: "orange" },
+    cancelled: { label: "Cancelled", color: "zinc" },
+  };
+
+  const config = configs[status] || configs.idle;
+  const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);
+  const animateClass = config.animate ? " animate-pulse" : "";
+
+  return {
+    label: config.label,
+    className: `${colors.bg} ${colors.text} ${colors.border}${animateClass}`,
+  };
+};
+
+// Phase configuration using design system colors
+const getPhaseConfig = (phase: TaskPhase): { className: string } => {
+  const phaseColors: Record<TaskPhase, string> = {
+    setup: "blue",
+    verification: "purple",
+    ai_work: "green",
+    idle: "zinc",
+  };
+
+  const colors = getAccentColors(phaseColors[phase] as Parameters<typeof getAccentColors>[0]);
+  return {
+    className: `${colors.bg} ${colors.text} ${colors.border}`,
+  };
 };
 
 export function ControlBar({
-  workflowName,
+  taskName,
+  phase = "idle",
+  showPhaseBadge = false,
   status,
   onPlayPause,
   onStop,
-  onGoToExecute,
 }: ControlBarProps) {
+  const statusInfo = getStatusConfig(status);
+  const phaseInfo = PHASE_DISPLAY_CONFIG[phase];
+  const phaseStyle = getPhaseConfig(phase);
+
   return (
     <div className="flex h-14 items-center justify-between border-b border-border bg-card px-4">
-      <div className="flex items-center gap-3">
-        <Button variant="ghost" onClick={onGoToExecute} className="border-border hover:bg-muted">
-          Go to Execute
-        </Button>
-        {workflowName && <span className="text-sm text-muted-foreground">{workflowName}</span>}
+      {/* Left: Task Name */}
+      <div className="flex items-center gap-3 min-w-0 flex-1">
+        {taskName && (
+          <span className="text-sm text-foreground font-medium truncate">{taskName}</span>
+        )}
       </div>
 
-      {/* Center: Status Indicator */}
-      <Badge className={`px-4 py-1.5 text-sm font-medium ${statusConfig[status].className}`}>
-        {statusConfig[status].label}
-      </Badge>
+      {/* Center: Phase Badge + Status */}
+      <div className="flex items-center gap-2 flex-shrink-0">
+        {showPhaseBadge && phase !== "idle" && phaseInfo.label && (
+          <Badge className={`px-3 py-1 text-xs font-medium ${phaseStyle.className}`}>
+            {phaseInfo.label}
+          </Badge>
+        )}
+        <Badge className={`px-4 py-1.5 text-sm font-medium ${statusInfo.className}`}>
+          {statusInfo.label}
+        </Badge>
+      </div>
 
-      <div className="flex items-center gap-2">
+      {/* Right: Controls */}
+      <div className="flex items-center gap-2 flex-shrink-0 flex-1 justify-end">
         <Button
           size="sm"
           variant="outline"

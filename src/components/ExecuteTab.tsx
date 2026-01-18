@@ -6,7 +6,7 @@
  * - AI Tasks (from Library)
  * - AI Workflows (from Library)
  * - Playwright Scripts (from Library)
- * - Verifications (from Library, requires config)
+ * - State Explorer (from Library, requires config)
  */
 
 import { useState, useEffect, useCallback } from "react";
@@ -28,13 +28,15 @@ import { ConfigurationPanel } from "./ConfigurationPanel";
 import { ExecutionControlPanel } from "./ExecutionControlPanel";
 import { MonitorSelector as _MonitorSelector } from "./MonitorSelector";
 import { QuickActionsPanel } from "./QuickActionsPanel";
+import { PageTutorialMenu } from "./tutorial";
 import { useExecution } from "../contexts/ExecutionContext";
-import type { SavedVerification, VerificationTaskConfig, SavedGuiWorkflow } from "../types";
-import { useVerificationAgent } from "../hooks/useVerificationAgent";
+import type { SavedExploration, ExplorationConfig, SavedGuiWorkflow } from "../types";
+import { useStateExplorer } from "../hooks/useStateExplorer";
+import { getAccentColors } from "@/design-system";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
-type TaskType = "gui" | "gui-workflows" | "tasks" | "workflows" | "scripts" | "verifications";
+type TaskType = "gui" | "gui-workflows" | "tasks" | "workflows" | "scripts" | "state-explorer";
 
 interface SavedPrompt {
   id: string;
@@ -90,11 +92,14 @@ interface PlaywrightScript {
   modified_at: string;
 }
 
+// Accent color mapping for task types
+type TaskAccentColor = "blue" | "orange" | "amber" | "green" | "purple" | "emerald";
+
 interface TaskTypeConfig {
   id: TaskType;
   label: string;
   icon: React.ComponentType<{ className?: string }>;
-  color: string;
+  accentColor: TaskAccentColor;
   description: string;
   requiresConfig: boolean;
 }
@@ -104,7 +109,7 @@ const TASK_TYPES: TaskTypeConfig[] = [
     id: "gui",
     label: "GUI Automation",
     icon: Cpu,
-    color: "text-blue-500",
+    accentColor: "blue",
     description: "Run workflows from loaded config",
     requiresConfig: true,
   },
@@ -112,7 +117,7 @@ const TASK_TYPES: TaskTypeConfig[] = [
     id: "gui-workflows",
     label: "GUI Workflows",
     icon: MousePointer2,
-    color: "text-orange-500",
+    accentColor: "orange",
     description: "Sequential GUI action workflows",
     requiresConfig: true,
   },
@@ -120,7 +125,7 @@ const TASK_TYPES: TaskTypeConfig[] = [
     id: "tasks",
     label: "AI Tasks",
     icon: FileText,
-    color: "text-amber-500",
+    accentColor: "amber",
     description: "Single-step AI prompts",
     requiresConfig: false,
   },
@@ -128,7 +133,7 @@ const TASK_TYPES: TaskTypeConfig[] = [
     id: "workflows",
     label: "AI Workflows",
     icon: Sparkles,
-    color: "text-green-500",
+    accentColor: "green",
     description: "Multi-step AI workflows",
     requiresConfig: false,
   },
@@ -136,16 +141,16 @@ const TASK_TYPES: TaskTypeConfig[] = [
     id: "scripts",
     label: "Scripts",
     icon: TestTube,
-    color: "text-purple-500",
+    accentColor: "purple",
     description: "Playwright browser tests",
     requiresConfig: false,
   },
   {
-    id: "verifications",
-    label: "Verifications",
+    id: "state-explorer",
+    label: "State Explorer",
     icon: ShieldCheck,
-    color: "text-emerald-500",
-    description: "State verification runs",
+    accentColor: "emerald",
+    description: "State exploration runs",
     requiresConfig: true,
   },
 ];
@@ -159,7 +164,7 @@ interface ExecuteTabProps {
 
 export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   const execution = useExecution();
-  const { startVerification, verificationRunning } = useVerificationAgent();
+  const { startExploration, explorationRunning } = useStateExplorer();
 
   // Task type selection
   const [selectedTaskType, setSelectedTaskType] = useState<TaskType>("gui");
@@ -169,7 +174,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   const [aiWorkflows, setAiWorkflows] = useState<SavedAiWorkflow[]>([]);
   const [guiWorkflows, setGuiWorkflows] = useState<SavedGuiWorkflow[]>([]);
   const [scripts, setScripts] = useState<PlaywrightScript[]>([]);
-  const [verifications, setVerifications] = useState<SavedVerification[]>([]);
+  const [explorations, setExplorations] = useState<SavedExploration[]>([]);
   const [loading, setLoading] = useState(true);
   const [runningId, setRunningId] = useState<string | null>(null);
 
@@ -187,22 +192,22 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
   const fetchLibraryItems = useCallback(async () => {
     setLoading(true);
     try {
-      const [promptsRes, workflowsRes, guiWorkflowsRes, scriptsRes, verificationsRes] =
+      const [promptsRes, workflowsRes, guiWorkflowsRes, scriptsRes, explorationsRes] =
         await Promise.all([
           fetch(`${API_BASE}/prompts`).catch(() => ({ ok: false })),
           fetch(`${API_BASE}/ai-workflows`).catch(() => ({ ok: false })),
           fetch(`${API_BASE}/gui-workflows`).catch(() => ({ ok: false })),
           fetch(`${API_BASE}/playwright/scripts`).catch(() => ({ ok: false })),
-          fetch(`${API_BASE}/verifications`).catch(() => ({ ok: false })),
+          fetch(`${API_BASE}/saved-explorations`).catch(() => ({ ok: false })),
         ]);
 
-      const [promptsData, workflowsData, guiWorkflowsData, scriptsData, verificationsData] =
+      const [promptsData, workflowsData, guiWorkflowsData, scriptsData, explorationsData] =
         await Promise.all([
           promptsRes.ok ? (promptsRes as Response).json() : { success: false },
           workflowsRes.ok ? (workflowsRes as Response).json() : { success: false },
           guiWorkflowsRes.ok ? (guiWorkflowsRes as Response).json() : { success: false },
           scriptsRes.ok ? (scriptsRes as Response).json() : { success: false },
-          verificationsRes.ok ? (verificationsRes as Response).json() : { success: false },
+          explorationsRes.ok ? (explorationsRes as Response).json() : { success: false },
         ]);
 
       // Sort by modified_at descending (most recent first)
@@ -215,7 +220,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
       if (workflowsData.success) setAiWorkflows(sortByDate(workflowsData.data || []));
       if (guiWorkflowsData.success) setGuiWorkflows(sortByDate(guiWorkflowsData.data || []));
       if (scriptsData.success) setScripts(sortByDate(scriptsData.data || []));
-      if (verificationsData.success) setVerifications(verificationsData.data || []);
+      if (explorationsData.success) setExplorations(explorationsData.data || []);
     } catch (error) {
       console.error("Failed to fetch library items:", error);
     } finally {
@@ -330,37 +335,37 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
     }
   };
 
-  const runVerification = async (verification: SavedVerification) => {
+  const runExploration = async (exploration: SavedExploration) => {
     if (!execution.config) {
       onLog("error", "No configuration loaded. Please load a config first.");
       return;
     }
 
-    setRunningId(verification.id);
+    setRunningId(exploration.id);
     try {
       const configPath = execution.config.path || execution.config.name || "";
-      const config: VerificationTaskConfig = {
+      const config: ExplorationConfig = {
         config_path: configPath,
-        strategy: verification.config.strategy,
-        max_states: verification.config.max_states,
-        max_duration_seconds: verification.config.max_duration_seconds,
-        target_state_ids: verification.config.target_state_ids,
-        target_transition_ids: verification.config.target_transition_ids,
+        strategy: exploration.config.strategy,
+        max_states: exploration.config.max_states,
+        max_duration_seconds: exploration.config.max_duration_seconds,
+        target_state_ids: exploration.config.target_state_ids,
+        target_transition_ids: exploration.config.target_transition_ids,
         monitor_index:
           execution.selectedMonitors.length > 0 ? execution.selectedMonitors[0] : undefined,
-        capture_screenshots: verification.config.capture_screenshots,
-        capture_transition_screenshots: verification.config.capture_transition_screenshots,
-        state_delay_ms: verification.config.state_delay_ms,
-        stop_on_first_failure: verification.config.stop_on_first_failure,
+        capture_screenshots: exploration.config.capture_screenshots,
+        capture_transition_screenshots: exploration.config.capture_transition_screenshots,
+        state_delay_ms: exploration.config.state_delay_ms,
+        stop_on_first_failure: exploration.config.stop_on_first_failure,
       };
 
-      const result = await startVerification(config);
+      const result = await startExploration(config);
       if (result) {
-        onLog("success", `Started verification: ${verification.name}`);
+        onLog("success", `Started exploration: ${exploration.name}`);
         onNavigateToActive();
       }
     } catch (error) {
-      onLog("error", `Failed to run verification: ${error}`);
+      onLog("error", `Failed to run exploration: ${error}`);
     } finally {
       setRunningId(null);
     }
@@ -513,7 +518,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
             <div className="panel max-w-2xl">
               <div className="panel-header">
                 <div className="panel-title">
-                  <MousePointer2 className="w-4 h-4 text-orange-500" />
+                  <MousePointer2 className={`w-4 h-4 ${getAccentColors("orange").text}`} />
                   <span>Run GUI Workflow</span>
                 </div>
               </div>
@@ -550,14 +555,20 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                             setShowGuiWorkflowDropdown(false);
                           }}
                           className={`w-full flex items-center gap-2 px-3 py-2 text-sm text-left hover:bg-muted/50 transition-colors ${
-                            selectedGuiWorkflowId === workflow.id ? "bg-orange-500/10" : ""
+                            selectedGuiWorkflowId === workflow.id
+                              ? getAccentColors("orange").bg
+                              : ""
                           }`}
                         >
-                          <MousePointer2 className="w-4 h-4 text-orange-500 flex-shrink-0" />
+                          <MousePointer2
+                            className={`w-4 h-4 ${getAccentColors("orange").text} flex-shrink-0`}
+                          />
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="font-medium truncate">{workflow.name}</span>
-                              <span className="text-[10px] bg-orange-500/20 text-orange-400 px-1.5 py-0.5 rounded flex-shrink-0">
+                              <span
+                                className={`text-[10px] ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-1.5 py-0.5 rounded flex-shrink-0`}
+                              >
                                 {workflow.steps.length} steps
                               </span>
                             </div>
@@ -577,7 +588,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                 <button
                   onClick={() => selectedGuiWorkflow && runGuiWorkflow(selectedGuiWorkflow)}
                   disabled={!selectedGuiWorkflow || !execution.configLoaded || runningId !== null}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium bg-orange-500 text-white rounded-lg hover:bg-orange-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium ${getAccentColors("orange").bgSolid} text-white rounded-lg hover:opacity-90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
                 >
                   {runningId !== null && runningId === selectedGuiWorkflowId ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -619,11 +630,15 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                     className={`item-card ${!execution.configLoaded ? "opacity-60" : ""}`}
                   >
                     <div className="item-card-header">
-                      <MousePointer2 className="item-card-icon text-orange-500" />
+                      <MousePointer2
+                        className={`item-card-icon ${getAccentColors("orange").text}`}
+                      />
                       <div className="item-card-content">
                         <div className="flex items-center gap-2">
                           <h4 className="item-card-title">{workflow.name}</h4>
-                          <span className="text-[10px] bg-orange-500/20 text-orange-400 px-1.5 py-0.5 rounded">
+                          <span
+                            className={`text-[10px] ${getAccentColors("orange").bg} ${getAccentColors("orange").text} px-1.5 py-0.5 rounded`}
+                          >
                             {workflow.steps.length} steps
                           </span>
                         </div>
@@ -640,7 +655,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                     <button
                       onClick={() => runGuiWorkflow(workflow)}
                       disabled={!execution.configLoaded || runningId === workflow.id}
-                      className="w-full mt-3 flex items-center justify-center gap-2 py-2 text-xs rounded-lg bg-orange-500/20 text-orange-400 hover:bg-orange-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      className={`w-full mt-3 flex items-center justify-center gap-2 py-2 text-xs rounded-lg ${getAccentColors("orange").bg} ${getAccentColors("orange").text} hover:opacity-80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
                     >
                       {runningId === workflow.id ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -673,7 +688,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
               prompts.map((task) => (
                 <div key={task.id} className="item-card">
                   <div className="item-card-header">
-                    <FileText className="item-card-icon text-amber-500" />
+                    <FileText className={`item-card-icon ${getAccentColors("amber").text}`} />
                     <div className="item-card-content">
                       <h4 className="item-card-title">{task.name}</h4>
                       {task.description && <p className="item-card-desc">{task.description}</p>}
@@ -681,7 +696,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                     <button
                       onClick={() => runTask(task)}
                       disabled={runningId === task.id}
-                      className="item-card-action bg-amber-500/20 text-amber-400 hover:bg-amber-500/30"
+                      className={`item-card-action ${getAccentColors("amber").bg} ${getAccentColors("amber").text} hover:opacity-80`}
                       title="Run Task"
                     >
                       {runningId === task.id ? (
@@ -716,11 +731,13 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
               aiWorkflows.map((workflow) => (
                 <div key={workflow.id} className="item-card">
                   <div className="item-card-header">
-                    <Sparkles className="item-card-icon text-green-500" />
+                    <Sparkles className={`item-card-icon ${getAccentColors("green").text}`} />
                     <div className="item-card-content">
                       <div className="flex items-center gap-2">
                         <h4 className="item-card-title">{workflow.name}</h4>
-                        <span className="text-[10px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded">
+                        <span
+                          className={`text-[10px] ${getAccentColors("green").bg} ${getAccentColors("green").text} px-1.5 py-0.5 rounded`}
+                        >
                           {workflow.steps.length} steps
                         </span>
                       </div>
@@ -729,7 +746,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                     <button
                       onClick={() => runAiWorkflow(workflow)}
                       disabled={runningId === workflow.id}
-                      className="item-card-action bg-green-500/20 text-green-400 hover:bg-green-500/30"
+                      className={`item-card-action ${getAccentColors("green").bg} ${getAccentColors("green").text} hover:opacity-80`}
                       title="Run Workflow"
                     >
                       {runningId === workflow.id ? (
@@ -764,7 +781,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
               scripts.map((script) => (
                 <div key={script.id} className="item-card">
                   <div className="item-card-header">
-                    <TestTube className="item-card-icon text-purple-500" />
+                    <TestTube className={`item-card-icon ${getAccentColors("purple").text}`} />
                     <div className="item-card-content">
                       <h4 className="item-card-title">{script.name}</h4>
                       {script.description && <p className="item-card-desc">{script.description}</p>}
@@ -772,7 +789,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                     <button
                       onClick={() => runScript(script)}
                       disabled={runningId === script.id}
-                      className="item-card-action bg-purple-500/20 text-purple-400 hover:bg-purple-500/30"
+                      className={`item-card-action ${getAccentColors("purple").bg} ${getAccentColors("purple").text} hover:opacity-80`}
                       title="Run Script"
                     >
                       {runningId === script.id ? (
@@ -788,10 +805,10 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
           </div>
         );
 
-      case "verifications":
+      case "state-explorer":
         return (
           <div className="space-y-4">
-            {/* Config Panel for Verifications */}
+            {/* Config Panel for State Explorer */}
             <div className="panel max-w-2xl">
               <div className="panel-header">
                 <div className="panel-title">
@@ -828,57 +845,59 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
               </div>
             </div>
 
-            {/* Verification Cards */}
+            {/* Exploration Cards */}
             <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-3">
               {loading ? (
                 <div className="col-span-full empty-state">
                   <Loader2 className="empty-state-icon animate-spin" />
                 </div>
-              ) : verifications.length === 0 ? (
+              ) : explorations.length === 0 ? (
                 <div className="col-span-full empty-state">
                   <FolderOpen className="empty-state-icon" />
-                  <p className="empty-state-title">No verifications found</p>
+                  <p className="empty-state-title">No explorations found</p>
                   <p className="empty-state-desc">
-                    Create verification configs in the Library to run them here.
+                    Create exploration configs in the Library to run them here.
                   </p>
                 </div>
               ) : (
-                verifications.map((verification) => (
+                explorations.map((exploration) => (
                   <div
-                    key={verification.id}
+                    key={exploration.id}
                     className={`item-card ${!configLoaded ? "opacity-60" : ""}`}
                   >
                     <div className="item-card-header">
-                      <ShieldCheck className="item-card-icon text-emerald-500" />
+                      <ShieldCheck
+                        className={`item-card-icon ${getAccentColors("emerald").text}`}
+                      />
                       <div className="item-card-content">
                         <div className="flex items-center gap-2">
-                          <h4 className="item-card-title">{verification.name}</h4>
-                          <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-1.5 py-0.5 rounded">
-                            {verification.config.strategy}
+                          <h4 className="item-card-title">{exploration.name}</h4>
+                          <span
+                            className={`text-[10px] ${getAccentColors("emerald").bg} ${getAccentColors("emerald").text} px-1.5 py-0.5 rounded`}
+                          >
+                            {exploration.config.strategy}
                           </span>
                         </div>
-                        {verification.description && (
-                          <p className="item-card-desc">{verification.description}</p>
+                        {exploration.description && (
+                          <p className="item-card-desc">{exploration.description}</p>
                         )}
                         <div className="flex gap-3 mt-1.5 text-[10px] text-muted-foreground">
-                          <span>Max: {verification.config.max_states || "All"} states</span>
-                          {verification.run_count > 0 && <span>{verification.run_count} runs</span>}
+                          <span>Max: {exploration.config.max_states || "All"} states</span>
+                          {exploration.run_count > 0 && <span>{exploration.run_count} runs</span>}
                         </div>
                       </div>
                     </div>
                     <button
-                      onClick={() => runVerification(verification)}
-                      disabled={
-                        !configLoaded || runningId === verification.id || verificationRunning
-                      }
-                      className="w-full mt-3 flex items-center justify-center gap-2 py-2 text-xs rounded-lg bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      onClick={() => runExploration(exploration)}
+                      disabled={!configLoaded || runningId === exploration.id || explorationRunning}
+                      className={`w-full mt-3 flex items-center justify-center gap-2 py-2 text-xs rounded-lg ${getAccentColors("emerald").bg} ${getAccentColors("emerald").text} hover:opacity-80 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
                     >
-                      {runningId === verification.id || verificationRunning ? (
+                      {runningId === exploration.id || explorationRunning ? (
                         <Loader2 className="w-3.5 h-3.5 animate-spin" />
                       ) : (
                         <Play className="w-3.5 h-3.5" />
                       )}
-                      {!configLoaded ? "Load Config First" : "Run Verification"}
+                      {!configLoaded ? "Load Config First" : "Run Exploration"}
                     </button>
                   </div>
                 ))
@@ -903,7 +922,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
         return "tab-accent-green";
       case "scripts":
         return "tab-accent-purple";
-      case "verifications":
+      case "state-explorer":
         return "tab-accent-emerald";
       default:
         return "tab-active";
@@ -928,7 +947,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
                       ? aiWorkflows.length
                       : taskType.id === "scripts"
                         ? scripts.length
-                        : verifications.length;
+                        : explorations.length;
             const isActive = selectedTaskType === taskType.id;
 
             return (
@@ -947,7 +966,8 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
           })}
         </div>
 
-        {/* Refresh button */}
+        {/* Tutorial and Refresh buttons */}
+        <PageTutorialMenu page="run" variant="compact" />
         <button
           onClick={fetchLibraryItems}
           disabled={loading}
@@ -960,7 +980,7 @@ export function ExecuteTab({ onLog, onNavigateToActive }: ExecuteTabProps) {
 
       {/* Task Type Description */}
       <div className="flex-shrink-0 flex items-center gap-2 text-xs text-muted-foreground px-1">
-        <TaskIcon className={`w-4 h-4 ${currentTaskType.color}`} />
+        <TaskIcon className={`w-4 h-4 ${getAccentColors(currentTaskType.accentColor).text}`} />
         <span>{currentTaskType.description}</span>
         {currentTaskType.requiresConfig && !execution.configLoaded && (
           <span className="badge badge-warning">Requires config</span>

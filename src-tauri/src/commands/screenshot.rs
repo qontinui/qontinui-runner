@@ -4,6 +4,8 @@
 //! - Capturing screenshots from connected monitors
 //! - Uploading screenshots directly to qontinui-web projects
 //! - Getting monitor information for screenshot capture
+//!
+//! All screenshot capture uses IPC to the Python bridge (qontinui library).
 
 use super::{AppState, CommandResponse};
 use crate::auth::AuthManager;
@@ -11,8 +13,9 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::State;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Get API base URL for qontinui-web backend
 fn get_api_base_url() -> String {
@@ -25,19 +28,7 @@ fn get_api_base_url() -> String {
     })
 }
 
-/// Get qontinui-api URL for screenshot capture
-fn get_qontinui_api_url() -> String {
-    std::env::var("QONTINUI_API_URL_VISION").unwrap_or_else(|_| {
-        if cfg!(debug_assertions) {
-            "http://localhost:8001".to_string()
-        } else {
-            // Production qontinui-api URL (when deployed)
-            "http://localhost:8001".to_string()
-        }
-    })
-}
-
-/// Monitor information from qontinui-api.
+/// Monitor information.
 /// Matches the Monitor type from qontinui-schemas/geometry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorInfo {
@@ -88,9 +79,9 @@ pub struct ScreenshotUploadResult {
     pub error: Option<String>,
 }
 
-/// Get available monitors for screenshot capture via qontinui-api.
+/// Get available monitors for screenshot capture via IPC to Python bridge.
 ///
-/// This calls the qontinui-api screenshot/monitors endpoint to get
+/// This calls the Python executor's get_monitors command to get
 /// information about all connected displays at **physical resolution**.
 ///
 /// Note: This is distinct from `get_monitors` in execution.rs, which uses
@@ -98,52 +89,162 @@ pub struct ScreenshotUploadResult {
 /// when you need physical pixel coordinates for screenshot capture, and
 /// `get_monitors` for workflow execution monitor selection.
 #[tauri::command]
-pub async fn get_screenshot_monitors() -> Result<CommandResponse, String> {
-    info!("Getting available monitors for screenshot capture");
+pub async fn get_screenshot_monitors(
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    info!("Getting available monitors for screenshot capture via IPC");
 
-    let client = reqwest::Client::new();
-    let api_url = get_qontinui_api_url();
+    let app_state = state.inner().clone();
 
-    let response = client
-        .get(format!("{}/api/capture/screenshot/monitors", api_url))
-        .send()
-        .await
-        .map_err(|e| {
-            error!("Failed to get monitors: {}", e);
-            format!("Network error: {}", e)
-        })?;
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!("Get monitors failed with status {}: {}", status, error_text);
-        return Err(format!("Failed to get monitors: {}", error_text));
-    }
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
 
-    let monitors_response: serde_json::Value = response.json().await.map_err(|e| {
-        error!("Failed to parse monitors response: {}", e);
-        format!("Invalid response from API: {}", e)
-    })?;
-
-    info!(
-        "Retrieved {} monitors",
-        monitors_response
-            .get("count")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(0)
-    );
-
-    Ok(CommandResponse {
-        success: true,
-        message: Some("Monitors retrieved".to_string()),
-        data: Some(monitors_response),
+            let timeout_duration = Duration::from_secs(30);
+            bridge.send_command_and_wait("get_monitors", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
     })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                let data = response.data.unwrap_or(json!({"success": true, "monitors": [], "count": 0}));
+                let count = data.get("count").and_then(|c| c.as_i64()).unwrap_or(0);
+                info!("Retrieved {} monitors via IPC", count);
+                Ok(CommandResponse {
+                    success: true,
+                    message: Some("Monitors retrieved".to_string()),
+                    data: Some(data),
+                })
+            } else {
+                let error_msg = response.error.unwrap_or_else(|| "Get monitors failed".to_string());
+                error!("Get monitors via IPC failed: {}", error_msg);
+                Err(error_msg)
+            }
+        }
+        Err(e) => {
+            error!("Failed to get monitors via IPC: {}", e);
+            Err(e)
+        }
+    }
 }
 
-/// Capture a screenshot from the specified monitor via qontinui-api.
+/// Internal function to capture a screenshot via IPC.
+///
+/// This is the core implementation used by both the Tauri command and other
+/// functions that need to capture screenshots.
+async fn capture_screenshot_internal(
+    app_state: Arc<AppState>,
+    monitor: Option<i32>,
+    delay_seconds: Option<f64>,
+) -> Result<ScreenshotCaptureResult, String> {
+    // Apply delay if specified (clamped to 0-30 seconds)
+    if let Some(delay) = delay_seconds {
+        if delay > 0.0 {
+            let clamped_delay = delay.clamp(0.0, 30.0);
+            info!("Waiting {}s before screenshot capture", clamped_delay);
+            tokio::time::sleep(tokio::time::Duration::from_secs_f64(clamped_delay)).await;
+        }
+    }
+
+    let params = json!({
+        "monitor": monitor,
+        "format": "png",
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = Duration::from_secs(30);
+            bridge.send_command_and_wait("capture_screenshot", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                let data = response.data.unwrap_or(json!({}));
+
+                let screenshot_base64 = data
+                    .get("screenshot_base64")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+
+                let width = data
+                    .get("width")
+                    .and_then(|w| w.as_i64())
+                    .map(|w| w as i32);
+
+                let height = data
+                    .get("height")
+                    .and_then(|h| h.as_i64())
+                    .map(|h| h as i32);
+
+                info!(
+                    "Screenshot captured via IPC: {}x{} pixels",
+                    width.unwrap_or(0),
+                    height.unwrap_or(0)
+                );
+
+                Ok(ScreenshotCaptureResult {
+                    success: true,
+                    screenshot_base64,
+                    width,
+                    height,
+                    monitor,
+                    error: None,
+                })
+            } else {
+                let error_msg = response.error.unwrap_or_else(|| "Screenshot capture failed".to_string());
+                error!("Screenshot capture via IPC failed: {}", error_msg);
+                Ok(ScreenshotCaptureResult {
+                    success: false,
+                    screenshot_base64: None,
+                    width: None,
+                    height: None,
+                    monitor,
+                    error: Some(error_msg),
+                })
+            }
+        }
+        Err(e) => {
+            error!("Failed to capture screenshot via IPC: {}", e);
+            Ok(ScreenshotCaptureResult {
+                success: false,
+                screenshot_base64: None,
+                width: None,
+                height: None,
+                monitor,
+                error: Some(e),
+            })
+        }
+    }
+}
+
+/// Capture a screenshot from the specified monitor via IPC to Python bridge.
 ///
 /// This uses the qontinui library's HAL layer for capture, ensuring
 /// screenshots are taken at physical pixel resolution.
@@ -152,95 +253,19 @@ pub async fn get_screenshot_monitors() -> Result<CommandResponse, String> {
 /// * `monitor` - Monitor index (0-based), None for all monitors combined
 /// * `delay_seconds` - Optional delay in seconds before capturing (0-30).
 ///   Useful for waiting for UI animations to settle.
+/// * `state` - Application state containing the Python bridge
 #[tauri::command]
 pub async fn capture_screenshot(
     monitor: Option<i32>,
     delay_seconds: Option<f64>,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<ScreenshotCaptureResult, String> {
     info!(
-        "Capturing screenshot from monitor: {:?}, delay: {:?}s",
+        "Capturing screenshot from monitor: {:?}, delay: {:?}s via IPC",
         monitor, delay_seconds
     );
 
-    let client = reqwest::Client::new();
-    let api_url = get_qontinui_api_url();
-
-    // Build URL with query parameters
-    let mut url = format!("{}/api/capture/screenshot/current", api_url);
-    let mut params = Vec::new();
-    if let Some(mon) = monitor {
-        params.push(format!("monitor={}", mon));
-    }
-    if let Some(delay) = delay_seconds {
-        if delay > 0.0 {
-            // Clamp delay to valid range (0-30 seconds)
-            let clamped_delay = delay.clamp(0.0, 30.0);
-            params.push(format!("delay_seconds={}", clamped_delay));
-        }
-    }
-    if !params.is_empty() {
-        url = format!("{}?{}", url, params.join("&"));
-    }
-
-    let response = client.get(&url).send().await.map_err(|e| {
-        error!("Failed to capture screenshot: {}", e);
-        format!("Network error: {}", e)
-    })?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!(
-            "Screenshot capture failed with status {}: {}",
-            status, error_text
-        );
-        return Ok(ScreenshotCaptureResult {
-            success: false,
-            screenshot_base64: None,
-            width: None,
-            height: None,
-            monitor,
-            error: Some(format!("Capture failed: {}", error_text)),
-        });
-    }
-
-    let capture_response: serde_json::Value = response.json().await.map_err(|e| {
-        error!("Failed to parse screenshot response: {}", e);
-        format!("Invalid response from API: {}", e)
-    })?;
-
-    let screenshot_base64 = capture_response
-        .get("screenshot_base64")
-        .and_then(|s| s.as_str())
-        .map(|s| s.to_string());
-
-    let width = capture_response
-        .get("width")
-        .and_then(|w| w.as_i64())
-        .map(|w| w as i32);
-
-    let height = capture_response
-        .get("height")
-        .and_then(|h| h.as_i64())
-        .map(|h| h as i32);
-
-    info!(
-        "Screenshot captured: {}x{} pixels",
-        width.unwrap_or(0),
-        height.unwrap_or(0)
-    );
-
-    Ok(ScreenshotCaptureResult {
-        success: true,
-        screenshot_base64,
-        width,
-        height,
-        monitor,
-        error: None,
-    })
+    capture_screenshot_internal(state.inner().clone(), monitor, delay_seconds).await
 }
 
 /// Capture a screenshot and upload it directly to a qontinui-web project.
@@ -250,17 +275,19 @@ pub async fn capture_screenshot(
 ///
 /// # Arguments
 /// * `config` - Upload configuration including project_id and optional name
+/// * `state` - Application state containing the Python bridge
 #[tauri::command]
 pub async fn capture_and_upload_screenshot(
     config: ScreenshotUploadConfig,
+    state: State<'_, Arc<AppState>>,
 ) -> Result<ScreenshotUploadResult, String> {
     info!(
         "Capturing and uploading screenshot to project: {}",
         config.project_id
     );
 
-    // 1. Capture the screenshot via qontinui-api (no delay for upload workflow)
-    let capture_result = capture_screenshot(config.monitor, None).await?;
+    // 1. Capture the screenshot via IPC (no delay for upload workflow)
+    let capture_result = capture_screenshot_internal(state.inner().clone(), config.monitor, None).await?;
 
     if !capture_result.success || capture_result.screenshot_base64.is_none() {
         return Ok(ScreenshotUploadResult {
@@ -387,9 +414,9 @@ pub async fn capture_and_upload_screenshot(
     })
 }
 
-/// Capture a screenshot using Python bridge (alternative to API).
+/// Capture a screenshot using Python bridge.
 ///
-/// Uses the Python executor's capture functionality instead of the qontinui-api.
+/// Uses the Python executor's capture functionality.
 /// This requires the Python executor to be running.
 ///
 /// # Arguments

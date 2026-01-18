@@ -693,6 +693,10 @@ mod tests {
             max_sessions: Some(5),
             provider: None,
             model: None,
+            requires_orchestrator: false,
+            orchestrator_goal: None,
+            orchestrator_max_iterations: None,
+            orchestrator_verification_first: None,
             created_at: String::new(),
             modified_at: String::new(),
         };
@@ -716,6 +720,10 @@ mod tests {
             max_sessions: None,
             provider: None,
             model: None,
+            requires_orchestrator: false,
+            orchestrator_goal: None,
+            orchestrator_max_iterations: None,
+            orchestrator_verification_first: None,
             created_at: String::new(),
             modified_at: String::new(),
         };

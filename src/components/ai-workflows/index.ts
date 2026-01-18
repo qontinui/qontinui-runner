@@ -1,10 +1,5 @@
 /**
- * AI Workflows sub-components
+ * AI Workflows components
  */
 
-export { WorkflowBuilderSubTab } from "./WorkflowBuilderSubTab";
-export { WorkflowLibrarySubTab } from "./WorkflowLibrarySubTab";
-export { PromptsSubTab } from "./PromptsSubTab";
-export { ScriptsSubTab } from "./ScriptsSubTab";
-export { AiOutputSubTab } from "./AiOutputSubTab";
-export { ScriptletsSubTab } from "./ScriptletsSubTab";
+export { ExecutionSummaryTab } from "./ExecutionSummaryTab";

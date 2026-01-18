@@ -484,6 +484,262 @@ pub fn run_script(
     Ok(result)
 }
 
+/// Execute inline Playwright script content (for combined scripts)
+///
+/// This is similar to run_script but takes the script content directly
+/// instead of fetching it from the library by ID.
+pub fn run_script_inline(
+    content: &str,
+    target_url: Option<&str>,
+    script_name: &str,
+) -> Result<PlaywrightResult, String> {
+    // Find the qontinui-runner directory (where Playwright is installed in node_modules)
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+    info!("Running inline Playwright script: {}", script_name);
+
+    // Walk up to find node_modules/@playwright directory
+    let mut runner_dir = exe_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "Failed to get executable directory".to_string())?;
+
+    for _ in 0..10 {
+        if runner_dir.join("node_modules").join("@playwright").exists() {
+            break;
+        }
+        if let Some(parent) = runner_dir.parent() {
+            runner_dir = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+
+    // Verify we found @playwright/test
+    if !runner_dir.join("node_modules").join("@playwright").exists() {
+        return Err(format!(
+            "Could not find @playwright/test in node_modules. \
+             Make sure @playwright/test is installed in qontinui-runner. \
+             Searched from: {}",
+            exe_path.display()
+        ));
+    }
+
+    // Create a user-scripts subdirectory for test files
+    let user_scripts_dir = runner_dir.join("playwright-user-scripts");
+    fs::create_dir_all(&user_scripts_dir)
+        .map_err(|e| format!("Failed to create user scripts directory: {}", e))?;
+
+    // Generate a unique ID for this inline script
+    let inline_id = format!("inline-{}", Uuid::new_v4());
+    let script_file = user_scripts_dir.join(format!("{}.spec.ts", inline_id));
+
+    // Prepare script content with potential URL override
+    let mut final_content = content.to_string();
+    if let Some(url) = target_url {
+        if final_content.contains("baseURL:") {
+            let re = regex::Regex::new(r#"baseURL:\s*['"`][^'"`]*['"`]"#)
+                .map_err(|e| format!("Regex error: {}", e))?;
+            final_content = re
+                .replace(&final_content, format!(r#"baseURL: '{}'"#, url))
+                .to_string();
+        }
+    }
+
+    fs::write(&script_file, &final_content)
+        .map_err(|e| format!("Failed to write script file: {}", e))?;
+
+    // Prepare output directory for this run
+    let results_dir = get_results_dir()?;
+    let run_id = Uuid::new_v4().to_string();
+    let output_dir = results_dir.join(&run_id);
+    fs::create_dir_all(&output_dir)
+        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+
+    info!("Executing inline playwright script: {}", script_name);
+
+    let start_time = std::time::Instant::now();
+    let system = std::env::consts::OS;
+
+    // Build args
+    let script_filename = format!("{}.spec.ts", inline_id);
+    let args = vec![
+        "playwright".to_string(),
+        "test".to_string(),
+        script_filename,
+        "--reporter=json".to_string(),
+        format!("--output={}", output_dir.to_string_lossy()),
+        "--timeout=300000".to_string(), // 5 minute timeout for combined scripts
+        "--headed".to_string(),         // Use headed mode for visibility
+    ];
+
+    // Load Playwright settings
+    let playwright_settings = settings::get_playwright_settings();
+
+    let output = if system == "windows" {
+        let npx_args = std::iter::once("npx".to_string())
+            .chain(args)
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        info!(
+            "Running inline Playwright via cmd.exe in dir {}: {}",
+            runner_dir.display(),
+            npx_args
+        );
+
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/c", &npx_args]).current_dir(&runner_dir);
+
+        // Set Playwright environment variables from settings
+        if let Some(username) = &playwright_settings.test_username {
+            cmd.env("PLAYWRIGHT_TEST_USERNAME", username);
+        }
+        if let Some(password) = &playwright_settings.test_password {
+            cmd.env("PLAYWRIGHT_TEST_PASSWORD", password);
+        }
+        if let Some(base_url) = &playwright_settings.base_url {
+            cmd.env("PLAYWRIGHT_BASE_URL", base_url);
+        }
+        if playwright_settings.skip_web_server {
+            cmd.env("SKIP_WEB_SERVER", "1");
+        }
+
+        cmd.output()
+            .map_err(|e| format!("Failed to execute playwright via cmd.exe: {}", e))?
+    } else {
+        info!(
+            "Running inline Playwright in dir {}: npx {}",
+            runner_dir.display(),
+            args.join(" ")
+        );
+
+        let mut cmd = Command::new("npx");
+        cmd.args(&args).current_dir(&runner_dir);
+
+        if let Some(username) = &playwright_settings.test_username {
+            cmd.env("PLAYWRIGHT_TEST_USERNAME", username);
+        }
+        if let Some(password) = &playwright_settings.test_password {
+            cmd.env("PLAYWRIGHT_TEST_PASSWORD", password);
+        }
+        if let Some(base_url) = &playwright_settings.base_url {
+            cmd.env("PLAYWRIGHT_BASE_URL", base_url);
+        }
+        if playwright_settings.skip_web_server {
+            cmd.env("SKIP_WEB_SERVER", "1");
+        }
+
+        cmd.output()
+            .map_err(|e| format!("Failed to execute playwright: {}", e))?
+    };
+
+    // Clean up the script file after execution
+    let _ = fs::remove_file(&script_file);
+
+    let duration_ms = start_time.elapsed().as_millis() as u64;
+    let executed_at = chrono::Utc::now().to_rfc3339();
+
+    // Parse JSON output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    info!("Inline Playwright stdout length: {}", stdout.len());
+    if !stderr.is_empty() {
+        warn!("Inline Playwright stderr: {}", stderr);
+    }
+
+    // Parse results
+    let (tests_passed, tests_failed, tests_skipped, specs, error) = parse_playwright_json(&stdout);
+    let passed = tests_failed == 0 && output.status.success();
+
+    // Collect screenshots
+    let screenshots = collect_screenshots(&output_dir);
+
+    // Build console output
+    let mut console_lines: Vec<String> = Vec::new();
+    for line in stderr.lines() {
+        console_lines.push(line.to_string());
+    }
+
+    let page_snapshot = collect_error_context(&output_dir);
+
+    let structured_output = StructuredTestOutput {
+        specs,
+        console_output: console_lines,
+        network_requests: None,
+        page_snapshot,
+    };
+
+    let result = PlaywrightResult {
+        passed,
+        tests_passed,
+        tests_failed,
+        tests_skipped,
+        duration_ms,
+        error,
+        report_path: output_dir.to_str().map(|s| s.to_string()),
+        screenshots,
+        video_paths: find_video_files(&output_dir),
+        trace_path: find_trace_file(&output_dir),
+        executed_at,
+        structured_output: Some(structured_output),
+        workflow_status: None,
+    };
+
+    info!(
+        "Inline Playwright execution complete: passed={}, tests_passed={}, tests_failed={}",
+        result.passed, result.tests_passed, result.tests_failed
+    );
+
+    // Log to .dev-logs
+    let log_params = PlaywrightLogParams {
+        script_id: &inline_id,
+        script_name,
+        target_url,
+        display_mode: Some("headed"),
+        browser: Some("chromium"),
+        passed: result.passed,
+        tests_passed: result.tests_passed,
+        tests_failed: result.tests_failed,
+        tests_skipped: result.tests_skipped,
+        duration_ms: result.duration_ms,
+        error: result.error.as_deref(),
+        original_screenshots: &result.screenshots,
+        console_output: &result
+            .structured_output
+            .as_ref()
+            .map(|s| s.console_output.clone())
+            .unwrap_or_default(),
+        specs: &result
+            .structured_output
+            .as_ref()
+            .map(|so| {
+                so.specs
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.title.clone(),
+                            s.status.clone(),
+                            s.duration_ms,
+                            s.error.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+        page_snapshot: result
+            .structured_output
+            .as_ref()
+            .and_then(|so| so.page_snapshot.as_deref()),
+        workflow_status: None,
+    };
+    FileLogger::log_playwright_execution(&log_params);
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

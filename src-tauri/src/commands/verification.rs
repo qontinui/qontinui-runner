@@ -33,8 +33,7 @@ pub struct PendingVerification {
 
 /// Get the path to the pending verification file
 fn get_pending_verification_path() -> PathBuf {
-    let base_dir = PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
-    base_dir.join("pending-verification.json")
+    crate::paths::get_dev_logs_dir().join("pending-verification.json")
 }
 
 /// Verification expiry time in milliseconds (24 hours)

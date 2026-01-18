@@ -19,6 +19,7 @@ import {
   Info,
   ImageIcon,
   CheckSquare,
+  Search,
 } from "lucide-react";
 import type {
   PlaywrightScript,
@@ -29,6 +30,7 @@ import type {
 } from "../types";
 import { ScriptletSelector, useScriptletMention } from "./ScriptletSelector";
 import { executeAiTask } from "../hooks";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -1935,652 +1937,789 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
     }
   }, []);
 
+  const accentColors = getAccentColors("purple");
+
+  // Filter scripts based on search
+  const filteredScripts = scripts.filter((script) => {
+    if (!searchQuery) return true;
+    const query = searchQuery.toLowerCase();
+    return (
+      script.name.toLowerCase().includes(query) ||
+      script.description?.toLowerCase().includes(query) ||
+      script.target_url?.toLowerCase().includes(query)
+    );
+  });
+
+  // Select a script for editing
+  const selectScript = (script: PlaywrightScript) => {
+    setEditingScript(script);
+    setIsCreating(false);
+    setFormName(script.name);
+    setFormDescription(script.description || "");
+    setFormTargetUrl(script.target_url || "");
+    setFormScriptContent(script.script_content || DEFAULT_SCRIPT_CONTENT);
+    setFormCategory(script.category || "");
+    setFormTags(script.tags?.join(", ") || "");
+    setFormTimeoutSeconds(script.timeout_seconds || 60);
+    setFormDisplayMode((script.display_mode as DisplayMode) || "headless");
+    setFormBrowser(script.browser || "chromium");
+    setFormAiInstructions(script.ai_instructions || "");
+    setFormWorkflowObjective(script.workflow_objective || "");
+    setFormSuccessCriteria(script.success_criteria || []);
+    setFormIsWorkflowAutomation(script.is_workflow_automation || false);
+  };
+
+  // Start creating new script
+  const startCreate = () => {
+    setEditingScript(null);
+    setIsCreating(true);
+    resetForm();
+  };
+
   return (
-    <div className="h-full flex flex-col p-4 gap-3 overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center justify-between flex-shrink-0">
-        <div className="flex items-center gap-3">
-          {onNavigateToLibrary && (
+    <div className="h-full flex">
+      {/* Left Panel - Script List */}
+      <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
+        {/* Header */}
+        <div className="p-4 border-b border-neutral-700">
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <TestTube className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
+              Scripts
+            </h2>
             <button
-              onClick={onNavigateToLibrary}
-              className="p-2 hover:bg-muted rounded-lg transition-colors"
-              title="Back to Library"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          )}
-          <TestTube className="w-6 h-6 text-green-500" />
-          <h2 className="text-xl font-semibold">
-            {editingScript ? `Editing: ${editingScript.name}` : "New Playwright Script"}
-          </h2>
-        </div>
-        <div className="flex items-center gap-2">
-          {editingScript && (
-            <button
-              onClick={() => {
-                setEditingScript(null);
-                resetForm();
-                setIsCreating(true);
-              }}
-              className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
+              onClick={startCreate}
+              className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
+              title="New Script"
             >
               <Plus className="w-4 h-4" />
-              New Script
             </button>
+          </div>
+
+          {/* Search */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-400" />
+            <input
+              type="text"
+              placeholder="Search scripts..."
+              value={searchQuery}
+              onChange={(e) => _setSearchQuery(e.target.value)}
+              className="w-full pl-9 pr-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-sm focus:outline-none focus:border-neutral-600"
+            />
+          </div>
+        </div>
+
+        {/* Script List */}
+        <div className="flex-1 overflow-y-auto p-2">
+          {_loading ? (
+            <div className="flex items-center justify-center py-8">
+              <Loader2 className="w-6 h-6 animate-spin text-neutral-400" />
+            </div>
+          ) : filteredScripts.length === 0 ? (
+            <div className="text-center py-8 text-neutral-400">
+              <TestTube className="w-8 h-8 mx-auto mb-2 opacity-50" />
+              <p className="text-sm">No scripts found</p>
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {filteredScripts.map((script) => (
+                <button
+                  key={script.id}
+                  onClick={() => selectScript(script)}
+                  className={`w-full text-left p-3 rounded-lg transition-colors ${
+                    editingScript?.id === script.id ? "bg-neutral-700" : "hover:bg-neutral-800"
+                  }`}
+                >
+                  <div className="font-medium text-sm truncate">{script.name}</div>
+                  {script.target_url && (
+                    <div className="text-xs text-neutral-400 truncate mt-0.5">
+                      {script.target_url}
+                    </div>
+                  )}
+                  {script.category && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 mt-1.5 inline-block">
+                      {script.category}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
           )}
-          <button
-            onClick={importScripts}
-            className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
-          >
-            <Upload className="w-4 h-4" />
-            Import
-          </button>
-          <button
-            onClick={exportScripts}
-            className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
-          >
-            <Download className="w-4 h-4" />
-            Export
-          </button>
         </div>
       </div>
 
-      {/* Scrollable Content */}
-      <div className="flex-1 overflow-y-auto scrollbar-dark">
-        {/* Script Builder Form - Always visible */}
-        {(isCreating || editingScript) && (
-          <div className="card p-4 space-y-4 border-2 border-green-500/30 min-h-min">
-            <div className="flex items-center justify-between">
-              <h3 className="text-lg font-semibold flex items-center gap-2">
-                <TestTube className="w-5 h-5 text-green-500" />
+      {/* Right Panel - Editor */}
+      <div className="flex-1 flex flex-col bg-neutral-900/50 overflow-hidden">
+        {!editingScript && !isCreating ? (
+          <div className="flex-1 flex items-center justify-center">
+            <div className="text-center text-neutral-400">
+              <TestTube className="w-12 h-12 mx-auto mb-3 opacity-30" />
+              <p className="text-lg mb-2">No script selected</p>
+              <p className="text-sm mb-4">Select a script to edit or create a new one</p>
+              <button
+                onClick={startCreate}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg transition-colors"
+                style={{ backgroundColor: accentColors.bgSolid, color: "#000" }}
+              >
+                <Plus className="w-4 h-4" />
                 Create New Script
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* Toolbar */}
+            <div className="flex items-center justify-between p-4 border-b border-neutral-700">
+              <h3 className="font-medium">
+                {isCreating ? "New Script" : `Editing: ${editingScript?.name}`}
               </h3>
               <div className="flex items-center gap-2">
-                {/* View Mode Toggle */}
-                <div className="flex items-center bg-card border border-border rounded-lg p-1">
-                  <button
-                    onClick={() => setViewMode("natural_language")}
-                    className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
-                      viewMode === "natural_language"
-                        ? "bg-green-500/20 text-green-500"
-                        : "text-muted-foreground hover:text-foreground"
-                    }`}
-                  >
-                    <FileText className="w-4 h-4" />
-                    Description
-                  </button>
-                  <button
-                    onClick={() => setViewMode("code")}
-                    className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
-                      viewMode === "code"
-                        ? "bg-green-500/20 text-green-500"
-                        : "text-muted-foreground hover:text-foreground"
-                    }`}
-                  >
-                    <Code className="w-4 h-4" />
-                    Code
-                  </button>
-                </div>
                 <button
-                  onClick={() => {
-                    setIsCreating(false);
-                    setEditingScript(null);
-                    resetForm();
-                  }}
-                  className="p-1 hover:bg-card rounded"
+                  onClick={importScripts}
+                  className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
+                  title="Import"
+                >
+                  <Upload className="w-4 h-4" />
+                </button>
+                <button
+                  onClick={exportScripts}
+                  className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
+                  title="Export"
+                >
+                  <Download className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            {/* Scrollable Content */}
+            <div className="flex-1 overflow-y-auto p-4 scrollbar-dark">
+              {/* Script Builder Form - Always visible */}
+              {(isCreating || editingScript) && (
+                <div
+                  className={`card p-4 space-y-4 border-2 ${getStatusColors("success").border} min-h-min`}
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold flex items-center gap-2">
+                      <TestTube className={`w-5 h-5 ${getStatusColors("success").text}`} />
+                      Create New Script
+                    </h3>
+                    <div className="flex items-center gap-2">
+                      {/* View Mode Toggle */}
+                      <div className="flex items-center bg-card border border-border rounded-lg p-1">
+                        <button
+                          onClick={() => setViewMode("natural_language")}
+                          className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
+                            viewMode === "natural_language"
+                              ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                              : "text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          <FileText className="w-4 h-4" />
+                          Description
+                        </button>
+                        <button
+                          onClick={() => setViewMode("code")}
+                          className={`px-3 py-1 text-sm rounded flex items-center gap-1 ${
+                            viewMode === "code"
+                              ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                              : "text-muted-foreground hover:text-foreground"
+                          }`}
+                        >
+                          <Code className="w-4 h-4" />
+                          Code
+                        </button>
+                      </div>
+                      <button
+                        onClick={() => {
+                          setIsCreating(false);
+                          setEditingScript(null);
+                          resetForm();
+                        }}
+                        className="p-1 hover:bg-card rounded"
+                      >
+                        <X className="w-5 h-5" />
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Name *</label>
+                      <input
+                        type="text"
+                        value={formName}
+                        onChange={(e) => setFormName(e.target.value)}
+                        placeholder="Login Flow Test"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Target URL</label>
+                      <div className="relative">
+                        <Globe className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                        <input
+                          type="text"
+                          value={formTargetUrl}
+                          onChange={(e) => setFormTargetUrl(e.target.value)}
+                          placeholder="http://localhost:3000"
+                          className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  {viewMode === "natural_language" ? (
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="block text-sm font-medium">
+                          Description (Natural Language)
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
+                          <button
+                            onClick={generateScript}
+                            disabled={isGenerating || !formDescription.trim()}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                          >
+                            {isGenerating ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Generating...
+                              </>
+                            ) : (
+                              <>
+                                <Sparkles className="w-4 h-4" />
+                                Generate Script
+                              </>
+                            )}
+                          </button>
+                        </div>
+                      </div>
+                      <div className="relative">
+                        <textarea
+                          ref={descriptionTextareaRef}
+                          value={formDescription}
+                          onChange={(e) => setFormDescription(e.target.value)}
+                          onKeyDown={scriptletMention.handleKeyDown}
+                          onInput={scriptletMention.handleInput}
+                          placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
+                          rows={6}
+                          className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        />
+                        {/* @-mention popup for scriptlet insertion */}
+                        {scriptletMention.isActive && (
+                          <ScriptletSelector
+                            mode="popup"
+                            onSelect={scriptletMention.handleSelect}
+                            onClose={scriptletMention.handleClose}
+                            searchQuery={scriptletMention.searchQuery}
+                            position={scriptletMention.position}
+                          />
+                        )}
+                      </div>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Describe what you want to test, then click "Generate Script" to create the
+                        Playwright code.
+                      </p>
+
+                      {/* AI Instructions (optional) */}
+                      <div className="mt-4">
+                        <label className="block text-sm font-medium mb-1 flex items-center gap-2">
+                          <Sparkles className={`w-4 h-4 ${getAccentColors("purple").text}`} />
+                          AI Instructions (Optional)
+                        </label>
+                        <textarea
+                          value={formAiInstructions}
+                          onChange={(e) => setFormAiInstructions(e.target.value)}
+                          placeholder="Additional instructions for the AI that modify how the description is interpreted...&#10;&#10;Example: The feature is currently broken. Stop after capturing the screen and take a screenshot. Expect failure but capture the state for debugging."
+                          rows={3}
+                          className={`w-full px-3 py-2 ${getAccentColors("purple").bg} border ${getAccentColors("purple").border} rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm`}
+                        />
+                        <p className="text-xs text-muted-foreground mt-1">
+                          Use this to give the AI additional context without changing the test
+                          description.
+                        </p>
+                      </div>
+
+                      {/* Workflow Automation (optional - collapsible) */}
+                      <details
+                        className={`mt-4 border ${getAccentColors("blue").border} rounded-lg p-3 ${getAccentColors("blue").bg}`}
+                      >
+                        <summary
+                          className={`cursor-pointer text-sm font-medium flex items-center gap-2 ${getAccentColors("blue").text}`}
+                        >
+                          <CheckSquare className="w-4 h-4" />
+                          Workflow Automation Settings (Optional)
+                        </summary>
+                        <div className="mt-3 space-y-3">
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="checkbox"
+                              id="is-workflow-automation"
+                              checked={formIsWorkflowAutomation}
+                              onChange={(e) => setFormIsWorkflowAutomation(e.target.checked)}
+                              className={`w-4 h-4 rounded ${getAccentColors("blue").border} ${getAccentColors("blue").text} focus:ring-blue-500`}
+                            />
+                            <label htmlFor="is-workflow-automation" className="text-sm">
+                              This is workflow automation (script success is expected, verify
+                              objective instead)
+                            </label>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium mb-1">
+                              Workflow Objective
+                            </label>
+                            <textarea
+                              value={formWorkflowObjective}
+                              onChange={(e) => setFormWorkflowObjective(e.target.value)}
+                              placeholder="What should this workflow achieve?&#10;&#10;Example: Create a new state called 'test-state' and verify it appears in the state list"
+                              rows={2}
+                              className={`w-full px-3 py-2 bg-background border ${getAccentColors("blue").border} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm`}
+                            />
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium mb-1">
+                              Success Criteria (one per line)
+                            </label>
+                            <textarea
+                              value={formSuccessCriteria.join("\n")}
+                              onChange={(e) =>
+                                setFormSuccessCriteria(
+                                  e.target.value
+                                    .split("\n")
+                                    .map((s) => s.trim())
+                                    .filter(Boolean),
+                                )
+                              }
+                              placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
+                              rows={3}
+                              className={`w-full px-3 py-2 bg-background border ${getAccentColors("blue").border} rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm`}
+                            />
+                          </div>
+
+                          <p className="text-xs text-muted-foreground">
+                            When enabled, script execution success is expected. After the script
+                            passes, AI will verify whether the workflow objective was actually
+                            achieved.
+                          </p>
+                        </div>
+                      </details>
+                    </div>
+                  ) : (
+                    <div>
+                      <div className="flex items-center justify-between mb-1">
+                        <label className="block text-sm font-medium">
+                          Script Content (.spec.ts) *
+                        </label>
+                        {formDescription.trim() && (
+                          <button
+                            onClick={generateScript}
+                            disabled={isGenerating}
+                            className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-card border border-border rounded-lg hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                            title="Regenerate script from description"
+                          >
+                            {isGenerating ? (
+                              <>
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                Regenerating...
+                              </>
+                            ) : (
+                              <>
+                                <RefreshCw className="w-4 h-4" />
+                                Regenerate
+                              </>
+                            )}
+                          </button>
+                        )}
+                      </div>
+                      <textarea
+                        value={formScriptContent}
+                        onChange={(e) => setFormScriptContent(e.target.value)}
+                        rows={12}
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
+                        spellCheck={false}
+                      />
+
+                      {/* Coverage validation status */}
+                      {isValidatingCoverage && (
+                        <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          Validating script covers all requirements...
+                        </div>
+                      )}
+
+                      {/* Coverage warnings */}
+                      {coverageWarnings.length > 0 && (
+                        <div
+                          className={`mt-3 p-3 ${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded-lg`}
+                        >
+                          <div className="flex items-start gap-2">
+                            <Info
+                              className={`w-4 h-4 ${getAccentColors("amber").text} mt-0.5 flex-shrink-0`}
+                            />
+                            <div className="flex-1">
+                              <div
+                                className={`text-sm font-medium ${getAccentColors("amber").text} mb-1`}
+                              >
+                                Missing Requirements Detected
+                              </div>
+                              <div className={`text-sm ${getAccentColors("amber").text} mb-2`}>
+                                The generated code may not implement all functionality from the
+                                description:
+                              </div>
+                              <ul
+                                className={`text-sm ${getAccentColors("amber").text} list-disc list-inside space-y-1`}
+                              >
+                                {coverageWarnings.map((warning, i) => (
+                                  <li key={i}>{warning}</li>
+                                ))}
+                              </ul>
+                              <button
+                                onClick={() => {
+                                  // Re-generate with emphasis on missing requirements
+                                  const missingItems = coverageWarnings.join(", ");
+                                  setFormAiInstructions(
+                                    (prev) =>
+                                      prev +
+                                      (prev ? "\n\n" : "") +
+                                      `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`,
+                                  );
+                                  setCoverageWarnings([]);
+                                  generateScript();
+                                }}
+                                disabled={isGenerating}
+                                className={`mt-2 px-3 py-1.5 text-sm ${getAccentColors("amber").bg} hover:opacity-80 ${getAccentColors("amber").text} rounded-lg transition-colors disabled:opacity-50`}
+                              >
+                                <RefreshCw className="w-3 h-3 inline mr-1.5" />
+                                Regenerate with missing requirements
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Category</label>
+                      <input
+                        type="text"
+                        value={formCategory}
+                        onChange={(e) => setFormCategory(e.target.value)}
+                        placeholder="E2E, Smoke, Regression"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                        list="category-suggestions"
+                      />
+                      <datalist id="category-suggestions">
+                        {categories.map((cat) => (
+                          <option key={cat} value={cat} />
+                        ))}
+                      </datalist>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">
+                        Tags (comma-separated)
+                      </label>
+                      <input
+                        type="text"
+                        value={formTags}
+                        onChange={(e) => setFormTags(e.target.value)}
+                        placeholder="login, auth, smoke"
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Timeout (seconds)</label>
+                      <input
+                        type="number"
+                        value={formTimeoutSeconds}
+                        onChange={(e) => setFormTimeoutSeconds(parseInt(e.target.value) || 60)}
+                        min={10}
+                        max={600}
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Browser</label>
+                      <select
+                        value={formBrowser}
+                        onChange={(e) => setFormBrowser(e.target.value as typeof formBrowser)}
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                      >
+                        <option value="chromium">Chromium</option>
+                        <option value="firefox">Firefox</option>
+                        <option value="webkit">WebKit</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Display Mode</label>
+                      <select
+                        value={formDisplayMode}
+                        onChange={(e) => setFormDisplayMode(e.target.value as DisplayMode)}
+                        className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
+                      >
+                        <option value="headless">Headless (No UI)</option>
+                        <option value="headed">Headed (New Window)</option>
+                        <option value="connect_existing">Open Browser (CDP)</option>
+                      </select>
+                      {formDisplayMode === "connect_existing" && (
+                        <div className="mt-1 space-y-1">
+                          <div className="flex items-center gap-1">
+                            <p className={`text-xs ${getAccentColors("amber").text}`}>
+                              Requires Chrome started with: --remote-debugging-port=9222
+                            </p>
+                            <div className="relative group">
+                              <Info
+                                className={`w-3.5 h-3.5 ${getAccentColors("amber").text} cursor-help`}
+                              />
+                              <div className="absolute right-0 bottom-full mb-2 hidden group-hover:block z-50 w-80">
+                                <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-xs">
+                                  <p className="font-medium mb-2">
+                                    How to start Chrome with debugging:
+                                  </p>
+                                  <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
+                                    <li>Close all Chrome windows first</li>
+                                    <li>
+                                      Click the button below to restart Chrome with debugging, or:
+                                    </li>
+                                    <li>
+                                      Create a shortcut with target:{" "}
+                                      <code className="bg-muted px-1 rounded">
+                                        chrome --remote-debugging-port=9222
+                                      </code>
+                                    </li>
+                                  </ol>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              if (
+                                !confirm(
+                                  "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
+                                )
+                              ) {
+                                return;
+                              }
+                              try {
+                                onLog("info", "Closing Chrome and relaunching with debug port...");
+                                const response = await fetch(`${API_BASE}/launch-debug-chrome`, {
+                                  method: "POST",
+                                });
+                                const result = await response.json();
+                                if (result.success) {
+                                  onLog(
+                                    "success",
+                                    "Chrome launched with debugging enabled. Navigate to your test page, then run the test.",
+                                  );
+                                } else {
+                                  onLog("error", `Failed to launch Chrome: ${result.error}`);
+                                }
+                              } catch (error) {
+                                onLog("error", `Failed to launch Chrome: ${error}`);
+                              }
+                            }}
+                            className={`text-xs px-2 py-1 ${getAccentColors("amber").bg} ${getAccentColors("amber").text} rounded hover:opacity-80 transition-colors`}
+                          >
+                            Restart Chrome with Debug Port
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Visual Context Settings for Auto-Refine (applies when using Save & Auto-Refine) */}
+                  <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground py-3 border-t border-border">
+                    <div className="flex items-center gap-2">
+                      <ImageIcon className="w-4 h-4" />
+                      <span>Auto-Refine Visual Context:</span>
+                    </div>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeScreenshot}
+                        onChange={(e) => setIncludeScreenshot(e.target.checked)}
+                        className="rounded border-border"
+                      />
+                      <span>Screenshot</span>
+                    </label>
+                    <label className="flex items-center gap-1.5 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={includeTraceData}
+                        onChange={(e) => setIncludeTraceData(e.target.checked)}
+                        className="rounded border-border"
+                      />
+                      <span>Trace</span>
+                    </label>
+                    <label
+                      className="flex items-center gap-1.5 cursor-pointer"
+                      title="Video uses significantly more tokens. Only recommended for complex failures."
+                    >
+                      <input
+                        type="checkbox"
+                        checked={includeVideo}
+                        onChange={(e) => setIncludeVideo(e.target.checked)}
+                        className="rounded border-border"
+                      />
+                      <span>Video after</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={10}
+                        value={includeVideoAfterIterations}
+                        onChange={(e) =>
+                          setIncludeVideoAfterIterations(Math.max(1, parseInt(e.target.value) || 3))
+                        }
+                        disabled={!includeVideo}
+                        className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
+                      />
+                      <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
+                      <span title="Video uses significantly more tokens. Enables after N failed iterations.">
+                        <Info className="w-3.5 h-3.5 text-muted-foreground" />
+                      </span>
+                    </label>
+                    <div className="border-l border-border pl-4 ml-2">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <span>Max iterations:</span>
+                        <input
+                          type="number"
+                          min={1}
+                          max={50}
+                          value={autoRefineMaxIterations}
+                          onChange={(e) =>
+                            setAutoRefineMaxIterations(
+                              Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
+                            )
+                          }
+                          className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
+                        />
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="flex justify-between items-center gap-2 pt-4 border-t border-border">
+                    <button
+                      onClick={() => {
+                        setIsCreating(false);
+                        resetForm();
+                      }}
+                      className="btn-secondary px-4 py-2"
+                    >
+                      Cancel
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => createScript()}
+                        disabled={!formName || !formScriptContent}
+                        className="btn-secondary px-4 py-2 flex items-center gap-2"
+                      >
+                        <Save className="w-4 h-4" />
+                        Save Only
+                      </button>
+                      <button
+                        onClick={() => createScript({ runTest: true })}
+                        disabled={!formName || !formScriptContent}
+                        className="btn-primary px-4 py-2 flex items-center gap-2"
+                        title="Save and run the test once"
+                      >
+                        <Play className="w-4 h-4" />
+                        Save & Run
+                      </button>
+                      <button
+                        onClick={() => createScript({ autoRefine: true })}
+                        disabled={!formName || !formScriptContent}
+                        className="flex items-center gap-2 px-4 py-2 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
+                        title="Save, run test, and refine with AI until it passes"
+                      >
+                        <Sparkles className="w-4 h-4" />
+                        Save & Auto-Refine
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* Description Preview Modal */}
+        {showDescriptionPreview && descriptionPreview && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+            <div className="bg-card border border-border rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] overflow-hidden">
+              <div className="px-4 py-3 border-b border-border flex items-center justify-between">
+                <h3 className="text-lg font-semibold flex items-center gap-2">
+                  <Sparkles className={`w-5 h-5 ${getAccentColors("blue").text}`} />
+                  Generated Description
+                </h3>
+                <button
+                  onClick={rejectDescriptionPreview}
+                  className="p-1 hover:bg-muted rounded transition-colors"
                 >
                   <X className="w-5 h-5" />
                 </button>
               </div>
-            </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">Name *</label>
-                <input
-                  type="text"
-                  value={formName}
-                  onChange={(e) => setFormName(e.target.value)}
-                  placeholder="Login Flow Test"
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Target URL</label>
-                <div className="relative">
-                  <Globe className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-muted-foreground" />
-                  <input
-                    type="text"
-                    value={formTargetUrl}
-                    onChange={(e) => setFormTargetUrl(e.target.value)}
-                    placeholder="http://localhost:3000"
-                    className="w-full pl-10 pr-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {viewMode === "natural_language" ? (
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm font-medium">
-                    Description (Natural Language)
+              <div className="p-4 space-y-4 overflow-y-auto max-h-[60vh]">
+                {/* Current description */}
+                <div>
+                  <label className="block text-sm font-medium text-muted-foreground mb-2">
+                    Current Description
                   </label>
-                  <div className="flex items-center gap-2">
-                    <ScriptletSelector mode="dropdown" onSelect={insertScriptletAtCursor} />
-                    <button
-                      onClick={generateScript}
-                      disabled={isGenerating || !formDescription.trim()}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                    >
-                      {isGenerating ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Generating...
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles className="w-4 h-4" />
-                          Generate Script
-                        </>
-                      )}
-                    </button>
+                  <div className="p-3 bg-muted/30 border border-border rounded-lg text-sm">
+                    {formDescription || (
+                      <span className="text-muted-foreground italic">No description</span>
+                    )}
                   </div>
                 </div>
-                <div className="relative">
-                  <textarea
-                    ref={descriptionTextareaRef}
-                    value={formDescription}
-                    onChange={(e) => setFormDescription(e.target.value)}
-                    onKeyDown={scriptletMention.handleKeyDown}
-                    onInput={scriptletMention.handleInput}
-                    placeholder="Describe what this test should do in plain English... (Type @ to insert a scriptlet)&#10;&#10;Example: There is a Capture Screen button on the Image Extraction page. Click it and select Capture Screen in the dialog box."
-                    rows={6}
-                    className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                  />
-                  {/* @-mention popup for scriptlet insertion */}
-                  {scriptletMention.isActive && (
-                    <ScriptletSelector
-                      mode="popup"
-                      onSelect={scriptletMention.handleSelect}
-                      onClose={scriptletMention.handleClose}
-                      searchQuery={scriptletMention.searchQuery}
-                      position={scriptletMention.position}
-                    />
-                  )}
-                </div>
-                <p className="text-xs text-muted-foreground mt-1">
-                  Describe what you want to test, then click "Generate Script" to create the
-                  Playwright code.
-                </p>
 
-                {/* AI Instructions (optional) */}
-                <div className="mt-4">
-                  <label className="block text-sm font-medium mb-1 flex items-center gap-2">
-                    <Sparkles className="w-4 h-4 text-purple-500" />
-                    AI Instructions (Optional)
+                {/* Arrow */}
+                <div className="flex justify-center">
+                  <ChevronDown className="w-6 h-6 text-muted-foreground" />
+                </div>
+
+                {/* New description */}
+                <div>
+                  <label
+                    className={`block text-sm font-medium ${getAccentColors("blue").text} mb-2`}
+                  >
+                    New Description (from code)
                   </label>
-                  <textarea
-                    value={formAiInstructions}
-                    onChange={(e) => setFormAiInstructions(e.target.value)}
-                    placeholder="Additional instructions for the AI that modify how the description is interpreted...&#10;&#10;Example: The feature is currently broken. Stop after capturing the screen and take a screenshot. Expect failure but capture the state for debugging."
-                    rows={3}
-                    className="w-full px-3 py-2 bg-purple-500/5 border border-purple-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500/50 text-sm"
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Use this to give the AI additional context without changing the test
-                    description.
-                  </p>
+                  <div
+                    className={`p-3 ${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg text-sm`}
+                  >
+                    {descriptionPreview}
+                  </div>
                 </div>
-
-                {/* Workflow Automation (optional - collapsible) */}
-                <details className="mt-4 border border-blue-500/30 rounded-lg p-3 bg-blue-500/5">
-                  <summary className="cursor-pointer text-sm font-medium flex items-center gap-2 text-blue-600 dark:text-blue-400">
-                    <CheckSquare className="w-4 h-4" />
-                    Workflow Automation Settings (Optional)
-                  </summary>
-                  <div className="mt-3 space-y-3">
-                    <div className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        id="is-workflow-automation"
-                        checked={formIsWorkflowAutomation}
-                        onChange={(e) => setFormIsWorkflowAutomation(e.target.checked)}
-                        className="w-4 h-4 rounded border-blue-500/50 text-blue-600 focus:ring-blue-500"
-                      />
-                      <label htmlFor="is-workflow-automation" className="text-sm">
-                        This is workflow automation (script success is expected, verify objective
-                        instead)
-                      </label>
-                    </div>
-
-                    <div>
-                      <label className="block text-sm font-medium mb-1">Workflow Objective</label>
-                      <textarea
-                        value={formWorkflowObjective}
-                        onChange={(e) => setFormWorkflowObjective(e.target.value)}
-                        placeholder="What should this workflow achieve?&#10;&#10;Example: Create a new state called 'test-state' and verify it appears in the state list"
-                        rows={2}
-                        className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
-                      />
-                    </div>
-
-                    <div>
-                      <label className="block text-sm font-medium mb-1">
-                        Success Criteria (one per line)
-                      </label>
-                      <textarea
-                        value={formSuccessCriteria.join("\n")}
-                        onChange={(e) =>
-                          setFormSuccessCriteria(
-                            e.target.value
-                              .split("\n")
-                              .map((s) => s.trim())
-                              .filter(Boolean),
-                          )
-                        }
-                        placeholder="Specific things to verify after script passes:&#10;- 'test-state' appears in state list&#10;- State is visible on canvas&#10;- No error messages shown"
-                        rows={3}
-                        className="w-full px-3 py-2 bg-background border border-blue-500/30 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-sm"
-                      />
-                    </div>
-
-                    <p className="text-xs text-muted-foreground">
-                      When enabled, script execution success is expected. After the script passes,
-                      AI will verify whether the workflow objective was actually achieved.
-                    </p>
-                  </div>
-                </details>
               </div>
-            ) : (
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-sm font-medium">Script Content (.spec.ts) *</label>
-                  {formDescription.trim() && (
-                    <button
-                      onClick={generateScript}
-                      disabled={isGenerating}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-card border border-border rounded-lg hover:bg-muted disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                      title="Regenerate script from description"
-                    >
-                      {isGenerating ? (
-                        <>
-                          <Loader2 className="w-4 h-4 animate-spin" />
-                          Regenerating...
-                        </>
-                      ) : (
-                        <>
-                          <RefreshCw className="w-4 h-4" />
-                          Regenerate
-                        </>
-                      )}
-                    </button>
-                  )}
-                </div>
-                <textarea
-                  value={formScriptContent}
-                  onChange={(e) => setFormScriptContent(e.target.value)}
-                  rows={12}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50 font-mono text-sm"
-                  spellCheck={false}
-                />
 
-                {/* Coverage validation status */}
-                {isValidatingCoverage && (
-                  <div className="mt-2 flex items-center gap-2 text-sm text-muted-foreground">
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                    Validating script covers all requirements...
-                  </div>
-                )}
-
-                {/* Coverage warnings */}
-                {coverageWarnings.length > 0 && (
-                  <div className="mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-                    <div className="flex items-start gap-2">
-                      <Info className="w-4 h-4 text-amber-500 mt-0.5 flex-shrink-0" />
-                      <div className="flex-1">
-                        <div className="text-sm font-medium text-amber-500 mb-1">
-                          Missing Requirements Detected
-                        </div>
-                        <div className="text-sm text-amber-400/80 mb-2">
-                          The generated code may not implement all functionality from the
-                          description:
-                        </div>
-                        <ul className="text-sm text-amber-400/80 list-disc list-inside space-y-1">
-                          {coverageWarnings.map((warning, i) => (
-                            <li key={i}>{warning}</li>
-                          ))}
-                        </ul>
-                        <button
-                          onClick={() => {
-                            // Re-generate with emphasis on missing requirements
-                            const missingItems = coverageWarnings.join(", ");
-                            setFormAiInstructions(
-                              (prev) =>
-                                prev +
-                                (prev ? "\n\n" : "") +
-                                `IMPORTANT: Make sure to implement these missing requirements: ${missingItems}`,
-                            );
-                            setCoverageWarnings([]);
-                            generateScript();
-                          }}
-                          disabled={isGenerating}
-                          className="mt-2 px-3 py-1.5 text-sm bg-amber-500/20 hover:bg-amber-500/30 text-amber-400 rounded-lg transition-colors disabled:opacity-50"
-                        >
-                          <RefreshCw className="w-3 h-3 inline mr-1.5" />
-                          Regenerate with missing requirements
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">Category</label>
-                <input
-                  type="text"
-                  value={formCategory}
-                  onChange={(e) => setFormCategory(e.target.value)}
-                  placeholder="E2E, Smoke, Regression"
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                  list="category-suggestions"
-                />
-                <datalist id="category-suggestions">
-                  {categories.map((cat) => (
-                    <option key={cat} value={cat} />
-                  ))}
-                </datalist>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Tags (comma-separated)</label>
-                <input
-                  type="text"
-                  value={formTags}
-                  onChange={(e) => setFormTags(e.target.value)}
-                  placeholder="login, auth, smoke"
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-4">
-              <div>
-                <label className="block text-sm font-medium mb-1">Timeout (seconds)</label>
-                <input
-                  type="number"
-                  value={formTimeoutSeconds}
-                  onChange={(e) => setFormTimeoutSeconds(parseInt(e.target.value) || 60)}
-                  min={10}
-                  max={600}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Browser</label>
-                <select
-                  value={formBrowser}
-                  onChange={(e) => setFormBrowser(e.target.value as typeof formBrowser)}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                >
-                  <option value="chromium">Chromium</option>
-                  <option value="firefox">Firefox</option>
-                  <option value="webkit">WebKit</option>
-                </select>
-              </div>
-              <div>
-                <label className="block text-sm font-medium mb-1">Display Mode</label>
-                <select
-                  value={formDisplayMode}
-                  onChange={(e) => setFormDisplayMode(e.target.value as DisplayMode)}
-                  className="w-full px-3 py-2 bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-green-500/50"
-                >
-                  <option value="headless">Headless (No UI)</option>
-                  <option value="headed">Headed (New Window)</option>
-                  <option value="connect_existing">Open Browser (CDP)</option>
-                </select>
-                {formDisplayMode === "connect_existing" && (
-                  <div className="mt-1 space-y-1">
-                    <div className="flex items-center gap-1">
-                      <p className="text-xs text-amber-500">
-                        Requires Chrome started with: --remote-debugging-port=9222
-                      </p>
-                      <div className="relative group">
-                        <Info className="w-3.5 h-3.5 text-amber-500 cursor-help" />
-                        <div className="absolute right-0 bottom-full mb-2 hidden group-hover:block z-50 w-80">
-                          <div className="bg-popover border border-border rounded-lg shadow-lg p-3 text-xs">
-                            <p className="font-medium mb-2">How to start Chrome with debugging:</p>
-                            <ol className="list-decimal list-inside space-y-1 text-muted-foreground">
-                              <li>Close all Chrome windows first</li>
-                              <li>Click the button below to restart Chrome with debugging, or:</li>
-                              <li>
-                                Create a shortcut with target:{" "}
-                                <code className="bg-muted px-1 rounded">
-                                  chrome --remote-debugging-port=9222
-                                </code>
-                              </li>
-                            </ol>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={async () => {
-                        if (
-                          !confirm(
-                            "This will close all Chrome windows and relaunch with debugging enabled. Continue?",
-                          )
-                        ) {
-                          return;
-                        }
-                        try {
-                          onLog("info", "Closing Chrome and relaunching with debug port...");
-                          const response = await fetch(`${API_BASE}/launch-debug-chrome`, {
-                            method: "POST",
-                          });
-                          const result = await response.json();
-                          if (result.success) {
-                            onLog(
-                              "success",
-                              "Chrome launched with debugging enabled. Navigate to your test page, then run the test.",
-                            );
-                          } else {
-                            onLog("error", `Failed to launch Chrome: ${result.error}`);
-                          }
-                        } catch (error) {
-                          onLog("error", `Failed to launch Chrome: ${error}`);
-                        }
-                      }}
-                      className="text-xs px-2 py-1 bg-amber-500/20 text-amber-500 rounded hover:bg-amber-500/30 transition-colors"
-                    >
-                      Restart Chrome with Debug Port
-                    </button>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Visual Context Settings for Auto-Refine (applies when using Save & Auto-Refine) */}
-            <div className="flex flex-wrap items-center gap-4 text-sm text-muted-foreground py-3 border-t border-border">
-              <div className="flex items-center gap-2">
-                <ImageIcon className="w-4 h-4" />
-                <span>Auto-Refine Visual Context:</span>
-              </div>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={includeScreenshot}
-                  onChange={(e) => setIncludeScreenshot(e.target.checked)}
-                  className="rounded border-border"
-                />
-                <span>Screenshot</span>
-              </label>
-              <label className="flex items-center gap-1.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={includeTraceData}
-                  onChange={(e) => setIncludeTraceData(e.target.checked)}
-                  className="rounded border-border"
-                />
-                <span>Trace</span>
-              </label>
-              <label
-                className="flex items-center gap-1.5 cursor-pointer"
-                title="Video uses significantly more tokens. Only recommended for complex failures."
-              >
-                <input
-                  type="checkbox"
-                  checked={includeVideo}
-                  onChange={(e) => setIncludeVideo(e.target.checked)}
-                  className="rounded border-border"
-                />
-                <span>Video after</span>
-                <input
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={includeVideoAfterIterations}
-                  onChange={(e) =>
-                    setIncludeVideoAfterIterations(Math.max(1, parseInt(e.target.value) || 3))
-                  }
-                  disabled={!includeVideo}
-                  className={`w-12 px-1 py-0.5 text-center bg-background border border-border rounded ${!includeVideo ? "opacity-50" : ""}`}
-                />
-                <span className={!includeVideo ? "opacity-50" : ""}>iterations</span>
-                <span title="Video uses significantly more tokens. Enables after N failed iterations.">
-                  <Info className="w-3.5 h-3.5 text-muted-foreground" />
-                </span>
-              </label>
-              <div className="border-l border-border pl-4 ml-2">
-                <label className="flex items-center gap-1.5 cursor-pointer">
-                  <span>Max iterations:</span>
-                  <input
-                    type="number"
-                    min={1}
-                    max={50}
-                    value={autoRefineMaxIterations}
-                    onChange={(e) =>
-                      setAutoRefineMaxIterations(
-                        Math.max(1, Math.min(50, parseInt(e.target.value) || 10)),
-                      )
-                    }
-                    className="w-12 px-1 py-0.5 text-center bg-background border border-border rounded"
-                  />
-                </label>
-              </div>
-            </div>
-
-            <div className="flex justify-between items-center gap-2 pt-4 border-t border-border">
-              <button
-                onClick={() => {
-                  setIsCreating(false);
-                  resetForm();
-                }}
-                className="btn-secondary px-4 py-2"
-              >
-                Cancel
-              </button>
-              <div className="flex items-center gap-2">
+              <div className="px-4 py-3 border-t border-border flex justify-end gap-2">
                 <button
-                  onClick={() => createScript()}
-                  disabled={!formName || !formScriptContent}
-                  className="btn-secondary px-4 py-2 flex items-center gap-2"
+                  onClick={rejectDescriptionPreview}
+                  className="px-4 py-2 text-sm bg-muted hover:bg-muted/80 rounded-lg transition-colors"
                 >
-                  <Save className="w-4 h-4" />
-                  Save Only
+                  Keep Original
                 </button>
                 <button
-                  onClick={() => createScript({ runTest: true })}
-                  disabled={!formName || !formScriptContent}
-                  className="btn-primary px-4 py-2 flex items-center gap-2"
-                  title="Save and run the test once"
+                  onClick={acceptDescriptionPreview}
+                  className={`px-4 py-2 text-sm ${getAccentColors("blue").bgSolid} text-white hover:opacity-90 rounded-lg transition-colors flex items-center gap-2`}
                 >
-                  <Play className="w-4 h-4" />
-                  Save & Run
-                </button>
-                <button
-                  onClick={() => createScript({ autoRefine: true })}
-                  disabled={!formName || !formScriptContent}
-                  className="flex items-center gap-2 px-4 py-2 text-sm bg-gradient-to-r from-purple-500 to-pink-500 text-white rounded-lg hover:from-purple-600 hover:to-pink-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
-                  title="Save, run test, and refine with AI until it passes"
-                >
-                  <Sparkles className="w-4 h-4" />
-                  Save & Auto-Refine
+                  <CheckCircle className="w-4 h-4" />
+                  Use New Description
                 </button>
               </div>
             </div>
           </div>
         )}
       </div>
-      {/* End scrollable content */}
-
-      {/* Description Preview Modal */}
-      {showDescriptionPreview && descriptionPreview && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-card border border-border rounded-lg shadow-xl max-w-2xl w-full max-h-[80vh] overflow-hidden">
-            <div className="px-4 py-3 border-b border-border flex items-center justify-between">
-              <h3 className="text-lg font-semibold flex items-center gap-2">
-                <Sparkles className="w-5 h-5 text-blue-500" />
-                Generated Description
-              </h3>
-              <button
-                onClick={rejectDescriptionPreview}
-                className="p-1 hover:bg-muted rounded transition-colors"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="p-4 space-y-4 overflow-y-auto max-h-[60vh]">
-              {/* Current description */}
-              <div>
-                <label className="block text-sm font-medium text-muted-foreground mb-2">
-                  Current Description
-                </label>
-                <div className="p-3 bg-muted/30 border border-border rounded-lg text-sm">
-                  {formDescription || (
-                    <span className="text-muted-foreground italic">No description</span>
-                  )}
-                </div>
-              </div>
-
-              {/* Arrow */}
-              <div className="flex justify-center">
-                <ChevronDown className="w-6 h-6 text-muted-foreground" />
-              </div>
-
-              {/* New description */}
-              <div>
-                <label className="block text-sm font-medium text-blue-500 mb-2">
-                  New Description (from code)
-                </label>
-                <div className="p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg text-sm">
-                  {descriptionPreview}
-                </div>
-              </div>
-            </div>
-
-            <div className="px-4 py-3 border-t border-border flex justify-end gap-2">
-              <button
-                onClick={rejectDescriptionPreview}
-                className="px-4 py-2 text-sm bg-muted hover:bg-muted/80 rounded-lg transition-colors"
-              >
-                Keep Original
-              </button>
-              <button
-                onClick={acceptDescriptionPreview}
-                className="px-4 py-2 text-sm bg-blue-500 text-white hover:bg-blue-600 rounded-lg transition-colors flex items-center gap-2"
-              >
-                <CheckCircle className="w-4 h-4" />
-                Use New Description
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

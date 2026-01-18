@@ -1,0 +1,664 @@
+/**
+ * Background Service Worker for Qontinui DOM Capture Extension
+ *
+ * Handles communication between popup and content scripts,
+ * and sends captured DOM to the qontinui-runner API.
+ * Also provides API request recording functionality.
+ */
+
+const RUNNER_API = "http://localhost:9876";
+
+// =============================================================================
+// Request Recording State (persisted via chrome.storage.session)
+// =============================================================================
+
+let isRecording = false;
+let capturedRequests = [];
+let requestIdToData = new Map(); // Track request data by ID
+let interceptedBodies = new Map(); // Bodies captured by content script (keyed by URL+method+timestamp)
+
+// Restore state from storage on startup
+chrome.storage.session.get(["isRecording", "capturedRequests"], (result) => {
+  if (result.isRecording !== undefined) {
+    isRecording = result.isRecording;
+    console.log("[Qontinui] Restored recording state:", isRecording);
+  }
+  if (result.capturedRequests) {
+    capturedRequests = result.capturedRequests;
+    console.log("[Qontinui] Restored", capturedRequests.length, "captured requests");
+  }
+});
+
+/**
+ * Persist recording state to storage
+ */
+function persistState() {
+  chrome.storage.session.set({
+    isRecording: isRecording,
+    capturedRequests: capturedRequests,
+  });
+}
+
+// Patterns to filter out (noise)
+const FILTER_PATTERNS = [
+  /\/api\/dev-debug\//,           // Dev debug endpoints
+  /\/monitors$/,                   // Monitor polling
+  /\/status$/,                     // Status polling
+  /\/health$/,                     // Health checks
+  /\/auth\/jwt\/refresh/,          // Token refresh
+  /\/auth\/refresh/,               // Token refresh
+  /\/_next\//,                     // Next.js internals
+  /\/favicon\.ico/,                // Favicons
+  /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot)(\?|$)/i, // Static assets
+  /^chrome-extension:\/\//,        // Extension requests
+  /sockjs-node/,                   // Hot reload
+  /webpack/,                       // Webpack dev server
+];
+
+// Domains to completely ignore (streaming, analytics, ads, etc.)
+const IGNORED_DOMAINS = [
+  /googlevideo\.com$/,             // YouTube video streaming
+  /youtube\.com$/,                 // YouTube API
+  /accounts\.google\.com$/,        // Google auth
+  /accounts\.youtube\.com$/,       // YouTube auth
+  /google-analytics\.com$/,        // Analytics
+  /googletagmanager\.com$/,        // Tag manager
+  /doubleclick\.net$/,             // Ads
+  /facebook\.com$/,                // Facebook
+  /fbcdn\.net$/,                   // Facebook CDN
+  /twitter\.com$/,                 // Twitter
+  /analytics/,                     // Generic analytics
+  /telemetry/,                     // Telemetry
+  /sentry\.io$/,                   // Error tracking
+  /hotjar\.com$/,                  // Heatmaps
+  /intercom\.io$/,                 // Chat widgets
+  /clarity\.ms$/,                  // Microsoft Clarity
+];
+
+// Methods to prioritize (show first)
+const PRIORITY_METHODS = ["POST", "PUT", "PATCH", "DELETE"];
+
+/**
+ * Check if a URL should be filtered out
+ */
+function shouldFilterUrl(url) {
+  // Check URL patterns
+  if (FILTER_PATTERNS.some(pattern => pattern.test(url))) {
+    return true;
+  }
+
+  // Check domain
+  try {
+    const urlObj = new URL(url);
+    if (IGNORED_DOMAINS.some(pattern => pattern.test(urlObj.hostname))) {
+      return true;
+    }
+  } catch {
+    // Invalid URL, don't filter
+  }
+
+  return false;
+}
+
+/**
+ * Start recording requests
+ */
+function startRecording() {
+  isRecording = true;
+  capturedRequests = [];
+  requestIdToData.clear();
+  interceptedBodies.clear();
+  persistState();
+  console.log("[Qontinui] Started recording API requests");
+}
+
+/**
+ * Generate a key for matching intercepted bodies to webRequest data
+ */
+function getBodyMatchKey(method, url) {
+  try {
+    const urlObj = new URL(url);
+    // Normalize URL (remove trailing slash, lowercase host)
+    return `${method}:${urlObj.host.toLowerCase()}${urlObj.pathname}${urlObj.search}`;
+  } catch {
+    return `${method}:${url}`;
+  }
+}
+
+/**
+ * Find a matching intercepted body for a request
+ * Returns the body if found within a time window (5 seconds)
+ */
+function findInterceptedBody(method, url, timestamp) {
+  const key = getBodyMatchKey(method, url);
+
+  // Look for matches within 5 seconds of the webRequest timestamp
+  const timeWindow = 5000;
+  let bestMatch = null;
+  let bestTimeDiff = Infinity;
+
+  for (const [entryKey, entry] of interceptedBodies.entries()) {
+    if (entryKey.startsWith(key)) {
+      const timeDiff = Math.abs(entry.timestamp - timestamp);
+      if (timeDiff < timeWindow && timeDiff < bestTimeDiff) {
+        bestMatch = entry;
+        bestTimeDiff = timeDiff;
+      }
+    }
+  }
+
+  if (bestMatch) {
+    console.log("[Qontinui] Found intercepted body for", method, url, "from", bestMatch.source);
+    return bestMatch.body;
+  }
+  return null;
+}
+
+/**
+ * Stop recording requests
+ */
+function stopRecording() {
+  isRecording = false;
+  persistState();
+  console.log("[Qontinui] Stopped recording. Captured:", capturedRequests.length, "requests");
+}
+
+/**
+ * Get a deduplication key for a request (method + host + path, ignoring query params)
+ */
+function getDedupeKey(req) {
+  try {
+    const url = new URL(req.url);
+    return `${req.method}:${url.host}${url.pathname}`;
+  } catch {
+    return `${req.method}:${req.url}`;
+  }
+}
+
+/**
+ * Get captured requests (filtered, deduplicated, and sorted)
+ */
+function getCapturedRequests() {
+  // Deduplicate: group by method + host + path (ignoring query params), keep the most recent one
+  const seen = new Map();
+  for (const req of capturedRequests) {
+    const key = getDedupeKey(req);
+    const existing = seen.get(key);
+    if (!existing || req.timestamp > existing.timestamp) {
+      // For repeated requests, track the count
+      const newReq = { ...req };
+      if (existing) {
+        newReq.repeatCount = (existing.repeatCount || 1) + 1;
+      }
+      seen.set(key, newReq);
+    } else if (existing) {
+      existing.repeatCount = (existing.repeatCount || 1) + 1;
+    }
+  }
+
+  const deduplicated = Array.from(seen.values());
+
+  // Sort: priority methods first, then by timestamp (newest first)
+  return deduplicated.sort((a, b) => {
+    const aPriority = PRIORITY_METHODS.includes(a.method) ? 0 : 1;
+    const bPriority = PRIORITY_METHODS.includes(b.method) ? 0 : 1;
+    if (aPriority !== bPriority) return aPriority - bPriority;
+    return b.timestamp - a.timestamp;
+  });
+}
+
+/**
+ * Convert captured request to cURL command
+ */
+function requestToCurl(request) {
+  let curl = `curl '${request.url}'`;
+
+  if (request.method !== "GET") {
+    curl += ` \\\n  -X ${request.method}`;
+  }
+
+  if (request.headers) {
+    for (const [name, value] of Object.entries(request.headers)) {
+      // Skip some headers that curl handles automatically
+      if (["content-length", "host", "connection"].includes(name.toLowerCase())) continue;
+      curl += ` \\\n  -H '${name}: ${value}'`;
+    }
+  }
+
+  if (request.body) {
+    // Escape single quotes in body
+    const escapedBody = request.body.replace(/'/g, "'\\''");
+    curl += ` \\\n  --data-raw '${escapedBody}'`;
+  }
+
+  return curl;
+}
+
+// =============================================================================
+// WebRequest Listeners
+// =============================================================================
+
+// Capture request details when request starts
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (!isRecording) return;
+    if (details.method === "OPTIONS") return; // Skip CORS preflight
+    if (shouldFilterUrl(details.url)) return;
+
+    const timestamp = Date.now();
+
+    // Extract request body if available from webRequest API
+    let body = null;
+    let bodySource = null;
+
+    if (details.requestBody) {
+      if (details.requestBody.raw && details.requestBody.raw.length > 0) {
+        // Raw bytes - try to decode as text
+        try {
+          const decoder = new TextDecoder("utf-8");
+          const bytes = details.requestBody.raw.map(r => r.bytes).filter(Boolean);
+          if (bytes.length > 0) {
+            body = bytes.map(b => decoder.decode(b)).join("");
+            bodySource = "webRequest.raw";
+          }
+        } catch (e) {
+          console.log("[Qontinui] Failed to decode raw body:", e.message);
+        }
+      } else if (details.requestBody.formData) {
+        // Form data
+        body = JSON.stringify(details.requestBody.formData);
+        bodySource = "webRequest.formData";
+      }
+    }
+
+    // Fallback: Try to find body captured by content script interceptor
+    if (!body || body === "[Binary data]") {
+      const interceptedBody = findInterceptedBody(details.method, details.url, timestamp);
+      if (interceptedBody) {
+        body = interceptedBody;
+        bodySource = "interceptor";
+      }
+    }
+
+
+    // Store initial request data
+    requestIdToData.set(details.requestId, {
+      id: details.requestId,
+      method: details.method,
+      url: details.url,
+      body: body,
+      bodySource: bodySource,
+      timestamp: timestamp,
+      headers: {}, // Will be filled by onSendHeaders
+    });
+  },
+  { urls: ["<all_urls>"] },
+  ["requestBody"]
+);
+
+// Capture request headers
+// Note: "extraHeaders" is required in MV3 to capture sensitive headers like Cookie, Authorization, etc.
+chrome.webRequest.onSendHeaders.addListener(
+  (details) => {
+    if (!isRecording) return;
+
+    const requestData = requestIdToData.get(details.requestId);
+    if (!requestData) return;
+
+    // Convert headers array to object
+    const headers = {};
+    if (details.requestHeaders) {
+      for (const header of details.requestHeaders) {
+        headers[header.name] = header.value;
+      }
+    }
+    requestData.headers = headers;
+  },
+  { urls: ["<all_urls>"] },
+  ["requestHeaders", "extraHeaders"]
+);
+
+// Finalize request when it completes
+chrome.webRequest.onCompleted.addListener(
+  (details) => {
+    if (!isRecording) return;
+
+    const requestData = requestIdToData.get(details.requestId);
+    if (!requestData) return;
+
+    // Second chance: Try to find intercepted body if we didn't get one earlier
+    // This handles the timing case where the interceptor message arrives after onBeforeRequest
+    if (!requestData.body) {
+      const interceptedBody = findInterceptedBody(requestData.method, requestData.url, requestData.timestamp);
+      if (interceptedBody) {
+        requestData.body = interceptedBody;
+        requestData.bodySource = "interceptor-delayed";
+        console.log("[Qontinui] Found intercepted body (delayed) for", requestData.method, requestData.url);
+      }
+    }
+
+    // Add response info
+    requestData.statusCode = details.statusCode;
+    requestData.completed = true;
+
+    // Add to captured requests
+    capturedRequests.push(requestData);
+
+    // Clean up
+    requestIdToData.delete(details.requestId);
+
+    // Persist state so requests aren't lost if service worker terminates
+    persistState();
+
+    console.log("[Qontinui] Captured:", details.method, details.url, details.statusCode, requestData.body ? "(with body)" : "(no body)");
+  },
+  { urls: ["<all_urls>"] }
+);
+
+// Handle request errors
+chrome.webRequest.onErrorOccurred.addListener(
+  (details) => {
+    if (!isRecording) return;
+    requestIdToData.delete(details.requestId);
+  },
+  { urls: ["<all_urls>"] }
+);
+
+/**
+ * Check if the runner is available
+ */
+async function checkRunnerStatus() {
+  try {
+    const response = await fetch(`${RUNNER_API}/health`, {
+      method: "GET",
+      headers: { "Content-Type": "application/json" },
+    });
+    return response.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Import cURL command to the runner (parse only, returns parsed data)
+ */
+async function importCurlToRunner(curlCommand) {
+  const response = await fetch(`${RUNNER_API}/api-request/import-curl`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      curl_command: curlCommand,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to import cURL: ${response.status} ${errorText}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Import cURL command and save to the API Request Library
+ */
+async function importCurlToLibrary(curlCommand, name = null) {
+  const body = {
+    curl_command: curlCommand,
+  };
+  if (name) {
+    body.name = name;
+  }
+  // Mark as imported from browser extension
+  body.category = "imported";
+
+  const response = await fetch(`${RUNNER_API}/api-request/import-to-library`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to save to library: ${response.status} ${errorText}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Send captured DOM to the runner
+ */
+async function sendDomToRunner(data) {
+  const response = await fetch(`${RUNNER_API}/dom/receive`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url: data.url,
+      pageTitle: data.pageTitle,
+      html: data.html,
+      selector: data.selector || null,
+      taskRunId: data.taskRunId || null,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to send DOM: ${response.status} ${errorText}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Capture DOM from the active tab
+ */
+async function captureCurrentTab(selector = null) {
+  // Get the active tab
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab || !tab.id) {
+    throw new Error("No active tab found");
+  }
+
+  // Inject and execute content script to capture DOM
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: (sel) => {
+      if (sel) {
+        const el = document.querySelector(sel);
+        if (!el) {
+          return { error: `Element not found: ${sel}` };
+        }
+        return {
+          html: el.outerHTML,
+          url: window.location.href,
+          pageTitle: document.title,
+          selector: sel,
+        };
+      }
+      return {
+        html: document.documentElement.outerHTML,
+        url: window.location.href,
+        pageTitle: document.title,
+        selector: null,
+      };
+    },
+    args: [selector],
+  });
+
+  if (!results || !results[0]) {
+    throw new Error("Failed to execute content script");
+  }
+
+  const result = results[0].result;
+  if (result.error) {
+    throw new Error(result.error);
+  }
+
+  return result;
+}
+
+// Handle messages from popup and content scripts
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // Handle intercepted request body from content script
+  if (message.action === "interceptedRequestBody") {
+    if (!isRecording || !message.data || shouldFilterUrl(message.data.url)) {
+      // Still need to respond to prevent "message port closed" error
+      return false;
+    }
+
+    const data = message.data;
+    const key = getBodyMatchKey(data.method, data.url) + ":" + data.timestamp;
+
+    // Store the intercepted body for later matching
+    interceptedBodies.set(key, {
+      body: data.body,
+      headers: data.headers,
+      timestamp: data.timestamp,
+      source: data.source // 'fetch' or 'xhr'
+    });
+
+    // Clean up old entries (older than 30 seconds)
+    const cutoff = Date.now() - 30000;
+    for (const [k, v] of interceptedBodies.entries()) {
+      if (v.timestamp < cutoff) {
+        interceptedBodies.delete(k);
+      }
+    }
+
+    console.log("[Qontinui] Stored intercepted body from", data.source, "for", data.method, data.url);
+    return false; // No async response needed
+  }
+
+  if (message.action === "checkStatus") {
+    checkRunnerStatus().then((available) => {
+      sendResponse({ available });
+    });
+    return true; // Keep channel open for async response
+  }
+
+  if (message.action === "capture") {
+    (async () => {
+      try {
+        // Capture DOM
+        const domData = await captureCurrentTab(message.selector);
+
+        // Send to runner
+        const result = await sendDomToRunner(domData);
+
+        sendResponse({
+          success: true,
+          capture: result.data,
+          size: domData.html.length,
+        });
+      } catch (error) {
+        sendResponse({
+          success: false,
+          error: error.message,
+        });
+      }
+    })();
+    return true; // Keep channel open for async response
+  }
+
+  if (message.action === "importCurl") {
+    (async () => {
+      try {
+        const result = await importCurlToRunner(message.curlCommand);
+
+        sendResponse({
+          success: true,
+          method: result.method,
+          url: result.url,
+        });
+      } catch (error) {
+        sendResponse({
+          success: false,
+          error: error.message,
+        });
+      }
+    })();
+    return true; // Keep channel open for async response
+  }
+
+  // Recording controls
+  if (message.action === "startRecording") {
+    startRecording();
+    sendResponse({ success: true, isRecording: true });
+    return true;
+  }
+
+  if (message.action === "stopRecording") {
+    stopRecording();
+    sendResponse({ success: true, isRecording: false });
+    return true;
+  }
+
+  if (message.action === "getRecordingStatus") {
+    sendResponse({
+      isRecording: isRecording,
+      requestCount: capturedRequests.length,
+    });
+    return true;
+  }
+
+  if (message.action === "getCapturedRequests") {
+    sendResponse({
+      success: true,
+      requests: getCapturedRequests(),
+    });
+    return true;
+  }
+
+  if (message.action === "getRequestAsCurl") {
+    const request = capturedRequests.find(r => r.id === message.requestId);
+    if (request) {
+      sendResponse({
+        success: true,
+        curl: requestToCurl(request),
+      });
+    } else {
+      sendResponse({
+        success: false,
+        error: "Request not found",
+      });
+    }
+    return true;
+  }
+
+  if (message.action === "sendRequestToRunner") {
+    (async () => {
+      try {
+        const request = capturedRequests.find(r => r.id === message.requestId);
+        if (!request) {
+          throw new Error("Request not found");
+        }
+
+        const curl = requestToCurl(request);
+        // Save to the API Request Library
+        const result = await importCurlToLibrary(curl);
+
+        sendResponse({
+          success: true,
+          method: result.data?.method || request.method,
+          url: result.data?.url || request.url,
+          name: result.data?.name,
+          message: "Saved to API Request Library",
+        });
+      } catch (error) {
+        sendResponse({
+          success: false,
+          error: error.message,
+        });
+      }
+    })();
+    return true;
+  }
+
+  if (message.action === "clearCapturedRequests") {
+    capturedRequests = [];
+    persistState();
+    sendResponse({ success: true });
+    return true;
+  }
+});

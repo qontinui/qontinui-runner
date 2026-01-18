@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { HardDrive, FolderOpen, Trash2, Trash, Loader2 } from "lucide-react";
 import { SectionHeader } from "./SectionHeader";
+import { getAccentColors } from "@/design-system";
 import type { StorageUsage, StoragePaths, LogFunction } from "./types";
 
 interface TauriResult<T> {
@@ -238,21 +239,21 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => handleDeleteOldSessions("screenshots", 30)}
-                className="px-2.5 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 rounded-md transition-colors flex items-center gap-1.5 text-xs"
+                className={`px-2.5 py-1.5 ${getAccentColors("amber").bg} hover:bg-amber-500/20 ${getAccentColors("amber").text} rounded-md transition-colors flex items-center gap-1.5 text-xs`}
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 Delete Screenshots (30+ days)
               </button>
               <button
                 onClick={() => handleDeleteOldSessions("videos", 30)}
-                className="px-2.5 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-500 rounded-md transition-colors flex items-center gap-1.5 text-xs"
+                className={`px-2.5 py-1.5 ${getAccentColors("amber").bg} hover:bg-amber-500/20 ${getAccentColors("amber").text} rounded-md transition-colors flex items-center gap-1.5 text-xs`}
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 Delete Videos (30+ days)
               </button>
               <button
                 onClick={handleClearAllStorage}
-                className="px-2.5 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-md transition-colors flex items-center gap-1.5 text-xs"
+                className={`px-2.5 py-1.5 ${getAccentColors("red").bg} hover:bg-red-500/20 ${getAccentColors("red").text} rounded-md transition-colors flex items-center gap-1.5 text-xs`}
               >
                 <Trash className="w-3.5 h-3.5" />
                 Clear All Storage

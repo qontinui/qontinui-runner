@@ -8,6 +8,7 @@ import { useState, useEffect } from "react";
 import { Settings, Save, Clock, AlertTriangle, Tag, FileText, Power, Sparkles } from "lucide-react";
 import { useTestBuilder } from "./TestBuilderContext";
 import type { TestCategory, CreateTestInput } from "./types";
+import { getStatusColors } from "@/design-system";
 
 // Category options
 const categoryOptions: { value: TestCategory; label: string }[] = [
@@ -28,7 +29,8 @@ interface TestPropertiesPanelProps {
 }
 
 export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) {
-  const { selectedTest, state, updateTest, setDirty } = useTestBuilder();
+  const { selectedTest, state, updateTest, setDirty, isDraftSelected, saveDraft, updateDraft } =
+    useTestBuilder();
 
   // Local form state
   const [name, setName] = useState("");
@@ -125,7 +127,14 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
         break;
     }
 
-    await updateTest(selectedTest.id, input);
+    // If this is a draft, save it as a new test; otherwise update existing
+    if (isDraftSelected) {
+      // Update draft with final values before saving
+      updateDraft(input, code);
+      await saveDraft();
+    } else {
+      await updateTest(selectedTest.id, input);
+    }
     onSave();
   };
 
@@ -146,6 +155,11 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
         <h3 className="text-sm font-semibold flex items-center gap-2">
           <Settings className="w-4 h-4" />
           Properties
+          {isDraftSelected && (
+            <span className="px-1.5 py-0.5 text-xs bg-amber-500/20 text-amber-400 rounded">
+              Draft
+            </span>
+          )}
         </h3>
         <button
           className={`
@@ -161,7 +175,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
           disabled={!state.isDirty || state.isSaving}
         >
           <Save className="w-3.5 h-3.5" />
-          {state.isSaving ? "Saving..." : "Save"}
+          {state.isSaving ? "Saving..." : isDraftSelected ? "Create" : "Save"}
         </button>
       </div>
 
@@ -239,7 +253,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
         <div className="space-y-3">
           <label className="flex items-center justify-between cursor-pointer">
             <span className="text-sm flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-yellow-500" />
+              <AlertTriangle className={`w-4 h-4 ${getStatusColors("warning").icon}`} />
               Critical Test
             </span>
             <input

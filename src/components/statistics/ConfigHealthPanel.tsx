@@ -9,6 +9,7 @@
  */
 
 import { CheckCircle2, XCircle, Clock, Activity } from "lucide-react";
+import { getStatusColors } from "@/design-system";
 import type { ConfigStatistics } from "../../types/statistics";
 
 interface ConfigHealthPanelProps {
@@ -19,15 +20,15 @@ export function ConfigHealthPanel({ stats }: ConfigHealthPanelProps) {
   const successRate = stats.total_runs > 0 ? (stats.successful_runs / stats.total_runs) * 100 : 0;
 
   const getHealthColor = (rate: number) => {
-    if (rate >= 90) return "text-green-500";
-    if (rate >= 70) return "text-yellow-500";
-    return "text-red-500";
+    if (rate >= 90) return getStatusColors("success").text;
+    if (rate >= 70) return getStatusColors("warning").text;
+    return getStatusColors("error").text;
   };
 
   const getHealthBg = (rate: number) => {
-    if (rate >= 90) return "bg-green-500/10";
-    if (rate >= 70) return "bg-yellow-500/10";
-    return "bg-red-500/10";
+    if (rate >= 90) return getStatusColors("success").bg;
+    if (rate >= 70) return getStatusColors("warning").bg;
+    return getStatusColors("error").bg;
   };
 
   const formatDuration = (ms: number | undefined) => {

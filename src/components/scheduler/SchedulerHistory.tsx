@@ -7,6 +7,7 @@
 import { Clock, CheckCircle, XCircle, SkipForward, Loader2 } from "lucide-react";
 import type { ScheduledTask, TaskExecutionRecord } from "../../types/scheduler";
 import { getStatusColor } from "../../types/scheduler";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 interface SchedulerHistoryProps {
   tasks: ScheduledTask[];
@@ -24,13 +25,13 @@ export function SchedulerHistory({
   const getStatusIcon = (record: TaskExecutionRecord) => {
     switch (record.status) {
       case "running":
-        return <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />;
+        return <Loader2 className={`w-4 h-4 ${getStatusColors("running").icon} animate-spin`} />;
       case "completed":
-        return <CheckCircle className="w-4 h-4 text-green-500" />;
+        return <CheckCircle className={`w-4 h-4 ${getStatusColors("success").icon}`} />;
       case "failed":
-        return <XCircle className="w-4 h-4 text-red-500" />;
+        return <XCircle className={`w-4 h-4 ${getStatusColors("error").icon}`} />;
       case "skipped":
-        return <SkipForward className="w-4 h-4 text-yellow-500" />;
+        return <SkipForward className={`w-4 h-4 ${getStatusColors("warning").icon}`} />;
       default:
         return <Clock className="w-4 h-4 text-muted-foreground" />;
     }
@@ -101,12 +102,16 @@ export function SchedulerHistory({
                         {record.status.charAt(0).toUpperCase() + record.status.slice(1)}
                       </span>
                       {record.success && (
-                        <span className="px-2 py-0.5 text-xs bg-green-500/10 text-green-500 rounded">
+                        <span
+                          className={`px-2 py-0.5 text-xs ${getAccentColors("green").bg} ${getAccentColors("green").text} rounded`}
+                        >
                           Success
                         </span>
                       )}
                       {record.triggered_auto_fix && (
-                        <span className="px-2 py-0.5 text-xs bg-orange-500/10 text-orange-500 rounded">
+                        <span
+                          className={`px-2 py-0.5 text-xs ${getAccentColors("orange").bg} ${getAccentColors("orange").text} rounded`}
+                        >
                           Auto-fix triggered
                         </span>
                       )}

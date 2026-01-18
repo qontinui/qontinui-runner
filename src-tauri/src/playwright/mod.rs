@@ -44,8 +44,8 @@ pub use script_storage::{
     save_script_library, search_scripts, update_script, PlaywrightLibrary, PlaywrightScript,
 };
 
-// Re-export execution function from executor module
-pub use executor::run_script;
+// Re-export execution functions from executor module
+pub use executor::{run_script, run_script_inline};
 
 #[cfg(test)]
 mod tests {

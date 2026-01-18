@@ -74,7 +74,13 @@ export interface ExecutionStep {
     | "action"
     | "screenshot"
     | "gui_workflow"
-    | "test";
+    | "test"
+    // AWAS step types
+    | "awas_discover"
+    | "awas_execute"
+    | "awas_check_support"
+    | "awas_list_actions"
+    | "awas_extract_elements";
   name: string;
   takeScreenshot: boolean;
   screenshotDelay?: number;
@@ -93,6 +99,35 @@ export interface ExecutionStep {
   testId?: string;
   testType?: "playwright_cdp" | "qontinui_vision" | "python_script" | "repository_test";
   testIsCritical?: boolean;
+  /**
+   * Whether this step is a setup step (brings app to target state) vs verification step.
+   * Setup steps typically run on the first iteration only.
+   * Default: true for GUI automation steps (workflow, state, action, gui_workflow)
+   * Default: false for verification steps (playwright, test, screenshot)
+   */
+  isSetup?: boolean;
+  /**
+   * Whether to run this step on subsequent iterations (after the first).
+   * For GUI automation: default false (setup usually only needed on first iteration)
+   * For Playwright: always true (Playwright closes environment, so setup is always needed)
+   * Note: Playwright verification scripts are combined with setup scripts for efficiency.
+   */
+  runOnSubsequentIterations?: boolean;
+
+  // ========================================================================
+  // AWAS Step Fields
+  // ========================================================================
+
+  /** AWAS: URL for AWAS operations (discover, execute, check_support) */
+  awasUrl?: string;
+  /** AWAS: Action ID to execute (for awas_execute steps) */
+  awasActionId?: string;
+  /** AWAS: Parameters for action execution (for awas_execute steps) */
+  awasParams?: Record<string, unknown>;
+  /** AWAS: HTML content for element extraction (for awas_extract_elements steps) */
+  awasHtml?: string;
+  /** AWAS: Base URL for resolving relative URLs (for awas_extract_elements steps) */
+  awasBaseUrl?: string;
 }
 
 /** Saved AI Workflow from the AI Workflows library */
@@ -241,6 +276,8 @@ export interface AiBuilderContextValue {
   toggleStepScreenshot: (stepId: string) => void;
   updateScreenshotDelay: (stepId: string, delay: number) => void;
   updateScreenshotMonitor: (stepId: string, monitor: number | "all") => void;
+  toggleStepIsSetup: (stepId: string) => void;
+  toggleStepRunOnSubsequent: (stepId: string) => void;
   moveStepUp: (index: number) => void;
   moveStepDown: (index: number) => void;
 

@@ -6,10 +6,16 @@
  */
 
 import { ZoomIn, ZoomOut, Maximize2, Monitor } from "lucide-react";
+import { cn } from "../../lib/utils";
 import { Button, Badge } from "../ui";
 import type { ScreenshotViewProps } from "./types";
+import { getStatusColors, getAccentColors } from "@/design-system";
 
 export function ScreenshotView({ status }: ScreenshotViewProps) {
+  const greenColors = getAccentColors("green");
+  const blueColors = getAccentColors("blue");
+  const pausedColors = getStatusColors("paused");
+
   return (
     <div className="relative h-[60%] border-b border-border bg-card">
       {/* Screenshot placeholder with grid pattern */}
@@ -23,8 +29,14 @@ export function ScreenshotView({ status }: ScreenshotViewProps) {
           }}
         >
           {/* Simulated bounding box */}
-          <div className="absolute left-[40%] top-[45%] h-12 w-32 border-2 border-green-500/50 bg-green-500/10">
-            <div className="absolute -top-6 left-0 text-xs text-green-400 font-mono">
+          <div
+            className={cn(
+              "absolute left-[40%] top-[45%] h-12 w-32 border-2",
+              greenColors.border,
+              greenColors.bg,
+            )}
+          >
+            <div className={cn("absolute -top-6 left-0 text-xs font-mono", greenColors.text)}>
               save-button (92.3%)
             </div>
           </div>
@@ -32,8 +44,18 @@ export function ScreenshotView({ status }: ScreenshotViewProps) {
           {/* Simulated crosshair */}
           <div className="absolute left-[46%] top-[50%]">
             <div className="relative h-4 w-4">
-              <div className="absolute left-1/2 top-0 h-full w-0.5 -translate-x-1/2 bg-blue-400" />
-              <div className="absolute left-0 top-1/2 h-0.5 w-full -translate-y-1/2 bg-blue-400" />
+              <div
+                className={cn(
+                  "absolute left-1/2 top-0 h-full w-0.5 -translate-x-1/2",
+                  blueColors.bgSolid,
+                )}
+              />
+              <div
+                className={cn(
+                  "absolute left-0 top-1/2 h-0.5 w-full -translate-y-1/2",
+                  blueColors.bgSolid,
+                )}
+              />
             </div>
           </div>
         </div>
@@ -42,7 +64,7 @@ export function ScreenshotView({ status }: ScreenshotViewProps) {
       {/* Paused overlay */}
       {status === "paused" && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="text-4xl font-bold text-amber-400">PAUSED</div>
+          <div className={cn("text-4xl font-bold", pausedColors.text)}>PAUSED</div>
         </div>
       )}
 

@@ -67,8 +67,8 @@ export type {
   FindingsSummary,
 } from "./useUnifiedReport";
 
-export { useVerificationAgent } from "./useVerificationAgent";
-export type { UseVerificationAgentReturn } from "./useVerificationAgent";
+export { useStateExplorer } from "./useStateExplorer";
+export type { UseStateExplorerReturn } from "./useStateExplorer";
 
 export {
   statisticsKeys,
@@ -90,3 +90,41 @@ export {
   useClearDiscovery,
   useClearFailedDiscoveries,
 } from "./useDiscoveries";
+
+export { useExecutionStatus } from "./useExecutionStatus";
+export type { UseExecutionStatusReturn } from "./useExecutionStatus";
+
+export { useTutorialKeyboard } from "./useTutorialKeyboard";
+
+export { useTutorialEvents, useTutorialAware } from "./useTutorialEvents";
+export type {} from "./useTutorialEvents";
+
+export {
+  useDOMObserver,
+  useDOMObserverMultiple,
+  useElementExists,
+  useElementVisible,
+} from "./useDOMObserver";
+
+export {
+  useRealtimeUpdates,
+  useLearningUpdates,
+  useCheckpointUpdates,
+  useTaskStatusUpdates,
+} from "./useRealtimeUpdates";
+export type {
+  UseRealtimeUpdatesOptions,
+  UseRealtimeUpdatesReturn,
+  UseLearningUpdatesOptions,
+  UseLearningUpdatesReturn,
+  UseCheckpointUpdatesOptions,
+  UseCheckpointUpdatesReturn,
+  UseTaskStatusUpdatesOptions,
+  UseTaskStatusUpdatesReturn,
+  CurrentTaskInfo,
+  LearningUpdateCallback,
+  CheckpointCreatedCallback,
+  TaskStatusChangeCallback,
+} from "./useRealtimeUpdates";
+
+export { useTaskRunRecap, recapKeys } from "./useTaskRunRecap";

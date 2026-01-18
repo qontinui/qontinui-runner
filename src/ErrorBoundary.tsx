@@ -22,7 +22,13 @@ class ErrorBoundary extends Component<Props, State> {
   }
 
   public componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error("Uncaught error:", error, errorInfo);
+    // Log full error details to console
+    console.error("=== ErrorBoundary caught error ===");
+    console.error("Error name:", error.name);
+    console.error("Error message:", error.message);
+    console.error("Error stack:", error.stack);
+    console.error("Component stack:", errorInfo.componentStack);
+    console.error("=================================");
     this.setState({
       error,
       errorInfo,
@@ -31,6 +37,10 @@ class ErrorBoundary extends Component<Props, State> {
 
   public render() {
     if (this.state.hasError) {
+      const errorMessage = this.state.error?.message || "Unknown error";
+      const errorStack = this.state.error?.stack || "";
+      const componentStack = this.state.errorInfo?.componentStack || "";
+
       return (
         <div
           style={{
@@ -42,11 +52,60 @@ class ErrorBoundary extends Component<Props, State> {
           }}
         >
           <h2>Something went wrong.</h2>
-          <details style={{ whiteSpace: "pre-wrap", marginTop: "20px" }}>
-            <summary>Error Details</summary>
-            {this.state.error && this.state.error.toString()}
-            <br />
-            {this.state.errorInfo && this.state.errorInfo.componentStack}
+          <div
+            style={{
+              backgroundColor: "#2d2d2d",
+              padding: "15px",
+              borderRadius: "8px",
+              marginTop: "15px",
+              border: "1px solid #ff6b6b",
+            }}
+          >
+            <strong style={{ color: "#ff9999" }}>Error:</strong>
+            <pre
+              style={{
+                color: "#ffffff",
+                marginTop: "10px",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              {errorMessage}
+            </pre>
+          </div>
+          <details open style={{ whiteSpace: "pre-wrap", marginTop: "20px" }}>
+            <summary style={{ cursor: "pointer", color: "#ffaa00" }}>Full Stack Trace</summary>
+            <pre
+              style={{
+                color: "#aaaaaa",
+                fontSize: "12px",
+                marginTop: "10px",
+                backgroundColor: "#2d2d2d",
+                padding: "10px",
+                borderRadius: "4px",
+                overflow: "auto",
+                maxHeight: "300px",
+              }}
+            >
+              {errorStack}
+            </pre>
+          </details>
+          <details style={{ whiteSpace: "pre-wrap", marginTop: "15px" }}>
+            <summary style={{ cursor: "pointer", color: "#ffaa00" }}>Component Stack</summary>
+            <pre
+              style={{
+                color: "#aaaaaa",
+                fontSize: "12px",
+                marginTop: "10px",
+                backgroundColor: "#2d2d2d",
+                padding: "10px",
+                borderRadius: "4px",
+                overflow: "auto",
+                maxHeight: "300px",
+              }}
+            >
+              {componentStack}
+            </pre>
           </details>
         </div>
       );

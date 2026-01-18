@@ -35,7 +35,7 @@ import ActionLogTable from "./ActionLogTable";
 import ImageLogTable from "./ImageLogTable";
 import type { ActionLogViewData, ActionLogEntry } from "../types/displayProfile";
 import { useUnifiedReport, useFindings } from "../hooks/useUnifiedReport";
-import { getSeverityColors } from "../design-system";
+import { getSeverityColors, getAccentColors } from "../design-system";
 
 // Storage keys for panel collapse states
 const STORAGE_KEY_ACTIONS_COLLAPSED = "activeTab.actionsPanelCollapsed";
@@ -214,14 +214,16 @@ export function ActiveTab({
       {/* Status Banner - borderless with subtle background */}
       <div
         className={`flex-shrink-0 px-4 py-3 rounded-lg ${
-          statusInfo.status === "running" ? "bg-emerald-500/10" : "bg-muted/30"
+          statusInfo.status === "running" ? getAccentColors("emerald").bg : "bg-muted/30"
         }`}
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
             {statusInfo.status === "running" ? (
-              <div className="w-8 h-8 rounded-full bg-emerald-500/20 flex items-center justify-center">
-                <Loader2 className="w-4 h-4 text-emerald-500 animate-spin" />
+              <div
+                className={`w-8 h-8 rounded-full ${getAccentColors("emerald").bg} flex items-center justify-center`}
+              >
+                <Loader2 className={`w-4 h-4 ${getAccentColors("emerald").text} animate-spin`} />
               </div>
             ) : (
               <div className="w-8 h-8 rounded-full bg-muted flex items-center justify-center">
@@ -238,7 +240,7 @@ export function ActiveTab({
           {statusInfo.status === "running" && isAiRunning && (
             <button
               onClick={handleStopAi}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg transition-colors"
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${getAccentColors("red").bg} ${getAccentColors("red").text} hover:opacity-80`}
               title="Stop AI analysis"
             >
               <Square className="w-3.5 h-3.5" />
@@ -256,28 +258,40 @@ export function ActiveTab({
             <span className="text-sm font-semibold">{summary.total}</span>
           </div>
           {summary.resolved > 0 && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-green-500/10">
-              <CheckCircle className="w-3 h-3 text-green-500" />
-              <span className="text-sm font-semibold text-green-500">{summary.resolved}</span>
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md ${getAccentColors("green").bg}`}
+            >
+              <CheckCircle className={`w-3 h-3 ${getAccentColors("green").text}`} />
+              <span className={`text-sm font-semibold ${getAccentColors("green").text}`}>
+                {summary.resolved}
+              </span>
             </div>
           )}
           {summary.actionable > 0 && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-yellow-500/10">
-              <Clock className="w-3 h-3 text-yellow-500" />
-              <span className="text-sm font-semibold text-yellow-500">{summary.actionable}</span>
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md ${getAccentColors("yellow").bg}`}
+            >
+              <Clock className={`w-3 h-3 ${getAccentColors("yellow").text}`} />
+              <span className={`text-sm font-semibold ${getAccentColors("yellow").text}`}>
+                {summary.actionable}
+              </span>
             </div>
           )}
           {summary.bySeverity.critical > 0 && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-red-500/10">
-              <AlertTriangle className="w-3 h-3 text-red-500" />
-              <span className="text-sm font-semibold text-red-500">
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md ${getSeverityColors("critical").bg}`}
+            >
+              <AlertTriangle className={`w-3 h-3 ${getSeverityColors("critical").text}`} />
+              <span className={`text-sm font-semibold ${getSeverityColors("critical").text}`}>
                 {summary.bySeverity.critical}
               </span>
             </div>
           )}
           {summary.bySeverity.high > 0 && (
-            <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-orange-500/10">
-              <span className="text-sm font-semibold text-orange-500">
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md ${getSeverityColors("high").bg}`}
+            >
+              <span className={`text-sm font-semibold ${getSeverityColors("high").text}`}>
                 {summary.bySeverity.high} high
               </span>
             </div>
@@ -294,7 +308,7 @@ export function ActiveTab({
             className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors"
           >
             <div className="flex items-center gap-2">
-              <ScrollText className="w-4 h-4 text-green-500/70" />
+              <ScrollText className={`w-4 h-4 ${getAccentColors("green").text} opacity-70`} />
               <span className="text-sm font-medium">Actions</span>
               <span className="text-xs text-muted-foreground">
                 ({actionLogData?.visible_count || 0})
@@ -328,7 +342,7 @@ export function ActiveTab({
             className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors"
           >
             <div className="flex items-center gap-2">
-              <Image className="w-4 h-4 text-purple-500/70" />
+              <Image className={`w-4 h-4 ${getAccentColors("purple").text} opacity-70`} />
               <span className="text-sm font-medium">Image Recognition</span>
               <span className="text-xs text-muted-foreground">({imageLogs.length})</span>
             </div>
@@ -359,7 +373,7 @@ export function ActiveTab({
             className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/30 rounded-lg transition-colors"
           >
             <div className="flex items-center gap-2">
-              <Lightbulb className="w-4 h-4 text-yellow-500/70" />
+              <Lightbulb className={`w-4 h-4 ${getAccentColors("yellow").text} opacity-70`} />
               <span className="text-sm font-medium">Findings</span>
               <span className="text-xs text-muted-foreground">({findings.length})</span>
             </div>
@@ -403,9 +417,11 @@ export function ActiveTab({
       <div className="flex-1 flex flex-col min-h-0 rounded-lg bg-card/50 overflow-hidden">
         <div className="flex-shrink-0 flex items-center justify-between px-3 py-2">
           <div className="flex items-center gap-2">
-            <Bot className="w-4 h-4 text-purple-500/70" />
+            <Bot className={`w-4 h-4 ${getAccentColors("purple").text} opacity-70`} />
             <span className="text-sm font-medium">AI Output</span>
-            {isAiRunning && <Sparkles className="w-3 h-3 animate-pulse text-purple-500" />}
+            {isAiRunning && (
+              <Sparkles className={`w-3 h-3 animate-pulse ${getAccentColors("purple").text}`} />
+            )}
           </div>
           {activeSessions.length > 0 && (
             <span className="text-xs text-muted-foreground">{activeSessions.length} active</span>

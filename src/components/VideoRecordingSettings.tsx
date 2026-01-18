@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Video, Check, AlertCircle } from "lucide-react";
+import { getStatusColors } from "@/design-system";
 
 interface VideoRecordingConfig {
   enabled: boolean;
@@ -234,9 +235,13 @@ export function VideoRecordingSettings({ onLog }: VideoRecordingSettingsProps) {
 
       {/* Success message */}
       {saveSuccess && (
-        <div className="p-3 bg-green-500/10 border border-green-500/30 rounded-lg flex items-start gap-2">
-          <Check className="w-5 h-5 text-green-400 shrink-0 mt-0.5" />
-          <span className="text-green-400 text-sm">Settings saved successfully!</span>
+        <div
+          className={`p-3 ${getStatusColors("success").bg} border ${getStatusColors("success").border} rounded-lg flex items-start gap-2`}
+        >
+          <Check className={`w-5 h-5 ${getStatusColors("success").icon} shrink-0 mt-0.5`} />
+          <span className={`${getStatusColors("success").text} text-sm`}>
+            Settings saved successfully!
+          </span>
         </div>
       )}
 

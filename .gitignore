@@ -87,7 +87,13 @@ temp_dev/
 # Ignore CLAUDE notes file
 CLAUDE.md
 python-bridge/build/
-src-tauri/binaries/*.exe
+python-bridge/dist/
+
+# Bundled Python executors (large, platform-specific)
+# Keep .gitkeep but ignore actual executables
+src-tauri/binaries/qontinui-executor-*
+!src-tauri/binaries/.gitkeep
+
 .claude/
 
 # Playwright user scripts (generated at runtime)

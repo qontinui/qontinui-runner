@@ -59,7 +59,10 @@ use axum::{
         Path, Query, State,
     },
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json,
+    },
     routing::{get, post},
     Router,
 };
@@ -79,15 +82,28 @@ use crate::commands::AppState;
 use crate::config::ConfigLoader;
 use crate::config_storage::{ConfigMetadata, ConfigStorage, StoredConfig};
 use crate::context;
+use crate::dom_capture::{
+    DomCapture, DomCaptureLogger, DomCaptureSource, DomCaptureTrigger,
+    ReceiveExtensionDomRequest,
+};
 use crate::findings::storage as finding_storage;
 use crate::findings::{Finding, FindingParser, ParsedFinding};
+use crate::mcp::awas::{
+    awas_check_support, awas_discover, awas_execute, awas_extract_elements, awas_list_actions,
+};
 use crate::mcp::types::{GoToStateRequest, GoToStateResult};
 use crate::rag::{ImportResult, QontinuiConfig, RAGConfigSummary};
 use crate::scriptlets;
 use crate::session::SessionManager;
 use crate::settings;
+use crate::summary_generator;
 use crate::task_monitor::TaskMonitor;
 use crate::task_recorder::{TaskConfig, TaskRecorder};
+use crate::orchestrator::{
+    CompressionConfig, RetryConfig, RetryState, RetryService,
+    WorkerSignal, DeterministicVerifier, Orchestrator, OrchestratorConfig,
+    OrchestratorState, WorkerOutputAction,
+};
 use crate::tiered_info::{self, RunDetails};
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
@@ -744,6 +760,135 @@ fn run_claude_session_inline(
     Ok((success, all_output))
 }
 
+/// Run Claude session with retry support.
+///
+/// Wraps `run_claude_session_inline` with exponential backoff retry logic.
+/// On transient failures, the error context is injected into the prompt for the retry.
+///
+/// # Arguments
+/// * `retry_config` - Retry configuration (if None, no retry)
+/// * All other arguments are passed to `run_claude_session_inline`
+///
+/// # Returns
+/// * `(bool, String, Option<RetryState>)` - (success, output, retry_state if retries occurred)
+#[allow(clippy::too_many_arguments)]
+fn run_claude_session_with_retry(
+    working_dir: &str,
+    prompt: &str,
+    session_id: &str,
+    app_handle: &tauri::AppHandle,
+    timeout_seconds: u64,
+    session_ctx: Option<AiOutputSessionContext>,
+    finding_ctx: Option<FindingContext>,
+    pid_tracker: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+    retry_config: Option<&RetryConfig>,
+) -> Result<(bool, String, Option<RetryState>), String> {
+    use std::thread;
+    use std::time::Duration;
+
+    // If no retry config or retry disabled, just run once
+    let config = match retry_config {
+        Some(cfg) if cfg.enabled => cfg,
+        _ => {
+            let result = run_claude_session_inline(
+                working_dir,
+                prompt,
+                session_id,
+                app_handle,
+                timeout_seconds,
+                session_ctx,
+                finding_ctx,
+                pid_tracker,
+            )?;
+            return Ok((result.0, result.1, None));
+        }
+    };
+
+    let retry_service = RetryService::new(config.clone());
+    let mut retry_state = RetryState::new();
+    let mut current_prompt = prompt.to_string();
+
+    loop {
+        // Clone contexts for each attempt (they might be consumed)
+        let ctx_clone = session_ctx.clone();
+        let finding_ctx_clone = finding_ctx.clone();
+        let pid_tracker_clone = pid_tracker.clone();
+
+        // Try to run the session
+        let result = run_claude_session_inline(
+            working_dir,
+            &current_prompt,
+            session_id,
+            app_handle,
+            timeout_seconds,
+            ctx_clone,
+            finding_ctx_clone,
+            pid_tracker_clone,
+        );
+
+        match result {
+            Ok((success, output)) => {
+                // Session succeeded (or at least completed without error)
+                if retry_state.attempt > 0 {
+                    info!(
+                        "Session {} succeeded after {} retries",
+                        session_id, retry_state.attempt
+                    );
+                }
+                return Ok((success, output, Some(retry_state)));
+            }
+            Err(error) => {
+                // Session failed - check if we should retry
+                let decision = retry_service.should_retry(&error, &retry_state);
+
+                match decision {
+                    crate::orchestrator::RetryDecision::Retry { delay_ms, feedback } => {
+                        // Check if feedback will be injected
+                        let will_inject_feedback = config.feedback_injection && !feedback.is_empty();
+
+                        // Record this attempt
+                        retry_state.record_attempt(&error, delay_ms, will_inject_feedback);
+
+                        warn!(
+                            "Session {} failed (attempt {}), retrying in {}ms: {}",
+                            session_id,
+                            retry_state.attempt,
+                            delay_ms,
+                            error
+                        );
+
+                        // Wait before retry
+                        thread::sleep(Duration::from_millis(delay_ms));
+
+                        // If feedback injection is enabled, prepend error context to prompt
+                        if will_inject_feedback {
+                            current_prompt = format!("{}\n\n---\n\n{}", feedback, prompt);
+                            info!(
+                                "Injected {} chars of feedback context for retry",
+                                feedback.len()
+                            );
+                        }
+                    }
+                    crate::orchestrator::RetryDecision::GiveUp { reason } => {
+                        // Record final attempt and give up
+                        retry_state.record_attempt(&error, 0, false);
+
+                        warn!(
+                            "Session {} giving up after {} attempts: {}",
+                            session_id, retry_state.attempt, reason
+                        );
+
+                        return Err(format!(
+                            "Session failed after {} attempts: {} (last error: {})",
+                            retry_state.attempt, reason, error
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Default port for the MCP API server
 pub const MCP_API_PORT: u16 = 9876;
 
@@ -764,6 +909,10 @@ pub struct ApiState {
     pub action_service: Arc<UnifiedActionService>,
     /// Currently running AI process PIDs (for stopping)
     pub current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Orchestrator states by task_run_id (for agentic task orchestration)
+    pub orchestrator_states: Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
+    /// Web extraction state tracking
+    pub extraction_state: Arc<ExtractionState>,
 }
 
 /// Response for API endpoints
@@ -787,7 +936,7 @@ impl<T: Serialize> ApiResponse<T> {
 }
 
 /// Create an error response
-fn api_error(message: impl Into<String>) -> ApiResponse<()> {
+pub fn api_error(message: impl Into<String>) -> ApiResponse<()> {
     ApiResponse {
         success: false,
         data: None,
@@ -832,6 +981,19 @@ pub struct StatusResponse {
     pub config_path: Option<String>,
     /// Whether an AI analysis is currently in progress
     pub ai_analysis_running: bool,
+}
+
+/// Tool version response for MCP caching
+#[derive(Debug, Serialize)]
+pub struct ToolVersionResponse {
+    /// Version hash for cache invalidation (based on config + test count)
+    pub version: String,
+    /// Number of base tools available
+    pub tool_count: usize,
+    /// Number of tests that can be executed
+    pub test_count: usize,
+    /// Last update timestamp
+    pub last_updated: String,
 }
 
 /// Load config request
@@ -888,6 +1050,29 @@ pub struct ExecuteActionResult {
     pub action_type: String,
     pub image_id: String,
     pub error: Option<String>,
+}
+
+/// Execute Python command request (generic command forwarding to Python executor)
+///
+/// This is used by the accessibility service and other features that need
+/// to send commands directly to the Python executor via HTTP.
+#[derive(Debug, Deserialize)]
+pub struct ExecutePythonCommandRequest {
+    /// Command type (e.g., "capture_accessibility", "auto_connect_accessibility")
+    pub cmd_type: String,
+    /// Command parameters as JSON
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+/// Execute Python command response
+#[derive(Debug, Serialize)]
+pub struct ExecutePythonCommandResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 /// Workflow execution result (for /workflow/run endpoint)
@@ -1050,6 +1235,68 @@ async fn handle_ws_events(socket: WebSocket, state: Arc<ApiState>) {
     info!("WebSocket client disconnected from event streaming");
 }
 
+/// SSE events handler for MCP notification streaming
+///
+/// Provides Server-Sent Events (SSE) stream of runner events.
+/// More compatible with HTTP-based MCP clients than WebSocket.
+///
+/// Events emitted:
+/// - qontinui/execution_started - Workflow begins
+/// - qontinui/execution_progress - Step completion
+/// - qontinui/execution_completed - Workflow ends
+/// - qontinui/test_started - Test begins
+/// - qontinui/test_completed - Test ends
+/// - qontinui/image_recognition - Match found/failed
+/// - qontinui/error - Error occurs
+async fn sse_events_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    use futures_util::StreamExt as FuturesStreamExt;
+    use tokio_stream::wrappers::BroadcastStream;
+
+    // Subscribe to the broadcast channel
+    let event_rx = state.app_state.event_broadcast.subscribe();
+
+    info!("SSE client connected for event streaming");
+
+    // Convert broadcast receiver to SSE stream
+    // Use futures_util::StreamExt::filter_map for compatibility with Sse
+    let stream = FuturesStreamExt::filter_map(BroadcastStream::new(event_rx), |result| async move {
+        match result {
+            Ok(event) => {
+                // Serialize event to JSON and wrap in SSE Event
+                match serde_json::to_string(&event) {
+                    Ok(json_str) => {
+                        // Determine event type from the event data
+                        let event_type = event
+                            .get("event_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("message");
+
+                        Some(Ok(Event::default()
+                            .event(format!("qontinui/{}", event_type))
+                            .data(json_str)))
+                    }
+                    Err(e) => {
+                        warn!("Failed to serialize event for SSE: {}", e);
+                        None
+                    }
+                }
+            }
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                warn!("SSE client lagged, skipped {} events", n);
+                // Send a notification about skipped events
+                Some(Ok(Event::default()
+                    .event("qontinui/warning")
+                    .data(format!("{{\"message\": \"Skipped {} events due to lag\"}}", n))))
+            }
+        }
+    });
+
+    // Return SSE response with keep-alive
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 /// Health check endpoint
 async fn health() -> Json<ApiResponse<String>> {
     Json(ApiResponse::success("ok".to_string()))
@@ -1113,8 +1360,7 @@ async fn get_debug_errors(
 ) -> Json<ApiResponse<DebugErrorsResponse>> {
     use std::io::{BufRead, BufReader};
 
-    let dev_logs_path =
-        std::path::PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
+    let dev_logs_path = crate::paths::get_dev_logs_dir();
 
     if !dev_logs_path.exists() {
         return Json(ApiResponse::success(DebugErrorsResponse {
@@ -1134,7 +1380,6 @@ async fn get_debug_errors(
     let log_files = [
         ("backend.log", "backend"),
         ("frontend.log", "frontend"),
-        ("qontinui-api.log", "api"),
         ("runner-tauri.log", "runner"),
         ("runner-actions.jsonl", "runner-actions"),
     ];
@@ -1574,6 +1819,56 @@ async fn get_status(
     })))
 }
 
+/// Get tool version for MCP caching
+///
+/// Returns a version hash based on:
+/// - Current config ID (if loaded)
+/// - Number of tests in the database
+///
+/// MCP clients can use this to invalidate their tool cache when
+/// the available tools change (e.g., new tests added).
+async fn get_tool_version(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<ToolVersionResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use sha2::{Sha256, Digest};
+
+    // Get current config ID
+    let config_id = state.current_config_id.lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_else(|| "none".to_string());
+
+    // Get test count from database using list_verification_tests
+    let db = state.app_state.checkpoint_db.clone();
+    let test_count = tokio::task::spawn_blocking(move || {
+        db.list_verification_tests(false, None, None)
+            .map(|tests| tests.len())
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0);
+
+    // Base tool count (from qontinui-mcp server.py TOOLS list)
+    // This should be kept in sync with the actual tool count
+    const BASE_TOOL_COUNT: usize = 35;
+
+    // Create version hash from config_id and test_count
+    let version_input = format!("{}:{}", config_id, test_count);
+    let mut hasher = Sha256::new();
+    hasher.update(version_input.as_bytes());
+    let hash = hasher.finalize();
+    let version = format!("{:x}", hash)[..8].to_string();
+
+    let last_updated = chrono::Utc::now().to_rfc3339();
+
+    Ok(Json(ApiResponse::success(ToolVersionResponse {
+        version,
+        tool_count: BASE_TOOL_COUNT,
+        test_count,
+        last_updated,
+    })))
+}
+
 /// Internal helper to load a configuration file synchronously.
 /// Used by resume_active_workflow_on_startup to load config before resuming.
 ///
@@ -1976,6 +2271,9 @@ struct ExecuteStepsRequest {
     /// Log sources to capture during execution
     #[serde(default)]
     log_sources: Vec<crate::step_executor::LogSourceConfig>,
+    /// Optional task run ID for database logging (AWAS steps, etc.)
+    #[serde(default)]
+    task_run_id: Option<String>,
 }
 
 /// Execute a list of steps and return results
@@ -2012,11 +2310,17 @@ async fn execute_steps(
         execution_id
     );
 
-    // Create step executor
-    let executor = crate::step_executor::StepExecutor::new(
+    // Create step executor with app handle for frontend event emission
+    let mut executor = crate::step_executor::StepExecutor::with_app_handle(
         state.app_state.clone(),
         state.config_storage.clone(),
+        state.app_handle.clone(),
     );
+
+    // Add task_run_id if provided (enables AWAS step result logging to database)
+    if let Some(task_run_id) = request.task_run_id {
+        executor = executor.with_task_run_id(task_run_id);
+    }
 
     // Execute all steps with log source capture
     let result = executor
@@ -2232,6 +2536,82 @@ async fn stop_execution(
     }
 }
 
+/// Execute a Python command via the executor bridge
+///
+/// This endpoint forwards commands to the Python executor and returns the result.
+/// Used by the accessibility service and other features that need to communicate
+/// with the Python executor via HTTP (e.g., for frontend components that can't
+/// use Tauri IPC directly).
+async fn execute_python_command(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ExecutePythonCommandRequest>,
+) -> Result<Json<ApiResponse<ExecutePythonCommandResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Executing Python command: {} with params: {:?}",
+        request.cmd_type, request.params
+    );
+
+    let app_state = state.app_state.clone();
+    let cmd_type = request.cmd_type.clone();
+    let cmd_type_for_log = cmd_type.clone(); // Clone for logging after closure
+    let params = request.params.clone();
+
+    // Use spawn_blocking for the synchronous bridge operation
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            // Convert params to Option<Value> (None if params is null or empty object)
+            let params_option = if params.is_null()
+                || (params.is_object() && params.as_object().map_or(true, |o| o.is_empty()))
+            {
+                None
+            } else {
+                Some(params)
+            };
+
+            // Send command and wait for response (60 second timeout for most commands)
+            let timeout_duration = std::time::Duration::from_secs(60);
+            bridge.send_command_and_wait(&cmd_type, params_option, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            info!(
+                "MCP API: Python command {} completed, success={}",
+                cmd_type_for_log, response.success
+            );
+            Ok(Json(ApiResponse::success(ExecutePythonCommandResponse {
+                success: response.success,
+                error: response.error,
+                data: response.data,
+            })))
+        }
+        Err(e) => {
+            error!("MCP API: Python command {} failed: {}", cmd_type_for_log, e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Execute a single action (e.g., click on an image, type text, press hotkey)
 ///
 /// This endpoint allows executing individual GUI actions without running a full workflow.
@@ -2420,28 +2800,15 @@ async fn capture_screenshot_step(
         }
     }
 
-    // Get qontinui-api URL
-    let api_url = std::env::var("QONTINUI_API_URL_VISION")
-        .unwrap_or_else(|_| "http://localhost:8001".to_string());
-
-    // Build URL with query parameters
-    let mut url = format!("{}/api/capture/screenshot/current", api_url);
-    let mut params = Vec::new();
-    if let Some(mon) = request.monitor {
-        params.push(format!("monitor={}", mon));
-    }
-    // Always request high quality for AI analysis
-    params.push("quality=95".to_string());
-    if !params.is_empty() {
-        url = format!("{}?{}", url, params.join("&"));
-    }
-
-    // Capture screenshot via qontinui-api
-    let client = reqwest::Client::new();
-    let response = match client.get(&url).send().await {
-        Ok(r) => r,
+    // Capture screenshot via Python IPC
+    let capture_response = match capture_screenshot_ipc(
+        state.app_state.clone(),
+        request.monitor,
+        "png",
+    ).await {
+        Ok(response) => response,
         Err(e) => {
-            error!("MCP API: Failed to capture screenshot: {}", e);
+            error!("MCP API: Failed to capture screenshot via IPC: {}", e);
             return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
                 success: false,
                 screenshot_path: None,
@@ -2449,45 +2816,7 @@ async fn capture_screenshot_step(
                 width: None,
                 height: None,
                 monitor: request.monitor,
-                error: Some(format!("Network error: {}", e)),
-            })));
-        }
-    };
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown error".to_string());
-        error!(
-            "MCP API: Screenshot capture failed with status {}: {}",
-            status, error_text
-        );
-        return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
-            success: false,
-            screenshot_path: None,
-            absolute_path: None,
-            width: None,
-            height: None,
-            monitor: request.monitor,
-            error: Some(format!("Capture failed: {}", error_text)),
-        })));
-    }
-
-    // Parse response
-    let capture_response: serde_json::Value = match response.json().await {
-        Ok(j) => j,
-        Err(e) => {
-            error!("MCP API: Failed to parse screenshot response: {}", e);
-            return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
-                success: false,
-                screenshot_path: None,
-                absolute_path: None,
-                width: None,
-                height: None,
-                monitor: request.monitor,
-                error: Some(format!("Invalid API response: {}", e)),
+                error: Some(format!("IPC error: {}", e)),
             })));
         }
     };
@@ -2498,7 +2827,7 @@ async fn capture_screenshot_step(
     {
         Some(s) => s.to_string(),
         None => {
-            error!("MCP API: No screenshot_base64 in response");
+            error!("MCP API: No screenshot_base64 in IPC response");
             return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
                 success: false,
                 screenshot_path: None,
@@ -2554,9 +2883,7 @@ async fn capture_screenshot_step(
     );
 
     // Save to .dev-logs/screenshots/
-    let dev_logs_path =
-        std::path::PathBuf::from(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs");
-    let screenshots_dir = dev_logs_path.join("screenshots");
+    let screenshots_dir = crate::paths::get_screenshots_dir();
     if let Err(e) = fs::create_dir_all(&screenshots_dir) {
         error!("MCP API: Failed to create screenshots directory: {}", e);
         return Ok(Json(ApiResponse::success(CaptureScreenshotResponse {
@@ -2658,6 +2985,48 @@ async fn capture_screenshot_step(
 }
 
 // ============================================================================
+// Screenshot List API Endpoint
+// ============================================================================
+
+/// List all screenshots from dev-logs directories.
+/// Returns screenshots from:
+/// - `.dev-logs/screenshots/` - Annotated screenshots from image recognition
+/// - `.dev-logs/playwright-screenshots/` - Screenshots from Playwright test failures
+async fn list_screenshots_endpoint() -> Json<crate::commands::screenshots::ScreenshotsResponse> {
+    info!("MCP API: Listing screenshots from dev-logs directories");
+    Json(crate::commands::screenshots::list_screenshots().await)
+}
+
+// ============================================================================
+// Action Log View API Endpoint
+// ============================================================================
+
+/// Get the action log view data.
+/// Returns the same data as the Tauri command `get_action_log_view`.
+/// This provides a single source of truth for both the Actions page and GUI Automation widget.
+async fn get_action_log_view_endpoint(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Getting action log view");
+
+    let processor = state.app_state.display_processor.lock().await;
+
+    match processor.get_view("action_log") {
+        Ok(view_data) => {
+            info!("MCP API: Action log view retrieved successfully");
+            Ok(Json(view_data))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get action log view: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get action log view: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
 // Web Extraction API Endpoints
 // ============================================================================
 
@@ -2715,12 +3084,196 @@ pub struct ExtractionStatusResponse {
     pub stats: Option<ExtractionStats>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExtractionStats {
     pub states_found: u32,
     pub transitions_found: u32,
+    pub pages_extracted: u32,
     pub warnings: u32,
     pub errors: u32,
+}
+
+/// Tracks the current state of web extraction
+/// Thread-safe wrapper for extraction status tracking
+#[derive(Debug, Default)]
+pub struct ExtractionState {
+    inner: std::sync::Mutex<ExtractionStateInner>,
+}
+
+#[derive(Debug, Default)]
+struct ExtractionStateInner {
+    is_running: bool,
+    extraction_id: Option<String>,
+    stats: ExtractionStats,
+}
+
+impl ExtractionState {
+    /// Create a new extraction state tracker
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ExtractionStateInner::default()),
+        }
+    }
+
+    /// Mark extraction as started with the given ID
+    pub fn start(&self, extraction_id: Option<String>) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.is_running = true;
+        inner.extraction_id = extraction_id;
+        inner.stats = ExtractionStats::default();
+    }
+
+    /// Mark extraction as stopped
+    pub fn stop(&self) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.is_running = false;
+    }
+
+    /// Mark extraction as complete with final stats
+    pub fn complete(&self, stats: ExtractionStats) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.is_running = false;
+        inner.stats = stats;
+    }
+
+    /// Update the extraction stats
+    pub fn update_stats(&self, stats: ExtractionStats) {
+        let mut inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.stats = stats;
+    }
+
+    /// Get the current extraction status
+    pub fn get_status(&self) -> ExtractionStatusResponse {
+        let inner = self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        ExtractionStatusResponse {
+            is_running: inner.is_running,
+            extraction_id: inner.extraction_id.clone(),
+            stats: if inner.is_running || inner.stats.states_found > 0 || inner.stats.pages_extracted > 0 {
+                Some(inner.stats.clone())
+            } else {
+                None
+            },
+        }
+    }
+}
+
+// =============================================================================
+// UI-TARS Extraction Types
+// =============================================================================
+
+/// Request to start UI-TARS extraction
+#[derive(Debug, Deserialize)]
+pub struct StartUITarsExtractionRequest {
+    /// Target type: "web" or "desktop"
+    #[serde(default = "default_desktop")]
+    pub target_type: String,
+    /// Target URL (for web) or application name (for desktop)
+    pub target: String,
+    /// Exploration goal (what to discover)
+    #[serde(default = "default_uitars_goal")]
+    pub goal: String,
+    /// Provider: "local_transformers", "local_vllm", or "cloud"
+    #[serde(default = "default_provider")]
+    pub provider: String,
+    /// Model size: "2B", "7B", or "72B"
+    #[serde(default = "default_model_size")]
+    pub model_size: String,
+    /// Quantization: "none", "int8", or "int4"
+    #[serde(default = "default_quantization")]
+    pub quantization: String,
+    /// Maximum exploration steps
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u32,
+    /// Timeout in seconds
+    #[serde(default = "default_uitars_timeout")]
+    pub timeout_seconds: u32,
+    /// Whether to save screenshots
+    #[serde(default = "default_true")]
+    pub save_screenshots: bool,
+    /// HuggingFace endpoint (for cloud provider)
+    #[serde(default)]
+    pub huggingface_endpoint: Option<String>,
+    /// HuggingFace API token (for cloud provider)
+    #[serde(default)]
+    pub huggingface_api_token: Option<String>,
+    /// vLLM server URL (for local_vllm provider)
+    #[serde(default)]
+    pub vllm_server_url: Option<String>,
+    /// Monitor index for desktop extraction
+    #[serde(default)]
+    pub monitor_index: u32,
+}
+
+fn default_desktop() -> String {
+    "desktop".to_string()
+}
+
+fn default_uitars_goal() -> String {
+    "Explore the application and discover all clickable UI elements including buttons, links, menu items, and interactive controls. Identify distinct application states and the actions that transition between them.".to_string()
+}
+
+fn default_provider() -> String {
+    "local_transformers".to_string()
+}
+
+fn default_model_size() -> String {
+    "2B".to_string()
+}
+
+fn default_quantization() -> String {
+    "int4".to_string()
+}
+
+fn default_max_steps() -> u32 {
+    50
+}
+
+fn default_uitars_timeout() -> u32 {
+    600
+}
+
+/// Response from UI-TARS extraction status endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UITarsExtractionStatusResponse {
+    pub status: String,
+    pub current_step: u32,
+    pub max_steps: u32,
+    pub elapsed_seconds: f64,
+    pub last_thought: Option<String>,
+    pub last_action: Option<String>,
+    pub states_discovered: u32,
+    pub transitions_discovered: u32,
+    pub error_message: Option<String>,
+    pub uitars_available: bool,
+}
+
+/// Response from UI-TARS extraction results endpoint
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UITarsExtractionResultsResponse {
+    pub states: Vec<UITarsDiscoveredState>,
+    pub transitions: Vec<UITarsDiscoveredTransition>,
+    pub total_steps: u32,
+    pub total_screenshots: u32,
+    pub exploration_time_seconds: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UITarsDiscoveredState {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub screenshot_path: String,
+    pub elements: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UITarsDiscoveredTransition {
+    pub id: String,
+    pub from_state_id: String,
+    pub to_state_id: String,
+    pub action_type: String,
+    pub action_description: String,
+    pub coordinates: Option<(i32, i32)>,
 }
 
 /// Start web extraction
@@ -2732,6 +3285,11 @@ async fn start_web_extraction(
         "MCP API: Starting web extraction for {} URLs",
         request.urls.len()
     );
+
+    // Generate an extraction ID from session_id or create a new one
+    let extraction_id = request.session_id.clone().unwrap_or_else(|| {
+        format!("extraction_{}", chrono::Utc::now().timestamp_millis())
+    });
 
     // Build extraction params
     let params = serde_json::json!({
@@ -2748,6 +3306,8 @@ async fn start_web_extraction(
     });
 
     let app_state = state.app_state.clone();
+    let extraction_state = state.extraction_state.clone();
+    let extraction_id_for_state = extraction_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
@@ -2772,9 +3332,12 @@ async fn start_web_extraction(
 
     match result {
         Ok(_) => {
-            info!("MCP API: Web extraction started");
+            // Mark extraction as running
+            extraction_state.start(Some(extraction_id_for_state.clone()));
+            info!("MCP API: Web extraction started with ID: {}", extraction_id_for_state);
             Ok(Json(ApiResponse::success(serde_json::json!({
                 "started": true,
+                "extraction_id": extraction_id_for_state,
                 "message": "Web extraction started"
             }))))
         }
@@ -2792,6 +3355,7 @@ async fn stop_web_extraction(
     info!("MCP API: Stopping web extraction");
 
     let app_state = state.app_state.clone();
+    let extraction_state = state.extraction_state.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
@@ -2816,6 +3380,8 @@ async fn stop_web_extraction(
 
     match result {
         Ok(_) => {
+            // Mark extraction as stopped
+            extraction_state.stop();
             info!("MCP API: Web extraction stopped");
             Ok(Json(ApiResponse::success(
                 "Web extraction stopped".to_string(),
@@ -2832,44 +3398,37 @@ async fn stop_web_extraction(
 async fn get_extraction_status(
     State(state): State<Arc<ApiState>>,
 ) -> Result<Json<ApiResponse<ExtractionStatusResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let app_state = state.app_state.clone();
+    // Return the tracked extraction state
+    let status = state.extraction_state.get_status();
+    debug!("MCP API: Extraction status - is_running: {}, extraction_id: {:?}",
+           status.is_running, status.extraction_id);
+    Ok(Json(ApiResponse::success(status)))
+}
 
-    let result = tokio::task::spawn_blocking(move || {
-        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
-            warn!("MCP API: python_bridge mutex was poisoned, recovering");
-            poisoned.into_inner()
-        });
+/// Update extraction stats
+///
+/// Called by the Python extraction process to report progress.
+async fn update_extraction_stats(
+    State(state): State<Arc<ApiState>>,
+    Json(stats): Json<ExtractionStats>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    debug!("MCP API: Updating extraction stats - states: {}, transitions: {}, pages: {}, errors: {}",
+           stats.states_found, stats.transitions_found, stats.pages_extracted, stats.errors);
+    state.extraction_state.update_stats(stats);
+    Ok(Json(ApiResponse::success("Stats updated".to_string())))
+}
 
-        if let Some(ref mut bridge) = *bridge_lock {
-            bridge.send_command("get_extraction_status", None)
-        } else {
-            Err("Python executor not initialized".to_string())
-        }
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
-
-    match result {
-        Ok(_) => {
-            // Note: send_command doesn't return data, so we return a default status
-            // TODO: Implement proper extraction status tracking in app state
-            Ok(Json(ApiResponse::success(ExtractionStatusResponse {
-                is_running: false,
-                extraction_id: None,
-                stats: None,
-            })))
-        }
-        Err(e) => {
-            error!("MCP API: Failed to get extraction status: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
-        }
-    }
+/// Mark extraction as complete
+///
+/// Called by the Python extraction process when extraction finishes.
+async fn complete_extraction(
+    State(state): State<Arc<ApiState>>,
+    Json(stats): Json<ExtractionStats>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Extraction complete - states: {}, transitions: {}, pages: {}, errors: {}",
+          stats.states_found, stats.transitions_found, stats.pages_extracted, stats.errors);
+    state.extraction_state.complete(stats);
+    Ok(Json(ApiResponse::success("Extraction completed".to_string())))
 }
 
 /// Get extraction screenshot
@@ -2927,6 +3486,228 @@ async fn get_extraction_screenshot(
                 )),
             )
                 .into_response()
+        }
+    }
+}
+
+// ============================================================================
+// UI-TARS Extraction Endpoints
+// ============================================================================
+
+/// Start UI-TARS extraction
+async fn start_uitars_extraction(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartUITarsExtractionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting UI-TARS extraction for target: {}",
+        request.target
+    );
+
+    // Build extraction params
+    let params = serde_json::json!({
+        "target_type": request.target_type,
+        "target": request.target,
+        "goal": request.goal,
+        "provider": request.provider,
+        "model_size": request.model_size,
+        "quantization": request.quantization,
+        "max_steps": request.max_steps,
+        "timeout_seconds": request.timeout_seconds,
+        "save_screenshots": request.save_screenshots,
+        "huggingface_endpoint": request.huggingface_endpoint,
+        "huggingface_api_token": request.huggingface_api_token,
+        "vllm_server_url": request.vllm_server_url,
+        "monitor_index": request.monitor_index,
+    });
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command("start_uitars_extraction", Some(params))
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: UI-TARS extraction started");
+            Ok(Json(ApiResponse::success(serde_json::json!({
+                "started": true,
+                "message": "UI-TARS extraction started"
+            }))))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start UI-TARS extraction: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Stop UI-TARS extraction
+async fn stop_uitars_extraction(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Stopping UI-TARS extraction");
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command("stop_uitars_extraction", None)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: UI-TARS extraction stopped");
+            Ok(Json(ApiResponse::success(
+                "UI-TARS extraction stopped".to_string(),
+            )))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to stop UI-TARS extraction: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get UI-TARS extraction status
+async fn get_uitars_extraction_status(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            let timeout = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("get_uitars_extraction_status", None, timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            // Return the actual status from Python
+            if response.success {
+                Ok(Json(ApiResponse::success(response.data.unwrap_or(serde_json::json!({
+                    "status": "idle",
+                    "current_step": 0,
+                    "max_steps": 0,
+                    "elapsed_seconds": 0.0,
+                    "states_discovered": 0,
+                    "transitions_discovered": 0,
+                    "uitars_available": false
+                })))))
+            } else {
+                error!("MCP API: UI-TARS extraction status command failed: {:?}", response.error);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(response.error.unwrap_or_else(|| "Unknown error".to_string())))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get UI-TARS extraction status: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get UI-TARS extraction results
+async fn get_uitars_extraction_results(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            let timeout = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("get_uitars_extraction_results", None, timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            // Return the actual results from Python
+            if response.success {
+                Ok(Json(ApiResponse::success(response.data.unwrap_or(serde_json::json!({
+                    "states": [],
+                    "transitions": [],
+                    "total_steps": 0,
+                    "total_screenshots": 0,
+                    "exploration_time_seconds": 0.0
+                })))))
+            } else {
+                error!("MCP API: UI-TARS extraction results command failed: {:?}", response.error);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(response.error.unwrap_or_else(|| "Unknown error".to_string())))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get UI-TARS extraction results: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
 }
@@ -3656,6 +4437,1893 @@ async fn run_vision_extraction(
     }
 }
 
+// ============================================================================
+// Pattern Matching API
+// ============================================================================
+
+/// Search region for pattern matching
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct SearchRegion {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Request for pattern matching
+#[derive(Debug, Deserialize)]
+pub struct PatternMatchRequest {
+    /// Base64 encoded screenshot or file path
+    pub screenshot: String,
+    /// Base64 encoded template image or file path
+    pub template: String,
+    /// Minimum similarity threshold (0.0 to 1.0, default: 0.8)
+    #[serde(default = "default_similarity")]
+    pub similarity: f32,
+    /// Optional search region
+    #[serde(default)]
+    pub search_region: Option<SearchRegion>,
+    /// Maximum matches for find_all (default: 100)
+    #[serde(default = "default_max_matches")]
+    pub max_matches: Option<i32>,
+}
+
+fn default_similarity() -> f32 {
+    0.8
+}
+
+fn default_max_matches() -> Option<i32> {
+    Some(100)
+}
+
+/// Match result from pattern matching
+#[derive(Debug, Serialize)]
+pub struct PatternMatch {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub similarity: f32,
+    pub center_x: i32,
+    pub center_y: i32,
+}
+
+/// Response from pattern matching
+#[derive(Debug, Serialize)]
+pub struct PatternMatchResponse {
+    pub success: bool,
+    pub matches: Vec<PatternMatch>,
+    pub search_time_ms: f32,
+    pub screenshot_width: i32,
+    pub screenshot_height: i32,
+    pub template_width: i32,
+    pub template_height: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Find best match of template in screenshot
+async fn pattern_find(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<PatternMatchRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Pattern find (screenshot: {} bytes, template: {} bytes, similarity: {})",
+        request.screenshot.len(),
+        request.template.len(),
+        request.similarity
+    );
+
+    let start_time = std::time::Instant::now();
+    let app_state = state.app_state.clone();
+
+    // Build parameters for Python command
+    let params = serde_json::json!({
+        "screenshot": request.screenshot,
+        "template": request.template,
+        "similarity": request.similarity,
+        "search_region": request.search_region,
+    });
+
+    // Use spawn_blocking for the synchronous bridge operation
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            // Send command and wait for response (30 second timeout)
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("pattern_find", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!(
+                    "MCP API: Pattern find completed in {}ms",
+                    elapsed.as_millis()
+                );
+
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true,
+                        "matches": [],
+                        "search_time_ms": elapsed.as_millis() as f32
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Pattern find failed".to_string());
+                error!("MCP API: Pattern find failed: {}", error_msg);
+
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false,
+                    "error": error_msg,
+                    "matches": [],
+                    "search_time_ms": elapsed.as_millis() as f32
+                }))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to run pattern find: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Find all matches of template in screenshot
+async fn pattern_find_all(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<PatternMatchRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Pattern find all (screenshot: {} bytes, template: {} bytes, similarity: {}, max_matches: {:?})",
+        request.screenshot.len(),
+        request.template.len(),
+        request.similarity,
+        request.max_matches
+    );
+
+    let start_time = std::time::Instant::now();
+    let app_state = state.app_state.clone();
+
+    // Build parameters for Python command
+    let params = serde_json::json!({
+        "screenshot": request.screenshot,
+        "template": request.template,
+        "similarity": request.similarity,
+        "search_region": request.search_region,
+        "max_matches": request.max_matches.unwrap_or(100),
+    });
+
+    // Use spawn_blocking for the synchronous bridge operation
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            // Send command and wait for response (30 second timeout)
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("pattern_find_all", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    let elapsed = start_time.elapsed();
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!(
+                    "MCP API: Pattern find all completed in {}ms",
+                    elapsed.as_millis()
+                );
+
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true,
+                        "matches": [],
+                        "search_time_ms": elapsed.as_millis() as f32
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Pattern find all failed".to_string());
+                error!("MCP API: Pattern find all failed: {}", error_msg);
+
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false,
+                    "error": error_msg,
+                    "matches": [],
+                    "search_time_ms": elapsed.as_millis() as f32
+                }))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to run pattern find all: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// IPC-Based Screenshot Capture
+// ============================================================================
+
+/// Capture a screenshot via Python IPC (physical pixel resolution)
+async fn capture_screenshot_ipc(
+    app_state: Arc<crate::AppState>,
+    monitor: Option<i32>,
+    format: &str,
+) -> Result<serde_json::Value, String> {
+    let params = serde_json::json!({
+        "monitor": monitor,
+        "format": format,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("IPC: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("capture_screenshot", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                Ok(response.data.unwrap_or(serde_json::json!({"success": true})))
+            } else {
+                Err(response.error.unwrap_or_else(|| "Screenshot capture failed".to_string()))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Get monitors via Python IPC (physical pixel coordinates)
+async fn get_monitors_ipc(
+    app_state: Arc<crate::AppState>,
+) -> Result<serde_json::Value, String> {
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("IPC: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("get_monitors", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                Ok(response.data.unwrap_or(serde_json::json!({"success": true, "monitors": [], "count": 0})))
+            } else {
+                Err(response.error.unwrap_or_else(|| "Get monitors failed".to_string()))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// HTTP endpoint to get monitors via IPC (physical pixel coordinates)
+async fn get_screenshot_monitors_ipc(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Get monitors via IPC");
+
+    match get_monitors_ipc(state.app_state.clone()).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("MCP API: Failed to get monitors via IPC: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Model Management API
+// ============================================================================
+
+/// Request to download a model
+#[derive(Debug, Deserialize)]
+pub struct ModelDownloadRequest {
+    /// Model identifier (e.g., "sam3", "clip_vit_b32")
+    pub model_id: String,
+    /// Force re-download even if already available
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// Request to delete a model
+#[derive(Debug, Deserialize)]
+pub struct ModelDeleteRequest {
+    /// Model identifier
+    pub model_id: String,
+}
+
+/// Request to get model status
+#[derive(Debug, Deserialize)]
+pub struct ModelStatusRequest {
+    /// Model identifier
+    pub model_id: String,
+}
+
+/// List all available models with their download status
+async fn list_models(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: List models");
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("models_list", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true,
+                        "models": []
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "List models failed".to_string());
+                error!("MCP API: List models failed: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to list models: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Download a model (returns when download completes)
+async fn download_model(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ModelDownloadRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Download model {} (force: {})",
+        request.model_id, request.force
+    );
+
+    let app_state = state.app_state.clone();
+    let params = serde_json::json!({
+        "model_id": request.model_id,
+        "force": request.force,
+    });
+
+    // Model downloads can take a long time, use 10 minute timeout
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(600); // 10 minutes
+            bridge.send_command_and_wait("models_download", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: Model download completed");
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Model download failed".to_string());
+                error!("MCP API: Model download failed: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to download model: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Delete a downloaded model
+async fn delete_model(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ModelDeleteRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Delete model {}", request.model_id);
+
+    let app_state = state.app_state.clone();
+    let params = serde_json::json!({
+        "model_id": request.model_id,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("models_delete", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: Model deleted");
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Model delete failed".to_string());
+                error!("MCP API: Model delete failed: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to delete model: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get status of a specific model
+async fn get_model_status(
+    State(state): State<Arc<ApiState>>,
+    Path(model_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Get model status for {}", model_id);
+
+    let app_state = state.app_state.clone();
+    let params = serde_json::json!({
+        "model_id": model_id,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("models_status", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true,
+                        "available": false
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Get model status failed".to_string());
+                error!("MCP API: Get model status failed: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get model status: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get disk usage for all downloaded models
+async fn get_models_disk_usage(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Get models disk usage");
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("models_disk_usage", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true,
+                        "total_bytes": 0,
+                        "models": {}
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Get disk usage failed".to_string());
+                error!("MCP API: Get disk usage failed: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get disk usage: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+// ============================================================================
+// Integration Testing API
+// ============================================================================
+
+/// Request to start an integration test run
+#[derive(Debug, Deserialize)]
+pub struct StartIntegrationTestRequest {
+    /// Name of the test run
+    pub name: String,
+    /// Configuration path being tested (optional)
+    #[serde(default)]
+    pub config_path: Option<String>,
+    /// Test cases to execute
+    #[serde(default)]
+    pub test_cases: Vec<IntegrationTestCase>,
+    /// Additional metadata
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// A test case for integration testing
+#[derive(Debug, Deserialize, Serialize)]
+pub struct IntegrationTestCase {
+    /// Test ID
+    #[serde(default)]
+    pub test_id: Option<String>,
+    /// Test name
+    pub name: String,
+    /// Test description
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Assertions to run
+    #[serde(default)]
+    pub assertions: Vec<IntegrationTestAssertion>,
+    /// Setup actions
+    #[serde(default)]
+    pub setup_actions: Vec<serde_json::Value>,
+    /// Teardown actions
+    #[serde(default)]
+    pub teardown_actions: Vec<serde_json::Value>,
+}
+
+/// An assertion for integration testing
+#[derive(Debug, Deserialize, Serialize)]
+pub struct IntegrationTestAssertion {
+    /// Assertion type: state_reached, element_found, action_performed, etc.
+    #[serde(rename = "type")]
+    pub assertion_type: String,
+    /// Target to verify
+    pub target: String,
+    /// Expected value (optional)
+    #[serde(default)]
+    pub expected: Option<serde_json::Value>,
+    /// Timeout in seconds
+    #[serde(default = "default_assertion_timeout")]
+    pub timeout_seconds: f64,
+}
+
+fn default_assertion_timeout() -> f64 {
+    30.0
+}
+
+/// Request to mock a GUI action
+#[derive(Debug, Deserialize)]
+pub struct MockGuiActionRequest {
+    /// Action type: click, type, screenshot
+    pub action_type: String,
+    /// X coordinate (for click)
+    #[serde(default)]
+    pub x: Option<i32>,
+    /// Y coordinate (for click)
+    #[serde(default)]
+    pub y: Option<i32>,
+    /// Mouse button (for click)
+    #[serde(default)]
+    pub button: Option<String>,
+    /// Click count (for click)
+    #[serde(default)]
+    pub clicks: Option<i32>,
+    /// Text to type (for type action)
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Delay between keystrokes in ms (for type action)
+    #[serde(default)]
+    pub delay_ms: Option<i32>,
+    /// Monitor index (for screenshot)
+    #[serde(default)]
+    pub monitor_index: Option<i32>,
+}
+
+/// Request to find path between states
+#[derive(Debug, Deserialize)]
+pub struct FindPathRequest {
+    /// Source state name or ID
+    pub from_state: String,
+    /// Target state name or ID
+    pub to_state: String,
+}
+
+/// Request to traverse to a state
+#[derive(Debug, Deserialize)]
+pub struct TraverseToStateRequest {
+    /// Target state name or ID
+    pub target_state: String,
+    /// Whether to execute the traversal (false for dry run)
+    #[serde(default = "default_execute")]
+    pub execute: bool,
+}
+
+fn default_execute() -> bool {
+    true
+}
+
+/// Request to set mock mode
+#[derive(Debug, Deserialize)]
+pub struct SetMockModeRequest {
+    /// Mode: disabled, record, playback
+    pub mode: String,
+}
+
+/// Request to run an assertion
+#[derive(Debug, Deserialize)]
+pub struct RunAssertionRequest {
+    /// Assertion type
+    pub assertion_type: String,
+    /// Target to verify
+    pub target: String,
+    /// Expected value
+    #[serde(default)]
+    pub expected: Option<serde_json::Value>,
+    /// Timeout in seconds
+    #[serde(default = "default_assertion_timeout")]
+    pub timeout_seconds: f64,
+}
+
+/// Start an integration test run
+async fn start_integration_test(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartIntegrationTestRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting integration test run: {}",
+        request.name
+    );
+
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "name": request.name,
+        "config_path": request.config_path,
+        "metadata": request.metadata,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("testing_start_run", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: Integration test run started successfully");
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to start test run".to_string());
+                error!("MCP API: Failed to start test run: {}", error_msg);
+                Err((StatusCode::BAD_REQUEST, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start integration test: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get test run status
+async fn get_test_run_status(
+    State(state): State<Arc<ApiState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "run_id": run_id,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_get_status", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "status": "unknown"
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get test results
+async fn get_integration_test_results(
+    State(state): State<Arc<ApiState>>,
+    Path(run_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "run_id": run_id,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("testing_get_results", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "results": []
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// List test runs
+async fn list_integration_test_runs(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+    let limit: i32 = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+
+    let params = serde_json::json!({
+        "limit": limit,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_list_runs", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "runs": []
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Mock a GUI action
+async fn mock_gui_action(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<MockGuiActionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let (command, params) = match request.action_type.as_str() {
+        "click" => {
+            let params = serde_json::json!({
+                "x": request.x.unwrap_or(0),
+                "y": request.y.unwrap_or(0),
+                "button": request.button.unwrap_or_else(|| "left".to_string()),
+                "clicks": request.clicks.unwrap_or(1),
+            });
+            ("testing_mock_click", params)
+        }
+        "type" => {
+            let params = serde_json::json!({
+                "text": request.text.unwrap_or_default(),
+                "delay_ms": request.delay_ms.unwrap_or(50),
+            });
+            ("testing_mock_type", params)
+        }
+        "screenshot" => {
+            let params = serde_json::json!({
+                "monitor_index": request.monitor_index,
+            });
+            ("testing_mock_screenshot", params)
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("Unknown action type: {}", request.action_type))),
+            ));
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait(command, Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": true,
+                    "mocked": true
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get all states for testing
+async fn get_testing_states(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_get_states", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "states": []
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get all transitions for testing
+async fn get_testing_transitions(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_get_transitions", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "transitions": []
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Find path between states
+async fn find_testing_path(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<FindPathRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "from_state": request.from_state,
+        "to_state": request.to_state,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("testing_find_path", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false,
+                    "error": "No path found"
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Traverse to a state
+async fn traverse_to_state(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<TraverseToStateRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "target_state": request.target_state,
+        "execute": request.execute,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(120);
+            bridge.send_command_and_wait("testing_traverse_to_state", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get active states
+async fn get_testing_active_states(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_get_active_states", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "active_states": []
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Set mock mode
+async fn set_testing_mock_mode(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<SetMockModeRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "mode": request.mode,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_set_mock_mode", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": true
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Get mocked actions
+async fn get_mocked_actions(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_get_mocked_actions", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "actions": []
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Clear mocked actions
+async fn clear_mocked_actions(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(10);
+            bridge.send_command_and_wait("testing_clear_mocked_actions", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": true
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// Run an assertion
+async fn run_testing_assertion(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<RunAssertionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "assertion_type": request.assertion_type,
+        "target": request.target,
+        "expected": request.expected,
+        "timeout_seconds": request.timeout_seconds,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(60);
+            bridge.send_command_and_wait("testing_run_assertion", Some(params), timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+/// End an integration test run
+async fn end_integration_test(
+    State(state): State<Arc<ApiState>>,
+    Path(_run_id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+
+            let timeout_duration = std::time::Duration::from_secs(30);
+            bridge.send_command_and_wait("testing_end_run", None, timeout_duration)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if let Some(data) = response.data {
+                Ok(Json(ApiResponse::success(data)))
+            } else {
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": true
+                }))))
+            }
+        }
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
+    }
+}
+
+// ============================================================================
+// Playwright State Collector API
+// ============================================================================
+
+/// Request to start Playwright state collection
+#[derive(Debug, Deserialize)]
+pub struct StartPlaywrightCollectionRequest {
+    /// Target URL to collect from
+    pub url: String,
+    /// Maximum navigation depth (default: 2)
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+    /// Maximum elements per page (default: 50)
+    #[serde(default)]
+    pub max_elements_per_page: Option<i32>,
+    /// Risk level: "safe", "caution", or "dry_run" (default: "safe")
+    #[serde(default)]
+    pub max_risk_level: Option<String>,
+    /// Skip clicking elements (default: false)
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+    /// Verify extractions with pattern matching (default: true)
+    #[serde(default)]
+    pub verify_extractions: Option<bool>,
+    /// Verification similarity threshold (default: 0.85)
+    #[serde(default)]
+    pub verification_threshold: Option<f32>,
+    /// Additional keywords to block
+    #[serde(default)]
+    pub additional_blocked_keywords: Option<Vec<String>>,
+    /// Additional keywords to allow
+    #[serde(default)]
+    pub additional_safe_keywords: Option<Vec<String>>,
+    /// CSS selectors to skip
+    #[serde(default)]
+    pub blocked_selectors: Option<Vec<String>>,
+}
+
+/// Response for Playwright collection status
+#[derive(Debug, Serialize)]
+pub struct PlaywrightCollectionStatusResponse {
+    pub job_id: Option<String>,
+    pub status: String,
+    pub url: Option<String>,
+    pub progress_message: Option<String>,
+    pub progress_percent: Option<i32>,
+    pub error: Option<String>,
+    pub has_results: Option<bool>,
+}
+
+/// Start Playwright state collection
+async fn start_playwright_collection(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartPlaywrightCollectionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting Playwright collection for URL: {}",
+        request.url
+    );
+
+    let app_state = state.app_state.clone();
+
+    // Build parameters for Python command
+    let params = serde_json::json!({
+        "url": request.url,
+        "max_depth": request.max_depth.unwrap_or(2),
+        "max_elements_per_page": request.max_elements_per_page.unwrap_or(50),
+        "max_risk_level": request.max_risk_level.clone().unwrap_or_else(|| "safe".to_string()),
+        "dry_run": request.dry_run.unwrap_or(false),
+        "verify_extractions": request.verify_extractions.unwrap_or(true),
+        "verification_threshold": request.verification_threshold.unwrap_or(0.85),
+        "additional_blocked_keywords": request.additional_blocked_keywords.clone(),
+        "additional_safe_keywords": request.additional_safe_keywords.clone(),
+        "blocked_selectors": request.blocked_selectors.clone(),
+    });
+
+    let timeout = std::time::Duration::from_secs(30);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("start_playwright_collection", Some(params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: Playwright collection started");
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to start Playwright collection".to_string());
+                error!("MCP API: Playwright collection failed to start: {}", error_msg);
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false,
+                    "error": error_msg
+                }))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start Playwright collection: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get Playwright collection status
+async fn get_playwright_collection_status(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+    let job_id = params.get("job_id").cloned();
+
+    let cmd_params = serde_json::json!({
+        "job_id": job_id,
+    });
+
+    let timeout = std::time::Duration::from_secs(10);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command_and_wait("get_playwright_collection_status", Some(cmd_params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "status": "idle",
+                        "job_id": null
+                    }))))
+                }
+            } else {
+                let error_msg = response.error.unwrap_or_else(|| "Unknown error".to_string());
+                error!("MCP API: Playwright collection status error: {}", error_msg);
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "status": "error",
+                    "error": error_msg
+                }))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get Playwright collection status: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get Playwright collection results
+async fn get_playwright_collection_results(
+    State(state): State<Arc<ApiState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+    let job_id = params.get("job_id").cloned();
+
+    let cmd_params = serde_json::json!({
+        "job_id": job_id,
+    });
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            // Use longer timeout for getting results (may include large screenshots)
+            let timeout = std::time::Duration::from_secs(60);
+            bridge.send_command_and_wait("get_playwright_collection_results", Some(cmd_params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": false,
+                        "error": "No results available"
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to get results".to_string());
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "success": false,
+                    "error": error_msg
+                }))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get Playwright collection results: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Stop Playwright collection
+async fn stop_playwright_collection(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Stopping Playwright collection");
+
+    let app_state = state.app_state.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            bridge.send_command("stop_playwright_collection", None)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(_) => {
+            info!("MCP API: Playwright collection stopped");
+            Ok(Json(ApiResponse::success("Playwright collection stopped".to_string())))
+        }
+        Err(e) => {
+            error!("MCP API: Failed to stop Playwright collection: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Request to restart the runner (for AI self-healing workflow)
 #[derive(Debug, Deserialize)]
 pub struct RestartRunnerRequest {
@@ -3690,6 +6358,16 @@ pub struct CreatePromptRequest {
     /// AI model to use
     #[serde(default)]
     pub model: Option<String>,
+    /// Whether this prompt requires the orchestrator for planning and verification
+    /// This is a system-level configuration set at prompt creation time
+    #[serde(default)]
+    pub requires_orchestrator: bool,
+    /// Goal description for the orchestrator (used for planning)
+    #[serde(default)]
+    pub orchestrator_goal: Option<String>,
+    /// Maximum iterations for the orchestrator (default: 10)
+    #[serde(default)]
+    pub orchestrator_max_iterations: Option<u32>,
 }
 
 /// Request to update an existing prompt
@@ -3714,6 +6392,15 @@ pub struct UpdatePromptRequest {
     /// AI model to use
     #[serde(default)]
     pub model: Option<Option<String>>,
+    /// Whether this prompt requires the orchestrator for planning and verification
+    #[serde(default)]
+    pub requires_orchestrator: Option<bool>,
+    /// Goal description for the orchestrator (used for planning)
+    #[serde(default)]
+    pub orchestrator_goal: Option<Option<String>>,
+    /// Maximum iterations for the orchestrator
+    #[serde(default)]
+    pub orchestrator_max_iterations: Option<Option<u32>>,
 }
 
 /// Request to run a prompt
@@ -4045,6 +6732,76 @@ pub struct UpdateScriptletRequest {
     pub tags: Option<Vec<String>>,
 }
 
+// ============================================================================
+// Inline Python Execution Types
+// ============================================================================
+
+/// Request to execute inline Python code
+#[derive(Debug, Deserialize)]
+pub struct InlinePythonRequest {
+    /// Python code to execute
+    pub code: String,
+    /// Optional pip packages to install (uses uvx for isolation)
+    #[serde(default)]
+    pub dependencies: Option<Vec<String>>,
+    /// Execution timeout in seconds (default: 30)
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    /// Working directory for execution (default: temp dir)
+    #[serde(default)]
+    pub working_directory: Option<String>,
+}
+
+/// Response from inline Python execution
+#[derive(Debug, Serialize)]
+pub struct InlinePythonResponse {
+    /// Whether execution succeeded (exit code 0)
+    pub success: bool,
+    /// Stdout from the script
+    pub stdout: String,
+    /// Stderr from the script
+    pub stderr: String,
+    /// Return value if the script returned JSON via __QONTINUI_RETURN__ marker
+    pub return_value: Option<serde_json::Value>,
+    /// Execution duration in milliseconds
+    pub duration_ms: u64,
+}
+
+// ============================================================================
+// Agent Spawning Types
+// ============================================================================
+
+/// Request to spawn a sub-agent
+#[derive(Debug, Deserialize)]
+pub struct SpawnSubAgentRequest {
+    /// Task description for the sub-agent
+    pub task: String,
+    /// List of tool names the sub-agent can use (default: all)
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Maximum iterations for the sub-agent (default: 10)
+    #[serde(default)]
+    pub max_iterations: Option<u32>,
+    /// Additional context to provide to the sub-agent
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// Response from spawning a sub-agent
+#[derive(Debug, Serialize)]
+pub struct SpawnSubAgentResponse {
+    /// Session ID of the spawned agent
+    pub session_id: String,
+    /// Whether the sub-agent completed successfully
+    pub success: bool,
+    /// Output from the sub-agent
+    pub output: String,
+    /// Number of iterations used
+    pub iterations_used: u32,
+    /// Findings reported by the sub-agent
+    pub findings: Vec<serde_json::Value>,
+}
+
 /// Emit AI output event to frontend
 pub fn emit_ai_output(
     app_handle: &tauri::AppHandle,
@@ -4301,12 +7058,92 @@ async fn has_running_ai_tasks_async(db: Arc<CheckpointDb>) -> bool {
     }
 }
 
+/// Migrate JSONL logs to SQLite for a completed task run.
+/// This should be called after a task completes (success or failure) to persist logs.
+async fn migrate_logs_for_task(db: Arc<CheckpointDb>, task_id: &str, workflow_name: Option<String>) {
+    let task_id_owned = task_id.to_string();
+
+    // Get the dev-logs directory path
+    let dev_logs_dir = match std::env::current_exe() {
+        Ok(exe_path) => {
+            // Navigate up to find the parent directory containing .dev-logs
+            let mut current = exe_path.as_path();
+            loop {
+                if let Some(parent) = current.parent() {
+                    let dev_logs = parent.join(".dev-logs");
+                    if dev_logs.exists() {
+                        break dev_logs;
+                    }
+                    // Also check parent's parent (for qontinui_parent_directory)
+                    if let Some(grandparent) = parent.parent() {
+                        let dev_logs = grandparent.join(".dev-logs");
+                        if dev_logs.exists() {
+                            break dev_logs;
+                        }
+                    }
+                    current = parent;
+                } else {
+                    // Fallback to a reasonable default
+                    warn!("Could not find .dev-logs directory, skipping log migration");
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to get executable path for log migration: {}", e);
+            return;
+        }
+    };
+
+    info!("Migrating JSONL logs to SQLite for task run: {}", task_id_owned);
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::log_migration::migrate_logs_to_sqlite(
+            &db,
+            &task_id_owned,
+            &dev_logs_dir,
+            workflow_name.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(migration_result)) => {
+            info!(
+                "Log migration complete for task {}: {} general, {} actions, {} image recognition, {} screenshots, {} playwright",
+                task_id,
+                migration_result.general_events,
+                migration_result.action_events,
+                migration_result.image_recognition_events,
+                migration_result.screenshots,
+                migration_result.playwright_results
+            );
+            if !migration_result.errors.is_empty() {
+                warn!("Log migration had {} errors: {:?}", migration_result.errors.len(), migration_result.errors);
+            }
+        }
+        Ok(Err(e)) => {
+            warn!("Failed to migrate logs for task {}: {}", task_id, e);
+        }
+        Err(e) => {
+            warn!("spawn_blocking error during log migration for task {}: {}", task_id, e);
+        }
+    }
+}
+
 /// Helper function to mark a task run as complete with retry logic.
 /// Retries up to 3 times with exponential backoff (100ms, 200ms, 400ms).
 /// Returns true if successfully marked complete, false otherwise.
+/// Also triggers log migration to persist JSONL logs to SQLite.
 async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> bool {
     let task_id_owned = task_id.to_string();
     let max_retries = 3;
+
+    // Get workflow name before completion for log migration context
+    let workflow_name = db.get_task_run(&task_id_owned)
+        .ok()
+        .flatten()
+        .and_then(|t| t.workflow_name);
 
     for retry in 0..max_retries {
         let db_clone = db.clone();
@@ -4320,6 +7157,10 @@ async fn complete_task_run_with_retry(db: Arc<CheckpointDb>, task_id: &str) -> b
                         task_id_owned, retry
                     );
                 }
+
+                // Migrate logs to SQLite after successful completion
+                migrate_logs_for_task(db.clone(), &task_id_owned, workflow_name).await;
+
                 return true;
             }
             Ok(Err(e)) => {
@@ -4552,6 +7393,9 @@ async fn create_prompt(
         request.max_sessions,
         request.provider,
         request.model,
+        request.requires_orchestrator,
+        request.orchestrator_goal,
+        request.orchestrator_max_iterations,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
@@ -4574,6 +7418,9 @@ async fn update_prompt(
         request.max_sessions,
         request.provider,
         request.model,
+        request.requires_orchestrator,
+        request.orchestrator_goal,
+        request.orchestrator_max_iterations,
     ) {
         Ok(prompt) => Ok(Json(ApiResponse::success(prompt))),
         Err(e) => Err((StatusCode::NOT_FOUND, Json(api_error(e)))),
@@ -4603,8 +7450,9 @@ async fn run_prompt(
     State(state): State<Arc<ApiState>>,
     Json(request): Json<RunPromptRequest>,
 ) -> Result<Json<ApiResponse<RunPromptResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
-    // Determine mode and get prompt name + content
-    let (prompt_name, prompt_content, prompt_id, prompt_max_sessions) =
+    // Determine mode and get prompt name + content + orchestrator config
+    // Orchestrator config is extracted from saved prompts (system-level setting, not user-controllable)
+    let (prompt_name, prompt_content, prompt_id, prompt_max_sessions, requires_orchestrator, orchestrator_goal, orchestrator_max_iterations, orchestrator_verification_first) =
         if let Some(ref id) = request.prompt_id {
             // Mode 1: Lookup from database
             let prompt = prompts::get_prompt(id).ok_or_else(|| {
@@ -4618,10 +7466,14 @@ async fn run_prompt(
                 prompt.content.clone(),
                 Some(prompt.id.clone()),
                 prompt.max_sessions,
+                prompt.requires_orchestrator,
+                prompt.orchestrator_goal.clone(),
+                prompt.orchestrator_max_iterations,
+                prompt.orchestrator_verification_first,
             )
         } else if let (Some(name), Some(content)) = (&request.name, &request.content) {
-            // Mode 2: Ad-hoc prompt
-            (name.clone(), content.clone(), None, None)
+            // Mode 2: Ad-hoc prompt (no orchestrator by default)
+            (name.clone(), content.clone(), None, None, false, None, None, None)
         } else {
             // Invalid: neither mode satisfied
             return Err((
@@ -4780,7 +7632,7 @@ You are being run BY the qontinui-runner. You are a child process of the runner.
 
 **CRITICAL RULES:**
 1. Do NOT restart the qontinui-runner directly - it will kill your session
-2. You CAN restart backend, frontend, and qontinui-api without issues
+2. You CAN restart backend and frontend without issues
 3. If the runner needs to be restarted, USE THE SUPERVISOR API
 
 **Restarting Runner via Supervisor (SAFE):**
@@ -4809,7 +7661,7 @@ You are being run BY the qontinui-runner. You are a child process of the runner.
 
 **CRITICAL RULES:**
 1. Do NOT restart the qontinui-runner directly - it will kill your session
-2. You CAN restart backend, frontend, and qontinui-api without issues
+2. You CAN restart backend and frontend without issues
 3. The supervisor is NOT currently running - if runner restart is needed, inform the user
 
 **If runner restart is needed:**
@@ -4829,6 +7681,21 @@ Tell the user: "The qontinui-runner needs to be restarted manually to apply chan
         context::format_single_context(&multi_step_guide)
     );
     enhanced_prompt = format!("{}{}", multi_step_section, enhanced_prompt);
+
+    // Inject Service Restart Commands context (user override takes precedence)
+    // Replace {{WORKSPACE}} placeholder with actual workspace path
+    let service_restart = context::get_service_restart_commands();
+    let workspace_path = get_workspace_paths_internal()
+        .map(|(root, _, _)| root.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "{{WORKSPACE}}".to_string());
+    let service_restart_content = service_restart.content.replace("{{WORKSPACE}}", &workspace_path);
+    let mut service_restart_with_path = service_restart.clone();
+    service_restart_with_path.content = service_restart_content;
+    let service_restart_section = format!(
+        "{}\n\n---\n\n",
+        context::format_single_context(&service_restart_with_path)
+    );
+    enhanced_prompt = format!("{}{}", service_restart_section, enhanced_prompt);
 
     // Inject configured log sources from active profile if available
     // This tells the AI where to find logs for debugging
@@ -4928,10 +7795,11 @@ If your task requires running visual automation, use the Runner API to execute w
     enhanced_prompt = format!("{}{}", enhanced_prompt, FINDING_INSTRUCTIONS);
 
     info!(
-        "MCP API: Running prompt '{}' (session: {}, max_sessions: {:?}, images: {})",
+        "MCP API: Running prompt '{}' (session: {}, max_sessions: {:?}, requires_orchestrator: {}, images: {})",
         prompt_name,
         session_id,
         max_sessions,
+        requires_orchestrator,
         all_images.len()
     );
 
@@ -4995,117 +7863,401 @@ If your task requires running visual automation, use the Runner API to execute w
         context::record_contexts_used(&used_context_ids);
     }
 
-    let prompt_name_for_state = prompt_name.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
-        let spawn_script = scripts_path.join("spawn-independent-claude.py");
-        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
-        let prompt_file = dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id));
-        let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+    // =========================================================================
+    // EXECUTION PATH ROUTING
+    // =========================================================================
+    // When requires_orchestrator is true, route through the unified session API
+    // which has full orchestrator support (planning, verification, feedback loops).
+    // When false, use the simpler direct spawn path.
+    // =========================================================================
 
-        // Ensure .dev-logs directory exists
-        std::fs::create_dir_all(&dev_logs_path)
-            .map_err(|e| format!("Failed to create dev-logs directory: {}", e))?;
+    if requires_orchestrator {
+        // =====================================================================
+        // ORCHESTRATOR PATH
+        // =====================================================================
+        // Use the unified session API with full orchestrator support.
+        // This path provides:
+        // - Planning agent: Creates verification plan with success criteria
+        // - Verification agent: Runs deterministic checks and AI verification
+        // - Knowledge base: Accumulates findings across iterations
+        // - Feedback loops: Provides guidance when verification fails
+        // =====================================================================
 
-        // Create initial state file
-        let initial_state = serde_json::json!({
-            "session_id": session_id,
-            "task_run_id": session_id,
-            "prompt_id": prompt_id,
-            "prompt_name": prompt_name_for_state,
-            "session_count": 1,
-            "max_sessions": max_sessions,
-            "status": "starting",
-            "started_at": chrono::Utc::now().to_rfc3339(),
-            "stop_requested": false,
-            "current_action": "Initializing",
-            "errors_fixed": [],
-            "errors_remaining": [],
-            "activity_log": []
-        });
-
-        let state_json = serde_json::to_string_pretty(&initial_state)
-            .map_err(|e| format!("Failed to serialize state: {}", e))?;
-        std::fs::write(&state_file, state_json)
-            .map_err(|e| format!("Failed to write state file: {}", e))?;
-
-        // Write enhanced prompt content to file
-        std::fs::write(&prompt_file, &enhanced_prompt)
-            .map_err(|e| format!("Failed to write prompt file: {}", e))?;
-
-        info!("MCP API: State file created: {:?}", state_file);
-        info!("MCP API: Prompt file created: {:?}", prompt_file);
-
-        // Spawn Claude independently using the spawn script
-        // Use spawn_python_with_console to ensure Claude CLI gets a console window
-        let spawn_result = spawn_python_with_console(
-            "python",
-            &[
-                spawn_script.as_os_str(),
-                std::ffi::OsStr::new("--file"),
-                prompt_file.as_os_str(),
-                std::ffi::OsStr::new("--session-id"),
-                std::ffi::OsStr::new(&session_id),
-            ],
-            &workspace_root,
+        info!(
+            "MCP API: Using orchestrator path for prompt '{}' (session: {})",
+            prompt_name, session_id
         );
 
-        match spawn_result {
-            Ok(child) => {
+        // Create session config for the unified session API
+        let session_config = SessionConfig {
+            prompt: enhanced_prompt.clone(),
+            continuation_prompt: None,
+            total_phases: 0, // Unlimited phases within session
+            uses_gui: false,
+            timeout_seconds: 1800, // 30 minutes
+            stall_threshold_seconds: 300,
+            name: prompt_name.clone(),
+            description: String::new(),
+            custom_config: serde_json::json!({}),
+            provider: None,
+            model: None,
+        };
+
+        // Start the session via session manager
+        let session = state.session.start_session(session_config).await.map_err(|e| {
+            error!("MCP API: Failed to start orchestrator session: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to start session: {}", e))),
+            )
+        })?;
+
+        let orchestrator_session_id = session.id.clone();
+        info!("MCP API: Started orchestrator session: {}", orchestrator_session_id);
+
+        // Initialize the orchestrator
+        let orch_goal = orchestrator_goal.clone().unwrap_or_else(|| prompt_content.clone());
+        let orch_max_iterations = orchestrator_max_iterations.unwrap_or(10);
+
+        info!(
+            "MCP API: Initializing orchestrator with goal: {}",
+            &orch_goal[..orch_goal.len().min(100)]
+        );
+
+        let workspace_root_for_orchestrator = get_workspace_paths_internal()
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        // Determine if this workflow should run verification before the first worker
+        let verification_first = orchestrator_verification_first.unwrap_or(false);
+
+        let orchestrator_config = OrchestratorConfig {
+            max_iterations: orch_max_iterations,
+            ai_timeout_seconds: 300,
+            working_directory: workspace_root_for_orchestrator.clone(),
+            enable_planning: true,
+            enable_ai_verification: true,
+            run_initial_verification: verification_first,
+            compression: Some(CompressionConfig::default()),
+            enable_checkpointing: true,
+        };
+
+        let orchestrator = Orchestrator::new(
+            orchestrator_config,
+            state.app_state.checkpoint_db.clone(),
+        );
+
+        // Initialize the orchestrator state with planning
+        match orchestrator.initialize_task(&orchestrator_session_id, &orch_goal) {
+            Ok(mut orch_state) => {
                 info!(
-                    "MCP API: AI Developer spawned with PID: {} for prompt '{}'",
-                    child.id(),
-                    prompt_name_for_state
+                    "MCP API: Orchestrator initialized for session {} with {} success criteria",
+                    orchestrator_session_id,
+                    orch_state.plan.as_ref().map(|p| p.success_criteria.len()).unwrap_or(0)
                 );
-                Ok((
-                    RunPromptResponse {
-                        task_run_id: session_id.clone(),
-                        action_id: session_id.clone(), // Backward compatibility
-                        session_id,
-                        state_file: state_file.to_string_lossy().to_string(),
-                        log_file: log_file.to_string_lossy().to_string(),
-                        pid: Some(child.id()),
-                    },
-                    log_file,
-                    dev_logs_path,
-                ))
+
+                // Run initial verification if configured (for verification-first workflows)
+                if verification_first && orch_state.plan.is_some() {
+                    info!(
+                        "MCP API: Running initial verification for session {} (verification-first mode)",
+                        orchestrator_session_id
+                    );
+
+                    // Need to create orchestrator with output support for emissions
+                    let orchestrator_with_output = Orchestrator::new_with_output(
+                        OrchestratorConfig {
+                            max_iterations: orch_max_iterations,
+                            ai_timeout_seconds: 300,
+                            working_directory: workspace_root_for_orchestrator.clone(),
+                            enable_planning: true,
+                            enable_ai_verification: true,
+                            run_initial_verification: true,
+                            compression: Some(CompressionConfig::default()),
+                            enable_checkpointing: true,
+                        },
+                        state.app_state.checkpoint_db.clone(),
+                        state.app_handle.clone(),
+                        Some(AiOutputSessionContext {
+                            session_id: Some(orchestrator_session_id.clone()),
+                            session_name: Some(prompt_name.clone()),
+                        }),
+                    );
+
+                    match orchestrator_with_output.run_initial_verification(&mut orch_state).await {
+                        Ok(results) => {
+                            info!(
+                                "MCP API: Initial verification complete for session {}: {} passed, {} failed",
+                                orchestrator_session_id,
+                                results.deterministic_results.iter().filter(|r| r.passed).count(),
+                                results.deterministic_results.iter().filter(|r| !r.passed).count()
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "MCP API: Initial verification failed for session {}: {}. Continuing without initial results.",
+                                orchestrator_session_id, e
+                            );
+                        }
+                    }
+                }
+
+                // Store the orchestrator state
+                let mut states = state.orchestrator_states.lock().await;
+                states.insert(orchestrator_session_id.clone(), orch_state);
             }
             Err(e) => {
-                error!("MCP API: Failed to spawn AI Developer: {}", e);
-                Err(format!("Failed to spawn AI Developer: {}", e))
+                warn!(
+                    "MCP API: Failed to initialize orchestrator for session {}: {}. Continuing without orchestrator.",
+                    orchestrator_session_id, e
+                );
             }
         }
-    })
-    .await
-    .map_err(|e| {
-        error!("MCP API: spawn_blocking error: {}", e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(api_error(format!("Internal error: {}", e))),
-        )
-    })?;
 
-    match result {
-        Ok((response, log_file, dev_logs_path)) => {
-            // Start monitoring the task for [TASK_COMPLETE] marker
-            let task_monitor = state.task_monitor.clone();
-            let task_run_id = response.task_run_id.clone();
+        // Get workspace root for execution loop
+        let workspace_root = get_workspace_paths_internal()
+            .map(|(root, _, _)| root.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
 
-            // Spawn monitoring in background
-            tokio::spawn(async move {
-                if let Err(e) = task_monitor
-                    .start_monitoring(&task_run_id, log_file, dev_logs_path)
-                    .await
-                {
-                    error!("Failed to start task monitoring for {}: {}", task_run_id, e);
-                } else {
-                    info!("Started task monitoring for {}", task_run_id);
+        // Clone values for the spawned task
+        let state_clone = state.clone();
+        let session_id_for_loop = orchestrator_session_id.clone();
+        let session_name_for_loop = prompt_name.clone();
+
+        // Spawn the unified session execution loop with orchestrator support
+        tokio::spawn(async move {
+            info!(
+                "MCP API: Starting orchestrator session '{}' (id: {})",
+                session_name_for_loop, session_id_for_loop
+            );
+
+            // Create session context for grouping output
+            let session_ctx = AiOutputSessionContext {
+                session_id: Some(session_id_for_loop.clone()),
+                session_name: Some(session_name_for_loop.clone()),
+            };
+
+            // Run the unified session loop (which integrates with orchestrator)
+            run_unified_session_loop(
+                state_clone.clone(),
+                session_id_for_loop.clone(),
+                workspace_root.clone(),
+                None, // No external checkpoint
+                Some(session_ctx.clone()),
+                None, // Use session_id as task_run_id
+                1,    // First iteration
+            )
+            .await;
+
+            // Cross-session continuation loop for orchestrator tasks
+            loop {
+                let db = match CheckpointDb::new() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Failed to open database for orchestrator session check: {}", e);
+                        break;
+                    }
+                };
+
+                let task = match db.get_task_run(&session_id_for_loop) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => {
+                        info!("Orchestrator task {} not found, exiting loop", session_id_for_loop);
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("Failed to get orchestrator task {}: {}", session_id_for_loop, e);
+                        break;
+                    }
+                };
+
+                // Check if task is complete or stopped
+                if task.status == "completed" || task.status == "failed" || task.status == "stopped" {
+                    info!(
+                        "Orchestrator task {} finished with status: {}",
+                        session_id_for_loop, task.status
+                    );
+                    break;
                 }
+
+                // Check max sessions limit
+                if let Some(max) = max_sessions {
+                    if task.sessions_count >= max {
+                        info!(
+                            "Orchestrator task {} reached max sessions ({})",
+                            session_id_for_loop, max
+                        );
+                        break;
+                    }
+                }
+
+                // Continue with next iteration
+                let next_iteration = task.sessions_count + 1;
+                info!(
+                    "Orchestrator task {} continuing to iteration {}",
+                    session_id_for_loop, next_iteration
+                );
+
+                run_unified_session_loop(
+                    state_clone.clone(),
+                    session_id_for_loop.clone(),
+                    workspace_root.clone(),
+                    None,
+                    Some(session_ctx.clone()),
+                    Some(session_id_for_loop.clone()),
+                    next_iteration,
+                )
+                .await;
+            }
+        });
+
+        // Return response for orchestrator path
+        let (_, dev_logs_path, _) = get_workspace_paths_internal().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get workspace paths: {}", e))),
+            )
+        })?;
+
+        let state_file = dev_logs_path.join(format!("ai-developer-{}.json", orchestrator_session_id));
+        let log_file = dev_logs_path.join(format!("claude-session-{}.log", orchestrator_session_id));
+
+        Ok(Json(ApiResponse::success(RunPromptResponse {
+            task_run_id: orchestrator_session_id.clone(),
+            action_id: orchestrator_session_id.clone(),
+            session_id: orchestrator_session_id,
+            state_file: state_file.to_string_lossy().to_string(),
+            log_file: log_file.to_string_lossy().to_string(),
+            pid: None, // No PID for session-based execution
+        })))
+    } else {
+        // =====================================================================
+        // DIRECT SPAWN PATH
+        // =====================================================================
+        // Use the simpler direct spawn path without orchestrator.
+        // This is faster for simple prompts that don't need verification.
+        // =====================================================================
+
+        info!(
+            "MCP API: Using direct spawn path for prompt '{}' (session: {})",
+            prompt_name, session_id
+        );
+
+        let prompt_name_for_state = prompt_name.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let (workspace_root, dev_logs_path, scripts_path) = get_workspace_paths_internal()?;
+            let spawn_script = scripts_path.join("spawn-independent-claude.py");
+            let state_file = dev_logs_path.join(format!("ai-developer-{}.json", session_id));
+            let prompt_file = dev_logs_path.join(format!("ai-developer-{}-prompt.txt", session_id));
+            let log_file = dev_logs_path.join(format!("claude-session-{}.log", session_id));
+
+            // Ensure .dev-logs directory exists
+            std::fs::create_dir_all(&dev_logs_path)
+                .map_err(|e| format!("Failed to create dev-logs directory: {}", e))?;
+
+            // Create initial state file
+            let initial_state = serde_json::json!({
+                "session_id": session_id,
+                "task_run_id": session_id,
+                "prompt_id": prompt_id,
+                "prompt_name": prompt_name_for_state,
+                "session_count": 1,
+                "max_sessions": max_sessions,
+                "status": "starting",
+                "started_at": chrono::Utc::now().to_rfc3339(),
+                "stop_requested": false,
+                "current_action": "Initializing",
+                "errors_fixed": [],
+                "errors_remaining": [],
+                "activity_log": [],
+                // Orchestrator not used in direct spawn path
+                "requires_orchestrator": false,
+                "orchestrator_goal": null,
+                "orchestrator_max_iterations": null
             });
 
-            Ok(Json(ApiResponse::success(response)))
+            let state_json = serde_json::to_string_pretty(&initial_state)
+                .map_err(|e| format!("Failed to serialize state: {}", e))?;
+            std::fs::write(&state_file, state_json)
+                .map_err(|e| format!("Failed to write state file: {}", e))?;
+
+            // Write enhanced prompt content to file
+            std::fs::write(&prompt_file, &enhanced_prompt)
+                .map_err(|e| format!("Failed to write prompt file: {}", e))?;
+
+            info!("MCP API: State file created: {:?}", state_file);
+            info!("MCP API: Prompt file created: {:?}", prompt_file);
+
+            // Spawn Claude independently using the spawn script
+            // Use spawn_python_with_console to ensure Claude CLI gets a console window
+            let spawn_result = spawn_python_with_console(
+                "python",
+                &[
+                    spawn_script.as_os_str(),
+                    std::ffi::OsStr::new("--file"),
+                    prompt_file.as_os_str(),
+                    std::ffi::OsStr::new("--session-id"),
+                    std::ffi::OsStr::new(&session_id),
+                ],
+                &workspace_root,
+            );
+
+            match spawn_result {
+                Ok(child) => {
+                    info!(
+                        "MCP API: AI Developer spawned with PID: {} for prompt '{}'",
+                        child.id(),
+                        prompt_name_for_state
+                    );
+                    Ok((
+                        RunPromptResponse {
+                            task_run_id: session_id.clone(),
+                            action_id: session_id.clone(), // Backward compatibility
+                            session_id,
+                            state_file: state_file.to_string_lossy().to_string(),
+                            log_file: log_file.to_string_lossy().to_string(),
+                            pid: Some(child.id()),
+                        },
+                        log_file,
+                        dev_logs_path,
+                    ))
+                }
+                Err(e) => {
+                    error!("MCP API: Failed to spawn AI Developer: {}", e);
+                    Err(format!("Failed to spawn AI Developer: {}", e))
+                }
+            }
+        })
+        .await
+        .map_err(|e| {
+            error!("MCP API: spawn_blocking error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Internal error: {}", e))),
+            )
+        })?;
+
+        match result {
+            Ok((response, log_file, dev_logs_path)) => {
+                // Start monitoring the task for [TASK_COMPLETE] marker
+                let task_monitor = state.task_monitor.clone();
+                let task_run_id = response.task_run_id.clone();
+
+                // Spawn monitoring in background
+                tokio::spawn(async move {
+                    if let Err(e) = task_monitor
+                        .start_monitoring(&task_run_id, log_file, dev_logs_path)
+                        .await
+                    {
+                        error!("Failed to start task monitoring for {}: {}", task_run_id, e);
+                    } else {
+                        info!("Started task monitoring for {}", task_run_id);
+                    }
+                });
+
+                Ok(Json(ApiResponse::success(response)))
+            }
+            Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e)))),
     }
 }
 
@@ -5806,6 +8958,328 @@ async fn get_scriptlet_categories(
     Ok(Json(ApiResponse::success(categories)))
 }
 
+// ============================================================================
+// Inline Python Execution
+// ============================================================================
+
+/// Execute inline Python code
+///
+/// This handler allows executing arbitrary Python code with optional dependency
+/// isolation via uvx. The code is wrapped to capture return values if the
+/// script returns a JSON-serializable value.
+async fn execute_inline_python(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<InlinePythonRequest>,
+) -> Result<Json<ApiResponse<InlinePythonResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    use std::time::Instant;
+    use tokio::process::Command;
+    use tokio::time::timeout;
+
+    let start = Instant::now();
+    let timeout_secs = request.timeout_seconds.unwrap_or(30);
+
+    // Determine working directory
+    let working_dir = request
+        .working_directory
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir());
+
+    // Create a temporary script file
+    let script_id = uuid::Uuid::new_v4();
+    let script_path = std::env::temp_dir().join(format!("qontinui_inline_{}.py", script_id));
+
+    // Wrap the code to capture return value
+    // The user's code becomes the body of a __main__ function
+    // If the function returns a value, it's printed with a special marker
+    let indented_code = request
+        .code
+        .lines()
+        .map(|line| format!("    {}", line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let wrapped_code = format!(
+        r#"import json
+import sys
+
+def __qontinui_main__():
+{indented_code}
+
+if __name__ == "__main__":
+    try:
+        result = __qontinui_main__()
+        if result is not None:
+            print("__QONTINUI_RETURN__:" + json.dumps(result))
+    except Exception as e:
+        print(f"Error: {{e}}", file=sys.stderr)
+        sys.exit(1)
+"#,
+        indented_code = indented_code
+    );
+
+    // Write the script to the temp file
+    if let Err(e) = std::fs::write(&script_path, &wrapped_code) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to write script: {}", e))),
+        ));
+    }
+
+    // Build the command - use uvx if dependencies are specified
+    let output_result = if let Some(deps) = &request.dependencies {
+        if !deps.is_empty() {
+            // Use uvx for dependency isolation
+            let deps_str = deps.join(",");
+            let mut cmd = Command::new("uvx");
+            cmd.args(["--with", &deps_str, "python", script_path.to_str().unwrap()])
+                .current_dir(&working_dir)
+                .kill_on_drop(true);
+
+            timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                cmd.output(),
+            )
+            .await
+        } else {
+            // No dependencies, use python directly
+            let mut cmd = Command::new("python");
+            cmd.arg(script_path.to_str().unwrap())
+                .current_dir(&working_dir)
+                .kill_on_drop(true);
+
+            timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                cmd.output(),
+            )
+            .await
+        }
+    } else {
+        // No dependencies, use python directly
+        let mut cmd = Command::new("python");
+        cmd.arg(script_path.to_str().unwrap())
+            .current_dir(&working_dir)
+            .kill_on_drop(true);
+
+        timeout(
+            std::time::Duration::from_secs(timeout_secs),
+            cmd.output(),
+        )
+        .await
+    };
+
+    // Cleanup the temp script
+    let _ = std::fs::remove_file(&script_path);
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    match output_result {
+        Ok(Ok(output)) => {
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            // Parse return value from stdout if present
+            let (stdout_clean, return_value) =
+                if let Some(idx) = stdout.find("__QONTINUI_RETURN__:") {
+                    let (before, after) = stdout.split_at(idx);
+                    let json_str = after.trim_start_matches("__QONTINUI_RETURN__:");
+                    let parsed: Option<serde_json::Value> =
+                        serde_json::from_str(json_str.trim()).ok();
+                    (before.to_string(), parsed)
+                } else {
+                    (stdout, None)
+                };
+
+            Ok(Json(ApiResponse::success(InlinePythonResponse {
+                success: output.status.success(),
+                stdout: stdout_clean,
+                stderr,
+                return_value,
+                duration_ms,
+            })))
+        }
+        Ok(Err(e)) => {
+            // Command failed to execute
+            Ok(Json(ApiResponse::success(InlinePythonResponse {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("Failed to execute: {}", e),
+                return_value: None,
+                duration_ms,
+            })))
+        }
+        Err(_) => {
+            // Timeout
+            Ok(Json(ApiResponse::success(InlinePythonResponse {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("Execution timed out after {} seconds", timeout_secs),
+                return_value: None,
+                duration_ms,
+            })))
+        }
+    }
+}
+
+// ============================================================================
+// Agent Spawning
+// ============================================================================
+
+/// Spawn a sub-agent with a specific task
+///
+/// This handler creates a new AI session with a focused task and optionally
+/// restricted tool access. The sub-agent runs autonomously via the session
+/// manager and returns when complete.
+async fn spawn_sub_agent(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<SpawnSubAgentRequest>,
+) -> Result<Json<ApiResponse<SpawnSubAgentResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let max_iterations = request.max_iterations.unwrap_or(10);
+
+    // Build the sub-agent prompt with tool restrictions
+    let tool_instructions = if let Some(tools) = &request.tools {
+        if tools.is_empty() {
+            "You have access to all available tools.".to_string()
+        } else {
+            format!(
+                "You have access ONLY to these tools: {}. Do not attempt to use other tools.",
+                tools.join(", ")
+            )
+        }
+    } else {
+        "You have access to all available tools.".to_string()
+    };
+
+    let context_section = request
+        .context
+        .as_ref()
+        .map(|c| format!("\n## Additional Context\n{}\n", c))
+        .unwrap_or_default();
+
+    let prompt = format!(
+        r#"You are a sub-agent with a specific task. Complete the task and report your findings.
+
+## Task
+{task}
+{context_section}
+## Tool Access
+{tool_instructions}
+
+## Instructions
+1. Complete the task using available tools
+2. Be thorough but efficient
+3. Report any findings or issues discovered
+4. When done, summarize what was accomplished
+
+## Output Format
+When you complete the task, include a summary line starting with [TASK_COMPLETE] followed by a brief summary.
+If you encounter issues, include them in your response.
+"#,
+        task = request.task,
+        context_section = context_section,
+        tool_instructions = tool_instructions,
+    );
+
+    info!(
+        "Spawning sub-agent with task: {} (max_iterations: {})",
+        request.task.chars().take(100).collect::<String>(),
+        max_iterations
+    );
+
+    // Create a new session via the session manager
+    let session_manager = &state.session;
+
+    // Generate a session name
+    let session_name = format!("sub-agent-{}", uuid::Uuid::new_v4());
+
+    // Create session config
+    let session_config = SessionConfig {
+        prompt,
+        continuation_prompt: None,
+        total_phases: max_iterations,
+        uses_gui: false,
+        timeout_seconds: 300, // 5 minutes per iteration
+        stall_threshold_seconds: 60,
+        name: session_name.clone(),
+        description: format!("Sub-agent task: {}", request.task.chars().take(50).collect::<String>()),
+        custom_config: serde_json::json!({}),
+        provider: None,
+        model: None,
+    };
+
+    // Start the session
+    match session_manager.start_session(session_config).await {
+        Ok(session) => {
+            let session_id = session.id.clone();
+
+            // Wait for session completion
+            let mut iterations_used = 0u32;
+            let mut output = String::new();
+            let mut success = false;
+
+            // Poll for completion (simplified - in production you'd use proper async waiting)
+            for i in 0..max_iterations {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                iterations_used = i + 1;
+
+                // Check session status
+                if let Some(session_info) = session_manager.get_session(&session_id).await {
+                    // Collect output from event log
+                    output = session_info
+                        .event_log
+                        .iter()
+                        .map(|event| event.message.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    match session_info.status {
+                        crate::session::SessionStatus::Completed
+                        | crate::session::SessionStatus::Stopped => {
+                            success = output.contains("[TASK_COMPLETE]");
+                            break;
+                        }
+                        crate::session::SessionStatus::Failed => {
+                            success = false;
+                            break;
+                        }
+                        _ => {
+                            // Still running, continue waiting
+                        }
+                    }
+                } else {
+                    // Session not found
+                    break;
+                }
+            }
+
+            // Parse findings from output (look for [FINDING:...] patterns)
+            let findings: Vec<serde_json::Value> = output
+                .lines()
+                .filter(|line| line.contains("[FINDING:"))
+                .map(|line| {
+                    serde_json::json!({
+                        "raw": line.trim()
+                    })
+                })
+                .collect();
+
+            Ok(Json(ApiResponse::success(SpawnSubAgentResponse {
+                session_id,
+                success,
+                output,
+                iterations_used,
+                findings,
+            })))
+        }
+        Err(e) => {
+            error!("Failed to spawn sub-agent: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to spawn sub-agent: {}", e))),
+            ))
+        }
+    }
+}
+
 /// Search scriptlets
 async fn search_scriptlets(
     State(_state): State<Arc<ApiState>>,
@@ -6218,6 +9692,32 @@ struct StartSessionRequest {
     /// Whether to capture input for validation (comparing reported vs actual positions)
     #[serde(default)]
     capture_input_validation: bool,
+
+    /// Maximum number of cross-session iterations (None = unlimited)
+    #[serde(default)]
+    max_sessions: Option<u32>,
+
+    // Orchestrator configuration
+    /// Enable the task orchestrator for planning and verification
+    /// When enabled, the orchestrator will:
+    /// - Create a verification plan at task start
+    /// - Inject plan context into worker prompts
+    /// - Process worker signals (WORK_COMPLETE, NEED_REPLAN, findings)
+    /// - Run verification when work is complete
+    /// - Provide feedback for failed verification
+    #[serde(default)]
+    enable_orchestrator: bool,
+    /// Goal description for the orchestrator (used for planning)
+    /// If not provided, the prompt will be used as the goal
+    #[serde(default)]
+    orchestrator_goal: Option<String>,
+    /// Maximum iterations for the orchestrator (default: 10)
+    #[serde(default)]
+    orchestrator_max_iterations: Option<u32>,
+    /// Whether to run verification before the first worker iteration
+    /// For non-automation workflows, verification identifies what needs fixing
+    #[serde(default)]
+    orchestrator_verification_first: Option<bool>,
 }
 
 fn default_phase_field() -> String {
@@ -6321,7 +9821,11 @@ async fn start_session(
                 .next()
                 .unwrap_or("0000")
         );
-        let executor = StepExecutor::new(state.app_state.clone(), state.config_storage.clone());
+        let executor = StepExecutor::with_app_handle(
+            state.app_state.clone(),
+            state.config_storage.clone(),
+            state.app_handle.clone(),
+        );
         executor
             .execute_steps_with_log_sources(
                 &request.execution_steps,
@@ -6478,10 +9982,22 @@ async fn start_session(
         )
     };
 
+    // When execution_steps are configured, limit to 1 phase per session
+    // This allows the cross-session loop to re-run automation between each phase
+    // giving the AI fresh data (new screenshots) to verify its changes worked
+    let effective_total_phases = if !request.execution_steps.is_empty() {
+        // With execution steps, each session should only run 1 phase
+        // so automation is re-run before the next AI session
+        1
+    } else {
+        // Without execution steps, use the requested total_phases
+        request.total_phases
+    };
+
     let config = SessionConfig {
         prompt: final_prompt_with_results,
         continuation_prompt: request.continuation_prompt,
-        total_phases: request.total_phases,
+        total_phases: effective_total_phases,
         uses_gui: request.uses_gui,
         timeout_seconds: request.timeout_seconds,
         stall_threshold_seconds: 300,
@@ -6507,7 +10023,7 @@ async fn start_session(
                 "task", // task_type
                 None,   // config_id
                 None,   // workflow_name
-                None,   // max_sessions - None means unlimited
+                request.max_sessions, // max_sessions from request (None = unlimited)
                 None,   // auto_continue - defaults to true
                 execution_steps_json.clone(),
                 log_sources_json.clone(),
@@ -6519,6 +10035,75 @@ async fn start_session(
                 // Continue anyway - session will still run, just without auto-continue tracking
             } else {
                 info!("Created task_run {} for session tracking", task_run_id);
+            }
+
+            // Initialize orchestrator if enabled
+            let enable_orchestrator = request.enable_orchestrator;
+            let orchestrator_goal = request.orchestrator_goal.clone()
+                .unwrap_or_else(|| prompt_for_task_run.clone());
+            let orchestrator_max_iterations = request.orchestrator_max_iterations.unwrap_or(10);
+
+            if enable_orchestrator {
+                info!(
+                    "Initializing orchestrator for task {} with goal: {}",
+                    task_run_id,
+                    &orchestrator_goal[..orchestrator_goal.len().min(100)]
+                );
+
+                let workspace_root_for_orchestrator = get_workspace_paths_internal()
+                    .map(|(root, _, _)| root.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string());
+
+                let verification_first = request.orchestrator_verification_first.unwrap_or(false);
+
+                let orchestrator_config = OrchestratorConfig {
+                    max_iterations: orchestrator_max_iterations,
+                    ai_timeout_seconds: 300,
+                    working_directory: workspace_root_for_orchestrator.clone(),
+                    enable_planning: true,
+                    enable_ai_verification: true,
+                    run_initial_verification: verification_first,
+                    compression: Some(CompressionConfig::default()),
+                    enable_checkpointing: true,
+                };
+
+                let orchestrator = Orchestrator::new(
+                    orchestrator_config,
+                    state.app_state.checkpoint_db.clone(),
+                );
+
+                // Initialize the orchestrator state with planning
+                match orchestrator.initialize_task(&task_run_id, &orchestrator_goal) {
+                    Ok(orch_state) => {
+                        info!(
+                            "Orchestrator initialized for task {} with {} success criteria",
+                            task_run_id,
+                            orch_state.plan.as_ref().map(|p| p.success_criteria.len()).unwrap_or(0)
+                        );
+
+                        // Run initial verification if configured (for verification-first workflows)
+                        // Note: This is a blocking call because we're in a synchronous context
+                        if verification_first && orch_state.plan.is_some() {
+                            info!(
+                                "Running initial verification for task {} (verification-first mode)",
+                                task_run_id
+                            );
+                            // Initial verification will be run when the orchestrator state is loaded
+                            // in the async context of the session loop
+                        }
+
+                        // Store the orchestrator state
+                        let mut states = state.orchestrator_states.blocking_lock();
+                        states.insert(task_run_id.clone(), orch_state);
+                    }
+                    Err(e) => {
+                        // Log error but continue without orchestrator
+                        warn!(
+                            "Failed to initialize orchestrator for task {}: {}. Continuing without orchestrator.",
+                            task_run_id, e
+                        );
+                    }
+                }
             }
 
             // Spawn the execution loop
@@ -6551,54 +10136,314 @@ async fn start_session(
                 // Max sessions is a safety limit to prevent infinite loops.
                 // =====================================================================
 
-                // Simple session execution - task_runs table handles state tracking
-                // The TaskMonitor captures output to task_runs.output_log
-                // [TASK_COMPLETE] in output signals completion
-                // Startup resume handles continuation after restart
-
                 info!("Starting session '{}' (id: {})", session_name, session_id);
 
                 // Log session start
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
-                    .open(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log") {
+                    .open(crate::paths::get_workflow_debug_log_path()) {
                     use std::io::Write;
                     let _ = writeln!(f, "[{}] START_SESSION: name={}, id={}",
                         chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
                         session_name, session_id);
                 }
 
-                // Create session context for grouping output
+                // Track the current task_id for this session
+                let task_id = session_id.clone();
+
+                // Create initial session context for grouping output
                 let session_ctx = AiOutputSessionContext {
                     session_id: Some(session_id.clone()),
                     session_name: Some(session_name.clone()),
                 };
 
-                // Run the session
+                // Run the FIRST session with the original prompt (which already includes pre-execution results)
                 run_unified_session_loop(
                     state_clone.clone(),
                     session_id.clone(),
                     workspace_root.clone(),
                     None, // No external checkpoint - database tracks state
-                    Some(session_ctx),
+                    Some(session_ctx.clone()),
                     None, // No task_run_id - use session_id
+                    1,    // First iteration
                 )
                 .await;
 
-                // Safety net: ensure database status is updated when session loop exits
-                // The session loop should handle this, but we add a fallback in case of
-                // early returns or errors that don't update the status
-                if let Ok(db) = CheckpointDb::new() {
-                    if let Ok(Some(task)) = db.get_task_run(&session_id) {
-                        if task.status == "running" {
-                            info!("Session '{}' exited but status still 'running', marking as complete", session_name);
-                            if let Err(e) = db.complete_task_run(&session_id) {
-                                warn!("Failed to mark session {} as complete: {}", session_id, e);
+                // Cross-session continuation loop
+                // After the first session, this loop handles continuation across sessions
+                // re-executing automation between each to get fresh data
+                loop {
+                    // Check if task was stopped or completed
+                    let db = match CheckpointDb::new() {
+                        Ok(d) => d,
+                        Err(e) => {
+                            warn!("Failed to open database for session check: {}", e);
+                            break;
+                        }
+                    };
+
+                    let task = match db.get_task_run(&task_id) {
+                        Ok(Some(t)) => t,
+                        Ok(None) => {
+                            info!("Task {} not found, exiting continuation loop", task_id);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("Failed to get task {}: {}", task_id, e);
+                            break;
+                        }
+                    };
+
+                    // Check termination conditions
+                    if task.status == "completed" || task.status == "stopped" {
+                        info!("Task {} is {}, exiting continuation loop", task_id, task.status);
+                        break;
+                    }
+
+                    if !task.auto_continue {
+                        info!("Task {} has auto_continue disabled, exiting continuation loop", task_id);
+                        // Mark as completed since we're not continuing
+                        if let Err(e) = db.complete_task_run(&task_id) {
+                            warn!("Failed to mark task {} as complete: {}", task_id, e);
+                        }
+                        break;
+                    }
+
+                    // Check max_sessions limit
+                    if let Some(max) = task.max_sessions {
+                        if task.sessions_count >= max {
+                            info!("Task {} reached max sessions ({}/{}), exiting", task_id, task.sessions_count, max);
+                            if let Err(e) = db.complete_task_run(&task_id) {
+                                warn!("Failed to mark task {} as complete: {}", task_id, e);
                             }
+                            break;
+                        }
+                    }
+
+                    // =====================================================================
+                    // Re-execute deterministic steps BEFORE starting AI session
+                    // =====================================================================
+                    let iteration = task.sessions_count + 1;
+                    info!("Cross-session continuation: Starting iteration {} for task '{}'", iteration, task.task_name);
+
+                    // Log iteration start
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                        .open(crate::paths::get_workflow_debug_log_path()) {
+                        use std::io::Write;
+                        let _ = writeln!(f, "[{}] CROSS_SESSION_ITERATION: task={}, iteration={}",
+                            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                            task_id, iteration);
+                    }
+
+                    let execution_summary = if let Some(ref steps_json) = task.execution_steps_json {
+                        match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
+                            Ok(execution_steps) if !execution_steps.is_empty() => {
+                                info!("Re-executing {} deterministic steps for iteration {}", execution_steps.len(), iteration);
+
+                                // Parse log sources if present
+                                let log_sources: Vec<LogSourceConfig> = task
+                                    .log_sources_json
+                                    .as_ref()
+                                    .and_then(|json| serde_json::from_str(json).ok())
+                                    .unwrap_or_default();
+
+                                // Create a temp session ID for screenshot naming
+                                let temp_session_id = format!(
+                                    "iter-{}-{}",
+                                    iteration,
+                                    uuid::Uuid::new_v4()
+                                        .to_string()
+                                        .split('-')
+                                        .next()
+                                        .unwrap_or("0000")
+                                );
+
+                                // Execute steps using StepExecutor
+                                let executor = StepExecutor::with_app_handle(
+                                    state_clone.app_state.clone(),
+                                    state_clone.config_storage.clone(),
+                                    state_clone.app_handle.clone(),
+                                )
+                                .with_task_run_id(task_id.clone());
+                                let execution_result = executor
+                                    .execute_steps_for_iteration(
+                                        &execution_steps,
+                                        &temp_session_id,
+                                        &log_sources,
+                                        iteration,
+                                    )
+                                    .await;
+
+                                // Generate execution summary using IterationBundle
+                                if !execution_result.steps.is_empty() {
+                                    let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
+                                    let timestamp_now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+                                    let mut bundle = IterationBundle::new(
+                                        iteration,
+                                        task_id.clone(),
+                                        timestamp_now.clone(),
+                                        timestamp_now,
+                                        &execution_result,
+                                        &relevant_logs,
+                                    );
+
+                                    // Add application logs if captured
+                                    if let Some(ref captured) = execution_result.captured_logs {
+                                        bundle.add_application_logs(&captured.sources, &log_sources);
+                                    }
+
+                                    // Add runner logs if captured
+                                    if let Some(ref runner_logs) = execution_result.captured_runner_logs {
+                                        bundle.add_gui_automation_logs(
+                                            runner_logs.actions.clone(),
+                                            runner_logs.image_recognition.clone(),
+                                        );
+                                    }
+
+                                    bundle.to_markdown()
+                                } else {
+                                    String::new()
+                                }
+                            }
+                            Ok(_) => String::new(),
+                            Err(e) => {
+                                warn!("Failed to parse execution_steps_json: {}", e);
+                                String::new()
+                            }
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    // Build continuation prompt
+                    let consolidated_output = log_consolidation::get_consolidated_output_for_task(
+                        &task.created_at,
+                        task.completed_at.as_deref(),
+                    );
+
+                    // Get findings context from database
+                    let findings_context = db
+                        .format_findings_for_continuation_prompt(&task_id)
+                        .unwrap_or_else(|e| {
+                            warn!("Failed to get findings context: {}", e);
+                            String::new()
+                        });
+
+                    let has_execution_steps = task.execution_steps_json.as_ref().is_some_and(|json| {
+                        serde_json::from_str::<Vec<serde_json::Value>>(json)
+                            .is_ok_and(|steps| !steps.is_empty())
+                    });
+
+                    let pre_execution_message = if has_execution_steps && !execution_summary.is_empty() {
+                        "\
+                        **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
+                        The Pre-Execution Results section below shows FRESH results from this iteration.\n\n\
+                        Review these NEW results to verify if your previous changes worked.\n\n"
+                            .to_string()
+                    } else if has_execution_steps {
+                        "\
+                        **NOTE:** Pre-execution steps were configured but produced no results.\n\n"
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+
+                    let mut continuation_prompt = format!(
+                        "{}\n\n## Cross-Session Continuation (Iteration #{})\n\n{}\
+                        Previous session output:\n\n{}\n\n",
+                        task.prompt.as_deref().unwrap_or(""),
+                        iteration,
+                        pre_execution_message,
+                        consolidated_output
+                    );
+
+                    if !findings_context.is_empty() {
+                        continuation_prompt.push_str(&findings_context);
+                        continuation_prompt.push_str("\n\n");
+                    }
+
+                    if !execution_summary.is_empty() {
+                        continuation_prompt.push_str(&execution_summary);
+                        continuation_prompt.push_str("\n\n");
+                    }
+
+                    continuation_prompt.push_str(FINDING_INSTRUCTIONS);
+                    continuation_prompt.push_str("\nContinue the task. When the goal is VERIFIED achieved, print [TASK_COMPLETE].\n");
+
+                    // Each continuation session runs exactly 1 phase
+                    // This ensures automation is re-run before the next AI session
+                    // giving fresh data (new screenshots) to verify changes worked
+
+                    // Create new session config
+                    let session_config = SessionConfig {
+                        prompt: continuation_prompt,
+                        continuation_prompt: None,
+                        total_phases: 1, // Always 1 phase - automation re-runs between sessions
+                        uses_gui: false,
+                        timeout_seconds: 600,
+                        stall_threshold_seconds: 300,
+                        name: format!("{} (iteration {})", task.task_name, iteration),
+                        description: format!("Cross-session continuation - iteration #{}", iteration),
+                        custom_config: serde_json::json!({}),
+                        provider: None,
+                        model: None,
+                    };
+
+                    // Create session context
+                    let session_ctx = AiOutputSessionContext {
+                        session_id: Some(task_id.clone()),
+                        session_name: Some(task.task_name.clone()),
+                    };
+
+                    // Start the new session
+                    match state_clone.session.start_session(session_config).await {
+                        Ok(new_session) => {
+                            info!("Started iteration {} session {} for task '{}'", iteration, new_session.id, task.task_name);
+
+                            emit_ai_output(
+                                &state_clone.app_handle,
+                                &format!("🔄 Starting iteration {} for '{}'", iteration, task.task_name),
+                                "status",
+                                None,
+                                Some(&session_ctx),
+                            );
+
+                            // Increment session count
+                            if let Err(e) = db.append_task_output(&task_id, "", true) {
+                                warn!("Failed to increment session count: {}", e);
+                            }
+
+                            // Run the session loop
+                            run_unified_session_loop(
+                                state_clone.clone(),
+                                new_session.id.clone(),
+                                workspace_root.clone(),
+                                None,
+                                Some(session_ctx.clone()),
+                                Some(task_id.clone()), // Use original task ID
+                                iteration,             // Pass iteration number for display
+                            )
+                            .await;
+
+                            info!("Iteration {} session completed", iteration);
+
+                            // Continue the loop - will check task status and decide if more iterations needed
+                        }
+                        Err(e) => {
+                            error!("Failed to start iteration {} session: {}", iteration, e);
+                            emit_ai_output(
+                                &state_clone.app_handle,
+                                &format!("❌ Failed to start iteration {}: {}", iteration, e),
+                                "error",
+                                None,
+                                Some(&session_ctx),
+                            );
+                            break;
                         }
                     }
                 }
 
-                info!("Session '{}' completed", session_name);
+                info!("Session '{}' cross-session loop completed", session_name);
             });
 
             Ok(Json(ApiResponse::success(StartSessionResponse { session })))
@@ -6615,10 +10460,67 @@ async fn stop_session(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(session_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<Option<Session>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Stopping session: {}", session_id);
+
+    // Kill all tracked AI processes (same logic as stop_ai_analysis)
+    // This ensures the actual Claude CLI process is terminated
+    let pids_to_kill: Vec<u32> = {
+        let mut pids = state.current_ai_pids.lock().unwrap();
+        let pids_copy = pids.clone();
+        pids.clear();
+        pids_copy
+    };
+
+    let mut killed_count = 0;
+    for pid in &pids_to_kill {
+        info!("Killing AI process PID {} for session {}", pid, session_id);
+        let result = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("Successfully killed process tree for PID {}", pid);
+                    killed_count += 1;
+                } else {
+                    // Process may have already exited
+                    killed_count += 1;
+                }
+            }
+            Err(e) => {
+                error!("Failed to execute taskkill for PID {}: {}", pid, e);
+            }
+        }
+    }
+
+    // Stop monitoring for this task
+    if let Err(e) = state.task_monitor.stop_monitoring(&session_id).await {
+        warn!("Failed to stop monitoring for {}: {}", session_id, e);
+    }
+
+    // Mark task_run as stopped in database (session_id == task_run_id for unified sessions)
+    if let Err(e) = state.app_state.checkpoint_db.stop_task_run(&session_id) {
+        warn!("Failed to stop task_run {}: {}", session_id, e);
+    }
+
+    // Stop the session
     let session = state
         .session
         .stop_session(&session_id, "Stopped by user")
         .await;
+
+    // Emit status to frontend
+    emit_ai_output(
+        &state.app_handle,
+        &format!("🛑 Session {} stopped (killed {} process(es))", session_id, killed_count),
+        "status",
+        Some(&session_id),
+        None,
+    );
+
+    info!("Session {} stopped, killed {} process(es)", session_id, killed_count);
+
     Ok(Json(ApiResponse::success(session)))
 }
 
@@ -6631,31 +10533,61 @@ async fn delete_session(
     Ok(Json(ApiResponse::success(())))
 }
 
-/// Check if AI output contains goal completion markers
-/// Returns true if any marker indicates the goal has been achieved
-fn check_goal_completion_markers(output: &str) -> bool {
-    // List of markers that indicate goal completion
-    // Claude should output one of these when the goal is achieved
-    // NOTE: [TASK_COMPLETE] is the canonical marker used by TaskMonitor and prompts
-    let completion_markers = [
-        "[TASK_COMPLETE]", // Primary marker - used by TaskMonitor and prompts
+/// Result of parsing worker output for signals
+#[derive(Debug, Clone)]
+enum WorkerOutputSignal {
+    /// Worker signals work is complete, ready for verification
+    WorkComplete { reason: Option<String> },
+    /// Worker requests replan
+    NeedReplan { reason: String },
+    /// Legacy task complete marker (deprecated but still supported)
+    TaskComplete,
+    /// No signal found, worker continues
+    Continue,
+}
+
+/// Parse worker output for orchestrator signals
+/// This is the primary signal detection used by the orchestrator architecture
+fn parse_worker_output_signal(output: &str) -> WorkerOutputSignal {
+    // First check for the new orchestrator signals
+    if let Some(signal) = WorkerSignal::parse_from_output(output) {
+        match signal {
+            WorkerSignal::WorkComplete { reason } => {
+                info!("Worker signal detected: [WORK_COMPLETE]");
+                return WorkerOutputSignal::WorkComplete { reason };
+            }
+            WorkerSignal::NeedReplan { reason } => {
+                info!("Worker signal detected: [NEED_REPLAN] - {}", reason);
+                return WorkerOutputSignal::NeedReplan { reason };
+            }
+            WorkerSignal::Finding(_) => {
+                // Findings don't terminate the loop, they're just recorded
+            }
+            WorkerSignal::Continue => {}
+        }
+    }
+
+    // Check for legacy TASK_COMPLETE marker (deprecated but supported for backward compatibility)
+    let output_upper = output.to_uppercase();
+    let legacy_markers = [
+        "[TASK_COMPLETE]",
         "[GOAL_COMPLETE]",
         "[GOAL_ACHIEVED]",
         "[STOP_SESSION]",
         "[SESSION_COMPLETE]",
     ];
 
-    // Check for explicit markers (case-insensitive)
-    let output_upper = output.to_uppercase();
-    for marker in &completion_markers {
+    for marker in &legacy_markers {
         if output_upper.contains(marker) {
-            info!("Goal completion marker detected: {}", marker);
-            return true;
+            info!("Legacy completion marker detected: {} - treating as WORK_COMPLETE", marker);
+            // Treat legacy markers as WORK_COMPLETE so verification still runs
+            return WorkerOutputSignal::WorkComplete {
+                reason: Some(format!("Legacy marker: {}", marker))
+            };
         }
     }
 
-    // Also check for common completion patterns in structured output
-    // These patterns appear in Claude's session summaries
+    // Check for structured completion patterns
     let completion_patterns = [
         r#""goal_achieved":\s*true"#,
         r#""goal_achieved": true"#,
@@ -6667,13 +10599,201 @@ fn check_goal_completion_markers(output: &str) -> bool {
     for pattern in &completion_patterns {
         if let Ok(re) = Regex::new(pattern) {
             if re.is_match(output) {
-                info!("Goal completion pattern detected: {}", pattern);
-                return true;
+                info!("Goal completion pattern detected: {} - treating as WORK_COMPLETE", pattern);
+                return WorkerOutputSignal::WorkComplete {
+                    reason: Some(format!("Pattern match: {}", pattern))
+                };
             }
         }
     }
 
-    false
+    WorkerOutputSignal::Continue
+}
+
+/// Check if AI output contains goal completion markers
+/// Returns true if any marker indicates the goal has been achieved
+/// NOTE: This is kept for backward compatibility but parse_worker_output_signal should be preferred
+fn check_goal_completion_markers(output: &str) -> bool {
+    matches!(
+        parse_worker_output_signal(output),
+        WorkerOutputSignal::WorkComplete { .. } | WorkerOutputSignal::TaskComplete
+    )
+}
+
+/// Result of running deterministic verification
+#[derive(Debug, Clone)]
+struct DeterministicVerificationResult {
+    /// Whether all CRITICAL checks passed (non-critical failures are informational)
+    all_passed: bool,
+    /// Summary of what was checked
+    checks_run: Vec<String>,
+    /// Details of CRITICAL failures (these block completion)
+    critical_failures: Vec<String>,
+    /// Details of non-critical failures (informational only)
+    non_critical_failures: Vec<String>,
+    /// Raw output from checks
+    raw_output: String,
+}
+
+/// Run deterministic verification for a task
+/// This runs build, tests, type checks, etc. before allowing task completion
+///
+/// IMPORTANT: Tests have an `is_critical` flag. Only critical test failures
+/// block task completion. Non-critical failures are reported but don't fail verification.
+async fn run_deterministic_verification(
+    workspace_root: &str,
+    _verification_config: Option<&serde_json::Value>,
+) -> DeterministicVerificationResult {
+    let _verifier = DeterministicVerifier::new(workspace_root.to_string());
+    let mut checks_run = Vec::new();
+    let mut critical_failures = Vec::new();
+    let non_critical_failures: Vec<String> = Vec::new();
+    let mut raw_output = String::new();
+
+    // For Phase 1: Run basic build checks
+    // Build checks are always CRITICAL - if the code doesn't compile, verification fails
+    let workspace = std::path::Path::new(workspace_root);
+
+    // Check for npm project
+    if workspace.join("package.json").exists() {
+        checks_run.push("npm build (critical)".to_string());
+        info!("Running npm build verification in {}", workspace_root);
+
+        let output = if cfg!(target_os = "windows") {
+            std::process::Command::new("cmd")
+                .args(["/C", "npm run build"])
+                .current_dir(workspace_root)
+                .output()
+        } else {
+            std::process::Command::new("sh")
+                .args(["-c", "npm run build"])
+                .current_dir(workspace_root)
+                .output()
+        };
+
+        match output {
+            Ok(result) => {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                raw_output.push_str(&format!("=== npm build (CRITICAL) ===\nExit: {}\nStdout:\n{}\nStderr:\n{}\n\n",
+                    result.status.code().unwrap_or(-1), stdout, stderr));
+
+                if !result.status.success() {
+                    critical_failures.push(format!("npm build failed with exit code {}", result.status.code().unwrap_or(-1)));
+                    // Extract error lines
+                    for line in stderr.lines().chain(stdout.lines()) {
+                        let lower = line.to_lowercase();
+                        if lower.contains("error") || lower.contains("failed") {
+                            critical_failures.push(line.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                critical_failures.push(format!("Failed to run npm build: {}", e));
+            }
+        }
+    }
+
+    // Check for Cargo project
+    if workspace.join("Cargo.toml").exists() {
+        checks_run.push("cargo check (critical)".to_string());
+        info!("Running cargo check verification in {}", workspace_root);
+
+        let output = std::process::Command::new("cargo")
+            .args(["check"])
+            .current_dir(workspace_root)
+            .output();
+
+        match output {
+            Ok(result) => {
+                let stdout = String::from_utf8_lossy(&result.stdout);
+                let stderr = String::from_utf8_lossy(&result.stderr);
+                raw_output.push_str(&format!("=== cargo check (CRITICAL) ===\nExit: {}\nStdout:\n{}\nStderr:\n{}\n\n",
+                    result.status.code().unwrap_or(-1), stdout, stderr));
+
+                if !result.status.success() {
+                    critical_failures.push(format!("cargo check failed with exit code {}", result.status.code().unwrap_or(-1)));
+                    // Extract error lines
+                    for line in stderr.lines() {
+                        if line.contains("error[E") || line.starts_with("error:") {
+                            critical_failures.push(line.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                critical_failures.push(format!("Failed to run cargo check: {}", e));
+            }
+        }
+    }
+
+    // If no build system found, verification passes by default
+    if checks_run.is_empty() {
+        checks_run.push("(no build system detected)".to_string());
+        raw_output.push_str("No package.json or Cargo.toml found. Skipping build verification.\n");
+    }
+
+    // TODO Phase 2: Run verification_tests from database using execute_tests_for_trigger
+    // This will:
+    // 1. Get tests associated with the config/task
+    // 2. Execute each test
+    // 3. Track is_critical flag - only critical failures block completion
+    // 4. Non-critical failures are reported but don't fail verification
+    //
+    // Example integration:
+    // let test_results = execute_tests_for_trigger(db, config_id, &TriggerPoint::AfterWorkflow, Some(task_run_id));
+    // if test_results.critical_failure {
+    //     critical_failures.extend(test_results.results.iter()
+    //         .filter(|r| !matches!(r.status, TestStatus::Passed) && /* is_critical */)
+    //         .map(|r| format!("Test '{}' failed: {}", r.name, r.error.as_deref().unwrap_or("Unknown"))));
+    // }
+
+    DeterministicVerificationResult {
+        // Only CRITICAL failures block completion
+        all_passed: critical_failures.is_empty(),
+        checks_run,
+        critical_failures,
+        non_critical_failures,
+        raw_output,
+    }
+}
+
+/// Generate feedback for failed verification to include in next iteration prompt
+fn generate_verification_feedback(result: &DeterministicVerificationResult) -> String {
+    let mut feedback = String::new();
+
+    if !result.all_passed {
+        feedback.push_str("## ⚠️ Deterministic Verification Failed\n\n");
+        feedback.push_str("The system ran verification after your [WORK_COMPLETE] signal and found issues:\n\n");
+
+        feedback.push_str("### Checks Run\n");
+        for check in &result.checks_run {
+            feedback.push_str(&format!("- {}\n", check));
+        }
+
+        if !result.critical_failures.is_empty() {
+            feedback.push_str("\n### ❌ Critical Failures (blocking)\n");
+            feedback.push_str("These MUST be fixed before the task can complete:\n");
+            for failure in &result.critical_failures {
+                feedback.push_str(&format!("- {}\n", failure));
+            }
+        }
+
+        if !result.non_critical_failures.is_empty() {
+            feedback.push_str("\n### ⚠️ Non-Critical Failures (informational)\n");
+            feedback.push_str("These don't block completion but should be reviewed:\n");
+            for failure in &result.non_critical_failures {
+                feedback.push_str(&format!("- {}\n", failure));
+            }
+        }
+
+        feedback.push_str("\n### Action Required\n");
+        feedback.push_str("Please fix the CRITICAL issues above and signal [WORK_COMPLETE] again when ready.\n");
+        feedback.push_str("The task will NOT be marked complete until all critical checks pass.\n");
+    }
+
+    feedback
 }
 
 /// Information about a single active session
@@ -7011,10 +11131,11 @@ async fn force_continue_session(
             task.sessions_count + 1
         );
 
+        // Use 1 phase so the cross-session loop can re-run automation between each session
         let config = crate::session::SessionConfig {
             prompt: continuation_prompt,
             continuation_prompt: None,
-            total_phases: 1,
+            total_phases: 1, // Always 1 phase - cross-session loop handles continuation
             uses_gui: false,
             timeout_seconds: 1800,
             stall_threshold_seconds: 300,
@@ -7025,8 +11146,9 @@ async fn force_continue_session(
             model: None,
         };
 
-        // Get task_id for context grouping
+        // Get task_id and iteration for context grouping
         let task_id = task.id.clone();
+        let iteration = task.sessions_count + 1;
 
         // Note: sessions_count will be incremented when output is appended via append_task_output
 
@@ -7051,6 +11173,7 @@ async fn force_continue_session(
                         None,
                         Some(run_ctx),
                         None,
+                        iteration, // Pass iteration number for display
                     )
                     .await;
                 });
@@ -7083,9 +11206,7 @@ async fn force_continue_simple(
     info!("Force continue: No active workflow config found. Using simple one-shot continuation.");
 
     // Read the last AI output to provide context
-    let ai_output_path = std::path::PathBuf::from(
-        "C:/Users/Joshua/Documents/qontinui_parent_directory/.dev-logs/ai-output.jsonl",
-    );
+    let ai_output_path = crate::paths::get_ai_output_jsonl_path();
     let last_lines = if ai_output_path.exists() {
         match std::fs::read_to_string(&ai_output_path) {
             Ok(content) => {
@@ -7135,6 +11256,8 @@ async fn force_continue_simple(
     );
 
     // Create a session to continue
+    // Note: total_phases is 1 because we have no task context to determine remaining phases.
+    // This is the fallback path when no running task is found in the database.
     let config = crate::session::SessionConfig {
         prompt: continuation_prompt,
         continuation_prompt: None,
@@ -7161,7 +11284,7 @@ async fn force_continue_simple(
                 .unwrap_or_else(|_| ".".to_string());
 
             tokio::spawn(async move {
-                run_unified_session_loop(state_clone, sid, workspace_root, None, None, None).await;
+                run_unified_session_loop(state_clone, sid, workspace_root, None, None, None, 1).await;
             });
 
             Json(ApiResponse::success(ForceContinueResponse {
@@ -7328,7 +11451,7 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log")
+        .open(crate::paths::get_workflow_debug_log_path())
     {
         use std::io::Write;
         let _ = writeln!(
@@ -7414,21 +11537,29 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                             .unwrap_or("0000")
                     );
 
-                    // Execute steps using StepExecutor
-                    let executor =
-                        StepExecutor::new(state.app_state.clone(), state.config_storage.clone());
+                    // Calculate iteration number BEFORE execution so we can use it for filtering
+                    let iteration = task.sessions_count + 1;
+
+                    // Execute steps using StepExecutor (iteration-aware)
+                    // For iterations > 1, this filters out setup steps that aren't marked to run
+                    let executor = StepExecutor::with_app_handle(
+                        state.app_state.clone(),
+                        state.config_storage.clone(),
+                        state.app_handle.clone(),
+                    )
+                    .with_task_run_id(task.id.clone());
                     let execution_result = executor
-                        .execute_steps_with_log_sources(
+                        .execute_steps_for_iteration(
                             &execution_steps,
                             &temp_session_id,
                             &log_sources,
+                            iteration,
                         )
                         .await;
 
                     // Generate execution summary using IterationBundle
                     if !execution_result.steps.is_empty() {
                         let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
-                        let iteration = task.sessions_count + 1;
                         let timestamp_now =
                             chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
@@ -7561,10 +11692,11 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
             .push_str("\nContinue the task. When complete, print [TASK_COMPLETE].\n");
 
         // Create session config
+        // Use 1 phase so the cross-session loop can re-run automation between each session
         let session_config = SessionConfig {
             prompt: continuation_prompt,
             continuation_prompt: None,
-            total_phases: 1,
+            total_phases: 1, // Always 1 phase - cross-session loop handles continuation
             uses_gui: false,
             timeout_seconds: 600,
             stall_threshold_seconds: 300,
@@ -7612,7 +11744,7 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                     );
                 }
 
-                // Run the session loop in background
+                // Run the session loop in background with cross-session continuation
                 let session_id = session.id.clone();
                 let workspace_root = get_workspace_paths_internal()
                     .map(|(root, _, _)| root.to_string_lossy().to_string())
@@ -7622,21 +11754,301 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                 let task_name = task.task_name.clone();
                 let task_id = task.id.clone();
                 let run_ctx = session_ctx.clone();
+                // Capture additional fields needed for cross-session continuation
+                let execution_steps_json = task.execution_steps_json.clone();
+                let log_sources_json = task.log_sources_json.clone();
+                let original_prompt = task.prompt.clone();
+                let first_iteration = task.sessions_count + 1; // Iteration number for display
 
                 tokio::spawn(async move {
+                    // Run the FIRST resumed session
                     run_unified_session_loop(
-                        state_clone,
+                        state_clone.clone(),
                         session_id.clone(),
-                        workspace_root,
+                        workspace_root.clone(),
                         None,
-                        Some(run_ctx),
-                        Some(task_id), // Use original task ID for resumed tasks
+                        Some(run_ctx.clone()),
+                        Some(task_id.clone()), // Use original task ID for resumed tasks
+                        first_iteration,       // Iteration number for display
                     )
                     .await;
                     info!(
                         "Resumed session {} completed for '{}'",
                         session_id, task_name
                     );
+
+                    // =====================================================================
+                    // Cross-session continuation loop (same logic as start_session)
+                    // After the first session, this loop handles continuation across sessions
+                    // re-executing automation between each to get fresh data
+                    // =====================================================================
+                    loop {
+                        // Check if task was stopped or completed
+                        let db = match CheckpointDb::new() {
+                            Ok(d) => d,
+                            Err(e) => {
+                                warn!("Failed to open database for resume continuation check: {}", e);
+                                break;
+                            }
+                        };
+
+                        let task = match db.get_task_run(&task_id) {
+                            Ok(Some(t)) => t,
+                            Ok(None) => {
+                                info!("Task {} not found in resume continuation, exiting", task_id);
+                                break;
+                            }
+                            Err(e) => {
+                                warn!("Failed to get task {} in resume continuation: {}", task_id, e);
+                                break;
+                            }
+                        };
+
+                        // Check termination conditions
+                        if task.status == "completed" || task.status == "stopped" {
+                            info!("Task {} is {}, exiting resume continuation loop", task_id, task.status);
+                            break;
+                        }
+
+                        if !task.auto_continue {
+                            info!("Task {} has auto_continue disabled, exiting resume continuation", task_id);
+                            if let Err(e) = db.complete_task_run(&task_id) {
+                                warn!("Failed to mark task {} as complete: {}", task_id, e);
+                            }
+                            break;
+                        }
+
+                        // Check max_sessions limit
+                        if let Some(max) = task.max_sessions {
+                            if task.sessions_count >= max {
+                                info!("Task {} reached max sessions ({}/{}), exiting resume continuation", task_id, task.sessions_count, max);
+                                if let Err(e) = db.complete_task_run(&task_id) {
+                                    warn!("Failed to mark task {} as complete: {}", task_id, e);
+                                }
+                                break;
+                            }
+                        }
+
+                        // =====================================================================
+                        // Re-execute deterministic steps BEFORE starting next AI session
+                        // =====================================================================
+                        let iteration = task.sessions_count + 1;
+                        info!("Resume cross-session continuation: Starting iteration {} for task '{}'", iteration, task.task_name);
+
+                        // Log iteration start
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true)
+                            .open(crate::paths::get_workflow_debug_log_path()) {
+                            use std::io::Write;
+                            let _ = writeln!(f, "[{}] RESUME_CROSS_SESSION_ITERATION: task={}, iteration={}",
+                                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"),
+                                task_id, iteration);
+                        }
+
+                        let execution_summary = if let Some(ref steps_json) = execution_steps_json {
+                            match serde_json::from_str::<Vec<ExecutionStepConfig>>(steps_json) {
+                                Ok(execution_steps) if !execution_steps.is_empty() => {
+                                    info!("Re-executing {} deterministic steps for iteration {}", execution_steps.len(), iteration);
+
+                                    // Parse log sources if present
+                                    let log_sources: Vec<LogSourceConfig> = log_sources_json
+                                        .as_ref()
+                                        .and_then(|json| serde_json::from_str(json).ok())
+                                        .unwrap_or_default();
+
+                                    // Create a temp session ID for screenshot naming
+                                    let temp_session_id = format!(
+                                        "iter-{}-{}",
+                                        iteration,
+                                        uuid::Uuid::new_v4()
+                                            .to_string()
+                                            .split('-')
+                                            .next()
+                                            .unwrap_or("0000")
+                                    );
+
+                                    // Execute steps using StepExecutor
+                                    let executor = StepExecutor::with_app_handle(
+                                        state_clone.app_state.clone(),
+                                        state_clone.config_storage.clone(),
+                                        state_clone.app_handle.clone(),
+                                    )
+                                    .with_task_run_id(task_id.clone());
+                                    let execution_result = executor
+                                        .execute_steps_for_iteration(
+                                            &execution_steps,
+                                            &temp_session_id,
+                                            &log_sources,
+                                            iteration,
+                                        )
+                                        .await;
+
+                                    // Generate execution summary using IterationBundle
+                                    if !execution_result.steps.is_empty() {
+                                        let relevant_logs = RelevantLogSources::from_steps(&execution_steps);
+                                        let timestamp_now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+                                        let mut bundle = IterationBundle::new(
+                                            iteration,
+                                            task_id.clone(),
+                                            timestamp_now.clone(),
+                                            timestamp_now,
+                                            &execution_result,
+                                            &relevant_logs,
+                                        );
+
+                                        // Add application logs if captured
+                                        if let Some(ref captured) = execution_result.captured_logs {
+                                            bundle.add_application_logs(&captured.sources, &log_sources);
+                                        }
+
+                                        // Add runner logs if captured
+                                        if let Some(ref runner_logs) = execution_result.captured_runner_logs {
+                                            bundle.add_gui_automation_logs(
+                                                runner_logs.actions.clone(),
+                                                runner_logs.image_recognition.clone(),
+                                            );
+                                        }
+
+                                        bundle.to_markdown()
+                                    } else {
+                                        String::new()
+                                    }
+                                }
+                                Ok(_) => String::new(),
+                                Err(e) => {
+                                    warn!("Failed to parse execution_steps_json in resume continuation: {}", e);
+                                    String::new()
+                                }
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        // Build continuation prompt
+                        let consolidated_output = log_consolidation::get_consolidated_output_for_task(
+                            &task.created_at,
+                            task.completed_at.as_deref(),
+                        );
+
+                        // Get findings context from database
+                        let findings_context = db
+                            .format_findings_for_continuation_prompt(&task_id)
+                            .unwrap_or_else(|e| {
+                                warn!("Failed to get findings context: {}", e);
+                                String::new()
+                            });
+
+                        let has_execution_steps = execution_steps_json.as_ref().is_some_and(|json| {
+                            serde_json::from_str::<Vec<serde_json::Value>>(json)
+                                .is_ok_and(|steps| !steps.is_empty())
+                        });
+
+                        let pre_execution_message = if has_execution_steps && !execution_summary.is_empty() {
+                            "\
+                            **IMPORTANT:** Pre-execution steps (GUI automation, screenshots, tests) were re-run. \
+                            The Pre-Execution Results section below shows FRESH results from this iteration.\n\n\
+                            Review these NEW results to verify if your previous changes worked.\n\n"
+                                .to_string()
+                        } else if has_execution_steps {
+                            "\
+                            **NOTE:** Pre-execution steps were configured but produced no results.\n\n"
+                                .to_string()
+                        } else {
+                            String::new()
+                        };
+
+                        let mut continuation_prompt = format!(
+                            "{}\n\n## Cross-Session Continuation (Iteration #{})\n\n{}\
+                            Previous session output:\n\n{}\n\n",
+                            original_prompt.as_deref().unwrap_or(""),
+                            iteration,
+                            pre_execution_message,
+                            consolidated_output
+                        );
+
+                        if !findings_context.is_empty() {
+                            continuation_prompt.push_str(&findings_context);
+                            continuation_prompt.push_str("\n\n");
+                        }
+
+                        if !execution_summary.is_empty() {
+                            continuation_prompt.push_str(&execution_summary);
+                            continuation_prompt.push_str("\n\n");
+                        }
+
+                        continuation_prompt.push_str(FINDING_INSTRUCTIONS);
+                        continuation_prompt.push_str("\nContinue the task. When the goal is VERIFIED achieved, print [TASK_COMPLETE].\n");
+
+                        // Each continuation session runs exactly 1 phase
+                        let session_config = SessionConfig {
+                            prompt: continuation_prompt,
+                            continuation_prompt: None,
+                            total_phases: 1, // Always 1 phase - automation re-runs between sessions
+                            uses_gui: false,
+                            timeout_seconds: 600,
+                            stall_threshold_seconds: 300,
+                            name: format!("{} (iteration {})", task.task_name, iteration),
+                            description: format!("Cross-session continuation - iteration #{}", iteration),
+                            custom_config: serde_json::json!({}),
+                            provider: None,
+                            model: None,
+                        };
+
+                        // Create session context
+                        let session_ctx = AiOutputSessionContext {
+                            session_id: Some(task_id.clone()),
+                            session_name: Some(task.task_name.clone()),
+                        };
+
+                        // Start the new session
+                        match state_clone.session.start_session(session_config).await {
+                            Ok(new_session) => {
+                                info!("Started iteration {} session {} for task '{}' (from resume)", iteration, new_session.id, task.task_name);
+
+                                emit_ai_output(
+                                    &state_clone.app_handle,
+                                    &format!("🔄 Starting iteration {} for '{}'", iteration, task.task_name),
+                                    "status",
+                                    None,
+                                    Some(&session_ctx),
+                                );
+
+                                // Increment session count
+                                if let Err(e) = db.append_task_output(&task_id, "", true) {
+                                    warn!("Failed to increment session count: {}", e);
+                                }
+
+                                // Run the session loop
+                                run_unified_session_loop(
+                                    state_clone.clone(),
+                                    new_session.id.clone(),
+                                    workspace_root.clone(),
+                                    None,
+                                    Some(session_ctx.clone()),
+                                    Some(task_id.clone()),
+                                    iteration, // Pass iteration number for display
+                                )
+                                .await;
+
+                                info!("Iteration {} session completed (from resume)", iteration);
+
+                                // Continue the loop - will check task status and decide if more iterations needed
+                            }
+                            Err(e) => {
+                                error!("Failed to start iteration {} session (from resume): {}", iteration, e);
+                                emit_ai_output(
+                                    &state_clone.app_handle,
+                                    &format!("❌ Failed to start iteration {}: {}", iteration, e),
+                                    "error",
+                                    None,
+                                    Some(&session_ctx),
+                                );
+                                break;
+                            }
+                        }
+                    }
+
+                    info!("Resume cross-session loop completed for '{}'", task_name);
                 });
 
                 resumed_count += 1;
@@ -7666,6 +12078,9 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
 /// complete_task_run, fail_task_run). When resuming a task, the session_id is a NEW
 /// session but we need to update the ORIGINAL task_run record. Pass `Some(task.id)`
 /// for resumed tasks, or `None` to use session_id as the task_run_id.
+///
+/// The `iteration` parameter indicates which cross-session iteration this is (1, 2, 3, etc.)
+/// for display purposes. Pass 1 for the first session, 2 for the second, etc.
 async fn run_unified_session_loop(
     state: Arc<ApiState>,
     session_id: String,
@@ -7673,6 +12088,7 @@ async fn run_unified_session_loop(
     external_checkpoint: Option<(std::path::PathBuf, String, u32)>, // (path, phase_field, initial_phase)
     run_ctx: Option<AiOutputSessionContext>, // Context for grouping output into a single Run
     task_run_id: Option<String>, // ID to use for database task_run operations (for resumed tasks)
+    iteration: u32, // Cross-session iteration number for display (1, 2, 3, ...)
 ) {
     // Use task_run_id if provided (for resumed tasks), otherwise use session_id
     let db_task_id = task_run_id.unwrap_or_else(|| session_id.clone());
@@ -7764,8 +12180,8 @@ async fn run_unified_session_loop(
         emit_ai_output(
             &app_handle,
             &format!(
-                "🚀 Running phase {} (session {})...",
-                phase, phase_session_id
+                "🚀 Running iteration {} (session {})...",
+                iteration, phase_session_id
             ),
             "status",
             Some(&session_id),
@@ -7774,11 +12190,59 @@ async fn run_unified_session_loop(
 
         // Run Claude session
         let workspace = workspace_root.clone();
-        let prompt = current_prompt.clone();
         let sid = phase_session_id.clone();
         let handle = app_handle.clone();
         let timeout_secs = timeout;
         let ctx_for_claude = Some(session_ctx.clone());
+
+        // =====================================================================
+        // ORCHESTRATOR INTEGRATION: Build prompt with plan context
+        // =====================================================================
+        // If orchestrator is enabled for this task, inject verification plan
+        // and cross-iteration context into the worker prompt
+        let prompt = {
+            let orchestrator_states = state.orchestrator_states.lock().await;
+            if let Some(orch_state) = orchestrator_states.get(&db_task_id) {
+                // Build prompt with orchestrator context
+                let workspace_for_orch = workspace_root.clone();
+                let orch_config = OrchestratorConfig {
+                    max_iterations: 10,
+                    ai_timeout_seconds: 300,
+                    working_directory: workspace_for_orch,
+                    enable_planning: true,
+                    enable_ai_verification: true,
+                    run_initial_verification: orch_state.initial_verification_run,
+                    compression: Some(CompressionConfig::default()),
+                    enable_checkpointing: true,
+                };
+                let orchestrator = Orchestrator::new(
+                    orch_config,
+                    state.app_state.checkpoint_db.clone(),
+                );
+
+                match orchestrator.build_worker_prompt(orch_state, &current_prompt) {
+                    Ok(enhanced_prompt) => {
+                        info!(
+                            "Orchestrator enhanced prompt for task {} (iteration {}), added {} chars of context",
+                            db_task_id,
+                            orch_state.iteration + 1,
+                            enhanced_prompt.len().saturating_sub(current_prompt.len())
+                        );
+                        enhanced_prompt
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to build orchestrator prompt for task {}: {}. Using original prompt.",
+                            db_task_id, e
+                        );
+                        current_prompt.clone()
+                    }
+                }
+            } else {
+                // No orchestrator state, use original prompt
+                current_prompt.clone()
+            }
+        };
 
         // Create finding context for this phase
         // Use db_task_id for finding storage - critical for resumed tasks
@@ -7790,8 +12254,11 @@ async fn run_unified_session_loop(
         // Clone PID tracker for the blocking task
         let pid_tracker = state.current_ai_pids.clone();
 
+        // Get retry config from AI settings
+        let retry_config = crate::settings::get_ai_settings().retry;
+
         let result = tokio::task::spawn_blocking(move || {
-            run_claude_session_inline(
+            run_claude_session_with_retry(
                 &workspace,
                 &prompt,
                 &sid,
@@ -7800,12 +12267,24 @@ async fn run_unified_session_loop(
                 ctx_for_claude,
                 finding_ctx_for_claude,
                 Some(pid_tracker),
+                Some(&retry_config),
             )
         })
         .await;
 
         let session_result = match result {
-            Ok(Ok((success, output))) => Ok((success, output)),
+            Ok(Ok((success, output, retry_state))) => {
+                // Log if retries occurred
+                if let Some(ref rs) = retry_state {
+                    if rs.attempt > 0 {
+                        info!(
+                            "Session completed after {} retries (total delay: {}ms)",
+                            rs.attempt, rs.total_delay_ms
+                        );
+                    }
+                }
+                Ok((success, output))
+            }
             Ok(Err(e)) => Err(e),
             Err(e) => Err(format!("Task join error: {}", e)),
         };
@@ -7843,9 +12322,22 @@ async fn run_unified_session_loop(
                 // - The cross-session loop uses configurable completion_value
                 // - Sessions end naturally via total_phases or goal markers
 
-                // Check session checkpoint for completion
+                // Check session checkpoint for explicit completion
+                // NOTE: We check s.checkpoint.completed directly, NOT is_complete()
+                // is_complete() returns true when current_phase >= total_phases, which would
+                // prematurely mark the task as complete before the cross-session loop can continue.
+                // We only want to mark the task complete when:
+                // 1. The checkpoint's `completed` flag is explicitly true
+                // 2. The checkpoint status is explicitly "COMPLETED"/"DONE"/etc.
+                // 3. AI output contains [TASK_COMPLETE] (checked below)
+                // Phase-based completion is handled by line 10339 which does NOT mark the task complete.
                 if let Some(mut s) = state.session.get_session(&session_id).await {
-                    if s.checkpoint.is_complete() {
+                    let explicit_completion = s.checkpoint.completed || {
+                        let status_upper = s.checkpoint.status.to_uppercase();
+                        matches!(status_upper.as_str(), "COMPLETE" | "COMPLETED" | "DONE" | "FINISHED")
+                    };
+
+                    if explicit_completion {
                         s.status = SessionStatus::Completed;
                         s.checkpoint.mark_completed();
                         let _ = state.session.update_session(s).await;
@@ -7871,35 +12363,338 @@ async fn run_unified_session_loop(
                             Some(&session_id),
                             Some(&session_ctx),
                         );
-                        info!("Session {} completed after {} phases", session_id, phase);
+                        info!("Session {} completed after {} phases (explicit completion)", session_id, phase);
                         return;
                     }
 
-                    // Check if AI output indicates goal completion
-                    if check_goal_completion_markers(&output) {
+                    // =====================================================================
+                    // ORCHESTRATOR INTEGRATION: Process worker output
+                    // =====================================================================
+                    // If orchestrator is enabled, process output through orchestrator
+                    // to handle signals (WORK_COMPLETE, NEED_REPLAN, FINDING) and
+                    // run verification when appropriate.
+
+                    let has_orchestrator = {
+                        let states = state.orchestrator_states.lock().await;
+                        states.contains_key(&db_task_id)
+                    };
+
+                    if has_orchestrator {
+                        // Use orchestrator for output processing and verification
+                        let workspace_for_orch = workspace_root.clone();
+
+                        // Get initial_verification_run from state
+                        let initial_verification_run = {
+                            let states = state.orchestrator_states.lock().await;
+                            states.get(&db_task_id)
+                                .map(|s| s.initial_verification_run)
+                                .unwrap_or(false)
+                        };
+
+                        let orch_config = OrchestratorConfig {
+                            max_iterations: 10,
+                            ai_timeout_seconds: 300,
+                            working_directory: workspace_for_orch.clone(),
+                            enable_planning: true,
+                            enable_ai_verification: true,
+                            run_initial_verification: initial_verification_run,
+                            compression: Some(CompressionConfig::default()),
+                            enable_checkpointing: true,
+                        };
+                        let orchestrator = Orchestrator::new(
+                            orch_config,
+                            state.app_state.checkpoint_db.clone(),
+                        );
+
+                        // Process output and get action
+                        let action = {
+                            let mut states = state.orchestrator_states.lock().await;
+                            if let Some(orch_state) = states.get_mut(&db_task_id) {
+                                orchestrator.process_worker_output(orch_state, &output)
+                            } else {
+                                Err("Orchestrator state not found".to_string())
+                            }
+                        };
+
+                        match action {
+                            Ok(WorkerOutputAction::RunVerification) => {
+                                info!("Orchestrator: Worker signaled WORK_COMPLETE - running verification");
+
+                                // Run orchestrator verification (includes both deterministic and AI)
+                                let verification_results = {
+                                    let mut states = state.orchestrator_states.lock().await;
+                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
+                                        // Try to load latest screenshot for AI verification
+                                        let screenshot = crate::orchestrator::load_latest_screenshot_as_base64().ok();
+                                        orchestrator.run_verification(orch_state, screenshot.as_deref()).await
+                                    } else {
+                                        Err("Orchestrator state not found".to_string())
+                                    }
+                                };
+
+                                match verification_results {
+                                    Ok(results) => {
+                                        if results.all_passed {
+                                            info!("Orchestrator verification PASSED - marking task complete");
+                                            s.status = SessionStatus::Completed;
+                                            s.checkpoint.completed = true;
+                                            s.checkpoint.status = "orchestrator_verified_complete".to_string();
+                                            let _ = state.session.update_session(s).await;
+
+                                            // Mark task complete
+                                            if !complete_task_run_with_retry(
+                                                state.app_state.checkpoint_db.clone(),
+                                                &db_task_id,
+                                            ).await {
+                                                error!("Failed to mark task_run {} as complete", db_task_id);
+                                            }
+
+                                            // Clean up orchestrator state
+                                            {
+                                                let mut states = state.orchestrator_states.lock().await;
+                                                states.remove(&db_task_id);
+                                            }
+
+                                            emit_ai_output(
+                                                &app_handle,
+                                                &format!(
+                                                    "✅ Session {} orchestrator verified - all {} criteria passed after {} phases",
+                                                    session_id,
+                                                    results.deterministic_results.len() + results.ai_results.len(),
+                                                    phase
+                                                ),
+                                                "status",
+                                                Some(&session_id),
+                                                Some(&session_ctx),
+                                            );
+                                            return;
+                                        } else {
+                                            // Verification failed - feedback is already recorded by orchestrator
+                                            info!(
+                                                "Orchestrator verification FAILED - {} deterministic, {} AI failures",
+                                                results.deterministic_results.iter().filter(|r| !r.passed).count(),
+                                                results.ai_results.iter().filter(|r| !r.passed).count()
+                                            );
+                                            s.status = SessionStatus::Completed;
+                                            s.checkpoint.completed = false;
+                                            s.checkpoint.status = "orchestrator_verification_failed".to_string();
+                                            let _ = state.session.update_session(s).await;
+
+                                            emit_ai_output(
+                                                &app_handle,
+                                                &format!(
+                                                    "⚠️ Session {} work complete but orchestrator verification failed - will retry",
+                                                    session_id
+                                                ),
+                                                "status",
+                                                Some(&session_id),
+                                                Some(&session_ctx),
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Orchestrator verification failed: {}. Falling back to legacy verification.", e);
+                                        // Fall through to legacy verification below
+                                    }
+                                }
+                            }
+                            Ok(WorkerOutputAction::Replan { reason }) => {
+                                info!("Orchestrator: Worker requested REPLAN: {}", reason);
+
+                                // Handle replan through orchestrator
+                                {
+                                    let mut states = state.orchestrator_states.lock().await;
+                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
+                                        if let Err(e) = orchestrator.handle_replan(orch_state, &reason) {
+                                            warn!("Failed to handle replan: {}", e);
+                                        }
+                                    }
+                                }
+
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = false;
+                                s.checkpoint.status = format!("orchestrator_replan:{}", reason.chars().take(100).collect::<String>());
+                                let _ = state.session.update_session(s).await;
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!("🔄 Session {} orchestrator replan requested: {}", session_id, reason),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                return;
+                            }
+                            Ok(WorkerOutputAction::MaxIterationsReached) => {
+                                info!("Orchestrator: Max iterations reached for task {}", db_task_id);
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = false;
+                                s.checkpoint.status = "orchestrator_max_iterations".to_string();
+                                let _ = state.session.update_session(s).await;
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!("⏸️ Session {} paused - orchestrator max iterations reached", session_id),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                return;
+                            }
+                            Ok(WorkerOutputAction::Continue) => {
+                                // Continue processing - fall through to legacy signal checking
+                                // This handles cases where orchestrator says continue but
+                                // legacy markers might still be present
+                            }
+                            Err(e) => {
+                                warn!("Orchestrator process_worker_output failed: {}. Using legacy handling.", e);
+                                // Fall through to legacy handling
+                            }
+                        }
+                    }
+
+                    // Legacy handling: Check if AI output indicates work completion
+                    // This is used when orchestrator is disabled or as a fallback
+                    let worker_signal = parse_worker_output_signal(&output);
+                    match worker_signal {
+                        WorkerOutputSignal::WorkComplete { reason } => {
+                            info!(
+                                "Worker signaled WORK_COMPLETE (reason: {:?}) - running legacy verification",
+                                reason
+                            );
+
+                            // Run deterministic verification before marking complete
+                            let verification_result = run_deterministic_verification(
+                                &workspace_root,
+                                None, // TODO: Pass verification config from task
+                            ).await;
+
+                            if verification_result.all_passed {
+                                info!("Legacy deterministic verification PASSED - marking task complete");
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = true;
+                                s.checkpoint.status = "verified_complete".to_string();
+                                let _ = state.session.update_session(s).await;
+
+                                // Update task_run in database to match session status (with retry)
+                                // Use db_task_id (not session_id) - critical for resumed tasks
+                                if !complete_task_run_with_retry(
+                                    state.app_state.checkpoint_db.clone(),
+                                    &db_task_id,
+                                )
+                                .await
+                                {
+                                    error!(
+                                        "Failed to mark task_run {} as complete in database - AI status may be stale",
+                                        db_task_id
+                                    );
+                                }
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!(
+                                        "✅ Session {} verified and completed - all checks passed after {} phases",
+                                        session_id, phase
+                                    ),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                info!(
+                                    "Session {} verified complete after {} phases",
+                                    session_id, phase
+                                );
+                                return;
+                            } else {
+                                // Verification failed - end session but don't mark task complete
+                                // The continuation loop will start a new iteration with feedback
+                                info!(
+                                    "Legacy deterministic verification FAILED - ending session for retry. Critical failures: {:?}",
+                                    verification_result.critical_failures
+                                );
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = false; // NOT complete - verification failed
+                                s.checkpoint.status = "verification_failed".to_string();
+
+                                // Generate feedback for logging/display
+                                // The continuation loop will re-run verification and generate feedback
+                                let _feedback = generate_verification_feedback(&verification_result);
+
+                                let _ = state.session.update_session(s).await;
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!(
+                                        "⚠️ Session {} work complete but verification failed - will retry. Critical failures: {}",
+                                        session_id,
+                                        verification_result.critical_failures.join(", ")
+                                    ),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                info!(
+                                    "Session {} ended after {} phases - verification failed, will retry",
+                                    session_id, phase
+                                );
+                                return;
+                            }
+                        }
+                        WorkerOutputSignal::NeedReplan { reason } => {
+                            // Worker requested replan - end session and flag for replanning
+                            info!("Worker requested REPLAN: {}", reason);
+                            s.status = SessionStatus::Completed;
+                            s.checkpoint.completed = false;
+                            // Use a special status format to encode the reason
+                            s.checkpoint.status = format!("replan_requested:{}", reason.chars().take(100).collect::<String>());
+                            let _ = state.session.update_session(s).await;
+
+                            emit_ai_output(
+                                &app_handle,
+                                &format!(
+                                    "🔄 Session {} requested replan: {}",
+                                    session_id, reason
+                                ),
+                                "status",
+                                Some(&session_id),
+                                Some(&session_ctx),
+                            );
+                            info!(
+                                "Session {} ended after {} phases - replan requested",
+                                session_id, phase
+                            );
+                            return;
+                        }
+                        WorkerOutputSignal::TaskComplete => {
+                            // Legacy TASK_COMPLETE marker - treat same as WorkComplete but warn
+                            warn!("Legacy [TASK_COMPLETE] marker detected - please use [WORK_COMPLETE] instead");
+                            // Fall through to same handling as WorkComplete
+                        }
+                        WorkerOutputSignal::Continue => {
+                            // No completion signal - session continues normally
+                        }
+                    }
+
+                    // Check if max phases reached for THIS SESSION
+                    // Note: This only ends the current session, NOT the entire task.
+                    // The cross-session continuation loop will decide if more iterations are needed.
+                    // The task is only marked complete when [TASK_COMPLETE] is detected (above).
+                    if config.total_phases > 0 && phase >= config.total_phases {
                         s.status = SessionStatus::Completed;
-                        s.checkpoint.completed = true;
-                        s.checkpoint.status = "goal_achieved".to_string();
+                        s.checkpoint.completed = false; // Session ended, but task may continue
+                        s.checkpoint.status = "session_phases_complete".to_string();
                         let _ = state.session.update_session(s).await;
 
-                        // Update task_run in database to match session status (with retry)
-                        // Use db_task_id (not session_id) - critical for resumed tasks
-                        if !complete_task_run_with_retry(
-                            state.app_state.checkpoint_db.clone(),
-                            &db_task_id,
-                        )
-                        .await
-                        {
-                            error!(
-                                "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                db_task_id
-                            );
-                        }
+                        // DO NOT mark task as completed here!
+                        // The cross-session loop will check if more iterations are needed
+                        // and will mark the task complete when appropriate (max_sessions reached
+                        // or [TASK_COMPLETE] detected in a subsequent iteration)
 
                         emit_ai_output(
                             &app_handle,
                             &format!(
-                                "🎯 Session {} completed - goal achieved after {} phases",
+                                "📤 Session {} ended (reached {} phases). Cross-session loop will continue if needed.",
                                 session_id, phase
                             ),
                             "status",
@@ -7907,42 +12702,8 @@ async fn run_unified_session_loop(
                             Some(&session_ctx),
                         );
                         info!(
-                            "Session {} completed early - goal achieved after {} phases",
+                            "Session {} ended after {} phases. Task remains running for cross-session continuation.",
                             session_id, phase
-                        );
-                        return;
-                    }
-
-                    // Check if max phases reached
-                    if config.total_phases > 0 && phase >= config.total_phases {
-                        s.status = SessionStatus::Completed;
-                        s.checkpoint.completed = true;
-                        s.checkpoint.status = "completed".to_string();
-                        let _ = state.session.update_session(s).await;
-
-                        // Update task_run in database to match session status (with retry)
-                        // Use db_task_id (not session_id) - critical for resumed tasks
-                        if !complete_task_run_with_retry(
-                            state.app_state.checkpoint_db.clone(),
-                            &db_task_id,
-                        )
-                        .await
-                        {
-                            error!(
-                                "Failed to mark task_run {} as complete in database - AI status may be stale",
-                                db_task_id
-                            );
-                        }
-
-                        emit_ai_output(
-                            &app_handle,
-                            &format!(
-                                "✅ Session {} completed (reached {} phases)",
-                                session_id, phase
-                            ),
-                            "status",
-                            Some(&session_id),
-                            Some(&session_ctx),
                         );
                         return;
                     }
@@ -8019,6 +12780,13 @@ async fn run_unified_session_loop(
                         db_task_id, db_err
                     );
                 }
+
+                // Migrate logs to SQLite even on failure (for debugging/analysis)
+                let workflow_name = state.app_state.checkpoint_db.get_task_run(&db_task_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.workflow_name);
+                migrate_logs_for_task(state.app_state.checkpoint_db.clone(), &db_task_id, workflow_name).await;
 
                 emit_ai_output(
                     &app_handle,
@@ -8369,6 +13137,8 @@ async fn stop_task_run(
     State(state): State<Arc<ApiState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Stopping task run: {}", id);
+
     // Verify task exists first
     let task_run = state
         .app_state
@@ -8384,17 +13154,65 @@ async fn stop_task_run(
         })));
     }
 
+    // Kill all tracked AI processes (same logic as stop_ai_analysis)
+    // This ensures the actual Claude CLI process is terminated, not just marked as stopped
+    let pids_to_kill: Vec<u32> = {
+        let mut pids = state.current_ai_pids.lock().unwrap();
+        let pids_copy = pids.clone();
+        pids.clear();
+        pids_copy
+    };
+
+    let mut killed_count = 0;
+    for pid in &pids_to_kill {
+        info!("Killing AI process PID {} for task {}", pid, id);
+        let result = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+
+        match result {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("Successfully killed process tree for PID {}", pid);
+                    killed_count += 1;
+                } else {
+                    // Process may have already exited
+                    killed_count += 1;
+                }
+            }
+            Err(e) => {
+                error!("Failed to execute taskkill for PID {}: {}", pid, e);
+            }
+        }
+    }
+
+    // Stop monitoring
+    if let Err(e) = state.task_monitor.stop_monitoring(&id).await {
+        warn!("Failed to stop monitoring for {}: {}", id, e);
+    }
+
+    // Mark as stopped in database
     state
         .app_state
         .checkpoint_db
         .stop_task_run(&id)
-        .map(|_| {
-            Json(serde_json::json!({
-                "success": true,
-                "message": "Task run stopped"
-            }))
-        })
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    // Emit status to frontend
+    emit_ai_output(
+        &state.app_handle,
+        &format!("🛑 Task {} stopped (killed {} process(es))", id, killed_count),
+        "status",
+        None,
+        None,
+    );
+
+    info!("Task {} stopped, killed {} process(es)", id, killed_count);
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": format!("Task run stopped, killed {} process(es)", killed_count)
+    })))
 }
 
 /// Delete a task run.
@@ -8413,6 +13231,41 @@ async fn delete_task_run(
             }))
         })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Generate an AI summary for a completed task run.
+/// The summary includes:
+/// - A paragraph summary of what was accomplished
+/// - Whether the stated goal was achieved
+/// - What remaining work exists (if goal not achieved)
+async fn generate_task_summary(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("MCP API: Generating summary for task run: {}", id);
+
+    // Run summary generation in a blocking task
+    let db = state.app_state.checkpoint_db.clone();
+    let task_id = id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        summary_generator::generate_task_summary(&db, &task_id)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task spawn error: {}", e)))?;
+
+    match result {
+        Ok(summary_result) => Ok(Json(serde_json::json!({
+            "success": true,
+            "summary": summary_result.summary,
+            "goal_achieved": summary_result.goal_achieved,
+            "remaining_work": summary_result.remaining_work,
+        }))),
+        Err(e) => {
+            warn!("Failed to generate summary for task {}: {}", id, e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e))
+        }
+    }
 }
 
 /// Get the auto-continue setting for a specific task run.
@@ -8457,6 +13310,153 @@ async fn set_task_auto_continue(
             }))
         })
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// Query parameters for task run events.
+#[derive(Debug, Deserialize)]
+struct TaskRunEventsQuery {
+    event_type: Option<String>,
+    limit: Option<u32>,
+}
+
+/// Get events for a task run from SQLite (hybrid logging).
+async fn get_task_run_events(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<TaskRunEventsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    let events = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_events(&id, query.event_type.as_deref(), query.limit)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "events": events,
+        "count": events.len()
+    })))
+}
+
+/// Get screenshots for a task run from SQLite.
+async fn get_task_run_screenshots(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    let screenshots = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_screenshots(&id, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "screenshots": screenshots,
+        "count": screenshots.len()
+    })))
+}
+
+/// Get Playwright results for a task run from SQLite.
+async fn get_task_run_playwright_results(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Verify task exists
+    state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    let results = state
+        .app_state
+        .checkpoint_db
+        .get_task_run_playwright_results(&id, None)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "task_run_id": id,
+        "playwright_results": results,
+        "count": results.len()
+    })))
+}
+
+/// Migrate JSONL logs to SQLite for a task run.
+async fn migrate_task_run_logs(
+    State(state): State<Arc<ApiState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use std::path::PathBuf;
+    use tracing::info;
+
+    info!("Migrating JSONL logs to SQLite for task run: {}", id);
+
+    // Verify task exists
+    let task_run = state
+        .app_state
+        .checkpoint_db
+        .get_task_run(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("Task run not found: {}", id)))?;
+
+    // Get the dev-logs directory path
+    let dev_logs_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join(".dev-logs"))
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to resolve .dev-logs path".to_string(),
+            )
+        })?;
+
+    // Run migration
+    let db = state.app_state.checkpoint_db.clone();
+    let workflow_name = task_run.workflow_name.clone();
+    let task_id = id.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::log_migration::migrate_logs_to_sqlite(
+            &db,
+            &task_id,
+            &dev_logs_dir,
+            workflow_name.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task spawn error: {}", e)))?
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "task_run_id": id,
+        "migrated": {
+            "general_events": result.general_events,
+            "action_events": result.action_events,
+            "image_recognition_events": result.image_recognition_events,
+            "screenshots": result.screenshots,
+            "playwright_results": result.playwright_results
+        },
+        "errors": result.errors
+    })))
 }
 
 // ============================================================================
@@ -8640,6 +13640,107 @@ async fn list_configs(
     Ok(Json(ApiResponse::success(configs)))
 }
 
+/// Request to parse a config file
+#[derive(Debug, Deserialize)]
+struct ParseConfigRequest {
+    /// Path to the config file to parse
+    path: String,
+}
+
+/// State info for the parse config response
+#[derive(Debug, Serialize)]
+struct ConfigStateInfo {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    is_initial: bool,
+    is_final: bool,
+}
+
+/// Transition info for the parse config response
+#[derive(Debug, Serialize)]
+struct ConfigTransitionInfo {
+    id: String,
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    from_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    to_state: Option<String>,
+}
+
+/// Response for parsing a config file
+#[derive(Debug, Serialize)]
+struct ParseConfigResponse {
+    states: Vec<ConfigStateInfo>,
+    transitions: Vec<ConfigTransitionInfo>,
+}
+
+/// Parse a configuration file and return states/transitions without importing
+async fn parse_config_file(
+    Json(request): Json<ParseConfigRequest>,
+) -> Result<Json<ApiResponse<ParseConfigResponse>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match ConfigLoader::load_from_file(&request.path) {
+        Ok(config) => {
+            let states: Vec<ConfigStateInfo> = config
+                .states
+                .iter()
+                .filter_map(|s| {
+                    let id = s.get("id")?.as_str()?.to_string();
+                    let name = s.get("name")?.as_str()?.to_string();
+                    let description = s.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let is_initial = s.get("isInitial").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let is_final = s.get("isFinal").and_then(|v| v.as_bool()).unwrap_or(false);
+                    Some(ConfigStateInfo {
+                        id,
+                        name,
+                        description,
+                        is_initial,
+                        is_final,
+                    })
+                })
+                .collect();
+
+            let transitions: Vec<ConfigTransitionInfo> = config
+                .transitions
+                .iter()
+                .filter_map(|t| {
+                    let id = t.get("id")?.as_str()?.to_string();
+                    let from_state = t.get("fromState").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let to_state = t.get("toState").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let name = t.get("name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| {
+                            // Generate name from from_state -> to_state if no name
+                            match (&from_state, &to_state) {
+                                (Some(from), Some(to)) => format!("{} → {}", from, to),
+                                (Some(from), None) => format!("{} → ?", from),
+                                (None, Some(to)) => format!("? → {}", to),
+                                (None, None) => id.clone(),
+                            }
+                        });
+                    Some(ConfigTransitionInfo {
+                        id,
+                        name,
+                        from_state,
+                        to_state,
+                    })
+                })
+                .collect();
+
+            Ok(Json(ApiResponse::success(ParseConfigResponse {
+                states,
+                transitions,
+            })))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(api_error(format!("Failed to parse config: {}", e))),
+        )),
+    }
+}
+
 /// Request body for importing a config
 #[derive(Debug, Deserialize)]
 struct ImportConfigRequest {
@@ -8769,20 +13870,20 @@ async fn export_config(
 // ============================================================================
 
 // ============================================================================
-// AI Verification Agent HTTP API Handlers
+// State Explorer HTTP API Handlers
 // ============================================================================
 
-use crate::verification_agent::{
-    ExplorationStrategy, StateExplorer, StateMachineGraph, VerificationTask, VerificationTaskConfig,
+use crate::state_explorer::{
+    ExplorationConfig, ExplorationStrategy, ExplorationTask, StateExplorer, StateMachineGraph,
 };
 
-/// Request body for starting verification
+/// Request body for starting state exploration
 #[derive(Debug, Deserialize)]
-struct StartVerificationRequest {
+struct StartExplorationRequest {
     /// Path to the qontinui config file
     config_path: String,
     /// Exploration strategy: "exhaustive", "smoke_test", "regression", "random_walk", "targeted"
-    #[serde(default = "default_verification_strategy")]
+    #[serde(default = "default_exploration_strategy")]
     strategy: String,
     /// Maximum number of states to visit (0 = unlimited)
     #[serde(default)]
@@ -8807,7 +13908,7 @@ struct StartVerificationRequest {
     stop_on_first_failure: bool,
 }
 
-fn default_verification_strategy() -> String {
+fn default_exploration_strategy() -> String {
     "exhaustive".to_string()
 }
 
@@ -8815,18 +13916,19 @@ fn default_capture_screenshots() -> bool {
     true
 }
 
-/// Start a verification task
-async fn start_verification(
+/// Start a state exploration task
+async fn start_exploration(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<StartVerificationRequest>,
+    Json(request): Json<StartExplorationRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     info!(
-        "MCP API: Starting verification for {} with strategy {}",
+        "MCP API: Starting exploration for {} with strategy {}",
         request.config_path, request.strategy
     );
 
-    let config = VerificationTaskConfig {
+    let config = ExplorationConfig {
         config_path: request.config_path,
+        depth: None,
         strategy: request.strategy,
         max_states: request.max_states,
         max_duration_seconds: request.max_duration_seconds,
@@ -8839,9 +13941,13 @@ async fn start_verification(
         output_directory: None,
         stop_on_first_failure: request.stop_on_first_failure,
         random_seed: None,
+        checkpoint_batch_size: 10,
+        checkpoint_issue_threshold: 5,
+        checkpoint_on_critical: true,
+        interleave_with_agentic: false,
     };
 
-    let task = VerificationTask::new(config, state.app_state.clone());
+    let task = ExplorationTask::new(config, state.app_state.clone());
 
     // Run the task
     match task.execute().await {
@@ -8850,21 +13956,21 @@ async fn start_verification(
             Ok(Json(ApiResponse::success(result_json)))
         }
         Err(e) => {
-            error!("Verification failed: {}", e);
+            error!("Exploration failed: {}", e);
             Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
 }
 
-/// Get available verification strategies
-async fn get_verification_strategies() -> Json<ApiResponse<serde_json::Value>> {
+/// Get available exploration strategies
+async fn get_exploration_strategies() -> Json<ApiResponse<serde_json::Value>> {
     let strategies = serde_json::json!({
         "strategies": [
             {
                 "id": "exhaustive",
                 "name": "Exhaustive",
                 "description": "Visit every state and transition - complete but slow",
-                "recommended_for": "Full verification runs, nightly builds"
+                "recommended_for": "Full exploration runs, nightly builds"
             },
             {
                 "id": "smoke_test",
@@ -8887,8 +13993,8 @@ async fn get_verification_strategies() -> Json<ApiResponse<serde_json::Value>> {
             {
                 "id": "targeted",
                 "name": "Targeted",
-                "description": "Verify only specific states/transitions",
-                "recommended_for": "Specific feature verification"
+                "description": "Explore only specific states/transitions",
+                "recommended_for": "Specific feature exploration"
             }
         ]
     });
@@ -8896,10 +14002,10 @@ async fn get_verification_strategies() -> Json<ApiResponse<serde_json::Value>> {
     Json(ApiResponse::success(strategies))
 }
 
-/// Preview verification plan without executing
-async fn preview_verification(
+/// Preview exploration plan without executing
+async fn preview_exploration(
     State(state): State<Arc<ApiState>>,
-    Json(request): Json<StartVerificationRequest>,
+    Json(request): Json<StartExplorationRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Load the current config
     let config_lock = state.app_state.current_config.lock().unwrap();
@@ -8950,7 +14056,7 @@ async fn preview_verification(
         "total_states_in_config": graph.states.len(),
         "total_transitions_in_config": graph.transitions.len(),
         "states_to_visit": path.states.len(),
-        "transitions_to_verify": path.transitions.len(),
+        "transitions_to_explore": path.transitions.len(),
         "estimated_cost": path.estimated_cost,
         "states": path.states,
         "transitions": path.transitions,
@@ -8959,8 +14065,8 @@ async fn preview_verification(
     Ok(Json(ApiResponse::success(plan)))
 }
 
-/// Get verification history
-async fn get_verification_history(
+/// Get exploration history
+async fn get_exploration_history(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<ApiResponse<serde_json::Value>> {
     let limit: usize = params
@@ -8968,9 +14074,7 @@ async fn get_verification_history(
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
 
-    let reports_dir = std::path::PathBuf::from(
-        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\verification",
-    );
+    let reports_dir = crate::paths::get_state_explorer_dir();
 
     if !reports_dir.exists() {
         return Json(ApiResponse::success(serde_json::json!({ "runs": [] })));
@@ -8984,7 +14088,7 @@ async fn get_verification_history(
             if path.extension().map(|e| e == "json").unwrap_or(false)
                 && path
                     .file_name()
-                    .map(|n| n.to_string_lossy().starts_with("verification-report-"))
+                    .map(|n| n.to_string_lossy().starts_with("exploration-report-"))
                     .unwrap_or(false)
             {
                 if let Ok(content) = std::fs::read_to_string(&path) {
@@ -9016,14 +14120,12 @@ async fn get_verification_history(
     Json(ApiResponse::success(serde_json::json!({ "runs": runs })))
 }
 
-/// Get a specific verification report
-async fn get_verification_report(
+/// Get a specific exploration report
+async fn get_exploration_report(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let reports_dir = std::path::PathBuf::from(
-        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\verification",
-    );
-    let report_path = reports_dir.join(format!("verification-report-{}.json", run_id));
+    let reports_dir = crate::paths::get_state_explorer_dir();
+    let report_path = reports_dir.join(format!("exploration-report-{}.json", run_id));
 
     if !report_path.exists() {
         return Err((
@@ -9052,14 +14154,12 @@ async fn get_verification_report(
     Ok(Json(ApiResponse::success(report)))
 }
 
-/// Get AI analysis prompt for a verification report
-async fn get_verification_prompt(
+/// Get AI analysis prompt for an exploration report
+async fn get_exploration_prompt(
     axum::extract::Path(run_id): axum::extract::Path<String>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
-    let reports_dir = std::path::PathBuf::from(
-        r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\verification",
-    );
-    let report_path = reports_dir.join(format!("verification-report-{}.json", run_id));
+    let reports_dir = crate::paths::get_state_explorer_dir();
+    let report_path = reports_dir.join(format!("exploration-report-{}.json", run_id));
 
     if !report_path.exists() {
         return Err((
@@ -9098,7 +14198,7 @@ async fn get_verification_prompt(
 }
 
 // ============================================================================
-// End AI Verification Agent HTTP API Handlers
+// End State Explorer HTTP API Handlers
 // ============================================================================
 
 // ============================================================================
@@ -10334,6 +15434,853 @@ async fn sync_context_to_web(project_id: &str, ctx: &context::Context) -> Result
 // End AI Context HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// DOM Capture HTTP API Handlers
+// ============================================================================
+
+/// List all DOM captures
+async fn list_dom_captures() -> Result<Json<ApiResponse<Vec<DomCapture>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let captures = DomCaptureLogger::list_captures();
+    Ok(Json(ApiResponse::success(captures)))
+}
+
+/// Get a specific DOM capture by ID
+async fn get_dom_capture(
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<DomCapture>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match DomCaptureLogger::get_capture(&id) {
+        Some(capture) => Ok(Json(ApiResponse::success(capture))),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("DOM capture not found: {}", id))),
+        )),
+    }
+}
+
+/// Get the HTML content of a DOM capture
+async fn get_dom_capture_html(
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    match DomCaptureLogger::get_capture_html(&id) {
+        Ok(html) => Ok((
+            [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html,
+        )),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(e)),
+        )),
+    }
+}
+
+/// Receive DOM capture from browser extension
+async fn receive_dom_from_extension(
+    Json(request): Json<ReceiveExtensionDomRequest>,
+) -> Result<Json<ApiResponse<DomCapture>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "Received DOM capture from extension: {} ({} bytes)",
+        request.url,
+        request.html.len()
+    );
+
+    // Use auto-link to find and link recent screenshots
+    match DomCaptureLogger::log_capture_with_auto_link(
+        &request.url,
+        &request.page_title,
+        &request.html,
+        request.selector.as_deref(),
+        DomCaptureSource::Extension,
+        DomCaptureTrigger::OnDemand,
+        request.task_run_id.as_deref(),
+        None, // Will auto-find recent screenshot
+    ) {
+        Ok(capture) => {
+            info!("Stored DOM capture: {} from {}", capture.id, capture.url);
+            Ok(Json(ApiResponse::success(capture)))
+        }
+        Err(e) => {
+            error!("Failed to store DOM capture: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to store DOM capture: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
+// End DOM Capture HTTP API Handlers
+// ============================================================================
+
+// ============================================================================
+// API Request HTTP API Handlers
+// ============================================================================
+
+/// Request body for importing a cURL command
+#[derive(Debug, Deserialize)]
+struct ImportCurlRequest {
+    curl_command: String,
+}
+
+/// Request body for testing an API request
+#[derive(Debug, Deserialize)]
+struct TestApiRequestBody {
+    method: String,
+    url: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+    body: Option<String>,
+    content_type: Option<String>,
+    timeout_ms: Option<u64>,
+    follow_redirects: Option<bool>,
+    variables: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Import a cURL command and return the parsed configuration
+async fn import_curl_command(
+    Json(request): Json<ImportCurlRequest>,
+) -> Result<Json<ApiResponse<crate::api_request::ParsedCurl>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Importing cURL command: {} bytes", request.curl_command.len());
+
+    match crate::api_request::parse_curl(&request.curl_command) {
+        Ok(parsed) => {
+            info!("Parsed cURL: {} {}", parsed.method, parsed.url);
+            Ok(Json(ApiResponse::success(parsed)))
+        }
+        Err(e) => {
+            error!("Failed to parse cURL command: {}", e);
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("Failed to parse cURL command: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Test an API request immediately (for debugging/testing in the editor)
+async fn test_api_request(
+    Json(request): Json<TestApiRequestBody>,
+) -> Result<Json<ApiResponse<crate::api_request::ApiRequestResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Testing API request: {} {}", request.method, request.url);
+
+    // Parse method
+    let method = match request.method.to_uppercase().as_str() {
+        "GET" => crate::api_request::HttpMethod::Get,
+        "POST" => crate::api_request::HttpMethod::Post,
+        "PUT" => crate::api_request::HttpMethod::Put,
+        "PATCH" => crate::api_request::HttpMethod::Patch,
+        "DELETE" => crate::api_request::HttpMethod::Delete,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("Invalid HTTP method: {}", request.method))),
+            ))
+        }
+    };
+
+    // Build config
+    let config = crate::api_request::ApiRequestConfig {
+        step_id: None,
+        step_name: None,
+        method,
+        url: request.url.clone(),
+        resolved_url: None,
+        headers: request.headers,
+        body: request.body,
+        content_type: request.content_type,
+        timeout_ms: request.timeout_ms.or(Some(30000)),
+        follow_redirects: request.follow_redirects.or(Some(true)),
+        credential_id: None,
+        extractions: None,
+        assertions: None,
+    };
+
+    // Create executor with provided variables
+    let executor = crate::api_request::ApiRequestExecutor::new();
+    if let Some(vars) = request.variables {
+        for (key, value) in vars {
+            executor.resolver().set(&key, &value);
+        }
+    }
+
+    // Execute the request (no credentials for test endpoint)
+    match executor.execute(&config, None).await {
+        Ok(result) => {
+            info!(
+                "API request completed: {} {} - {} in {}ms",
+                request.method, request.url, result.status_code, result.response_time_ms
+            );
+            Ok(Json(ApiResponse::success(result)))
+        }
+        Err(e) => {
+            error!("API request failed: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("API request failed: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
+// Import cURL to API Request Library
+// ============================================================================
+
+/// Request body for importing cURL to library
+#[derive(Debug, Deserialize)]
+struct ImportCurlToLibraryRequest {
+    curl_command: String,
+    /// Custom name for the saved request (optional, defaults to URL-based name)
+    name: Option<String>,
+    /// Category for organization (optional, defaults to "imported")
+    category: Option<String>,
+}
+
+/// Import a cURL command and save it to the API Request Library
+async fn import_curl_to_library(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<ImportCurlToLibraryRequest>,
+) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Importing cURL to library: {} bytes", request.curl_command.len());
+
+    // Parse the cURL command
+    let parsed = match crate::api_request::parse_curl(&request.curl_command) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to parse cURL command: {}", e);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(api_error(format!("Failed to parse cURL command: {}", e))),
+            ));
+        }
+    };
+
+    // Generate a name from the URL if not provided
+    let name = request.name.unwrap_or_else(|| {
+        // Extract path from URL for a meaningful name
+        if let Ok(url) = tauri::Url::parse(&parsed.url) {
+            let path = url.path();
+            if path.len() > 1 {
+                // Remove leading slash and take first segment
+                let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                if let Some(first) = segments.first() {
+                    return format!("{} {}", parsed.method, first);
+                }
+            }
+        }
+        format!("{} Request", parsed.method)
+    });
+
+    // Create the saved API request
+    let create_request = crate::saved_api_requests::CreateSavedApiRequestRequest {
+        name,
+        description: String::new(),
+        category: request.category.unwrap_or_else(|| "imported".to_string()),
+        tags: vec![],
+        method: parsed.method,
+        url: parsed.url.clone(),
+        headers: parsed.headers,
+        body: parsed.body,
+        body_content_type: parsed.content_type,
+        timeout_ms: 30000,
+        follow_redirects: true,
+        variable_extractions: vec![],
+        assertions: vec![],
+        credential_id: None,
+    };
+
+    match state.app_state.checkpoint_db.create_saved_api_request(&create_request) {
+        Ok(saved) => {
+            info!("Saved API request to library: {} ({}) - {} {}", saved.name, saved.id, saved.method, parsed.url);
+            Ok(Json(ApiResponse::success(saved)))
+        }
+        Err(e) => {
+            error!("Failed to save API request to library: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to save API request: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
+// Saved API Requests Library HTTP API Handlers
+// ============================================================================
+
+/// List all saved API requests
+async fn list_saved_api_requests(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.list_saved_api_requests() {
+        Ok(requests) => Ok(Json(ApiResponse::success(requests))),
+        Err(e) => {
+            error!("Failed to list saved API requests: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list saved API requests: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Get a single saved API request by ID
+async fn get_saved_api_request(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.get_saved_api_request(&id) {
+        Ok(Some(request)) => Ok(Json(ApiResponse::success(request))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Saved API request not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to get saved API request: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get saved API request: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Create a new saved API request
+async fn create_saved_api_request(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<crate::saved_api_requests::CreateSavedApiRequestRequest>,
+) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Creating saved API request: {} {}", request.method, request.url);
+    match state.app_state.checkpoint_db.create_saved_api_request(&request) {
+        Ok(created) => {
+            info!("Created saved API request: {} ({})", created.name, created.id);
+            Ok(Json(ApiResponse::success(created)))
+        }
+        Err(e) => {
+            error!("Failed to create saved API request: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to create saved API request: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Update a saved API request
+async fn update_saved_api_request(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<crate::saved_api_requests::UpdateSavedApiRequestRequest>,
+) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Updating saved API request: {}", id);
+    match state.app_state.checkpoint_db.update_saved_api_request(&id, &request) {
+        Ok(updated) => {
+            info!("Updated saved API request: {} ({})", updated.name, updated.id);
+            Ok(Json(ApiResponse::success(updated)))
+        }
+        Err(e) if e.contains("not found") => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Saved API request not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to update saved API request: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update saved API request: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Delete a saved API request
+async fn delete_saved_api_request(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Deleting saved API request: {}", id);
+    match state.app_state.checkpoint_db.delete_saved_api_request(&id) {
+        Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
+            "deleted": true,
+            "id": id
+        })))),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Saved API request not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to delete saved API request: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to delete saved API request: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Search saved API requests
+async fn search_saved_api_requests(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<crate::saved_api_requests::SearchSavedApiRequestsQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::saved_api_requests::SavedApiRequest>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.search_saved_api_requests(&query) {
+        Ok(requests) => Ok(Json(ApiResponse::success(requests))),
+        Err(e) => {
+            error!("Failed to search saved API requests: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to search saved API requests: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Get all categories from saved API requests
+async fn get_saved_api_request_categories(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.get_saved_api_request_categories() {
+        Ok(categories) => Ok(Json(ApiResponse::success(categories))),
+        Err(e) => {
+            error!("Failed to get saved API request categories: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get categories: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Get all tags from saved API requests
+async fn get_saved_api_request_tags(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<String>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.get_saved_api_request_tags() {
+        Ok(tags) => Ok(Json(ApiResponse::success(tags))),
+        Err(e) => {
+            error!("Failed to get saved API request tags: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get tags: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Duplicate a saved API request
+async fn duplicate_saved_api_request(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<crate::saved_api_requests::SavedApiRequest>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Duplicating saved API request: {}", id);
+    match state.app_state.checkpoint_db.duplicate_saved_api_request(&id) {
+        Ok(duplicated) => {
+            info!("Duplicated saved API request: {} -> {}", id, duplicated.id);
+            Ok(Json(ApiResponse::success(duplicated)))
+        }
+        Err(e) if e.contains("not found") => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Saved API request not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to duplicate saved API request: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to duplicate saved API request: {}", e))),
+            ))
+        }
+    }
+}
+
+// ============================================================================
+// End Saved API Requests Library HTTP API Handlers
+// ============================================================================
+
+// ============================================================================
+// Unified Workflows HTTP API Handlers
+// ============================================================================
+
+/// List all unified workflows
+async fn list_unified_workflows(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<Vec<crate::unified_workflows::UnifiedWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.list_unified_workflows() {
+        Ok(workflows) => Ok(Json(ApiResponse::success(workflows))),
+        Err(e) => {
+            error!("Failed to list unified workflows: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to list unified workflows: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Get a single unified workflow by ID
+async fn get_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+        Ok(Some(workflow)) => Ok(Json(ApiResponse::success(workflow))),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Unified workflow not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to get unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get unified workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Create a new unified workflow
+async fn create_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<crate::unified_workflows::CreateUnifiedWorkflowRequest>,
+) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Creating unified workflow: {}", request.name);
+    match state.app_state.checkpoint_db.create_unified_workflow(&request) {
+        Ok(created) => {
+            info!("Created unified workflow: {} ({})", created.name, created.id);
+            Ok(Json(ApiResponse::success(created)))
+        }
+        Err(e) => {
+            error!("Failed to create unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to create unified workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Update a unified workflow
+async fn update_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<crate::unified_workflows::UpdateUnifiedWorkflowRequest>,
+) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Updating unified workflow: {}", id);
+    match state.app_state.checkpoint_db.update_unified_workflow(&id, &request) {
+        Ok(updated) => {
+            info!("Updated unified workflow: {} ({})", updated.name, updated.id);
+            Ok(Json(ApiResponse::success(updated)))
+        }
+        Err(e) if e.contains("not found") => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Unified workflow not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to update unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to update unified workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Delete a unified workflow
+async fn delete_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Deleting unified workflow: {}", id);
+    match state.app_state.checkpoint_db.delete_unified_workflow(&id) {
+        Ok(true) => Ok(Json(ApiResponse::success(serde_json::json!({
+            "deleted": true,
+            "id": id
+        })))),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Unified workflow not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to delete unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to delete unified workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Search unified workflows
+async fn search_unified_workflows(
+    State(state): State<Arc<ApiState>>,
+    Query(query): Query<crate::unified_workflows::SearchUnifiedWorkflowsQuery>,
+) -> Result<Json<ApiResponse<Vec<crate::unified_workflows::UnifiedWorkflow>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.app_state.checkpoint_db.search_unified_workflows(&query) {
+        Ok(workflows) => Ok(Json(ApiResponse::success(workflows))),
+        Err(e) => {
+            error!("Failed to search unified workflows: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to search unified workflows: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Duplicate a unified workflow
+async fn duplicate_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<crate::unified_workflows::UnifiedWorkflow>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Duplicating unified workflow: {}", id);
+    match state.app_state.checkpoint_db.duplicate_unified_workflow(&id) {
+        Ok(duplicated) => {
+            info!("Duplicated unified workflow: {} -> {}", id, duplicated.id);
+            Ok(Json(ApiResponse::success(duplicated)))
+        }
+        Err(e) if e.contains("not found") => Err((
+            StatusCode::NOT_FOUND,
+            Json(api_error(format!("Unified workflow not found: {}", id))),
+        )),
+        Err(e) => {
+            error!("Failed to duplicate unified workflow: {}", e);
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to duplicate unified workflow: {}", e))),
+            ))
+        }
+    }
+}
+
+/// Request body for running a unified workflow
+#[derive(Debug, Deserialize)]
+struct RunUnifiedWorkflowRequest {
+    /// Monitor index to use (defaults to 0)
+    #[serde(default)]
+    monitor_index: Option<i32>,
+    /// Timeout in seconds (defaults to 300)
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+/// Run a unified workflow by ID
+///
+/// This endpoint executes a unified workflow by:
+/// 1. Fetching the workflow from the database
+/// 2. Converting phase steps to executable steps
+/// 3. Running setup -> verification -> agentic -> completion phases
+async fn run_unified_workflow(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<RunUnifiedWorkflowRequest>,
+) -> Result<Json<ApiResponse<crate::step_executor::ExecutionResult>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("Running unified workflow: {}", id);
+
+    // Fetch the workflow
+    let workflow = match state.app_state.checkpoint_db.get_unified_workflow(&id) {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(api_error(format!("Unified workflow not found: {}", id))),
+            ));
+        }
+        Err(e) => {
+            error!("Failed to get unified workflow: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Failed to get unified workflow: {}", e))),
+            ));
+        }
+    };
+
+    info!(
+        "Executing unified workflow '{}' with {} setup, {} verification, {} agentic, {} completion steps",
+        workflow.name,
+        workflow.setup_steps.len(),
+        workflow.verification_steps.len(),
+        workflow.agentic_steps.len(),
+        workflow.completion_steps.len()
+    );
+
+    let monitor_index = request.monitor_index.unwrap_or(0);
+    let _timeout_seconds = request.timeout_seconds.unwrap_or(300);
+
+    // Convert JSON steps to ExecutionStepConfig
+    // For now, we run phases sequentially: setup -> (verification + agentic) -> completion
+    let mut all_steps: Vec<crate::step_executor::ExecutionStepConfig> = Vec::new();
+
+    // Helper to convert Value steps to ExecutionStepConfig
+    let convert_step = |step: &serde_json::Value, monitor: i32| -> Option<crate::step_executor::ExecutionStepConfig> {
+        // Try to deserialize the step directly
+        if let Ok(mut config) = serde_json::from_value::<crate::step_executor::ExecutionStepConfig>(step.clone()) {
+            // Set monitor index if not specified
+            if config.monitor_index.is_none() {
+                config.monitor_index = Some(monitor);
+            }
+            return Some(config);
+        }
+
+        // Fall back to extracting type and creating manually
+        let step_type = step.get("type").and_then(|t| t.as_str())?;
+        let name = step.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+
+        Some(crate::step_executor::ExecutionStepConfig {
+            step_type: step_type.to_string(),
+            name,
+            action_type: step.get("actionType").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            target_image_id: step.get("targetImageId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            target_image_name: step.get("targetImageName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            monitor_index: Some(monitor),
+            take_screenshot: step.get("takeScreenshot").and_then(|v| v.as_bool()).unwrap_or(false),
+            screenshot_delay: step.get("screenshotDelay").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(0),
+            screenshot_monitor: step.get("screenshotMonitor").cloned(),
+            playwright_script_id: step.get("playwrightScriptId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            playwright_script_content: step.get("playwrightScript").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            playwright_target_url: None,
+            prompt_content: step.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            timeout_seconds: step.get("timeoutSeconds").and_then(|v| v.as_u64()),
+            initial_state_ids: None,
+            is_setup: step.get("isSetup").and_then(|v| v.as_bool()),
+            run_on_subsequent_iterations: None,
+            test_id: None,
+            test_type: None,
+            test_is_critical: None,
+            awas_url: step.get("awasUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            awas_action_id: step.get("awasActionName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            awas_params: step.get("awasParameters").cloned(),
+            awas_html: None,
+            awas_base_url: step.get("awasBaseUrl").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            mcp_server_id: step.get("mcpServerId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            mcp_server_name: step.get("mcpServerName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            mcp_tool_name: step.get("mcpToolName").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            mcp_arguments: step.get("mcpArguments").cloned(),
+            mcp_fail_on_error: step.get("mcpFailOnError").and_then(|v| v.as_bool()),
+            // Shell command fields
+            shell_command: step.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            shell_command_id: step.get("shell_command_id").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            shell_command_working_directory: step.get("working_directory").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            shell_command_fail_on_error: step.get("fail_on_error").and_then(|v| v.as_bool()),
+            // API request fields
+            api_method: step.get("method").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            api_url: step.get("url").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            api_headers: step.get("headers").cloned(),
+            api_body: step.get("body").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            api_content_type: step.get("content_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            // Check fields
+            check_type: step.get("check_type").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            check_command: step.get("command").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            check_working_directory: step.get("working_directory").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            check_auto_fix: step.get("auto_fix").and_then(|v| v.as_bool()),
+        })
+    };
+
+    // Add setup steps
+    for step in &workflow.setup_steps {
+        if let Some(config) = convert_step(step, monitor_index) {
+            all_steps.push(config);
+        }
+    }
+
+    // Add verification steps
+    for step in &workflow.verification_steps {
+        if let Some(config) = convert_step(step, monitor_index) {
+            all_steps.push(config);
+        }
+    }
+
+    // Add agentic steps
+    for step in &workflow.agentic_steps {
+        if let Some(config) = convert_step(step, monitor_index) {
+            all_steps.push(config);
+        }
+    }
+
+    // Add completion steps
+    for step in &workflow.completion_steps {
+        if let Some(config) = convert_step(step, monitor_index) {
+            all_steps.push(config);
+        }
+    }
+
+    if all_steps.is_empty() {
+        return Ok(Json(ApiResponse::success(crate::step_executor::ExecutionResult {
+            success: true,
+            total_steps: 0,
+            successful_steps: 0,
+            failed_steps: 0,
+            total_duration_ms: 0,
+            steps: vec![],
+            captured_logs: None,
+            captured_runner_logs: None,
+        })));
+    }
+
+    let execution_id = format!("unified-workflow-{}-{}", id, chrono::Utc::now().timestamp_millis());
+
+    // Create a task_run record so the workflow shows in the Active page
+    // Build execution_steps_json for activity detection in the dashboard
+    let steps_for_detection: Vec<serde_json::Value> = all_steps.iter().map(|step| {
+        serde_json::json!({
+            "type": step.step_type,
+            "name": step.name,
+        })
+    }).collect();
+    let execution_steps_json = serde_json::to_string(&steps_for_detection).ok();
+
+    // Create task_run to track this execution (enables Active page monitoring)
+    if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
+        &execution_id,
+        &workflow.name,
+        None, // no prompt
+        "automation", // task_type - identifies as automation task
+        None, // config_id
+        Some(&workflow.name), // workflow_name - helps identify this in the dashboard
+        None, // max_sessions
+        None, // auto_continue
+        execution_steps_json, // execution_steps_json - for activity detection
+        None, // log_sources_json
+    ) {
+        warn!("Failed to create task_run for unified workflow {}: {}", execution_id, e);
+    }
+
+    // Create step executor
+    let executor = crate::step_executor::StepExecutor::with_app_handle(
+        state.app_state.clone(),
+        state.config_storage.clone(),
+        state.app_handle.clone(),
+    );
+
+    // Execute all steps
+    let result = executor
+        .execute_steps_with_log_sources(&all_steps, &execution_id, &[])
+        .await;
+
+    info!(
+        "Unified workflow '{}' completed: {} of {} steps succeeded",
+        workflow.name, result.successful_steps, result.total_steps
+    );
+
+    // Update task_run status based on result
+    if result.success {
+        if let Err(e) = state.app_state.checkpoint_db.complete_task_run(&execution_id) {
+            warn!("Failed to mark task_run {} as completed: {}", execution_id, e);
+        }
+    } else {
+        let error_msg = result.steps.iter()
+            .find(|s| !s.success)
+            .and_then(|s| s.error.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown error");
+        if let Err(e) = state.app_state.checkpoint_db.fail_task_run(&execution_id, error_msg) {
+            warn!("Failed to mark task_run {} as failed: {}", execution_id, e);
+        }
+    }
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+// ============================================================================
+// End Unified Workflows HTTP API Handlers
+// ============================================================================
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -10385,6 +16332,8 @@ pub fn create_router(
         config_storage,
         action_service,
         current_ai_pids: Arc::new(std::sync::Mutex::new(Vec::new())),
+        orchestrator_states: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        extraction_state: Arc::new(ExtractionState::new()),
     });
 
     // Restore persisted session state on startup
@@ -10425,7 +16374,7 @@ pub fn create_router(
 
         // Log to debug file
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(
-            r"C:\Users\Joshua\Documents\qontinui_parent_directory\.dev-logs\workflow-debug.log",
+            crate::paths::get_workflow_debug_log_path(),
         ) {
             use std::io::Write;
             let _ = writeln!(
@@ -10455,32 +16404,75 @@ pub fn create_router(
     Router::new()
         // WebSocket endpoint for live execution event streaming
         .route("/ws/events", get(ws_events_handler))
+        // SSE endpoint for MCP notification streaming (alternative to WebSocket)
+        .route("/sse/events", get(sse_events_handler))
         .route("/health", get(health))
         // Debug endpoints for AI sessions
         .route("/debug/app/errors", get(get_debug_errors))
         .route("/findings/summary", get(get_findings_summary))
         .route("/launch-debug-chrome", post(launch_debug_chrome))
         .route("/status", get(get_status))
+        .route("/tool-version", get(get_tool_version))
         .route("/monitors", get(get_monitors))
         .route("/load-config", post(load_config))
         .route("/load-last-config", post(load_last_config))
         .route("/run-workflow", post(run_workflow))
         .route("/execute-steps", post(execute_steps))
         .route("/stop-execution", post(stop_execution))
+        .route("/execute", post(execute_python_command))
         .route("/execute-action", post(execute_action))
         .route("/capture-screenshot", post(capture_screenshot_step))
+        .route("/screenshots/list", get(list_screenshots_endpoint))
+        .route("/action-log/view", get(get_action_log_view_endpoint))
         // State navigation route
         .route("/go-to-state", post(go_to_state))
         // Web extraction routes
         .route("/extraction/start", post(start_web_extraction))
         .route("/extraction/stop", post(stop_web_extraction))
         .route("/extraction/status", get(get_extraction_status))
+        .route("/extraction/stats", post(update_extraction_stats))
+        .route("/extraction/complete", post(complete_extraction))
         .route(
             "/extraction/:extraction_id/screenshot/:screenshot_id",
             get(get_extraction_screenshot),
         )
+        // UI-TARS extraction routes
+        .route("/uitars-extraction/start", post(start_uitars_extraction))
+        .route("/uitars-extraction/stop", post(stop_uitars_extraction))
+        .route("/uitars-extraction/status", get(get_uitars_extraction_status))
+        .route("/uitars-extraction/results", get(get_uitars_extraction_results))
         // Vision extraction route (runs Edge Detection, SAM3, OCR on desktop)
         .route("/vision-extraction/extract", post(run_vision_extraction))
+        // Pattern matching routes
+        .route("/pattern/find", post(pattern_find))
+        .route("/pattern/find-all", post(pattern_find_all))
+        // Model management routes
+        .route("/models", get(list_models))
+        .route("/models/download", post(download_model))
+        .route("/models/delete", post(delete_model))
+        .route("/models/disk-usage", get(get_models_disk_usage))
+        .route("/models/:model_id", get(get_model_status))
+        // Integration testing routes
+        .route("/testing/start", post(start_integration_test))
+        .route("/testing/status/:id", get(get_test_run_status))
+        .route("/testing/results/:id", get(get_integration_test_results))
+        .route("/testing/runs", get(list_integration_test_runs))
+        .route("/testing/mock-action", post(mock_gui_action))
+        .route("/testing/states", get(get_testing_states))
+        .route("/testing/transitions", get(get_testing_transitions))
+        .route("/testing/find-path", post(find_testing_path))
+        .route("/testing/traverse", post(traverse_to_state))
+        .route("/testing/active-states", get(get_testing_active_states))
+        .route("/testing/mock-mode", post(set_testing_mock_mode))
+        .route("/testing/mocked-actions", get(get_mocked_actions))
+        .route("/testing/clear-mocked-actions", post(clear_mocked_actions))
+        .route("/testing/assertion", post(run_testing_assertion))
+        .route("/testing/end/:id", post(end_integration_test))
+        // Playwright State Collector routes
+        .route("/playwright-collection/start", post(start_playwright_collection))
+        .route("/playwright-collection/status", get(get_playwright_collection_status))
+        .route("/playwright-collection/results", get(get_playwright_collection_results))
+        .route("/playwright-collection/stop", post(stop_playwright_collection))
         // RAG routes
         .route("/rag/import", post(import_rag))
         .route("/rag/list", get(list_rag_configs))
@@ -10570,6 +16562,10 @@ pub fn create_router(
         .route("/scriptlets/:id", get(get_scriptlet))
         .route("/scriptlets/:id", put(update_scriptlet))
         .route("/scriptlets/:id", delete(delete_scriptlet))
+        // Inline Python execution
+        .route("/execute-python", post(execute_inline_python))
+        // Agent spawning
+        .route("/spawn-sub-agent", post(spawn_sub_agent))
         // Workflow resume routes
         .route("/workflow/resumable", get(get_resumable_workflow))
         .route("/workflow/resume", post(resume_workflow))
@@ -10606,11 +16602,18 @@ pub fn create_router(
             "/task-runs/:id/auto-continue",
             get(get_task_auto_continue).put(set_task_auto_continue),
         )
+        .route("/task-runs/:id/generate-summary", post(generate_task_summary))
+        // Hybrid logging routes (SQLite event storage)
+        .route("/task-runs/:id/events", get(get_task_run_events))
+        .route("/task-runs/:id/screenshots", get(get_task_run_screenshots))
+        .route("/task-runs/:id/playwright-results", get(get_task_run_playwright_results))
+        .route("/task-runs/:id/migrate-logs", post(migrate_task_run_logs))
         // Automation Run routes (for MCP/AI access to task_run_automation)
         .route("/runs", get(list_automation_runs))
         .route("/runs/:id", get(get_automation_run))
         // Config Storage routes
         .route("/configs", get(list_configs).post(import_config))
+        .route("/configs/parse", post(parse_config_file))
         .route(
             "/configs/:id",
             get(get_stored_config)
@@ -10618,13 +16621,13 @@ pub fn create_router(
                 .delete(delete_stored_config),
         )
         .route("/configs/:id/export", post(export_config))
-        // AI Verification Agent routes
-        .route("/verification/start", post(start_verification))
-        .route("/verification/strategies", get(get_verification_strategies))
-        .route("/verification/preview", post(preview_verification))
-        .route("/verification/history", get(get_verification_history))
-        .route("/verification/:run_id", get(get_verification_report))
-        .route("/verification/:run_id/prompt", get(get_verification_prompt))
+        // State Explorer routes
+        .route("/state-explorer/start", post(start_exploration))
+        .route("/state-explorer/strategies", get(get_exploration_strategies))
+        .route("/state-explorer/preview", post(preview_exploration))
+        .route("/state-explorer/history", get(get_exploration_history))
+        .route("/state-explorer/:run_id", get(get_exploration_report))
+        .route("/state-explorer/:run_id/prompt", get(get_exploration_prompt))
         // Verification Test routes (test CRUD and execution)
         .route("/tests", get(list_tests).post(create_test))
         .route("/tests/execute-suite", post(execute_test_suite_handler))
@@ -10660,6 +16663,34 @@ pub fn create_router(
         // Context sync approval routes (for syncing project contexts to qontinui-web)
         .route("/contexts/:id/approve-sync", post(approve_context_sync))
         .route("/contexts/:id/dismiss-sync", post(dismiss_context_sync))
+        // DOM Capture routes
+        .route("/dom/captures", get(list_dom_captures))
+        .route("/dom/captures/:id", get(get_dom_capture))
+        .route("/dom/captures/:id/html", get(get_dom_capture_html))
+        .route("/dom/receive", post(receive_dom_from_extension))
+        // API Request routes
+        .route("/api-request/import-curl", post(import_curl_command))
+        .route("/api-request/import-to-library", post(import_curl_to_library))
+        .route("/api-request/test", post(test_api_request))
+        // Saved API Requests Library routes
+        .route("/saved-api-requests", get(list_saved_api_requests).post(create_saved_api_request))
+        .route("/saved-api-requests/search", get(search_saved_api_requests))
+        .route("/saved-api-requests/categories", get(get_saved_api_request_categories))
+        .route("/saved-api-requests/tags", get(get_saved_api_request_tags))
+        .route("/saved-api-requests/:id", get(get_saved_api_request).put(update_saved_api_request).delete(delete_saved_api_request))
+        .route("/saved-api-requests/:id/duplicate", post(duplicate_saved_api_request))
+        // Unified Workflows routes
+        .route("/unified-workflows", get(list_unified_workflows).post(create_unified_workflow))
+        .route("/unified-workflows/search", get(search_unified_workflows))
+        .route("/unified-workflows/:id", get(get_unified_workflow).put(update_unified_workflow).delete(delete_unified_workflow))
+        .route("/unified-workflows/:id/duplicate", post(duplicate_unified_workflow))
+        .route("/unified-workflows/:id/run", post(run_unified_workflow))
+        // AWAS (Application Web Automation Specification) routes
+        .route("/awas/discover", post(awas_discover))
+        .route("/awas/execute", post(awas_execute))
+        .route("/awas/check-support", post(awas_check_support))
+        .route("/awas/actions", get(awas_list_actions))
+        .route("/awas/extract-elements", post(awas_extract_elements))
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

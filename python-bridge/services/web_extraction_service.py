@@ -10,16 +10,21 @@ import base64
 import json
 import logging
 import os
+import time
 import uuid
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import cv2
 import numpy as np
 from PIL import Image
 from qontinui_schemas.common import utc_now
 
 logger = logging.getLogger(__name__)
+
+# Rust runner API URL for status updates
+RUNNER_API_URL = "http://localhost:9876"
 
 # Try to import OCR name generator
 try:
@@ -32,13 +37,16 @@ except ImportError:
 
 # Import state machine builder for transforming extraction results
 try:
-    from qontinui.state_management.builders import build_state_machine_from_extraction
+    from qontinui.state_management.builders import build_state_machine_from_extraction_result
 
     HAS_STATE_MACHINE_BUILDER = True
-except ImportError:
+    print(f"[STATE_MACHINE_DEBUG] Successfully imported build_state_machine_from_extraction_result", flush=True)
+    logger.info("State machine builder imported successfully")
+except ImportError as e:
     HAS_STATE_MACHINE_BUILDER = False
+    print(f"[STATE_MACHINE_DEBUG] Failed to import state machine builder: {e}", flush=True)
     logger.warning(
-        "State machine builder not available - extraction results will not be transformed"
+        f"State machine builder not available - extraction results will not be transformed: {e}"
     )
 
 # Import vision extraction from qontinui library
@@ -383,8 +391,11 @@ class WebExtractionService:
 
         try:
             # Run extraction
-            logger.info("Calling orchestrator.extract()...")
+            start_extract = time.time()
+            logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] Starting orchestrator.extract()")
             result = await self._orchestrator.extract(config)
+            duration_extract = time.time() - start_extract
+            logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] orchestrator.extract() finished in {duration_extract:.2f}s")
             logger.info("=" * 60)
             logger.info("EXTRACTION RESULT FROM ORCHESTRATOR")
             logger.info("=" * 60)
@@ -443,13 +454,21 @@ class WebExtractionService:
                     logger.info(f"Serialized {len(serialized_elements)} elements for backend")
 
                 # Save annotations to backend
+                start_save = time.time()
+                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _save_annotations_to_backend()")
                 await self._save_annotations_to_backend(
                     serialized_states, serialized_transitions, serialized_elements
                 )
+                duration_save = time.time() - start_save
+                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] _save_annotations_to_backend() finished in {duration_save:.2f}s")
 
                 # Build and upload the state machine
                 # This transforms raw elements into a proper state machine using co-occurrence clustering
+                start_build = time.time()
+                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _build_and_upload_state_machine()")
                 await self._build_and_upload_state_machine(serialized_elements)
+                duration_build = time.time() - start_build
+                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] _build_and_upload_state_machine() finished in {duration_build:.2f}s")
 
                 # Update backend session to completed with stats
                 pages_extracted = (
@@ -495,6 +514,14 @@ class WebExtractionService:
                     f"{len(result.transitions)} transitions"
                 )
 
+                # Notify Rust that extraction is complete
+                await self._notify_rust_extraction_complete(
+                    states_found=len(result.states),
+                    transitions_found=len(result.transitions),
+                    pages_extracted=result.runtime_extraction.pages_visited if result.runtime_extraction else 0,
+                    errors=len(result.errors),
+                )
+
         except asyncio.CancelledError:
             # Handle cancellation gracefully
             logger.info(f"Extraction {self._current_extraction_id} was cancelled")
@@ -509,6 +536,13 @@ class WebExtractionService:
                     "extraction_id": self._current_extraction_id,
                     "message": "Extraction cancelled by user",
                 },
+            )
+            # Notify Rust that extraction was cancelled
+            await self._notify_rust_extraction_complete(
+                states_found=0,
+                transitions_found=0,
+                pages_extracted=0,
+                errors=0,
             )
             # Re-raise to let asyncio handle the cancellation
             raise
@@ -527,10 +561,59 @@ class WebExtractionService:
                     "error": str(e),
                 },
             )
+            # Notify Rust that extraction failed
+            await self._notify_rust_extraction_complete(
+                states_found=0,
+                transitions_found=0,
+                pages_extracted=0,
+                errors=1,
+            )
 
         finally:
             self._is_running = False
             self._orchestrator = None
+
+    async def _notify_rust_extraction_complete(
+        self,
+        states_found: int,
+        transitions_found: int,
+        pages_extracted: int,
+        errors: int,
+    ) -> None:
+        """
+        Notify the Rust runner that extraction has completed.
+
+        This calls the /extraction/complete endpoint to update the status
+        that the frontend polls.
+
+        Args:
+            states_found: Number of states extracted
+            transitions_found: Number of transitions extracted
+            pages_extracted: Number of pages visited
+            errors: Number of errors encountered
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "states_found": states_found,
+                    "transitions_found": transitions_found,
+                    "pages_extracted": pages_extracted,
+                    "warnings": 0,
+                    "errors": errors,
+                }
+                async with session.post(
+                    f"{RUNNER_API_URL}/extraction/complete",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status == 200:
+                        logger.info("Notified Rust runner of extraction completion")
+                    else:
+                        logger.warning(
+                            f"Failed to notify Rust runner: {response.status}"
+                        )
+        except Exception as e:
+            logger.error(f"Error notifying Rust runner of extraction completion: {e}")
 
     async def _handle_progress(self, data: dict[str, Any]) -> None:
         """
@@ -1333,30 +1416,31 @@ class WebExtractionService:
         Returns:
             Vision extraction results dict, or None if extraction failed
         """
-        print(
-            f"[VISION_DEBUG] _run_vision_extraction called, HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}",
-            flush=True,
+        logger.debug(
+            f"[VISION_DEBUG] _run_vision_extraction called, HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}"
         )
+        start_vision = time.time()
+        logger.info(f"[PERF_DEBUG] [{screenshot_id}] Starting _run_vision_extraction for {source_url}")
         if not HAS_VISION_EXTRACTION:
-            print("[VISION_DEBUG] Vision extraction not available, returning None", flush=True)
+            logger.debug("[VISION_DEBUG] Vision extraction not available, returning None")
             logger.debug("Vision extraction not available")
             return None
 
         if not screenshot_path.exists():
-            print(f"[VISION_DEBUG] Screenshot not found: {screenshot_path}", flush=True)
+            logger.debug(f"[VISION_DEBUG] Screenshot not found: {screenshot_path}")
             logger.warning(f"Screenshot not found for vision extraction: {screenshot_path}")
             return None
 
         try:
-            print("[VISION_DEBUG] Screenshot exists, initializing extractor...", flush=True)
+            logger.debug("[VISION_DEBUG] Screenshot exists, initializing extractor...")
             # Lazy initialize vision extractor
             if self._vision_extractor is None:
-                print("[VISION_DEBUG] Creating UnifiedVisionExtractor...", flush=True)
+                logger.debug("[VISION_DEBUG] Creating UnifiedVisionExtractor...")
                 self._vision_extractor = UnifiedVisionExtractor()
-                print("[VISION_DEBUG] UnifiedVisionExtractor created successfully", flush=True)
+                logger.debug("[VISION_DEBUG] UnifiedVisionExtractor created successfully")
 
             # Run vision extraction
-            print(f"[VISION_DEBUG] Running extract() on {screenshot_path}", flush=True)
+            logger.debug(f"[VISION_DEBUG] Running extract() on {screenshot_path}")
             logger.info(f"Running vision extraction on {screenshot_path}")
             result = await self._vision_extractor.extract(
                 screenshot_path=screenshot_path,
@@ -1458,12 +1542,11 @@ class WebExtractionService:
                         }
                     )
 
-            print(
+            logger.debug(
                 f"[VISION_DEBUG] Vision extraction complete: {len(vision_data['edge_results'])} edges, "
                 f"{len(vision_data['sam3_results'])} segments, "
                 f"{len(vision_data['ocr_results'])} text regions, "
-                f"{len(vision_data['merged_candidates'])} merged candidates",
-                flush=True,
+                f"{len(vision_data['merged_candidates'])} merged candidates"
             )
             logger.info(
                 f"Vision extraction complete: {len(vision_data['edge_results'])} edges, "
@@ -1471,6 +1554,8 @@ class WebExtractionService:
                 f"{len(vision_data['ocr_results'])} text regions, "
                 f"{len(vision_data['merged_candidates'])} merged candidates"
             )
+            duration_vision = time.time() - start_vision
+            logger.info(f"[PERF_DEBUG] [{screenshot_id}] _run_vision_extraction finished in {duration_vision:.2f}s")
             return vision_data
 
         except Exception as e:
@@ -1485,14 +1570,18 @@ class WebExtractionService:
         """
         Build the state machine from extraction results and upload to backend.
 
-        Transforms raw extraction states into the StateMachine format expected
-        by the frontend (states with stateImages, patterns, searchRegions).
+        Uses image matching to find elements across screenshots, then groups
+        elements by co-occurrence (which screenshots they appear on together).
 
-        For comprehensive extraction, creates individual stateImages for each
-        element within a state (e.g., header state contains logo, signin, docs images).
+        The algorithm:
+        1. Load screenshots from disk
+        2. For each element, crop its image region from the source screenshot
+        3. Search for that image on ALL other screenshots using template matching
+        4. Record which screenshots contain each image
+        5. Group images by co-occurrence (same set of screenshots = same state)
 
         Args:
-            serialized_elements: List of serialized element dicts with id, name, bbox, etc.
+            serialized_elements: List of serialized element dicts (unused, kept for API compat)
         """
         if not self._backend_session_id or not self._backend_url:
             logger.debug("No backend session configured, skipping state machine upload")
@@ -1507,83 +1596,86 @@ class WebExtractionService:
                 return
 
             result = self._extraction_results[extraction_id].get("result")
-            if not result or not result.states:
-                logger.warning("No states in extraction result")
+            if not result:
+                logger.warning("No extraction result available")
                 return
 
-            # Use serialized_elements directly - ignore old state.element_ids
-            # This ensures we use the comprehensive extraction results
+            # Get the screenshots directory
+            actual_extraction_id = result.extraction_id
+            screenshots_dir = self.extractions_dir / actual_extraction_id / "screenshots"
+
+            print(f"[STATE_MACHINE_DEBUG] Building state machine with image matching", flush=True)
+            print(f"[STATE_MACHINE_DEBUG] Screenshots dir: {screenshots_dir}", flush=True)
+            print(f"[STATE_MACHINE_DEBUG] Screenshots dir exists: {screenshots_dir.exists()}", flush=True)
+            print(f"[STATE_MACHINE_DEBUG] HAS_STATE_MACHINE_BUILDER: {HAS_STATE_MACHINE_BUILDER}", flush=True)
             logger.info(
-                f"Building state machine with {len(serialized_elements)} elements "
-                f"(ignoring {len(result.states)} old states)"
+                f"Building state machine with image matching from {screenshots_dir}"
             )
 
-            # Create ONE state that contains ALL interactive elements as stateImages
-            state_images = []
-            for elem in serialized_elements:
-                elem_id = elem.get("id", "")
-                elem_bbox = elem.get("bbox", {"x": 0, "y": 0, "width": 100, "height": 30})
-                elem_name = (
-                    elem.get("name") or elem.get("text") or elem.get("element_type") or "Element"
+            # Use the new image-matching state machine builder from qontinui library
+            if HAS_STATE_MACHINE_BUILDER:
+                print(f"[STATE_MACHINE_DEBUG] Calling build_state_machine_from_extraction_result...", flush=True)
+                print(f"[STATE_MACHINE_DEBUG] extraction_result: {result}", flush=True)
+                print(f"[STATE_MACHINE_DEBUG] runtime_extraction: {result.runtime_extraction}", flush=True)
+                if result.runtime_extraction:
+                    print(f"[STATE_MACHINE_DEBUG] runtime_extraction.states count: {len(result.runtime_extraction.states)}", flush=True)
+                    for i, state in enumerate(result.runtime_extraction.states):
+                        print(f"[STATE_MACHINE_DEBUG]   State {i}: screenshot_id={state.screenshot.id if state.screenshot else 'None'}, elements={len(state.elements)}", flush=True)
+
+                states_config, transitions_config = build_state_machine_from_extraction_result(
+                    extraction_result=result,
+                    screenshots_dir=screenshots_dir,
+                    similarity_threshold=0.8,
                 )
+                print(f"[STATE_MACHINE_DEBUG] Image matching returned {len(states_config)} states", flush=True)
+                for i, state in enumerate(states_config):
+                    print(f"[STATE_MACHINE_DEBUG]   State {i}: name={state.get('name')}, images={len(state.get('stateImages', []))}, screensFound={state.get('screensFound', [])}", flush=True)
+                logger.info(
+                    f"Image matching produced {len(states_config)} states"
+                )
+            else:
+                print(f"[STATE_MACHINE_DEBUG] State machine builder NOT available, using fallback", flush=True)
+                # Fallback: Create a single state with all elements (old behavior)
+                logger.warning(
+                    "State machine builder not available - falling back to single state"
+                )
+                state_images = []
+                for elem in serialized_elements:
+                    elem_id = elem.get("id", "")
+                    elem_bbox = elem.get("bbox", {"x": 0, "y": 0, "width": 100, "height": 30})
+                    elem_name = (
+                        elem.get("name") or elem.get("text") or elem.get("element_type") or "Element"
+                    )
+                    if len(elem_name) > 30:
+                        elem_name = elem_name[:27] + "..."
 
-                # Truncate long names
-                if len(elem_name) > 30:
-                    elem_name = elem_name[:27] + "..."
-
-                state_image_id = f"stateimage-{elem_id}"
-                pattern_id = f"pattern-{elem_id}"
-
-                state_image = {
-                    "id": state_image_id,
-                    "name": elem_name,
-                    "patterns": [
-                        {
-                            "id": pattern_id,
+                    state_images.append({
+                        "id": f"stateimage-{elem_id}",
+                        "name": elem_name,
+                        "patterns": [{
+                            "id": f"pattern-{elem_id}",
                             "name": elem_name,
                             "searchRegions": [elem_bbox],
                             "fixed": False,
-                        }
-                    ],
-                    "shared": False,
-                    "searchRegions": [elem_bbox],
-                    "extractionCategory": elem.get("extraction_category", ""),
-                }
-                state_images.append(state_image)
-                logger.debug(
-                    f"  Element: {elem_name} ({elem.get('extraction_category', 'unknown')})"
-                )
+                        }],
+                        "shared": False,
+                        "searchRegions": [elem_bbox],
+                        "extractionCategory": elem.get("extraction_category", ""),
+                    })
 
-            # Create a single state containing all elements
-            state_config = {
-                "id": "state-page-elements",
-                "name": "Page Elements",
-                "description": "Interactive elements extracted from the page",
-                "stateImages": state_images,
-                "regions": [],
-                "locations": [],
-                "strings": [],
-                "position": {"x": 0, "y": 0},
-                "initial": True,
-                "isFinal": False,
-            }
-            states_config = [state_config]
-
-            logger.info(f"Created state with {len(state_images)} stateImages")
-
-            # Transform transitions
-            transitions_config = []
-            for trans in result.transitions:
-                trans_config = {
-                    "id": trans.id,
-                    "type": trans.trigger_type or "click",
-                    "fromState": trans.from_state_id,
-                    "toState": trans.to_state_id,
-                    "workflows": [],
-                    "timeout": 30,
-                    "retryCount": 3,
-                }
-                transitions_config.append(trans_config)
+                states_config = [{
+                    "id": "state-page-elements",
+                    "name": "Page Elements",
+                    "description": "Interactive elements extracted from the page",
+                    "stateImages": state_images,
+                    "regions": [],
+                    "locations": [],
+                    "strings": [],
+                    "position": {"x": 0, "y": 0},
+                    "initial": True,
+                    "isFinal": False,
+                }]
+                transitions_config = []
 
             logger.info(
                 f"Built state machine: {len(states_config)} states, "

@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ConfigStorageService, type StoredConfigMetadata } from "../services/ConfigStorageService";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 interface ConfigSelectorProps {
   /** Currently selected config ID */
@@ -132,9 +133,13 @@ export function ConfigSelector({
     <div className={`space-y-2 ${className}`}>
       {/* Warning when GUI steps exist without config */}
       {showWarning && (
-        <div className="flex items-start gap-2 p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg text-xs">
-          <AlertTriangle className="w-4 h-4 flex-shrink-0 text-amber-600 mt-0.5" />
-          <div className="text-amber-600">
+        <div
+          className={`flex items-start gap-2 p-2 ${getAccentColors("amber").bg} border ${getAccentColors("amber").border} rounded-lg text-xs`}
+        >
+          <AlertTriangle
+            className={`w-4 h-4 flex-shrink-0 ${getAccentColors("amber").text} mt-0.5`}
+          />
+          <div className={getAccentColors("amber").text}>
             <span className="font-medium">Config Required:</span> This workflow contains GUI
             automation steps (workflows, states, or click actions) that require a stored
             configuration. Please select or import a configuration.
@@ -212,7 +217,13 @@ export function ConfigSelector({
             </div>
 
             {/* Error State */}
-            {error && <div className="px-3 py-2 text-xs text-red-500 bg-red-500/10">{error}</div>}
+            {error && (
+              <div
+                className={`px-3 py-2 text-xs ${getStatusColors("error").text} ${getStatusColors("error").bg}`}
+              >
+                {error}
+              </div>
+            )}
 
             {/* Config List */}
             {configs.length === 0 ? (

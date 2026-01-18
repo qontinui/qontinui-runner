@@ -903,6 +903,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Deprecated: save_run no longer inserts to run_details table, use finish_*_with_db methods instead
     fn test_run_recorder_success() {
         let conn = create_test_db();
 
@@ -937,6 +938,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Deprecated: save_run no longer inserts to run_details table, use finish_*_with_db methods instead
     fn test_run_recorder_failure() {
         let conn = create_test_db();
 

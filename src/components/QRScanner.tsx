@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Html5Qrcode } from "html5-qrcode";
 import { Camera, X, CheckCircle, AlertCircle } from "lucide-react";
+import { getStatusColors } from "@/design-system";
 
 export interface QRScannerProps {
   onScan: (data: string) => void;
@@ -197,13 +198,13 @@ export function QRScanner({ onScan, onError, onClose }: QRScannerProps) {
       <div className="flex items-center justify-center gap-2 p-3 rounded-lg bg-card border border-border/50">
         {error ? (
           <>
-            <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
-            <span className="text-sm text-red-400">{statusMessage}</span>
+            <AlertCircle className={`w-5 h-5 ${getStatusColors("error").icon} shrink-0`} />
+            <span className={`text-sm ${getStatusColors("error").text}`}>{statusMessage}</span>
           </>
         ) : scanSuccess ? (
           <>
-            <CheckCircle className="w-5 h-5 text-green-400 shrink-0" />
-            <span className="text-sm text-green-400">{statusMessage}</span>
+            <CheckCircle className={`w-5 h-5 ${getStatusColors("success").icon} shrink-0`} />
+            <span className={`text-sm ${getStatusColors("success").text}`}>{statusMessage}</span>
           </>
         ) : scanning ? (
           <>

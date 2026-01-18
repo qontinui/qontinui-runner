@@ -6,6 +6,7 @@
  */
 
 import { Cloud, CloudOff, AlertCircle } from "lucide-react";
+import { getStatusColors } from "@/design-system";
 import { useSyncStatus } from "../../hooks/useDiscoveries";
 
 interface DiscoverySyncIndicatorProps {
@@ -26,12 +27,15 @@ export function DiscoverySyncIndicator({ onClick, showLabel = true }: DiscoveryS
   }
 
   const hasIssue = !status.authenticated || status.pending_count > 0;
+  const warningColors = getStatusColors("warning");
 
   return (
     <button
       onClick={onClick}
       className={`flex items-center gap-1.5 px-2 py-1 rounded text-xs transition-colors ${
-        hasIssue ? "text-yellow-500 hover:bg-yellow-500/10" : "text-muted-foreground hover:bg-muted"
+        hasIssue
+          ? `${warningColors.text} hover:${warningColors.bg}`
+          : "text-muted-foreground hover:bg-muted"
       }`}
       title={
         !status.authenticated

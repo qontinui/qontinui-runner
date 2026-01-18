@@ -11,6 +11,7 @@ import { X, Clock, CheckCircle2, XCircle, Maximize2 } from "lucide-react";
 import { DisplayNode } from "../types/treeEvents";
 import { ActionLogEntry } from "../types/displayProfile";
 import { cn } from "../lib/utils";
+import { getAccentColors, getStatusColors } from "@/design-system";
 
 // Type definitions for metadata structure
 interface ActionMetadata {
@@ -240,8 +241,12 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
             {/* Header */}
             <div className="flex items-center justify-between p-4 border-b border-border">
               <Dialog.Title className="text-lg font-semibold text-foreground flex items-center gap-2">
-                {action.status === "success" && <CheckCircle2 className="w-5 h-5 text-green-500" />}
-                {action.status === "failed" && <XCircle className="w-5 h-5 text-red-500" />}
+                {action.status === "success" && (
+                  <CheckCircle2 className={`w-5 h-5 ${getStatusColors("success").icon}`} />
+                )}
+                {action.status === "failed" && (
+                  <XCircle className={`w-5 h-5 ${getStatusColors("error").icon}`} />
+                )}
                 {actionName}
               </Dialog.Title>
               <Dialog.Close asChild>
@@ -273,10 +278,10 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                     <span
                       className={cn(
                         "font-semibold",
-                        action.status === "success" && "text-green-500",
-                        action.status === "failed" && "text-red-500",
-                        action.status === "running" && "text-blue-500",
-                        action.status === "pending" && "text-yellow-500",
+                        action.status === "success" && getStatusColors("success").text,
+                        action.status === "failed" && getStatusColors("error").text,
+                        action.status === "running" && getStatusColors("running").text,
+                        action.status === "pending" && getStatusColors("pending").text,
                       )}
                     >
                       {action.status === "success" && "✓ Success"}
@@ -304,16 +309,20 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
               {hasError && (
                 <Section
                   title="Error Details"
-                  className="bg-red-500/10 -m-4 p-4 border-l-4 border-red-500"
+                  className={`${getStatusColors("error").bg} -m-4 p-4 border-l-4 ${getStatusColors("error").border}`}
                 >
                   <div className="space-y-2">
                     <div className="flex items-start gap-2">
-                      <XCircle className="w-5 h-5 text-red-500 mt-0.5 flex-shrink-0" />
+                      <XCircle
+                        className={`w-5 h-5 ${getStatusColors("error").icon} mt-0.5 flex-shrink-0`}
+                      />
                       <div className="flex-1">
-                        <div className="font-semibold text-red-400">
+                        <div className={`font-semibold ${getStatusColors("error").text}`}>
                           {outcome?.error ? "Error" : "Action Failed"}
                         </div>
-                        <div className="text-red-300 mt-1 font-mono text-xs whitespace-pre-wrap">
+                        <div
+                          className={`${getStatusColors("error").text} mt-1 font-mono text-xs whitespace-pre-wrap`}
+                        >
                           {outcome?.error || action.error || "Unknown error occurred"}
                         </div>
                       </div>
@@ -375,7 +384,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                                     <span className="text-muted-foreground">{idx + 1}.</span> [
                                     {typedMatch.location.x}, {typedMatch.location.y},{" "}
                                     {typedMatch.dimensions.w}, {typedMatch.dimensions.h}]{" "}
-                                    <span className="text-green-400">
+                                    <span className={getStatusColors("success").text}>
                                       confidence: {(typedMatch.confidence * 100).toFixed(1)}%
                                     </span>
                                   </div>
@@ -401,14 +410,20 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                           <div className="pl-4 space-y-1 text-xs">
                             <div>
                               Found:{" "}
-                              <span className={found ? "text-green-400" : "text-red-400"}>
+                              <span
+                                className={
+                                  found
+                                    ? getStatusColors("success").text
+                                    : getStatusColors("error").text
+                                }
+                              >
                                 {found ? "Yes" : "No"}
                               </span>
                             </div>
                             {confidence !== undefined && (
                               <div>
                                 Confidence:{" "}
-                                <span className="text-green-400">
+                                <span className={getStatusColors("success").text}>
                                   {(confidence * 100).toFixed(1)}%
                                 </span>
                               </div>
@@ -522,7 +537,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                             {targetsReached && (
                               <div>
                                 Reached:{" "}
-                                <span className="font-mono text-green-400">
+                                <span className={`font-mono ${getStatusColors("success").text}`}>
                                   {targetsReached.join(", ")}
                                 </span>
                               </div>
@@ -534,7 +549,9 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                               </div>
                             )}
                             {alreadyAtTarget && (
-                              <div className="text-blue-400">Already at target state</div>
+                              <div className={getAccentColors("blue").text}>
+                                Already at target state
+                              </div>
                             )}
                           </div>
                         </div>
@@ -572,7 +589,9 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                                 Status:{" "}
                                 <span
                                   className={
-                                    workflowStatus === "success" ? "text-green-400" : "text-red-400"
+                                    workflowStatus === "success"
+                                      ? getStatusColors("success").text
+                                      : getStatusColors("error").text
                                   }
                                 >
                                   {workflowStatus}
@@ -597,7 +616,13 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                           <div className="pl-4 space-y-1 text-xs">
                             <div>
                               Passed:{" "}
-                              <span className={conditionPassed ? "text-green-400" : "text-red-400"}>
+                              <span
+                                className={
+                                  conditionPassed
+                                    ? getStatusColors("success").text
+                                    : getStatusColors("error").text
+                                }
+                              >
                                 {conditionPassed ? "Yes" : "No"}
                               </span>
                             </div>
@@ -663,10 +688,15 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                       <div className="pt-2 border-t border-border">
                         {stateContext.activated.length > 0 && (
                           <div className="mb-2">
-                            <div className="font-medium text-green-400">Activated:</div>
+                            <div className={`font-medium ${getStatusColors("success").text}`}>
+                              Activated:
+                            </div>
                             <div className="pl-2">
                               {stateContext.activated.map((state) => (
-                                <div key={state} className="font-mono text-green-400">
+                                <div
+                                  key={state}
+                                  className={`font-mono ${getStatusColors("success").text}`}
+                                >
                                   + {state}
                                 </div>
                               ))}
@@ -675,10 +705,15 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
                         )}
                         {stateContext.deactivated.length > 0 && (
                           <div>
-                            <div className="font-medium text-red-400">Deactivated:</div>
+                            <div className={`font-medium ${getStatusColors("error").text}`}>
+                              Deactivated:
+                            </div>
                             <div className="pl-2">
                               {stateContext.deactivated.map((state) => (
-                                <div key={state} className="font-mono text-red-400">
+                                <div
+                                  key={state}
+                                  className={`font-mono ${getStatusColors("error").text}`}
+                                >
                                   - {state}
                                 </div>
                               ))}

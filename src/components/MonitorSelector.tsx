@@ -10,6 +10,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Monitor as MonitorIcon, Check, Info } from "lucide-react";
 import type { Monitor } from "../types/geometry";
+import { getAccentColors } from "@/design-system";
 
 /**
  * Extended monitor info from the Rust backend.
@@ -124,9 +125,11 @@ export function MonitorSelector({
     <div className={`space-y-2 ${className}`}>
       {/* Info message when read-only */}
       {readOnly && (
-        <div className="flex items-start gap-2 p-2 bg-blue-500/10 border border-blue-500/30 rounded-lg text-xs">
-          <Info className="w-4 h-4 flex-shrink-0 text-blue-600 mt-0.5" />
-          <div className="text-blue-600">
+        <div
+          className={`flex items-start gap-2 p-2 ${getAccentColors("blue").bg} border ${getAccentColors("blue").border} rounded-lg text-xs`}
+        >
+          <Info className={`w-4 h-4 flex-shrink-0 ${getAccentColors("blue").text} mt-0.5`} />
+          <div className={getAccentColors("blue").text}>
             Monitors are configured per element in qontinui-web. To change monitors, update your
             workflow configuration.
           </div>
