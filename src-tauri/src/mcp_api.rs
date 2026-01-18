@@ -154,14 +154,27 @@ fn refetch_unified_workflow_steps(
 
             // Helper closure to convert step
             let convert_step = |step: &serde_json::Value| -> Option<ExecutionStepConfig> {
+                // Debug: log the raw step JSON
+                info!(
+                    "refetch_unified_workflow_steps: converting step: {}",
+                    serde_json::to_string(step).unwrap_or_else(|_| "ERROR".to_string())
+                );
+
                 // Try direct deserialization first
                 if let Ok(mut config) = serde_json::from_value::<ExecutionStepConfig>(step.clone())
                 {
+                    info!(
+                        "refetch_unified_workflow_steps: serde succeeded, check_type={:?}",
+                        config.check_type
+                    );
                     if config.monitor_index.is_none() {
                         config.monitor_index = Some(monitor);
                     }
                     return Some(config);
                 }
+
+                // Debug: log that serde failed
+                info!("refetch_unified_workflow_steps: serde failed, using manual extraction");
 
                 // Fall back to manual extraction
                 let step_type = step.get("type").and_then(|t| t.as_str())?;
