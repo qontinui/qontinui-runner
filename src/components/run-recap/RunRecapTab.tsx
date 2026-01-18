@@ -2,7 +2,7 @@
  * RunRecapTab
  *
  * Session Recap page component that provides a quick overview of what happened during a run,
- * prominently shows failure reasons, and displays all steps with brief summaries.
+ * prominently shows the AI summary at the top, failure reasons, and displays all steps with brief summaries.
  */
 
 import { useState } from "react";
@@ -18,12 +18,20 @@ import {
   Bot,
   TestTube,
   Play,
+  Sparkles,
+  Target,
+  AlertTriangle,
+  Loader2,
+  FileText,
 } from "lucide-react";
 import { useRunSelectionOptional } from "../../contexts/RunSelectionContext";
 import { useTaskRunRecap } from "../../hooks/useTaskRunRecap";
 import type { RecapData, RecapStep, FailureInfo } from "../../types/recap";
-import { getStatusColors } from "@/design-system";
+import { getStatusColors, getAccentColors } from "@/design-system";
 import { StagedTimeline } from "./StagedTimeline";
+import { aiDataService } from "../../services";
+import { useQueryClient } from "@tanstack/react-query";
+import { aiDataKeys } from "../../hooks/useAiData";
 
 /**
  * Format duration in milliseconds to a human-readable string.
@@ -199,6 +207,145 @@ function SummaryCard({ summary }: SummaryCardProps) {
   );
 }
 
+interface AISummarySectionProps {
+  aiSummary?: string | null;
+  goalAchieved?: boolean | null;
+  remainingWork?: string | null;
+  summaryGeneratedAt?: string | null;
+  taskRunId?: string;
+  status?: string;
+  onSummaryGenerated?: () => void;
+}
+
+function AISummarySection({
+  aiSummary,
+  goalAchieved,
+  remainingWork,
+  summaryGeneratedAt,
+  taskRunId,
+  status,
+  onSummaryGenerated,
+}: AISummarySectionProps) {
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+
+  const handleGenerateSummary = async () => {
+    if (!taskRunId) return;
+
+    setIsGenerating(true);
+    setError(null);
+
+    try {
+      const result = await aiDataService.generateSummary(taskRunId);
+      if (result.success) {
+        queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRun(taskRunId) });
+        queryClient.invalidateQueries({ queryKey: aiDataKeys.taskRuns() });
+        onSummaryGenerated?.();
+      } else {
+        setError(result.error || "Failed to generate summary");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to generate summary");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  // If we have a summary, display it prominently
+  if (aiSummary) {
+    return (
+      <div className="rounded-xl border-2 border-primary/30 bg-gradient-to-br from-primary/5 to-primary/10 p-5 space-y-4">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-primary/20 rounded-lg">
+              <Sparkles className="w-5 h-5 text-primary" />
+            </div>
+            <div>
+              <h2 className="font-semibold text-lg text-foreground">AI Summary</h2>
+              {summaryGeneratedAt && (
+                <p className="text-xs text-muted-foreground">
+                  Generated {new Date(summaryGeneratedAt).toLocaleString()}
+                </p>
+              )}
+            </div>
+          </div>
+          {/* Goal Achievement Badge */}
+          {goalAchieved !== undefined && goalAchieved !== null && (
+            <span
+              className={`flex items-center gap-2 px-3 py-1.5 text-sm font-medium rounded-full ${
+                goalAchieved
+                  ? `${getStatusColors("success").bg} ${getStatusColors("success").text}`
+                  : `${getAccentColors("amber").bg} ${getAccentColors("amber").text}`
+              }`}
+            >
+              <Target className="w-4 h-4" />
+              {goalAchieved ? "Goal Achieved" : "Goal Not Achieved"}
+            </span>
+          )}
+        </div>
+
+        {/* Summary Text */}
+        <p className="text-foreground/90 leading-relaxed whitespace-pre-wrap">{aiSummary}</p>
+
+        {/* Remaining Work (if goal not achieved) */}
+        {remainingWork && !goalAchieved && (
+          <div
+            className={`p-4 rounded-lg ${getAccentColors("amber").bg} border ${getAccentColors("amber").border}`}
+          >
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle className={`w-4 h-4 ${getAccentColors("amber").text}`} />
+              <span className={`font-medium ${getAccentColors("amber").text}`}>Remaining Work</span>
+            </div>
+            <p className="text-amber-300/90 whitespace-pre-wrap">{remainingWork}</p>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // No summary yet - show placeholder or loading state
+  const isComplete = status === "complete";
+  const completedRecently =
+    isComplete && status === "complete"; // Can enhance with timestamp check
+
+  if (isGenerating) {
+    return (
+      <div className="rounded-xl border border-border bg-muted/20 p-5">
+        <div className="flex items-center gap-3 text-muted-foreground">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          <span>Generating AI summary...</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (isComplete) {
+    return (
+      <div className="rounded-xl border border-border bg-muted/20 p-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3 text-muted-foreground">
+            <FileText className="w-5 h-5 opacity-50" />
+            <span>No AI summary available for this run.</span>
+          </div>
+          <button
+            onClick={handleGenerateSummary}
+            className="flex items-center gap-2 px-4 py-2 text-sm bg-primary/10 hover:bg-primary/20 text-primary rounded-lg transition-colors"
+          >
+            <Sparkles className="w-4 h-4" />
+            Generate Summary
+          </button>
+        </div>
+        {error && <p className="mt-3 text-sm text-red-400">Error: {error}</p>}
+      </div>
+    );
+  }
+
+  // Run is still in progress or not complete
+  return null;
+}
+
 interface StepItemProps {
   step: RecapStep;
   depth?: number;
@@ -302,7 +449,8 @@ function StepsTimeline({ steps }: StepsTimelineProps) {
 
 export function RunRecapTab() {
   const runSelection = useRunSelectionOptional();
-  const { data, isLoading, error } = useTaskRunRecap(runSelection?.selectedRunId);
+  const selectedRun = runSelection?.selectedRun;
+  const { data, isLoading, error, refetch } = useTaskRunRecap(runSelection?.selectedRunId);
 
   // Loading state
   if (isLoading) {
@@ -338,20 +486,35 @@ export function RunRecapTab() {
     );
   }
 
+  // Get summary data from selectedRun (which has more complete data)
+  // Fall back to data.summary for backward compatibility
+  const aiSummary = selectedRun?.summary || selectedRun?.ai_summary || null;
+  const goalAchieved = selectedRun?.goal_achieved ?? data.goal_achieved;
+  const remainingWork = selectedRun?.remaining_work || null;
+  const summaryGeneratedAt = selectedRun?.summary_generated_at || null;
+
   return (
     <div className="h-full overflow-y-auto p-4 space-y-4">
+      {/* AI Summary Section - Most prominent at the top */}
+      <AISummarySection
+        aiSummary={aiSummary}
+        goalAchieved={goalAchieved}
+        remainingWork={remainingWork}
+        summaryGeneratedAt={summaryGeneratedAt}
+        taskRunId={selectedRun?.id}
+        status={data.status}
+        onSummaryGenerated={() => refetch()}
+      />
+
       {/* Status Banner */}
       <StatusBanner
         status={data.status}
-        goalAchieved={data.goal_achieved}
+        goalAchieved={goalAchieved}
         duration={data.duration_ms}
       />
 
       {/* Failure Section - Prominent when failed */}
       {data.failure_info && <FailureSection failure={data.failure_info} />}
-
-      {/* Summary */}
-      {data.summary && <SummaryCard summary={data.summary} />}
 
       {/* Steps/Stages Timeline */}
       {data.stages && data.stages.length > 0 ? (

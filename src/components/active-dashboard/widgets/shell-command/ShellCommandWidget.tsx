@@ -22,14 +22,18 @@ function InlineCommandDetail({ command }: { command: ShellCommandExecution }) {
     <div className="border-l-2 border-primary bg-muted/30 ml-4 mr-4 mb-2 rounded-b overflow-hidden">
       {/* Command header */}
       <div className="px-4 py-2 border-b border-border/50 bg-muted/20">
-        <div className="flex items-center gap-2">
-          <Terminal className="h-3.5 w-3.5 text-muted-foreground" />
-          <code className="font-mono text-xs text-foreground break-all">{command.command}</code>
+        <div className="flex items-start gap-2">
+          <Terminal className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0 mt-0.5" />
+          <code className="font-mono text-xs text-foreground break-all whitespace-pre-wrap">
+            {command.command}
+          </code>
         </div>
         {command.workingDirectory && (
-          <div className="flex items-center gap-1 mt-1">
-            <FolderOpen className="h-3 w-3 text-muted-foreground" />
-            <span className="text-xs text-muted-foreground">{command.workingDirectory}</span>
+          <div className="flex items-start gap-1 mt-1">
+            <FolderOpen className="h-3 w-3 text-muted-foreground flex-shrink-0 mt-0.5" />
+            <span className="text-xs text-muted-foreground break-all">
+              {command.workingDirectory}
+            </span>
           </div>
         )}
       </div>
