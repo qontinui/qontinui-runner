@@ -133,7 +133,6 @@ import { ActiveDashboardPage } from "./components/active-dashboard";
 import { HistoryTab } from "./components/HistoryTab";
 import { ExecuteTab } from "./components/ExecuteTab";
 // Monitor/Observe components
-import { ExecutionSummaryTab } from "./components/ai-workflows/ExecutionSummaryTab";
 import { ExecutionReport } from "./components/findings";
 import { StateExplorerTab } from "./components/state-explorer";
 import { TestResultsTab } from "./components/test-results";
