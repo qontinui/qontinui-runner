@@ -42,13 +42,13 @@ pub mod analyzers;
 // Re-export public types
 pub use types::{
     CheckDefinition, CheckExecutionResult, CheckLanguage, CheckStatus, CheckSuiteSummary,
-    CheckTool, CheckToolInfo, CheckToolInfoSerialized, CheckType, CheckTypeInfo,
+    CheckTool, CheckToolInfoSerialized, CheckType,
     ProjectDetectionResult, SuggestedCheck, CHECK_TOOLS, CHECK_TYPE_INFO,
 };
 
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// Detected project type based on marker files

@@ -16,7 +16,7 @@ pub fn detect_shared_state(
     ctx: &mut AnalysisContext,
 ) {
     let root = tree.root_node();
-    let mut cursor = root.walk();
+    let cursor = root.walk();
 
     // Detect module-level globals
     detect_module_globals(&root, source, file, ctx);

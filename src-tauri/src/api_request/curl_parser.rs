@@ -51,7 +51,7 @@ pub fn parse_curl(curl_command: &str) -> Result<ParsedCurl, CurlParseError> {
     let mut method = HttpMethod::Get;
     let mut headers: HashMap<String, String> = HashMap::new();
     let mut body: Option<String> = None;
-    let mut url: Option<String>;
+    let url: Option<String>;
 
     // Parse method (-X or --request)
     let method_re = Regex::new(r#"(?:-X|--request)\s+['""]?(\w+)['""]?"#).unwrap();

@@ -39,43 +39,21 @@ pub use exploration_task::ExplorationTask;
 pub use types::{ExplorationConfig, ExplorationResult, ExplorationStatus};
 
 // AI analysis context for description-based verification
-pub use ai_context::{
-    ExplorationAnalysisContext, ExplorationSummary, StateAnalysisContext, StateObservations,
-    TimingInfo, TransitionAnalysisContext,
-};
 
 // Checkpoint system for interleaved exploration
 pub use checkpoint::{
-    CheckpointConfig, CheckpointManager, CheckpointStatus, CheckpointTrigger,
+    CheckpointConfig, CheckpointManager, CheckpointTrigger,
     ExplorationCheckpoint,
 };
 
 // Explicit assertions for states
-pub use assertions::{AssertionResult, AssertionType, StateAssertion};
 
 // Dependency graph for intelligent exploration ordering
-pub use dependency::{DependencyEdge, DependencyGraph, StateNode};
 
 // Exploration depth modes and critical path finding
-pub use depth::{CriticalPathFinder, DepthConfig, ExplorationDepth, ScreenshotMode};
 
 // Baseline comparison for diff-based exploration
-pub use baseline::{
-    BaselineDiff, BaselineManager, ChangeType, ExplorationBaseline, StateDiff, StateSignature,
-    TransitionDiff, TransitionSignature,
-};
 
 // AI-suggested assertions
-pub use suggestions::{
-    suggestions_to_markdown, AssertionSuggester, SuggestedAssertion, SuggestionCategory,
-    SuggestionConfig, SuggestionSet,
-};
 
 // These exports are available for external use
-pub use exploration::{ExplorationPath, StateVisit};
-pub use report::{
-    DiscrepancyType, ExplorationReport, StateExplorationReport, TransitionExplorationReport,
-};
-pub use types::{
-    ExplorationPriority, StateExplorationResult, TransitionExplorationResult, VerificationConfig,
-};

@@ -10,12 +10,12 @@
 //! - Call tools with arguments
 //! - Query MCP call history for task runs
 
-use crate::commands::{AppState, CommandResponse};
+use crate::commands::AppState;
 use crate::mcp_client::{
     CreateMcpServerInput, McpCallsResult, McpServerConfig, McpServerStatus,
     McpToolCallResult, McpToolInfo, UpdateMcpServerInput,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tauri::State;
 use tracing::{error, info};

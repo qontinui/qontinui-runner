@@ -7,7 +7,7 @@ use super::types::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Parsed output from a check tool
 pub struct ParsedOutput {

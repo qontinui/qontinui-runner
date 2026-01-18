@@ -2,7 +2,7 @@
 //!
 //! Builds shell commands for different check tools.
 
-use super::types::{CheckDefinition, CheckTool, CheckType};
+use super::types::{CheckDefinition, CheckTool};
 use std::error::Error;
 
 /// Build the command and arguments for a check definition

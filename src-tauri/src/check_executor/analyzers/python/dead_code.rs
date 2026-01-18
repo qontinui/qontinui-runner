@@ -9,7 +9,7 @@ use crate::check_executor::analyzers::common::file_walker::{walk_files, WalkConf
 use crate::check_executor::analyzers::common::issue_builder::IssueBuilder;
 use crate::check_executor::output_parser::ParsedOutput;
 use crate::check_executor::types::{
-    CheckIssue, CheckStructuredOutput, CheckSummary, IssueSeverity,
+    CheckStructuredOutput, CheckSummary, IssueSeverity,
 };
 
 /// Information about a defined symbol
