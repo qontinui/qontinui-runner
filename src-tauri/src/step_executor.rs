@@ -18,7 +18,7 @@
 use crate::action_service::UnifiedActionService;
 use crate::commands::AppState;
 use crate::config_storage::ConfigStorage;
-use crate::database::CreateTaskRunAwasStepInput;
+use crate::database::{CreateTaskRunAwasStepInput, CreateTaskRunEventInput};
 use crate::display::RawEvent;
 use crate::executor::file_logger::FileLogger;
 use crate::iteration_bundle::{
@@ -970,6 +970,58 @@ impl StepExecutor {
         self
     }
 
+    /// Log a step execution event to the database
+    ///
+    /// This logs step start, complete, and error events to the task_run_events table.
+    fn log_step_event(
+        &self,
+        task_run_id: &str,
+        step: &ExecutionStepConfig,
+        step_index: usize,
+        event_subtype: &str,
+        message: &str,
+        duration_ms: Option<i64>,
+        error: Option<&str>,
+        exit_code: Option<i32>,
+        stdout: Option<&str>,
+        stderr: Option<&str>,
+    ) {
+        let step_name = step.name.clone().unwrap_or_else(|| step.step_type.clone());
+
+        // Build data JSON with step details
+        let data = json!({
+            "step_index": step_index,
+            "step_type": step.step_type,
+            "step_name": step_name,
+            "command": step.shell_command.as_ref().or(step.check_command.as_ref()),
+            "working_directory": step.shell_command_working_directory.as_ref().or(step.check_working_directory.as_ref()),
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "error": error,
+            "playwright_script_id": step.playwright_script_id,
+            "target_image_name": step.target_image_name,
+            "action_type": step.action_type,
+        });
+
+        let event_input = CreateTaskRunEventInput {
+            task_run_id: task_run_id.to_string(),
+            event_type: "step_execution".to_string(),
+            event_subtype: Some(event_subtype.to_string()),
+            message: message.to_string(),
+            data: Some(serde_json::to_string(&data).unwrap_or_default()),
+            workflow_name: None,
+            state_name: None,
+            action_id: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            duration_ms,
+        };
+
+        if let Err(e) = self.app_state.checkpoint_db.create_task_run_event(&event_input) {
+            warn!("Failed to log step event: {}", e);
+        }
+    }
+
     /// Emit a tree event to the Tauri frontend (if app_handle is available)
     fn emit_tree_event(
         &self,
@@ -1375,6 +1427,9 @@ impl StepExecutor {
             execution_id
         );
 
+        // Get the task run ID for event logging (prefer self.task_run_id, fall back to execution_id)
+        let log_task_run_id = self.task_run_id.clone().unwrap_or_else(|| execution_id.to_string());
+
         for (index, step) in steps.iter().enumerate() {
             let step_name = step.name.clone().unwrap_or_else(|| step.step_type.clone());
             let start_time = std::time::Instant::now();
@@ -1385,6 +1440,20 @@ impl StepExecutor {
                 steps.len(),
                 step_name,
                 step.step_type
+            );
+
+            // Log step start event
+            self.log_step_event(
+                &log_task_run_id,
+                step,
+                index,
+                "start",
+                &format!("Starting step {}/{}: {} ({})", index + 1, steps.len(), step_name, step.step_type),
+                None,
+                None,
+                None,
+                None,
+                None,
             );
 
             let (success, error, screenshot_path) = self.execute_single_step(step).await;
@@ -1408,8 +1477,34 @@ impl StepExecutor {
                     steps.len(),
                     duration_ms
                 );
+                // Log step completion event
+                self.log_step_event(
+                    &log_task_run_id,
+                    step,
+                    index,
+                    "complete",
+                    &format!("Step {}/{} completed successfully in {}ms", index + 1, steps.len(), duration_ms),
+                    Some(duration_ms as i64),
+                    None,
+                    None,
+                    None,
+                    None,
+                );
             } else {
                 warn!("Step {}/{} failed: {:?}", index + 1, steps.len(), error);
+                // Log step error event
+                self.log_step_event(
+                    &log_task_run_id,
+                    step,
+                    index,
+                    "error",
+                    &format!("Step {}/{} failed: {:?}", index + 1, steps.len(), error),
+                    Some(duration_ms as i64),
+                    error.as_deref(),
+                    None,
+                    None,
+                    None,
+                );
             }
 
             results.push(StepExecutionResult {
