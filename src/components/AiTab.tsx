@@ -49,6 +49,9 @@ import { PageTutorialMenu } from "./tutorial";
 // localStorage key for stats panel collapse
 const STORAGE_KEY_STATS_COLLAPSED = "aiTab.statsCollapsed";
 
+// Special value to indicate "All Sessions" is explicitly selected
+const ALL_SESSIONS = "__all__";
+
 interface AiTabProps {
   aiOutputLines: AiOutputLine[];
   onClearAiOutput: () => void;
@@ -310,6 +313,11 @@ export function AiTab({
 
   // Get the selected session or default to the most recent
   const currentSession = useMemo(() => {
+    // "All Sessions" explicitly selected - return null to show all
+    if (selectedSessionId === ALL_SESSIONS) {
+      return null;
+    }
+    // Initial state (null) - default to most recent session
     if (!selectedSessionId && workflowSessions.length > 0) {
       return workflowSessions[0];
     }
@@ -376,7 +384,7 @@ export function AiTab({
 
   // Load per-run auto-continue setting when a specific run is selected
   useEffect(() => {
-    if (!selectedSessionId) {
+    if (!selectedSessionId || selectedSessionId === ALL_SESSIONS) {
       setRunAutoContinue(null);
       return;
     }
@@ -400,7 +408,7 @@ export function AiTab({
 
   // Toggle per-run auto-continue setting
   const toggleRunAutoContinue = useCallback(async () => {
-    if (!selectedSessionId || runAutoContinueLoading || runAutoContinue === null) return;
+    if (!selectedSessionId || selectedSessionId === ALL_SESSIONS || runAutoContinueLoading || runAutoContinue === null) return;
 
     setRunAutoContinueLoading(true);
     try {
@@ -1043,11 +1051,11 @@ export function AiTab({
                 {!isManagingRuns && workflowSessions.length > 0 && (
                   <button
                     onClick={() => {
-                      handleSelectSession(null);
+                      handleSelectSession(ALL_SESSIONS);
                       setSessionDropdownOpen(false);
                     }}
                     className={`w-full flex items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted/50 transition-colors ${
-                      !selectedSessionId ? "bg-primary/10" : ""
+                      selectedSessionId === ALL_SESSIONS ? "bg-primary/10" : ""
                     }`}
                   >
                     <Brain className="w-4 h-4 text-primary" />
@@ -1158,7 +1166,7 @@ export function AiTab({
           </div>
 
           {/* Per-Run Auto-Continue (if selected) */}
-          {selectedSessionId && runAutoContinue !== null && (
+          {selectedSessionId && selectedSessionId !== ALL_SESSIONS && runAutoContinue !== null && (
             <div className="ml-auto flex items-center gap-2">
               <button
                 onClick={toggleRunAutoContinue}

@@ -283,6 +283,8 @@ export interface TestStep extends BaseStep {
   test_type: TestType;
   /** Command to run (for custom_command and repository tests) */
   command?: string;
+  /** Working directory for repository tests */
+  working_directory?: string;
   /** Inline code (for playwright and python tests) */
   code?: string;
   /** Reference to saved test ID */

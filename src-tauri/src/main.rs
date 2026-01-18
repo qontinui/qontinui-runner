@@ -53,6 +53,7 @@ mod test_executor;
 mod tiered_info;
 mod unified_workflows;
 mod video_recorder;
+mod workflow_generation;
 mod workflow_monitor;
 
 use commands::AppState;

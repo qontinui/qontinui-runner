@@ -40,6 +40,7 @@ import { AddStepDropdown, AddStepButton } from "./AddStepDropdown";
 import { StepConfigPanel } from "./StepConfigPanel";
 import { PromptLibraryPicker } from "./PromptLibraryPicker";
 import { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
+import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
 
@@ -346,6 +347,9 @@ function WorkflowBuilderContent({
   const [shellCommandPickerOpen, setShellCommandPickerOpen] = useState(false);
   const [shellCommandPickerPhase, setShellCommandPickerPhase] = useState<WorkflowPhase>("setup");
 
+  // AI generate workflow modal state
+  const [aiGenerateModalOpen, setAiGenerateModalOpen] = useState(false);
+
   // Ref for focusing the name input when creating new workflow
   const nameInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -639,6 +643,33 @@ function WorkflowBuilderContent({
     [addStep],
   );
 
+  // Handler for when an AI-generated workflow is ready to load
+  const handleAiWorkflowGenerated = useCallback(
+    (workflow: UnifiedWorkflow) => {
+      // Load the generated workflow into the builder
+      // The workflow will be treated as a new workflow (not yet saved)
+      resetToNew();
+      updateWorkflow({
+        name: workflow.name,
+        description: workflow.description,
+        category: workflow.category,
+        tags: workflow.tags,
+        setup_steps: workflow.setup_steps,
+        verification_steps: workflow.verification_steps,
+        agentic_steps: workflow.agentic_steps,
+        completion_steps: workflow.completion_steps,
+        max_iterations: workflow.max_iterations,
+        provider: workflow.provider ?? undefined,
+        model: workflow.model ?? undefined,
+        skip_ai_summary: workflow.skip_ai_summary,
+        log_source_selection: workflow.log_source_selection,
+      });
+      setShowSettings(true);
+      console.log("[WorkflowBuilder] Loaded AI-generated workflow:", workflow.name);
+    },
+    [resetToNew, updateWorkflow],
+  );
+
   const renderStep = useCallback(
     (step: UnifiedStep, index: number, phase: WorkflowPhase, steps: UnifiedStep[]) => (
       <StepItem
@@ -681,6 +712,14 @@ function WorkflowBuilderContent({
             </h2>
             <div className="flex items-center gap-1">
               <PageTutorialMenu page="unified-workflow-builder" variant="compact" />
+              <button
+                data-tutorial-id="ai-generate-workflow-button"
+                onClick={() => setAiGenerateModalOpen(true)}
+                className="p-2 rounded-lg hover:bg-neutral-800 transition-colors text-blue-400 hover:text-blue-300"
+                title="Generate with AI"
+              >
+                <Sparkles className="w-4 h-4" />
+              </button>
               <button
                 data-tutorial-id="new-workflow-button"
                 onClick={handleNewWorkflow}
@@ -928,6 +967,13 @@ function WorkflowBuilderContent({
               onClose={() => setShellCommandPickerOpen(false)}
               onSelect={handleShellCommandSelected}
               phase={shellCommandPickerPhase}
+            />
+
+            {/* AI Generate Workflow Modal */}
+            <AiGenerateWorkflowModal
+              isOpen={aiGenerateModalOpen}
+              onClose={() => setAiGenerateModalOpen(false)}
+              onWorkflowGenerated={handleAiWorkflowGenerated}
             />
           </div>
 

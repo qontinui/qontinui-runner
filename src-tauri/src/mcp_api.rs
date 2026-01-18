@@ -103,6 +103,7 @@ use crate::summary_generator;
 use crate::task_monitor::TaskMonitor;
 use crate::task_recorder::{TaskConfig, TaskRecorder};
 use crate::tiered_info::{self, RunDetails};
+use crate::workflow_generation;
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
 use tauri::{Emitter, Manager};
@@ -1095,6 +1096,8 @@ pub struct ApiState {
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
     /// Web extraction state tracking
     pub extraction_state: Arc<ExtractionState>,
+    /// Task IDs currently being resumed (to prevent duplicate resumes)
+    pub resuming_task_ids: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Response for API endpoints
@@ -11934,6 +11937,20 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
 
     // Resume EACH running task
     for task in &running_tasks {
+        // Check if this task is already being resumed (prevent duplicate resumes)
+        {
+            let mut resuming_ids = state.resuming_task_ids.lock().unwrap();
+            if resuming_ids.contains(&task.id) {
+                info!(
+                    "Task '{}' (id: {}) is already being resumed, skipping duplicate",
+                    task.task_name, task.id
+                );
+                continue;
+            }
+            // Mark this task as being resumed
+            resuming_ids.insert(task.id.clone());
+        }
+
         info!(
             "Resuming task '{}' (id: {}, session #{})",
             task.task_name,
@@ -12390,6 +12407,10 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                 let original_prompt = task.prompt.clone();
                 let first_iteration = task.sessions_count + 1; // Iteration number for display
 
+                // Capture resuming_task_ids reference for cleanup when spawned task finishes
+                let resuming_ids_clone = state.resuming_task_ids.clone();
+                let task_id_for_cleanup = task.id.clone();
+
                 tokio::spawn(async move {
                     // Run the FIRST resumed session
                     run_unified_session_loop(
@@ -12726,6 +12747,15 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                     }
 
                     info!("Resume cross-session loop completed for '{}'", task_name);
+
+                    // Remove task from resuming set now that it's finished
+                    if let Ok(mut resuming_ids) = resuming_ids_clone.lock() {
+                        resuming_ids.remove(&task_id_for_cleanup);
+                        info!(
+                            "Removed task '{}' from resuming set (loop completed)",
+                            task_id_for_cleanup
+                        );
+                    }
                 });
 
                 resumed_count += 1;
@@ -12739,6 +12769,14 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                     None,
                     Some(&session_ctx),
                 );
+                // Remove task from resuming set on failure so it can be retried
+                if let Ok(mut resuming_ids) = state.resuming_task_ids.lock() {
+                    resuming_ids.remove(&task.id);
+                    info!(
+                        "Removed task '{}' from resuming set (start failed)",
+                        task.id
+                    );
+                }
             }
         }
     }
@@ -17277,6 +17315,55 @@ async fn import_unified_workflow(
     }
 }
 
+/// Generate a unified workflow from natural language description using AI
+async fn generate_unified_workflow_handler(
+    State(_state): State<Arc<ApiState>>,
+    Json(request): Json<workflow_generation::GenerateWorkflowRequest>,
+) -> Result<
+    Json<ApiResponse<workflow_generation::GenerateWorkflowResponse>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    info!(
+        "Generating unified workflow from description: {}...",
+        &request.description[..request.description.len().min(50)]
+    );
+
+    // Run the generation in a blocking task since it uses sync AI provider
+    let result =
+        tokio::task::spawn_blocking(move || workflow_generation::generate_workflow(request))
+            .await
+            .map_err(|e| {
+                error!(
+                    "Failed to spawn blocking task for workflow generation: {}",
+                    e
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(api_error(format!("Failed to generate workflow: {}", e))),
+                )
+            })?;
+
+    if result.success {
+        info!(
+            "Successfully generated workflow: {}",
+            result
+                .workflow
+                .as_ref()
+                .map(|w| w.name.as_str())
+                .unwrap_or("unknown")
+        );
+        Ok(Json(ApiResponse::success(result)))
+    } else {
+        warn!(
+            "Workflow generation failed: {}",
+            result.error.as_deref().unwrap_or("unknown error")
+        );
+        // Still return success HTTP status with the error in the response body
+        // This allows the client to show the error message to the user
+        Ok(Json(ApiResponse::success(result)))
+    }
+}
+
 /// Request body for running a unified workflow
 #[derive(Debug, Deserialize)]
 struct RunUnifiedWorkflowRequest {
@@ -17706,6 +17793,7 @@ pub fn create_router(
         current_ai_pids: Arc::new(std::sync::Mutex::new(Vec::new())),
         orchestrator_states: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         extraction_state: Arc::new(ExtractionState::new()),
+        resuming_task_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     });
 
     // Restore persisted session state on startup
@@ -18123,6 +18211,10 @@ pub fn create_router(
             get(export_unified_workflow),
         )
         .route("/unified-workflows/import", post(import_unified_workflow))
+        .route(
+            "/unified-workflows/generate",
+            post(generate_unified_workflow_handler),
+        )
         .route("/unified-workflows/:id/run", post(run_unified_workflow))
         // AWAS (Application Web Automation Specification) routes
         .route("/awas/discover", post(awas_discover))

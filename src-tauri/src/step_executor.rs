@@ -229,8 +229,8 @@ pub struct ExecutionStepConfig {
     pub check_command: Option<String>,
 
     /// Check: Working directory
-    /// Note: The "working_directory" alias conflicts with shell_command_working_directory
-    #[serde(alias = "checkWorkingDirectory")]
+    /// Also used for repository test steps
+    #[serde(alias = "checkWorkingDirectory", alias = "working_directory")]
     pub check_working_directory: Option<String>,
 
     /// Check: Whether to run auto-fix
