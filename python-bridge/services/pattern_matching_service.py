@@ -19,15 +19,26 @@ from PIL import Image as PILImage
 logger = logging.getLogger(__name__)
 
 # Check if qontinui library is available
+from typing import Any, Callable
+
+QONTINUI_AVAILABLE = False
+_get_hal_func: Callable[[], Any] | None = None
+
 try:
     from qontinui.find.find import Find  # noqa: F401
     from qontinui.model.element import Pattern, Region  # noqa: F401
-    from qontinui.hal import get_hal  # noqa: F401
 
     QONTINUI_AVAILABLE = True
     logger.info("qontinui library loaded for pattern matching")
+
+    # get_hal may not exist in all versions - import cautiously
+    try:
+        from qontinui.hal import get_hal as _imported_get_hal  # type: ignore[attr-defined]
+
+        _get_hal_func = _imported_get_hal
+    except (ImportError, AttributeError):
+        pass  # _get_hal_func stays None
 except ImportError as e:
-    QONTINUI_AVAILABLE = False
     logger.warning(f"qontinui library not available for pattern matching: {e}")
 
 
@@ -64,9 +75,9 @@ class PatternMatchingService:
     def __init__(self) -> None:
         """Initialize the pattern matching service."""
         self._hal = None
-        if QONTINUI_AVAILABLE:
+        if QONTINUI_AVAILABLE and _get_hal_func is not None:
             try:
-                self._hal = get_hal()
+                self._hal = _get_hal_func()
                 logger.info("HAL initialized for pattern matching")
             except Exception as e:
                 logger.error(f"Failed to initialize HAL: {e}")
@@ -88,7 +99,7 @@ class PatternMatchingService:
         image_bytes = base64.b64decode(base64_str)
 
         # Convert to PIL Image
-        pil_image = PILImage.open(io.BytesIO(image_bytes))
+        pil_image: PILImage.Image = PILImage.open(io.BytesIO(image_bytes))
 
         # Convert to RGB if needed (handles RGBA, L, etc.)
         if pil_image.mode != "RGB":

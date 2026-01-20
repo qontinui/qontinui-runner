@@ -403,7 +403,7 @@ class AccessibilityCaptureService:
             from qontinui_schemas.accessibility import AccessibilityRole
 
             # Build selector
-            selector_role = None
+            selector_role: AccessibilityRole | list[AccessibilityRole] | None = None
             if role:
                 if isinstance(role, str):
                     selector_role = AccessibilityRole(role)
@@ -496,10 +496,11 @@ class AccessibilityCaptureService:
             try:
                 async with aiohttp.ClientSession() as session:
                     url = f"http://{host}:{port}/json"
-                    async with asyncio.wait_for(
+                    resp = await asyncio.wait_for(
                         session.get(url),
                         timeout=timeout,
-                    ) as resp:
+                    )
+                    async with resp:
                         if resp.status == 200:
                             targets = await resp.json()
                             # Filter to page targets
@@ -652,7 +653,7 @@ class AccessibilityCaptureService:
             for ref in old_refs & new_refs:
                 old = old_nodes[ref]
                 new = new_nodes[ref]
-                changes = {}
+                changes: dict[str, Any] = {}
 
                 if old.get("name") != new.get("name"):
                     changes["name"] = {"old": old.get("name"), "new": new.get("name")}
@@ -662,7 +663,7 @@ class AccessibilityCaptureService:
                 # Compare state
                 old_state = old.get("state", {})
                 new_state = new.get("state", {})
-                state_changes = {}
+                state_changes: dict[str, dict[str, Any]] = {}
                 for key in {"is_focused", "is_disabled", "is_checked", "is_expanded"}:
                     if old_state.get(key) != new_state.get(key):
                         state_changes[key] = {"old": old_state.get(key), "new": new_state.get(key)}

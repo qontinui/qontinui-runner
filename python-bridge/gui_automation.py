@@ -175,7 +175,7 @@ class GUIAutomation:
                 self.emit_log("warning", f"Unknown accessibility action type: {action_type}")
                 return False
 
-            success = result.get("success", False)
+            success = bool(result.get("success", False))
             if success:
                 self.emit_log(
                     "info", f"Accessibility action {action_type} on {target_ref} succeeded"
@@ -254,7 +254,7 @@ class GUIAutomation:
 
             # Convert action_data to Action object for library
             action = Action(
-                id=action_id, type=action_type, config=config, base=action_data.get("base")
+                id=action_id, type=str(action_type), config=config, base=action_data.get("base")
             )
 
             # Handle RUN_WORKFLOW specially - execute workflow via runner's execute_workflow

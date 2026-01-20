@@ -384,7 +384,8 @@ class UITarsExtractionService:
                     raise InterruptedError("Extraction stopped by user")
 
                 self._progress.current_step = step
-                self._progress.elapsed_seconds = time.time() - self._start_time
+                if self._start_time is not None:
+                    self._progress.elapsed_seconds = time.time() - self._start_time
                 self._progress.last_thought = thought
                 self._progress.last_action = action
                 self._emit_progress_event()

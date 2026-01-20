@@ -35,10 +35,11 @@ import logging
 import os
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from collections.abc import Callable
+from typing import Any
 
 import httpx
 
@@ -170,11 +171,13 @@ class ModelManager:
             xdg_data = os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")
             return Path(xdg_data) / "com.qontinui.runner" / "models"
 
-    def _load_status(self) -> dict:
+    def _load_status(self) -> dict[str, Any]:
         """Load the status file."""
         if self._status_file.exists():
             try:
-                return json.loads(self._status_file.read_text())
+                data = json.loads(self._status_file.read_text())
+                if isinstance(data, dict):
+                    return data
             except Exception as e:
                 logger.warning(f"Failed to load status file: {e}")
         return {"downloaded": {}, "version": 1}

@@ -90,6 +90,7 @@ class SessionManager:
 
     _instance: "SessionManager | None" = None
     _lock = threading.Lock()
+    _initialized: bool = False  # Class-level default to satisfy mypy
 
     def __new__(cls) -> "SessionManager":
         """Ensure singleton instance."""
@@ -429,8 +430,8 @@ class SessionManager:
                     job_ids_to_remove.append(job_id)
 
             for job_id in job_ids_to_remove:
-                job = self._jobs.pop(job_id, None)
-                if job:
+                if job_id in self._jobs:
+                    job = self._jobs.pop(job_id)
                     # Remove from session tracking
                     session_jobs = self._sessions.get(job.session_id)
                     if session_jobs:

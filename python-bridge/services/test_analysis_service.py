@@ -515,7 +515,7 @@ const {{ chromium }} = require('playwright');
         return elements
 
     def analyze_via_vision(
-        self, screenshot_base64: str = None, monitor_index: int = 0
+        self, screenshot_base64: str | None = None, monitor_index: int = 0
     ) -> dict[str, Any]:
         """
         Analyze page using computer vision (OCR, edge detection, segmentation).
@@ -536,6 +536,7 @@ const {{ chromium }} = require('playwright');
 
         try:
             # Get screenshot
+            screenshot_bytes: bytes
             if screenshot_base64:
                 screenshot_bytes = base64.b64decode(
                     screenshot_base64.split(",")[-1]
@@ -544,12 +545,13 @@ const {{ chromium }} = require('playwright');
                 )
             else:
                 # Capture from monitor
-                screenshot_bytes = self._capture_monitor(monitor_index)
-                if screenshot_bytes is None:
+                captured_bytes = self._capture_monitor(monitor_index)
+                if captured_bytes is None:
                     return {
                         "success": False,
                         "error": f"Failed to capture screenshot from monitor {monitor_index}",
                     }
+                screenshot_bytes = captured_bytes
                 screenshot_base64 = base64.b64encode(screenshot_bytes).decode()
 
             # Use vision extraction service if available
@@ -564,7 +566,7 @@ const {{ chromium }} = require('playwright');
                 )
 
                 if not vision_result.get("success"):
-                    return vision_result
+                    return dict(vision_result)
 
                 vision_data = vision_result.get("data", {})
 
@@ -735,6 +737,7 @@ const {{ chromium }} = require('playwright');
             draw = ImageDraw.Draw(img)
 
             # Try to load a font, fall back to default
+            font: ImageFont.FreeTypeFont | ImageFont.ImageFont
             try:
                 font = ImageFont.truetype("arial.ttf", 14)
             except OSError:

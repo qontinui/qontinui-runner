@@ -316,7 +316,11 @@ class IntegrationTestingService:
 
             # Find path using navigator
             navigator = navigation_api._navigator
-            path = navigator.find_path([from_state_id], [to_state_id])
+            # Navigator type depends on qontinui library version
+            if hasattr(navigator, "find_path"):
+                path = navigator.find_path([from_state_id], [to_state_id])
+            else:
+                return {"success": False, "error": "Navigator does not support find_path"}
 
             if path:
                 return {
@@ -454,7 +458,7 @@ class IntegrationTestingService:
 
     def get_mock_mode(self) -> str:
         """Get the current mock mode."""
-        return self._mock_mode.value
+        return str(self._mock_mode.value)
 
     def mock_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, Any]:
         """

@@ -661,7 +661,7 @@ class VisionExtractionService:
 
         return merged
 
-    def _calculate_iou(self, bbox1: dict, bbox2: dict) -> float:
+    def _calculate_iou(self, bbox1: dict[str, int], bbox2: dict[str, int]) -> float:
         """Calculate Intersection over Union between two bounding boxes."""
         x1 = max(bbox1["x"], bbox2["x"])
         y1 = max(bbox1["y"], bbox2["y"])
@@ -676,7 +676,7 @@ class VisionExtractionService:
         area2 = bbox2["width"] * bbox2["height"]
         union = area1 + area2 - intersection
 
-        return intersection / max(union, 1)
+        return float(intersection / max(union, 1))
 
     def _classify_edge_result(self, result: dict) -> str:
         """Classify edge detection result into element category."""

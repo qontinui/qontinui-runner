@@ -340,8 +340,9 @@ def _run_native_windows_stdin(
 
         if proc.returncode == 0:
             result["success"] = True
-            result["output"] = proc.stdout.strip()
-            _debug_log(f"SUCCESS: output (first 200 chars): {result['output'][:200]!r}")
+            output = proc.stdout.strip()
+            result["output"] = output
+            _debug_log(f"SUCCESS: output (first 200 chars): {output[:200]!r}")
         else:
             result["error"] = proc.stderr or f"Claude CLI exited with code {proc.returncode}"
             _debug_log(f"FAILURE: returncode={proc.returncode}, error={result['error']!r}")

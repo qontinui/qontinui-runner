@@ -27,6 +27,7 @@ pylint = "^3.3"
 isort = "^6.0"
 flake8 = "^7.3"
 pre-commit = "^4.4"
+types-requests = "^2.31"
 
 [tool.black]
 line-length = 100
