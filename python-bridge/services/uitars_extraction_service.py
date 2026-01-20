@@ -6,18 +6,19 @@ This service wraps the qontinui library's uitars module for use by the runner.
 """
 
 import asyncio
-import json
 import threading
 import time
 import traceback
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 
 class UITarsExtractionStatus(str, Enum):
     """Status of a UI-TARS extraction session."""
+
     IDLE = "idle"
     STARTING = "starting"
     RUNNING = "running"
@@ -29,6 +30,7 @@ class UITarsExtractionStatus(str, Enum):
 @dataclass
 class UITarsProgress:
     """Progress tracking for UI-TARS extraction."""
+
     status: UITarsExtractionStatus = UITarsExtractionStatus.IDLE
     current_step: int = 0
     max_steps: int = 50
@@ -43,6 +45,7 @@ class UITarsProgress:
 @dataclass
 class UITarsExtractionConfig:
     """Configuration for UI-TARS extraction."""
+
     target_type: str  # "web" or "desktop"
     target: str  # URL for web, application name for desktop
     goal: str
@@ -61,6 +64,7 @@ class UITarsExtractionConfig:
 @dataclass
 class DiscoveredState:
     """A state discovered during exploration."""
+
     id: str
     name: str
     description: str
@@ -71,6 +75,7 @@ class DiscoveredState:
 @dataclass
 class DiscoveredTransition:
     """A transition discovered during exploration."""
+
     id: str
     from_state_id: str
     to_state_id: str
@@ -110,6 +115,7 @@ class UITarsExtractionService:
         self._uitars_available = False
         try:
             from qontinui.extraction.runtime.uitars import HAS_UITARS
+
             self._uitars_available = HAS_UITARS
         except ImportError:
             pass
@@ -307,22 +313,32 @@ class UITarsExtractionService:
             # Randomly discover states and transitions
             if random.random() > 0.7:
                 state_id = str(uuid.uuid4())
-                self._discovered_states.append(DiscoveredState(
-                    id=state_id,
-                    name=f"State_{len(self._discovered_states) + 1}",
-                    description=f"Discovered at step {step}",
-                    screenshot_path=f"/tmp/uitars_state_{state_id}.png",
-                ))
+                self._discovered_states.append(
+                    DiscoveredState(
+                        id=state_id,
+                        name=f"State_{len(self._discovered_states) + 1}",
+                        description=f"Discovered at step {step}",
+                        screenshot_path=f"/tmp/uitars_state_{state_id}.png",
+                    )
+                )
                 self._progress.states_discovered = len(self._discovered_states)
 
             if random.random() > 0.6 and len(self._discovered_states) >= 2:
-                self._discovered_transitions.append(DiscoveredTransition(
-                    id=str(uuid.uuid4()),
-                    from_state_id=self._discovered_states[-2].id if len(self._discovered_states) >= 2 else "",
-                    to_state_id=self._discovered_states[-1].id if self._discovered_states else "",
-                    action_type="click",
-                    action_description=self._progress.last_action or "",
-                ))
+                self._discovered_transitions.append(
+                    DiscoveredTransition(
+                        id=str(uuid.uuid4()),
+                        from_state_id=(
+                            self._discovered_states[-2].id
+                            if len(self._discovered_states) >= 2
+                            else ""
+                        ),
+                        to_state_id=(
+                            self._discovered_states[-1].id if self._discovered_states else ""
+                        ),
+                        action_type="click",
+                        action_description=self._progress.last_action or "",
+                    )
+                )
                 self._progress.transitions_discovered = len(self._discovered_transitions)
 
             self._emit_progress_event()
@@ -397,23 +413,27 @@ class UITarsExtractionService:
 
                 # Store results
                 for state in result.states:
-                    self._discovered_states.append(DiscoveredState(
-                        id=state.id,
-                        name=state.name,
-                        description=state.description or "",
-                        screenshot_path=state.screenshot_path or "",
-                        elements=[],
-                    ))
+                    self._discovered_states.append(
+                        DiscoveredState(
+                            id=state.id,
+                            name=state.name,
+                            description=state.description or "",
+                            screenshot_path=state.screenshot_path or "",
+                            elements=[],
+                        )
+                    )
 
                 for transition in result.transitions:
-                    self._discovered_transitions.append(DiscoveredTransition(
-                        id=transition.id,
-                        from_state_id=transition.from_state_id,
-                        to_state_id=transition.to_state_id,
-                        action_type=transition.action_type,
-                        action_description=transition.action_description or "",
-                        coordinates=transition.coordinates,
-                    ))
+                    self._discovered_transitions.append(
+                        DiscoveredTransition(
+                            id=transition.id,
+                            from_state_id=transition.from_state_id,
+                            to_state_id=transition.to_state_id,
+                            action_type=transition.action_type,
+                            action_description=transition.action_description or "",
+                            coordinates=transition.coordinates,
+                        )
+                    )
 
                 self._progress.states_discovered = len(self._discovered_states)
                 self._progress.transitions_discovered = len(self._discovered_transitions)

@@ -21,7 +21,6 @@ from qontinui_schemas.accessibility import (
     AccessibilityBackend,
     AccessibilityCaptureOptions,
     AccessibilityConfig,
-    AccessibilityNode,
     AccessibilitySelector,
     AccessibilitySnapshot,
 )
@@ -347,7 +346,9 @@ class AccessibilityCaptureService:
             },
         }
 
-    def get_ai_context(self, max_elements: int = 100, interactive_only: bool = True) -> dict[str, Any]:
+    def get_ai_context(
+        self, max_elements: int = 100, interactive_only: bool = True
+    ) -> dict[str, Any]:
         """Get AI-friendly context from the current snapshot.
 
         Args:

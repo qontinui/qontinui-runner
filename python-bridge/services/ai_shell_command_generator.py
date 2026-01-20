@@ -63,16 +63,24 @@ def build_shell_command_prompt(
         lines.append("## Command Category")
         if category == "git":
             lines.append("This should be a Git-related command.")
-            lines.append("Common git operations: status, add, commit, push, pull, branch, checkout, merge, log")
+            lines.append(
+                "Common git operations: status, add, commit, push, pull, branch, checkout, merge, log"
+            )
         elif category == "npm":
             lines.append("This should be an npm/Node.js-related command.")
-            lines.append("Common npm operations: install, run, build, test, update, outdated, audit")
+            lines.append(
+                "Common npm operations: install, run, build, test, update, outdated, audit"
+            )
         elif category == "docker":
             lines.append("This should be a Docker-related command.")
-            lines.append("Common docker operations: build, run, ps, stop, rm, images, prune, compose")
+            lines.append(
+                "Common docker operations: build, run, ps, stop, rm, images, prune, compose"
+            )
         elif category == "build":
             lines.append("This should be a build/compilation-related command.")
-            lines.append("Common build operations: make, cmake, cargo build, go build, npm run build")
+            lines.append(
+                "Common build operations: make, cmake, cargo build, go build, npm run build"
+            )
         elif category == "poetry":
             lines.append("This should be a Poetry/Python-related command.")
             lines.append("Common poetry operations: install, add, update, run, build, publish")
@@ -89,10 +97,10 @@ def build_shell_command_prompt(
     lines.append("")
     lines.append("Example output format:")
     lines.append("```json")
-    lines.append('{')
+    lines.append("{")
     lines.append('  "command": "git status && git add . && git commit -m \\"Update\\"",')
     lines.append('  "description": "Check status, stage all changes, and commit with message"')
-    lines.append('}')
+    lines.append("}")
     lines.append("```")
     lines.append("")
     lines.append("Return ONLY the JSON object, no explanations or markdown code blocks.")
@@ -304,7 +312,9 @@ class AiShellCommandGeneratorService:
         import sys
 
         # Debug log file (same as executor)
-        debug_log = os.path.join(os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log")
+        debug_log = os.path.join(
+            os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log"
+        )
 
         def debug(msg):
             ts = datetime.datetime.now().isoformat()
@@ -332,12 +342,16 @@ class AiShellCommandGeneratorService:
             execution_mode = ai_settings.get("execution_mode", "auto")
             timeout = ai_settings.get("timeout_seconds", 120)
             custom_path = ai_settings.get("custom_path")
-            debug(f"Using claude_cli: execution_mode={execution_mode}, timeout={timeout}, custom_path={custom_path}")
+            debug(
+                f"Using claude_cli: execution_mode={execution_mode}, timeout={timeout}, custom_path={custom_path}"
+            )
             debug("Calling generate_command_via_claude_cli()...")
             result = generate_command_via_claude_cli(
                 full_prompt, timeout, execution_mode, custom_path
             )
-            debug(f"generate_command_via_claude_cli() returned: success={result.get('success')}, error={result.get('error')!r}")
+            debug(
+                f"generate_command_via_claude_cli() returned: success={result.get('success')}, error={result.get('error')!r}"
+            )
 
         elif ai_provider == "claude_api":
             api_key = ai_settings.get("api_key", "")

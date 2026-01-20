@@ -40,7 +40,10 @@ try:
     from qontinui.state_management.builders import build_state_machine_from_extraction_result
 
     HAS_STATE_MACHINE_BUILDER = True
-    print(f"[STATE_MACHINE_DEBUG] Successfully imported build_state_machine_from_extraction_result", flush=True)
+    print(
+        "[STATE_MACHINE_DEBUG] Successfully imported build_state_machine_from_extraction_result",
+        flush=True,
+    )
     logger.info("State machine builder imported successfully")
 except ImportError as e:
     HAS_STATE_MACHINE_BUILDER = False
@@ -392,10 +395,14 @@ class WebExtractionService:
         try:
             # Run extraction
             start_extract = time.time()
-            logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] Starting orchestrator.extract()")
+            logger.info(
+                f"[PERF_DEBUG] [{self._current_extraction_id}] Starting orchestrator.extract()"
+            )
             result = await self._orchestrator.extract(config)
             duration_extract = time.time() - start_extract
-            logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] orchestrator.extract() finished in {duration_extract:.2f}s")
+            logger.info(
+                f"[PERF_DEBUG] [{self._current_extraction_id}] orchestrator.extract() finished in {duration_extract:.2f}s"
+            )
             logger.info("=" * 60)
             logger.info("EXTRACTION RESULT FROM ORCHESTRATOR")
             logger.info("=" * 60)
@@ -455,20 +462,28 @@ class WebExtractionService:
 
                 # Save annotations to backend
                 start_save = time.time()
-                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _save_annotations_to_backend()")
+                logger.info(
+                    f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _save_annotations_to_backend()"
+                )
                 await self._save_annotations_to_backend(
                     serialized_states, serialized_transitions, serialized_elements
                 )
                 duration_save = time.time() - start_save
-                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] _save_annotations_to_backend() finished in {duration_save:.2f}s")
+                logger.info(
+                    f"[PERF_DEBUG] [{self._current_extraction_id}] _save_annotations_to_backend() finished in {duration_save:.2f}s"
+                )
 
                 # Build and upload the state machine
                 # This transforms raw elements into a proper state machine using co-occurrence clustering
                 start_build = time.time()
-                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _build_and_upload_state_machine()")
+                logger.info(
+                    f"[PERF_DEBUG] [{self._current_extraction_id}] Starting _build_and_upload_state_machine()"
+                )
                 await self._build_and_upload_state_machine(serialized_elements)
                 duration_build = time.time() - start_build
-                logger.info(f"[PERF_DEBUG] [{self._current_extraction_id}] _build_and_upload_state_machine() finished in {duration_build:.2f}s")
+                logger.info(
+                    f"[PERF_DEBUG] [{self._current_extraction_id}] _build_and_upload_state_machine() finished in {duration_build:.2f}s"
+                )
 
                 # Update backend session to completed with stats
                 pages_extracted = (
@@ -518,7 +533,9 @@ class WebExtractionService:
                 await self._notify_rust_extraction_complete(
                     states_found=len(result.states),
                     transitions_found=len(result.transitions),
-                    pages_extracted=result.runtime_extraction.pages_visited if result.runtime_extraction else 0,
+                    pages_extracted=(
+                        result.runtime_extraction.pages_visited if result.runtime_extraction else 0
+                    ),
                     errors=len(result.errors),
                 )
 
@@ -609,9 +626,7 @@ class WebExtractionService:
                     if response.status == 200:
                         logger.info("Notified Rust runner of extraction completion")
                     else:
-                        logger.warning(
-                            f"Failed to notify Rust runner: {response.status}"
-                        )
+                        logger.warning(f"Failed to notify Rust runner: {response.status}")
         except Exception as e:
             logger.error(f"Error notifying Rust runner of extraction completion: {e}")
 
@@ -1420,7 +1435,9 @@ class WebExtractionService:
             f"[VISION_DEBUG] _run_vision_extraction called, HAS_VISION_EXTRACTION={HAS_VISION_EXTRACTION}"
         )
         start_vision = time.time()
-        logger.info(f"[PERF_DEBUG] [{screenshot_id}] Starting _run_vision_extraction for {source_url}")
+        logger.info(
+            f"[PERF_DEBUG] [{screenshot_id}] Starting _run_vision_extraction for {source_url}"
+        )
         if not HAS_VISION_EXTRACTION:
             logger.debug("[VISION_DEBUG] Vision extraction not available, returning None")
             logger.debug("Vision extraction not available")
@@ -1555,7 +1572,9 @@ class WebExtractionService:
                 f"{len(vision_data['merged_candidates'])} merged candidates"
             )
             duration_vision = time.time() - start_vision
-            logger.info(f"[PERF_DEBUG] [{screenshot_id}] _run_vision_extraction finished in {duration_vision:.2f}s")
+            logger.info(
+                f"[PERF_DEBUG] [{screenshot_id}] _run_vision_extraction finished in {duration_vision:.2f}s"
+            )
             return vision_data
 
         except Exception as e:
@@ -1604,77 +1623,107 @@ class WebExtractionService:
             actual_extraction_id = result.extraction_id
             screenshots_dir = self.extractions_dir / actual_extraction_id / "screenshots"
 
-            print(f"[STATE_MACHINE_DEBUG] Building state machine with image matching", flush=True)
+            print("[STATE_MACHINE_DEBUG] Building state machine with image matching", flush=True)
             print(f"[STATE_MACHINE_DEBUG] Screenshots dir: {screenshots_dir}", flush=True)
-            print(f"[STATE_MACHINE_DEBUG] Screenshots dir exists: {screenshots_dir.exists()}", flush=True)
-            print(f"[STATE_MACHINE_DEBUG] HAS_STATE_MACHINE_BUILDER: {HAS_STATE_MACHINE_BUILDER}", flush=True)
-            logger.info(
-                f"Building state machine with image matching from {screenshots_dir}"
+            print(
+                f"[STATE_MACHINE_DEBUG] Screenshots dir exists: {screenshots_dir.exists()}",
+                flush=True,
             )
+            print(
+                f"[STATE_MACHINE_DEBUG] HAS_STATE_MACHINE_BUILDER: {HAS_STATE_MACHINE_BUILDER}",
+                flush=True,
+            )
+            logger.info(f"Building state machine with image matching from {screenshots_dir}")
 
             # Use the new image-matching state machine builder from qontinui library
             if HAS_STATE_MACHINE_BUILDER:
-                print(f"[STATE_MACHINE_DEBUG] Calling build_state_machine_from_extraction_result...", flush=True)
+                print(
+                    "[STATE_MACHINE_DEBUG] Calling build_state_machine_from_extraction_result...",
+                    flush=True,
+                )
                 print(f"[STATE_MACHINE_DEBUG] extraction_result: {result}", flush=True)
-                print(f"[STATE_MACHINE_DEBUG] runtime_extraction: {result.runtime_extraction}", flush=True)
+                print(
+                    f"[STATE_MACHINE_DEBUG] runtime_extraction: {result.runtime_extraction}",
+                    flush=True,
+                )
                 if result.runtime_extraction:
-                    print(f"[STATE_MACHINE_DEBUG] runtime_extraction.states count: {len(result.runtime_extraction.states)}", flush=True)
+                    print(
+                        f"[STATE_MACHINE_DEBUG] runtime_extraction.states count: {len(result.runtime_extraction.states)}",
+                        flush=True,
+                    )
                     for i, state in enumerate(result.runtime_extraction.states):
-                        print(f"[STATE_MACHINE_DEBUG]   State {i}: screenshot_id={state.screenshot.id if state.screenshot else 'None'}, elements={len(state.elements)}", flush=True)
+                        print(
+                            f"[STATE_MACHINE_DEBUG]   State {i}: screenshot_id={state.screenshot.id if state.screenshot else 'None'}, elements={len(state.elements)}",
+                            flush=True,
+                        )
 
                 states_config, transitions_config = build_state_machine_from_extraction_result(
                     extraction_result=result,
                     screenshots_dir=screenshots_dir,
                     similarity_threshold=0.8,
                 )
-                print(f"[STATE_MACHINE_DEBUG] Image matching returned {len(states_config)} states", flush=True)
+                print(
+                    f"[STATE_MACHINE_DEBUG] Image matching returned {len(states_config)} states",
+                    flush=True,
+                )
                 for i, state in enumerate(states_config):
-                    print(f"[STATE_MACHINE_DEBUG]   State {i}: name={state.get('name')}, images={len(state.get('stateImages', []))}, screensFound={state.get('screensFound', [])}", flush=True)
-                logger.info(
-                    f"Image matching produced {len(states_config)} states"
-                )
+                    print(
+                        f"[STATE_MACHINE_DEBUG]   State {i}: name={state.get('name')}, images={len(state.get('stateImages', []))}, screensFound={state.get('screensFound', [])}",
+                        flush=True,
+                    )
+                logger.info(f"Image matching produced {len(states_config)} states")
             else:
-                print(f"[STATE_MACHINE_DEBUG] State machine builder NOT available, using fallback", flush=True)
-                # Fallback: Create a single state with all elements (old behavior)
-                logger.warning(
-                    "State machine builder not available - falling back to single state"
+                print(
+                    "[STATE_MACHINE_DEBUG] State machine builder NOT available, using fallback",
+                    flush=True,
                 )
+                # Fallback: Create a single state with all elements (old behavior)
+                logger.warning("State machine builder not available - falling back to single state")
                 state_images = []
                 for elem in serialized_elements:
                     elem_id = elem.get("id", "")
                     elem_bbox = elem.get("bbox", {"x": 0, "y": 0, "width": 100, "height": 30})
                     elem_name = (
-                        elem.get("name") or elem.get("text") or elem.get("element_type") or "Element"
+                        elem.get("name")
+                        or elem.get("text")
+                        or elem.get("element_type")
+                        or "Element"
                     )
                     if len(elem_name) > 30:
                         elem_name = elem_name[:27] + "..."
 
-                    state_images.append({
-                        "id": f"stateimage-{elem_id}",
-                        "name": elem_name,
-                        "patterns": [{
-                            "id": f"pattern-{elem_id}",
+                    state_images.append(
+                        {
+                            "id": f"stateimage-{elem_id}",
                             "name": elem_name,
+                            "patterns": [
+                                {
+                                    "id": f"pattern-{elem_id}",
+                                    "name": elem_name,
+                                    "searchRegions": [elem_bbox],
+                                    "fixed": False,
+                                }
+                            ],
+                            "shared": False,
                             "searchRegions": [elem_bbox],
-                            "fixed": False,
-                        }],
-                        "shared": False,
-                        "searchRegions": [elem_bbox],
-                        "extractionCategory": elem.get("extraction_category", ""),
-                    })
+                            "extractionCategory": elem.get("extraction_category", ""),
+                        }
+                    )
 
-                states_config = [{
-                    "id": "state-page-elements",
-                    "name": "Page Elements",
-                    "description": "Interactive elements extracted from the page",
-                    "stateImages": state_images,
-                    "regions": [],
-                    "locations": [],
-                    "strings": [],
-                    "position": {"x": 0, "y": 0},
-                    "initial": True,
-                    "isFinal": False,
-                }]
+                states_config = [
+                    {
+                        "id": "state-page-elements",
+                        "name": "Page Elements",
+                        "description": "Interactive elements extracted from the page",
+                        "stateImages": state_images,
+                        "regions": [],
+                        "locations": [],
+                        "strings": [],
+                        "position": {"x": 0, "y": 0},
+                        "initial": True,
+                        "isFinal": False,
+                    }
+                ]
                 transitions_config = []
 
             logger.info(

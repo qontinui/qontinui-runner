@@ -24,9 +24,7 @@ from typing import Any
 from qontinui_schemas.common import utc_now
 
 # Debug log file path - hardcoded to ensure it works
-_WS_CLIENT_DEBUG_LOG = (
-    r"D:\qontinui_parent_directory\.dev-logs\ws-client-debug.log"
-)
+_WS_CLIENT_DEBUG_LOG = r"D:\qontinui_parent_directory\.dev-logs\ws-client-debug.log"
 
 
 def _debug_log(message: str) -> None:

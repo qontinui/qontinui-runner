@@ -87,6 +87,7 @@ from services.input_monitor_service import InputMonitorService  # noqa: E402
 from services.screenshot_service import ScreenshotService  # noqa: E402
 from services.ai_test_generator import AiTestGeneratorService  # noqa: E402
 from services.ai_shell_command_generator import AiShellCommandGeneratorService  # noqa: E402
+from services.ai_builder_generator import AiBuilderGeneratorService  # noqa: E402
 from services.integration_testing_service import IntegrationTestingService  # noqa: E402
 from services.test_analysis_service import TestAnalysisService  # noqa: E402
 from services.unified_data_collector import UnifiedDataCollector  # noqa: E402
@@ -94,9 +95,12 @@ from services.vision_extraction_service import VisionExtractionService  # noqa: 
 from services.web_extraction_service import WebExtractionService  # noqa: E402
 from services.playwright_collector_service import PlaywrightCollectorService  # noqa: E402
 from services.pattern_matching_service import get_pattern_matching_service  # noqa: E402
-from services.model_manager import get_model_manager, ModelManager  # noqa: E402
+from services.model_manager import get_model_manager  # noqa: E402
 from services.accessibility_capture_service import AccessibilityCaptureService  # noqa: E402
-from services.uitars_extraction_service import get_uitars_extraction_service, UITarsExtractionService  # noqa: E402
+from services.uitars_extraction_service import (  # noqa: E402
+    get_uitars_extraction_service,
+    UITarsExtractionService,
+)
 from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
@@ -225,6 +229,9 @@ class QontinuiExecutor:
 
         # AI shell command generator service (lazy-loaded when needed)
         self._ai_shell_command_generator_service = None
+
+        # AI builder generator service (lazy-loaded when needed)
+        self._ai_builder_generator_service = None
 
         # Integration testing service (lazy-loaded when needed)
         self._integration_testing_service = None
@@ -1477,6 +1484,19 @@ class QontinuiExecutor:
         elif cmd_type == "generate_shell_command_with_ai":
             return self._handle_generate_shell_command_with_ai(params)
 
+        # AI builder generation commands
+        elif cmd_type == "generate_context_with_ai":
+            return self._handle_generate_context_with_ai(params)
+
+        elif cmd_type == "generate_api_request_with_ai":
+            return self._handle_generate_api_request_with_ai(params)
+
+        elif cmd_type == "generate_task_prompt_with_ai":
+            return self._handle_generate_task_prompt_with_ai(params)
+
+        elif cmd_type == "suggest_exploration_strategy_with_ai":
+            return self._handle_suggest_exploration_strategy_with_ai(params)
+
         # Pattern matching commands
         elif cmd_type == "pattern_find":
             return self._handle_pattern_find(params)
@@ -1761,17 +1781,19 @@ class QontinuiExecutor:
                 else:
                     position = "right"
 
-                monitors.append({
-                    "index": info.index,
-                    "x": info.x,
-                    "y": info.y,
-                    "width": info.width,
-                    "height": info.height,
-                    "position": position,
-                    "is_primary": info.index == manager.get_primary_monitor_index(),
-                    "name": info.device_id,
-                    "scale_factor": 1.0,  # MSS captures at physical resolution
-                })
+                monitors.append(
+                    {
+                        "index": info.index,
+                        "x": info.x,
+                        "y": info.y,
+                        "width": info.width,
+                        "height": info.height,
+                        "position": position,
+                        "is_primary": info.index == manager.get_primary_monitor_index(),
+                        "name": info.device_id,
+                        "scale_factor": 1.0,  # MSS captures at physical resolution
+                    }
+                )
 
             self.event_manager.emit_log(
                 "info",
@@ -2292,7 +2314,9 @@ class QontinuiExecutor:
         import sys
 
         # Debug log file
-        debug_log = os.path.join(os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log")
+        debug_log = os.path.join(
+            os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log"
+        )
         os.makedirs(os.path.dirname(debug_log), exist_ok=True)
 
         def debug(msg):
@@ -2338,13 +2362,16 @@ class QontinuiExecutor:
                 ai_provider=ai_provider,
                 ai_settings=ai_settings,
             )
-            debug(f"service.generate_command() returned: success={result.get('success')}, error={result.get('error')!r}")
+            debug(
+                f"service.generate_command() returned: success={result.get('success')}, error={result.get('error')!r}"
+            )
             debug(f"command (first 200 chars): {str(result.get('command', ''))[:200]!r}")
 
             return result
 
         except Exception as e:
             import traceback
+
             tb = traceback.format_exc()
             debug(f"EXCEPTION: {e}")
             debug(f"TRACEBACK:\n{tb}")
@@ -2353,6 +2380,124 @@ class QontinuiExecutor:
                 "success": False,
                 "error": f"AI shell command generation failed: {e}",
                 "traceback": tb,
+            }
+
+    def _get_ai_builder_generator_service(self) -> AiBuilderGeneratorService:
+        """Get or create the AI builder generator service."""
+        if self._ai_builder_generator_service is None:
+            self._ai_builder_generator_service = AiBuilderGeneratorService(
+                event_manager=self.event_manager,
+            )
+        return self._ai_builder_generator_service
+
+    def _handle_generate_context_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle AI context generation for knowledge base entries."""
+        user_prompt = params.get("user_prompt", "")
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        if not user_prompt:
+            return {"success": False, "error": "user_prompt is required"}
+
+        try:
+            service = self._get_ai_builder_generator_service()
+            return service.generate_context(
+                user_prompt=user_prompt,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Context generation failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _handle_generate_api_request_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle AI API request template generation."""
+        user_prompt = params.get("user_prompt", "")
+        base_url = params.get("base_url")
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        if not user_prompt:
+            return {"success": False, "error": "user_prompt is required"}
+
+        try:
+            service = self._get_ai_builder_generator_service()
+            return service.generate_api_request(
+                user_prompt=user_prompt,
+                base_url=base_url,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"API request generation failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _handle_generate_task_prompt_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle AI task prompt generation/improvement."""
+        user_prompt = params.get("user_prompt", "")
+        mode = params.get("mode", "generate")
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        if not user_prompt:
+            return {"success": False, "error": "user_prompt is required"}
+
+        try:
+            service = self._get_ai_builder_generator_service()
+            return service.generate_task_prompt(
+                user_prompt=user_prompt,
+                mode=mode,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Task prompt generation failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _handle_suggest_exploration_strategy_with_ai(
+        self, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Handle AI exploration strategy suggestion."""
+        user_goal = params.get("user_goal", "")
+        available_states = params.get("available_states", [])
+        available_transitions = params.get("available_transitions", [])
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        if not user_goal:
+            return {"success": False, "error": "user_goal is required"}
+
+        try:
+            service = self._get_ai_builder_generator_service()
+            return service.suggest_exploration_strategy(
+                user_goal=user_goal,
+                available_states=available_states,
+                available_transitions=available_transitions,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Exploration strategy suggestion failed: {e}",
+                "traceback": traceback.format_exc(),
             }
 
     def _handle_run_vision_extraction(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -2589,17 +2734,13 @@ class QontinuiExecutor:
             return result
 
         except Exception as e:
-            self.event_manager.emit_log(
-                "error", f"Failed to start Playwright collection: {e}"
-            )
+            self.event_manager.emit_log("error", f"Failed to start Playwright collection: {e}")
             import traceback
 
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
-    def _handle_get_playwright_collection_status(
-        self, params: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _handle_get_playwright_collection_status(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle get Playwright collection status command."""
         try:
             if self._playwright_collector_service is None:
@@ -2613,14 +2754,10 @@ class QontinuiExecutor:
             return self._playwright_collector_service.get_job_status(job_id)
 
         except Exception as e:
-            self.event_manager.emit_log(
-                "error", f"Failed to get Playwright collection status: {e}"
-            )
+            self.event_manager.emit_log("error", f"Failed to get Playwright collection status: {e}")
             return {"success": False, "error": str(e)}
 
-    def _handle_get_playwright_collection_results(
-        self, params: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _handle_get_playwright_collection_results(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle get Playwright collection results command."""
         try:
             if self._playwright_collector_service is None:
@@ -2644,9 +2781,7 @@ class QontinuiExecutor:
             return self._playwright_collector_service.stop_collection()
 
         except Exception as e:
-            self.event_manager.emit_log(
-                "error", f"Failed to stop Playwright collection: {e}"
-            )
+            self.event_manager.emit_log("error", f"Failed to stop Playwright collection: {e}")
             return {"success": False, "error": str(e)}
 
     # =========================================================================
@@ -2695,6 +2830,7 @@ class QontinuiExecutor:
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to start UI-TARS extraction: {e}")
             import traceback
+
             traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
@@ -3923,12 +4059,16 @@ class QontinuiExecutor:
                 "model_id": model_id,
                 "available": available,
                 "path": str(path) if path else None,
-                "info": {
-                    "name": info.name,
-                    "type": info.model_type.value,
-                    "description": info.description,
-                    "size_bytes": info.size_bytes,
-                } if info else None,
+                "info": (
+                    {
+                        "name": info.name,
+                        "type": info.model_type.value,
+                        "description": info.description,
+                        "size_bytes": info.size_bytes,
+                    }
+                    if info
+                    else None
+                ),
             }
 
         except Exception as e:
@@ -4629,10 +4769,7 @@ class QontinuiExecutor:
                 return {"success": False, "error": f"No AWAS manifest found at {url}"}
 
             # Get actions (filtered if requested)
-            if read_only_only:
-                actions = manifest.get_read_only_actions()
-            else:
-                actions = manifest.actions
+            actions = manifest.get_read_only_actions() if read_only_only else manifest.actions
 
             # Build action summaries
             action_summaries = []

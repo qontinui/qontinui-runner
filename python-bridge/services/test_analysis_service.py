@@ -10,11 +10,12 @@ The analysis data is used by AI to generate test code from natural language desc
 """
 
 import base64
+import contextlib
 import io
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
 import cv2
 import numpy as np
@@ -75,9 +76,7 @@ class TestAnalysisService:
             async with async_playwright() as p:
                 # Connect to existing browser via CDP
                 try:
-                    browser = await p.chromium.connect_over_cdp(
-                        f"http://127.0.0.1:{cdp_port}"
-                    )
+                    browser = await p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}")
                 except Exception as e:
                     return {
                         "success": False,
@@ -165,9 +164,12 @@ class TestAnalysisService:
         self._is_running = True
 
         try:
-            # Try to import playwright
+            # Try to import playwright (test availability)
             try:
-                from playwright.async_api import async_playwright
+                import importlib.util
+
+                if importlib.util.find_spec("playwright") is None:
+                    raise ImportError("Playwright not found")
             except ImportError:
                 return {
                     "success": False,
@@ -293,31 +295,31 @@ const {{ chromium }} = require('playwright');
 '''
 
             # Write wrapper script to temp file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.js', delete=False) as f:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False) as f:
                 f.write(wrapper_script)
                 script_path = f.name
 
             try:
                 # Run the script with Node.js
                 result = subprocess.run(
-                    ['node', script_path],
+                    ["node", script_path],
                     capture_output=True,
                     text=True,
                     timeout=90,
-                    cwd=os.path.dirname(script_path)
+                    cwd=os.path.dirname(script_path),
                 )
 
                 if result.returncode != 0:
                     error_output = result.stderr or result.stdout
                     # Try to parse JSON error
                     try:
-                        error_data = json.loads(error_output.strip().split('\n')[-1])
+                        error_data = json.loads(error_output.strip().split("\n")[-1])
                         return {"success": False, "error": error_data.get("error", error_output)}
-                    except:
+                    except (json.JSONDecodeError, IndexError, ValueError):
                         return {"success": False, "error": f"Script failed: {error_output}"}
 
                 # Parse output
-                output_lines = result.stdout.strip().split('\n')
+                output_lines = result.stdout.strip().split("\n")
                 for line in reversed(output_lines):
                     try:
                         data = json.loads(line)
@@ -327,16 +329,18 @@ const {{ chromium }} = require('playwright');
                             for i, raw in enumerate(data.get("elements", [])):
                                 element_id = f"element_{i + 1}"
                                 label = raw.get("text", "")[:30] or raw.get("type", "element")
-                                elements.append({
-                                    "id": element_id,
-                                    "label": label,
-                                    "element_type": raw.get("type", "element"),
-                                    "text_content": raw.get("text"),
-                                    "bounding_box": raw.get("bbox"),
-                                    "confidence": 1.0,
-                                    "selector": raw.get("selector"),
-                                    "attributes": {},
-                                })
+                                elements.append(
+                                    {
+                                        "id": element_id,
+                                        "label": label,
+                                        "element_type": raw.get("type", "element"),
+                                        "text_content": raw.get("text"),
+                                        "bounding_box": raw.get("bbox"),
+                                        "confidence": 1.0,
+                                        "selector": raw.get("selector"),
+                                        "attributes": {},
+                                    }
+                                )
 
                             # Generate annotated screenshot
                             screenshot_bytes = base64.b64decode(data.get("screenshotBase64", ""))
@@ -368,10 +372,8 @@ const {{ chromium }} = require('playwright');
 
             finally:
                 # Clean up temp file
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(script_path)
-                except:
-                    pass
 
         except subprocess.TimeoutExpired:
             return {
@@ -611,7 +613,11 @@ const {{ chromium }} = require('playwright');
                     monitor_index = 0
 
                 # monitors[0] is all monitors combined, [1] is first, etc.
-                monitor = monitors[monitor_index + 1] if monitor_index + 1 < len(monitors) else monitors[1]
+                monitor = (
+                    monitors[monitor_index + 1]
+                    if monitor_index + 1 < len(monitors)
+                    else monitors[1]
+                )
 
                 screenshot = sct.grab(monitor)
                 img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
@@ -731,10 +737,8 @@ const {{ chromium }} = require('playwright');
             # Try to load a font, fall back to default
             try:
                 font = ImageFont.truetype("arial.ttf", 14)
-                small_font = ImageFont.truetype("arial.ttf", 10)
             except OSError:
                 font = ImageFont.load_default()
-                small_font = font
 
             # Colors for different element types
             colors = {

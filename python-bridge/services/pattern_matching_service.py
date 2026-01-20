@@ -5,13 +5,11 @@ Provides pattern matching functionality via the qontinui library's Find system.
 Supports both find (best match) and find_all operations.
 """
 
-import asyncio
 import base64
 import io
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import cv2
@@ -22,9 +20,9 @@ logger = logging.getLogger(__name__)
 
 # Check if qontinui library is available
 try:
-    from qontinui.find.find import Find
-    from qontinui.model.element import Pattern, Region
-    from qontinui.hal import get_hal
+    from qontinui.find.find import Find  # noqa: F401
+    from qontinui.model.element import Pattern, Region  # noqa: F401
+    from qontinui.hal import get_hal  # noqa: F401
 
     QONTINUI_AVAILABLE = True
     logger.info("qontinui library loaded for pattern matching")
@@ -279,7 +277,7 @@ class PatternMatchingService:
 
                 # Group nearby matches using non-maximum suppression
                 match_data = []
-                for pt in zip(*locations[::-1]):  # Switch to (x, y) format
+                for pt in zip(*locations[::-1], strict=False):  # Switch to (x, y) format
                     match_similarity = float(result[pt[1], pt[0]])
                     match_data.append(
                         {
@@ -376,9 +374,7 @@ class PatternMatchingService:
 
         return selected
 
-    def _calculate_iou(
-        self, box1: dict[str, Any], box2: dict[str, Any]
-    ) -> float:
+    def _calculate_iou(self, box1: dict[str, Any], box2: dict[str, Any]) -> float:
         """Calculate Intersection over Union of two boxes.
 
         Args:

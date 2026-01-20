@@ -14,7 +14,6 @@ Features:
 
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -159,9 +158,7 @@ class SessionManager:
                 self._sessions[session_id] = set()
             self._sessions[session_id].add(job_id)
 
-        logger.info(
-            f"Created job {job_id} for session {session_id} (method={method.value})"
-        )
+        logger.info(f"Created job {job_id} for session {session_id} (method={method.value})")
         return job
 
     def start_job(self, job_id: str) -> bool:

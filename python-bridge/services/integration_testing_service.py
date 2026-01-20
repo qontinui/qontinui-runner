@@ -22,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Check if qontinui is available
 try:
-    from qontinui import navigation_api, registry
-    from qontinui.config import get_settings
+    from qontinui import navigation_api, registry  # noqa: F401
 
     QONTINUI_AVAILABLE = True
 except ImportError:
@@ -195,7 +194,9 @@ class IntegrationTestingService:
             emit_log_fn: Optional function for emitting log messages
             emit_event_fn: Optional function for emitting events
         """
-        self.emit_log = emit_log_fn or (lambda level, msg: logger.log(getattr(logging, level.upper()), msg))
+        self.emit_log = emit_log_fn or (
+            lambda level, msg: logger.log(getattr(logging, level.upper()), msg)
+        )
         self.emit_event = emit_event_fn or (lambda event_type, data: None)
 
         # Mock mode state
@@ -271,9 +272,7 @@ class IntegrationTestingService:
             self.emit_log("error", f"Failed to get transitions: {e}")
             return []
 
-    def find_path(
-        self, from_state: str | int, to_state: str | int
-    ) -> dict[str, Any]:
+    def find_path(self, from_state: str | int, to_state: str | int) -> dict[str, Any]:
         """
         Find a path between two states using the navigation system.
 
@@ -323,8 +322,14 @@ class IntegrationTestingService:
                 return {
                     "success": True,
                     "path": {
-                        "source_states": path.source_states if hasattr(path, "source_states") else [from_state_id],
-                        "target_states": path.target_states if hasattr(path, "target_states") else [to_state_id],
+                        "source_states": (
+                            path.source_states
+                            if hasattr(path, "source_states")
+                            else [from_state_id]
+                        ),
+                        "target_states": (
+                            path.target_states if hasattr(path, "target_states") else [to_state_id]
+                        ),
                         "transitions": [
                             {
                                 "id": t.id if hasattr(t, "id") else None,
@@ -343,9 +348,7 @@ class IntegrationTestingService:
             self.emit_log("error", f"Failed to find path: {e}")
             return {"success": False, "error": str(e)}
 
-    def traverse_to_state(
-        self, target_state: str | int, execute: bool = True
-    ) -> dict[str, Any]:
+    def traverse_to_state(self, target_state: str | int, execute: bool = True) -> dict[str, Any]:
         """
         Navigate to a target state, optionally executing the transition workflows.
 
@@ -453,9 +456,7 @@ class IntegrationTestingService:
         """Get the current mock mode."""
         return self._mock_mode.value
 
-    def mock_click(
-        self, x: int, y: int, button: str = "left", clicks: int = 1
-    ) -> dict[str, Any]:
+    def mock_click(self, x: int, y: int, button: str = "left", clicks: int = 1) -> dict[str, Any]:
         """
         Mock a click action (record without executing).
 
@@ -695,7 +696,9 @@ class IntegrationTestingService:
 
             elif atype == AssertionType.TRANSITION_COMPLETED:
                 # Check if we can find a path to target (as verification)
-                result = self.find_path(self.get_active_states()[0] if self.get_active_states() else "", target)
+                result = self.find_path(
+                    self.get_active_states()[0] if self.get_active_states() else "", target
+                )
                 assertion.passed = result.get("success", False)
                 assertion.actual_value = result
 

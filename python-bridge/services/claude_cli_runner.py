@@ -20,7 +20,9 @@ def _debug_log(msg: str) -> None:
     import datetime
     import sys
 
-    debug_log = os.path.join(os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log")
+    debug_log = os.path.join(
+        os.environ.get("USERPROFILE", "C:\\Users\\Joshua"), ".qontinui", "ai-shell-debug.log"
+    )
     ts = datetime.datetime.now().isoformat()
     line = f"[{ts}] [CLI_RUNNER] {msg}\n"
     try:
@@ -71,9 +73,13 @@ def run_claude_cli(
     import time
 
     _debug_log("run_claude_cli() CALLED")
-    _debug_log(f"prompt_len={len(prompt)}, timeout={timeout_seconds}, execution_mode={execution_mode}")
+    _debug_log(
+        f"prompt_len={len(prompt)}, timeout={timeout_seconds}, execution_mode={execution_mode}"
+    )
     _debug_log(f"custom_path={custom_path}, working_directory={working_directory}")
-    _debug_log(f"permission_mode={permission_mode}, fresh_context={fresh_context}, max_turns={max_turns}")
+    _debug_log(
+        f"permission_mode={permission_mode}, fresh_context={fresh_context}, max_turns={max_turns}"
+    )
 
     result = {"success": False, "output": "", "error": "", "exit_code": -1, "duration_seconds": 0.0}
 
@@ -113,7 +119,9 @@ def run_claude_cli(
                 max_turns=max_turns,
                 output_format=output_format,
             )
-        _debug_log(f"Function returned: success={result.get('success')}, error={result.get('error')!r}")
+        _debug_log(
+            f"Function returned: success={result.get('success')}, error={result.get('error')!r}"
+        )
 
     except subprocess.TimeoutExpired:
         _debug_log("EXCEPTION: subprocess.TimeoutExpired")
@@ -121,7 +129,9 @@ def run_claude_cli(
         result["duration_seconds"] = timeout_seconds
     except FileNotFoundError as e:
         _debug_log(f"EXCEPTION: FileNotFoundError: {e}")
-        result["error"] = f"Claude CLI not found: {e}. Please install Claude Code or check AI settings."
+        result["error"] = (
+            f"Claude CLI not found: {e}. Please install Claude Code or check AI settings."
+        )
     except Exception as e:
         _debug_log(f"EXCEPTION: {type(e).__name__}: {e}")
         result["error"] = f"Failed to invoke Claude CLI: {e}"
@@ -129,7 +139,9 @@ def run_claude_cli(
     if result["duration_seconds"] == 0.0:
         result["duration_seconds"] = time.time() - start_time
 
-    _debug_log(f"run_claude_cli() RETURNING: success={result.get('success')}, duration={result.get('duration_seconds'):.2f}s")
+    _debug_log(
+        f"run_claude_cli() RETURNING: success={result.get('success')}, duration={result.get('duration_seconds'):.2f}s"
+    )
     return result
 
 
@@ -209,7 +221,9 @@ def _run_native(
         )
 
     # For non-Windows, use command line arguments
-    cmd = [claude_cmd] + _build_claude_args(prompt, permission_mode, fresh_context, max_turns, output_format)
+    cmd = [claude_cmd] + _build_claude_args(
+        prompt, permission_mode, fresh_context, max_turns, output_format
+    )
 
     # Subprocess options
     kwargs: dict[str, Any] = {
@@ -257,7 +271,9 @@ def _run_native_windows_stdin(
 
     _debug_log("_run_native_windows_stdin() CALLED")
     _debug_log(f"claude_cmd={claude_cmd}, timeout={timeout_seconds}, cwd={working_directory}")
-    _debug_log(f"prompt_len={len(prompt)}, permission_mode={permission_mode}, fresh_context={fresh_context}")
+    _debug_log(
+        f"prompt_len={len(prompt)}, permission_mode={permission_mode}, fresh_context={fresh_context}"
+    )
 
     result = {"success": False, "output": "", "error": "", "exit_code": -1, "duration_seconds": 0.0}
 
@@ -379,7 +395,9 @@ def _run_via_wsl(
 
     try:
         # Write prompt to temp file for WSL (handles escaping issues)
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, encoding="utf-8"
+        ) as f:
             f.write(prompt)
             prompt_file = f.name
 
@@ -409,7 +427,7 @@ def _run_via_wsl(
         if wsl_cwd:
             bash_cmd = f'cd "{wsl_cwd}" && {claude_cmd} {args_str} 2>&1'
         else:
-            bash_cmd = f'{claude_cmd} {args_str} 2>&1'
+            bash_cmd = f"{claude_cmd} {args_str} 2>&1"
 
         cmd = ["wsl.exe", "bash", "-c", bash_cmd]
 

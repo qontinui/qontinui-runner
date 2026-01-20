@@ -2,6 +2,7 @@
 
 Generates test code from natural language descriptions using AI.
 Uses the runner's AI settings to connect to Claude CLI, Claude API, or Gemini.
+Supports the modular step output piping system via formatters.
 """
 
 import json
@@ -9,6 +10,7 @@ import logging
 from typing import Any
 
 from .claude_cli_runner import clean_code_output, run_claude_cli
+from .formatters import formatter_registry
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,9 @@ def build_test_generation_prompt(
             lines.append("")
             if test_type == "python_script":
                 lines.append("**This is ground truth data from actual page analysis.**")
-                lines.append("Use this to verify that API responses correctly identify these elements.")
+                lines.append(
+                    "Use this to verify that API responses correctly identify these elements."
+                )
                 lines.append("Compare API-returned bounding boxes/elements against this reference.")
                 lines.append("")
             lines.append("The following elements were detected on the page:")
@@ -74,7 +78,9 @@ def build_test_generation_prompt(
             if test_type == "python_script":
                 lines.append("### Ground Truth Summary")
                 lines.append(f"- Total elements: {len(elements)}")
-                lines.append(f"- Element types: {', '.join(set(el.get('element_type', 'unknown') for el in elements))}")
+                lines.append(
+                    f"- Element types: {', '.join({el.get('element_type', 'unknown') for el in elements})}"
+                )
                 lines.append("")
 
         url = page_analysis.get("url")
@@ -91,9 +97,13 @@ def build_test_generation_prompt(
             lines.append("## Multi-Request Ground Truth")
             lines.append("")
             lines.append("**Multiple API responses were collected as ground truth data.**")
-            lines.append("Each response represents per-page extraction results that can be used for verification.")
+            lines.append(
+                "Each response represents per-page extraction results that can be used for verification."
+            )
             lines.append("")
-            lines.append(f"**Total Requests:** {len(requests)} ({len(successful_requests)} successful)")
+            lines.append(
+                f"**Total Requests:** {len(requests)} ({len(successful_requests)} successful)"
+            )
             if multi_request_analysis.get("total_elements"):
                 lines.append(f"**Total Elements:** {multi_request_analysis['total_elements']}")
             lines.append("")
@@ -126,7 +136,9 @@ def build_test_generation_prompt(
             lines.append("Use this multi-request data to:")
             lines.append("- Compare elements across different pages")
             lines.append("- Verify no duplicate elements appear in multiple pages/states")
-            lines.append("- Check that bounding boxes are valid (positive dimensions, within screen bounds)")
+            lines.append(
+                "- Check that bounding boxes are valid (positive dimensions, within screen bounds)"
+            )
             lines.append("- Validate that state groupings are logically consistent")
             lines.append("")
 
@@ -137,20 +149,39 @@ def build_test_generation_prompt(
             playwright_analyses = [a for a in analyses if a.get("type") == "playwright"]
             vision_analyses = [a for a in analyses if a.get("type") == "vision"]
             api_analyses = [a for a in analyses if a.get("type") == "api_request"]
+            step_output_analyses = [a for a in analyses if a.get("type") == "step_output"]
 
             lines.append("## Collected Analyses (Ground Truth)")
             lines.append("")
             lines.append(f"**{len(analyses)} analyses collected:**")
-            lines.append(f"- {len(playwright_analyses)} Playwright DOM analyses")
-            lines.append(f"- {len(vision_analyses)} Vision captures")
-            lines.append(f"- {len(api_analyses)} API request responses")
+            if playwright_analyses:
+                lines.append(f"- {len(playwright_analyses)} Playwright DOM analyses")
+            if vision_analyses:
+                lines.append(f"- {len(vision_analyses)} Vision captures")
+            if api_analyses:
+                lines.append(f"- {len(api_analyses)} API request responses")
+            if step_output_analyses:
+                lines.append(f"- {len(step_output_analyses)} Step outputs")
             lines.append("")
+
+            # Format Step Output analyses using the formatter registry
+            if step_output_analyses:
+                lines.append("## Step Outputs (Ground Truth)")
+                lines.append("")
+                for analysis in step_output_analyses:
+                    data = analysis.get("data", {})
+                    # Use the formatter registry to format the step output
+                    summary = formatter_registry.summarize_for_ai(data)
+                    lines.append(summary)
+                    lines.append("")
 
             # Format Playwright analyses
             for idx, analysis in enumerate(playwright_analyses):
                 data = analysis.get("data", {})
                 elements = data.get("elements", [])
-                lines.append(f"### Playwright Analysis {idx + 1}: {analysis.get('name', 'Unnamed')}")
+                lines.append(
+                    f"### Playwright Analysis {idx + 1}: {analysis.get('name', 'Unnamed')}"
+                )
                 lines.append(f"- Elements detected: {len(elements)}")
                 if data.get("url"):
                     lines.append(f"- URL: {data['url']}")
@@ -162,7 +193,9 @@ def build_test_generation_prompt(
                         text = el.get("text_content", "-") or "-"
                         if len(text) > 25:
                             text = text[:25] + "..."
-                        lines.append(f"| {i + 1} | {el.get('label', '-')} | {el.get('element_type', '-')} | {text} |")
+                        lines.append(
+                            f"| {i + 1} | {el.get('label', '-')} | {el.get('element_type', '-')} | {text} |"
+                        )
                     if len(elements) > 15:
                         lines.append(f"*... and {len(elements) - 15} more elements*")
                     lines.append("")
@@ -180,12 +213,14 @@ def build_test_generation_prompt(
                     for i, el in enumerate(elements[:15]):
                         box = el.get("bounding_box", {})
                         bounds = f"({box.get('x', 0)}, {box.get('y', 0)}, {box.get('width', 0)}x{box.get('height', 0)})"
-                        lines.append(f"| {i + 1} | {el.get('label', '-')} | {el.get('element_type', '-')} | {bounds} |")
+                        lines.append(
+                            f"| {i + 1} | {el.get('label', '-')} | {el.get('element_type', '-')} | {bounds} |"
+                        )
                     if len(elements) > 15:
                         lines.append(f"*... and {len(elements) - 15} more elements*")
                     lines.append("")
 
-            # Format API analyses
+            # Format API analyses (legacy format - also support via formatter if it's a step_output)
             for idx, analysis in enumerate(api_analyses):
                 data = analysis.get("data", {})
                 lines.append(f"### API Analysis {idx + 1}: {analysis.get('name', 'Unnamed')}")
@@ -217,6 +252,8 @@ def build_test_generation_prompt(
             lines.append("- Compare element counts and positions across sources")
             lines.append("- Validate that detected elements exist and are correctly identified")
             lines.append("- Check for consistency between different analysis methods")
+            if step_output_analyses:
+                lines.append("- Use step output data to verify automation behavior")
             lines.append("")
 
     lines.append("## User Request")
@@ -236,7 +273,9 @@ def build_test_generation_prompt(
     elif test_type == "qontinui_vision":
         lines.append("Generate a Qontinui Vision assertion config in JSON that:")
         lines.append("- Uses element bounding boxes from the analysis")
-        lines.append("- Supports assertion types: element_present, text_present, element_within_bounds")
+        lines.append(
+            "- Supports assertion types: element_present, text_present, element_within_bounds"
+        )
         lines.append("- Returns a valid JSON object with an 'assertions' array")
     elif test_type == "python_script":
         lines.append("Generate a Python test script that:")
@@ -265,12 +304,12 @@ def build_test_generation_prompt(
         lines.append("### Output Format")
         lines.append("The script should print a JSON object at the end with this structure:")
         lines.append("```json")
-        lines.append('{')
+        lines.append("{")
         lines.append('  "passed": true,')
         lines.append('  "summary": "Brief summary of verification result",')
         lines.append('  "issues": ["List of specific issues found"],')
         lines.append('  "metrics": {"metric_name": value}')
-        lines.append('}')
+        lines.append("}")
         lines.append("```")
         lines.append("")
         if page_analysis:
@@ -281,7 +320,9 @@ def build_test_generation_prompt(
             lines.append("- Check if API missed any clickable elements")
             lines.append("- Validate that element counts are reasonable")
             lines.append("")
-            lines.append("The ground truth data is provided above under 'Page Analysis (Ground Truth)'.")
+            lines.append(
+                "The ground truth data is provided above under 'Page Analysis (Ground Truth)'."
+            )
             lines.append("Store it as a constant in your script and compare against API response.")
     elif test_type == "repository_test":
         lines.append("Generate a configuration comment with:")
@@ -371,7 +412,7 @@ def generate_test_via_claude_api(
             data = response.json()
             if data.get("content") and len(data["content"]) > 0:
                 code = data["content"][0].get("text", "")
-                code = _clean_code_output(code)
+                code = clean_code_output(code)
                 result["success"] = True
                 result["code"] = code
             else:
@@ -385,8 +426,6 @@ def generate_test_via_claude_api(
         result["error"] = f"Claude API request failed: {e}"
 
     return result
-
-
 
 
 class AiTestGeneratorService:
@@ -458,13 +497,19 @@ class AiTestGeneratorService:
 
         elif ai_provider in ("gemini_cli", "gemini_api"):
             # TODO: Implement Gemini support
-            return {"success": False, "code": "", "error": f"{ai_provider} not yet implemented for test generation"}
+            return {
+                "success": False,
+                "code": "",
+                "error": f"{ai_provider} not yet implemented for test generation",
+            }
 
         else:
             return {"success": False, "code": "", "error": f"Unknown AI provider: {ai_provider}"}
 
         if result["success"]:
-            self._log("info", f"Successfully generated {len(result['code'])} characters of test code")
+            self._log(
+                "info", f"Successfully generated {len(result['code'])} characters of test code"
+            )
         else:
             self._log("error", f"Test generation failed: {result['error']}")
 

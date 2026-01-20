@@ -10,7 +10,7 @@ import base64
 import io
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -211,9 +211,7 @@ class PlaywrightCollectorService:
 
             # Handle safe keywords
             if config.get("additional_safe_keywords"):
-                safety_kwargs["additional_safe_keywords"] = config[
-                    "additional_safe_keywords"
-                ]
+                safety_kwargs["additional_safe_keywords"] = config["additional_safe_keywords"]
 
             # Handle blocked selectors
             if config.get("blocked_selectors"):

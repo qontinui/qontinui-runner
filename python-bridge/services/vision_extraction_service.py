@@ -325,7 +325,7 @@ class VisionExtractionService:
 
             model_path = None
             model_type = None
-            for path, mtype in zip(model_paths, ["vit_h", "vit_b", "vit_l"]):
+            for path, mtype in zip(model_paths, ["vit_h", "vit_b", "vit_l"], strict=True):
                 if os.path.exists(path):
                     model_path = path
                     model_type = mtype

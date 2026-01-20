@@ -10,7 +10,6 @@ Single Responsibility: Handle GUI interaction and action execution
 - Handle accessibility-based targeting via AccessibilityCaptureService
 """
 
-import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -98,9 +97,7 @@ class GUIAutomation:
             self._accessibility_service = AccessibilityCaptureService()
         return self._accessibility_service
 
-    async def _handle_accessibility_action(
-        self, action_type: str, target: dict[str, Any]
-    ) -> bool:
+    async def _handle_accessibility_action(self, action_type: str, target: dict[str, Any]) -> bool:
         """Handle actions with accessibility targets.
 
         This method:
@@ -137,7 +134,9 @@ class GUIAutomation:
                     interactive_only=True,
                 )
                 if not result.get("success"):
-                    self.emit_log("error", f"Failed to capture accessibility tree: {result.get('error')}")
+                    self.emit_log(
+                        "error", f"Failed to capture accessibility tree: {result.get('error')}"
+                    )
                     return False
 
             # If we have a direct ref, use it
@@ -153,7 +152,7 @@ class GUIAutomation:
                     is_interactive=is_interactive,
                 )
                 if not find_result.get("success") or find_result.get("count", 0) == 0:
-                    self.emit_log("error", f"No elements found matching selector")
+                    self.emit_log("error", "No elements found matching selector")
                     return False
 
                 # Use the first match
@@ -178,9 +177,14 @@ class GUIAutomation:
 
             success = result.get("success", False)
             if success:
-                self.emit_log("info", f"Accessibility action {action_type} on {target_ref} succeeded")
+                self.emit_log(
+                    "info", f"Accessibility action {action_type} on {target_ref} succeeded"
+                )
             else:
-                self.emit_log("error", f"Accessibility action {action_type} on {target_ref} failed: {result.get('error')}")
+                self.emit_log(
+                    "error",
+                    f"Accessibility action {action_type} on {target_ref} failed: {result.get('error')}",
+                )
 
             return success
 

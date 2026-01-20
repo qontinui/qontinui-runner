@@ -38,7 +38,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable
+from collections.abc import Callable
 
 import httpx
 
@@ -115,13 +115,9 @@ MODEL_REGISTRY: dict[str, ModelInfo] = {
 class DownloadError(Exception):
     """Error during model download."""
 
-    pass
-
 
 class VerificationError(Exception):
     """Model verification failed."""
-
-    pass
 
 
 class ModelManager:
@@ -167,7 +163,9 @@ class ModelManager:
             app_data = os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")
             return Path(app_data) / "com.qontinui.runner" / "models"
         elif sys.platform == "darwin":
-            return Path.home() / "Library" / "Application Support" / "com.qontinui.runner" / "models"
+            return (
+                Path.home() / "Library" / "Application Support" / "com.qontinui.runner" / "models"
+            )
         else:
             xdg_data = os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")
             return Path(xdg_data) / "com.qontinui.runner" / "models"
@@ -253,14 +251,16 @@ class ModelManager:
         """
         result = []
         for model_id, info in MODEL_REGISTRY.items():
-            result.append({
-                "id": model_id,
-                "name": info.name,
-                "type": info.model_type.value,
-                "description": info.description,
-                "size_bytes": info.size_bytes,
-                "available": self.is_available(model_id),
-            })
+            result.append(
+                {
+                    "id": model_id,
+                    "name": info.name,
+                    "type": info.model_type.value,
+                    "description": info.description,
+                    "size_bytes": info.size_bytes,
+                    "available": self.is_available(model_id),
+                }
+            )
         return result
 
     def download(
@@ -302,7 +302,9 @@ class ModelManager:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as temp_file:
                 temp_path = Path(temp_file.name)
 
-                with httpx.stream("GET", model_info.url, follow_redirects=True, timeout=300) as response:
+                with httpx.stream(
+                    "GET", model_info.url, follow_redirects=True, timeout=300
+                ) as response:
                     response.raise_for_status()
 
                     total_size = int(response.headers.get("content-length", model_info.size_bytes))
