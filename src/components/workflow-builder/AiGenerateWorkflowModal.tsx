@@ -187,7 +187,9 @@ export function AiGenerateWorkflowModal({
       <div className="absolute inset-0 bg-black/50" onClick={handleClose} />
 
       {/* Dialog */}
-      <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
+      <div
+        data-ui-id="dialog-ai-generate-workflow"
+        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-border">
           <div className="flex items-center gap-2">
@@ -195,6 +197,7 @@ export function AiGenerateWorkflowModal({
             <h3 className="text-lg font-semibold">Generate Workflow with AI</h3>
           </div>
           <button
+            data-ui-id="dialog-ai-generate-workflow-close-btn"
             onClick={handleClose}
             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
           >
@@ -210,6 +213,7 @@ export function AiGenerateWorkflowModal({
               What should the workflow do?
             </label>
             <textarea
+              data-ui-id="dialog-ai-generate-workflow-description-input"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Describe what you want the workflow to accomplish. For example: 'Run TypeScript type checking and fix any errors automatically' or 'Build a React app and run Playwright tests, fixing failures'"
@@ -227,6 +231,7 @@ export function AiGenerateWorkflowModal({
                 Category (optional)
               </label>
               <input
+                data-ui-id="dialog-ai-generate-workflow-category-input"
                 type="text"
                 value={category}
                 onChange={(e) => setCategory(e.target.value)}
@@ -240,6 +245,7 @@ export function AiGenerateWorkflowModal({
                 Tags (optional)
               </label>
               <input
+                data-ui-id="dialog-ai-generate-workflow-tags-input"
                 type="text"
                 value={tags}
                 onChange={(e) => setTags(e.target.value)}
@@ -279,6 +285,7 @@ export function AiGenerateWorkflowModal({
                       AI Provider
                     </label>
                     <select
+                      data-ui-id="dialog-ai-generate-workflow-provider-select"
                       value={provider}
                       onChange={(e) => setProvider(e.target.value)}
                       className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
@@ -296,6 +303,7 @@ export function AiGenerateWorkflowModal({
                       Model Override
                     </label>
                     <input
+                      data-ui-id="dialog-ai-generate-workflow-model-input"
                       type="text"
                       value={model}
                       onChange={(e) => setModel(e.target.value)}
@@ -313,6 +321,7 @@ export function AiGenerateWorkflowModal({
                       Max Iterations
                     </label>
                     <input
+                      data-ui-id="dialog-ai-generate-workflow-max-iterations-input"
                       type="number"
                       min={1}
                       max={100}
@@ -328,6 +337,7 @@ export function AiGenerateWorkflowModal({
                       Log Source Selection
                     </label>
                     <select
+                      data-ui-id="dialog-ai-generate-workflow-log-source-select"
                       value={logSourceSelection}
                       onChange={(e) => setLogSourceSelection(e.target.value)}
                       className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
@@ -449,6 +459,7 @@ export function AiGenerateWorkflowModal({
         {/* Footer */}
         <div className="flex gap-3 px-6 py-4 border-t border-border">
           <button
+            data-ui-id="dialog-ai-generate-workflow-cancel-btn"
             onClick={handleClose}
             className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
           >
@@ -458,6 +469,7 @@ export function AiGenerateWorkflowModal({
           {generatedWorkflow ? (
             <>
               <button
+                data-ui-id="dialog-ai-generate-workflow-regenerate-btn"
                 onClick={handleRegenerate}
                 disabled={isGenerating}
                 className="px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -465,6 +477,7 @@ export function AiGenerateWorkflowModal({
                 Regenerate
               </button>
               <button
+                data-ui-id="dialog-ai-generate-workflow-confirm-btn"
                 onClick={handleLoadWorkflow}
                 className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${accentColors.bgSolid} text-white rounded-md font-medium hover:opacity-90 transition-colors`}
               >
@@ -474,6 +487,7 @@ export function AiGenerateWorkflowModal({
             </>
           ) : (
             <button
+              data-ui-id="dialog-ai-generate-workflow-generate-btn"
               onClick={handleGenerate}
               disabled={isGenerating || !description.trim()}
               className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${accentColors.bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}

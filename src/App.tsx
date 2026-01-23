@@ -23,6 +23,7 @@
 
 import { useEffect, useState, useCallback, createContext, useContext, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   Zap,
   Image,
@@ -36,6 +37,7 @@ import {
   TestTube,
   Accessibility,
   Cloud,
+  Puzzle,
 } from "lucide-react";
 
 // Contexts
@@ -45,9 +47,13 @@ import {
   EventManagerProvider,
   AutoContinueProvider,
 } from "./contexts";
+import { RenderLogWrapper } from "./lib/ui-bridge";
 import { AuthProvider, useAuth } from "./components/AuthProvider";
 import { TutorialProvider } from "./contexts/TutorialContext";
 import { ContextualTutorial } from "./components/tutorial";
+
+// UI Bridge for AI-driven UI automation
+import { UIBridgeProvider, AutoRegisterProvider } from "ui-bridge";
 
 // Navigation context for tutorials to navigate to pages
 interface NavigationContextValue {
@@ -99,6 +105,7 @@ import {
   useProjectLogs,
   useWebSocketAutoConnect,
   useBackgroundActivities,
+  UIBridgeEventHandler,
 } from "./hooks";
 import { useGlobalLogSources } from "./hooks/useGlobalLogSources";
 
@@ -140,14 +147,16 @@ import { StatisticsTab } from "./components/statistics";
 import { DiscoverySyncPanel } from "./components/discoveries";
 // Run-specific components
 import { RunSelectionProvider } from "./contexts/RunSelectionContext";
-import { RunDashboard } from "./components/run-dashboard/RunDashboard";
 import { RunPageLayout } from "./components/run-dashboard/RunPageLayout";
 import { RunActionsTab } from "./components/run-logs/RunActionsTab";
 import { RunImageRecognitionTab } from "./components/run-logs/RunImageRecognitionTab";
 import { AiDataViewerTab } from "./components/run-logs/AiDataViewerTab";
 import { RunRecapTab } from "./components/run-recap";
+import { useTaskRuns } from "./hooks/useAiData";
 // Accessibility components
 import { AccessibilityExplorerPanel } from "./components/accessibility";
+// UI Bridge Inspector
+import { ConnectedUIBridgeInspector } from "./components/ui-bridge";
 // New dashboard components
 import { LearningDashboard } from "./components/learning-dashboard";
 import { CheckpointBrowser } from "./components/checkpoint-browser";
@@ -168,7 +177,6 @@ type MainTabId =
   | "active"
   | "history"
   // Observe group - new structure
-  | "run-dashboard"
   | "run-recap"
   | "run-actions"
   | "run-image"
@@ -179,6 +187,7 @@ type MainTabId =
   | "run-statistics"
   | "run-ai-data"
   | "run-accessibility"
+  | "run-ui-bridge"
   | "learning"
   | "checkpoints"
   | "discoveries"
@@ -232,7 +241,6 @@ const VALID_TAB_IDS: MainTabId[] = [
   "active",
   "history",
   // New observe tabs
-  "run-dashboard",
   "run-recap",
   "run-actions",
   "run-image",
@@ -243,6 +251,7 @@ const VALID_TAB_IDS: MainTabId[] = [
   "run-statistics",
   "run-ai-data",
   "run-accessibility",
+  "run-ui-bridge",
   "learning",
   "checkpoints",
   "discoveries",
@@ -313,7 +322,8 @@ function migrateTabId(stored: string | null): MainTabId {
     dataset: "capture", // Dataset is now part of capture
     extract: "capture",
     // Old observe tab migrations to new structure
-    logs: "run-dashboard",
+    logs: "run-recap",
+    "run-dashboard": "run-recap", // Dashboard merged into Summary (formerly Recap)
     ai: "run-ai-output",
     "run-summary": "run-recap", // Summary merged into Recap
     "monitor-summary": "run-recap", // Summary merged into Recap
@@ -361,6 +371,11 @@ function AppContent() {
   // Execution state from context
   const execution = useExecution();
 
+  // Get recent task runs for "View Last Run" feature
+  const { data: recentTaskRuns = [] } = useTaskRuns(1);
+  const lastRun = recentTaskRuns.length > 0 ? recentTaskRuns[0] : null;
+  const lastRunWorkflowName = lastRun?.workflow_name ?? lastRun?.task_name ?? null;
+
   // Navigation context for tutorials
   const { registerNavigate } = useNavigation();
 
@@ -392,6 +407,66 @@ function AppContent() {
       }
     });
   }, [registerNavigate]);
+
+  // Listen for test-navigation events (for UI testing)
+  // Allows Python tests to trigger navigation via HTTP API
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+
+    const setupNavigationListener = async () => {
+      unlisten = await listen<{
+        type: string;
+        page: string;
+        task_run_id?: number;
+        select_run?: number;
+      }>("test-navigation", (event) => {
+        console.log("[APP] Received test-navigation event:", event.payload);
+        const { page, task_run_id, select_run } = event.payload;
+
+        // Map page names to tab IDs (same mapping as tutorials)
+        const pageToTab: Record<string, MainTabId> = {
+          "run": "run",
+          "run-recap": "run-recap",
+          "run-dashboard": "run-recap", // Dashboard merged into Summary
+          "active": "active",
+          "history": "history",
+          "library": "library",
+          "logs": "logs",
+          "ai": "ai",
+          "settings": "settings",
+          "test-builder": "test-builder",
+          "unified-workflow-builder": "unified-workflow-builder",
+        };
+
+        const tabId = pageToTab[page];
+        if (tabId) {
+          console.log(`[APP] Navigating to tab: ${tabId}`);
+          setActiveTab(tabId);
+
+          // If select_run is provided and we're going to a run-related page,
+          // we might need to select the run (this would require RunSelectionContext)
+          // For now, just log it - the run selection will need to be done via
+          // the RunSelectionContext or a separate mechanism
+          if (select_run) {
+            console.log(`[APP] Run selection requested: ${select_run}`);
+          }
+          if (task_run_id) {
+            console.log(`[APP] Task run ID provided: ${task_run_id}`);
+          }
+        } else {
+          console.warn(`[APP] Unknown page for navigation: ${page}`);
+        }
+      });
+    };
+
+    setupNavigationListener();
+
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
 
   // Script ID to edit (when navigating from Library to Script Builder)
   const [editScriptId, setEditScriptId] = useState<string | null>(null);
@@ -461,7 +536,6 @@ function AppContent() {
           setEditWorkflowId(itemId);
           break;
         case "macro":
-        case "gui-workflow": // backward compatibility
           setEditMacroId(itemId);
           break;
       }
@@ -665,6 +739,25 @@ function AppContent() {
     await clearActionLogs();
   };
 
+  /**
+   * Navigate to Recap page and set session workflow to last run's workflow
+   * NOTE: This hook must be defined before conditional returns to satisfy React's rules of hooks
+   */
+  const handleGoToRecap = useCallback(() => {
+    // If we have a last run with a workflow name, try to select it
+    if (lastRun?.workflow_name && execution.workflows.length > 0) {
+      // Find matching workflow by name
+      const matchingWorkflow = execution.workflows.find(
+        (w) => w.name === lastRun.workflow_name || w.id === lastRun.workflow_name
+      );
+      if (matchingWorkflow) {
+        execution.selectWorkflowWithPersistence(matchingWorkflow.id);
+      }
+    }
+    // Navigate to recap
+    setActiveTab("run-recap");
+  }, [lastRun, execution]);
+
   // Show loading state while checking auth or during dev auto-login
   const isAuthLoading = auth.loading || auth.devAutoLoginPending;
   console.log(
@@ -697,6 +790,9 @@ function AppContent() {
 
   console.log("[APP] Rendering main app (authenticated)");
 
+  // Get last run task_run_id for render logging context
+  const lastRunId = lastRun?.id;
+
   /**
    * Renders the content for the currently active tab
    */
@@ -706,7 +802,13 @@ function AppContent() {
         return <ExecuteTab onLog={addLog} onNavigateToActive={() => setActiveTab("active")} />;
 
       case "active":
-        return <ActiveDashboardPage onGoToExecute={() => setActiveTab("run")} />;
+        return (
+          <ActiveDashboardPage
+            onGoToExecute={() => setActiveTab("run")}
+            onGoToRecap={lastRun ? handleGoToRecap : undefined}
+            lastRunWorkflowName={lastRunWorkflowName}
+          />
+        );
 
       case "history":
         return (
@@ -717,13 +819,6 @@ function AppContent() {
         );
 
       // ========== NEW OBSERVE TABS ==========
-      case "run-dashboard":
-        return (
-          <RunSelectionProvider>
-            <RunDashboard onNavigate={(tabId) => setActiveTab(tabId as MainTabId)} />
-          </RunSelectionProvider>
-        );
-
       case "run-recap":
         return (
           <RunSelectionProvider>
@@ -863,6 +958,17 @@ function AppContent() {
             <RunPageLayout title="Accessibility Explorer" icon={Accessibility}>
               <div className="h-full overflow-hidden">
                 <AccessibilityExplorerPanel />
+              </div>
+            </RunPageLayout>
+          </RunSelectionProvider>
+        );
+
+      case "run-ui-bridge":
+        return (
+          <RunSelectionProvider>
+            <RunPageLayout title="UI Bridge Inspector" icon={Puzzle}>
+              <div className="h-full overflow-hidden p-4">
+                <ConnectedUIBridgeInspector />
               </div>
             </RunPageLayout>
           </RunSelectionProvider>
@@ -1181,10 +1287,10 @@ function AppContent() {
                   <p className="text-sm text-muted-foreground">
                     To view log content during workflow runs, use the{" "}
                     <button
-                      onClick={() => setActiveTab("run-dashboard")}
+                      onClick={() => setActiveTab("run-recap")}
                       className="text-primary hover:underline"
                     >
-                      Sessions Dashboard
+                      Session Summary
                     </button>
                     .
                   </p>
@@ -1228,6 +1334,7 @@ function AppContent() {
       case "settings-mobile":
       case "settings-mcp":
       case "settings-log-sources":
+      case "settings-execution-variables":
       case "settings-general":
       case "settings-storage":
       case "settings-backup":
@@ -1244,6 +1351,7 @@ function AppContent() {
           "settings-mobile": "mobile",
           "settings-mcp": "mcp",
           "settings-log-sources": "log-sources",
+          "settings-execution-variables": "execution-variables",
           "settings-general": "general",
           "settings-storage": "storage",
           "settings-backup": "backup",
@@ -1289,58 +1397,66 @@ function AppContent() {
   };
 
   return (
-    <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
-      {/* Status Bar - Sticky Top */}
-      <StatusIndicator
-        pythonStatus={execution.pythonStatus}
-        configLoaded={execution.configLoaded}
-        executionActive={execution.executionActive}
-        backgroundActivities={backgroundActivities}
-      />
-
-      {/* Main Content: Sidebar + Content Area */}
-      <div className="flex flex-1 overflow-hidden">
-        {/* Sidebar Navigation */}
-        <Sidebar
-          activeTab={activeTab}
-          onTabChange={(tab) => setActiveTab(tab as MainTabId)}
-          collapsed={sidebarCollapsed}
-          onCollapsedChange={setSidebarCollapsed}
+    <RenderLogWrapper
+      activeTab={activeTab}
+      taskRunId={lastRunId}
+      enableOnMount={true}
+      enableMutationObserver={true}
+      mutationDebounceMs={500}
+    >
+      <div className="h-screen w-screen bg-background grid-dots flex flex-col overflow-hidden min-w-[1200px] min-h-[700px]">
+        {/* Status Bar - Sticky Top */}
+        <StatusIndicator
+          pythonStatus={execution.pythonStatus}
+          configLoaded={execution.configLoaded}
+          executionActive={execution.executionActive}
+          backgroundActivities={backgroundActivities}
         />
 
-        {/* Content Area */}
-        <main className="flex-1 overflow-hidden">{renderTabContent()}</main>
+        {/* Main Content: Sidebar + Content Area */}
+        <div className="flex flex-1 overflow-hidden">
+          {/* Sidebar Navigation */}
+          <Sidebar
+            activeTab={activeTab}
+            onTabChange={(tab) => setActiveTab(tab as MainTabId)}
+            collapsed={sidebarCollapsed}
+            onCollapsedChange={setSidebarCollapsed}
+          />
+
+          {/* Content Area */}
+          <main className="flex-1 overflow-hidden">{renderTabContent()}</main>
+        </div>
+
+        {/* Action Detail Modal */}
+        <ActionDetailModal
+          action={modalState.selectedAction}
+          isOpen={modalState.isActionModalOpen}
+          onClose={modalState.closeActionModal}
+        />
+
+        {/* Image Detail Modal */}
+        <ImageDetailModal
+          entry={modalState.selectedImageEntry}
+          isOpen={modalState.isImageModalOpen}
+          onClose={modalState.closeImageModal}
+        />
+
+        {/* Log Source Manager Modal */}
+        {projectLogs.config && (
+          <LogSourceManager
+            config={projectLogs.config}
+            isOpen={showLogSourceManager}
+            onClose={() => setShowLogSourceManager(false)}
+            onSave={(sources) => {
+              projectLogs.setLogSources(sources);
+              projectLogs.saveConfig(sources); // Pass sources directly to avoid React async state issue
+              setShowLogSourceManager(false);
+            }}
+            projectDirectory={projectLogs.directories?.base}
+          />
+        )}
       </div>
-
-      {/* Action Detail Modal */}
-      <ActionDetailModal
-        action={modalState.selectedAction}
-        isOpen={modalState.isActionModalOpen}
-        onClose={modalState.closeActionModal}
-      />
-
-      {/* Image Detail Modal */}
-      <ImageDetailModal
-        entry={modalState.selectedImageEntry}
-        isOpen={modalState.isImageModalOpen}
-        onClose={modalState.closeImageModal}
-      />
-
-      {/* Log Source Manager Modal */}
-      {projectLogs.config && (
-        <LogSourceManager
-          config={projectLogs.config}
-          isOpen={showLogSourceManager}
-          onClose={() => setShowLogSourceManager(false)}
-          onSave={(sources) => {
-            projectLogs.setLogSources(sources);
-            projectLogs.saveConfig(sources); // Pass sources directly to avoid React async state issue
-            setShowLogSourceManager(false);
-          }}
-          projectDirectory={projectLogs.directories?.base}
-        />
-      )}
-    </div>
+    </RenderLogWrapper>
   );
 }
 
@@ -1363,21 +1479,33 @@ function AppWithTutorials() {
  */
 export default function App() {
   return (
-    <AuthProvider>
-      <NavigationProvider>
-        <EventManagerProvider>
-          <ExecutionProvider
-            onLog={(level, message) => {
-              // Logs are now handled by LogManager through event handlers
-              console.log(`[LOG] ${level}: ${message}`);
-            }}
-          >
-            <AutoContinueProvider>
-              <AppWithTutorials />
-            </AutoContinueProvider>
-          </ExecutionProvider>
-        </EventManagerProvider>
-      </NavigationProvider>
-    </AuthProvider>
+    <UIBridgeProvider features={{ renderLog: true, control: true, debug: true }}>
+      <UIBridgeEventHandler />
+      {/* AutoRegisterProvider enables automatic UI Bridge element registration */}
+      {/* All interactive elements (buttons, inputs, links, etc.) are auto-registered */}
+      <AutoRegisterProvider
+        enabled={import.meta.env.DEV}
+        idStrategy="prefer-existing"
+        debounceMs={100}
+        excludeSelectors={['[data-no-register]']}
+      >
+        <AuthProvider>
+          <NavigationProvider>
+            <EventManagerProvider>
+              <ExecutionProvider
+                onLog={(level, message) => {
+                  // Logs are now handled by LogManager through event handlers
+                  console.log(`[LOG] ${level}: ${message}`);
+                }}
+              >
+                <AutoContinueProvider>
+                  <AppWithTutorials />
+                </AutoContinueProvider>
+              </ExecutionProvider>
+            </EventManagerProvider>
+          </NavigationProvider>
+        </AuthProvider>
+      </AutoRegisterProvider>
+    </UIBridgeProvider>
   );
 }

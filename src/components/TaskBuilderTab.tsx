@@ -18,8 +18,13 @@ import {
   X,
   Copy,
   Clock,
+  Sparkles,
+  Check,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
+import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
+import { AiTaskGenerator } from "./task-builder/AiTaskGenerator";
+import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 
 const API_BASE = "http://localhost:9876";
 
@@ -49,6 +54,13 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTask, setSelectedTask] = useState<SavedTask | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [showAiGenerator, setShowAiGenerator] = useState(false);
+
+  // Selection mode state (for batch delete)
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   // Form state
   const [formName, setFormName] = useState("");
@@ -228,6 +240,30 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
     }
   };
 
+  // Handle AI-generated task
+  const handleAiTaskGenerated = (generated: {
+    name: string;
+    description: string;
+    content: string;
+    category: string;
+    tags: string[];
+  }) => {
+    // Set up form with generated values
+    setFormName(generated.name);
+    setFormDescription(generated.description);
+    setFormContent(generated.content);
+    setFormCategory(generated.category);
+    setFormTags(generated.tags.join(", "));
+    setFormMaxSessions(null);
+
+    // Switch to create mode
+    setSelectedTask(null);
+    setIsCreating(true);
+    setShowAiGenerator(false);
+
+    onLog?.("success", "Task generated with AI - review and save");
+  };
+
   // Filter tasks
   const filteredTasks = tasks.filter((task) => {
     if (!searchQuery) return true;
@@ -240,25 +276,89 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
     );
   });
 
+  // Toggle selection for batch delete
+  const toggleSelection = useCallback((taskId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(taskId)) {
+        next.delete(taskId);
+      } else {
+        next.add(taskId);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit selection mode
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Delete selected tasks
+  const deleteSelected = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+
+    setIsDeleting(true);
+    try {
+      // Delete in parallel
+      const deletePromises = Array.from(selectedIds).map((id) =>
+        fetch(`${API_BASE}/prompts/${id}`, { method: "DELETE" })
+      );
+      await Promise.all(deletePromises);
+
+      // Refresh the list
+      await fetchTasks();
+
+      // If currently selected task was deleted, clear it
+      if (selectedTask && selectedIds.has(selectedTask.id)) {
+        setSelectedTask(null);
+        setIsCreating(false);
+      }
+
+      // Exit selection mode
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+      onLog?.("success", `Deleted ${selectedIds.size} task(s)`);
+    } catch (error) {
+      onLog?.("error", `Failed to delete tasks: ${error}`);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [selectedIds, fetchTasks, selectedTask, exitSelectionMode, onLog]);
+
+  // Get names of selected tasks for the delete dialog
+  const getSelectedNames = useCallback((): string[] => {
+    return tasks
+      .filter((t) => selectedIds.has(t.id))
+      .map((t) => t.name);
+  }, [tasks, selectedIds]);
+
   return (
     <div className="h-full flex">
       {/* Left Panel - Task List */}
       <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
         {/* Header */}
         <div className="p-4 border-b border-neutral-700">
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between mb-2">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <FileText className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
               Tasks
             </h2>
-            <button
-              onClick={startCreate}
-              className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
-              title="New Task"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
           </div>
+
+          {/* Action buttons */}
+          <BuilderToolbar
+            className="mb-3"
+            actions={[
+              toolbarActions.ai(() => setShowAiGenerator(true)),
+              toolbarActions.new(startCreate, "New"),
+              toolbarActions.delete(
+                () => setIsSelectionMode(!isSelectionMode),
+                isSelectionMode
+              ),
+            ]}
+          />
 
           {/* Search */}
           <div className="relative">
@@ -272,6 +372,32 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
             />
           </div>
         </div>
+
+        {/* Selection Mode Header */}
+        {isSelectionMode && (
+          <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+            <span className="text-sm text-red-400">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              {selectedIds.size > 0 && (
+                <button
+                  onClick={() => setShowBatchDeleteDialog(true)}
+                  className="flex items-center gap-1 px-3 py-1 text-sm font-medium bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete
+                </button>
+              )}
+              <button
+                onClick={exitSelectionMode}
+                className="px-3 py-1 text-sm text-neutral-400 hover:text-neutral-200 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Task List */}
         <div className="flex-1 overflow-y-auto p-2">
@@ -289,23 +415,53 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
               {filteredTasks.map((task) => (
                 <button
                   key={task.id}
-                  onClick={() => selectTask(task)}
-                  className={`w-full text-left p-3 rounded-lg transition-colors ${
-                    selectedTask?.id === task.id ? "bg-neutral-700" : "hover:bg-neutral-800"
+                  onClick={() => {
+                    if (isSelectionMode) {
+                      toggleSelection(task.id);
+                    } else {
+                      selectTask(task);
+                    }
+                  }}
+                  className={`w-full text-left p-3 rounded-lg transition-colors flex items-start gap-3 ${
+                    isSelectionMode && selectedIds.has(task.id)
+                      ? "bg-red-500/20 border border-red-500/50"
+                      : selectedTask?.id === task.id
+                        ? "bg-neutral-700"
+                        : "hover:bg-neutral-800"
+                  } ${isSelectionMode ? "border" : ""} ${
+                    isSelectionMode && !selectedIds.has(task.id)
+                      ? "border-transparent"
+                      : ""
                   }`}
                 >
-                  <div className="font-medium text-sm truncate">{task.name}</div>
-                  {task.description && (
-                    <div className="text-xs text-neutral-400 truncate mt-0.5">
-                      {task.description}
+                  {/* Checkbox in selection mode */}
+                  {isSelectionMode && (
+                    <div
+                      className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
+                        selectedIds.has(task.id)
+                          ? "bg-red-500 border-red-500"
+                          : "border-neutral-500"
+                      }`}
+                    >
+                      {selectedIds.has(task.id) && (
+                        <Check className="w-3 h-3 text-white" />
+                      )}
                     </div>
                   )}
-                  <div className="flex items-center gap-2 mt-1.5">
-                    {task.category && (
-                      <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
-                        {task.category}
-                      </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm truncate">{task.name}</div>
+                    {task.description && (
+                      <div className="text-xs text-neutral-400 truncate mt-0.5">
+                        {task.description}
+                      </div>
                     )}
+                    <div className="flex items-center gap-2 mt-1.5">
+                      {task.category && (
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
+                          {task.category}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </button>
               ))}
@@ -314,9 +470,17 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
         </div>
       </div>
 
-      {/* Right Panel - Editor */}
+      {/* Right Panel - Editor or AI Generator */}
       <div className="flex-1 flex flex-col bg-neutral-900/50">
-        {!selectedTask && !isCreating ? (
+        {showAiGenerator ? (
+          <div className="flex-1 p-4">
+            <AiTaskGenerator
+              onTaskGenerated={handleAiTaskGenerated}
+              onCancel={() => setShowAiGenerator(false)}
+              existingPrompt={selectedTask?.content}
+            />
+          </div>
+        ) : !selectedTask && !isCreating ? (
           <div className="flex-1 flex items-center justify-center">
             <div className="text-center text-neutral-400">
               <FileText className="w-12 h-12 mx-auto mb-3 opacity-30" />
@@ -466,6 +630,17 @@ export function TaskBuilderTab({ onLog, editTaskId, onNavigateToLibrary }: TaskB
           </>
         )}
       </div>
+
+      {/* Batch Delete Dialog */}
+      <BatchDeleteDialog
+        open={showBatchDeleteDialog}
+        title="Delete Tasks"
+        itemType="task"
+        itemNames={getSelectedNames()}
+        isDeleting={isDeleting}
+        onClose={() => setShowBatchDeleteDialog(false)}
+        onConfirm={deleteSelected}
+      />
     </div>
   );
 }

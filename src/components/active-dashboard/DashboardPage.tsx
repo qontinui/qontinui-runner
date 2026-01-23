@@ -7,6 +7,7 @@
 
 import { useCallback } from "react";
 import { useDashboardState } from "../../hooks/dashboard";
+import { TaskProvider } from "../../contexts";
 import { DashboardLayout } from "./DashboardLayout";
 import { ControlBar } from "./ControlBar";
 import { BottomBar } from "./BottomBar";
@@ -23,6 +24,10 @@ registerAllWidgets();
 export interface DashboardPageProps {
   /** Callback to navigate to the Execute page */
   onGoToExecute: () => void;
+  /** Callback to navigate to the Recap page and set session workflow */
+  onGoToRecap?: () => void;
+  /** Name of the last run workflow */
+  lastRunWorkflowName?: string | null;
 }
 
 /**
@@ -35,7 +40,11 @@ export interface DashboardPageProps {
  * - Phase tracking and iteration display
  * - Links to detail pages
  */
-export function DashboardPage({ onGoToExecute }: DashboardPageProps) {
+export function DashboardPage({
+  onGoToExecute,
+  onGoToRecap,
+  lastRunWorkflowName,
+}: DashboardPageProps) {
   // Get dashboard state
   const { state, setActiveWidget, navigateToDetail } = useDashboardState();
 
@@ -61,36 +70,44 @@ export function DashboardPage({ onGoToExecute }: DashboardPageProps) {
     : null;
 
   return (
-    <div className="flex h-full flex-col bg-background">
-      {/* Control Bar - always visible */}
-      <ControlBar
-        taskName={state.taskInfo?.taskName ?? null}
-        phase={state.currentPhase}
-        showPhaseBadge={state.showPhaseBadge}
-        status={state.status}
-        workflowStage={state.workflowStage}
-        isOrchestrated={state.isOrchestrated}
-      />
+    <TaskProvider taskInfo={state.taskInfo} isRunning={state.isRunning}>
+      <div className="flex h-full flex-col bg-background">
+        {/* Control Bar - always visible */}
+        <ControlBar
+          taskName={state.taskInfo?.taskName ?? null}
+          phase={state.currentPhase}
+          showPhaseBadge={state.showPhaseBadge}
+          status={state.status}
+          workflowStage={state.workflowStage}
+          isOrchestrated={state.isOrchestrated}
+          isComplete={state.status === "completed"}
+          isFailed={state.status === "failed"}
+          iteration={state.isOrchestrated ? state.iteration : undefined}
+          maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
+        />
 
-      {/* Main Content Area */}
-      <div className="flex-1 overflow-hidden">
-        <DashboardLayout
-          layout={state.layout}
-          onWidgetClick={handleWidgetClick}
-          onNavigateToDetail={handleNavigateToDetail}
-          onGoToExecute={onGoToExecute}
+        {/* Main Content Area */}
+        <div className="flex-1 overflow-hidden">
+          <DashboardLayout
+            layout={state.layout}
+            onWidgetClick={handleWidgetClick}
+            onNavigateToDetail={handleNavigateToDetail}
+            onGoToExecute={onGoToExecute}
+            onGoToRecap={onGoToRecap}
+            lastRunWorkflowName={lastRunWorkflowName}
+          />
+        </div>
+
+        {/* Bottom Bar - always visible */}
+        <BottomBar
+          iteration={state.isOrchestrated ? state.iteration : (state.taskInfo?.iteration ?? 1)}
+          maxIterations={state.isOrchestrated ? state.maxIterations : (state.taskInfo?.maxIterations ?? 1)}
+          activeActivity={state.layout.activeWidget}
+          isRunning={state.isRunning}
+          currentOrchestratorAgent={state.currentOrchestratorAgent}
         />
       </div>
-
-      {/* Bottom Bar - always visible */}
-      <BottomBar
-        iteration={state.isOrchestrated ? state.iteration : (state.taskInfo?.iteration ?? 1)}
-        maxIterations={state.isOrchestrated ? state.maxIterations : (state.taskInfo?.maxIterations ?? 1)}
-        activeActivity={state.layout.activeWidget}
-        isRunning={state.isRunning}
-        currentOrchestratorAgent={state.currentOrchestratorAgent}
-      />
-    </div>
+    </TaskProvider>
   );
 }
 

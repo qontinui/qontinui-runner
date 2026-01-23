@@ -128,7 +128,8 @@ pub fn start_python_executor(
     })?;
 
     // If a configuration was already loaded, send it to the Python executor
-    let config_lock = state.current_config.lock().unwrap();
+    let config_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
     let has_config = config_lock.is_some();
     drop(config_lock); // Release lock before calling bridge methods
 
@@ -195,7 +196,8 @@ pub fn start_python_executor(
 #[tauri::command]
 pub fn stop_python_executor(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping Python executor");
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge_lock {
         bridge.stop().map_err(|e| {
@@ -234,7 +236,7 @@ pub fn update_capture_settings(
         "Updating screenshot capture settings: enabled={}",
         settings.enabled
     );
-    let bridge_lock = state.python_bridge.lock().unwrap();
+    let bridge_lock = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err("Python executor is not running. Please start the executor first by clicking 'Start Executor' in the Control tab.".to_string());

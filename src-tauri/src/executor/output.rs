@@ -70,7 +70,12 @@ impl OutputProcessor {
             line_count += 1;
             match line {
                 Ok(line) => {
-                    info!("[OUTPUT_PROCESSOR] Line #{}: {}", line_count, line);
+                    // Skip verbose logging for pong and heartbeat messages
+                    let is_pong =
+                        line.contains("\"type\": \"pong\"") || line.contains("\"type\":\"pong\"");
+                    if !is_pong {
+                        info!("[OUTPUT_PROCESSOR] Line #{}: {}", line_count, line);
+                    }
 
                     // Check if this looks like a READY message
                     if line.contains("\"type\"") && line.contains("ready") {
@@ -80,17 +85,17 @@ impl OutputProcessor {
                     // Parse message
                     match parse_executor_message(&line) {
                         Ok(message) => {
+                            // Handle pong messages for health monitoring (skip verbose logging)
+                            if matches!(message, ExecutorMessage::Pong { .. }) {
+                                health_monitor.record_pong().await;
+                                continue;
+                            }
+
                             info!(
                                 "[OUTPUT_PROCESSOR] Parsed message type: {:?}",
                                 std::mem::discriminant(&message)
                             );
                             debug!("Parsed message full: {:?}", message);
-
-                            // Handle pong messages for health monitoring
-                            if matches!(message, ExecutorMessage::Pong { .. }) {
-                                health_monitor.record_pong().await;
-                                continue;
-                            }
 
                             // Process message through lifecycle
                             let mut lifecycle_guard = lifecycle.write().await;
@@ -166,5 +171,109 @@ impl OutputProcessor {
             Self::log_python_stderr(&line);
         }
         info!("Stderr reader thread ending");
+    }
+
+    /// Stdout reader task for extraction executor (no health monitor)
+    ///
+    /// This is a simplified version of stdout_reader_task for the extraction executor.
+    /// It emits events to "extraction-event" instead of "executor-event".
+    pub async fn extraction_stdout_reader_task(
+        stdout: std::process::ChildStdout,
+        lifecycle: Arc<RwLock<ExecutorLifecycle>>,
+        app_handle: tauri::AppHandle,
+    ) {
+        info!("[EXTRACTION_EXECUTOR] stdout_reader_task started");
+        let reader = BufReader::new(stdout);
+        let mut line_count = 0;
+
+        for line in reader.lines() {
+            line_count += 1;
+            match line {
+                Ok(line) => {
+                    // Log all messages for extraction (typically less verbose than main executor)
+                    info!("[EXTRACTION_EXECUTOR] Line #{}: {}", line_count, line);
+
+                    // Check if this looks like a READY message
+                    if line.contains("\"type\"") && line.contains("ready") {
+                        info!("[EXTRACTION_EXECUTOR] DETECTED READY MESSAGE: {}", line);
+                    }
+
+                    // Parse message
+                    match parse_executor_message(&line) {
+                        Ok(message) => {
+                            // Skip pong messages for extraction (no health monitor)
+                            if matches!(message, ExecutorMessage::Pong { .. }) {
+                                continue;
+                            }
+
+                            debug!(
+                                "[EXTRACTION_EXECUTOR] Parsed message type: {:?}",
+                                std::mem::discriminant(&message)
+                            );
+
+                            // Process message through lifecycle
+                            let mut lifecycle_guard = lifecycle.write().await;
+                            match lifecycle_guard.handle_message(message.clone()).await {
+                                Ok(Some(msg)) => {
+                                    // Forward message to frontend via extraction-event channel
+                                    EventForwarder::emit_extraction_message_to_frontend(
+                                        &app_handle,
+                                        msg,
+                                    )
+                                    .await;
+                                }
+                                Ok(None) => {
+                                    debug!("Message handled internally");
+                                }
+                                Err(e) => {
+                                    error!("Error handling extraction message: {}", e);
+
+                                    let error_event = json!({
+                                        "type": "error",
+                                        "error": "message_handling_error",
+                                        "message": e.to_string(),
+                                    });
+                                    let _ = app_handle.emit("extraction-error", &error_event);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to parse extraction message: {} - Line: {}", e, line);
+
+                            let error_event = json!({
+                                "type": "error",
+                                "error": "parse_error",
+                                "message": format!("Failed to parse extraction output: {}", e),
+                                "raw_line": line,
+                                "timestamp": chrono::Utc::now().timestamp_millis(),
+                            });
+                            let _ = app_handle.emit("extraction-error", &error_event);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading extraction stdout: {}", e);
+                    break;
+                }
+            }
+        }
+
+        info!("Extraction stdout reader task ending");
+
+        // Mark as failed if not already in terminal state
+        let lifecycle_guard = lifecycle.write().await;
+        let state = lifecycle_guard.get_state().await;
+        if !state.is_terminal() {
+            let _ = lifecycle_guard
+                .mark_failed("Extraction process stdout closed unexpectedly".to_string())
+                .await;
+
+            let error_event = json!({
+                "type": "error",
+                "error": "extraction_executor_crashed",
+                "message": "Extraction executor process terminated unexpectedly",
+            });
+            let _ = app_handle.emit("extraction-error", &error_event);
+        }
     }
 }

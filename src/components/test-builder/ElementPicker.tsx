@@ -158,11 +158,13 @@ export function ElementPicker({
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="w-full pl-8 pr-8 py-1.5 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200 placeholder-neutral-500 focus:outline-none focus:border-blue-500"
+                data-ui-id="test-builder-element-search-input"
               />
               {searchQuery && (
                 <button
                   onClick={() => setSearchQuery("")}
                   className="absolute right-2 top-1/2 -translate-y-1/2 text-neutral-500 hover:text-neutral-300"
+                  data-ui-id="test-builder-element-clear-search-btn"
                 >
                   <X className="w-4 h-4" />
                 </button>
@@ -217,6 +219,7 @@ export function ElementPicker({
                     }}
                     className="flex-shrink-0 p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
                     title="Copy reference"
+                    data-ui-id={`test-builder-element-copy-${element.id}-btn`}
                   >
                     {copiedId === element.id ? (
                       <Check className="w-4 h-4 text-green-400" />

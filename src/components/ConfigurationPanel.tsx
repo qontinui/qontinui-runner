@@ -64,6 +64,7 @@ export function ConfigurationPanel({
             onClick={handleLoadLastConfig}
             disabled={isLoadingLastConfig}
             type="button"
+            data-ui-id="config-load-last-btn"
             className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg bg-muted/50 hover:bg-muted transition-colors disabled:opacity-50"
           >
             <FileText className="w-3.5 h-3.5" />
@@ -71,7 +72,7 @@ export function ConfigurationPanel({
           </button>
 
           {config && (
-            <div className={`p-3 rounded-lg ${getAccentColors("blue").bg}`}>
+            <div className={`p-3 rounded-lg ${getAccentColors("blue").bg}`} data-ui-id="config-info">
               <p className={`font-medium text-sm ${getAccentColors("blue").text} mb-1`}>
                 {config.name}
               </p>

@@ -26,7 +26,9 @@ export function SaveMacroDialog() {
       <div className="absolute inset-0 bg-black/50" onClick={() => setShowSaveDialog(false)} />
 
       {/* Dialog */}
-      <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
+      <div
+        data-ui-id="dialog-save-macro"
+        className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-md mx-4 p-6 space-y-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Save className="w-5 h-5 text-primary" />
@@ -35,6 +37,7 @@ export function SaveMacroDialog() {
           <button
             onClick={() => setShowSaveDialog(false)}
             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+            data-ui-id="macro-builder-save-dialog-close-btn"
           >
             <X className="w-5 h-5" />
           </button>
@@ -54,6 +57,7 @@ export function SaveMacroDialog() {
               placeholder="Enter macro name..."
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
               autoFocus
+              data-ui-id="macro-builder-save-name-input"
             />
           </div>
 
@@ -69,6 +73,7 @@ export function SaveMacroDialog() {
               }
               placeholder="Describe what this macro does..."
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none h-20 focus:outline-none focus:ring-2 focus:ring-primary"
+              data-ui-id="macro-builder-save-description-input"
             />
           </div>
 
@@ -80,6 +85,7 @@ export function SaveMacroDialog() {
               onChange={(e) => setFormState((prev) => ({ ...prev, category: e.target.value }))}
               placeholder="e.g., general, testing"
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              data-ui-id="macro-builder-save-category-input"
             />
           </div>
 
@@ -99,6 +105,7 @@ export function SaveMacroDialog() {
           <button
             onClick={() => setShowSaveDialog(false)}
             className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
+            data-ui-id="macro-builder-save-cancel-btn"
           >
             Cancel
           </button>
@@ -106,6 +113,7 @@ export function SaveMacroDialog() {
             onClick={handleSaveAsNew}
             disabled={isSaving || !formState.name.trim()}
             className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            data-ui-id="macro-builder-save-confirm-btn"
           >
             {isSaving ? (
               <>

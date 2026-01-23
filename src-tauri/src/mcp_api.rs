@@ -53,6 +53,7 @@
 //! regardless of which monitor is specified, because FIND always captures the full virtual desktop.
 
 use crate::safe_eprintln;
+use crate::safe_lock::safe_lock_or_recover;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -235,31 +236,35 @@ fn refetch_unified_workflow_steps(
                 })
             };
 
-            // Add setup steps (mark as setup)
+            // Add setup steps (mark as setup phase)
             for step in &workflow.setup_steps {
                 if let Some(mut config) = convert_step(step) {
                     config.is_setup = Some(true);
+                    config.phase = Some("setup".to_string());
                     all_steps.push(config);
                 }
             }
 
             // Add verification steps
             for step in &workflow.verification_steps {
-                if let Some(config) = convert_step(step) {
+                if let Some(mut config) = convert_step(step) {
+                    config.phase = Some("verification".to_string());
                     all_steps.push(config);
                 }
             }
 
             // Add agentic steps
             for step in &workflow.agentic_steps {
-                if let Some(config) = convert_step(step) {
+                if let Some(mut config) = convert_step(step) {
+                    config.phase = Some("agentic".to_string());
                     all_steps.push(config);
                 }
             }
 
-            // Add completion steps
+            // Add completion steps (mark as completion phase)
             for step in &workflow.completion_steps {
-                if let Some(config) = convert_step(step) {
+                if let Some(mut config) = convert_step(step) {
+                    config.phase = Some("completion".to_string());
                     all_steps.push(config);
                 }
             }
@@ -1091,6 +1096,12 @@ pub struct ApiState {
     pub action_service: Arc<UnifiedActionService>,
     /// Currently running AI process PIDs (for stopping)
     pub current_ai_pids: Arc<std::sync::Mutex<Vec<u32>>>,
+    /// Pending UI Bridge requests waiting for frontend response
+    pub ui_bridge_pending: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+        >,
+    >,
     /// Orchestrator states by task_run_id (for agentic task orchestration)
     pub orchestrator_states:
         Arc<tokio::sync::Mutex<std::collections::HashMap<String, OrchestratorState>>>,
@@ -3207,6 +3218,451 @@ async fn get_action_log_view_endpoint(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(api_error(format!("Failed to get action log view: {}", e))),
             ))
+        }
+    }
+}
+
+// ============================================================================
+// Render Logging API Endpoints (for UI Testing)
+// ============================================================================
+
+/// Get all render log entries
+/// Used by Python tests to verify component rendering
+async fn get_render_log() -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Getting render log");
+
+    let result = crate::commands::logging::load_render_log();
+
+    if result.success {
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "data": result.data
+        })))
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(
+                result
+                    .message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            )),
+        ))
+    }
+}
+
+/// Clear the render log file
+async fn clear_render_log_handler(
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Clearing render log");
+
+    let result = crate::commands::logging::clear_render_log();
+
+    if result.success {
+        Ok(Json(ApiResponse::success(())))
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(
+                result
+                    .message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            )),
+        ))
+    }
+}
+
+/// Get the path to the render log file
+async fn get_render_log_path(
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Getting render log path");
+
+    let result = crate::commands::logging::get_render_log_path_cmd();
+
+    if result.success {
+        Ok(Json(serde_json::json!({
+            "success": true,
+            "data": result.data
+        })))
+    } else {
+        Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(
+                result
+                    .message
+                    .unwrap_or_else(|| "Unknown error".to_string()),
+            )),
+        ))
+    }
+}
+
+// ============================================================================
+// Navigation API Endpoints (for UI Testing)
+// ============================================================================
+
+/// Request to navigate to a page
+#[derive(Debug, Deserialize)]
+pub struct NavigateRequest {
+    /// Target page/tab ID (e.g., "run-recap", "run", "active", "library")
+    pub page: String,
+    /// Optional: task run ID when navigating to run-recap
+    #[serde(default)]
+    pub task_run_id: Option<i64>,
+    /// Optional: select a specific run when navigating
+    #[serde(default)]
+    pub select_run: Option<i64>,
+}
+
+/// Navigate to a specific page in the runner UI.
+/// Used by Python tests to trigger page renders for testing.
+async fn navigate_to_page(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<NavigateRequest>,
+) -> Result<Json<ApiResponse<()>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Navigating to page: {} (task_run_id: {:?}, select_run: {:?})",
+        request.page, request.task_run_id, request.select_run
+    );
+
+    // Emit navigation event to frontend
+    let event_payload = serde_json::json!({
+        "type": "navigate",
+        "page": request.page,
+        "task_run_id": request.task_run_id,
+        "select_run": request.select_run,
+    });
+
+    if let Err(e) = state.app_handle.emit("test-navigation", &event_payload) {
+        error!("MCP API: Failed to emit navigation event: {}", e);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Failed to emit navigation event: {}", e))),
+        ));
+    }
+
+    // Give the UI a moment to process the navigation
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    Ok(Json(ApiResponse::success(())))
+}
+
+// ============================================================================
+// UI Bridge API Endpoints
+// ============================================================================
+
+/// Request to execute an action on an element
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UIBridgeActionRequest {
+    action: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+    #[serde(default)]
+    wait_options: Option<serde_json::Value>,
+}
+
+/// Request to execute an action on a component
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UIBridgeComponentActionRequest {
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+/// Discovery options request
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UIBridgeDiscoveryRequest {
+    #[serde(default)]
+    root: Option<String>,
+    #[serde(default)]
+    interactive_only: Option<bool>,
+    #[serde(default)]
+    include_hidden: Option<bool>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    types: Option<Vec<String>>,
+    #[serde(default)]
+    selector: Option<String>,
+}
+
+/// Default timeout for UI Bridge requests (5 seconds)
+const UI_BRIDGE_TIMEOUT_MS: u64 = 5000;
+
+/// Send a UI Bridge request and wait for the response synchronously.
+///
+/// This creates a oneshot channel, stores the sender in the pending map,
+/// emits the request to the frontend, and waits for the response with a timeout.
+async fn ui_bridge_request_sync(
+    state: &Arc<ApiState>,
+    request_type: &str,
+    additional_payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    // Create the full event payload
+    let mut event_payload = serde_json::json!({
+        "requestId": request_id,
+        "type": request_type
+    });
+
+    // Merge additional payload fields
+    if let (Some(base), Some(additional)) = (
+        event_payload.as_object_mut(),
+        additional_payload.as_object(),
+    ) {
+        for (key, value) in additional {
+            base.insert(key.clone(), value.clone());
+        }
+    }
+
+    // Create oneshot channel for the response
+    let (tx, rx) = tokio::sync::oneshot::channel::<serde_json::Value>();
+
+    // Store the sender in the pending map
+    {
+        let mut pending = state.ui_bridge_pending.lock().await;
+        pending.insert(request_id.clone(), tx);
+    }
+
+    // Emit request to React frontend
+    if let Err(e) = state.app_handle.emit("ui-bridge-request", &event_payload) {
+        // Clean up the pending entry
+        let mut pending = state.ui_bridge_pending.lock().await;
+        pending.remove(&request_id);
+        return Err(format!("Failed to emit UI Bridge request: {}", e));
+    }
+
+    // Wait for response with timeout
+    let timeout_duration = std::time::Duration::from_millis(UI_BRIDGE_TIMEOUT_MS);
+    match tokio::time::timeout(timeout_duration, rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => {
+            // Channel was closed without sending
+            Err("UI Bridge request channel closed unexpectedly".to_string())
+        }
+        Err(_) => {
+            // Timeout - clean up the pending entry
+            let mut pending = state.ui_bridge_pending.lock().await;
+            pending.remove(&request_id);
+            Err(format!(
+                "UI Bridge request timed out after {}ms. Is the frontend running?",
+                UI_BRIDGE_TIMEOUT_MS
+            ))
+        }
+    }
+}
+
+/// Handle incoming UI Bridge response from the frontend.
+///
+/// This is called by the Tauri event listener set up in create_router.
+pub async fn handle_ui_bridge_response(
+    pending: Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>,
+        >,
+    >,
+    response: serde_json::Value,
+) {
+    let request_id = response
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if let Some(request_id) = request_id {
+        let mut pending_map = pending.lock().await;
+        if let Some(sender) = pending_map.remove(&request_id) {
+            // Extract the data portion of the response
+            let data = response.get("data").cloned().unwrap_or(response.clone());
+            if sender.send(data).is_err() {
+                warn!(
+                    "UI Bridge: Failed to send response, receiver dropped for request {}",
+                    request_id
+                );
+            } else {
+                debug!("UI Bridge: Delivered response for request {}", request_id);
+            }
+        } else {
+            warn!(
+                "UI Bridge: No pending request found for response {}",
+                request_id
+            );
+        }
+    } else {
+        warn!("UI Bridge: Response missing requestId: {:?}", response);
+    }
+}
+
+/// Get all registered UI elements from the React UI Bridge.
+///
+/// This endpoint emits an event to the React frontend via Tauri IPC
+/// and waits for the response synchronously.
+async fn ui_bridge_get_elements_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting all elements");
+
+    match ui_bridge_request_sync(&state, "get_elements", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get a specific element by ID.
+async fn ui_bridge_get_element_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting element {}", id);
+
+    match ui_bridge_request_sync(
+        &state,
+        "get_element",
+        serde_json::json!({ "elementId": id }),
+    )
+    .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Execute an action on an element.
+async fn ui_bridge_execute_action_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+    Json(request): Json<UIBridgeActionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: Executing action {} on element {}",
+        request.action, id
+    );
+
+    let payload = serde_json::json!({
+        "elementId": id,
+        "action": {
+            "action": request.action,
+            "params": request.params,
+            "waitOptions": request.wait_options
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "execute_action", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get all registered components.
+async fn ui_bridge_get_components_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting all components");
+
+    match ui_bridge_request_sync(&state, "get_components", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get a specific component by ID.
+async fn ui_bridge_get_component_handler(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting component {}", id);
+
+    match ui_bridge_request_sync(
+        &state,
+        "get_component",
+        serde_json::json!({ "componentId": id }),
+    )
+    .await
+    {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Execute an action on a component.
+async fn ui_bridge_execute_component_action_handler(
+    State(state): State<Arc<ApiState>>,
+    Path((id, action_id)): Path<(String, String)>,
+    Json(request): Json<UIBridgeComponentActionRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "UI Bridge API: Executing action {} on component {}",
+        action_id, id
+    );
+
+    let payload = serde_json::json!({
+        "componentId": id,
+        "actionId": action_id,
+        "params": request.params
+    });
+
+    match ui_bridge_request_sync(&state, "execute_component_action", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Discover controllable elements in the UI.
+async fn ui_bridge_discover_handler(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<UIBridgeDiscoveryRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Discovering elements");
+
+    let payload = serde_json::json!({
+        "options": {
+            "root": request.root,
+            "interactiveOnly": request.interactive_only,
+            "includeHidden": request.include_hidden,
+            "limit": request.limit,
+            "types": request.types,
+            "selector": request.selector
+        }
+    });
+
+    match ui_bridge_request_sync(&state, "discover", payload).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get a full snapshot of the UI Bridge state.
+async fn ui_bridge_get_snapshot_handler(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("UI Bridge API: Getting snapshot");
+
+    match ui_bridge_request_sync(&state, "get_snapshot", serde_json::json!({})).await {
+        Ok(data) => Ok(Json(ApiResponse::success(data))),
+        Err(e) => {
+            error!("UI Bridge API: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
         }
     }
 }
@@ -6358,6 +6814,315 @@ pub struct PlaywrightCollectionStatusResponse {
     pub has_results: Option<bool>,
 }
 
+// =============================================================================
+// UI Bridge Exploration
+// =============================================================================
+
+/// Request to start UI Bridge exploration
+#[derive(Debug, Deserialize)]
+pub struct StartUIBridgeExplorationRequest {
+    /// Target type: "web", "desktop", or "mobile"
+    #[serde(default = "default_target_type")]
+    pub target_type: String,
+    /// Connection URL for the target application
+    pub connection_url: String,
+    /// Maximum navigation depth (default: 2)
+    #[serde(default)]
+    pub max_depth: Option<i32>,
+    /// Maximum elements per page (default: 20)
+    #[serde(default)]
+    pub max_elements_per_page: Option<i32>,
+    /// Maximum total elements to explore (default: 100)
+    #[serde(default)]
+    pub max_total_elements: Option<i32>,
+    /// Delay between actions in milliseconds (default: 500)
+    #[serde(default)]
+    pub action_delay_ms: Option<i32>,
+    /// Keywords in element text/id to skip
+    #[serde(default)]
+    pub blocked_keywords: Option<Vec<String>>,
+    /// Keywords that are always safe to interact with
+    #[serde(default)]
+    pub safe_keywords: Option<Vec<String>>,
+    /// CSS selectors to skip
+    #[serde(default)]
+    pub blocked_selectors: Option<Vec<String>>,
+    /// Whether to capture screenshots (default: false)
+    #[serde(default)]
+    pub capture_screenshots: Option<bool>,
+    /// Whether to run state discovery on results (default: true)
+    #[serde(default)]
+    pub run_state_discovery: Option<bool>,
+}
+
+fn default_target_type() -> String {
+    "web".to_string()
+}
+
+/// Start UI Bridge exploration using qontinui library
+/// Returns a job_id that can be used to poll for status and results
+async fn start_ui_bridge_exploration(
+    State(state): State<Arc<ApiState>>,
+    Json(request): Json<StartUIBridgeExplorationRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!(
+        "MCP API: Starting UI Bridge exploration for URL: {} (type: {})",
+        request.connection_url, request.target_type
+    );
+
+    let app_state = state.app_state.clone();
+
+    // Build parameters for Python command
+    let params = serde_json::json!({
+        "target_type": request.target_type,
+        "connection_url": request.connection_url,
+        "max_depth": request.max_depth.unwrap_or(2),
+        "max_elements_per_page": request.max_elements_per_page.unwrap_or(20),
+        "max_total_elements": request.max_total_elements.unwrap_or(100),
+        "action_delay_ms": request.action_delay_ms.unwrap_or(500),
+        "blocked_keywords": request.blocked_keywords.clone().unwrap_or_default(),
+        "safe_keywords": request.safe_keywords.clone().unwrap_or_default(),
+        "blocked_selectors": request.blocked_selectors.clone().unwrap_or_default(),
+        "capture_screenshots": request.capture_screenshots.unwrap_or(false),
+        "run_state_discovery": request.run_state_discovery.unwrap_or(true),
+    });
+
+    // Short timeout since this just starts the background job
+    let timeout = std::time::Duration::from_secs(30);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("start_ui_bridge_exploration", Some(params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: UI Bridge exploration job started");
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "success": true
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to start UI Bridge exploration".to_string());
+                error!("MCP API: Failed to start UI Bridge exploration: {}", error_msg);
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to start UI Bridge exploration: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Request for getting UI Bridge exploration status
+#[derive(Debug, Deserialize)]
+pub struct UIBridgeExplorationStatusRequest {
+    pub job_id: Option<String>,
+}
+
+/// Get UI Bridge exploration status
+async fn get_ui_bridge_exploration_status(
+    State(state): State<Arc<ApiState>>,
+    Query(request): Query<UIBridgeExplorationStatusRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "job_id": request.job_id,
+    });
+
+    let timeout = std::time::Duration::from_secs(10);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("get_ui_bridge_exploration_status", Some(params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "status": "unknown"
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to get exploration status".to_string());
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get UI Bridge exploration status: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Get UI Bridge exploration results
+async fn get_ui_bridge_exploration_results(
+    State(state): State<Arc<ApiState>>,
+    Query(request): Query<UIBridgeExplorationStatusRequest>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    let app_state = state.app_state.clone();
+
+    let params = serde_json::json!({
+        "job_id": request.job_id,
+    });
+
+    let timeout = std::time::Duration::from_secs(30);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("get_ui_bridge_exploration_results", Some(params), timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                if let Some(data) = response.data {
+                    Ok(Json(ApiResponse::success(data)))
+                } else {
+                    Ok(Json(ApiResponse::success(serde_json::json!({
+                        "data": null
+                    }))))
+                }
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to get exploration results".to_string());
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to get UI Bridge exploration results: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
+/// Stop UI Bridge exploration
+async fn stop_ui_bridge_exploration(
+    State(state): State<Arc<ApiState>>,
+) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
+    info!("MCP API: Stopping UI Bridge exploration");
+
+    let app_state = state.app_state.clone();
+
+    let timeout = std::time::Duration::from_secs(10);
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = app_state.python_bridge.lock().unwrap_or_else(|poisoned| {
+            warn!("MCP API: python_bridge mutex was poisoned, recovering");
+            poisoned.into_inner()
+        });
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return Err("Python executor not running".to_string());
+            }
+            bridge.send_command_and_wait("stop_ui_bridge_exploration", None, timeout)
+        } else {
+            Err("Python executor not initialized".to_string())
+        }
+    })
+    .await
+    .map_err(|e| {
+        error!("MCP API: spawn_blocking error: {}", e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(format!("Internal error: {}", e))),
+        )
+    })?;
+
+    match result {
+        Ok(response) => {
+            if response.success {
+                info!("MCP API: UI Bridge exploration stop requested");
+                Ok(Json(ApiResponse::success(serde_json::json!({
+                    "message": "Stop requested"
+                }))))
+            } else {
+                let error_msg = response
+                    .error
+                    .unwrap_or_else(|| "Failed to stop exploration".to_string());
+                Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(error_msg))))
+            }
+        }
+        Err(e) => {
+            error!("MCP API: Failed to stop UI Bridge exploration: {}", e);
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(api_error(e))))
+        }
+    }
+}
+
 /// Start Playwright state collection
 async fn start_playwright_collection(
     State(state): State<Arc<ApiState>>,
@@ -7110,7 +7875,7 @@ async fn stop_ai_analysis(
     // First, kill all tracked AI processes immediately
     // This is the key fix - previously we only stopped monitoring, not the actual processes
     let pids_to_kill: Vec<u32> = {
-        let mut pids = state.current_ai_pids.lock().unwrap();
+        let mut pids = safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
         let pids_copy = pids.clone();
         pids.clear(); // Clear the tracker
         pids_copy
@@ -7770,7 +8535,7 @@ async fn run_prompt(
     // Auto-load last config if not already loaded and auto_load_last_config is enabled
     // This ensures GUI automation tasks have access to workflows
     let config_was_loaded = {
-        let config_lock = state.app_state.current_config.lock().unwrap();
+        let config_lock = safe_lock_or_recover(&state.app_state.current_config, "current_config");
         config_lock.is_some()
     };
 
@@ -7787,7 +8552,8 @@ async fn run_prompt(
                 match crate::config::ConfigLoader::load_from_file(&config_path) {
                     Ok(config) => {
                         // Store the config
-                        let mut config_lock = state.app_state.current_config.lock().unwrap();
+                        let mut config_lock =
+                            safe_lock_or_recover(&state.app_state.current_config, "current_config");
                         *config_lock = Some(config);
 
                         let workflow_id = settings::get_last_workflow_id();
@@ -7832,7 +8598,7 @@ async fn run_prompt(
 
     // Extract action types from loaded config for auto-detection
     let action_types: Vec<String> = {
-        let config_lock = state.app_state.current_config.lock().unwrap();
+        let config_lock = safe_lock_or_recover(&state.app_state.current_config, "current_config");
         if let Some(ref config) = *config_lock {
             // Extract action types from workflows
             config
@@ -8041,7 +8807,7 @@ If your task requires running visual automation, use the Runner API to execute w
 
     // Add MCP tool context if config is loaded (either pre-loaded or auto-loaded)
     {
-        let config_lock = state.app_state.current_config.lock().unwrap();
+        let config_lock = safe_lock_or_recover(&state.app_state.current_config, "current_config");
         if let Some(config) = config_lock.as_ref() {
             let tool_context = generate_mcp_tool_context(config);
             enhanced_prompt = format!("{}\n{}", enhanced_prompt, tool_context);
@@ -10072,7 +10838,8 @@ async fn start_session(
     let final_prompt = if !request.context_ids.is_empty() || request.auto_include_contexts {
         // Extract action types from loaded config for auto-detection
         let action_types: Vec<String> = {
-            let config_lock = state.app_state.current_config.lock().unwrap();
+            let config_lock =
+                safe_lock_or_recover(&state.app_state.current_config, "current_config");
             if let Some(ref config) = *config_lock {
                 config
                     .workflows
@@ -10376,10 +11143,15 @@ async fn start_session(
                         }
                     };
 
-                    // Check termination conditions
+                    // Check termination conditions with detailed logging
+                    info!(
+                        "Cross-session loop check: task={}, status={}, auto_continue={}, sessions_count={}, max_sessions={:?}",
+                        task_id, task.status, task.auto_continue, task.sessions_count, task.max_sessions
+                    );
+
                     if task.status == "completed" || task.status == "stopped" {
                         info!(
-                            "Task {} is {}, exiting continuation loop",
+                            "Task {} is {}, exiting continuation loop (this is expected after verification passes)",
                             task_id, task.status
                         );
                         break;
@@ -10387,7 +11159,7 @@ async fn start_session(
 
                     if !task.auto_continue {
                         info!(
-                            "Task {} has auto_continue disabled, exiting continuation loop",
+                            "Task {} has auto_continue=false, exiting continuation loop and marking complete",
                             task_id
                         );
                         // Mark as completed since we're not continuing
@@ -10401,7 +11173,7 @@ async fn start_session(
                     if let Some(max) = task.max_sessions {
                         if task.sessions_count >= max {
                             info!(
-                                "Task {} reached max sessions ({}/{}), exiting",
+                                "Task {} reached max sessions ({}/{}), exiting and marking complete",
                                 task_id, task.sessions_count, max
                             );
                             if let Err(e) = db.complete_task_run(&task_id) {
@@ -10410,6 +11182,12 @@ async fn start_session(
                             break;
                         }
                     }
+
+                    // Log that we're continuing to next iteration (verification must have failed)
+                    info!(
+                        "Task {} status is '{}' - continuing to iteration {} (previous verification likely failed)",
+                        task_id, task.status, task.sessions_count + 1
+                    );
 
                     // =====================================================================
                     // Re-execute deterministic steps BEFORE starting AI session
@@ -10655,7 +11433,18 @@ async fn start_session(
                             )
                             .await;
 
-                            info!("Iteration {} session completed", iteration);
+                            info!(
+                                "Iteration {} session completed. Looping back to check task status for potential retry.",
+                                iteration
+                            );
+
+                            // Re-check task status to log what happened
+                            if let Ok(Some(updated_task)) = db.get_task_run(&task_id) {
+                                info!(
+                                    "Post-iteration {} task status: status={}, sessions_count={}",
+                                    iteration, updated_task.status, updated_task.sessions_count
+                                );
+                            }
 
                             // Continue the loop - will check task status and decide if more iterations needed
                         }
@@ -10695,7 +11484,7 @@ async fn stop_session(
     // Kill all tracked AI processes (same logic as stop_ai_analysis)
     // This ensures the actual Claude CLI process is terminated
     let pids_to_kill: Vec<u32> = {
-        let mut pids = state.current_ai_pids.lock().unwrap();
+        let mut pids = safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
         let pids_copy = pids.clone();
         pids.clear();
         pids_copy
@@ -10875,6 +11664,104 @@ struct DeterministicVerificationResult {
     non_critical_failures: Vec<String>,
     /// Raw output from checks
     raw_output: String,
+}
+
+/// Run the workflow's actual verification steps (if defined) instead of just build checks
+///
+/// This function:
+/// 1. Gets the task_run from database
+/// 2. Extracts verification_steps from execution_steps_json
+/// 3. If verification_steps exist, runs them through StepExecutor
+/// 4. Otherwise falls back to basic deterministic verification
+async fn run_workflow_verification_for_task(
+    app_state: &std::sync::Arc<crate::AppState>,
+    config_storage: &std::sync::Arc<tokio::sync::Mutex<ConfigStorage>>,
+    db_task_id: &str,
+    workspace_root: &str,
+) -> DeterministicVerificationResult {
+    use crate::step_executor::{ExecutionStepConfig, StepExecutor};
+
+    // Try to get verification steps from the task's execution_steps_json
+    let verification_steps: Vec<ExecutionStepConfig> = match app_state.checkpoint_db.get_task_run(db_task_id) {
+        Ok(Some(task)) => {
+            task.execution_steps_json
+                .as_ref()
+                .and_then(|json| serde_json::from_str::<Vec<ExecutionStepConfig>>(json).ok())
+                .map(|steps| {
+                    steps.into_iter()
+                        .filter(|s| s.phase.as_deref() == Some("verification"))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+
+    // If no verification steps defined, fall back to basic deterministic verification
+    if verification_steps.is_empty() {
+        info!(
+            "WORKFLOW-VERIFICATION: No verification_steps found for task {} - falling back to basic build checks",
+            db_task_id
+        );
+        return run_deterministic_verification(workspace_root, None).await;
+    }
+
+    info!(
+        "WORKFLOW-VERIFICATION: Running {} verification_steps for task {}",
+        verification_steps.len(), db_task_id
+    );
+
+    // Create a StepExecutor to run the verification steps
+    let executor = StepExecutor::new(app_state.clone(), config_storage.clone());
+
+    // Run verification steps
+    let verification_result = executor
+        .execute_verification_steps(&verification_steps, db_task_id, 1)
+        .await;
+
+    // Log the result
+    info!(
+        "WORKFLOW-VERIFICATION: Result for task {}: all_passed={}, passed={}/{}, failed={}",
+        db_task_id,
+        verification_result.all_passed,
+        verification_result.passed_steps,
+        verification_result.total_steps,
+        verification_result.failed_steps
+    );
+
+    // Convert to DeterministicVerificationResult format
+    let mut checks_run = Vec::new();
+    let mut critical_failures = Vec::new();
+    let mut raw_output = String::new();
+
+    for result in &verification_result.step_results {
+        let check_name = format!("{} ({})", result.step_name, result.step_type);
+        checks_run.push(check_name.clone());
+
+        if !result.success {
+            let failure_msg = if let Some(ref error) = result.error {
+                format!("{}: {}", check_name, error)
+            } else {
+                format!("{}: failed", check_name)
+            };
+            critical_failures.push(failure_msg);
+
+            // Add detailed output if available
+            if let Some(ref details) = result.verification_details {
+                if let Some(ref stdout) = details.stdout {
+                    raw_output.push_str(&format!("=== {} ===\n{}\n\n", check_name, stdout));
+                }
+            }
+        }
+    }
+
+    DeterministicVerificationResult {
+        all_passed: verification_result.all_passed,
+        checks_run,
+        critical_failures,
+        non_critical_failures: Vec::new(),
+        raw_output,
+    }
 }
 
 /// Run deterministic verification for a task
@@ -11763,7 +12650,8 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
     for task in &running_tasks {
         // Check if this task is already being resumed (prevent duplicate resumes)
         {
-            let mut resuming_ids = state.resuming_task_ids.lock().unwrap();
+            let mut resuming_ids =
+                safe_lock_or_recover(&state.resuming_task_ids, "resuming_task_ids");
             if resuming_ids.contains(&task.id) {
                 info!(
                     "Task '{}' (id: {}) is already being resumed, skipping duplicate",
@@ -11902,24 +12790,35 @@ pub async fn resume_all_running_tasks_on_startup(state: Arc<ApiState>) -> usize 
                                 })
                             };
 
-                        // Add setup steps (mark as setup)
+                        // Add setup steps (mark as setup phase)
                         for step in &workflow.setup_steps {
                             if let Some(mut config) = convert_step_inline(step) {
                                 config.is_setup = Some(true);
+                                config.phase = Some("setup".to_string());
                                 all_steps.push(config);
                             }
                         }
 
                         // Add verification steps
                         for step in &workflow.verification_steps {
-                            if let Some(config) = convert_step_inline(step) {
+                            if let Some(mut config) = convert_step_inline(step) {
+                                config.phase = Some("verification".to_string());
                                 all_steps.push(config);
                             }
                         }
 
-                        // Add completion steps
+                        // Add agentic steps (if any)
+                        for step in &workflow.agentic_steps {
+                            if let Some(mut config) = convert_step_inline(step) {
+                                config.phase = Some("agentic".to_string());
+                                all_steps.push(config);
+                            }
+                        }
+
+                        // Add completion steps (mark as completion phase)
                         for step in &workflow.completion_steps {
-                            if let Some(config) = convert_step_inline(step) {
+                            if let Some(mut config) = convert_step_inline(step) {
+                                config.phase = Some("completion".to_string());
                                 all_steps.push(config);
                             }
                         }
@@ -12984,7 +13883,141 @@ async fn run_unified_session_loop(
                                 match verification_results {
                                     Ok(results) => {
                                         if results.all_passed {
-                                            info!("Orchestrator verification PASSED - marking task complete");
+                                            info!("Orchestrator verification PASSED - also checking workflow verification_steps");
+
+                                            // IMPORTANT: Also run the workflow's verification_steps (check groups)
+                                            // The orchestrator's verification uses a different system than check groups
+                                            let workflow_verification = run_workflow_verification_for_task(
+                                                &state.app_state,
+                                                &state.config_storage,
+                                                &db_task_id,
+                                                &workspace_root,
+                                            )
+                                            .await;
+
+                                            if !workflow_verification.all_passed {
+                                                // Workflow verification_steps failed - don't complete
+                                                info!(
+                                                    "ORCHESTRATOR: Orchestrator verification passed but workflow verification_steps FAILED ({} failures). Ending session for retry.",
+                                                    workflow_verification.critical_failures.len()
+                                                );
+
+                                                s.status = SessionStatus::Completed;
+                                                s.checkpoint.completed = false;
+                                                s.checkpoint.status = "workflow_verification_failed".to_string();
+                                                let _ = state.session.update_session(s).await;
+
+                                                emit_ai_output(
+                                                    &app_handle,
+                                                    &format!(
+                                                        "⚠️ Session {} work complete but workflow verification_steps failed - will retry. Failures: {}",
+                                                        session_id,
+                                                        workflow_verification.critical_failures.join(", ")
+                                                    ),
+                                                    "status",
+                                                    Some(&session_id),
+                                                    Some(&session_ctx),
+                                                );
+                                                return;
+                                            }
+
+                                            info!("Both orchestrator and workflow verification PASSED - checking for completion steps");
+
+                                            // Get completion steps from the task's execution_steps_json
+                                            // Completion steps are marked with phase="completion"
+                                            let completion_steps: Vec<ExecutionStepConfig> = {
+                                                match state
+                                                    .app_state
+                                                    .checkpoint_db
+                                                    .get_task_run(&db_task_id)
+                                                {
+                                                    Ok(Some(task)) => task
+                                                        .execution_steps_json
+                                                        .as_ref()
+                                                        .and_then(|json| {
+                                                            serde_json::from_str::<
+                                                                Vec<ExecutionStepConfig>,
+                                                            >(
+                                                                json
+                                                            )
+                                                            .ok()
+                                                        })
+                                                        .map(|steps| {
+                                                            steps
+                                                                .into_iter()
+                                                                .filter(|s| {
+                                                                    s.phase.as_deref()
+                                                                        == Some("completion")
+                                                                })
+                                                                .collect()
+                                                        })
+                                                        .unwrap_or_default(),
+                                                    _ => Vec::new(),
+                                                }
+                                            };
+
+                                            // Run completion steps if they exist
+                                            if !completion_steps.is_empty() {
+                                                info!(
+                                                    "Running {} completion steps for task {}",
+                                                    completion_steps.len(),
+                                                    db_task_id
+                                                );
+                                                emit_ai_output(
+                                                    &app_handle,
+                                                    &format!(
+                                                        "🏁 Session {} verification passed - running {} completion steps",
+                                                        session_id, completion_steps.len()
+                                                    ),
+                                                    "status",
+                                                    Some(&session_id),
+                                                    Some(&session_ctx),
+                                                );
+
+                                                // Get log sources from task
+                                                let log_sources: Vec<LogSourceConfig> = state
+                                                    .app_state
+                                                    .checkpoint_db
+                                                    .get_task_run(&db_task_id)
+                                                    .ok()
+                                                    .flatten()
+                                                    .and_then(|t| t.log_sources_json)
+                                                    .and_then(|json| {
+                                                        serde_json::from_str(&json).ok()
+                                                    })
+                                                    .unwrap_or_default();
+
+                                                // Execute completion steps
+                                                let executor = StepExecutor::with_app_handle(
+                                                    state.app_state.clone(),
+                                                    state.config_storage.clone(),
+                                                    state.app_handle.clone(),
+                                                )
+                                                .with_task_run_id(db_task_id.clone());
+
+                                                let completion_result = executor
+                                                    .execute_completion_phase(
+                                                        &completion_steps,
+                                                        &session_id,
+                                                        &log_sources,
+                                                    )
+                                                    .await;
+
+                                                if !completion_result.success {
+                                                    warn!(
+                                                        "Completion steps had failures for task {}",
+                                                        db_task_id
+                                                    );
+                                                } else {
+                                                    info!("Completion steps executed successfully for task {}", db_task_id);
+                                                }
+                                            } else {
+                                                info!(
+                                                    "No completion steps defined for task {}",
+                                                    db_task_id
+                                                );
+                                            }
+
                                             s.status = SessionStatus::Completed;
                                             s.checkpoint.completed = true;
                                             s.checkpoint.status =
@@ -13026,22 +14059,70 @@ async fn run_unified_session_loop(
                                             return;
                                         } else {
                                             // Verification failed - feedback is already recorded by orchestrator
+                                            let det_failures = results
+                                                .deterministic_results
+                                                .iter()
+                                                .filter(|r| !r.passed)
+                                                .count();
+                                            let ai_failures = results
+                                                .ai_results
+                                                .iter()
+                                                .filter(|r| !r.passed)
+                                                .count();
                                             info!(
-                                                "Orchestrator verification FAILED - {} deterministic, {} AI failures",
-                                                results.deterministic_results.iter().filter(|r| !r.passed).count(),
-                                                results.ai_results.iter().filter(|r| !r.passed).count()
+                                                "Orchestrator verification FAILED - {} deterministic, {} AI failures. Task status remains 'running' for retry.",
+                                                det_failures, ai_failures
                                             );
+
+                                            // Log detailed failure info for debugging
+                                            for result in results
+                                                .deterministic_results
+                                                .iter()
+                                                .filter(|r| !r.passed)
+                                            {
+                                                let issues_str = if result.issues.is_empty() {
+                                                    "no issues recorded".to_string()
+                                                } else {
+                                                    result.issues.join("; ")
+                                                };
+                                                info!(
+                                                    "  FAILED deterministic check: {} - {}",
+                                                    result.criterion_id, issues_str
+                                                );
+                                            }
+                                            for result in
+                                                results.ai_results.iter().filter(|r| !r.passed)
+                                            {
+                                                let issues_str = if result.issues.is_empty() {
+                                                    "no issues recorded".to_string()
+                                                } else {
+                                                    result.issues.join("; ")
+                                                };
+                                                info!(
+                                                    "  FAILED AI check: {} - {}",
+                                                    result.criterion_id, issues_str
+                                                );
+                                            }
+
                                             s.status = SessionStatus::Completed;
                                             s.checkpoint.completed = false;
                                             s.checkpoint.status =
                                                 "orchestrator_verification_failed".to_string();
                                             let _ = state.session.update_session(s).await;
 
+                                            // NOTE: We do NOT call complete_task_run here.
+                                            // The task status remains "running" in the database,
+                                            // which allows the cross-session loop to continue.
+                                            info!(
+                                                "Session {} returning with completed=false. Cross-session loop will check task status and retry.",
+                                                session_id
+                                            );
+
                                             emit_ai_output(
                                                 &app_handle,
                                                 &format!(
-                                                    "⚠️ Session {} work complete but orchestrator verification failed - will retry",
-                                                    session_id
+                                                    "⚠️ Session {} verification failed ({} det, {} AI failures) - will retry in next iteration",
+                                                    session_id, det_failures, ai_failures
                                                 ),
                                                 "status",
                                                 Some(&session_id),
@@ -13115,6 +14196,89 @@ async fn run_unified_session_loop(
                                 // This handles cases where orchestrator says continue but
                                 // legacy markers might still be present
                             }
+                            Ok(WorkerOutputAction::SetupPhaseComplete) => {
+                                info!("Orchestrator: Setup phase complete - transitioning to verification");
+
+                                // Transition to verification phase
+                                {
+                                    let mut states = state.orchestrator_states.lock().await;
+                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
+                                        orchestrator.complete_setup_phase(orch_state);
+                                    }
+                                }
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!(
+                                        "✅ Session {} setup phase complete - transitioning to verification",
+                                        session_id
+                                    ),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                // Continue to next iteration with verification phase
+                            }
+                            Ok(WorkerOutputAction::CompletionPhaseComplete) => {
+                                info!(
+                                    "Orchestrator: Completion phase complete for task {}",
+                                    db_task_id
+                                );
+
+                                // Mark as complete through orchestrator
+                                let success = {
+                                    let mut states = state.orchestrator_states.lock().await;
+                                    if let Some(orch_state) = states.get_mut(&db_task_id) {
+                                        let success = orch_state
+                                            .last_verification
+                                            .as_ref()
+                                            .map(|v| v.all_passed)
+                                            .unwrap_or(false);
+                                        let _result = orchestrator
+                                            .complete_completion_phase(orch_state, success);
+                                        success
+                                    } else {
+                                        false
+                                    }
+                                };
+
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = true;
+                                s.checkpoint.status = if success {
+                                    "completion_phase_done_success".to_string()
+                                } else {
+                                    "completion_phase_done_failed".to_string()
+                                };
+                                let _ = state.session.update_session(s).await;
+
+                                // Mark task complete
+                                if !complete_task_run_with_retry(
+                                    state.app_state.checkpoint_db.clone(),
+                                    &db_task_id,
+                                )
+                                .await
+                                {
+                                    error!("Failed to mark task_run {} as complete", db_task_id);
+                                }
+
+                                // Clean up orchestrator state
+                                {
+                                    let mut states = state.orchestrator_states.lock().await;
+                                    states.remove(&db_task_id);
+                                }
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!(
+                                        "✅ Session {} completion phase done - task finished (success={})",
+                                        session_id, success
+                                    ),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                return;
+                            }
                             Err(e) => {
                                 warn!("Orchestrator process_worker_output failed: {}. Using legacy handling.", e);
                                 // Fall through to legacy handling
@@ -13128,19 +14292,21 @@ async fn run_unified_session_loop(
                     match worker_signal {
                         WorkerOutputSignal::WorkComplete { reason } => {
                             info!(
-                                "Worker signaled WORK_COMPLETE (reason: {:?}) - running legacy verification",
+                                "Worker signaled WORK_COMPLETE (reason: {:?}) - running workflow verification",
                                 reason
                             );
 
-                            // Run deterministic verification before marking complete
-                            let verification_result = run_deterministic_verification(
+                            // Run the workflow's actual verification steps (not just build checks)
+                            let verification_result = run_workflow_verification_for_task(
+                                &state.app_state,
+                                &state.config_storage,
+                                &db_task_id,
                                 &workspace_root,
-                                None, // TODO: Pass verification config from task
                             )
                             .await;
 
                             if verification_result.all_passed {
-                                info!("Legacy deterministic verification PASSED - marking task complete");
+                                info!("Workflow verification PASSED - marking task complete");
                                 s.status = SessionStatus::Completed;
                                 s.checkpoint.completed = true;
                                 s.checkpoint.status = "verified_complete".to_string();
@@ -13237,9 +14403,71 @@ async fn run_unified_session_loop(
                             return;
                         }
                         WorkerOutputSignal::TaskComplete => {
-                            // Legacy TASK_COMPLETE marker - treat same as WorkComplete but warn
-                            warn!("Legacy [TASK_COMPLETE] marker detected - please use [WORK_COMPLETE] instead");
-                            // Fall through to same handling as WorkComplete
+                            // Legacy TASK_COMPLETE marker - treat same as WorkComplete
+                            warn!("Legacy [TASK_COMPLETE] marker detected - running workflow verification");
+
+                            // Run the workflow's actual verification steps (not just build checks)
+                            let verification_result = run_workflow_verification_for_task(
+                                &state.app_state,
+                                &state.config_storage,
+                                &db_task_id,
+                                &workspace_root,
+                            )
+                            .await;
+
+                            if verification_result.all_passed {
+                                info!("Workflow verification PASSED after [TASK_COMPLETE] - marking task complete");
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = true;
+                                s.checkpoint.status = "verified_complete".to_string();
+                                let _ = state.session.update_session(s).await;
+
+                                if !complete_task_run_with_retry(
+                                    state.app_state.checkpoint_db.clone(),
+                                    &db_task_id,
+                                )
+                                .await
+                                {
+                                    error!(
+                                        "Failed to mark task_run {} as complete in database",
+                                        db_task_id
+                                    );
+                                }
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!(
+                                        "✅ Session {} verified and completed after {} phases",
+                                        session_id, phase
+                                    ),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                return;
+                            } else {
+                                // Verification failed - end session but don't mark task complete
+                                info!(
+                                    "Legacy verification FAILED after [TASK_COMPLETE] - ending session for retry. Critical failures: {:?}",
+                                    verification_result.critical_failures
+                                );
+                                s.status = SessionStatus::Completed;
+                                s.checkpoint.completed = false;
+                                s.checkpoint.status = "verification_failed".to_string();
+                                let _ = state.session.update_session(s).await;
+
+                                emit_ai_output(
+                                    &app_handle,
+                                    &format!(
+                                        "⚠️ Session {} [TASK_COMPLETE] but verification failed - will retry",
+                                        session_id
+                                    ),
+                                    "status",
+                                    Some(&session_id),
+                                    Some(&session_ctx),
+                                );
+                                return;
+                            }
                         }
                         WorkerOutputSignal::Continue => {
                             // No completion signal - session continues normally
@@ -13735,7 +14963,7 @@ async fn stop_task_run(
     // Kill all tracked AI processes (same logic as stop_ai_analysis)
     // This ensures the actual Claude CLI process is terminated, not just marked as stopped
     let pids_to_kill: Vec<u32> = {
-        let mut pids = state.current_ai_pids.lock().unwrap();
+        let mut pids = safe_lock_or_recover(&state.current_ai_pids, "current_ai_pids");
         let pids_copy = pids.clone();
         pids.clear();
         pids_copy
@@ -13959,15 +15187,24 @@ struct StepExecutionData {
     exit_code: Option<i32>,
     stdout: Option<String>,
     stderr: Option<String>,
+    /// Original command template (with {{variable}} placeholders) - only present if variables were used
+    template_command: Option<String>,
+    /// Variables that were resolved during command execution (name -> resolved value)
+    resolved_variables: Option<serde_json::Value>,
 }
 
 /// Get step executions for the currently running task.
 /// This endpoint combines running task detection with event querying,
 /// so the frontend doesn't need to track task IDs.
+///
+/// Events are aggregated by step_name + step_index so that start and complete
+/// events for the same step are merged into a single entry.
 async fn get_current_execution_steps(
     State(state): State<Arc<ApiState>>,
     axum::extract::Query(query): axum::extract::Query<CurrentExecutionStepsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use std::collections::HashMap;
+
     // Get running tasks
     let running_tasks = state
         .app_state
@@ -13996,9 +15233,9 @@ async fn get_current_execution_steps(
         .get_task_run_events(&task.id, None, query.limit)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-    // Transform events into step execution data
-    // Only include step_execution and shell_command events
-    let mut executions: Vec<StepExecutionData> = Vec::new();
+    // Aggregate events by step_name + step_index to merge start/complete events
+    // Key: (step_name, step_index) -> merged StepExecutionData
+    let mut step_map: HashMap<(String, i64), StepExecutionData> = HashMap::new();
 
     for event in events {
         // Only process step-related events
@@ -14015,14 +15252,30 @@ async fn get_current_execution_steps(
         let event_subtype = event.event_subtype.as_deref().unwrap_or("");
         let message = event.message.as_str();
 
+        // Extract step identification
+        let step_name = data
+            .as_ref()
+            .and_then(|d| d.get("step_name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| message.to_string());
+
+        let step_index = data
+            .as_ref()
+            .and_then(|d| d.get("step_index"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(-1);
+
+        let step_type_str = data
+            .as_ref()
+            .and_then(|d| d.get("step_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(event_type)
+            .to_string();
+
         // Filter by step type if specified
         if let Some(ref filter_type) = query.step_type {
-            let step_type = data
-                .as_ref()
-                .and_then(|d| d.get("step_type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if !step_type
+            if !step_type_str
                 .to_lowercase()
                 .contains(&filter_type.to_lowercase())
             {
@@ -14030,78 +15283,126 @@ async fn get_current_execution_steps(
             }
         }
 
-        // Create step execution data from event
-        let step_data = StepExecutionData {
-            id: event.id.to_string(),
-            step_type: data
-                .as_ref()
-                .and_then(|d| d.get("step_type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or(event_type)
-                .to_string(),
-            step_name: data
-                .as_ref()
-                .and_then(|d| d.get("step_name"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| message.to_string()),
-            status: match event_subtype {
-                "start" => "running",
-                "complete" | "success" => "success",
-                "error" | "failed" => "failed",
-                _ => "pending",
-            }
-            .to_string(),
-            start_time: chrono::DateTime::parse_from_rfc3339(&event.timestamp)
-                .ok()
-                .map(|dt| dt.timestamp_millis()),
-            end_time: data
-                .as_ref()
-                .and_then(|d| d.get("end_time"))
-                .and_then(|v| v.as_i64()),
-            duration_ms: data
-                .as_ref()
-                .and_then(|d| d.get("duration_ms"))
-                .and_then(|v| v.as_i64()),
-            error: data
-                .as_ref()
-                .and_then(|d| d.get("error"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            output: data
-                .as_ref()
-                .and_then(|d| d.get("output"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            command: data
-                .as_ref()
-                .and_then(|d| d.get("command"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            working_directory: data
-                .as_ref()
-                .and_then(|d| d.get("working_directory"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            exit_code: data
-                .as_ref()
-                .and_then(|d| d.get("exit_code"))
-                .and_then(|v| v.as_i64())
-                .map(|i| i as i32),
-            stdout: data
-                .as_ref()
-                .and_then(|d| d.get("stdout"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            stderr: data
-                .as_ref()
-                .and_then(|d| d.get("stderr"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-        };
+        let key = (step_name.clone(), step_index);
 
-        executions.push(step_data);
+        // Get the timestamp for this event
+        let event_timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+            .ok()
+            .map(|dt| dt.timestamp_millis());
+
+        // Determine status from event_subtype
+        let status = match event_subtype {
+            "start" => "running",
+            "complete" | "success" => "success",
+            "error" | "failed" => "failed",
+            _ => "pending",
+        }
+        .to_string();
+
+        // Check if we already have an entry for this step
+        if let Some(existing) = step_map.get_mut(&key) {
+            // Merge: prefer completion data over start data
+            // Status: complete/success/failed takes precedence over running
+            if status != "running" {
+                existing.status = status;
+            }
+
+            // Update fields that are typically only in complete events
+            if let Some(d) = &data {
+                if let Some(v) = d.get("duration_ms").and_then(|v| v.as_i64()) {
+                    existing.duration_ms = Some(v);
+                }
+                if let Some(v) = d.get("end_time").and_then(|v| v.as_i64()) {
+                    existing.end_time = Some(v);
+                }
+                if let Some(v) = d.get("exit_code").and_then(|v| v.as_i64()) {
+                    existing.exit_code = Some(v as i32);
+                }
+                if let Some(v) = d.get("stdout").and_then(|v| v.as_str()) {
+                    existing.stdout = Some(v.to_string());
+                }
+                if let Some(v) = d.get("stderr").and_then(|v| v.as_str()) {
+                    existing.stderr = Some(v.to_string());
+                }
+                if let Some(v) = d.get("error").and_then(|v| v.as_str()) {
+                    existing.error = Some(v.to_string());
+                }
+                if let Some(v) = d.get("output").and_then(|v| v.as_str()) {
+                    existing.output = Some(v.to_string());
+                }
+            }
+        } else {
+            // Create new entry
+            let step_data = StepExecutionData {
+                id: event.id.to_string(),
+                step_type: step_type_str,
+                step_name,
+                status,
+                start_time: event_timestamp,
+                end_time: data
+                    .as_ref()
+                    .and_then(|d| d.get("end_time"))
+                    .and_then(|v| v.as_i64()),
+                duration_ms: data
+                    .as_ref()
+                    .and_then(|d| d.get("duration_ms"))
+                    .and_then(|v| v.as_i64()),
+                error: data
+                    .as_ref()
+                    .and_then(|d| d.get("error"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                output: data
+                    .as_ref()
+                    .and_then(|d| d.get("output"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                command: data
+                    .as_ref()
+                    .and_then(|d| d.get("command"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                working_directory: data
+                    .as_ref()
+                    .and_then(|d| d.get("working_directory"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                exit_code: data
+                    .as_ref()
+                    .and_then(|d| d.get("exit_code"))
+                    .and_then(|v| v.as_i64())
+                    .map(|i| i as i32),
+                stdout: data
+                    .as_ref()
+                    .and_then(|d| d.get("stdout"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                stderr: data
+                    .as_ref()
+                    .and_then(|d| d.get("stderr"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                template_command: data
+                    .as_ref()
+                    .and_then(|d| d.get("template_command"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                resolved_variables: data
+                    .as_ref()
+                    .and_then(|d| d.get("resolved_variables"))
+                    .cloned(),
+            };
+
+            step_map.insert(key, step_data);
+        }
     }
+
+    // Convert map to vector, sorted by step_index
+    let mut executions: Vec<StepExecutionData> = step_map.into_values().collect();
+    executions.sort_by(|a, b| {
+        // Sort by start_time to maintain execution order
+        a.start_time.cmp(&b.start_time)
+    });
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -14792,7 +16093,7 @@ async fn preview_exploration(
     Json(request): Json<StartExplorationRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, (StatusCode, Json<ApiResponse<()>>)> {
     // Load the current config
-    let config_lock = state.app_state.current_config.lock().unwrap();
+    let config_lock = safe_lock_or_recover(&state.app_state.current_config, "current_config");
     let qontinui_config = match config_lock.as_ref() {
         Some(c) => c,
         None => {
@@ -17195,6 +18496,496 @@ async fn generate_unified_workflow_handler(
     }
 }
 
+/// Run a unified workflow with the verification-agentic loop.
+///
+/// This implements the proper verification-agentic loop:
+/// 1. SETUP (once) - Run setup_steps via step_executor
+/// 2. VERIFICATION-AGENTIC LOOP (until pass or max_iterations):
+///    - VERIFICATION PHASE: Run verification_steps via step_executor
+///    - IF all pass → exit loop
+///    - AGENTIC PHASE: Build prompt with failure context, run AI session
+/// 3. COMPLETION (once) - Run completion_steps
+///
+/// This function integrates the workflow's explicit verification_steps with the
+/// orchestrator system, ensuring the AI cannot self-declare [TASK_COMPLETE]
+/// to bypass actual verification tests.
+async fn run_unified_workflow_with_verification_loop(
+    state: Arc<ApiState>,
+    workflow: crate::unified_workflows::UnifiedWorkflow,
+    execution_id: String,
+    setup_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    verification_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    agentic_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    completion_steps: Vec<crate::step_executor::ExecutionStepConfig>,
+    combined_prompt: String,
+    timeout_seconds: u64,
+) -> crate::step_executor::ExecutionResult {
+    use crate::step_executor::{
+        ExecutionResult, LogSourceConfig, StepExecutor, VerificationPhaseResult,
+    };
+
+    let max_iterations = workflow.max_iterations;
+    let mut all_step_results = Vec::new();
+    let mut total_duration_ms = 0u64;
+    let start = std::time::Instant::now();
+
+    // Create step executor
+    let executor = StepExecutor::with_app_handle(
+        state.app_state.clone(),
+        state.config_storage.clone(),
+        state.app_handle.clone(),
+    );
+
+    // Empty log sources for now (can be configured via workflow later)
+    let log_sources: Vec<LogSourceConfig> = vec![];
+
+    // =========================================================================
+    // PHASE 1: SETUP (once)
+    // =========================================================================
+    if !setup_steps.is_empty() {
+        info!(
+            "Executing {} setup steps for workflow '{}'",
+            setup_steps.len(),
+            workflow.name
+        );
+
+        let (setup_result, setup_complete) = executor
+            .execute_setup_phase(&setup_steps, &execution_id, &log_sources)
+            .await;
+
+        all_step_results.extend(setup_result.steps.clone());
+
+        if !setup_complete {
+            warn!("Setup phase failed for workflow '{}'", workflow.name);
+            // Update task status
+            let _ = state
+                .app_state
+                .checkpoint_db
+                .fail_task_run(&execution_id, "Setup phase failed");
+            return ExecutionResult {
+                success: false,
+                total_steps: setup_result.total_steps,
+                successful_steps: setup_result.successful_steps,
+                failed_steps: setup_result.failed_steps,
+                total_duration_ms: start.elapsed().as_millis() as u64,
+                steps: all_step_results,
+                captured_logs: setup_result.captured_logs,
+                captured_runner_logs: setup_result.captured_runner_logs,
+            };
+        }
+
+        info!("Setup phase completed successfully");
+    }
+
+    // =========================================================================
+    // PHASE 2: VERIFICATION-AGENTIC LOOP
+    // =========================================================================
+    let mut iteration = 0u32;
+    let mut last_verification_result: Option<VerificationPhaseResult> = None;
+
+    loop {
+        iteration += 1;
+
+        info!(
+            "VERIFICATION-AGENTIC LOOP: Starting iteration {} (max={}) for workflow '{}'",
+            iteration, max_iterations, workflow.name
+        );
+
+        if iteration > max_iterations {
+            warn!(
+                "VERIFICATION-AGENTIC LOOP: Max iterations ({}) reached for workflow '{}' - stopping loop. Last verification passed: {:?}",
+                max_iterations, workflow.name, last_verification_result.as_ref().map(|r| r.all_passed)
+            );
+            break;
+        }
+
+        info!(
+            "VERIFICATION-AGENTIC LOOP: Iteration {} of {} for workflow '{}' - running verification phase",
+            iteration, max_iterations, workflow.name
+        );
+
+        // ---------------------------------------------------------------------
+        // VERIFICATION PHASE: Run verification_steps
+        // ---------------------------------------------------------------------
+        if !verification_steps.is_empty() {
+            info!(
+                "Running {} verification steps (iteration {})",
+                verification_steps.len(),
+                iteration
+            );
+
+            let verification_result = executor
+                .execute_verification_steps(&verification_steps, &execution_id, iteration)
+                .await;
+
+            info!("{}", verification_result.summary());
+
+            // Store verification result for database and Recap page
+            if let Ok(result_json) = serde_json::to_value(&verification_result) {
+                if let Err(e) = state
+                    .app_state
+                    .checkpoint_db
+                    .store_verification_phase_result(&execution_id, iteration, &result_json)
+                {
+                    warn!("Failed to store verification result: {}", e);
+                }
+            }
+
+            // Add step results to overall results
+            let step_offset = all_step_results.len();
+            all_step_results.extend(verification_result.step_results.iter().cloned().map(
+                |mut r| {
+                    // Adjust step index to account for setup steps
+                    r.step_index += step_offset;
+                    r
+                },
+            ));
+
+            // Check if all verification passed
+            info!(
+                "VERIFICATION-AGENTIC LOOP: Iteration {} verification result: all_passed={}, critical_failure={}, passed={}/{}, failed={}",
+                iteration, verification_result.all_passed, verification_result.critical_failure,
+                verification_result.passed_steps, verification_result.total_steps, verification_result.failed_steps
+            );
+
+            if verification_result.all_passed {
+                info!(
+                    "VERIFICATION-AGENTIC LOOP: All verification steps PASSED on iteration {} - exiting loop successfully",
+                    iteration
+                );
+                last_verification_result = Some(verification_result);
+                break;
+            }
+
+            // Check for critical failure
+            if verification_result.critical_failure {
+                warn!(
+                    "VERIFICATION-AGENTIC LOOP: Critical verification failure on iteration {} - stopping execution",
+                    iteration
+                );
+                let _ = state
+                    .app_state
+                    .checkpoint_db
+                    .fail_task_run(&execution_id, "Critical verification step failed");
+                return ExecutionResult {
+                    success: false,
+                    total_steps: all_step_results.len(),
+                    successful_steps: all_step_results.iter().filter(|r| r.success).count(),
+                    failed_steps: all_step_results.iter().filter(|r| !r.success).count(),
+                    total_duration_ms: start.elapsed().as_millis() as u64,
+                    steps: all_step_results,
+                    captured_logs: None,
+                    captured_runner_logs: None,
+                };
+            }
+
+            last_verification_result = Some(verification_result);
+        }
+
+        // ---------------------------------------------------------------------
+        // AGENTIC PHASE: Run AI session with verification failure context
+        // ---------------------------------------------------------------------
+        if !agentic_steps.is_empty() {
+            info!("Running agentic phase (iteration {})", iteration);
+
+            // Build context from verification failures
+            let failure_context = last_verification_result
+                .as_ref()
+                .map(|r| r.build_failure_context())
+                .unwrap_or_default();
+
+            // Log what we're passing to the AI
+            if failure_context.is_empty() {
+                warn!(
+                    "VERIFICATION-AGENTIC LOOP: failure_context is EMPTY for iteration {} - AI won't know what to fix!",
+                    iteration
+                );
+            } else {
+                info!(
+                    "VERIFICATION-AGENTIC LOOP: Passing {} chars of failure context to AI for iteration {}",
+                    failure_context.len(), iteration
+                );
+                // Log first 500 chars for debugging
+                let preview = if failure_context.len() > 500 {
+                    format!("{}...[truncated]", &failure_context[..500])
+                } else {
+                    failure_context.clone()
+                };
+                info!("VERIFICATION-AGENTIC LOOP: Failure context preview:\n{}", preview);
+            }
+
+            // Combine prompt with failure context
+            let enhanced_prompt = if failure_context.is_empty() {
+                warn!("VERIFICATION-AGENTIC LOOP: Using original prompt without failure context");
+                combined_prompt.clone()
+            } else {
+                info!("VERIFICATION-AGENTIC LOOP: Enhanced prompt with failure context ({} + {} = {} chars)",
+                    combined_prompt.len(), failure_context.len(), combined_prompt.len() + failure_context.len() + 50);
+                format!(
+                    "{}\n\n---\n\n{}\n\nPlease fix the issues identified above.",
+                    combined_prompt, failure_context
+                )
+            };
+
+            // Build session config
+            let session_config = SessionConfig {
+                prompt: enhanced_prompt.clone(),
+                continuation_prompt: None,
+                total_phases: 1, // Single phase per agentic iteration
+                uses_gui: false,
+                timeout_seconds,
+                stall_threshold_seconds: 300,
+                name: format!("{} - Iteration {}", workflow.name, iteration),
+                description: workflow.description.clone(),
+                custom_config: serde_json::json!({
+                    "workflow_id": workflow.id,
+                    "iteration": iteration,
+                    "verification_failed": last_verification_result.as_ref().map(|r| !r.all_passed).unwrap_or(false),
+                }),
+                provider: workflow.provider.clone(),
+                model: workflow.model.clone(),
+            };
+
+            // Update task status to indicate agentic phase
+            let _ = state.app_state.checkpoint_db.append_task_output(
+                &execution_id,
+                &format!("\n\n=== Agentic Phase Iteration {} ===\n", iteration),
+                true, // increment session count
+            );
+
+            // Start AI session
+            match state.session.start_session(session_config).await {
+                Ok(session) => {
+                    info!(
+                        "Started AI session {} for agentic phase iteration {}",
+                        session.id, iteration
+                    );
+
+                    // Wait for session to complete
+                    // Note: In production, this should be more sophisticated
+                    // with proper session monitoring and timeout handling
+                    let session_id = session.id.clone();
+                    let mut attempts = 0;
+                    let max_attempts = (timeout_seconds / 5) as u32 + 1;
+
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                        attempts += 1;
+
+                        if let Some(s) = state.session.get_session(&session_id).await {
+                            match s.status {
+                                SessionStatus::Completed => {
+                                    info!("AI session {} completed", session_id);
+                                    break;
+                                }
+                                SessionStatus::Failed => {
+                                    warn!("AI session {} failed", session_id);
+                                    break;
+                                }
+                                _ => {
+                                    if attempts >= max_attempts {
+                                        warn!("AI session {} timed out", session_id);
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            warn!("Session {} not found", session_id);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to start AI session for iteration {}: {}",
+                        iteration, e
+                    );
+                    // Continue to next iteration - don't fail entire workflow
+                }
+            }
+
+            info!(
+                "VERIFICATION-AGENTIC LOOP: Agentic phase completed for iteration {}. Continuing to next iteration.",
+                iteration
+            );
+        } else {
+            info!(
+                "VERIFICATION-AGENTIC LOOP: No agentic steps defined, skipping agentic phase for iteration {}",
+                iteration
+            );
+        }
+
+        info!(
+            "VERIFICATION-AGENTIC LOOP: Iteration {} complete, looping back to verification phase",
+            iteration
+        );
+    }
+
+    info!(
+        "VERIFICATION-AGENTIC LOOP: Exited after {} iterations. Last verification all_passed: {:?}",
+        iteration.min(max_iterations),
+        last_verification_result.as_ref().map(|r| r.all_passed)
+    );
+
+    // =========================================================================
+    // PHASE 3: COMPLETION (once)
+    // =========================================================================
+    if !completion_steps.is_empty() {
+        info!(
+            "Executing {} completion steps for workflow '{}'",
+            completion_steps.len(),
+            workflow.name
+        );
+
+        // Separate completion steps into automation (non-prompt) and prompt steps
+        let (completion_automation_steps, completion_prompt_steps): (Vec<_>, Vec<_>) =
+            completion_steps
+                .into_iter()
+                .partition(|s| s.step_type != "prompt");
+
+        // Run non-prompt completion steps through the executor
+        if !completion_automation_steps.is_empty() {
+            let completion_result = executor
+                .execute_completion_phase(&completion_automation_steps, &execution_id, &log_sources)
+                .await;
+
+            all_step_results.extend(completion_result.steps.clone());
+
+            if !completion_result.success {
+                warn!(
+                    "Completion automation steps failed for workflow '{}'",
+                    workflow.name
+                );
+            }
+        }
+
+        // Run prompt completion steps (e.g., AI summary) as an AI session
+        if !completion_prompt_steps.is_empty() {
+            info!(
+                "Running {} completion prompt steps (AI summary)",
+                completion_prompt_steps.len()
+            );
+
+            // Combine all completion prompts into one
+            let completion_prompt = completion_prompt_steps
+                .iter()
+                .filter_map(|s| s.prompt_content.as_ref())
+                .map(|content| content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n---\n\n");
+
+            if !completion_prompt.is_empty() {
+                // Build session config for completion
+                let session_config = SessionConfig {
+                    prompt: completion_prompt.clone(),
+                    continuation_prompt: None,
+                    total_phases: 1,
+                    uses_gui: false,
+                    timeout_seconds,
+                    stall_threshold_seconds: 300,
+                    name: format!("{} - Completion", workflow.name),
+                    description: "Completion phase summary".to_string(),
+                    custom_config: serde_json::json!({
+                        "workflow_id": workflow.id,
+                        "phase": "completion",
+                    }),
+                    provider: workflow.provider.clone(),
+                    model: workflow.model.clone(),
+                };
+
+                // Start AI session for completion
+                match state.session.start_session(session_config).await {
+                    Ok(session) => {
+                        info!("Started AI session {} for completion phase", session.id);
+
+                        // Wait for session to complete
+                        let session_id = session.id.clone();
+                        let mut attempts = 0;
+                        let max_attempts = (timeout_seconds / 5) as u32 + 1;
+
+                        loop {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                            attempts += 1;
+
+                            if let Some(s) = state.session.get_session(&session_id).await {
+                                match s.status {
+                                    SessionStatus::Completed => {
+                                        info!("Completion AI session {} completed", session_id);
+                                        break;
+                                    }
+                                    SessionStatus::Failed => {
+                                        warn!("Completion AI session {} failed", session_id);
+                                        break;
+                                    }
+                                    _ => {
+                                        if attempts >= max_attempts {
+                                            warn!("Completion AI session {} timed out", session_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            } else {
+                                warn!("Completion session {} not found", session_id);
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to start completion AI session: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // FINAL RESULT
+    // =========================================================================
+    total_duration_ms = start.elapsed().as_millis() as u64;
+
+    let verification_passed = last_verification_result
+        .as_ref()
+        .map(|r| r.all_passed)
+        .unwrap_or(true); // If no verification steps, consider passed
+
+    let success = verification_passed && all_step_results.iter().all(|r| r.success);
+
+    // Update task status
+    if success {
+        let _ = state
+            .app_state
+            .checkpoint_db
+            .complete_task_run(&execution_id);
+    } else if !verification_passed {
+        let _ = state.app_state.checkpoint_db.fail_task_run(
+            &execution_id,
+            &format!(
+                "Verification failed after {} iterations",
+                iteration.min(max_iterations)
+            ),
+        );
+    }
+
+    info!(
+        "Unified workflow '{}' completed: success={}, iterations={}, total_steps={}",
+        workflow.name,
+        success,
+        iteration.min(max_iterations),
+        all_step_results.len()
+    );
+
+    ExecutionResult {
+        success,
+        total_steps: all_step_results.len(),
+        successful_steps: all_step_results.iter().filter(|r| r.success).count(),
+        failed_steps: all_step_results.iter().filter(|r| !r.success).count(),
+        total_duration_ms,
+        steps: all_step_results,
+        captured_logs: None,
+        captured_runner_logs: None,
+    }
+}
+
 /// Request body for running a unified workflow
 #[derive(Debug, Deserialize)]
 struct RunUnifiedWorkflowRequest {
@@ -17248,6 +19039,12 @@ async fn run_unified_workflow(
         workflow.agentic_steps.len(),
         workflow.completion_steps.len()
     );
+
+    // Save unified workflow config to .dev-logs for Claude Code debugging access
+    // This is separate from GUI automation configs to avoid confusion
+    if let Ok(workflow_json) = serde_json::to_value(&workflow) {
+        crate::executor::file_logger::save_unified_workflow_config(&workflow_json, &workflow.name);
+    }
 
     let monitor_index = request.monitor_index.unwrap_or(0);
     let _timeout_seconds = request.timeout_seconds.unwrap_or(300);
@@ -17354,7 +19151,10 @@ async fn run_unified_workflow(
             timeout_seconds: step.get("timeoutSeconds").and_then(|v| v.as_u64()),
             initial_state_ids: None,
             is_setup: step.get("isSetup").and_then(|v| v.as_bool()),
-            phase: step.get("phase").and_then(|v| v.as_str()).map(|s| s.to_string()),
+            phase: step
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
             run_on_subsequent_iterations: None,
             test_id: step
                 .get("test_id")
@@ -17456,33 +19256,44 @@ async fn run_unified_workflow(
                 .or_else(|| step.get("macroId"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string()),
+            // Check group fields
+            check_group_id: step
+                .get("check_group_id")
+                .or_else(|| step.get("checkGroupId"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         })
     };
 
-    // Add setup steps
+    // Add setup steps (mark as setup phase)
     for step in &workflow.setup_steps {
-        if let Some(config) = convert_step(step, monitor_index) {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.is_setup = Some(true);
+            config.phase = Some("setup".to_string());
             all_steps.push(config);
         }
     }
 
     // Add verification steps
     for step in &workflow.verification_steps {
-        if let Some(config) = convert_step(step, monitor_index) {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("verification".to_string());
             all_steps.push(config);
         }
     }
 
     // Add agentic steps
     for step in &workflow.agentic_steps {
-        if let Some(config) = convert_step(step, monitor_index) {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("agentic".to_string());
             all_steps.push(config);
         }
     }
 
-    // Add completion steps
+    // Add completion steps (mark as completion phase)
     for step in &workflow.completion_steps {
-        if let Some(config) = convert_step(step, monitor_index) {
+        if let Some(mut config) = convert_step(step, monitor_index) {
+            config.phase = Some("completion".to_string());
             all_steps.push(config);
         }
     }
@@ -17506,9 +19317,8 @@ async fn run_unified_workflow(
     let has_prompt_steps = all_steps.iter().any(|s| s.step_type == "prompt");
 
     // Separate automation steps from prompt steps
-    let (automation_steps, prompt_steps): (Vec<_>, Vec<_>) = all_steps
-        .into_iter()
-        .partition(|s| s.step_type != "prompt");
+    let (automation_steps, prompt_steps): (Vec<_>, Vec<_>) =
+        all_steps.into_iter().partition(|s| s.step_type != "prompt");
 
     let execution_id = format!(
         "unified-workflow-{}-{}",
@@ -17516,10 +19326,10 @@ async fn run_unified_workflow(
         chrono::Utc::now().timestamp_millis()
     );
 
-    // If workflow has prompt steps, use session-based execution
+    // If workflow has prompt steps, use AI-based execution
     if has_prompt_steps {
         info!(
-            "Workflow '{}' has {} prompt steps - using session-based execution",
+            "Workflow '{}' has {} prompt steps - using AI-based execution",
             workflow.name,
             prompt_steps.len()
         );
@@ -17535,9 +19345,105 @@ async fn run_unified_workflow(
         if combined_prompt.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(api_error("Workflow has prompt steps but no prompt content".to_string())),
+                Json(api_error(
+                    "Workflow has prompt steps but no prompt content".to_string(),
+                )),
             ));
         }
+
+        // Check if workflow has verification steps
+        let has_verification_steps = !workflow.verification_steps.is_empty();
+
+        // =====================================================================
+        // NEW VERIFICATION-AGENTIC LOOP for workflows with verification_steps
+        // =====================================================================
+        // When the workflow has explicit verification_steps (tests, checks),
+        // use the new verification-agentic loop that:
+        // 1. Runs verification FIRST to tell the agentic phase what to work on
+        // 2. Builds failure context from verification results
+        // 3. Loops: verification -> agentic until pass or max_iterations
+        // 4. Cannot be bypassed by AI claiming [TASK_COMPLETE]
+        if has_verification_steps {
+            info!(
+                "Unified workflow '{}' has {} verification steps - using verification-agentic loop",
+                workflow.name,
+                workflow.verification_steps.len()
+            );
+
+            // Separate steps by phase for the new loop function
+            let setup_steps: Vec<_> = automation_steps
+                .iter()
+                .filter(|s| s.phase.as_deref() == Some("setup"))
+                .cloned()
+                .collect();
+            let verification_steps: Vec<_> = automation_steps
+                .iter()
+                .filter(|s| s.phase.as_deref() == Some("verification"))
+                .cloned()
+                .collect();
+            // Filter prompt_steps by phase - agentic prompts only
+            let agentic_steps: Vec<_> = prompt_steps
+                .iter()
+                .filter(|s| s.phase.as_deref() == Some("agentic"))
+                .cloned()
+                .collect();
+            // Completion steps: combine non-prompt completion steps with prompt completion steps
+            let mut completion_steps: Vec<_> = automation_steps
+                .iter()
+                .filter(|s| s.phase.as_deref() == Some("completion"))
+                .cloned()
+                .collect();
+            // Add completion prompts (e.g., AI summary) to completion_steps
+            completion_steps.extend(
+                prompt_steps
+                    .iter()
+                    .filter(|s| s.phase.as_deref() == Some("completion"))
+                    .cloned(),
+            );
+
+            // Create task_run for tracking
+            let execution_steps_json = serde_json::to_string(&automation_steps).ok();
+            if let Err(e) = state.app_state.checkpoint_db.create_task_run_with_config(
+                &execution_id,
+                &workflow.name,
+                Some(&combined_prompt),
+                "ai",
+                None,
+                Some(&workflow.name),
+                Some(workflow.max_iterations),
+                Some(true),
+                execution_steps_json,
+                None,
+            ) {
+                warn!(
+                    "Failed to create task_run for unified workflow {}: {}",
+                    execution_id, e
+                );
+            }
+
+            // Run the verification-agentic loop
+            let timeout_seconds = request.timeout_seconds.unwrap_or(1800);
+            let result = run_unified_workflow_with_verification_loop(
+                state.clone(),
+                workflow,
+                execution_id,
+                setup_steps,
+                verification_steps,
+                agentic_steps,
+                completion_steps,
+                combined_prompt,
+                timeout_seconds,
+            )
+            .await;
+
+            return Ok(Json(ApiResponse::success(result)));
+        }
+
+        // =====================================================================
+        // LEGACY SESSION-BASED EXECUTION (for workflows without verification_steps)
+        // =====================================================================
+        // When the workflow has NO verification_steps, use the original
+        // session-based execution which relies on AI to self-report completion.
 
         // Build session config
         let session_config = SessionConfig {
@@ -17607,7 +19513,10 @@ async fn run_unified_workflow(
             Err(e) => {
                 error!("Failed to start session for unified workflow: {}", e);
                 // Mark task as failed
-                let _ = state.app_state.checkpoint_db.fail_task_run(&execution_id, &e);
+                let _ = state
+                    .app_state
+                    .checkpoint_db
+                    .fail_task_run(&execution_id, &e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(api_error(format!("Failed to start AI session: {}", e))),
@@ -17693,6 +19602,89 @@ async fn run_unified_workflow(
 // End Unified Workflows HTTP API Handlers
 // ============================================================================
 
+// ============================================================================
+// Check Generation HTTP API Handlers
+// ============================================================================
+
+/// Scan a workspace for projects and their configuration
+async fn scan_workspace_handler(
+    Json(request): Json<crate::check_generation::ScanWorkspaceRequest>,
+) -> Result<
+    Json<ApiResponse<crate::check_generation::WorkspaceScanResult>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    use crate::check_generation::scan_workspace;
+
+    info!(
+        "Scanning workspace: {} (max_depth: {})",
+        request.base_directory, request.max_depth
+    );
+
+    // Run scan in blocking task since it involves file I/O
+    let result = tokio::task::spawn_blocking(move || scan_workspace(&request))
+        .await
+        .map_err(|e| {
+            error!("Workspace scan task failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Scan task failed: {}", e))),
+            )
+        })?;
+
+    match result {
+        Ok(scan_result) => {
+            info!(
+                "Workspace scan complete: {} projects found in {} directories",
+                scan_result.projects.len(),
+                scan_result.total_directories_scanned
+            );
+            Ok(Json(ApiResponse::success(scan_result)))
+        }
+        Err(e) => {
+            error!("Workspace scan failed: {}", e);
+            Err((StatusCode::BAD_REQUEST, Json(api_error(e))))
+        }
+    }
+}
+
+/// Generate check suggestions using AI based on workspace scan results
+async fn generate_checks_handler(
+    Json(request): Json<crate::check_generation::GenerateChecksRequest>,
+) -> Result<
+    Json<ApiResponse<crate::check_generation::GenerateChecksResponse>>,
+    (StatusCode, Json<ApiResponse<()>>),
+> {
+    use crate::check_generation::generate_checks;
+
+    info!(
+        "Generating checks for {} projects",
+        request.workspace_scan.projects.len()
+    );
+
+    // Run generation in blocking task since it may call AI
+    let result = tokio::task::spawn_blocking(move || generate_checks(&request))
+        .await
+        .map_err(|e| {
+            error!("Check generation task failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(api_error(format!("Generation task failed: {}", e))),
+            )
+        })?;
+
+    info!(
+        "Check generation complete: {} suggestions, success={}",
+        result.suggested_checks.len(),
+        result.success
+    );
+
+    Ok(Json(ApiResponse::success(result)))
+}
+
+// ============================================================================
+// End Check Generation HTTP API Handlers
+// ============================================================================
+
 /// Create the API router
 pub fn create_router(
     app_state: Arc<AppState>,
@@ -17747,7 +19739,45 @@ pub fn create_router(
         orchestrator_states: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         extraction_state: Arc::new(ExtractionState::new()),
         resuming_task_ids: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        ui_bridge_pending: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     });
+
+    // Set up UI Bridge response listener
+    // This listens for "ui-bridge-response" events from the React frontend
+    // and delivers responses to waiting HTTP handlers
+    {
+        let pending = api_state.ui_bridge_pending.clone();
+        let handle = app_handle.clone();
+
+        // We need to use tauri's listen which returns a sync result
+        // The listener callback will be called on the main thread
+        use tauri::Emitter;
+        use tauri::Listener;
+
+        let pending_for_listener = pending.clone();
+        let _listener_id = handle.listen("ui-bridge-response", move |event| {
+            let pending = pending_for_listener.clone();
+
+            // Parse the response payload
+            if let Ok(response) = serde_json::from_str::<serde_json::Value>(event.payload()) {
+                // Spawn a task to handle the response since we need async
+                let runtime = tokio::runtime::Handle::try_current();
+                if let Ok(rt) = runtime {
+                    rt.spawn(async move {
+                        handle_ui_bridge_response(pending, response).await;
+                    });
+                } else {
+                    warn!("UI Bridge: No tokio runtime available for response handling");
+                }
+            } else {
+                warn!(
+                    "UI Bridge: Failed to parse response payload: {}",
+                    event.payload()
+                );
+            }
+        });
+        info!("UI Bridge: Response listener set up");
+    }
 
     // Restore persisted session state on startup
     let state_for_restore = api_state.clone();
@@ -17943,17 +19973,6 @@ pub fn create_router(
             get(get_macro).put(update_macro).delete(delete_macro),
         )
         .route("/macros/:id/run", post(run_macro))
-        // Legacy GUI Workflow routes (backward compatibility)
-        .route("/gui-workflows", get(list_macros))
-        .route("/gui-workflows", post(create_macro))
-        .route("/gui-workflows/search", get(search_macros))
-        .route("/gui-workflows/categories", get(get_macro_categories))
-        .route("/gui-workflows/tags", get(get_macro_tags))
-        .route(
-            "/gui-workflows/:id",
-            get(get_macro).put(update_macro).delete(delete_macro),
-        )
-        .route("/gui-workflows/:id/run", post(run_macro))
         // Unified Session routes (replaces workflows and ai-developer)
         .route("/sessions", get(list_sessions))
         .route("/sessions/start", post(start_session))
@@ -18169,6 +20188,64 @@ pub fn create_router(
         .route("/awas/check-support", post(awas_check_support))
         .route("/awas/actions", get(awas_list_actions))
         .route("/awas/extract-elements", post(awas_extract_elements))
+        // Check generation routes (AI-assisted check configuration)
+        .route("/checks/scan-workspace", post(scan_workspace_handler))
+        .route("/checks/generate", post(generate_checks_handler))
+        // Render logging routes (for UI testing)
+        .route(
+            "/render-log",
+            get(get_render_log).delete(clear_render_log_handler),
+        )
+        .route("/render-log/path", get(get_render_log_path))
+        // Navigation routes (for UI testing)
+        .route("/navigate", post(navigate_to_page))
+        // UI Bridge routes (AI-driven UI automation via React UI Bridge)
+        .route(
+            "/ui-bridge/control/elements",
+            get(ui_bridge_get_elements_handler),
+        )
+        .route(
+            "/ui-bridge/control/element/:id",
+            get(ui_bridge_get_element_handler),
+        )
+        .route(
+            "/ui-bridge/control/element/:id/action",
+            post(ui_bridge_execute_action_handler),
+        )
+        .route(
+            "/ui-bridge/control/components",
+            get(ui_bridge_get_components_handler),
+        )
+        .route(
+            "/ui-bridge/control/component/:id",
+            get(ui_bridge_get_component_handler),
+        )
+        .route(
+            "/ui-bridge/control/component/:id/action/:action_id",
+            post(ui_bridge_execute_component_action_handler),
+        )
+        .route(
+            "/ui-bridge/control/discover",
+            post(ui_bridge_discover_handler),
+        )
+        .route(
+            "/ui-bridge/control/snapshot",
+            get(ui_bridge_get_snapshot_handler),
+        )
+        // UI Bridge Exploration (uses qontinui library via Python bridge)
+        .route("/ui-bridge/explore", post(start_ui_bridge_exploration))
+        .route(
+            "/ui-bridge/explore/status",
+            get(get_ui_bridge_exploration_status),
+        )
+        .route(
+            "/ui-bridge/explore/results",
+            get(get_ui_bridge_exploration_results),
+        )
+        .route(
+            "/ui-bridge/explore/stop",
+            post(stop_ui_bridge_exploration),
+        )
         .layer(cors)
         // Allow up to 100MB request bodies for configs with embedded images
         .layer(RequestBodyLimitLayer::new(100 * 1024 * 1024))

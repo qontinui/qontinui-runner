@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{error, info};
@@ -523,6 +524,99 @@ pub struct PathSettings {
 }
 
 // ============================================================================
+// Execution Variables Settings
+// ============================================================================
+
+/// Authentication source for test execution
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthSource {
+    /// Use captured headers from saved requests (original tokens may expire)
+    #[default]
+    Captured,
+    /// Use manually configured auth token
+    Manual,
+    /// Use environment variable for auth token
+    Environment,
+}
+
+/// A custom variable for execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomVariable {
+    /// Variable name (used as {{name}} in substitution)
+    pub name: String,
+    /// Source of the value: "manual" or "environment"
+    #[serde(default)]
+    pub source: VariableSource,
+    /// Manual value (when source is "manual")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Environment variable name (when source is "environment")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_var: Option<String>,
+    /// Optional description for the variable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Source of a variable value
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VariableSource {
+    #[default]
+    Manual,
+    Environment,
+}
+
+/// Settings for execution variables
+///
+/// Allows configuring authentication source and custom variables
+/// for API request execution in the Test Orchestrator and similar features.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionVariablesSettings {
+    /// Authentication source for API requests
+    #[serde(default)]
+    pub auth_source: AuthSource,
+
+    /// Header name to use for authentication (default: "Authorization")
+    #[serde(default = "default_auth_header_name")]
+    pub auth_header_name: String,
+
+    /// Manual auth token (when auth_source is "manual")
+    /// Note: For security, sensitive tokens should ideally be stored in keychain
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+
+    /// Environment variable name for auth token (when auth_source is "environment")
+    #[serde(default = "default_auth_env_var")]
+    pub auth_env_var: String,
+
+    /// Custom variables for substitution
+    #[serde(default)]
+    pub custom_variables: Vec<CustomVariable>,
+}
+
+fn default_auth_header_name() -> String {
+    "Authorization".to_string()
+}
+
+fn default_auth_env_var() -> String {
+    "API_AUTH_TOKEN".to_string()
+}
+
+impl Default for ExecutionVariablesSettings {
+    fn default() -> Self {
+        Self {
+            auth_source: AuthSource::default(),
+            auth_header_name: default_auth_header_name(),
+            auth_token: None,
+            auth_env_var: default_auth_env_var(),
+            custom_variables: Vec::new(),
+        }
+    }
+}
+
+// ============================================================================
 // Debug Settings
 // ============================================================================
 
@@ -583,6 +677,8 @@ pub struct Settings {
     pub mobile: MobileSettings,
     #[serde(default)]
     pub log_sources: GlobalLogSourceSettings,
+    #[serde(default)]
+    pub execution_variables: ExecutionVariablesSettings,
 }
 
 fn default_auto_load_last_config() -> bool {
@@ -990,4 +1086,69 @@ pub fn get_log_sources_for_ai_selection() -> Vec<GlobalLogSource> {
 pub fn get_log_source_ai_selection_mode() -> LogSourceAiSelectionMode {
     let settings = get_global_log_source_settings();
     settings.ai_selection_mode
+}
+
+// ============================================================================
+// Execution Variables Settings
+// ============================================================================
+
+/// Get the current Execution Variables settings
+pub fn get_execution_variables_settings() -> ExecutionVariablesSettings {
+    let settings = load_settings();
+    settings.execution_variables
+}
+
+/// Save Execution Variables settings
+pub fn save_execution_variables_settings(
+    execution_variables_settings: ExecutionVariablesSettings,
+) -> Result<(), String> {
+    info!(
+        "Saving Execution Variables settings: auth_source={:?}, {} custom variables",
+        execution_variables_settings.auth_source,
+        execution_variables_settings.custom_variables.len()
+    );
+    let mut settings = load_settings();
+    settings.execution_variables = execution_variables_settings;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Get the resolved auth token based on current settings
+///
+/// Returns the auth token to use based on the configured auth source:
+/// - Captured: Returns None (use original captured headers)
+/// - Manual: Returns the manually configured token
+/// - Environment: Returns the value from the configured environment variable
+pub fn get_resolved_auth_token() -> Option<String> {
+    let settings = get_execution_variables_settings();
+
+    match settings.auth_source {
+        AuthSource::Captured => None, // Use original captured headers
+        AuthSource::Manual => settings.auth_token,
+        AuthSource::Environment => std::env::var(&settings.auth_env_var).ok(),
+    }
+}
+
+/// Get resolved custom variables
+///
+/// Returns all custom variables with their resolved values.
+/// For environment variables, resolves them from the environment.
+pub fn get_resolved_custom_variables() -> HashMap<String, String> {
+    let settings = get_execution_variables_settings();
+    let mut resolved = HashMap::new();
+
+    for var in settings.custom_variables {
+        let value = match var.source {
+            VariableSource::Manual => var.value,
+            VariableSource::Environment => var
+                .env_var
+                .and_then(|env_name| std::env::var(&env_name).ok()),
+        };
+
+        if let Some(v) = value {
+            resolved.insert(var.name, v);
+        }
+    }
+
+    resolved
 }

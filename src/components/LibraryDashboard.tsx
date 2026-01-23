@@ -17,7 +17,7 @@ import {
   Globe,
   TestTube,
   Sparkles,
-  MousePointer2,
+  Layers,
   Loader2,
   ChevronRight,
   Filter,
@@ -105,8 +105,8 @@ const CATEGORY_CONFIG: Record<
   },
   macro: {
     label: "Macro",
-    icon: MousePointer2,
-    accentColor: "orange",
+    icon: Layers,
+    accentColor: "pink",
     builderTab: "macro-builder",
   },
   check: {

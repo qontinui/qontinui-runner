@@ -5,7 +5,8 @@
  */
 
 import { useState, useEffect } from "react";
-import { Settings, Save, Clock, AlertTriangle, Tag, FileText, Power, Sparkles } from "lucide-react";
+import { Settings, Save, Clock, AlertTriangle, Tag, FileText, Power, Sparkles, Loader2, Wand2 } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { useTestBuilder } from "./TestBuilderContext";
 import type { TestCategory, CreateTestInput } from "./types";
 import { getStatusColors } from "@/design-system";
@@ -37,13 +38,15 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
   const [description, setDescription] = useState("");
   const [category, setCategory] = useState<TestCategory>("custom");
   const [timeoutSeconds, setTimeoutSeconds] = useState(60);
-  const [isCritical, setIsCritical] = useState(true);
+  const [isCritical, setIsCritical] = useState(false);
   const [enabled, setEnabled] = useState(true);
-  const [successCriteria, setSuccessCriteria] = useState("");
   const [tags, setTags] = useState<string[]>([]);
+  const [isFillingWithAI, setIsFillingWithAI] = useState(false);
   const [tagInput, setTagInput] = useState("");
 
   // Sync local state with selected test
+  // Only re-sync when the test ID changes (not on every render)
+  // selectedTest is recreated as a new object each render, so we use the ID
   useEffect(() => {
     if (selectedTest) {
       setName(selectedTest.name);
@@ -52,10 +55,9 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
       setTimeoutSeconds(selectedTest.timeout_seconds);
       setIsCritical(selectedTest.is_critical);
       setEnabled(selectedTest.enabled);
-      setSuccessCriteria(selectedTest.success_criteria || "");
       setTags(selectedTest.tags || []);
     }
-  }, [selectedTest]);
+  }, [selectedTest?.id]);
 
   // Handle name change
   const handleNameChange = (value: string) => {
@@ -84,6 +86,50 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
     setDirty(true);
   };
 
+  // Handle fill with AI - analyze test code to generate metadata
+  const handleFillWithAI = async () => {
+    if (!code.trim()) return;
+
+    setIsFillingWithAI(true);
+    try {
+      const response = await invoke<{
+        success: boolean;
+        data?: {
+          name?: string;
+          description?: string;
+          category?: TestCategory;
+          tags?: string[];
+        };
+        message?: string;
+      }>("generate_test_metadata", {
+        testCode: code,
+        testType: selectedTest?.test_type || "python_script",
+      });
+
+      if (response.success && response.data) {
+        if (response.data.name) {
+          setName(response.data.name);
+        }
+        if (response.data.description) {
+          setDescription(response.data.description);
+        }
+        if (response.data.category) {
+          setCategory(response.data.category);
+        }
+        if (response.data.tags && response.data.tags.length > 0) {
+          // Merge with existing tags, avoiding duplicates
+          const newTags = [...new Set([...tags, ...response.data.tags])];
+          setTags(newTags);
+        }
+        setDirty(true);
+      }
+    } catch (err) {
+      console.error("Failed to generate metadata with AI:", err);
+    } finally {
+      setIsFillingWithAI(false);
+    }
+  };
+
   // Handle save
   const handleSave = async () => {
     if (!selectedTest) return;
@@ -97,7 +143,6 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
       timeout_seconds: timeoutSeconds,
       is_critical: isCritical,
       enabled,
-      success_criteria: successCriteria || undefined,
       tags,
     };
 
@@ -129,9 +174,8 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
 
     // If this is a draft, save it as a new test; otherwise update existing
     if (isDraftSelected) {
-      // Update draft with final values before saving
-      updateDraft(input, code);
-      await saveDraft();
+      // Pass input directly to saveDraft to avoid race condition with state updates
+      await saveDraft(input);
     } else {
       await updateTest(selectedTest.id, input);
     }
@@ -173,6 +217,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
           `}
           onClick={handleSave}
           disabled={!state.isDirty || state.isSaving}
+          data-ui-id="test-builder-save-btn"
         >
           <Save className="w-3.5 h-3.5" />
           {state.isSaving ? "Saving..." : isDraftSelected ? "Create" : "Save"}
@@ -190,6 +235,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
             onChange={(e) => handleNameChange(e.target.value)}
             className="w-full px-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-primary/50"
+            data-ui-id="test-builder-name-input"
           />
         </div>
 
@@ -206,6 +252,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
             className="w-full px-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none"
             placeholder="What does this test verify?"
+            data-ui-id="test-builder-description-input"
           />
         </div>
 
@@ -220,6 +267,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
             }}
             className="w-full px-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-primary/50"
+            data-ui-id="test-builder-category-select"
           >
             {categoryOptions.map((opt) => (
               <option key={opt.value} value={opt.value}>
@@ -246,6 +294,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
             max={600}
             className="w-full px-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-primary/50"
+            data-ui-id="test-builder-timeout-input"
           />
         </div>
 
@@ -264,6 +313,7 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
                 setDirty(true);
               }}
               className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-primary/50"
+              data-ui-id="test-builder-critical-checkbox"
             />
           </label>
           <p className="text-xs text-muted-foreground ml-6">
@@ -283,28 +333,40 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
                 setDirty(true);
               }}
               className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-primary/50"
+              data-ui-id="test-builder-enabled-checkbox"
             />
           </label>
         </div>
 
-        {/* Success Criteria (for AI) */}
-        <div className="space-y-1.5">
-          <label className="text-xs font-medium text-muted-foreground flex items-center gap-1">
-            <Sparkles className="w-3 h-3" />
-            Success Criteria
-          </label>
-          <textarea
-            value={successCriteria}
-            onChange={(e) => {
-              setSuccessCriteria(e.target.value);
-              setDirty(true);
-            }}
-            rows={2}
-            className="w-full px-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md
-                     focus:outline-none focus:ring-2 focus:ring-primary/50 resize-none"
-            placeholder="Natural language description for AI..."
-          />
-        </div>
+        {/* Fill with AI Button - only show when there's code */}
+        {code.trim() && (
+          <button
+            onClick={handleFillWithAI}
+            disabled={isFillingWithAI}
+            className={`
+              w-full px-3 py-2 text-sm font-medium rounded-md flex items-center justify-center gap-2
+              transition-colors border border-border/50
+              ${
+                isFillingWithAI
+                  ? "bg-muted/30 text-muted-foreground cursor-not-allowed"
+                  : "bg-primary/10 text-primary hover:bg-primary/20"
+              }
+            `}
+            data-ui-id="test-builder-fill-ai-btn"
+          >
+            {isFillingWithAI ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Analyzing...
+              </>
+            ) : (
+              <>
+                <Wand2 className="w-4 h-4" />
+                Fill with AI
+              </>
+            )}
+          </button>
+        )}
 
         {/* Tags */}
         <div className="space-y-1.5">
@@ -326,10 +388,12 @@ export function TestPropertiesPanel({ code, onSave }: TestPropertiesPanelProps) 
               className="flex-1 px-3 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md
                        focus:outline-none focus:ring-2 focus:ring-primary/50"
               placeholder="Add tag..."
+              data-ui-id="test-builder-tag-input"
             />
             <button
               onClick={handleAddTag}
               className="px-3 py-1.5 text-sm bg-muted hover:bg-muted/80 rounded-md"
+              data-ui-id="test-builder-add-tag-btn"
             >
               Add
             </button>

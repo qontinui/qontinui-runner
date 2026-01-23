@@ -620,7 +620,7 @@ export function AccessibilityExplorerPanel({
   );
 
   return (
-    <div className="h-full flex flex-col overflow-hidden">
+    <div data-ui-id="a11y-explorer-panel" className="h-full flex flex-col overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between p-3 border-b border-border flex-shrink-0">
         <div className="flex items-center gap-2">
@@ -655,6 +655,7 @@ export function AccessibilityExplorerPanel({
             )}
           </div>
           <button
+            data-ui-id="a11y-settings-btn"
             onClick={() => setShowSettings(!showSettings)}
             className={`p-1.5 rounded transition-colors ${
               showSettings ? "bg-primary/20 text-primary" : "hover:bg-muted text-muted-foreground"
@@ -743,6 +744,7 @@ export function AccessibilityExplorerPanel({
         {/* Launch Chrome Button with Info - always visible */}
         <div className="relative flex items-center gap-1">
           <button
+            data-ui-id="a11y-launch-chrome-btn"
             onClick={handleLaunchChrome}
             disabled={isLaunchingChrome}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs rounded-l transition-colors ${
@@ -776,6 +778,7 @@ export function AccessibilityExplorerPanel({
         {connection.isConnected ? (
           <>
             <button
+              data-ui-id="a11y-refresh-tree-btn"
               onClick={handleCapture}
               disabled={isLoading}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-colors"
@@ -784,6 +787,7 @@ export function AccessibilityExplorerPanel({
               Refresh Tree
             </button>
             <button
+              data-ui-id="a11y-disconnect-btn"
               onClick={handleDisconnect}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-muted hover:bg-muted/80 rounded transition-colors"
             >
@@ -794,6 +798,7 @@ export function AccessibilityExplorerPanel({
         ) : (
           <>
             <button
+              data-ui-id="a11y-auto-connect-btn"
               onClick={handleAutoConnect}
               disabled={isLoading}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-colors"
@@ -802,6 +807,7 @@ export function AccessibilityExplorerPanel({
               Auto Connect
             </button>
             <button
+              data-ui-id="a11y-connect-port-btn"
               onClick={handleCapture}
               disabled={isLoading}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-muted hover:bg-muted/80 rounded disabled:opacity-50 transition-colors"
@@ -816,6 +822,7 @@ export function AccessibilityExplorerPanel({
 
         {/* Toggle buttons */}
         <button
+          data-ui-id="a11y-refs-toggle-btn"
           onClick={() => setShowRefList(!showRefList)}
           className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors ${
             showRefList ? "bg-primary/20 text-primary" : "hover:bg-muted text-muted-foreground"
@@ -825,6 +832,7 @@ export function AccessibilityExplorerPanel({
           Refs
         </button>
         <button
+          data-ui-id="a11y-ai-context-toggle-btn"
           onClick={() => setShowAIContext(!showAIContext)}
           className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors ${
             showAIContext ? "bg-primary/20 text-primary" : "hover:bg-muted text-muted-foreground"

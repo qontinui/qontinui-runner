@@ -28,6 +28,7 @@ import type {
   TaskRunMigratedLogsSummary,
   TaskRunApiRequestsDbResult,
   TaskRunAwasStepsDbResult,
+  TaskRunVerificationResultsDbResult,
 } from "../types/aiData";
 import type { TieredInfoResponse, RunDetails } from "../types/statistics";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
@@ -332,5 +333,16 @@ export const aiDataService = {
     successFilter?: boolean,
   ): Promise<AiDataResponse<TaskRunMcpCallsDbResult>> {
     return invoke("get_task_run_mcp_calls", { taskRunId, successFilter });
+  },
+
+  /**
+   * Get verification phase results for a task run from SQLite database.
+   * Returns results from all verification iterations including individual test/check results.
+   * @param taskRunId - Task run ID to get verification results for
+   */
+  async getTaskRunVerificationResults(
+    taskRunId: string,
+  ): Promise<AiDataResponse<TaskRunVerificationResultsDbResult>> {
+    return invoke("get_task_run_verification_results_from_db", { taskRunId });
   },
 };

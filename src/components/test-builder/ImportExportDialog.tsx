@@ -139,7 +139,9 @@ export function ImportExportDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="bg-card border border-border rounded-lg shadow-xl w-full max-w-lg mx-4">
+      <div
+        data-ui-id="dialog-test-import-export"
+        className="bg-card border border-border rounded-lg shadow-xl w-full max-w-lg mx-4">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border">
           <div className="flex items-center gap-2">
@@ -156,6 +158,7 @@ export function ImportExportDialog({
             onClick={onClose}
             className="p-1 hover:bg-muted rounded-md transition-colors"
             disabled={isProcessing}
+            data-ui-id="test-builder-import-export-close-btn"
           >
             <X className="w-5 h-5" />
           </button>
@@ -184,6 +187,7 @@ export function ImportExportDialog({
                       checked={exportAll}
                       onChange={() => setExportAll(true)}
                       className="w-4 h-4"
+                      data-ui-id="test-builder-export-all-radio"
                     />
                     <span className="text-sm">Export all tests ({tests.length})</span>
                   </label>
@@ -195,6 +199,7 @@ export function ImportExportDialog({
                         checked={!exportAll}
                         onChange={() => setExportAll(false)}
                         className="w-4 h-4"
+                        data-ui-id="test-builder-export-selected-radio"
                       />
                       <span className="text-sm">
                         Export selected tests ({selectedTestIds.length})
@@ -222,6 +227,7 @@ export function ImportExportDialog({
                   checked={updateExisting}
                   onChange={(e) => setUpdateExisting(e.target.checked)}
                   className="w-4 h-4"
+                  data-ui-id="test-builder-update-existing-checkbox"
                 />
                 <span className="text-sm">Update existing tests with same name</span>
               </label>
@@ -327,6 +333,7 @@ export function ImportExportDialog({
             onClick={onClose}
             className="px-4 py-2 text-sm hover:bg-muted rounded-md transition-colors"
             disabled={isProcessing}
+            data-ui-id="test-builder-import-export-cancel-btn"
           >
             {importSummary ? "Close" : "Cancel"}
           </button>
@@ -337,6 +344,7 @@ export function ImportExportDialog({
               className="px-4 py-2 text-sm bg-primary text-primary-foreground rounded-md
                        hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed
                        flex items-center gap-2 transition-colors"
+              data-ui-id="test-builder-import-export-confirm-btn"
             >
               {isProcessing ? (
                 <>

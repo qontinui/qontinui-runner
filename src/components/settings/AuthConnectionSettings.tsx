@@ -115,7 +115,7 @@ export function AuthConnectionSettings({
 
       {/* User Info */}
       {auth.authStatus?.user && (
-        <div className="rounded-lg bg-card/50 p-4 flex items-center justify-between">
+        <div className="rounded-lg bg-card/50 p-4 flex items-center justify-between" data-ui-id="settings-authconnection-user-section">
           <div className="flex items-center gap-3">
             <div className="w-8 h-8 rounded-full bg-primary/20 flex items-center justify-center">
               <User className="w-4 h-4 text-primary" />
@@ -130,6 +130,7 @@ export function AuthConnectionSettings({
           <button
             onClick={handleLogout}
             className="flex items-center gap-1.5 px-3 py-1.5 bg-destructive/10 hover:bg-destructive/20 text-destructive text-xs rounded-md transition-colors"
+            data-ui-id="settings-authconnection-signout-btn"
           >
             <LogOut className="w-3.5 h-3.5" />
             Sign Out
@@ -146,7 +147,7 @@ export function AuthConnectionSettings({
       )}
 
       {/* Runner Name */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-authconnection-runner-identity-section">
         <div className="flex items-center gap-2">
           <Tag className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Runner Identity</h4>
@@ -165,6 +166,7 @@ export function AuthConnectionSettings({
               onChange={(e) => handleRunnerNameChange(e.target.value)}
               placeholder="My Runner"
               className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              data-ui-id="settings-authconnection-runner-name-input"
             />
           </label>
         </div>
@@ -172,7 +174,7 @@ export function AuthConnectionSettings({
 
       {/* Project Selection */}
       {projects.length > 0 && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-authconnection-project-section">
           <div className="flex items-center gap-2">
             <Cloud className="w-4 h-4 text-primary" />
             <h4 className="font-medium text-sm">Select Project</h4>
@@ -191,6 +193,7 @@ export function AuthConnectionSettings({
                 className={`w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md flex items-center justify-between gap-2 text-left transition-colors ${
                   connected ? "opacity-60 cursor-default" : "hover:bg-muted cursor-pointer"
                 }`}
+                data-ui-id="settings-authconnection-project-select-btn"
               >
                 <span className={selectedProjectId ? "" : "text-muted-foreground"}>
                   {selectedProjectId
@@ -236,7 +239,7 @@ export function AuthConnectionSettings({
       )}
 
       {/* Connection Controls */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-authconnection-connection-section">
         <div className="flex items-center gap-2">
           <Wifi className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Connection Status</h4>
@@ -283,6 +286,7 @@ export function AuthConnectionSettings({
               onClick={connect}
               disabled={connecting || !connectionInfo || !selectedProjectId}
               className="px-4 py-1.5 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              data-ui-id="settings-authconnection-connect-btn"
             >
               {connecting ? (
                 <>
@@ -300,6 +304,7 @@ export function AuthConnectionSettings({
             <button
               onClick={disconnect}
               className="px-3 py-1.5 bg-destructive text-destructive-foreground rounded-md text-sm hover:bg-destructive/90 transition-colors"
+              data-ui-id="settings-authconnection-disconnect-btn"
             >
               Disconnect
             </button>

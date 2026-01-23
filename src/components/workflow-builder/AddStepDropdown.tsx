@@ -15,6 +15,7 @@ import {
   FileCode,
   Navigation,
   GitBranch,
+  Layers,
   MousePointer2,
   MousePointerClick,
   MousePointer,
@@ -53,19 +54,47 @@ type CategoryId =
   | "verification"
   | "agentic"
   | "completion"
+  // GUI actions for all non-agentic phases
   | "gui_actions_setup"
   | "gui_actions_verification"
+  | "gui_actions_completion"
+  // API requests for all non-agentic phases
   | "api_setup"
   | "api_verification"
   | "api_completion"
+  // Prompts for all phases
   | "prompt_setup"
   | "prompt_verification"
   | "prompt_agentic"
   | "prompt_completion"
+  // Shell commands for all non-agentic phases
   | "shell_command_setup"
+  | "shell_command_verification"
   | "shell_command_completion"
-  | "tests"
-  | "checks";
+  // Tests for all non-agentic phases
+  | "tests_setup"
+  | "tests_verification"
+  | "tests_completion"
+  // Checks for all non-agentic phases
+  | "checks_setup"
+  | "checks_verification"
+  | "checks_completion"
+  // Macros for all non-agentic phases
+  | "macros_setup"
+  | "macros_verification"
+  | "macros_completion"
+  // Workflows for all non-agentic phases
+  | "workflows_setup"
+  | "workflows_verification"
+  | "workflows_completion"
+  // States for all non-agentic phases
+  | "states_setup"
+  | "states_verification"
+  | "states_completion"
+  // MCP for all non-agentic phases
+  | "mcp_setup"
+  | "mcp_verification"
+  | "mcp_completion";
 
 // =============================================================================
 // Icon Mapping
@@ -75,6 +104,7 @@ const ICON_MAP: Record<string, React.ElementType> = {
   FileCode,
   Navigation,
   GitBranch,
+  Layers,
   MousePointer2,
   MousePointerClick,
   MousePointer,
@@ -107,9 +137,9 @@ const getColorClass = (color: string): string => {
     emerald: "text-emerald-400",
     blue: "text-blue-400",
     purple: "text-purple-400",
+    pink: "text-pink-400",
     orange: "text-orange-400",
     green: "text-green-400",
-    pink: "text-pink-400",
     amber: "text-amber-400",
     cyan: "text-cyan-400",
     violet: "text-violet-400",
@@ -139,6 +169,22 @@ interface AddStepDropdownProps {
   onOpenPromptLibrary?: (phase: WorkflowPhase) => void;
   /** Called to open the shell command library picker (phase is passed) */
   onOpenShellCommandLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the check library picker (phase is passed) */
+  onOpenCheckLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the check group library picker (phase is passed) */
+  onOpenCheckGroupLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the macro library picker (phase is passed) */
+  onOpenMacroLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the playwright script library picker (phase is passed) */
+  onOpenPlaywrightScriptLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the test library picker (phase is passed) */
+  onOpenTestLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the workflow library picker (phase is passed) */
+  onOpenWorkflowLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the state library picker (phase is passed) */
+  onOpenStateLibrary?: (phase: WorkflowPhase) => void;
+  /** Called to open the MCP server tool picker (phase is passed) */
+  onOpenMcpServerToolPicker?: (phase: WorkflowPhase) => void;
 }
 
 export function AddStepDropdown({
@@ -150,6 +196,14 @@ export function AddStepDropdown({
   onOpenCurlImport,
   onOpenPromptLibrary,
   onOpenShellCommandLibrary,
+  onOpenCheckLibrary,
+  onOpenCheckGroupLibrary,
+  onOpenMacroLibrary,
+  onOpenPlaywrightScriptLibrary,
+  onOpenTestLibrary,
+  onOpenWorkflowLibrary,
+  onOpenStateLibrary,
+  onOpenMcpServerToolPicker,
 }: AddStepDropdownProps) {
   // Navigation state - start at phase level if filterPhase provided
   const [activeCategory, setActiveCategory] = useState<CategoryId>(
@@ -187,24 +241,45 @@ export function AddStepDropdown({
       case "agentic":
       case "completion":
         return "root";
+      // Setup phase submenus
       case "gui_actions_setup":
       case "api_setup":
       case "prompt_setup":
       case "shell_command_setup":
+      case "macros_setup":
+      case "workflows_setup":
+      case "states_setup":
+      case "mcp_setup":
+      case "tests_setup":
+      case "checks_setup":
         return "setup";
+      // Verification phase submenus
       case "gui_actions_verification":
       case "api_verification":
       case "prompt_verification":
+      case "shell_command_verification":
+      case "macros_verification":
+      case "workflows_verification":
+      case "states_verification":
+      case "mcp_verification":
+      case "tests_verification":
+      case "checks_verification":
         return "verification";
+      // Agentic phase submenus
       case "prompt_agentic":
         return "agentic";
+      // Completion phase submenus
+      case "gui_actions_completion":
       case "api_completion":
       case "prompt_completion":
       case "shell_command_completion":
+      case "macros_completion":
+      case "workflows_completion":
+      case "states_completion":
+      case "mcp_completion":
+      case "tests_completion":
+      case "checks_completion":
         return "completion";
-      case "tests":
-      case "checks":
-        return "verification";
       default:
         return "root";
     }
@@ -236,7 +311,7 @@ export function AddStepDropdown({
         step = {
           id,
           type: "state",
-          phase: phase as "setup" | "verification",
+          phase: phase as "setup" | "verification" | "completion",
           name: "Navigate to State",
           state_id: "",
         };
@@ -246,9 +321,19 @@ export function AddStepDropdown({
         step = {
           id,
           type: "workflow_ref",
-          phase: phase as "setup" | "verification",
+          phase: phase as "setup" | "verification" | "completion",
           name: "Run Workflow",
           workflow_id: "",
+        };
+        break;
+
+      case "macro":
+        step = {
+          id,
+          type: "macro",
+          phase: phase as "setup" | "verification" | "completion",
+          name: "Run Macro",
+          macro_id: "",
         };
         break;
 
@@ -256,7 +341,7 @@ export function AddStepDropdown({
         step = {
           id,
           type: "gui_action",
-          phase: phase as "setup" | "verification",
+          phase: phase as "setup" | "verification" | "completion",
           name: guiAction
             ? GUI_ACTION_TYPES.find((g) => g.type === guiAction)?.label || "GUI Action"
             : "Click",
@@ -290,8 +375,8 @@ export function AddStepDropdown({
         step = {
           id,
           type: "test",
-          phase: "verification",
-          name: STEP_TYPES.verification.find((s) => s.type === stepType)?.label || "New Test",
+          phase: phase as "setup" | "verification" | "completion",
+          name: STEP_TYPES[phase].find((s) => s.type === stepType)?.label || "New Test",
           test_type: testTypeMap[stepType] || "custom_command",
           is_critical: true,
         };
@@ -314,8 +399,8 @@ export function AddStepDropdown({
         step = {
           id,
           type: "check",
-          phase: "verification",
-          name: STEP_TYPES.verification.find((s) => s.type === stepType)?.label || "New Check",
+          phase: phase as "setup" | "verification" | "completion",
+          name: STEP_TYPES[phase].find((s) => s.type === stepType)?.label || "New Check",
           check_type: checkTypeMap[stepType] || "custom_command",
           auto_fix: checkTypeMap[stepType] === "format", // Default formatters to auto-fix
           is_blocking: true,
@@ -326,7 +411,7 @@ export function AddStepDropdown({
         step = {
           id,
           type: "screenshot",
-          phase: "verification",
+          phase: phase as "setup" | "verification" | "completion",
           name: "Screenshot",
         };
         break;
@@ -350,11 +435,17 @@ export function AddStepDropdown({
       }
 
       case "shell_command":
+        const shellCommandNames: Record<WorkflowPhase, string> = {
+          setup: "Setup Command",
+          verification: "Verification Command",
+          agentic: "Command",
+          completion: "Completion Command",
+        };
         step = {
           id,
           type: "shell_command",
-          phase: phase as "setup" | "completion",
-          name: phase === "setup" ? "Setup Command" : "Completion Command",
+          phase: phase as "setup" | "verification" | "completion",
+          name: shellCommandNames[phase] || "Shell Command",
           command: "",
           fail_on_error: true,
         };
@@ -492,14 +583,21 @@ export function AddStepDropdown({
         {/* Step items */}
         <div className="max-h-80 overflow-y-auto py-1">
           {steps.map((stepType) => {
-            // GUI Actions get their own submenu
+            // GUI Actions get their own submenu (all non-agentic phases)
             if (stepType.type === "gui_action") {
-              const subCategoryId =
-                phase === "setup" ? "gui_actions_setup" : "gui_actions_verification";
+              const guiActionSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "gui_actions_setup",
+                verification: "gui_actions_verification",
+                agentic: null,
+                completion: "gui_actions_completion",
+              };
+              const subCategoryId = guiActionSubCategories[phase];
+              if (!subCategoryId) return null;
+
               return (
                 <button
                   key={`${stepType.type}-${phase}`}
-                  onClick={() => setActiveCategory(subCategoryId as CategoryId)}
+                  onClick={() => setActiveCategory(subCategoryId)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
                 >
                   <MousePointer2 className="w-4 h-4 text-orange-400" />
@@ -538,14 +636,23 @@ export function AddStepDropdown({
               );
             }
 
-            // Tests get their own submenu (only show once)
+            // Tests get their own submenu (all non-agentic phases)
             if (stepType.type.startsWith("test_")) {
               if (stepType.type !== "test_playwright") return null;
-              const testTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("test_"));
+              const testsSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "tests_setup",
+                verification: "tests_verification",
+                agentic: null,
+                completion: "tests_completion",
+              };
+              const subCategoryId = testsSubCategories[phase];
+              if (!subCategoryId) return null;
+
+              const testTypes = STEP_TYPES[phase].filter((s) => s.type.startsWith("test_"));
               return (
                 <button
-                  key="tests"
-                  onClick={() => setActiveCategory("tests")}
+                  key={`tests-${phase}`}
+                  onClick={() => setActiveCategory(subCategoryId)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
                 >
                   <TestTube2 className="w-4 h-4 text-green-400" />
@@ -559,17 +666,23 @@ export function AddStepDropdown({
               );
             }
 
-            // Skip other test types (they're grouped)
-            if (stepType.type.startsWith("test_")) return null;
-
-            // Checks get their own submenu (only show once)
+            // Checks get their own submenu (all non-agentic phases)
             if (stepType.type.startsWith("check_")) {
               if (stepType.type !== "check_lint") return null;
-              const checkTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("check_"));
+              const checksSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "checks_setup",
+                verification: "checks_verification",
+                agentic: null,
+                completion: "checks_completion",
+              };
+              const subCategoryId = checksSubCategories[phase];
+              if (!subCategoryId) return null;
+
+              const checkTypes = STEP_TYPES[phase].filter((s) => s.type.startsWith("check_"));
               return (
                 <button
-                  key="checks"
-                  onClick={() => setActiveCategory("checks")}
+                  key={`checks-${phase}`}
+                  onClick={() => setActiveCategory(subCategoryId)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
                 >
                   <Shield className="w-4 h-4 text-cyan-400" />
@@ -582,9 +695,6 @@ export function AddStepDropdown({
                 </button>
               );
             }
-
-            // Skip other check types (they're grouped)
-            if (stepType.type.startsWith("check_")) return null;
 
             // Prompts get their own submenu (New or From Library)
             if (stepType.type === "prompt") {
@@ -618,20 +728,20 @@ export function AddStepDropdown({
               );
             }
 
-            // Shell Commands get their own submenu (New or From Library)
+            // Shell Commands get their own submenu (all non-agentic phases)
             if (stepType.type === "shell_command") {
               const shellCommandSubCategories: Record<WorkflowPhase, CategoryId | null> = {
                 setup: "shell_command_setup",
-                verification: null, // Shell commands not in verification phase
-                agentic: null, // Shell commands not in agentic phase
+                verification: "shell_command_verification",
+                agentic: null,
                 completion: "shell_command_completion",
               };
               const subCategoryId = shellCommandSubCategories[phase];
-              if (!subCategoryId) return null; // Skip if not applicable to this phase
+              if (!subCategoryId) return null;
 
               const shellCommandLabels: Record<WorkflowPhase, string> = {
                 setup: "Setup Command",
-                verification: "",
+                verification: "Verification Command",
                 agentic: "",
                 completion: "Completion Command",
               };
@@ -641,10 +751,122 @@ export function AddStepDropdown({
                   onClick={() => setActiveCategory(subCategoryId)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
                 >
-                  <Terminal className="w-4 h-4 text-violet-400" />
+                  <Terminal className="w-4 h-4 text-gray-400" />
                   <div className="flex-1 min-w-0">
                     <div className="font-medium text-zinc-200">{shellCommandLabels[phase]}</div>
                     <div className="text-xs text-zinc-500">New command or from library</div>
+                  </div>
+                  <span className="text-xs text-zinc-500">2</span>
+                  <ChevronRight className="w-4 h-4 text-zinc-500 group-hover:text-zinc-300 transition-colors" />
+                </button>
+              );
+            }
+
+            // Macros get their own submenu (From Library or New)
+            if (stepType.type === "macro") {
+              const macroSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "macros_setup",
+                verification: "macros_verification",
+                agentic: null,
+                completion: "macros_completion",
+              };
+              const subCategoryId = macroSubCategories[phase];
+              if (!subCategoryId) return null;
+
+              return (
+                <button
+                  key={`${stepType.type}-${phase}`}
+                  onClick={() => setActiveCategory(subCategoryId)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
+                >
+                  <Layers className="w-4 h-4 text-emerald-400" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-zinc-200">Macros</div>
+                    <div className="text-xs text-zinc-500">Run recorded action sequences</div>
+                  </div>
+                  <span className="text-xs text-zinc-500">2</span>
+                  <ChevronRight className="w-4 h-4 text-zinc-500 group-hover:text-zinc-300 transition-colors" />
+                </button>
+              );
+            }
+
+            // Workflow references get their own submenu
+            if (stepType.type === "workflow_ref") {
+              const workflowSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "workflows_setup",
+                verification: "workflows_verification",
+                agentic: null,
+                completion: "workflows_completion",
+              };
+              const subCategoryId = workflowSubCategories[phase];
+              if (!subCategoryId) return null;
+
+              return (
+                <button
+                  key={`${stepType.type}-${phase}`}
+                  onClick={() => setActiveCategory(subCategoryId)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
+                >
+                  <GitBranch className="w-4 h-4 text-blue-400" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-zinc-200">Run Workflow</div>
+                    <div className="text-xs text-zinc-500">Execute another workflow as a step</div>
+                  </div>
+                  <span className="text-xs text-zinc-500">2</span>
+                  <ChevronRight className="w-4 h-4 text-zinc-500 group-hover:text-zinc-300 transition-colors" />
+                </button>
+              );
+            }
+
+            // State navigation gets its own submenu
+            if (stepType.type === "state") {
+              const stateSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "states_setup",
+                verification: "states_verification",
+                agentic: null,
+                completion: "states_completion",
+              };
+              const subCategoryId = stateSubCategories[phase];
+              if (!subCategoryId) return null;
+
+              return (
+                <button
+                  key={`${stepType.type}-${phase}`}
+                  onClick={() => setActiveCategory(subCategoryId)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
+                >
+                  <Navigation className="w-4 h-4 text-purple-400" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-zinc-200">Navigate to State</div>
+                    <div className="text-xs text-zinc-500">Go to a specific application state</div>
+                  </div>
+                  <span className="text-xs text-zinc-500">2</span>
+                  <ChevronRight className="w-4 h-4 text-zinc-500 group-hover:text-zinc-300 transition-colors" />
+                </button>
+              );
+            }
+
+            // MCP calls get their own submenu
+            if (stepType.type === "mcp_call") {
+              const mcpSubCategories: Record<WorkflowPhase, CategoryId | null> = {
+                setup: "mcp_setup",
+                verification: "mcp_verification",
+                agentic: null,
+                completion: "mcp_completion",
+              };
+              const subCategoryId = mcpSubCategories[phase];
+              if (!subCategoryId) return null;
+
+              return (
+                <button
+                  key={`${stepType.type}-${phase}`}
+                  onClick={() => setActiveCategory(subCategoryId)}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors group"
+                >
+                  <Plug className="w-4 h-4 text-indigo-400" />
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-zinc-200">MCP Call</div>
+                    <div className="text-xs text-zinc-500">Call a tool on an MCP server</div>
                   </div>
                   <span className="text-xs text-zinc-500">2</span>
                   <ChevronRight className="w-4 h-4 text-zinc-500 group-hover:text-zinc-300 transition-colors" />
@@ -717,9 +939,7 @@ export function AddStepDropdown({
   // Render: Tests Submenu
   // =============================================================================
 
-  const renderTestsMenu = () => {
-    const testTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("test_"));
-
+  const renderTestsMenu = (phase: WorkflowPhase) => {
     return (
       <div className="py-1">
         {/* Header with back button */}
@@ -732,24 +952,43 @@ export function AddStepDropdown({
           <span className="text-zinc-200">Tests</span>
         </button>
 
-        {/* Test type items */}
-        <div className="max-h-80 overflow-y-auto py-1">
-          {testTypes.map((testType) => {
-            const TestIcon = ICON_MAP[testType.icon] || TestTube2;
-            return (
-              <button
-                key={testType.type}
-                onClick={() => handleStepClick(testType.type, "verification")}
-                className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
-              >
-                <TestIcon className="w-4 h-4 text-green-400" />
-                <div className="flex-1 min-w-0">
-                  <div className="font-medium text-zinc-200">{testType.label}</div>
-                  <div className="text-xs text-zinc-500">{testType.description}</div>
-                </div>
-              </button>
-            );
-          })}
+        {/* Test options */}
+        <div className="py-1">
+          {/* From Test Library - select a saved test */}
+          <button
+            onClick={() => {
+              if (onOpenTestLibrary) {
+                onOpenTestLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenTestLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Library className="w-4 h-4 text-green-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">From Test Library</div>
+              <div className="text-xs text-zinc-500">Select a saved test from Test Builder</div>
+            </div>
+          </button>
+
+          {/* Playwright Script Library - for backwards compatibility */}
+          <button
+            onClick={() => {
+              if (onOpenPlaywrightScriptLibrary) {
+                onOpenPlaywrightScriptLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenPlaywrightScriptLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Code className="w-4 h-4 text-green-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">Playwright Script Library</div>
+              <div className="text-xs text-zinc-500">Select a saved Playwright script</div>
+            </div>
+          </button>
         </div>
       </div>
     );
@@ -759,9 +998,7 @@ export function AddStepDropdown({
   // Render: Checks Submenu
   // =============================================================================
 
-  const renderChecksMenu = () => {
-    const checkTypes = STEP_TYPES.verification.filter((s) => s.type.startsWith("check_"));
-
+  const renderChecksMenu = (phase: WorkflowPhase) => {
     return (
       <div className="py-1">
         {/* Header with back button */}
@@ -774,24 +1011,282 @@ export function AddStepDropdown({
           <span className="text-zinc-200">Checks</span>
         </button>
 
-        {/* Check type items */}
-        <div className="max-h-80 overflow-y-auto py-1">
-          {checkTypes.map((checkType) => {
-            const CheckIcon = ICON_MAP[checkType.icon] || Shield;
-            return (
-              <button
-                key={checkType.type}
-                onClick={() => handleStepClick(checkType.type, "verification")}
-                className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
-              >
-                <CheckIcon className="w-4 h-4 text-cyan-400" />
-                <div className="flex-1 min-w-0">
-                  <div className="font-medium text-zinc-200">{checkType.label}</div>
-                  <div className="text-xs text-zinc-500">{checkType.description}</div>
-                </div>
-              </button>
-            );
-          })}
+        {/* Check options */}
+        <div className="py-1">
+          {/* From Library - select a saved check */}
+          <button
+            onClick={() => {
+              if (onOpenCheckLibrary) {
+                onOpenCheckLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenCheckLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Library className="w-4 h-4 text-cyan-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">From Library</div>
+              <div className="text-xs text-zinc-500">Select a saved check from Check Builder</div>
+            </div>
+          </button>
+
+          {/* Check Group - run all checks in a group */}
+          <button
+            onClick={() => {
+              if (onOpenCheckGroupLibrary) {
+                onOpenCheckGroupLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenCheckGroupLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Layers className="w-4 h-4 text-cyan-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">Check Group</div>
+              <div className="text-xs text-zinc-500">Run all checks in a saved group</div>
+            </div>
+          </button>
+
+          {/* Divider */}
+          <div className="border-t border-zinc-700 my-1" />
+
+          {/* New Custom Check - for quick inline check */}
+          <button
+            onClick={() => handleStepClick("check_custom", phase)}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
+          >
+            <Plus className="w-4 h-4 text-zinc-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">New Custom Check</div>
+              <div className="text-xs text-zinc-500">Create an inline check with a custom command</div>
+            </div>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // =============================================================================
+  // Render: Macros Submenu
+  // =============================================================================
+
+  const renderMacrosMenu = (phase: WorkflowPhase) => {
+    return (
+      <div className="py-1">
+        {/* Header with back button */}
+        <button
+          onClick={navigateBack}
+          className="w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium border-b border-zinc-700 hover:bg-zinc-700/30 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4 text-zinc-400" />
+          <Layers className="w-4 h-4 text-emerald-400" />
+          <span className="text-zinc-200">Macros</span>
+        </button>
+
+        {/* Macro options */}
+        <div className="py-1">
+          {/* From Library - select a saved macro */}
+          <button
+            onClick={() => {
+              if (onOpenMacroLibrary) {
+                onOpenMacroLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenMacroLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Library className="w-4 h-4 text-emerald-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">From Library</div>
+              <div className="text-xs text-zinc-500">Select a saved macro from Macro Manager</div>
+            </div>
+          </button>
+
+          {/* Divider */}
+          <div className="border-t border-zinc-700 my-1" />
+
+          {/* New Macro - create inline */}
+          <button
+            onClick={() => handleStepClick("macro", phase)}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
+          >
+            <Plus className="w-4 h-4 text-zinc-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">New Inline Macro</div>
+              <div className="text-xs text-zinc-500">Create a new macro step inline</div>
+            </div>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // =============================================================================
+  // Render: Workflows Submenu
+  // =============================================================================
+
+  const renderWorkflowsMenu = (phase: WorkflowPhase) => {
+    return (
+      <div className="py-1">
+        {/* Header with back button */}
+        <button
+          onClick={navigateBack}
+          className="w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium border-b border-zinc-700 hover:bg-zinc-700/30 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4 text-zinc-400" />
+          <GitBranch className="w-4 h-4 text-blue-400" />
+          <span className="text-zinc-200">Run Workflow</span>
+        </button>
+
+        {/* Workflow options */}
+        <div className="py-1">
+          {/* From Library - select a saved workflow */}
+          <button
+            onClick={() => {
+              if (onOpenWorkflowLibrary) {
+                onOpenWorkflowLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenWorkflowLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Library className="w-4 h-4 text-blue-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">From Library</div>
+              <div className="text-xs text-zinc-500">Select a saved workflow to run</div>
+            </div>
+          </button>
+
+          {/* Divider */}
+          <div className="border-t border-zinc-700 my-1" />
+
+          {/* New inline workflow ref */}
+          <button
+            onClick={() => handleStepClick("workflow_ref", phase)}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
+          >
+            <Plus className="w-4 h-4 text-zinc-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">New Inline Reference</div>
+              <div className="text-xs text-zinc-500">Create a workflow reference manually</div>
+            </div>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // =============================================================================
+  // Render: States Submenu
+  // =============================================================================
+
+  const renderStatesMenu = (phase: WorkflowPhase) => {
+    return (
+      <div className="py-1">
+        {/* Header with back button */}
+        <button
+          onClick={navigateBack}
+          className="w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium border-b border-zinc-700 hover:bg-zinc-700/30 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4 text-zinc-400" />
+          <Navigation className="w-4 h-4 text-purple-400" />
+          <span className="text-zinc-200">Navigate to State</span>
+        </button>
+
+        {/* State options */}
+        <div className="py-1">
+          {/* From Library - select a state */}
+          <button
+            onClick={() => {
+              if (onOpenStateLibrary) {
+                onOpenStateLibrary(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenStateLibrary}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Library className="w-4 h-4 text-purple-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">From State Machine</div>
+              <div className="text-xs text-zinc-500">Select a state from the loaded config</div>
+            </div>
+          </button>
+
+          {/* Divider */}
+          <div className="border-t border-zinc-700 my-1" />
+
+          {/* New inline state step */}
+          <button
+            onClick={() => handleStepClick("state", phase)}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
+          >
+            <Plus className="w-4 h-4 text-zinc-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">New Inline State</div>
+              <div className="text-xs text-zinc-500">Enter a state ID manually</div>
+            </div>
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // =============================================================================
+  // Render: MCP Calls Submenu
+  // =============================================================================
+
+  const renderMcpMenu = (phase: WorkflowPhase) => {
+    return (
+      <div className="py-1">
+        {/* Header with back button */}
+        <button
+          onClick={navigateBack}
+          className="w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium border-b border-zinc-700 hover:bg-zinc-700/30 transition-colors"
+        >
+          <ArrowLeft className="w-4 h-4 text-zinc-400" />
+          <Plug className="w-4 h-4 text-indigo-400" />
+          <span className="text-zinc-200">MCP Call</span>
+        </button>
+
+        {/* MCP options */}
+        <div className="py-1">
+          {/* From configured servers */}
+          <button
+            onClick={() => {
+              if (onOpenMcpServerToolPicker) {
+                onOpenMcpServerToolPicker(phase);
+                onClose();
+              }
+            }}
+            disabled={!onOpenMcpServerToolPicker}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Library className="w-4 h-4 text-indigo-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">From Configured Servers</div>
+              <div className="text-xs text-zinc-500">Select an MCP server and tool</div>
+            </div>
+          </button>
+
+          {/* Divider */}
+          <div className="border-t border-zinc-700 my-1" />
+
+          {/* New inline MCP call */}
+          <button
+            onClick={() => handleStepClick("mcp_call", phase)}
+            className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
+          >
+            <Plus className="w-4 h-4 text-zinc-400" />
+            <div className="flex-1 min-w-0">
+              <div className="font-medium text-zinc-200">New Inline MCP Call</div>
+              <div className="text-xs text-zinc-500">Enter server and tool details manually</div>
+            </div>
+          </button>
         </div>
       </div>
     );
@@ -933,7 +1428,7 @@ export function AddStepDropdown({
   const renderShellCommandMenu = (phase: WorkflowPhase) => {
     const shellCommandLabels: Record<WorkflowPhase, string> = {
       setup: "Setup Command",
-      verification: "",
+      verification: "Verification Command",
       agentic: "",
       completion: "Completion Command",
     };
@@ -946,7 +1441,7 @@ export function AddStepDropdown({
           className="w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium border-b border-zinc-700 hover:bg-zinc-700/30 transition-colors"
         >
           <ArrowLeft className="w-4 h-4 text-zinc-400" />
-          <Terminal className="w-4 h-4 text-violet-400" />
+          <Terminal className="w-4 h-4 text-gray-400" />
           <span className="text-zinc-200">{shellCommandLabels[phase]}</span>
         </button>
 
@@ -957,7 +1452,7 @@ export function AddStepDropdown({
             onClick={() => handleStepClick("shell_command", phase)}
             className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors"
           >
-            <Plus className="w-4 h-4 text-violet-400" />
+            <Plus className="w-4 h-4 text-gray-400" />
             <div className="flex-1 min-w-0">
               <div className="font-medium text-zinc-200">New Command</div>
               <div className="text-xs text-zinc-500">Create a new shell command</div>
@@ -975,7 +1470,7 @@ export function AddStepDropdown({
             disabled={!onOpenShellCommandLibrary}
             className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-left hover:bg-zinc-700/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            <Library className="w-4 h-4 text-violet-400" />
+            <Library className="w-4 h-4 text-gray-400" />
             <div className="flex-1 min-w-0">
               <div className="font-medium text-zinc-200">From Library</div>
               <div className="text-xs text-zinc-500">Use a saved shell command</div>
@@ -1002,20 +1497,42 @@ export function AddStepDropdown({
         return renderPhaseMenu("agentic");
       case "completion":
         return renderPhaseMenu("completion");
+      // GUI Actions
       case "gui_actions_setup":
         return renderGuiActionsMenu("setup");
       case "gui_actions_verification":
         return renderGuiActionsMenu("verification");
+      case "gui_actions_completion":
+        return renderGuiActionsMenu("completion");
+      // API Requests
       case "api_setup":
         return renderApiMenu("setup");
       case "api_verification":
         return renderApiMenu("verification");
       case "api_completion":
         return renderApiMenu("completion");
-      case "tests":
-        return renderTestsMenu();
-      case "checks":
-        return renderChecksMenu();
+      // Tests
+      case "tests_setup":
+        return renderTestsMenu("setup");
+      case "tests_verification":
+        return renderTestsMenu("verification");
+      case "tests_completion":
+        return renderTestsMenu("completion");
+      // Checks
+      case "checks_setup":
+        return renderChecksMenu("setup");
+      case "checks_verification":
+        return renderChecksMenu("verification");
+      case "checks_completion":
+        return renderChecksMenu("completion");
+      // Macros
+      case "macros_setup":
+        return renderMacrosMenu("setup");
+      case "macros_verification":
+        return renderMacrosMenu("verification");
+      case "macros_completion":
+        return renderMacrosMenu("completion");
+      // Prompts
       case "prompt_setup":
         return renderPromptMenu("setup");
       case "prompt_verification":
@@ -1024,10 +1541,34 @@ export function AddStepDropdown({
         return renderPromptMenu("agentic");
       case "prompt_completion":
         return renderPromptMenu("completion");
+      // Shell Commands
       case "shell_command_setup":
         return renderShellCommandMenu("setup");
+      case "shell_command_verification":
+        return renderShellCommandMenu("verification");
       case "shell_command_completion":
         return renderShellCommandMenu("completion");
+      // Workflows
+      case "workflows_setup":
+        return renderWorkflowsMenu("setup");
+      case "workflows_verification":
+        return renderWorkflowsMenu("verification");
+      case "workflows_completion":
+        return renderWorkflowsMenu("completion");
+      // States
+      case "states_setup":
+        return renderStatesMenu("setup");
+      case "states_verification":
+        return renderStatesMenu("verification");
+      case "states_completion":
+        return renderStatesMenu("completion");
+      // MCP Calls
+      case "mcp_setup":
+        return renderMcpMenu("setup");
+      case "mcp_verification":
+        return renderMcpMenu("verification");
+      case "mcp_completion":
+        return renderMcpMenu("completion");
       default:
         return renderRootMenu();
     }

@@ -20,6 +20,8 @@ export { WidgetHeader } from "./WidgetHeader";
 export { ControlBar } from "./ControlBar";
 export { BottomBar } from "./BottomBar";
 export { IdleState } from "./IdleState";
+export { ExecutionStatsCard } from "./ExecutionStatsCard";
+export { TaskListWidget } from "./TaskListWidget";
 
 // Legacy components (may be deprecated in future)
 export { LiveExecutionView } from "./LiveExecutionView";

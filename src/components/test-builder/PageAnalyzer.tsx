@@ -26,6 +26,8 @@ import {
   Check,
   X,
   AlertCircle,
+  Play,
+  RefreshCw,
 } from "lucide-react";
 import { MonitorSelector } from "../MonitorSelector";
 import type {
@@ -35,8 +37,11 @@ import type {
   CollectedAnalysisSet,
   ApiRequestAnalysis,
   AnalysisData,
+  StepOutput,
 } from "./types";
+import { createAnalysisFromStepOutput, isStepOutputAnalysis } from "./types";
 import type { SavedApiRequest } from "../../types";
+import { stepOutputRegistry } from "../../lib/step-output-handlers";
 
 // Script info from the Scripts library API
 interface PlaywrightScript {
@@ -57,16 +62,20 @@ function generateId(): string {
 interface PageAnalyzerProps {
   onAnalysisComplete: (analysis: AnalysisData) => void;
   onError?: (error: string) => void;
+  /** Initial analyses to restore when component mounts (e.g., from parent state) */
+  initialAnalyses?: CollectedAnalysis[];
 }
 
-export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps) {
-  // Collected analyses
-  const [analyses, setAnalyses] = useState<CollectedAnalysis[]>([]);
+export function PageAnalyzer({ onAnalysisComplete, onError, initialAnalyses }: PageAnalyzerProps) {
+  // Collected analyses - initialize from prop if provided
+  const [analyses, setAnalyses] = useState<CollectedAnalysis[]>(initialAnalyses ?? []);
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   // Add analysis state
   const [showAddMenu, setShowAddMenu] = useState(false);
-  const [addMode, setAddMode] = useState<"playwright" | "vision" | "api_request" | null>(null);
+  const [addMode, setAddMode] = useState<"playwright" | "vision" | "step_output" | null>(null);
+  // Step output sub-mode: select from recent outputs or run a new step
+  const [stepOutputMode, setStepOutputMode] = useState<"recent" | "run_api">("recent");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -83,6 +92,11 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
   const [selectedRequestId, setSelectedRequestId] = useState<string>("");
   const [loadingRequests, setLoadingRequests] = useState(false);
 
+  // Step Output selection
+  const [recentStepOutputs, setRecentStepOutputs] = useState<StepOutput[]>([]);
+  const [selectedStepOutputIds, setSelectedStepOutputIds] = useState<string[]>([]);
+  const [loadingStepOutputs, setLoadingStepOutputs] = useState(false);
+
   // Load Playwright scripts when mode changes
   useEffect(() => {
     if (addMode === "playwright" && playwrightScripts.length === 0) {
@@ -90,12 +104,16 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
     }
   }, [addMode, playwrightScripts.length]);
 
-  // Load API requests when mode changes
+  // Load step outputs and API requests when step_output mode changes
   useEffect(() => {
-    if (addMode === "api_request" && savedRequests.length === 0) {
-      loadSavedRequests();
+    if (addMode === "step_output") {
+      if (stepOutputMode === "recent") {
+        loadRecentStepOutputs();
+      } else if (stepOutputMode === "run_api" && savedRequests.length === 0) {
+        loadSavedRequests();
+      }
     }
-  }, [addMode, savedRequests.length]);
+  }, [addMode, stepOutputMode, savedRequests.length]);
 
   const loadPlaywrightScripts = async () => {
     setLoadingScripts(true);
@@ -130,6 +148,24 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
       console.error("Failed to load saved API requests:", err);
     } finally {
       setLoadingRequests(false);
+    }
+  };
+
+  const loadRecentStepOutputs = async () => {
+    setLoadingStepOutputs(true);
+    try {
+      const response = await fetch(`${API_BASE}/recent-step-outputs`);
+      const result = await response.json();
+      if (result.success && result.data) {
+        setRecentStepOutputs(result.data);
+        setSelectedStepOutputIds([]);
+      }
+    } catch (err) {
+      console.error("Failed to load recent step outputs:", err);
+      // Continue without step outputs - endpoint may not exist yet
+      setRecentStepOutputs([]);
+    } finally {
+      setLoadingStepOutputs(false);
     }
   };
 
@@ -212,7 +248,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
     }
   }, [selectedMonitors]);
 
-  // Run API Request analysis
+  // Run API Request and create step output
   const runApiRequestAnalysis = useCallback(async () => {
     const selectedRequest = savedRequests.find((r) => r.id === selectedRequestId);
     if (!selectedRequest) {
@@ -241,17 +277,23 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
       const response = await fetch(selectedRequest.url, options);
       const data = await response.json();
 
-      const apiAnalysis: ApiRequestAnalysis = {
-        id: generateId(),
-        request_name: selectedRequest.name,
+      const durationMs = Date.now() - startTime;
+      const executedAt = new Date().toISOString();
+      const outputId = generateId();
+
+      // Create as StepOutput (api_request type)
+      const stepOutput: StepOutput = {
+        id: outputId,
+        step_type: "api_request",
+        step_name: selectedRequest.name,
+        executed_at: executedAt,
+        duration_ms: durationMs,
+        success: response.status < 400,
         method: selectedRequest.method,
         url: selectedRequest.url,
-        response: data,
         status_code: response.status,
-        duration_ms: Date.now() - startTime,
-        executed_at: new Date().toISOString(),
-        // Include source config for auto-populating api_request_config in tests
-        source_request_config: {
+        response: data,
+        source_config: {
           method: selectedRequest.method,
           url: selectedRequest.url,
           headers:
@@ -260,14 +302,9 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
           timeout_ms: selectedRequest.timeout_ms,
           follow_redirects: selectedRequest.follow_redirects,
         },
-      };
+      } as StepOutput;
 
-      const newAnalysis: CollectedAnalysis = {
-        type: "api_request",
-        id: apiAnalysis.id,
-        name: selectedRequest.name,
-        data: apiAnalysis,
-      };
+      const newAnalysis = createAnalysisFromStepOutput(stepOutput);
       setAnalyses((prev) => [...prev, newAnalysis]);
       setAddMode(null);
     } catch (err) {
@@ -276,6 +313,28 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
       setIsAnalyzing(false);
     }
   }, [selectedRequestId, savedRequests]);
+
+  // Add selected step outputs
+  const addStepOutputs = useCallback(() => {
+    if (selectedStepOutputIds.length === 0) {
+      setError("Please select at least one step output");
+      return;
+    }
+
+    const selectedOutputs = recentStepOutputs.filter((o) => selectedStepOutputIds.includes(o.id));
+    const newAnalyses = selectedOutputs.map((output) => createAnalysisFromStepOutput(output));
+
+    setAnalyses((prev) => [...prev, ...newAnalyses]);
+    setSelectedStepOutputIds([]);
+    setAddMode(null);
+  }, [selectedStepOutputIds, recentStepOutputs]);
+
+  // Toggle step output selection
+  const toggleStepOutputSelection = useCallback((id: string) => {
+    setSelectedStepOutputIds((prev) =>
+      prev.includes(id) ? prev.filter((i) => i !== id) : [...prev, id],
+    );
+  }, []);
 
   // Remove an analysis
   const removeAnalysis = useCallback(
@@ -306,6 +365,28 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
         return "bg-green-500/20 text-green-400";
       case "api_request":
         return "bg-purple-500/20 text-purple-400";
+      case "step_output":
+        return "bg-orange-500/20 text-orange-400";
+    }
+  };
+
+  // Get type label for display
+  const getTypeLabel = (analysis: CollectedAnalysis): string => {
+    if (analysis.type === "step_output") {
+      const stepType = analysis.data.step_type;
+      // Capitalize and clean up step type
+      return stepType
+        .split("_")
+        .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(" ");
+    }
+    switch (analysis.type) {
+      case "playwright":
+        return "Playwright";
+      case "vision":
+        return "Vision";
+      case "api_request":
+        return "API";
     }
   };
 
@@ -313,6 +394,14 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
   const getItemCount = (analysis: CollectedAnalysis): string => {
     if (analysis.type === "playwright" || analysis.type === "vision") {
       return `${analysis.data.elements.length} elements`;
+    }
+    if (analysis.type === "step_output") {
+      const handler = stepOutputRegistry.get(analysis.data.step_type);
+      if (handler) {
+        const fields = handler.getAssertableFields(analysis.data);
+        return `${fields.length} fields`;
+      }
+      return "Step data";
     }
     return "Response data";
   };
@@ -335,6 +424,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
           <button
             onClick={() => setShowAddMenu(!showAddMenu)}
             className="flex items-center gap-1 px-3 py-1.5 text-sm bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+            data-ui-id="test-builder-add-analysis-btn"
           >
             <Plus className="w-4 h-4" />
             Add Analysis
@@ -352,6 +442,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
                     setShowAddMenu(false);
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-700 rounded"
+                  data-ui-id="test-builder-add-playwright-btn"
                 >
                   <Globe className="w-4 h-4 text-blue-400" />
                   Playwright Script
@@ -362,19 +453,22 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
                     setShowAddMenu(false);
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-700 rounded"
+                  data-ui-id="test-builder-add-vision-btn"
                 >
                   <Monitor className="w-4 h-4 text-green-400" />
                   Vision Capture
                 </button>
                 <button
                   onClick={() => {
-                    setAddMode("api_request");
+                    setAddMode("step_output");
+                    setStepOutputMode("recent");
                     setShowAddMenu(false);
                   }}
                   className="w-full flex items-center gap-2 px-3 py-2 text-sm text-neutral-300 hover:bg-neutral-700 rounded"
+                  data-ui-id="test-builder-add-step-output-btn"
                 >
-                  <Network className="w-4 h-4 text-purple-400" />
-                  API Request
+                  <Play className="w-4 h-4 text-orange-400" />
+                  Run Step
                 </button>
               </div>
             </div>
@@ -389,7 +483,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
             <h4 className="text-sm font-medium text-neutral-200">
               {addMode === "playwright" && "Add Playwright Analysis"}
               {addMode === "vision" && "Add Vision Analysis"}
-              {addMode === "api_request" && "Add API Request Analysis"}
+              {addMode === "step_output" && "Run Step"}
             </h4>
             <button
               onClick={() => {
@@ -442,30 +536,144 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
             </div>
           )}
 
-          {/* API Request Options */}
-          {addMode === "api_request" && (
+          {/* Step Output Options */}
+          {addMode === "step_output" && (
             <div className="space-y-3">
-              {loadingRequests ? (
-                <div className="flex items-center gap-2 text-sm text-neutral-500">
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Loading API requests...
-                </div>
-              ) : savedRequests.length === 0 ? (
-                <p className="text-sm text-neutral-400">
-                  No saved API requests found. Create one in the Library tab first.
-                </p>
-              ) : (
-                <select
-                  value={selectedRequestId}
-                  onChange={(e) => setSelectedRequestId(e.target.value)}
-                  className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
+              {/* Mode selector tabs */}
+              <div className="flex gap-1 p-1 bg-neutral-900 rounded-lg">
+                <button
+                  onClick={() => setStepOutputMode("recent")}
+                  className={`flex-1 flex items-center justify-center gap-2 px-3 py-1.5 text-xs rounded transition-colors ${
+                    stepOutputMode === "recent"
+                      ? "bg-orange-500/20 text-orange-400"
+                      : "text-neutral-400 hover:text-neutral-200"
+                  }`}
                 >
-                  {savedRequests.map((request) => (
-                    <option key={request.id} value={request.id}>
-                      [{request.method}] {request.name}
-                    </option>
-                  ))}
-                </select>
+                  <RefreshCw className="w-3 h-3" />
+                  Recent Outputs
+                </button>
+                <button
+                  onClick={() => setStepOutputMode("run_api")}
+                  className={`flex-1 flex items-center justify-center gap-2 px-3 py-1.5 text-xs rounded transition-colors ${
+                    stepOutputMode === "run_api"
+                      ? "bg-orange-500/20 text-orange-400"
+                      : "text-neutral-400 hover:text-neutral-200"
+                  }`}
+                >
+                  <Network className="w-3 h-3" />
+                  Run API Request
+                </button>
+              </div>
+
+              {/* Recent outputs sub-panel */}
+              {stepOutputMode === "recent" && (
+                <>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-neutral-400">
+                      Select step outputs from recent workflow execution
+                    </span>
+                    <button
+                      onClick={loadRecentStepOutputs}
+                      disabled={loadingStepOutputs}
+                      className="flex items-center gap-1 px-2 py-1 text-xs text-neutral-400 hover:text-neutral-200 transition-colors"
+                    >
+                      <RefreshCw
+                        className={`w-3 h-3 ${loadingStepOutputs ? "animate-spin" : ""}`}
+                      />
+                      Refresh
+                    </button>
+                  </div>
+
+                  {loadingStepOutputs ? (
+                    <div className="flex items-center gap-2 text-sm text-neutral-500">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Loading step outputs...
+                    </div>
+                  ) : recentStepOutputs.length === 0 ? (
+                    <p className="text-sm text-neutral-400">
+                      No recent step outputs found. Run a workflow first.
+                    </p>
+                  ) : (
+                    <div className="max-h-60 overflow-y-auto space-y-1">
+                      {recentStepOutputs.map((output) => (
+                        <label
+                          key={output.id}
+                          className={`flex items-center gap-3 p-2 rounded cursor-pointer transition-colors ${
+                            selectedStepOutputIds.includes(output.id)
+                              ? "bg-orange-500/20 border border-orange-500/50"
+                              : "bg-neutral-900 border border-neutral-700 hover:border-neutral-600"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedStepOutputIds.includes(output.id)}
+                            onChange={() => toggleStepOutputSelection(output.id)}
+                            className="sr-only"
+                          />
+                          <div
+                            className={`w-4 h-4 rounded border flex items-center justify-center ${
+                              selectedStepOutputIds.includes(output.id)
+                                ? "bg-orange-500 border-orange-500"
+                                : "border-neutral-600"
+                            }`}
+                          >
+                            {selectedStepOutputIds.includes(output.id) && (
+                              <Check className="w-3 h-3 text-white" />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm text-neutral-200 truncate">
+                                {output.step_name}
+                              </span>
+                              <span className="text-xs px-1.5 py-0.5 bg-neutral-700 text-neutral-400 rounded">
+                                {output.step_type}
+                              </span>
+                            </div>
+                            <div className="text-xs text-neutral-500 flex items-center gap-2">
+                              <span>{output.success ? "Success" : "Failed"}</span>
+                              {output.duration_ms && <span>{output.duration_ms}ms</span>}
+                            </div>
+                          </div>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+
+                  {selectedStepOutputIds.length > 0 && (
+                    <div className="text-xs text-orange-400">
+                      {selectedStepOutputIds.length} output(s) selected
+                    </div>
+                  )}
+                </>
+              )}
+
+              {/* Run API Request sub-panel */}
+              {stepOutputMode === "run_api" && (
+                <>
+                  {loadingRequests ? (
+                    <div className="flex items-center gap-2 text-sm text-neutral-500">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Loading API requests...
+                    </div>
+                  ) : savedRequests.length === 0 ? (
+                    <p className="text-sm text-neutral-400">
+                      No saved API requests found. Create one in the Library tab first.
+                    </p>
+                  ) : (
+                    <select
+                      value={selectedRequestId}
+                      onChange={(e) => setSelectedRequestId(e.target.value)}
+                      className="w-full px-3 py-2 bg-neutral-900 border border-neutral-700 rounded text-sm text-neutral-200 focus:outline-none focus:border-blue-500"
+                    >
+                      {savedRequests.map((request) => (
+                        <option key={request.id} value={request.id}>
+                          [{request.method}] {request.name}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                </>
               )}
             </div>
           )}
@@ -483,19 +691,36 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
             onClick={() => {
               if (addMode === "playwright") runPlaywrightAnalysis();
               else if (addMode === "vision") runVisionAnalysis();
-              else if (addMode === "api_request") runApiRequestAnalysis();
+              else if (addMode === "step_output") {
+                if (stepOutputMode === "recent") addStepOutputs();
+                else if (stepOutputMode === "run_api") runApiRequestAnalysis();
+              }
             }}
             disabled={
               isAnalyzing ||
               (addMode === "playwright" && !selectedScriptId) ||
-              (addMode === "api_request" && !selectedRequestId)
+              (addMode === "step_output" &&
+                stepOutputMode === "recent" &&
+                selectedStepOutputIds.length === 0) ||
+              (addMode === "step_output" && stepOutputMode === "run_api" && !selectedRequestId)
             }
             className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            data-ui-id="test-builder-run-analysis-btn"
           >
             {isAnalyzing ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin" />
-                Analyzing...
+                {stepOutputMode === "run_api" ? "Running..." : "Analyzing..."}
+              </>
+            ) : addMode === "step_output" && stepOutputMode === "recent" ? (
+              <>
+                <Plus className="w-4 h-4" />
+                Add Selected Outputs
+              </>
+            ) : addMode === "step_output" && stepOutputMode === "run_api" ? (
+              <>
+                <Play className="w-4 h-4" />
+                Run & Collect Output
               </>
             ) : (
               <>
@@ -533,9 +758,7 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
                 <span
                   className={`px-2 py-0.5 text-xs font-medium rounded ${getTypeBadge(analysis.type)}`}
                 >
-                  {analysis.type === "playwright" && "Playwright"}
-                  {analysis.type === "vision" && "Vision"}
-                  {analysis.type === "api_request" && "API"}
+                  {getTypeLabel(analysis)}
                 </span>
                 <span className="text-sm text-neutral-200 truncate">{analysis.name}</span>
                 <span className="text-xs text-neutral-400">{getItemCount(analysis)}</span>
@@ -621,6 +844,111 @@ export function PageAnalyzer({ onAnalysisComplete, onError }: PageAnalyzerProps)
                         <pre className="text-xs text-neutral-300 font-mono whitespace-pre-wrap">
                           {JSON.stringify(analysis.data.response, null, 2)}
                         </pre>
+                      </div>
+                    </div>
+                  )}
+
+                  {analysis.type === "step_output" && (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-4 text-xs text-neutral-400">
+                        <span className="font-mono">{analysis.data.step_type}</span>
+                        <span
+                          className={
+                            analysis.data.success ? "text-green-400" : "text-red-400"
+                          }
+                        >
+                          {analysis.data.success ? "Success" : "Failed"}
+                        </span>
+                        {analysis.data.duration_ms && (
+                          <span>{analysis.data.duration_ms}ms</span>
+                        )}
+                        <span>
+                          Executed: {new Date(analysis.data.executed_at).toLocaleString()}
+                        </span>
+                      </div>
+
+                      {/* API Request specific info */}
+                      {analysis.data.step_type === "api_request" && (
+                        <div className="flex items-center gap-4 text-xs text-neutral-400">
+                          <span className="font-mono font-semibold text-blue-400">
+                            {(analysis.data as { method?: string }).method}
+                          </span>
+                          <span className="truncate text-neutral-300">
+                            {(analysis.data as { url?: string }).url}
+                          </span>
+                          {(analysis.data as { status_code?: number }).status_code && (
+                            <span
+                              className={
+                                ((analysis.data as { status_code?: number }).status_code ?? 0) < 400
+                                  ? "text-green-400"
+                                  : "text-red-400"
+                              }
+                            >
+                              Status: {(analysis.data as { status_code?: number }).status_code}
+                            </span>
+                          )}
+                        </div>
+                      )}
+
+                      {analysis.data.error && (
+                        <div className="p-2 bg-red-900/30 border border-red-700 rounded text-xs text-red-300">
+                          Error: {analysis.data.error}
+                        </div>
+                      )}
+
+                      {/* Response Data (for API requests) */}
+                      {analysis.data.step_type === "api_request" &&
+                        (analysis.data as { response?: unknown }).response && (
+                          <div className="space-y-1">
+                            <span className="text-xs font-medium text-neutral-300">
+                              Response Data:
+                            </span>
+                            <div className="max-h-64 overflow-auto p-2 bg-neutral-900 rounded border border-neutral-700">
+                              <pre className="text-xs text-neutral-300 font-mono whitespace-pre-wrap">
+                                {JSON.stringify(
+                                  (analysis.data as { response?: unknown }).response,
+                                  null,
+                                  2,
+                                )}
+                              </pre>
+                            </div>
+                          </div>
+                        )}
+
+                      {/* Assertable Fields */}
+                      <div className="space-y-1">
+                        <span className="text-xs font-medium text-neutral-300">
+                          Assertable Fields:
+                        </span>
+                        <div className="max-h-48 overflow-auto">
+                          {(() => {
+                            const handler = stepOutputRegistry.get(analysis.data.step_type);
+                            if (!handler) return null;
+                            const fields = handler.getAssertableFields(analysis.data);
+                            return (
+                              <table className="w-full text-xs">
+                                <thead className="bg-neutral-800">
+                                  <tr>
+                                    <th className="px-2 py-1 text-left text-neutral-400">Field</th>
+                                    <th className="px-2 py-1 text-left text-neutral-400">Type</th>
+                                    <th className="px-2 py-1 text-left text-neutral-400">Value</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {fields.slice(0, 15).map((field, idx) => (
+                                    <tr key={idx} className="border-t border-neutral-700">
+                                      <td className="px-2 py-1 text-neutral-200">{field.name}</td>
+                                      <td className="px-2 py-1 text-neutral-400">{field.type}</td>
+                                      <td className="px-2 py-1 text-neutral-400 truncate max-w-[200px]">
+                                        {String(field.example_value ?? "-")}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            );
+                          })()}
+                        </div>
                       </div>
                     </div>
                   )}

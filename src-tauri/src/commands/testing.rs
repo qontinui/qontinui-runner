@@ -1455,6 +1455,22 @@ pub fn analyze_page_vision(
 // AI Test Generation
 // ========================================================================
 
+/// Reference document for AI test generation context
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReferenceDocument {
+    /// Unique ID for this document
+    pub id: String,
+    /// Display name for the document
+    pub name: String,
+    /// Document type (markdown, text, image, json)
+    #[serde(rename = "type")]
+    pub doc_type: String,
+    /// Document content (text for markdown/text/json, base64 for images)
+    pub content: String,
+    /// Original file name if uploaded
+    pub filename: Option<String>,
+}
+
 /// Input for AI test generation
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateTestInput {
@@ -1468,6 +1484,10 @@ pub struct GenerateTestInput {
     pub multi_request_analysis: Option<serde_json::Value>,
     /// Optional collected analyses (multiple analyses of different types)
     pub collected_analyses: Option<serde_json::Value>,
+    /// Optional reference documents (specs, expected data, images)
+    pub reference_documents: Option<Vec<ReferenceDocument>>,
+    /// Optional workflow run context (data from a previous workflow execution)
+    pub workflow_run_context: Option<serde_json::Value>,
 }
 
 /// Generate test code using AI.
@@ -1475,14 +1495,17 @@ pub struct GenerateTestInput {
 /// Uses the configured AI provider (Claude CLI, Claude API, etc.) to generate
 /// test code from a natural language description and optional page analysis context.
 ///
+/// This command is async to avoid blocking the main thread during AI generation,
+/// which can take a long time and would otherwise cause "Not Responding" on Windows.
+///
 /// # Arguments
 /// * `input` - Generation parameters including prompt and test type
 /// * `state` - Application state containing Python bridge and settings
 #[tauri::command]
-pub fn generate_test_with_ai(
+pub async fn generate_test_with_ai(
     input: GenerateTestInput,
     state: State<'_, Arc<AppState>>,
-) -> CommandResponse {
+) -> Result<CommandResponse, String> {
     use crate::settings;
 
     info!(
@@ -1532,75 +1555,721 @@ pub fn generate_test_with_ai(
         }
     };
 
-    let mut bridge_lock = match state.python_bridge.lock() {
-        Ok(lock) => lock,
+    // Clone state for use in spawn_blocking
+    let app_state = state.inner().clone();
+
+    // Build params before moving into spawn_blocking
+    let params = serde_json::json!({
+        "user_prompt": input.user_prompt,
+        "test_type": input.test_type,
+        "page_analysis": input.page_analysis,
+        "multi_request_analysis": input.multi_request_analysis,
+        "collected_analyses": input.collected_analyses,
+        "reference_documents": input.reference_documents,
+        "workflow_run_context": input.workflow_run_context,
+        "ai_provider": ai_provider,
+        "ai_settings": provider_settings,
+    });
+
+    // Execute in spawn_blocking to avoid blocking the main thread
+    // This prevents "Not Responding" on Windows during AI generation
+    let result = tokio::task::spawn_blocking(move || {
+        let mut bridge_lock = match app_state.python_bridge.lock() {
+            Ok(lock) => lock,
+            Err(e) => {
+                return CommandResponse {
+                    success: false,
+                    message: Some(format!("Failed to acquire lock: {}", e)),
+                    data: None,
+                };
+            }
+        };
+
+        if let Some(ref mut bridge) = *bridge_lock {
+            if !bridge.is_running() {
+                return CommandResponse {
+                    success: false,
+                    message: Some(
+                        "Python executor not running. Please start the executor first.".to_string(),
+                    ),
+                    data: None,
+                };
+            }
+
+            // Use longer timeout for AI generation (can take time)
+            match bridge.send_command_and_wait(
+                "generate_test_with_ai",
+                Some(params),
+                std::time::Duration::from_secs(180),
+            ) {
+                Ok(response) => {
+                    if response.success {
+                        CommandResponse {
+                            success: true,
+                            message: Some("Test generated successfully".to_string()),
+                            data: response.data,
+                        }
+                    } else {
+                        CommandResponse {
+                            success: false,
+                            message: Some(
+                                response
+                                    .error
+                                    .unwrap_or_else(|| "Generation failed".to_string()),
+                            ),
+                            data: None,
+                        }
+                    }
+                }
+                Err(e) => CommandResponse {
+                    success: false,
+                    message: Some(format!("Command failed: {}", e)),
+                    data: None,
+                },
+            }
+        } else {
+            CommandResponse {
+                success: false,
+                message: Some("Python executor not initialized".to_string()),
+                data: None,
+            }
+        }
+    })
+    .await;
+
+    // Handle spawn_blocking result
+    match result {
+        Ok(response) => Ok(response),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Task execution error: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Input for generating test metadata from code
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerateMetadataInput {
+    /// The test code to analyze
+    pub test_code: String,
+    /// The type of test (playwright_cdp, python_script, etc.)
+    pub test_type: String,
+}
+
+/// Generated metadata from test code analysis
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GeneratedMetadata {
+    /// Suggested test name
+    pub name: Option<String>,
+    /// Suggested description
+    pub description: Option<String>,
+    /// Suggested category
+    pub category: Option<String>,
+    /// Suggested tags
+    pub tags: Vec<String>,
+}
+
+/// Generate test metadata by analyzing test code.
+///
+/// Uses local pattern matching to extract meaningful metadata from test code.
+/// This is fast and doesn't require the Python executor or AI provider.
+///
+/// # Arguments
+/// * `test_code` - The test code to analyze
+/// * `test_type` - The type of test (playwright_cdp, python_script, etc.)
+#[tauri::command]
+pub fn generate_test_metadata(input: GenerateMetadataInput) -> CommandResponse {
+    info!(
+        "Generating metadata for {} test ({} chars)",
+        input.test_type,
+        input.test_code.len()
+    );
+
+    let metadata = analyze_test_code(&input.test_code, &input.test_type);
+
+    CommandResponse {
+        success: true,
+        message: Some("Metadata generated from code analysis".to_string()),
+        data: Some(serde_json::to_value(metadata).unwrap_or_default()),
+    }
+}
+
+/// Analyze test code and extract metadata
+fn analyze_test_code(code: &str, test_type: &str) -> GeneratedMetadata {
+    let mut name = None;
+    let mut description = None;
+    let mut category = None;
+    let mut tags = Vec::new();
+
+    match test_type {
+        "playwright_cdp" => {
+            // Extract test name from test('name', ...) or test.describe('name', ...)
+            if let Some(cap) = regex_find(code, r#"test\s*\(\s*['"]([^'"]+)['"]"#) {
+                name = Some(cap);
+            } else if let Some(cap) = regex_find(code, r#"test\.describe\s*\(\s*['"]([^'"]+)['"]"#)
+            {
+                name = Some(cap);
+            }
+
+            // Detect category from patterns
+            if code.contains("toBeVisible") || code.contains("screenshot") {
+                category = Some("visual".to_string());
+                tags.push("ui".to_string());
+            }
+            if code.contains("locator")
+                || code.contains("getByRole")
+                || code.contains("querySelector")
+            {
+                category = category.or(Some("dom".to_string()));
+                tags.push("dom".to_string());
+            }
+            if code.contains("request") || code.contains("response") || code.contains("fetch") {
+                tags.push("network".to_string());
+            }
+            if code.contains("waitFor") || code.contains("expect") {
+                tags.push("assertions".to_string());
+            }
+
+            // Build description from assertions
+            let assertions: Vec<&str> = code
+                .lines()
+                .filter(|l| l.contains("expect(") || l.contains("toHave") || l.contains("toBe"))
+                .take(3)
+                .collect();
+            if !assertions.is_empty() {
+                description = Some(format!(
+                    "Verifies: {}",
+                    assertions
+                        .iter()
+                        .map(|a| a.trim())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ));
+            }
+        }
+        "python_script" => {
+            // Extract function name from def test_xxx() or def xxx()
+            if let Some(cap) = regex_find(code, r#"def\s+(test_\w+|check_\w+|\w+_test)\s*\("#) {
+                let func_name = cap
+                    .replace("test_", "")
+                    .replace("_test", "")
+                    .replace("check_", "")
+                    .replace('_', " ");
+                name = Some(capitalize_words(&func_name));
+            }
+
+            // Detect category from imports and patterns
+            if code.contains("requests") || code.contains("httpx") || code.contains("aiohttp") {
+                category = Some("network".to_string());
+                tags.push("api".to_string());
+            }
+            if code.contains("selenium") || code.contains("playwright") {
+                category = Some("integration".to_string());
+                tags.push("browser".to_string());
+            }
+            if code.contains("pytest") || code.contains("unittest") {
+                tags.push("pytest".to_string());
+            }
+            if code.contains("assert ") || code.contains("assertEqual") {
+                tags.push("assertions".to_string());
+            }
+            if code.contains("json") || code.contains("dict") || code.contains("response.") {
+                tags.push("data".to_string());
+            }
+
+            // Build description from docstring
+            if let Some(docstring) = extract_docstring(code) {
+                description = Some(docstring);
+            } else {
+                // Build from assertions
+                let assertions: Vec<&str> = code
+                    .lines()
+                    .filter(|l| l.trim().starts_with("assert "))
+                    .take(3)
+                    .collect();
+                if !assertions.is_empty() {
+                    description = Some(format!(
+                        "Verifies: {}",
+                        assertions
+                            .iter()
+                            .map(|a| a.trim().trim_start_matches("assert "))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ));
+                }
+            }
+        }
+        "qontinui_vision" | "repository_test" => {
+            // JSON-based configs - try to parse and extract
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(code) {
+                if let Some(n) = json.get("name").and_then(|v| v.as_str()) {
+                    name = Some(n.to_string());
+                }
+                if let Some(d) = json.get("description").and_then(|v| v.as_str()) {
+                    description = Some(d.to_string());
+                }
+                if let Some(cmd) = json.get("command").and_then(|v| v.as_str()) {
+                    if cmd.contains("pytest") {
+                        tags.push("pytest".to_string());
+                        category = Some("unit".to_string());
+                    } else if cmd.contains("jest") || cmd.contains("vitest") {
+                        tags.push("jest".to_string());
+                        category = Some("unit".to_string());
+                    } else if cmd.contains("cargo test") {
+                        tags.push("cargo".to_string());
+                        category = Some("unit".to_string());
+                    }
+                }
+            }
+            if test_type == "qontinui_vision" {
+                category = Some("visual".to_string());
+                tags.push("vision".to_string());
+            }
+        }
+        _ => {}
+    }
+
+    // Default category if not detected
+    if category.is_none() {
+        category = Some("custom".to_string());
+    }
+
+    // Dedupe tags
+    tags.sort();
+    tags.dedup();
+
+    GeneratedMetadata {
+        name,
+        description,
+        category,
+        tags,
+    }
+}
+
+/// Simple regex find that returns the first capture group
+fn regex_find(text: &str, pattern: &str) -> Option<String> {
+    use regex::Regex;
+    if let Ok(re) = Regex::new(pattern) {
+        if let Some(caps) = re.captures(text) {
+            if let Some(m) = caps.get(1) {
+                return Some(m.as_str().to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Extract docstring from Python code
+fn extract_docstring(code: &str) -> Option<String> {
+    // Look for triple-quoted strings after def
+    let patterns = [
+        r#"def\s+\w+\s*\([^)]*\)\s*:\s*"""([^"]+)""""#,
+        r#"def\s+\w+\s*\([^)]*\)\s*:\s*'''([^']+)'''"#,
+    ];
+    for pattern in patterns {
+        if let Some(docstring) = regex_find(code, pattern) {
+            let trimmed = docstring.trim().lines().next().unwrap_or("").to_string();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+/// Capitalize first letter of each word
+fn capitalize_words(s: &str) -> String {
+    s.split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                None => String::new(),
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+// ========================================================================
+// Workflow Run Context for AI Test Generation
+// ========================================================================
+
+/// Summary of a task run for UI selection
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskRunSummary {
+    pub id: String,
+    pub task_name: String,
+    pub workflow_name: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub goal_achieved: Option<bool>,
+}
+
+/// Full workflow run context for AI test generation
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkflowRunContext {
+    pub task_run: serde_json::Value,
+    pub automation: Option<serde_json::Value>,
+    pub screenshots: Vec<serde_json::Value>,
+    pub api_requests: Vec<serde_json::Value>,
+    pub playwright_results: Vec<serde_json::Value>,
+    pub events: Vec<serde_json::Value>,
+    pub knowledge: Vec<serde_json::Value>,
+    pub test_results: Vec<serde_json::Value>,
+}
+
+/// List recent task runs for workflow context selection.
+///
+/// Returns a list of recent task runs that can be selected for AI test generation context.
+#[tauri::command]
+pub fn list_recent_task_runs(
+    limit: Option<i32>,
+    state: State<'_, Arc<AppState>>,
+) -> CommandResponse {
+    info!("[list_recent_task_runs] Called with limit: {:?}", limit);
+    let limit = limit.unwrap_or(20);
+
+    let conn = match state.checkpoint_db.connection() {
+        Ok(conn) => conn,
         Err(e) => {
             return CommandResponse {
                 success: false,
-                message: Some(format!("Failed to acquire lock: {}", e)),
+                message: Some(format!("Failed to get database connection: {}", e)),
                 data: None,
             };
         }
     };
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
+    // Query recent task runs
+    let query = r#"
+        SELECT
+            tr.id,
+            tr.task_name,
+            tr.workflow_name,
+            tr.status,
+            tr.created_at,
+            tr.completed_at,
+            tr.goal_achieved,
+            CASE
+                WHEN tr.completed_at IS NOT NULL
+                THEN CAST((julianday(tr.completed_at) - julianday(tr.created_at)) * 86400000 AS INTEGER)
+                ELSE NULL
+            END as duration_ms
+        FROM task_runs tr
+        ORDER BY tr.created_at DESC
+        LIMIT ?1
+    "#;
+    let mut stmt = match conn.prepare(query) {
+        Ok(stmt) => stmt,
+        Err(e) => {
             return CommandResponse {
                 success: false,
-                message: Some(
-                    "Python executor not running. Please start the executor first.".to_string(),
-                ),
+                message: Some(format!("Failed to prepare query: {}", e)),
                 data: None,
             };
         }
+    };
 
-        let params = serde_json::json!({
-            "user_prompt": input.user_prompt,
-            "test_type": input.test_type,
-            "page_analysis": input.page_analysis,
-            "multi_request_analysis": input.multi_request_analysis,
-            "collected_analyses": input.collected_analyses,
-            "ai_provider": ai_provider,
-            "ai_settings": provider_settings,
-        });
+    let runs: Result<Vec<TaskRunSummary>, _> = stmt
+        .query_map([limit], |row| {
+            Ok(TaskRunSummary {
+                id: row.get(0)?,
+                task_name: row.get(1)?,
+                workflow_name: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                completed_at: row.get(5)?,
+                goal_achieved: row.get(6)?,
+                duration_ms: row.get(7)?,
+            })
+        })
+        .and_then(|rows| rows.collect());
 
-        // Use longer timeout for AI generation (can take time)
-        match bridge.send_command_and_wait(
-            "generate_test_with_ai",
-            Some(params),
-            std::time::Duration::from_secs(180),
-        ) {
-            Ok(response) => {
-                if response.success {
-                    CommandResponse {
-                        success: true,
-                        message: Some("Test generated successfully".to_string()),
-                        data: response.data,
-                    }
-                } else {
-                    CommandResponse {
-                        success: false,
-                        message: Some(
-                            response
-                                .error
-                                .unwrap_or_else(|| "Generation failed".to_string()),
-                        ),
-                        data: None,
-                    }
-                }
+    match runs {
+        Ok(runs) => {
+            info!("[list_recent_task_runs] Found {} task runs", runs.len());
+            if !runs.is_empty() {
+                info!("[list_recent_task_runs] First run: {:?}", runs[0].task_name);
             }
-            Err(e) => CommandResponse {
+            CommandResponse {
+                success: true,
+                message: Some(format!("Found {} recent task runs", runs.len())),
+                data: Some(serde_json::to_value(&runs).unwrap_or_default()),
+            }
+        }
+        Err(e) => {
+            info!("[list_recent_task_runs] Query failed: {}", e);
+            CommandResponse {
                 success: false,
-                message: Some(format!("Command failed: {}", e)),
+                message: Some(format!("Failed to query task runs: {}", e)),
                 data: None,
+            }
+        }
+    }
+}
+
+/// Get full workflow run context for AI test generation.
+///
+/// Returns comprehensive context about a workflow run including automation results,
+/// screenshots, API requests, events, and AI findings.
+#[tauri::command]
+pub fn get_workflow_run_context(
+    task_run_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> CommandResponse {
+    let conn = match state.checkpoint_db.connection() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to get database connection: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    // Get task run details
+    let task_run: Option<serde_json::Value> = conn
+        .query_row(
+            r#"
+            SELECT
+                id, task_name, prompt, status, workflow_name,
+                summary, goal_achieved, remaining_work,
+                created_at, completed_at
+            FROM task_runs WHERE id = ?1
+            "#,
+            [&task_run_id],
+            |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "task_name": row.get::<_, String>(1)?,
+                    "prompt": row.get::<_, Option<String>>(2)?,
+                    "status": row.get::<_, String>(3)?,
+                    "workflow_name": row.get::<_, Option<String>>(4)?,
+                    "summary": row.get::<_, Option<String>>(5)?,
+                    "goal_achieved": row.get::<_, Option<bool>>(6)?,
+                    "remaining_work": row.get::<_, Option<String>>(7)?,
+                    "created_at": row.get::<_, String>(8)?,
+                    "completed_at": row.get::<_, Option<String>>(9)?
+                }))
             },
+        )
+        .ok();
+
+    let task_run = match task_run {
+        Some(tr) => tr,
+        None => {
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Task run not found: {}", task_run_id)),
+                data: None,
+            };
         }
-    } else {
-        CommandResponse {
-            success: false,
-            message: Some("Python executor not initialized".to_string()),
-            data: None,
-        }
+    };
+
+    // Get automation metrics
+    let automation: Option<serde_json::Value> = conn
+        .query_row(
+            r#"
+            SELECT
+                workflow_name, automation_status, duration_ms,
+                actions_summary, states_visited, transitions_executed
+            FROM task_run_automation WHERE task_run_id = ?1
+            ORDER BY started_at DESC LIMIT 1
+            "#,
+            [&task_run_id],
+            |row| {
+                Ok(serde_json::json!({
+                    "workflow_name": row.get::<_, Option<String>>(0)?,
+                    "automation_status": row.get::<_, String>(1)?,
+                    "duration_ms": row.get::<_, Option<i64>>(2)?,
+                    "actions_summary": row.get::<_, Option<String>>(3)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "states_visited": row.get::<_, Option<String>>(4)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "transitions_executed": row.get::<_, Option<String>>(5)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok())
+                }))
+            },
+        )
+        .ok();
+
+    // Get screenshots (limit to 10 most recent)
+    let screenshots: Vec<serde_json::Value> = conn
+        .prepare(
+            r#"
+            SELECT id, file_path, screenshot_type, template_name, confidence, match_location, created_at
+            FROM task_run_screenshots WHERE task_run_id = ?1
+            ORDER BY created_at DESC LIMIT 10
+            "#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([&task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "file_path": row.get::<_, String>(1)?,
+                    "screenshot_type": row.get::<_, String>(2)?,
+                    "template_name": row.get::<_, Option<String>>(3)?,
+                    "confidence": row.get::<_, Option<f64>>(4)?,
+                    "match_location": row.get::<_, Option<String>>(5)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "created_at": row.get::<_, String>(6)?
+                }))
+            })
+            .and_then(|rows| rows.collect())
+        })
+        .unwrap_or_default();
+
+    // Get API requests (limit to 20 most recent)
+    let api_requests: Vec<serde_json::Value> = conn
+        .prepare(
+            r#"
+            SELECT id, step_name, method, url, status_code, response_time_ms,
+                   success, response_body, extractions, error_message
+            FROM task_run_api_requests WHERE task_run_id = ?1
+            ORDER BY created_at DESC LIMIT 20
+            "#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([&task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "step_name": row.get::<_, Option<String>>(1)?,
+                    "method": row.get::<_, String>(2)?,
+                    "url": row.get::<_, String>(3)?,
+                    "status_code": row.get::<_, i32>(4)?,
+                    "response_time_ms": row.get::<_, i32>(5)?,
+                    "success": row.get::<_, bool>(6)?,
+                    "response_body": row.get::<_, Option<String>>(7)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "extractions": row.get::<_, Option<String>>(8)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "error_message": row.get::<_, Option<String>>(9)?
+                }))
+            })
+            .and_then(|rows| rows.collect())
+        })
+        .unwrap_or_default();
+
+    // Get Playwright results
+    let playwright_results: Vec<serde_json::Value> = conn
+        .prepare(
+            r#"
+            SELECT id, test_name, status, duration_ms, error_message,
+                   assertions_passed, assertions_failed, page_snapshot
+            FROM task_run_playwright_results WHERE task_run_id = ?1
+            ORDER BY created_at DESC LIMIT 20
+            "#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([&task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "test_name": row.get::<_, String>(1)?,
+                    "status": row.get::<_, String>(2)?,
+                    "duration_ms": row.get::<_, Option<i64>>(3)?,
+                    "error_message": row.get::<_, Option<String>>(4)?,
+                    "assertions_passed": row.get::<_, i32>(5)?,
+                    "assertions_failed": row.get::<_, i32>(6)?,
+                    "page_snapshot": row.get::<_, Option<String>>(7)?
+                }))
+            })
+            .and_then(|rows| rows.collect())
+        })
+        .unwrap_or_default();
+
+    // Get events (limit to 50 most recent, focus on important ones)
+    let events: Vec<serde_json::Value> = conn
+        .prepare(
+            r#"
+            SELECT id, event_type, event_subtype, message, data, timestamp, duration_ms
+            FROM task_run_events WHERE task_run_id = ?1
+            AND event_subtype IN ('complete', 'error', 'start', 'match', 'transition')
+            ORDER BY timestamp DESC LIMIT 50
+            "#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([&task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, i64>(0)?,
+                    "event_type": row.get::<_, String>(1)?,
+                    "event_subtype": row.get::<_, Option<String>>(2)?,
+                    "message": row.get::<_, String>(3)?,
+                    "data": row.get::<_, Option<String>>(4)?.and_then(|s: String| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "timestamp": row.get::<_, String>(5)?,
+                    "duration_ms": row.get::<_, Option<i64>>(6)?
+                }))
+            })
+            .and_then(|rows| rows.collect())
+        })
+        .unwrap_or_default();
+
+    // Get knowledge items
+    let knowledge: Vec<serde_json::Value> = conn
+        .prepare(
+            r#"
+            SELECT id, category, content, evidence, confidence, is_resolved, created_at
+            FROM task_knowledge WHERE task_run_id = ?1
+            ORDER BY created_at DESC LIMIT 30
+            "#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([&task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "category": row.get::<_, String>(1)?,
+                    "content": row.get::<_, String>(2)?,
+                    "evidence": row.get::<_, Option<String>>(3)?,
+                    "confidence": row.get::<_, String>(4)?,
+                    "is_resolved": row.get::<_, bool>(5)?,
+                    "created_at": row.get::<_, String>(6)?
+                }))
+            })
+            .and_then(|rows| rows.collect())
+        })
+        .unwrap_or_default();
+
+    // Get test results with test names
+    let test_results: Vec<serde_json::Value> = conn
+        .prepare(
+            r#"
+            SELECT tr.id, vt.name as test_name, tr.status, tr.output,
+                   tr.error_message, tr.assertions_passed, tr.assertions_failed
+            FROM test_results tr
+            JOIN verification_tests vt ON tr.test_id = vt.id
+            WHERE tr.task_run_id = ?1
+            ORDER BY tr.created_at DESC
+            "#,
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([&task_run_id], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "test_name": row.get::<_, String>(1)?,
+                    "status": row.get::<_, String>(2)?,
+                    "output": row.get::<_, Option<String>>(3)?,
+                    "error_message": row.get::<_, Option<String>>(4)?,
+                    "assertions_passed": row.get::<_, i32>(5)?,
+                    "assertions_failed": row.get::<_, i32>(6)?
+                }))
+            })
+            .and_then(|rows| rows.collect())
+        })
+        .unwrap_or_default();
+
+    let context = WorkflowRunContext {
+        task_run,
+        automation,
+        screenshots,
+        api_requests,
+        playwright_results,
+        events,
+        knowledge,
+        test_results,
+    };
+
+    CommandResponse {
+        success: true,
+        message: Some("Workflow run context retrieved".to_string()),
+        data: Some(serde_json::to_value(context).unwrap_or_default()),
     }
 }
 

@@ -48,6 +48,7 @@ export function MacrosPanel({ className }: MacrosPanelProps) {
         <button
           className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
           onClick={() => setShowMacrosPanel(false)}
+          data-ui-id="macro-builder-macros-panel-close-btn"
         >
           <X className="h-4 w-4" />
         </button>
@@ -70,6 +71,7 @@ export function MacrosPanel({ className }: MacrosPanelProps) {
                     : "border-transparent hover:border-border hover:bg-muted/50"
                 }`}
                 onClick={() => loadMacro(macro)}
+                data-ui-id={`macro-builder-macro-${macro.id}-item`}
               >
                 <div className="flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
@@ -96,6 +98,7 @@ export function MacrosPanel({ className }: MacrosPanelProps) {
                   <button
                     className="p-1.5 rounded hover:bg-muted text-destructive opacity-0 group-hover:opacity-100 transition-opacity"
                     onClick={(e) => handleDelete(e, macro)}
+                    data-ui-id={`macro-builder-macro-${macro.id}-delete-btn`}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
                   </button>

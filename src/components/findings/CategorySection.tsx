@@ -83,9 +83,10 @@ export function CategorySection({
   }
 
   return (
-    <div className="rounded-lg border border-border overflow-hidden">
+    <div data-ui-id={`findings-category-section-${category.id}`} className="rounded-lg border border-border overflow-hidden">
       {/* Category Header */}
       <button
+        data-ui-id="findings-category-toggle-btn"
         onClick={() => setIsExpanded(!isExpanded)}
         className={`w-full flex items-center gap-3 p-3 ${categoryColors.bg} hover:bg-muted/50 transition-colors`}
       >
@@ -128,7 +129,7 @@ export function CategorySection({
 
       {/* Findings List */}
       {isExpanded && (
-        <div className="p-3 space-y-2 bg-background/50">
+        <div data-ui-id="findings-section-list" className="p-3 space-y-2 bg-background/50">
           {findings.map((finding) => (
             <FindingCard
               key={finding.id}

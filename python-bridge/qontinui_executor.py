@@ -101,6 +101,7 @@ from services.uitars_extraction_service import (  # noqa: E402
     get_uitars_extraction_service,
     UITarsExtractionService,
 )
+from services.ui_bridge_explorer_service import UIBridgeExplorerService  # noqa: E402
 from test_results_handler import TestResultsHandler  # noqa: E402
 from training_export import TrainingExportCoordinator  # noqa: E402
 from websocket_handler import WebSocketHandler  # noqa: E402
@@ -241,6 +242,9 @@ class QontinuiExecutor:
 
         # UI-TARS extraction service (lazy-loaded when needed)
         self._uitars_extraction_service: UITarsExtractionService | None = None
+
+        # UI Bridge explorer service (lazy-loaded when needed)
+        self._ui_bridge_explorer_service: UIBridgeExplorerService | None = None
 
         # Dedicated event loop for async operations (avoids conflicts with WebSocket thread's loop)
         # Runs in a background thread to allow run_coroutine_threadsafe()
@@ -1631,6 +1635,20 @@ class QontinuiExecutor:
         elif cmd_type == "awas_extract_elements":
             return self._handle_awas_extract_elements(params)
 
+        # UI Bridge exploration commands
+        elif cmd_type == "start_ui_bridge_exploration":
+            return self._handle_start_ui_bridge_exploration(params)
+        elif cmd_type == "get_ui_bridge_exploration_status":
+            return self._handle_get_ui_bridge_exploration_status(params)
+        elif cmd_type == "get_ui_bridge_exploration_results":
+            return self._handle_get_ui_bridge_exploration_results(params)
+        elif cmd_type == "stop_ui_bridge_exploration":
+            return self._handle_stop_ui_bridge_exploration(params)
+
+        # UI Bridge state discovery from render logs
+        elif cmd_type == "discover_states_from_renders":
+            return self._handle_discover_states_from_renders(params)
+
         else:
             return {"success": False, "error": f"Unknown command: {cmd_type}"}
 
@@ -2789,6 +2807,196 @@ class QontinuiExecutor:
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to stop Playwright collection: {e}")
+            return {"success": False, "error": str(e)}
+
+    # =========================================================================
+    # UI Bridge Exploration Handlers
+    # =========================================================================
+
+    def _get_ui_bridge_explorer_service(self) -> UIBridgeExplorerService:
+        """Get or create the UI Bridge explorer service."""
+        if self._ui_bridge_explorer_service is None:
+            self._ui_bridge_explorer_service = UIBridgeExplorerService(
+                event_manager=self.event_manager,
+            )
+        return self._ui_bridge_explorer_service
+
+    def _handle_start_ui_bridge_exploration(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle start UI Bridge exploration command.
+
+        Starts an exploration job in the background and returns a job ID.
+        Use get_ui_bridge_exploration_status and get_ui_bridge_exploration_results
+        to poll for progress and retrieve results.
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_start_ui_bridge_exploration called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_ui_bridge_explorer_service()
+            result = service.start_exploration(params)
+
+            if result.get("success"):
+                self.event_manager.emit_log(
+                    "info",
+                    f"[UI Bridge] Started exploration job: {result.get('job_id')}",
+                )
+
+            return result
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log("error", f"[UI Bridge] Start exploration failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_ui_bridge_exploration_status(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle get UI Bridge exploration status command.
+
+        Returns the current status of an exploration job.
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_get_ui_bridge_exploration_status called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_ui_bridge_explorer_service()
+            job_id = params.get("job_id")
+            return service.get_job_status(job_id)
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log("error", f"[UI Bridge] Get exploration status failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_get_ui_bridge_exploration_results(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle get UI Bridge exploration results command.
+
+        Returns the results of a completed exploration job.
+        """
+        import sys
+
+        print(
+            f"[info    ] EXECUTOR: _handle_get_ui_bridge_exploration_results called with params: {params}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_ui_bridge_explorer_service()
+            job_id = params.get("job_id")
+            return service.get_results(job_id)
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log("error", f"[UI Bridge] Get exploration results failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_stop_ui_bridge_exploration(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle stop UI Bridge exploration command.
+
+        Stops the current exploration job.
+        """
+        import sys
+
+        print(
+            "[info    ] EXECUTOR: _handle_stop_ui_bridge_exploration called",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            service = self._get_ui_bridge_explorer_service()
+            return service.stop_exploration()
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log("error", f"[UI Bridge] Stop exploration failed: {e}")
+            traceback.print_exc(file=sys.stderr)
+            return {"success": False, "error": str(e)}
+
+    def _handle_discover_states_from_renders(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle discover states from render logs command.
+
+        Runs co-occurrence analysis on existing render logs to discover states.
+        This is separate from exploration - it only analyzes provided render data.
+
+        Args:
+            params: Command parameters:
+                - render_logs: Array of DOM snapshot render log entries
+
+        Returns:
+            Dictionary with:
+                - success: Whether discovery succeeded
+                - data: UIBridgeStateDiscoveryResult with states, elements, etc.
+                - error: Error message (if failed)
+        """
+        import sys
+
+        print(
+            "[info    ] EXECUTOR: _handle_discover_states_from_renders called",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        try:
+            if not QONTINUI_AVAILABLE:
+                return {
+                    "success": False,
+                    "error": "Qontinui library not available",
+                }
+
+            # Get render logs from params
+            render_logs = params.get("render_logs", [])
+
+            if not render_logs:
+                return {
+                    "success": False,
+                    "error": "No render_logs provided",
+                }
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] Starting state discovery on {len(render_logs)} render logs",
+            )
+
+            # Import and call the qontinui library function
+            from qontinui.discovery.ui_bridge_adapter import discover_states_from_renders
+
+            result = discover_states_from_renders(render_logs)
+
+            self.event_manager.emit_log(
+                "info",
+                f"[UI Bridge] State discovery complete: {len(result.states)} states, "
+                f"{result.unique_element_count} unique elements from {result.render_count} renders",
+            )
+
+            return {
+                "success": True,
+                "data": result.to_dict(),
+            }
+
+        except Exception as e:
+            import traceback
+
+            self.event_manager.emit_log(
+                "error", f"[UI Bridge] Discover states from renders failed: {e}"
+            )
+            traceback.print_exc(file=sys.stderr)
             return {"success": False, "error": str(e)}
 
     # =========================================================================

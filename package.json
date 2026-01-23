@@ -12,6 +12,9 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,js,jsx,json,css,md}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx,json,css,md}\"",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint && npm run format:check",
     "rust:fmt": "cd src-tauri && cargo fmt",
     "rust:lint": "cd src-tauri && cargo clippy -- -D warnings",
@@ -24,14 +27,17 @@
     "@tauri-apps/cli": "^2.9.4",
     "@typescript-eslint/eslint-plugin": "^8.44.1",
     "@typescript-eslint/parser": "^8.44.1",
+    "@vitest/coverage-v8": "^4.0.17",
     "eslint": "^9.36.0",
     "eslint-config-prettier": "^10.1.8",
     "eslint-plugin-react": "^7.37.5",
     "eslint-plugin-react-hooks": "^5.2.0",
     "prettier": "^3.6.2",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.0.17"
   },
   "dependencies": {
+    "ui-bridge": "file:../ui-bridge/packages/ui-bridge",
     "@monaco-editor/react": "^4.7.0",
     "@qontinui/design-tokens": "^1.0.0",
     "@radix-ui/react-dialog": "^1.1.15",

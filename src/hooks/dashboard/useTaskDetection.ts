@@ -57,6 +57,7 @@ interface DetectedStepTypes {
   hasScript: boolean;
   hasWorkflowRef: boolean;
   hasAiTask: boolean;
+  hasMcpCall: boolean;
 }
 
 /**
@@ -72,6 +73,7 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
     hasScript: false,
     hasWorkflowRef: false,
     hasAiTask: false,
+    hasMcpCall: false,
   };
 
   if (!stepsJson) {
@@ -113,6 +115,7 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
       "verify",
       "test",
       "check",
+      "check_group", // Unified workflow check groups
       "link_check",
       "format_check",
       "type_check",
@@ -135,6 +138,9 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
 
     // Workflow reference step types
     const workflowRefStepTypes = ["workflow_ref", "sub_workflow", "subworkflow"];
+
+    // MCP call step types
+    const mcpCallStepTypes = ["mcp_call", "mcp", "tool_call", "mcp_tool"];
 
     for (const step of steps) {
       const stepType = step.type || step.step_type;
@@ -169,6 +175,9 @@ function parseExecutionSteps(stepsJson?: string): DetectedStepTypes {
       if (matchesType(workflowRefStepTypes)) {
         result.hasWorkflowRef = true;
       }
+      if (matchesType(mcpCallStepTypes)) {
+        result.hasMcpCall = true;
+      }
       if (matchesType(aiStepTypes)) {
         result.hasAiTask = true;
       }
@@ -196,6 +205,7 @@ function detectActivities(task: RunningTaskData): ActivityType[] {
     hasScript,
     hasWorkflowRef,
     hasAiTask,
+    hasMcpCall,
   } = parseExecutionSteps(task.execution_steps_json);
 
   // GUI automation only if config_id (qontinui state machine) or actual GUI steps are present
@@ -226,6 +236,10 @@ function detectActivities(task: RunningTaskData): ActivityType[] {
 
   if (hasWorkflowRef) {
     activities.push("workflow_ref");
+  }
+
+  if (hasMcpCall) {
+    activities.push("mcp_call");
   }
 
   // AI conversation if task has a prompt or AI task steps

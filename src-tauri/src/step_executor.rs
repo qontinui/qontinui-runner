@@ -26,6 +26,7 @@ use crate::iteration_bundle::{
     RelevantLogSources,
 };
 use crate::mcp_client::CreateMcpCallInput;
+use crate::orchestrator::context_propagation::{ExpressionEvaluator, RuntimeContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -115,7 +116,7 @@ pub struct ExecutionStepConfig {
     pub run_on_subsequent_iterations: Option<bool>,
 
     /// Test ID for verification test steps
-    #[serde(rename = "testId")]
+    #[serde(rename = "testId", alias = "test_id")]
     pub test_id: Option<String>,
 
     /// Test type for verification test steps
@@ -127,6 +128,7 @@ pub struct ExecutionStepConfig {
         alias = "testIsCritical",
         alias = "test_is_critical",
         alias = "is_critical",
+        alias = "is_blocking",
         default
     )]
     pub test_is_critical: Option<bool>,
@@ -247,6 +249,13 @@ pub struct ExecutionStepConfig {
     /// Macro: ID of the saved macro to execute
     #[serde(alias = "macroId", alias = "macro_id")]
     pub macro_id: Option<String>,
+
+    // ========================================================================
+    // Check Group Step Fields
+    // ========================================================================
+    /// Check Group: ID of the check group to execute
+    #[serde(alias = "checkGroupId", alias = "check_group_id")]
+    pub check_group_id: Option<String>,
 }
 
 impl ExecutionStepConfig {
@@ -304,6 +313,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -361,6 +372,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -418,6 +431,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -479,6 +494,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -536,6 +553,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -593,6 +612,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -650,6 +671,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -707,6 +730,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -772,6 +797,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -829,6 +856,8 @@ impl ExecutionStepConfig {
             check_auto_fix: None,
             // Macro fields
             macro_id: Some(macro_id.to_string()),
+            // Check group fields
+            check_group_id: None,
         }
     }
 
@@ -866,6 +895,36 @@ pub struct StepExecutionResult {
     pub duration_ms: u64,
     /// Step configuration (for AI visibility)
     pub config: StepExecutionConfig,
+    /// Verification-specific fields (for test/check steps in verification phase)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_details: Option<VerificationStepDetails>,
+}
+
+/// Verification-specific details for test and check steps
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VerificationStepDetails {
+    /// Step ID from the workflow
+    pub step_id: String,
+    /// Phase this step belongs to
+    pub phase: String,
+    /// Whether this is a critical step (failure stops execution)
+    pub is_critical: bool,
+    /// Whether this is a blocking step (failure prevents agentic phase from continuing)
+    pub is_blocking: bool,
+    /// Standard output from the step
+    pub stdout: Option<String>,
+    /// Standard error from the step
+    pub stderr: Option<String>,
+    /// For test steps: number of assertions passed
+    pub assertions_passed: Option<u32>,
+    /// For test steps: total number of assertions
+    pub assertions_total: Option<u32>,
+    /// For test steps: console output from browser/runtime
+    pub console_output: Option<String>,
+    /// For Playwright tests: page snapshot (YAML accessibility tree)
+    pub page_snapshot: Option<String>,
+    /// Exit code from command execution
+    pub exit_code: Option<i32>,
 }
 
 /// Step configuration captured for AI visibility
@@ -920,6 +979,141 @@ pub struct ExecutionResult {
     /// Runner logs captured during execution (GUI automation events)
     #[serde(default)]
     pub captured_runner_logs: Option<CapturedRunnerLogs>,
+}
+
+/// Result of running all verification_steps in a unified workflow
+///
+/// This is returned by execute_verification_steps and used to:
+/// 1. Determine if the agentic phase should run (any failures)
+/// 2. Build context for the AI about what failed
+/// 3. Store results in the database for the Recap page
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationPhaseResult {
+    /// Iteration number (1-indexed)
+    pub iteration: u32,
+    /// Whether all verification steps passed
+    pub all_passed: bool,
+    /// Total number of verification steps
+    pub total_steps: usize,
+    /// Number of steps that passed
+    pub passed_steps: usize,
+    /// Number of steps that failed
+    pub failed_steps: usize,
+    /// Number of steps that were skipped (due to critical step failure)
+    pub skipped_steps: usize,
+    /// Total execution time in milliseconds
+    pub total_duration_ms: u64,
+    /// Individual step results
+    pub step_results: Vec<StepExecutionResult>,
+    /// Whether a critical step failed (should stop execution)
+    pub critical_failure: bool,
+}
+
+impl VerificationPhaseResult {
+    /// Build a failure context string for the agentic phase
+    ///
+    /// This summarizes what failed so the AI knows what to work on.
+    pub fn build_failure_context(&self) -> String {
+        if self.all_passed {
+            return String::new();
+        }
+
+        let mut context = String::new();
+        context.push_str("## Verification Results\n\n");
+        context.push_str(&format!(
+            "**Status:** {} of {} verification steps passed\n\n",
+            self.passed_steps, self.total_steps
+        ));
+
+        // List failed steps with details
+        context.push_str("### Failed Steps\n\n");
+        for result in &self.step_results {
+            if !result.success {
+                context.push_str(&format!(
+                    "#### {} ({})\n",
+                    result.step_name, result.step_type
+                ));
+
+                if let Some(error) = &result.error {
+                    context.push_str(&format!("**Error:** {}\n", error));
+                }
+
+                if let Some(details) = &result.verification_details {
+                    if let Some(stdout) = &details.stdout {
+                        if !stdout.is_empty() {
+                            // Truncate long output
+                            let truncated = if stdout.len() > 2000 {
+                                format!(
+                                    "{}...\n[truncated, {} more chars]",
+                                    &stdout[..2000],
+                                    stdout.len() - 2000
+                                )
+                            } else {
+                                stdout.clone()
+                            };
+                            context.push_str(&format!("**Output:**\n```\n{}\n```\n", truncated));
+                        }
+                    }
+                    if let Some(stderr) = &details.stderr {
+                        if !stderr.is_empty() {
+                            let truncated = if stderr.len() > 1000 {
+                                format!("{}...\n[truncated]", &stderr[..1000])
+                            } else {
+                                stderr.clone()
+                            };
+                            context.push_str(&format!("**Stderr:**\n```\n{}\n```\n", truncated));
+                        }
+                    }
+                    if let Some(passed) = details.assertions_passed {
+                        if let Some(total) = details.assertions_total {
+                            context.push_str(&format!(
+                                "**Assertions:** {}/{} passed\n",
+                                passed, total
+                            ));
+                        }
+                    }
+                }
+                context.push('\n');
+            }
+        }
+
+        // List passed steps briefly
+        let passed: Vec<_> = self.step_results.iter().filter(|r| r.success).collect();
+        if !passed.is_empty() {
+            context.push_str("### Passed Steps\n\n");
+            for result in passed {
+                context.push_str(&format!(
+                    "- ✓ {} ({}ms)\n",
+                    result.step_name, result.duration_ms
+                ));
+            }
+        }
+
+        context
+    }
+
+    /// Build a brief summary for logging
+    pub fn summary(&self) -> String {
+        if self.all_passed {
+            format!(
+                "Verification PASSED: {}/{} steps in {}ms",
+                self.passed_steps, self.total_steps, self.total_duration_ms
+            )
+        } else {
+            format!(
+                "Verification FAILED: {}/{} steps passed, {} failed in {}ms{}",
+                self.passed_steps,
+                self.total_steps,
+                self.failed_steps,
+                self.total_duration_ms,
+                if self.critical_failure {
+                    " (CRITICAL)"
+                } else {
+                    ""
+                }
+            )
+        }
+    }
 }
 
 /// A log source configuration (passed from frontend)
@@ -1030,6 +1224,8 @@ pub struct StepExecutor {
     app_handle: Option<tauri::AppHandle>,
     /// Optional task run ID for database logging (AWAS steps, etc.)
     task_run_id: Option<String>,
+    /// Runtime context for variable expansion in commands
+    runtime_context: RuntimeContext,
 }
 
 impl StepExecutor {
@@ -1040,6 +1236,7 @@ impl StepExecutor {
             app_state,
             app_handle: None,
             task_run_id: None,
+            runtime_context: RuntimeContext::new(),
         }
     }
 
@@ -1054,6 +1251,7 @@ impl StepExecutor {
             app_state,
             app_handle: Some(app_handle),
             task_run_id: None,
+            runtime_context: RuntimeContext::new(),
         }
     }
 
@@ -1061,8 +1259,26 @@ impl StepExecutor {
     ///
     /// When set, AWAS step results will be saved to the database.
     pub fn with_task_run_id(mut self, task_run_id: String) -> Self {
+        self.runtime_context = RuntimeContext::with_task_run_id(&task_run_id);
         self.task_run_id = Some(task_run_id);
         self
+    }
+
+    /// Set a variable in the runtime context for variable expansion in commands.
+    ///
+    /// Variables can be referenced in shell commands using `{{variable_name}}` syntax.
+    pub fn set_context_variable(&mut self, name: &str, value: serde_json::Value) {
+        self.runtime_context.set_variable(name, value);
+    }
+
+    /// Get the runtime context (for advanced use cases).
+    pub fn runtime_context(&self) -> &RuntimeContext {
+        &self.runtime_context
+    }
+
+    /// Get a mutable reference to the runtime context (for advanced use cases).
+    pub fn runtime_context_mut(&mut self) -> &mut RuntimeContext {
+        &mut self.runtime_context
     }
 
     /// Log a step execution event to the database
@@ -1088,6 +1304,7 @@ impl StepExecutor {
             "step_index": step_index,
             "step_type": step.step_type,
             "step_name": step_name,
+            "phase": step.phase,
             "command": step.shell_command.as_ref().or(step.check_command.as_ref()),
             "working_directory": step.shell_command_working_directory.as_ref().or(step.check_working_directory.as_ref()),
             "exit_code": exit_code,
@@ -1483,6 +1700,8 @@ impl StepExecutor {
             check_auto_fix: None,
             // Macro fields
             macro_id: None,
+            // Check group fields
+            check_group_id: None,
         })
     }
 
@@ -1656,6 +1875,7 @@ impl StepExecutor {
                         .clone()
                         .or_else(|| step.shell_command_working_directory.clone()),
                 },
+                verification_details: None,
             });
         }
 
@@ -1689,6 +1909,200 @@ impl StepExecutor {
             captured_logs,
             captured_runner_logs,
         }
+    }
+
+    // ========================================================================
+    // Phase-Based Execution Methods
+    // ========================================================================
+
+    /// Filter steps by phase
+    pub fn filter_steps_by_phase(
+        steps: &[ExecutionStepConfig],
+        phase: &str,
+    ) -> Vec<ExecutionStepConfig> {
+        steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some(phase))
+            .cloned()
+            .collect()
+    }
+
+    /// Check if any steps exist in the given phase
+    pub fn has_steps_in_phase(steps: &[ExecutionStepConfig], phase: &str) -> bool {
+        steps.iter().any(|s| s.phase.as_deref() == Some(phase))
+    }
+
+    /// Count steps in each phase
+    pub fn count_steps_by_phase(
+        steps: &[ExecutionStepConfig],
+    ) -> std::collections::HashMap<String, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for step in steps {
+            if let Some(ref phase) = step.phase {
+                *counts.entry(phase.clone()).or_insert(0) += 1;
+            } else {
+                // Steps without explicit phase are considered "unknown"
+                *counts.entry("unknown".to_string()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// Execute only setup phase steps.
+    ///
+    /// This runs setup steps (shell commands, workflows, etc.) that prepare the
+    /// environment before the verification loop begins. Setup steps run ONCE
+    /// at the start of the workflow.
+    ///
+    /// Returns the execution result and whether setup completed successfully.
+    pub async fn execute_setup_phase(
+        &self,
+        steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        log_sources: &[LogSourceConfig],
+    ) -> (ExecutionResult, bool) {
+        let setup_steps = Self::filter_steps_by_phase(steps, "setup");
+
+        if setup_steps.is_empty() {
+            info!("No setup steps to execute, setup phase complete by default");
+            return (
+                ExecutionResult {
+                    success: true,
+                    total_steps: 0,
+                    successful_steps: 0,
+                    failed_steps: 0,
+                    total_duration_ms: 0,
+                    steps: vec![],
+                    captured_logs: None,
+                    captured_runner_logs: None,
+                },
+                true, // Setup phase complete
+            );
+        }
+
+        info!(
+            "Executing {} setup phase steps for {}",
+            setup_steps.len(),
+            execution_id
+        );
+
+        let result = self
+            .execute_steps_with_log_sources(&setup_steps, execution_id, log_sources)
+            .await;
+
+        let setup_complete = result.success;
+
+        info!(
+            "Setup phase {}: {} of {} steps succeeded",
+            if setup_complete { "complete" } else { "failed" },
+            result.successful_steps,
+            result.total_steps
+        );
+
+        (result, setup_complete)
+    }
+
+    /// Execute only completion phase steps.
+    ///
+    /// This runs completion steps (cleanup, reports, notifications) that run
+    /// ONCE after the verification loop exits (success or max iterations).
+    ///
+    /// Returns the execution result.
+    pub async fn execute_completion_phase(
+        &self,
+        steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        log_sources: &[LogSourceConfig],
+    ) -> ExecutionResult {
+        let completion_steps = Self::filter_steps_by_phase(steps, "completion");
+
+        if completion_steps.is_empty() {
+            info!("No completion steps to execute");
+            return ExecutionResult {
+                success: true,
+                total_steps: 0,
+                successful_steps: 0,
+                failed_steps: 0,
+                total_duration_ms: 0,
+                steps: vec![],
+                captured_logs: None,
+                captured_runner_logs: None,
+            };
+        }
+
+        info!(
+            "Executing {} completion phase steps for {}",
+            completion_steps.len(),
+            execution_id
+        );
+
+        let result = self
+            .execute_steps_with_log_sources(&completion_steps, execution_id, log_sources)
+            .await;
+
+        info!(
+            "Completion phase done: {} of {} steps succeeded",
+            result.successful_steps, result.total_steps
+        );
+
+        result
+    }
+
+    /// Execute only verification/agentic phase steps (for iterations).
+    ///
+    /// This runs verification and agentic steps that may run on each iteration.
+    /// On iteration > 1, setup steps are filtered out (unless marked to run on
+    /// subsequent iterations).
+    ///
+    /// Completion steps are always excluded from this method.
+    pub async fn execute_verification_phase(
+        &self,
+        steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        log_sources: &[LogSourceConfig],
+        iteration: u32,
+    ) -> ExecutionResult {
+        // Filter out setup and completion steps, keep only verification/agentic
+        let mut verification_steps: Vec<ExecutionStepConfig> = steps
+            .iter()
+            .filter(|s| {
+                let phase = s.phase.as_deref().unwrap_or("unknown");
+                // Include verification and agentic phase steps
+                phase == "verification" || phase == "agentic"
+            })
+            .cloned()
+            .collect();
+
+        // For iteration > 1, also filter based on run_on_subsequent_iterations
+        if iteration > 1 {
+            verification_steps.retain(|step| step.should_run_on_iteration(iteration));
+        }
+
+        if verification_steps.is_empty() {
+            info!(
+                "No verification/agentic steps to execute for iteration {}",
+                iteration
+            );
+            return ExecutionResult {
+                success: true,
+                total_steps: 0,
+                successful_steps: 0,
+                failed_steps: 0,
+                total_duration_ms: 0,
+                steps: vec![],
+                captured_logs: None,
+                captured_runner_logs: None,
+            };
+        }
+
+        info!(
+            "Executing {} verification/agentic phase steps for iteration {}",
+            verification_steps.len(),
+            iteration
+        );
+
+        self.execute_steps_with_log_sources(&verification_steps, execution_id, log_sources)
+            .await
     }
 
     /// Get current file positions for configured log sources
@@ -2139,7 +2553,7 @@ impl StepExecutor {
                     .test_id
                     .clone()
                     .unwrap_or_else(|| "unknown".to_string());
-                let is_critical = step.test_is_critical.unwrap_or(true);
+                let is_critical = step.test_is_critical.unwrap_or(false);
 
                 // Build action node for tree events
                 let action_node = json!({
@@ -2559,6 +2973,10 @@ impl StepExecutor {
             // ================================================================
             "check" => self.execute_check_step(step, timeout).await,
             // ================================================================
+            // Check Group Step Type (run all checks in a group)
+            // ================================================================
+            "check_group" => self.execute_check_group_step(step, timeout).await,
+            // ================================================================
             // Macro Step Type (runs a saved macro by ID)
             // ================================================================
             "macro" => {
@@ -2725,24 +3143,66 @@ impl StepExecutor {
         }
     }
 
-    /// Execute a verification test by ID
+    /// Execute a verification test by ID and return simplified (success, error) tuple
     ///
-    /// Runs the test using the test_executor module and returns the result.
-    /// If is_critical is true, test failure will be reported as step failure.
+    /// This is the legacy interface used by execute_single_step.
     async fn execute_verification_test(
         &self,
         test_id: &str,
         is_critical: bool,
     ) -> Result<(bool, Option<String>), String> {
-        use crate::database::TestType as DbTestType;
-        use crate::test_executor::{
-            self, TestCategory, TestDefinition, TestStatus, TestType, VisionConfig,
-        };
+        use crate::test_executor::TestStatus;
 
-        info!(
-            "Executing verification test: {} (critical: {})",
-            test_id, is_critical
-        );
+        let result = self.execute_verification_test_with_details(test_id).await?;
+
+        // Log the result
+        if result.status == TestStatus::Passed {
+            info!(
+                "Test '{}' passed in {}ms ({}/{} assertions)",
+                result.test_name,
+                result.duration_ms,
+                result.assertions_passed,
+                result.assertions_passed + result.assertions_failed
+            );
+            Ok((true, None))
+        } else {
+            let error_msg = format!(
+                "Test '{}' {}: {} ({}/{} assertions passed)",
+                result.test_name,
+                match result.status {
+                    TestStatus::Failed => "failed",
+                    TestStatus::Error => "errored",
+                    TestStatus::Timeout => "timed out",
+                    _ => "did not pass",
+                },
+                result.error.as_deref().unwrap_or("Unknown error"),
+                result.assertions_passed,
+                result.assertions_passed + result.assertions_failed
+            );
+
+            warn!("{}", error_msg);
+
+            // If critical, report as step failure; otherwise, log but succeed
+            if is_critical {
+                Ok((false, Some(error_msg)))
+            } else {
+                info!("Non-critical test failure - step continues");
+                Ok((true, Some(format!("(Non-critical) {}", error_msg))))
+            }
+        }
+    }
+
+    /// Execute a verification test by ID and return the full TestExecutionResult
+    ///
+    /// This provides rich details for verification phase context building.
+    async fn execute_verification_test_with_details(
+        &self,
+        test_id: &str,
+    ) -> Result<crate::test_executor::TestExecutionResult, String> {
+        use crate::database::TestType as DbTestType;
+        use crate::test_executor::{self, TestCategory, TestDefinition, TestType, VisionConfig};
+
+        info!("Executing verification test with details: {}", test_id);
 
         // Get the test from database
         let verification_test = self
@@ -2789,41 +3249,308 @@ impl StepExecutor {
         // Execute the test (synchronous)
         let result = test_executor::execute_test(&test_def);
 
-        // Log the result
-        if result.status == TestStatus::Passed {
-            info!(
-                "Test '{}' passed in {}ms ({}/{} assertions)",
-                verification_test.name,
-                result.duration_ms,
-                result.assertions_passed,
-                result.assertions_passed + result.assertions_failed
-            );
-            Ok((true, None))
-        } else {
-            let error_msg = format!(
-                "Test '{}' {}: {} ({}/{} assertions passed)",
-                verification_test.name,
-                match result.status {
-                    TestStatus::Failed => "failed",
-                    TestStatus::Error => "errored",
-                    TestStatus::Timeout => "timed out",
-                    _ => "did not pass",
-                },
-                result.error.as_deref().unwrap_or("Unknown error"),
-                result.assertions_passed,
-                result.assertions_passed + result.assertions_failed
-            );
+        Ok(result)
+    }
 
-            warn!("{}", error_msg);
+    /// Execute all verification steps and return a VerificationPhaseResult
+    ///
+    /// This is the main entry point for the verification phase in the
+    /// verification-agentic loop. It:
+    /// 1. Executes each verification step in order
+    /// 2. Captures detailed results for each step
+    /// 3. Stops on critical step failure
+    /// 4. Returns a summary that can be used to build AI context
+    pub async fn execute_verification_steps(
+        &self,
+        steps: &[ExecutionStepConfig],
+        execution_id: &str,
+        iteration: u32,
+    ) -> VerificationPhaseResult {
+        use crate::test_executor::TestStatus;
+        use std::time::Instant;
 
-            // If critical, report as step failure; otherwise, log but succeed
-            if is_critical {
-                Ok((false, Some(error_msg)))
-            } else {
-                info!("Non-critical test failure - step continues");
-                Ok((true, Some(format!("(Non-critical) {}", error_msg))))
+        let start = Instant::now();
+        let mut step_results = Vec::new();
+        let mut passed_steps = 0;
+        let mut failed_steps = 0;
+        let mut skipped_steps = 0;
+        let mut critical_failure = false;
+
+        // Filter to only verification phase steps
+        let verification_steps: Vec<_> = steps
+            .iter()
+            .filter(|s| s.phase.as_deref() == Some("verification"))
+            .collect();
+
+        info!(
+            "Executing {} verification steps for iteration {}",
+            verification_steps.len(),
+            iteration
+        );
+
+        for (index, step) in verification_steps.iter().enumerate() {
+            // Skip remaining steps if we had a critical failure
+            if critical_failure {
+                let result = StepExecutionResult {
+                    step_index: index,
+                    step_name: step
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("Step {}", index + 1)),
+                    step_type: step.step_type.clone(),
+                    success: false,
+                    error: Some("Skipped due to critical failure".to_string()),
+                    duration_ms: 0,
+                    screenshot_path: None,
+                    config: StepExecutionConfig {
+                        action_type: None,
+                        target_image_id: None,
+                        target_image_name: None,
+                        monitor_index: None,
+                        screenshot_delay: None,
+                        timeout_seconds: None,
+                        playwright_script_id: None,
+                        initial_state_ids: None,
+                        check_type: None,
+                        command: None,
+                        test_id: step.test_id.clone(),
+                        test_type: step.test_type.clone(),
+                        working_directory: None,
+                    },
+                    verification_details: None,
+                };
+                step_results.push(result);
+                skipped_steps += 1;
+                continue;
             }
+
+            let step_start = Instant::now();
+            let step_name = step
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("Step {}", index + 1));
+            let is_critical = step.test_is_critical.unwrap_or(false);
+
+            // Execute based on step type
+            let (success, error, verification_details) = match step.step_type.as_str() {
+                "test" => {
+                    if let Some(ref test_id) = step.test_id {
+                        match self.execute_verification_test_with_details(test_id).await {
+                            Ok(test_result) => {
+                                let passed = test_result.status == TestStatus::Passed;
+                                let details = VerificationStepDetails {
+                                    step_id: step
+                                        .name
+                                        .clone()
+                                        .unwrap_or_else(|| format!("step-{}", index)),
+                                    phase: "verification".to_string(),
+                                    is_critical,
+                                    is_blocking: is_critical,
+                                    stdout: Some(test_result.output.clone()),
+                                    stderr: None,
+                                    assertions_passed: Some(test_result.assertions_passed),
+                                    assertions_total: Some(
+                                        test_result.assertions_passed
+                                            + test_result.assertions_failed,
+                                    ),
+                                    console_output: test_result
+                                        .structured_output
+                                        .as_ref()
+                                        .and_then(|v| v.get("console_output"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    page_snapshot: test_result
+                                        .structured_output
+                                        .as_ref()
+                                        .and_then(|v| v.get("page_snapshot"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string()),
+                                    exit_code: test_result.exit_code,
+                                };
+                                (
+                                    passed,
+                                    if passed {
+                                        None
+                                    } else {
+                                        test_result.error.clone()
+                                    },
+                                    Some(details),
+                                )
+                            }
+                            Err(e) => (
+                                false,
+                                Some(format!("Test execution error: {}", e)),
+                                Some(VerificationStepDetails {
+                                    step_id: step
+                                        .name
+                                        .clone()
+                                        .unwrap_or_else(|| format!("step-{}", index)),
+                                    phase: "verification".to_string(),
+                                    is_critical,
+                                    is_blocking: is_critical,
+                                    stderr: Some(e),
+                                    ..Default::default()
+                                }),
+                            ),
+                        }
+                    } else {
+                        (false, Some("No test_id specified".to_string()), None)
+                    }
+                }
+                "check" => {
+                    // Execute check step (shell command for checks like lint, typecheck, etc.)
+                    let (success, error, output) = self.execute_single_step(step).await;
+                    let details = VerificationStepDetails {
+                        step_id: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("step-{}", index)),
+                        phase: "verification".to_string(),
+                        is_critical,
+                        is_blocking: is_critical,
+                        stdout: output, // Capture output for AI context
+                        ..Default::default()
+                    };
+                    (success, error, Some(details))
+                }
+                "shell" => {
+                    // Execute shell command step
+                    let timeout = step.timeout_seconds.unwrap_or(120);
+                    let (success, error, output) =
+                        self.execute_shell_command_step(step, timeout).await;
+                    let details = VerificationStepDetails {
+                        step_id: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("step-{}", index)),
+                        phase: "verification".to_string(),
+                        is_critical,
+                        is_blocking: is_critical,
+                        stdout: output, // Capture output for AI context
+                        ..Default::default()
+                    };
+                    (success, error, Some(details))
+                }
+                "check_group" => {
+                    // Execute check group - runs all checks in the group
+                    let timeout = step.timeout_seconds.unwrap_or(300);
+                    let (success, error, summary) =
+                        self.execute_check_group_step(step, timeout).await;
+                    let details = VerificationStepDetails {
+                        step_id: step
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| format!("step-{}", index)),
+                        phase: "verification".to_string(),
+                        is_critical,
+                        is_blocking: is_critical,
+                        // Capture the detailed summary with all check results for AI context
+                        stdout: summary,
+                        ..Default::default()
+                    };
+                    (success, error, Some(details))
+                }
+                _ => {
+                    // For other step types, use the generic executor
+                    let (success, error, output) = self.execute_single_step(step).await;
+                    // Still capture output even for unknown step types
+                    let details = if output.is_some() {
+                        Some(VerificationStepDetails {
+                            step_id: step
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| format!("step-{}", index)),
+                            phase: "verification".to_string(),
+                            is_critical,
+                            is_blocking: is_critical,
+                            stdout: output,
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    };
+                    (success, error, details)
+                }
+            };
+
+            let duration_ms = step_start.elapsed().as_millis() as u64;
+
+            if success {
+                passed_steps += 1;
+                info!(
+                    "Verification step '{}' passed in {}ms",
+                    step_name, duration_ms
+                );
+            } else {
+                failed_steps += 1;
+                warn!(
+                    "Verification step '{}' failed: {:?}",
+                    step_name,
+                    error.as_deref().unwrap_or("unknown error")
+                );
+
+                // Check for critical failure
+                if is_critical {
+                    critical_failure = true;
+                    warn!("Critical verification step failed - stopping verification phase");
+                }
+            }
+
+            let result = StepExecutionResult {
+                step_index: index,
+                step_name,
+                step_type: step.step_type.clone(),
+                success,
+                error,
+                duration_ms,
+                screenshot_path: None,
+                config: StepExecutionConfig {
+                    action_type: step.action_type.clone(),
+                    target_image_id: step.target_image_id.clone(),
+                    target_image_name: step.target_image_name.clone(),
+                    monitor_index: step.monitor_index,
+                    screenshot_delay: if step.screenshot_delay > 0 {
+                        Some(step.screenshot_delay)
+                    } else {
+                        None
+                    },
+                    timeout_seconds: step.timeout_seconds,
+                    playwright_script_id: step.playwright_script_id.clone(),
+                    initial_state_ids: step.initial_state_ids.clone(),
+                    check_type: step.check_type.clone(),
+                    command: step
+                        .check_command
+                        .clone()
+                        .or_else(|| step.shell_command.clone()),
+                    test_id: step.test_id.clone(),
+                    test_type: step.test_type.clone(),
+                    working_directory: step
+                        .check_working_directory
+                        .clone()
+                        .or_else(|| step.shell_command_working_directory.clone()),
+                },
+                verification_details,
+            };
+            step_results.push(result);
         }
+
+        let total_duration_ms = start.elapsed().as_millis() as u64;
+        let all_passed = failed_steps == 0 && skipped_steps == 0;
+
+        let result = VerificationPhaseResult {
+            iteration,
+            all_passed,
+            total_steps: verification_steps.len(),
+            passed_steps,
+            failed_steps,
+            skipped_steps,
+            total_duration_ms,
+            step_results,
+            critical_failure,
+        };
+
+        info!("{}", result.summary());
+        result
     }
 
     // ========================================================================
@@ -3400,6 +4127,9 @@ impl StepExecutor {
     // =========================================================================
 
     /// Execute a shell command step
+    ///
+    /// Supports variable expansion using `{{variable_name}}` syntax in the command.
+    /// Variables are resolved from the runtime context.
     async fn execute_shell_command_step(
         &self,
         step: &ExecutionStepConfig,
@@ -3409,8 +4139,8 @@ impl StepExecutor {
         use tokio::process::Command;
         use tokio::time::{timeout, Duration};
 
-        // Get the command - either directly or from shell_command_id (not implemented yet)
-        let command = match &step.shell_command {
+        // Get the command template - either directly or from shell_command_id (not implemented yet)
+        let template_command = match &step.shell_command {
             Some(cmd) => cmd.clone(),
             None => {
                 // If no direct command, check for shell_command_id
@@ -3429,9 +4159,54 @@ impl StepExecutor {
             }
         };
 
+        // Expand variables in the command using runtime context
+        let evaluator = ExpressionEvaluator::new();
+        let has_variables = evaluator.has_expressions(&template_command);
+        let command = evaluator.evaluate(&template_command, &self.runtime_context);
+
+        // Track which variables were resolved (for UI display)
+        let resolved_variables: Option<HashMap<String, String>> = if has_variables {
+            let expressions = evaluator.find_expressions(&template_command);
+            let mut vars = HashMap::new();
+            for expr in expressions {
+                // Try to resolve the expression to get the value
+                let resolved =
+                    evaluator.evaluate(&format!("{{{{{}}}}}", expr), &self.runtime_context);
+                // Only include if it was actually resolved (doesn't still contain braces)
+                if !resolved.contains("{{") {
+                    vars.insert(expr, resolved);
+                }
+            }
+            if vars.is_empty() {
+                None
+            } else {
+                Some(vars)
+            }
+        } else {
+            None
+        };
+
+        // Log variable expansion if applicable
+        if has_variables {
+            info!(
+                "Shell command variables expanded: template='{}' -> resolved='{}'",
+                template_command, command
+            );
+            if let Some(ref vars) = resolved_variables {
+                info!("Resolved variables: {:?}", vars);
+            }
+        }
+
         let step_name = step.name.as_deref().unwrap_or("Shell Command");
         let working_directory = step.shell_command_working_directory.clone();
         let fail_on_error = step.shell_command_fail_on_error.unwrap_or(true);
+
+        // Store template info for later use in event logging
+        let template_info = if has_variables {
+            Some((template_command.clone(), resolved_variables.clone()))
+        } else {
+            None
+        };
 
         // Detect if command uses PowerShell syntax
         let is_powershell = command.contains("Get-")
@@ -3698,7 +4473,8 @@ impl StepExecutor {
                 stderr.clone()
             };
 
-            let shell_data = json!({
+            // Build shell_data with optional template info
+            let mut shell_data = json!({
                 "step_type": "shell_command",
                 "step_name": step_name,
                 "command": &command,
@@ -3710,6 +4486,16 @@ impl StepExecutor {
                 "duration_ms": duration_ms,
                 "success": final_success,
             });
+
+            // Add template info if variables were used
+            if let Some((ref template_cmd, ref vars)) = template_info {
+                if let Some(obj) = shell_data.as_object_mut() {
+                    obj.insert("template_command".to_string(), json!(template_cmd));
+                    if let Some(resolved_vars) = vars {
+                        obj.insert("resolved_variables".to_string(), json!(resolved_vars));
+                    }
+                }
+            }
 
             let event_input = CreateTaskRunEventInput {
                 task_run_id: task_run_id.clone(),
@@ -4274,11 +5060,29 @@ impl StepExecutor {
                     };
                     (true, None, output_data)
                 } else {
-                    let error_output = if !stderr.is_empty() { stderr } else { stdout };
+                    // IMPORTANT: Capture BOTH stdout and stderr for failed checks
+                    // so the AI can see the full error context for fixing
+                    let mut combined_output = String::new();
+                    if !stdout.is_empty() {
+                        combined_output.push_str("=== STDOUT ===\n");
+                        combined_output.push_str(&stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !combined_output.is_empty() {
+                            combined_output.push_str("\n\n");
+                        }
+                        combined_output.push_str("=== STDERR ===\n");
+                        combined_output.push_str(&stderr);
+                    }
+                    let error_summary = if !stderr.is_empty() {
+                        stderr.lines().take(5).collect::<Vec<_>>().join("\n")
+                    } else {
+                        stdout.lines().take(5).collect::<Vec<_>>().join("\n")
+                    };
                     (
                         false,
-                        Some(format!("Check failed: {}", error_output.trim())),
-                        None,
+                        Some(format!("Check failed (exit code {:?}): {}", exit_code, error_summary.trim())),
+                        Some(combined_output), // Return full output for AI context
                     )
                 }
             }
@@ -4345,6 +5149,179 @@ impl StepExecutor {
     }
 
     // =========================================================================
+    // Check Group Step Execution
+    // =========================================================================
+
+    /// Execute all checks in a check group
+    async fn execute_check_group_step(
+        &self,
+        step: &ExecutionStepConfig,
+        timeout_secs: u64,
+    ) -> (bool, Option<String>, Option<String>) {
+        let step_name = step.name.as_deref().unwrap_or("Check Group");
+        let group_id = match &step.check_group_id {
+            Some(id) => id.clone(),
+            None => {
+                return (
+                    false,
+                    Some("No check group ID specified for check_group step".to_string()),
+                    None,
+                );
+            }
+        };
+
+        info!(
+            "execute_check_group_step: step_name={:?}, group_id={:?}",
+            step_name, group_id
+        );
+
+        // Get the checkpoint_db from app_state
+        let db = &self.app_state.checkpoint_db;
+
+        // Get the group
+        let group = match db.get_check_group(&group_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                return (
+                    false,
+                    Some(format!("Check group not found: {}", group_id)),
+                    None,
+                );
+            }
+            Err(e) => {
+                return (
+                    false,
+                    Some(format!("Failed to get check group: {}", e)),
+                    None,
+                );
+            }
+        };
+
+        if !group.enabled {
+            info!("Check group '{}' is disabled, skipping", group.name);
+            return (
+                true,
+                None,
+                Some(format!("Check group '{}' is disabled", group.name)),
+            );
+        }
+
+        // Get checks in the group
+        let checks = match db.get_checks_in_group(&group_id) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    false,
+                    Some(format!("Failed to get checks in group: {}", e)),
+                    None,
+                );
+            }
+        };
+
+        if checks.is_empty() {
+            return (
+                true,
+                None,
+                Some(format!("No checks in group '{}'", group.name)),
+            );
+        }
+
+        info!(
+            "Executing check group '{}' with {} checks (stop_on_failure: {})",
+            group.name,
+            checks.len(),
+            group.stop_on_failure
+        );
+
+        // Execute each check
+        use crate::check_executor::{execute_check, CheckDefinition, CheckTool, CheckType};
+        use std::time::Instant;
+
+        let start_time = Instant::now();
+        let mut passed = 0;
+        let mut failed = 0;
+        let mut results_output = Vec::new();
+
+        for check in &checks {
+            if !check.enabled {
+                results_output.push(format!("  [SKIPPED] {} (disabled)", check.name));
+                continue;
+            }
+
+            let check_def = CheckDefinition {
+                id: check.id.clone(),
+                name: check.name.clone(),
+                check_type: serde_json::from_str(&format!("\"{}\"", check.check_type))
+                    .unwrap_or(CheckType::Lint),
+                tool: serde_json::from_str(&format!("\"{}\"", check.tool))
+                    .unwrap_or(CheckTool::Custom),
+                command: check.command.clone(),
+                working_directory: check.working_directory.clone(),
+                config_path: check.config_path.clone(),
+                auto_fix: check.auto_fix,
+                fail_on_warning: check.fail_on_warning,
+                timeout_seconds: check.timeout_seconds,
+                is_critical: check.is_critical,
+            };
+
+            let result = execute_check(&check_def);
+            let is_success = result.is_success();
+
+            if is_success {
+                passed += 1;
+                results_output.push(format!(
+                    "  [PASSED] {} ({}ms, {} issues found, {} fixed)",
+                    check.name, result.duration_ms, result.issues_found, result.issues_fixed
+                ));
+            } else {
+                failed += 1;
+                results_output.push(format!(
+                    "  [FAILED] {} ({}ms): {}",
+                    check.name,
+                    result.duration_ms,
+                    result.error.as_deref().unwrap_or(&result.output)
+                ));
+
+                if group.stop_on_failure {
+                    results_output.push("  Stopping due to stop_on_failure setting".to_string());
+                    break;
+                }
+            }
+        }
+
+        let duration_ms = start_time.elapsed().as_millis();
+        let total = passed + failed;
+        let success = failed == 0;
+
+        let summary = format!(
+            "Check group '{}': {}/{} passed ({}ms total)\n{}",
+            group.name,
+            passed,
+            total,
+            duration_ms,
+            results_output.join("\n")
+        );
+
+        info!(
+            "Check group '{}' completed: {}/{} passed ({}ms)",
+            group.name, passed, total, duration_ms
+        );
+
+        if success {
+            (true, None, Some(summary))
+        } else {
+            (
+                false,
+                Some(format!(
+                    "Check group '{}' failed: {}/{} passed",
+                    group.name, passed, total
+                )),
+                Some(summary),
+            )
+        }
+    }
+
+    // =========================================================================
     // Macro Step Execution
     // =========================================================================
 
@@ -4360,11 +5337,7 @@ impl StepExecutor {
         let macro_item = match macros::get_macro(macro_id) {
             Some(m) => m,
             None => {
-                return (
-                    false,
-                    Some(format!("Macro not found: {}", macro_id)),
-                    None,
-                );
+                return (false, Some(format!("Macro not found: {}", macro_id)), None);
             }
         };
 
@@ -4372,7 +5345,10 @@ impl StepExecutor {
 
         // Increment run count
         if let Err(e) = macros::increment_run_count(macro_id) {
-            warn!("Failed to increment run count for macro {}: {}", macro_id, e);
+            warn!(
+                "Failed to increment run count for macro {}: {}",
+                macro_id, e
+            );
         }
 
         let mut all_success = true;
@@ -4387,7 +5363,12 @@ impl StepExecutor {
                     if let Some(ref image_ids) = step.target_image_ids {
                         if let Some(first_image_id) = image_ids.first() {
                             self.action_service
-                                .execute_action(&step.action_type, first_image_id, None, step_monitor)
+                                .execute_action(
+                                    &step.action_type,
+                                    first_image_id,
+                                    None,
+                                    step_monitor,
+                                )
                                 .await
                                 .map(|r| r.success)
                                 .map_err(|e| format!("{:?}", e))
@@ -4532,6 +5513,7 @@ mod tests {
                     screenshot_path: Some("screenshot1.png".to_string()),
                     duration_ms: 1000,
                     config: StepExecutionConfig::default(),
+                    verification_details: None,
                 },
                 StepExecutionResult {
                     step_index: 1,
@@ -4542,6 +5524,7 @@ mod tests {
                     screenshot_path: Some("screenshot2.png".to_string()),
                     duration_ms: 500,
                     config: StepExecutionConfig::default(),
+                    verification_details: None,
                 },
             ],
             captured_logs: None,

@@ -120,7 +120,9 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-      <div className="bg-background border border-border rounded-lg shadow-xl w-[90vw] h-[90vh] flex flex-col overflow-hidden">
+      <div
+        data-ui-id="dialog-html-viewer"
+        className="bg-background border border-border rounded-lg shadow-xl w-[90vw] h-[90vh] flex flex-col overflow-hidden">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-border flex-shrink-0">
           <div className="flex items-center gap-3 min-w-0">
@@ -145,6 +147,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <input
                 id="html-search"
+                data-ui-id="dialog-html-viewer-search-input"
                 type="text"
                 placeholder="Search (Ctrl+F)"
                 value={searchQuery}
@@ -171,6 +174,7 @@ export function HtmlViewerModal({ capture, onClose }: Props) {
               <Download className="w-4 h-4" />
             </button>
             <button
+              data-ui-id="dialog-html-viewer-close-btn"
               onClick={onClose}
               className="p-2 rounded-md hover:bg-muted transition-colors"
               title="Close (Escape)"

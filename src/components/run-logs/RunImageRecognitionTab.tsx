@@ -23,9 +23,9 @@ export function RunImageRecognitionTab({
   onImageRowClick,
 }: RunImageRecognitionTabProps) {
   return (
-    <div className="h-full flex flex-col overflow-hidden">
+    <div data-ui-id="logs-image-recognition-tab" className="h-full flex flex-col overflow-hidden">
       {/* Content */}
-      <div className="flex-1 min-h-0 overflow-auto">
+      <div data-ui-id="logs-image-recognition-list" className="flex-1 min-h-0 overflow-auto">
         {imageLogs.length > 0 ? (
           <ImageLogTable imageLogs={imageLogs} onRowClick={onImageRowClick} />
         ) : (

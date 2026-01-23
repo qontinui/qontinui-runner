@@ -54,11 +54,13 @@ export function Tabs({ defaultValue, value, onValueChange, children, className }
 interface TabsListProps {
   children: ReactNode;
   className?: string;
+  "data-ui-id"?: string;
 }
 
-export function TabsList({ children, className }: TabsListProps) {
+export function TabsList({ children, className, "data-ui-id": dataUiId }: TabsListProps) {
   return (
     <div
+      data-ui-id={dataUiId}
       className={cn(
         "inline-flex h-9 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground",
         className,
@@ -75,9 +77,10 @@ interface TabsTriggerProps {
   children: ReactNode;
   className?: string;
   disabled?: boolean;
+  "data-ui-id"?: string;
 }
 
-export function TabsTrigger({ value, children, className, disabled }: TabsTriggerProps) {
+export function TabsTrigger({ value, children, className, disabled, "data-ui-id": dataUiId }: TabsTriggerProps) {
   const { value: currentValue, onValueChange } = useTabsContext();
   const isActive = currentValue === value;
 
@@ -87,6 +90,7 @@ export function TabsTrigger({ value, children, className, disabled }: TabsTrigge
       role="tab"
       aria-selected={isActive}
       disabled={disabled}
+      data-ui-id={dataUiId}
       onClick={() => onValueChange(value)}
       className={cn(
         "inline-flex items-center justify-center whitespace-nowrap rounded-md px-3 py-1 text-sm font-medium ring-offset-background transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:pointer-events-none disabled:opacity-50",

@@ -126,7 +126,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       />
 
       {/* ADB Configuration */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-adb-section">
         <h4 className="font-medium text-sm">ADB Configuration</h4>
         <p className="text-xs text-muted-foreground">
           Configure the path to ADB (Android Debug Bridge). Leave empty to auto-detect from
@@ -147,11 +147,13 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
                 onChange={(e) => updateSetting("adb_path", e.target.value || null)}
                 placeholder="Auto-detect (e.g., C:\Android\sdk\platform-tools\adb.exe)"
                 className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-mobile-adb-path-input"
               />
               <button
                 type="button"
                 className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md"
                 title="Browse for ADB"
+                data-ui-id="settings-mobile-adb-path-browse-btn"
               >
                 <FolderOpen className="w-4 h-4" />
               </button>
@@ -164,13 +166,14 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* Device Selection */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-device-section">
         <div className="flex items-center justify-between">
           <h4 className="font-medium text-sm">Default Device</h4>
           <button
             onClick={refreshDevices}
             disabled={loadingDevices}
             className="flex items-center gap-1 px-2 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-muted rounded transition-colors"
+            data-ui-id="settings-mobile-device-refresh-btn"
           >
             <RefreshCw className={`w-3 h-3 ${loadingDevices ? "animate-spin" : ""}`} />
             Refresh
@@ -186,6 +189,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
             value={settings.default_device_id || ""}
             onChange={(e) => updateSetting("default_device_id", e.target.value || null)}
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+            data-ui-id="settings-mobile-device-select"
           >
             <option value="">Auto (first connected device)</option>
             {devices.map((device) => (
@@ -204,7 +208,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* App Package Filter */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-package-section">
         <h4 className="font-medium text-sm">App Package</h4>
 
         <div className="space-y-1.5">
@@ -218,6 +222,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
             onChange={(e) => updateSetting("app_package", e.target.value || null)}
             placeholder="com.myapp or com.myapp.debug"
             className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+            data-ui-id="settings-mobile-package-input"
           />
           <p className="text-[10px] text-muted-foreground">
             Used for filtering logcat output to your app&apos;s logs
@@ -226,7 +231,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* Logcat Settings */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-logcat-section">
         <h4 className="font-medium text-sm">Logcat Capture</h4>
 
         <div className="grid grid-cols-2 gap-4">
@@ -243,6 +248,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
               value={settings.logcat_lines}
               onChange={(e) => updateSetting("logcat_lines", parseInt(e.target.value) || 500)}
               className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              data-ui-id="settings-mobile-logcat-lines-input"
             />
           </div>
         </div>
@@ -260,6 +266,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
             className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
               settings.filter_react_native ? "bg-primary" : "bg-muted"
             }`}
+            data-ui-id="settings-mobile-filter-react-native-toggle"
           >
             <span
               className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -271,7 +278,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
       </div>
 
       {/* Output Directory */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-mobile-output-section">
         <h4 className="font-medium text-sm">Output Directory</h4>
 
         <div className="space-y-1.5">
@@ -286,11 +293,13 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
               onChange={(e) => updateSetting("output_dir", e.target.value || null)}
               placeholder="Default: .dev-logs/mobile/"
               className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md placeholder:text-muted-foreground outline-none focus:ring-1 focus:ring-primary/50"
+              data-ui-id="settings-mobile-output-dir-input"
             />
             <button
               type="button"
               className="p-2 text-muted-foreground hover:text-foreground hover:bg-muted rounded-md"
               title="Browse for directory"
+              data-ui-id="settings-mobile-output-dir-browse-btn"
             >
               <FolderOpen className="w-4 h-4" />
             </button>
@@ -311,6 +320,7 @@ export function MobileSettings({ onLog }: MobileSettingsProps) {
               ? "bg-primary text-primary-foreground hover:bg-primary/90"
               : "bg-muted text-muted-foreground cursor-not-allowed"
           }`}
+          data-ui-id="settings-mobile-save-btn"
         >
           {isSaving ? "Saving..." : "Save Settings"}
         </button>

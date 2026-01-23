@@ -68,7 +68,7 @@ impl VariableResolver {
     /// Unknown variables are left as-is.
     pub fn resolve(&self, input: &str) -> String {
         let re = Regex::new(r"\{\{(\w+)\}\}").unwrap();
-        let vars = self.variables.read().unwrap();
+        let vars = crate::safe_lock::safe_read_or_recover(&self.variables, "variables");
 
         re.replace_all(input, |caps: &regex::Captures| {
             let var_name = &caps[1];
@@ -90,7 +90,7 @@ impl VariableResolver {
     /// Check if a string contains any unresolved variables
     pub fn has_unresolved(&self, input: &str) -> bool {
         let re = Regex::new(r"\{\{(\w+)\}\}").unwrap();
-        let vars = self.variables.read().unwrap();
+        let vars = crate::safe_lock::safe_read_or_recover(&self.variables, "variables");
 
         for caps in re.captures_iter(input) {
             let var_name = &caps[1];
@@ -104,7 +104,7 @@ impl VariableResolver {
     /// Get list of unresolved variable names in a string
     pub fn get_unresolved(&self, input: &str) -> Vec<String> {
         let re = Regex::new(r"\{\{(\w+)\}\}").unwrap();
-        let vars = self.variables.read().unwrap();
+        let vars = crate::safe_lock::safe_read_or_recover(&self.variables, "variables");
         let mut unresolved = Vec::new();
 
         for caps in re.captures_iter(input) {

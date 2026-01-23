@@ -17,6 +17,8 @@ import {
   CheckCircle,
   List,
   FileSearch,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import type { UnifiedStep, WorkflowPhase } from "../../types";
 import type {
@@ -32,6 +34,7 @@ import { CHECK_TOOLS, CHECK_TYPE_INFO } from "../check-builder/types";
 import { useWorkflowBuilder } from "./WorkflowBuilderContext";
 import { ApiRequestStepEditor } from "./ApiRequestStepEditor";
 import { McpCallStepEditor } from "./McpCallStepEditor";
+import { GuiWorkflowPicker } from "./GuiWorkflowPicker";
 
 // =============================================================================
 // Helper to find step phase
@@ -74,6 +77,7 @@ function ScriptConfig({
           onChange={(e) => onUpdate({ target_url: e.target.value || undefined })}
           placeholder="https://example.com"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-script-target-url-input"
         />
         <p className="text-xs text-zinc-500 mt-1">
           The URL to navigate to before running the script
@@ -87,6 +91,7 @@ function ScriptConfig({
           checked={step.refinement_enabled ?? true}
           onChange={(e) => onUpdate({ refinement_enabled: e.target.checked })}
           className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-script-refinement-checkbox"
         />
         <label htmlFor="refinement_enabled" className="text-sm text-zinc-300">
           Enable refinement loop
@@ -126,6 +131,7 @@ function StateConfig({
           onChange={(e) => onUpdate({ state_name: e.target.value || undefined })}
           placeholder="Enter state name"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-state-name-input"
         />
         <p className="text-xs text-zinc-500 mt-1">The state to navigate to</p>
       </div>
@@ -138,6 +144,7 @@ function StateConfig({
           onChange={(e) => onUpdate({ state_id: e.target.value })}
           placeholder="state-uuid"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-state-id-input"
         />
       </div>
 
@@ -150,6 +157,7 @@ function StateConfig({
           min={5}
           max={300}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-state-timeout-input"
         />
       </div>
 
@@ -161,6 +169,7 @@ function StateConfig({
             checked={step.run_on_subsequent_iterations ?? false}
             onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-state-run-subsequent-checkbox"
           />
           <label htmlFor="run_subsequent" className="text-sm text-zinc-300">
             Run on subsequent iterations
@@ -182,31 +191,91 @@ function WorkflowRefConfig({
   step: UnifiedStep & { type: "workflow_ref" };
   onUpdate: (updates: Partial<typeof step>) => void;
 }) {
+  const [showManualOverride, setShowManualOverride] = useState(false);
+
+  // Handle workflow selection from picker
+  const handleWorkflowSelect = (workflow: { id: string; name: string }) => {
+    onUpdate({
+      workflow_id: workflow.id,
+      workflow_name: workflow.name,
+      name: `Run: ${workflow.name}`, // Auto-set step name
+    });
+  };
+
   return (
     <div className="space-y-4">
+      {/* Workflow Picker */}
       <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Workflow Name</label>
-        <input
-          type="text"
-          value={step.workflow_name || ""}
-          onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
-          placeholder="Enter workflow name"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Select Workflow</label>
+        <GuiWorkflowPicker
+          selectedWorkflowId={step.workflow_id || ""}
+          onSelect={handleWorkflowSelect}
+          placeholder="Select a GUI workflow..."
         />
+        <p className="text-xs text-zinc-500 mt-1">
+          Choose a workflow from your loaded configuration
+        </p>
       </div>
 
-      <div>
-        <label className="block text-sm font-medium text-zinc-400 mb-1">Workflow ID</label>
-        <input
-          type="text"
-          value={step.workflow_id || ""}
-          onChange={(e) => onUpdate({ workflow_id: e.target.value })}
-          placeholder="workflow-uuid"
-          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
-        />
+      {/* Current Selection Info */}
+      {step.workflow_id && step.workflow_name && (
+        <div className="p-2 bg-purple-500/10 border border-purple-500/30 rounded-md">
+          <p className="text-xs text-purple-400">
+            <span className="font-medium">Selected:</span> {step.workflow_name}
+          </p>
+          <p className="text-xs text-zinc-500 font-mono mt-0.5">{step.workflow_id}</p>
+        </div>
+      )}
+
+      {/* Manual Override Section (Collapsed by default) */}
+      <div className="border-t border-zinc-700 pt-3">
+        <button
+          type="button"
+          onClick={() => setShowManualOverride(!showManualOverride)}
+          className="flex items-center gap-2 text-sm text-zinc-400 hover:text-zinc-300 transition-colors"
+        >
+          {showManualOverride ? (
+            <ChevronDown className="w-4 h-4" />
+          ) : (
+            <ChevronRight className="w-4 h-4" />
+          )}
+          <span>Manual Override</span>
+        </button>
+
+        {showManualOverride && (
+          <div className="mt-3 space-y-3 pl-6">
+            <div>
+              <label className="block text-sm font-medium text-zinc-400 mb-1">Workflow Name</label>
+              <input
+                type="text"
+                value={step.workflow_name || ""}
+                onChange={(e) => onUpdate({ workflow_name: e.target.value || undefined })}
+                placeholder="Enter workflow name"
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-step-config-workflow-ref-name-input"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-zinc-400 mb-1">Workflow ID</label>
+              <input
+                type="text"
+                value={step.workflow_id || ""}
+                onChange={(e) => onUpdate({ workflow_id: e.target.value })}
+                placeholder="workflow-uuid"
+                className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                data-ui-id="workflow-builder-step-config-workflow-ref-id-input"
+              />
+              <p className="text-xs text-zinc-500 mt-1">
+                The workflow ID from your JSON configuration file
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
-      {step.phase === "setup" && (
+      {/* Run on subsequent iterations (setup/verification only) */}
+      {(step.phase === "setup" || step.phase === "verification") && (
         <div className="flex items-center gap-2">
           <input
             type="checkbox"
@@ -214,12 +283,86 @@ function WorkflowRefConfig({
             checked={step.run_on_subsequent_iterations ?? false}
             onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-workflow-ref-run-subsequent-checkbox"
           />
           <label htmlFor="run_subsequent_wf" className="text-sm text-zinc-300">
             Run on subsequent iterations
           </label>
         </div>
       )}
+    </div>
+  );
+}
+
+// =============================================================================
+// Macro Ref Step Config
+// =============================================================================
+
+function MacroRefConfig({
+  step,
+  onUpdate,
+}: {
+  step: UnifiedStep & { type: "macro" };
+  onUpdate: (updates: Partial<typeof step>) => void;
+}) {
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Macro Name</label>
+        <input
+          type="text"
+          value={step.macro_name || ""}
+          onChange={(e) => onUpdate({ macro_name: e.target.value || undefined })}
+          placeholder="Enter macro name"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-macro-name-input"
+        />
+        <p className="text-xs text-zinc-500 mt-1">The saved macro to execute</p>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Macro ID</label>
+        <input
+          type="text"
+          value={step.macro_id || ""}
+          onChange={(e) => onUpdate({ macro_id: e.target.value })}
+          placeholder="macro-uuid"
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-macro-id-input"
+        />
+        <p className="text-xs text-zinc-500 mt-1">
+          The unique identifier of the macro from your macro library
+        </p>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-zinc-400 mb-1">Monitor (optional)</label>
+        <select
+          value={step.monitor_index ?? ""}
+          onChange={(e) =>
+            onUpdate({
+              monitor_index: e.target.value === "" ? undefined : parseInt(e.target.value),
+            })
+          }
+          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-macro-monitor-select"
+        >
+          <option value="">All Monitors (default)</option>
+          <option value="0">Primary Monitor (0)</option>
+          <option value="1">Monitor 1</option>
+          <option value="2">Monitor 2</option>
+        </select>
+        <p className="text-xs text-zinc-500 mt-1">
+          Restrict macro execution to a specific monitor
+        </p>
+      </div>
+
+      <div className="p-3 bg-pink-900/20 border border-pink-700/30 rounded-md">
+        <p className="text-xs text-zinc-400">
+          Macros are deterministic action sequences (click, type, hotkey). Create and manage macros
+          in the Macro Builder tab.
+        </p>
+      </div>
     </div>
   );
 }
@@ -245,6 +388,7 @@ function GuiActionConfig({
           value={step.action}
           onChange={(e) => onUpdate({ action: e.target.value as GuiActionType })}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-gui-action-type-select"
         >
           {GUI_ACTION_TYPES.map((action) => (
             <option key={action.type} value={action.type}>
@@ -273,6 +417,7 @@ function GuiActionConfig({
             }
             placeholder="button.png, icon.png"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-gui-action-target-images-input"
           />
           <p className="text-xs text-zinc-500 mt-1">
             Comma-separated list of image names from your library
@@ -290,6 +435,7 @@ function GuiActionConfig({
             onChange={(e) => onUpdate({ text_input: e.target.value })}
             placeholder="Enter text..."
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-gui-action-text-input"
           />
         </div>
       )}
@@ -304,6 +450,7 @@ function GuiActionConfig({
             onChange={(e) => onUpdate({ hotkey: e.target.value })}
             placeholder="ctrl+s, alt+tab, etc."
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-gui-action-hotkey-input"
           />
           <p className="text-xs text-zinc-500 mt-1">Use + to combine keys: ctrl+shift+s, alt+f4</p>
         </div>
@@ -317,6 +464,7 @@ function GuiActionConfig({
             value={step.scroll_direction || "down"}
             onChange={(e) => onUpdate({ scroll_direction: e.target.value as "up" | "down" })}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-gui-action-scroll-direction-select"
           >
             <option value="up">Up</option>
             <option value="down">Down</option>
@@ -332,6 +480,7 @@ function GuiActionConfig({
             checked={step.run_on_subsequent_iterations ?? false}
             onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-gui-action-run-subsequent-checkbox"
           />
           <label htmlFor="run_subsequent_gui" className="text-sm text-zinc-300">
             Run on subsequent iterations
@@ -363,6 +512,7 @@ function TestConfig({
           value={step.test_type}
           onChange={(e) => onUpdate({ test_type: e.target.value as TestType })}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-test-type-select"
         >
           <option value="playwright">Playwright (Browser)</option>
           <option value="qontinui_vision">Qontinui Vision</option>
@@ -390,6 +540,7 @@ function TestConfig({
                   : "command to run"
             }
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-test-command-input"
           />
         </div>
       )}
@@ -405,6 +556,7 @@ function TestConfig({
                 onUpdate({ execution_mode: e.target.value as PlaywrightExecutionMode })
               }
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-test-execution-mode-select"
             >
               <option value="independent">Independent (fresh session)</option>
               <option value="chained">Chained (continue after previous)</option>
@@ -424,6 +576,7 @@ function TestConfig({
               onChange={(e) => onUpdate({ fused_script_id: e.target.value || undefined })}
               placeholder="script-uuid"
               className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="workflow-builder-step-config-test-fused-script-id-input"
             />
             <p className="text-xs text-zinc-500 mt-1">
               If set, this test will run after the specified setup script
@@ -439,6 +592,7 @@ function TestConfig({
           checked={step.is_critical ?? true}
           onChange={(e) => onUpdate({ is_critical: e.target.checked })}
           className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-test-is-critical-checkbox"
         />
         <label htmlFor="is_critical" className="text-sm text-zinc-300">
           Critical test (fails workflow on failure)
@@ -487,6 +641,7 @@ function CheckConfig({
             onUpdate({ check_type: newType, tool: undefined, command: undefined });
           }}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-check-type-select"
         >
           <option value="lint">Lint (code quality)</option>
           <option value="format">Format (code style)</option>
@@ -511,6 +666,7 @@ function CheckConfig({
               });
             }}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-check-tool-select"
           >
             <option value="">Select a tool...</option>
             {availableTools.map((tool) => (
@@ -539,6 +695,7 @@ function CheckConfig({
           onChange={(e) => onUpdate({ command: e.target.value || undefined })}
           placeholder={selectedTool?.default_command || "Enter command..."}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+          data-ui-id="workflow-builder-step-config-check-command-input"
         />
         {selectedTool?.default_command && !step.command && (
           <p className="text-xs text-zinc-500 mt-1">
@@ -559,6 +716,7 @@ function CheckConfig({
           onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
           placeholder="Leave empty for project root"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-check-working-dir-input"
         />
       </div>
 
@@ -571,6 +729,7 @@ function CheckConfig({
             checked={step.auto_fix ?? false}
             onChange={(e) => onUpdate({ auto_fix: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-check-auto-fix-checkbox"
           />
           <label htmlFor="auto_fix" className="text-sm text-zinc-300">
             Auto-fix issues (when supported)
@@ -586,6 +745,7 @@ function CheckConfig({
           checked={step.is_blocking ?? true}
           onChange={(e) => onUpdate({ is_blocking: e.target.checked })}
           className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-check-is-blocking-checkbox"
         />
         <label htmlFor="is_blocking" className="text-sm text-zinc-300">
           Blocking (fails workflow on check failure)
@@ -602,6 +762,7 @@ function CheckConfig({
           min={5}
           max={600}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-check-timeout-input"
         />
       </div>
     </div>
@@ -630,6 +791,7 @@ function ShellCommandConfig({
           placeholder="git branch backup-$(date +%Y%m%d)"
           rows={3}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-mono text-sm"
+          data-ui-id="workflow-builder-step-config-shell-command-input"
         />
         <p className="text-xs text-zinc-500 mt-1">
           Shell command to execute (bash on Unix, PowerShell on Windows)
@@ -647,6 +809,7 @@ function ShellCommandConfig({
           onChange={(e) => onUpdate({ working_directory: e.target.value || undefined })}
           placeholder="Leave empty for project root"
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-shell-working-dir-input"
         />
       </div>
 
@@ -660,6 +823,7 @@ function ShellCommandConfig({
           min={5}
           max={600}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-shell-timeout-input"
         />
       </div>
 
@@ -671,6 +835,7 @@ function ShellCommandConfig({
           checked={step.fail_on_error ?? true}
           onChange={(e) => onUpdate({ fail_on_error: e.target.checked })}
           className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-shell-fail-on-error-checkbox"
         />
         <label htmlFor="fail_on_error" className="text-sm text-zinc-300">
           Fail workflow on non-zero exit code
@@ -686,6 +851,7 @@ function ShellCommandConfig({
             checked={step.run_on_subsequent_iterations ?? false}
             onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-shell-run-subsequent-checkbox"
           />
           <label htmlFor="run_on_subsequent" className="text-sm text-zinc-300">
             Run on subsequent iterations (not just first run)
@@ -747,6 +913,7 @@ function ScreenshotConfig({
             }
           }}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-screenshot-monitor-select"
         >
           <option value="primary">Primary Monitor</option>
           <option value="all">All Monitors</option>
@@ -769,6 +936,7 @@ function ScreenshotConfig({
           max={10000}
           step={100}
           className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-step-config-screenshot-delay-input"
         />
         <p className="text-xs text-zinc-500 mt-1">Wait before capturing (useful for animations)</p>
       </div>
@@ -797,6 +965,7 @@ function PromptConfig({
           placeholder="Enter the prompt for the AI agent..."
           rows={24}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-y font-mono text-sm"
+          data-ui-id="workflow-builder-step-config-prompt-content-input"
         />
         <p className="text-xs text-zinc-500 mt-1">
           This prompt will be sent to the AI agent during the agentic phase
@@ -812,6 +981,7 @@ function PromptConfig({
             value={step.provider ?? ""}
             onChange={(e) => onUpdate({ provider: e.target.value || undefined })}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-prompt-provider-select"
           >
             <option value="">Default</option>
             <option value="claude_cli">Claude CLI</option>
@@ -824,6 +994,7 @@ function PromptConfig({
             value={step.model ?? ""}
             onChange={(e) => onUpdate({ model: e.target.value || undefined })}
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-prompt-model-select"
           >
             <option value="">Default</option>
             <option value="claude-sonnet-4">Claude Sonnet 4</option>
@@ -876,6 +1047,7 @@ function ApiRequestConfig({
       <button
         onClick={onOpenEditor}
         className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded-md font-medium transition-colors"
+        data-ui-id="workflow-builder-step-config-api-request-open-editor-btn"
       >
         <Globe className="w-4 h-4" />
         <span>Open Request Editor</span>
@@ -895,6 +1067,7 @@ function ApiRequestConfig({
             checked={step.run_on_subsequent_iterations ?? false}
             onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-blue-500 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-api-request-run-subsequent-checkbox"
           />
           <label htmlFor="run_subsequent_api" className="text-sm text-zinc-300">
             Run on subsequent iterations
@@ -947,6 +1120,7 @@ function McpCallConfig({
       <button
         onClick={onOpenEditor}
         className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-md font-medium transition-colors"
+        data-ui-id="workflow-builder-step-config-mcp-call-open-editor-btn"
       >
         <Wifi className="w-4 h-4" />
         <span>Open MCP Call Editor</span>
@@ -965,6 +1139,7 @@ function McpCallConfig({
             checked={step.run_on_subsequent_iterations ?? false}
             onChange={(e) => onUpdate({ run_on_subsequent_iterations: e.target.checked })}
             className="rounded bg-zinc-700 border-zinc-600 text-purple-500 focus:ring-purple-500/50"
+            data-ui-id="workflow-builder-step-config-mcp-call-run-subsequent-checkbox"
           />
           <label htmlFor="run_subsequent_mcp" className="text-sm text-zinc-300">
             Run on subsequent iterations
@@ -1282,6 +1457,8 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         return "Navigate to State";
       case "workflow_ref":
         return "Run Workflow";
+      case "macro":
+        return "Run Macro";
       case "gui_action":
         return "GUI Action";
       case "test":
@@ -1323,6 +1500,7 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
           <button
             onClick={onClose}
             className="p-1 hover:bg-zinc-700 rounded transition-colors text-zinc-400 hover:text-zinc-200"
+            data-ui-id="workflow-builder-step-config-close-btn"
           >
             <X className="w-4 h-4" />
           </button>
@@ -1340,6 +1518,7 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
             onChange={(e) => handleUpdate({ name: e.target.value })}
             placeholder="Step name"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-step-config-name-input"
           />
         </div>
 
@@ -1352,6 +1531,9 @@ export function StepConfigPanel({ onClose }: StepConfigPanelProps) {
         )}
         {selectedStep.type === "workflow_ref" && (
           <WorkflowRefConfig step={selectedStep} onUpdate={handleUpdate} />
+        )}
+        {selectedStep.type === "macro" && (
+          <MacroRefConfig step={selectedStep} onUpdate={handleUpdate} />
         )}
         {selectedStep.type === "gui_action" && (
           <GuiActionConfig step={selectedStep} onUpdate={handleUpdate} />

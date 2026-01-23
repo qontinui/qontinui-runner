@@ -5,7 +5,7 @@
  * Shows quick stats and the last few commands with status.
  */
 
-import { Terminal, Loader2, Hash } from "lucide-react";
+import { Terminal, Loader2, Hash, Variable } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge } from "../../../ui";
 import { StepStatsBar, StepStatusBadge } from "../shared";
@@ -14,10 +14,19 @@ import type { ShellCommandSummaryProps } from "./types";
 import type { ShellCommandExecution } from "../shared/types";
 
 /**
+ * Check if command used variable expansion.
+ */
+function hasVariables(command: ShellCommandExecution): boolean {
+  return Boolean(command.templateCommand && command.resolvedVariables && Object.keys(command.resolvedVariables).length > 0);
+}
+
+/**
  * Compact command row for summary view.
  */
 function CompactCommandRow({ command }: { command: ShellCommandExecution }) {
   const slateColors = getAccentColors("slate");
+  const purpleColors = getAccentColors("purple");
+  const hasVars = hasVariables(command);
 
   return (
     <div className="flex items-center gap-2 py-1">
@@ -33,6 +42,20 @@ function CompactCommandRow({ command }: { command: ShellCommandExecution }) {
         <Terminal className="h-2.5 w-2.5 mr-0.5" />
         CMD
       </Badge>
+      {/* Variables indicator */}
+      {hasVars && command.resolvedVariables && (
+        <Badge
+          className={cn(
+            "text-[9px] px-1 py-0 border",
+            purpleColors.bg,
+            purpleColors.text,
+            purpleColors.border,
+          )}
+          title={`${Object.keys(command.resolvedVariables).length} variable(s)`}
+        >
+          <Variable className="h-2 w-2" />
+        </Badge>
+      )}
       <span className="text-xs text-muted-foreground truncate flex-1 font-mono">
         {command.command}
       </span>

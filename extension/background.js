@@ -1,9 +1,9 @@
 /**
- * Background Service Worker for Qontinui DOM Capture Extension
+ * Background Service Worker for Qontinui DevTools Extension
  *
  * Handles communication between popup and content scripts,
  * and sends captured DOM to the qontinui-runner API.
- * Also provides API request recording functionality.
+ * Also provides API request recording and UI Bridge inspection functionality.
  */
 
 const RUNNER_API = "http://localhost:9876";
@@ -655,10 +655,111 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.action === "sendAllRequestsToRunner") {
+    (async () => {
+      try {
+        if (capturedRequests.length === 0) {
+          sendResponse({ success: false, error: "No requests to save" });
+          return;
+        }
+
+        let savedCount = 0;
+        const errors = [];
+
+        for (const request of capturedRequests) {
+          try {
+            const curl = requestToCurl(request);
+            await importCurlToLibrary(curl);
+            savedCount++;
+          } catch (error) {
+            errors.push(`${request.method} ${request.url}: ${error.message}`);
+          }
+        }
+
+        if (savedCount > 0) {
+          sendResponse({
+            success: true,
+            count: savedCount,
+            errors: errors.length > 0 ? errors : undefined,
+          });
+        } else {
+          sendResponse({
+            success: false,
+            error: errors.join("; "),
+          });
+        }
+      } catch (error) {
+        sendResponse({
+          success: false,
+          error: error.message,
+        });
+      }
+    })();
+    return true;
+  }
+
   if (message.action === "clearCapturedRequests") {
     capturedRequests = [];
     persistState();
     sendResponse({ success: true });
     return true;
+  }
+
+  // =============================================================================
+  // UI Bridge Commands (from popup to content script)
+  // =============================================================================
+
+  if (message.type === "UI_BRIDGE_POPUP_COMMAND") {
+    (async () => {
+      try {
+        // Get the active tab
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab || !tab.id) {
+          sendResponse({ success: false, error: "No active tab found" });
+          return;
+        }
+
+        // Forward the command to the content script
+        chrome.tabs.sendMessage(
+          tab.id,
+          {
+            type: "UI_BRIDGE_COMMAND",
+            action: message.action,
+            params: message.params || {},
+          },
+          (response) => {
+            if (chrome.runtime.lastError) {
+              sendResponse({
+                success: false,
+                error: chrome.runtime.lastError.message || "Failed to communicate with content script",
+              });
+              return;
+            }
+            sendResponse(response || { success: false, error: "No response from content script" });
+          }
+        );
+      } catch (error) {
+        sendResponse({ success: false, error: error.message });
+      }
+    })();
+    return true; // Keep channel open for async response
+  }
+
+  // =============================================================================
+  // UI Bridge Events (from content script to popup)
+  // =============================================================================
+
+  if (message.type === "UI_BRIDGE_EVENT") {
+    // Forward the event to all extension pages (popup)
+    chrome.runtime.sendMessage(message).catch(() => {
+      // Popup might not be open, ignore error
+    });
+    return false;
+  }
+
+  if (message.type === "UI_BRIDGE_BRIDGE_READY") {
+    // Content script bridge is ready
+    console.log("[Qontinui] UI Bridge bridge ready on:", message.url);
+    return false;
   }
 });

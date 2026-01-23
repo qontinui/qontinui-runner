@@ -213,4 +213,65 @@ impl EventForwarder {
             }
         }
     }
+
+    /// Emits an extraction message to the Tauri frontend.
+    ///
+    /// This is a simplified version of emit_message_to_frontend for the extraction executor.
+    /// It emits to "extraction-event" instead of "executor-event" and doesn't process
+    /// tree events or display processor updates since extraction doesn't use GUI automation.
+    pub async fn emit_extraction_message_to_frontend(
+        app_handle: &tauri::AppHandle,
+        message: ExecutorMessage,
+    ) {
+        match message {
+            ExecutorMessage::Event {
+                event,
+                data,
+                timestamp,
+                sequence,
+            } => {
+                let event_obj = ExecutorEvent {
+                    event_type: "event".to_string(),
+                    event,
+                    timestamp,
+                    sequence,
+                    data,
+                };
+                if let Err(e) = app_handle.emit("extraction-event", &event_obj) {
+                    error!("Failed to emit extraction event: {}", e);
+                }
+            }
+            ExecutorMessage::Response {
+                id,
+                success,
+                data,
+                error,
+            } => {
+                let response = super::protocol::ExecutorResponse {
+                    resp_type: "response".to_string(),
+                    id,
+                    success,
+                    data,
+                    error,
+                };
+                if let Err(e) = app_handle.emit("extraction-response", &response) {
+                    error!("Failed to emit extraction response: {}", e);
+                }
+            }
+            ExecutorMessage::Error { message, details } => {
+                let error_event = json!({
+                    "type": "error",
+                    "error": "extraction_error",
+                    "message": message,
+                    "details": details,
+                });
+                if let Err(e) = app_handle.emit("extraction-error", &error_event) {
+                    error!("Failed to emit extraction error: {}", e);
+                }
+            }
+            _ => {
+                debug!("Unhandled extraction message type: {:?}", message);
+            }
+        }
+    }
 }

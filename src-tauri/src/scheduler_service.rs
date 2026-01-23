@@ -54,11 +54,8 @@ impl SchedulerService {
         }
 
         while !self.stop_signal.load(Ordering::SeqCst) {
-            // Check if scheduler is enabled
-            let settings = get_scheduler_settings();
-            if settings.enabled {
-                self.tick().await;
-            }
+            // tick() checks enabled status internally to avoid double-loading state
+            self.tick().await;
 
             // Wait for next check interval
             tokio::time::sleep(tokio::time::Duration::from_secs(self.check_interval_secs)).await;
@@ -75,9 +72,15 @@ impl SchedulerService {
 
     /// Check and execute due tasks
     async fn tick(&self) {
-        let now = chrono::Utc::now();
         let state = load_scheduler_state();
         let settings = state.settings;
+
+        // Skip if scheduler is disabled
+        if !settings.enabled {
+            return;
+        }
+
+        let now = chrono::Utc::now();
 
         // Find tasks that are:
         // 1. Due for execution (next_run <= now), OR

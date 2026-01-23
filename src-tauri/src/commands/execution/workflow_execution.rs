@@ -40,7 +40,8 @@ pub fn start_execution(
     initial_state_ids: Option<Vec<String>>, // Override for initial active states
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
@@ -75,7 +76,8 @@ pub fn start_execution(
 
         // Resolve and add initial_state_ids
         // Priority: override param > workflow.initialStateIds > states with is_initial=true
-        let config_lock = state.current_config.lock().unwrap();
+        let config_lock =
+            crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
         let resolved_initial_states =
             resolve_initial_states(config_lock.as_ref(), &workflow_id, initial_state_ids);
         drop(config_lock);
@@ -114,7 +116,8 @@ pub fn start_execution(
 /// * `Err(String)` - Error if executor not initialized or stop fails
 #[tauri::command]
 pub fn stop_execution(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge_lock {
         bridge
@@ -276,7 +279,8 @@ pub fn get_resolved_initial_states(
         workflow_id
     );
 
-    let config_lock = state.current_config.lock().unwrap();
+    let config_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
     let config = config_lock.as_ref();
 
     // Get resolved states (without override, since this is for display)
@@ -342,10 +346,8 @@ pub fn get_workflow_required_screens(
     info!("Getting required screens for workflow: {}", workflow_id);
 
     // Get the current config from state
-    let config_lock = state
-        .current_config
-        .lock()
-        .expect("current_config mutex poisoned");
+    let config_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
     let config = match config_lock.as_ref() {
         Some(c) => c,
         None => {

@@ -171,7 +171,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
         </div>
       )}
 
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-advanced-debug-section">
         <h4 className="font-medium text-sm">Debug</h4>
 
         <div className="space-y-2">
@@ -188,6 +188,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
                 settings.enable_image_debug ? "bg-primary" : "bg-muted"
               }`}
+              data-ui-id="settings-advanced-debug-toggle"
             >
               <span
                 className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
@@ -212,6 +213,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
                 value={settings.top_matches_count}
                 onChange={(e) => handleTopMatchesChange(parseInt(e.target.value))}
                 className="flex-1 h-2 bg-muted rounded-lg appearance-none cursor-pointer accent-primary"
+                data-ui-id="settings-advanced-top-matches-slider"
               />
               <input
                 type="number"
@@ -220,6 +222,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
                 value={settings.top_matches_count}
                 onChange={(e) => handleTopMatchesChange(parseInt(e.target.value))}
                 className="w-14 px-2 py-1.5 bg-muted/50 rounded-md text-center text-sm outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-advanced-top-matches-input"
               />
             </div>
           </label>
@@ -238,6 +241,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             onClick={saveSettings}
             disabled={saving}
             className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            data-ui-id="settings-advanced-save-btn"
           >
             {saving ? (
               <>
@@ -260,7 +264,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
       </div>
 
       {/* Device Information Section */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-advanced-device-info-section">
         <div className="flex items-center justify-between">
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Monitor className="w-4 h-4 text-primary" />
@@ -271,6 +275,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
             disabled={deviceInfoLoading}
             className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded-md transition-colors disabled:opacity-50"
             title="Refresh device info"
+            data-ui-id="settings-advanced-refresh-device-btn"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${deviceInfoLoading ? "animate-spin" : ""}`} />
           </button>
@@ -293,6 +298,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               <button
                 onClick={() => copyToClipboard(deviceInfo.device_id, "Device ID")}
                 className="w-full flex items-center justify-between px-2.5 py-1.5 bg-muted/50 rounded-md hover:bg-muted transition-colors group"
+                data-ui-id="settings-advanced-copy-device-id-btn"
               >
                 <span className="font-mono text-xs truncate">{deviceInfo.device_id}</span>
                 {copiedField === "Device ID" ? (
@@ -311,6 +317,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               <button
                 onClick={() => copyToClipboard(deviceInfo.device_name, "Device Name")}
                 className="w-full flex items-center justify-between px-2.5 py-1.5 bg-muted/50 rounded-md hover:bg-muted transition-colors group"
+                data-ui-id="settings-advanced-copy-device-name-btn"
               >
                 <span className="text-xs truncate">{deviceInfo.device_name}</span>
                 {copiedField === "Device Name" ? (
@@ -329,6 +336,7 @@ export function AdvancedSettings({ onLog, onDebugModeChange }: AdvancedSettingsP
               <button
                 onClick={() => copyToClipboard(deviceInfo.platform, "Platform")}
                 className="w-full flex items-center justify-between px-2.5 py-1.5 bg-muted/50 rounded-md hover:bg-muted transition-colors group"
+                data-ui-id="settings-advanced-copy-platform-btn"
               >
                 <span className="text-xs capitalize">{deviceInfo.platform}</span>
                 {copiedField === "Platform" ? (

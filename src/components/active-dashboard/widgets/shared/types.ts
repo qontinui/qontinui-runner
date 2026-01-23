@@ -56,7 +56,7 @@ export interface StepStats {
  * Shell command specific execution data.
  */
 export interface ShellCommandExecution extends StepExecution {
-  /** The command that was executed */
+  /** The command that was executed (resolved, with variables expanded) */
   command: string;
   /** Working directory */
   workingDirectory?: string;
@@ -66,6 +66,10 @@ export interface ShellCommandExecution extends StepExecution {
   stdout?: string;
   /** Standard error */
   stderr?: string;
+  /** Original command template (with {{variable}} placeholders) - only present if variables were used */
+  templateCommand?: string;
+  /** Variables that were resolved during command execution (variable name -> resolved value) */
+  resolvedVariables?: Record<string, string>;
 }
 
 /**

@@ -1,5 +1,5 @@
 -- SQLite Schema for qontinui-runner
--- Version: 34
+-- Version: 35
 --
 -- This schema provides persistent storage for task runs, settings,
 -- prompts, and scheduler state.
@@ -27,6 +27,7 @@
 -- Version 29 adds shell_commands and shell_command_results tables for shell command library.
 -- Version 30 adds mobile development feedback tables (task_run_mobile_state, task_run_mobile_logs).
 -- Version 31 adds MCP integration tables (mcp_servers, task_run_mcp_calls).
+-- Version 35 adds UI Bridge Inspector tables (ui_bridge_elements, ui_bridge_states, ui_bridge_transitions, ui_bridge_events, etc.).
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -428,7 +429,7 @@ CREATE TABLE IF NOT EXISTS verification_tests (
     config TEXT DEFAULT '{}',  -- timeout_seconds, cdp_port, env_vars, etc.
 
     timeout_seconds INTEGER NOT NULL DEFAULT 60,
-    is_critical BOOLEAN NOT NULL DEFAULT 1,  -- If true, failure fails the task
+    is_critical BOOLEAN NOT NULL DEFAULT 0,  -- If true, failure fails the task (default: false for iterative AI workflows)
     enabled BOOLEAN NOT NULL DEFAULT 1,
 
     -- AI generation tracking
@@ -1144,6 +1145,37 @@ CREATE INDEX IF NOT EXISTS idx_check_results_check_id ON check_results(check_id)
 CREATE INDEX IF NOT EXISTS idx_check_results_task_run_id ON check_results(task_run_id);
 CREATE INDEX IF NOT EXISTS idx_check_results_status ON check_results(status);
 
+-- Check Groups (organize checks into reusable groups)
+CREATE TABLE IF NOT EXISTS check_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT,
+    color TEXT,                       -- Color for UI display (e.g., 'purple', 'blue')
+    enabled BOOLEAN NOT NULL DEFAULT 1,
+    run_in_parallel BOOLEAN NOT NULL DEFAULT 0,  -- Run checks in parallel or sequential
+    stop_on_failure BOOLEAN NOT NULL DEFAULT 1,  -- Stop running checks if one fails
+    tags TEXT DEFAULT '[]',           -- JSON array
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_check_groups_enabled ON check_groups(enabled);
+
+-- Check Group Members (many-to-many relationship)
+CREATE TABLE IF NOT EXISTS check_group_members (
+    id TEXT PRIMARY KEY,
+    group_id TEXT NOT NULL,
+    check_id TEXT NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (group_id) REFERENCES check_groups(id) ON DELETE CASCADE,
+    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE CASCADE,
+    UNIQUE(group_id, check_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_check_group_members_group_id ON check_group_members(group_id);
+CREATE INDEX IF NOT EXISTS idx_check_group_members_check_id ON check_group_members(check_id);
+
 -- =============================================================================
 -- Shell Commands Library (Version 29)
 -- =============================================================================
@@ -1431,7 +1463,136 @@ CREATE INDEX IF NOT EXISTS idx_verification_plans_created_at ON verification_pla
 -- Add auto_include_contexts column (boolean, default true)
 -- Note: This is handled in migration code
 
+-- =============================================================================
+-- UI Bridge Inspector (Version 35)
+-- =============================================================================
+-- Tables for storing UI Bridge element snapshots, states, transitions, and events
+-- Used by the UI Bridge Inspector Panel for debugging and analysis
+
+-- UI Bridge element snapshots (captured from pages)
+CREATE TABLE IF NOT EXISTS ui_bridge_elements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id INTEGER REFERENCES task_runs(id) ON DELETE CASCADE,
+    timestamp INTEGER NOT NULL,
+    element_id TEXT NOT NULL,
+    tag_name TEXT,
+    element_type TEXT,  -- 'button', 'input', 'select', 'checkbox', 'link', 'form', 'custom'
+    bounds TEXT,        -- JSON: {x, y, width, height, top, right, bottom, left}
+    visible INTEGER DEFAULT 1,
+    enabled INTEGER DEFAULT 1,
+    focused INTEGER DEFAULT 0,
+    value TEXT,
+    text_content TEXT,
+    label TEXT,
+    parent_id TEXT,     -- Parent element's ui-id
+    children TEXT,      -- JSON array of child ui-ids
+    actions TEXT,       -- JSON array of available actions
+    metadata TEXT       -- JSON for extensible data
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_elements_task_run ON ui_bridge_elements(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_elements_element_id ON ui_bridge_elements(element_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_elements_timestamp ON ui_bridge_elements(timestamp);
+
+-- UI Bridge states (state machine definitions)
+CREATE TABLE IF NOT EXISTS ui_bridge_states (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    state_id TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    elements TEXT,       -- JSON array of element IDs belonging to this state
+    blocking INTEGER DEFAULT 0,
+    blocks TEXT,         -- JSON array of blocked state IDs
+    group_id TEXT,
+    path_cost REAL DEFAULT 1.0,
+    is_active INTEGER DEFAULT 0,
+    active_when TEXT,    -- Optional JavaScript condition string
+    metadata TEXT,       -- JSON for extensible data
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_states_state_id ON ui_bridge_states(state_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_states_group ON ui_bridge_states(group_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_states_active ON ui_bridge_states(is_active);
+
+-- UI Bridge state groups (atomic state collections)
+CREATE TABLE IF NOT EXISTS ui_bridge_state_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    states TEXT,         -- JSON array of state IDs in this group
+    metadata TEXT,       -- JSON for extensible data
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_state_groups_group_id ON ui_bridge_state_groups(group_id);
+
+-- UI Bridge transitions (state transitions)
+CREATE TABLE IF NOT EXISTS ui_bridge_transitions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transition_id TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    from_states TEXT NOT NULL,     -- JSON array of precondition state IDs
+    activate_states TEXT NOT NULL, -- JSON array of states to activate
+    exit_states TEXT,              -- JSON array of states to deactivate
+    activate_groups TEXT,          -- JSON array of groups to activate
+    exit_groups TEXT,              -- JSON array of groups to deactivate
+    actions TEXT,                  -- JSON array of workflow steps
+    path_cost REAL DEFAULT 1.0,
+    stays_visible INTEGER DEFAULT 0,
+    metadata TEXT,                 -- JSON for extensible data
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_transitions_transition_id ON ui_bridge_transitions(transition_id);
+
+-- UI Bridge events (timeline of actions and state changes)
+CREATE TABLE IF NOT EXISTS ui_bridge_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id INTEGER REFERENCES task_runs(id) ON DELETE CASCADE,
+    timestamp INTEGER NOT NULL,
+    sequence INTEGER NOT NULL,     -- Order within the task run
+    event_type TEXT NOT NULL,      -- 'element_registered', 'element_discovered', 'action_executed',
+                                   -- 'state_changed', 'transition_executed', 'navigation_started',
+                                   -- 'navigation_completed', 'path_found', 'error'
+    element_id TEXT,
+    state_id TEXT,
+    transition_id TEXT,
+    action TEXT,
+    params TEXT,                   -- JSON action parameters
+    result TEXT,                   -- JSON result data
+    duration_ms REAL,
+    success INTEGER DEFAULT 1,
+    error_message TEXT,
+    metadata TEXT                  -- JSON for extensible data
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_events_task_run ON ui_bridge_events(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_events_type ON ui_bridge_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_events_timestamp ON ui_bridge_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_events_element ON ui_bridge_events(element_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_events_state ON ui_bridge_events(state_id);
+
+-- UI Bridge navigation history (path execution records)
+CREATE TABLE IF NOT EXISTS ui_bridge_navigation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_run_id INTEGER REFERENCES task_runs(id) ON DELETE CASCADE,
+    timestamp INTEGER NOT NULL,
+    target_states TEXT NOT NULL,   -- JSON array of target state IDs
+    path_found INTEGER NOT NULL,
+    transitions_planned TEXT,      -- JSON array of transition IDs in path
+    transitions_executed TEXT,     -- JSON array of actually executed transitions
+    total_cost REAL,
+    duration_ms REAL,
+    success INTEGER DEFAULT 0,
+    final_active_states TEXT,      -- JSON array of final active states
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_nav_history_task_run ON ui_bridge_navigation_history(task_run_id);
+CREATE INDEX IF NOT EXISTS idx_ui_bridge_nav_history_timestamp ON ui_bridge_navigation_history(timestamp);
+
 -- Initialize singleton tables
 INSERT OR IGNORE INTO gui_lock (id, holder_session_id, acquired_at) VALUES (1, NULL, NULL);
 INSERT OR IGNORE INTO scheduler_settings (id) VALUES (1);
-INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (34, datetime('now'));
+INSERT OR IGNORE INTO schema_version (version, applied_at) VALUES (35, datetime('now'));

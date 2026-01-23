@@ -901,7 +901,7 @@ pub struct CreateVerificationTestInput {
     pub config: serde_json::Value,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u32,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub is_critical: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -1041,6 +1041,74 @@ pub struct UpdateCheckInput {
     pub is_critical: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Check group definition stored in the database.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Color for UI display (e.g., 'purple', 'blue')
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Whether the group is enabled
+    pub enabled: bool,
+    /// Run checks in parallel (vs sequential)
+    pub run_in_parallel: bool,
+    /// Stop running checks if one fails
+    pub stop_on_failure: bool,
+    /// Tags for organization
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Checks in this group (populated when fetching)
+    #[serde(default)]
+    pub checks: Vec<Check>,
+    /// Creation timestamp
+    pub created_at: String,
+    /// Last update timestamp
+    pub updated_at: String,
+}
+
+/// Input for creating a new check group.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateCheckGroupInput {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub run_in_parallel: bool,
+    #[serde(default = "default_true")]
+    pub stop_on_failure: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Check IDs to add to the group
+    #[serde(default)]
+    pub check_ids: Vec<String>,
+}
+
+/// Input for updating an existing check group.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UpdateCheckGroupInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_in_parallel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_on_failure: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }
@@ -3120,7 +3188,9 @@ impl CheckpointDb {
 
         // Version 32: Add context management fields to unified_workflows
         if current_version < 32 {
-            info!("Migrating database to version 32 (adding context management to unified_workflows)");
+            info!(
+                "Migrating database to version 32 (adding context management to unified_workflows)"
+            );
 
             conn.execute_batch(
                 r#"
@@ -3173,6 +3243,130 @@ impl CheckpointDb {
             .map_err(|e| format!("Failed to migrate to version 34: {}", e))?;
 
             info!("Successfully migrated to version 34 (transition_history_json for task_runs)");
+        }
+
+        // Version 35: Add check_groups tables for organizing checks
+        if current_version < 35 {
+            info!("Migrating database to version 35 (adding check_groups infrastructure)");
+
+            conn.execute_batch(
+                r#"
+                -- Check Groups (organize checks into reusable groups)
+                CREATE TABLE IF NOT EXISTS check_groups (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    color TEXT,
+                    enabled BOOLEAN NOT NULL DEFAULT 1,
+                    run_in_parallel BOOLEAN NOT NULL DEFAULT 0,
+                    stop_on_failure BOOLEAN NOT NULL DEFAULT 1,
+                    tags TEXT DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_check_groups_enabled ON check_groups(enabled);
+
+                -- Check Group Members (many-to-many relationship)
+                CREATE TABLE IF NOT EXISTS check_group_members (
+                    id TEXT PRIMARY KEY,
+                    group_id TEXT NOT NULL,
+                    check_id TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (group_id) REFERENCES check_groups(id) ON DELETE CASCADE,
+                    FOREIGN KEY (check_id) REFERENCES checks(id) ON DELETE CASCADE,
+                    UNIQUE(group_id, check_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_check_group_members_group_id ON check_group_members(group_id);
+                CREATE INDEX IF NOT EXISTS idx_check_group_members_check_id ON check_group_members(check_id);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (35, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 35: {}", e))?;
+
+            info!("Successfully migrated to version 35 (check_groups infrastructure)");
+        }
+
+        // Migration to version 36: Add workflow_verification_phase_results table
+        // Stores step-executor-based verification results from unified workflow execution
+        if (1..36).contains(&current_version) {
+            info!(
+                "Migrating database to version 36 (adding workflow_verification_phase_results table)"
+            );
+            conn.execute_batch(
+                r#"
+                -- Workflow Verification Phase Results
+                -- Stores results from execute_verification_steps in unified workflow execution
+                CREATE TABLE IF NOT EXISTS workflow_verification_phase_results (
+                    id TEXT PRIMARY KEY,
+                    task_run_id TEXT NOT NULL,
+                    iteration INTEGER NOT NULL,
+
+                    -- Summary fields
+                    all_passed BOOLEAN NOT NULL,
+                    total_steps INTEGER NOT NULL,
+                    passed_steps INTEGER NOT NULL,
+                    failed_steps INTEGER NOT NULL,
+                    skipped_steps INTEGER NOT NULL,
+                    total_duration_ms INTEGER NOT NULL,
+                    critical_failure BOOLEAN NOT NULL DEFAULT 0,
+
+                    -- Full result as JSON (for detailed access)
+                    result_json TEXT NOT NULL,
+
+                    created_at TEXT NOT NULL,
+
+                    FOREIGN KEY (task_run_id) REFERENCES task_runs(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_task_run_id ON workflow_verification_phase_results(task_run_id);
+                CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_iteration ON workflow_verification_phase_results(iteration);
+                CREATE INDEX IF NOT EXISTS idx_wf_ver_phase_all_passed ON workflow_verification_phase_results(all_passed);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (36, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 36: {}", e))?;
+
+            info!(
+                "Successfully migrated to version 36 (workflow_verification_phase_results table)"
+            );
+        }
+
+        // Migration to version 37: Add unique constraint on (task_run_id, iteration) for verification results
+        if current_version < 37 {
+            info!(
+                "Migrating database to version 37 (unique constraint for verification phase results)"
+            );
+
+            // First, remove any duplicate rows keeping only the latest per (task_run_id, iteration)
+            conn.execute_batch(
+                r#"
+                -- Delete duplicates, keeping only the row with the latest created_at for each (task_run_id, iteration)
+                DELETE FROM workflow_verification_phase_results
+                WHERE id NOT IN (
+                    SELECT id FROM (
+                        SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY task_run_id, iteration
+                            ORDER BY created_at DESC
+                        ) as rn
+                        FROM workflow_verification_phase_results
+                    ) WHERE rn = 1
+                );
+
+                -- Now add the unique constraint
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_wf_ver_phase_unique
+                ON workflow_verification_phase_results(task_run_id, iteration);
+
+                INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (37, datetime('now'));
+                "#,
+            )
+            .map_err(|e| format!("Failed to migrate to version 37: {}", e))?;
+
+            info!("Successfully migrated to version 37 (unique constraint for verification phase results)");
         }
 
         Ok(())
@@ -5944,6 +6138,294 @@ impl CheckpointDb {
         Ok(rows > 0)
     }
 
+    // ========================================================================
+    // Check Group Operations
+    // ========================================================================
+
+    /// List all check groups.
+    pub fn list_check_groups(&self, enabled_only: bool) -> Result<Vec<CheckGroup>, String> {
+        let conn = self.get_conn()?;
+
+        let sql = if enabled_only {
+            r#"
+            SELECT id, name, description, color, enabled, run_in_parallel,
+                   stop_on_failure, tags, created_at, updated_at
+            FROM check_groups
+            WHERE enabled = 1
+            ORDER BY name ASC
+            "#
+        } else {
+            r#"
+            SELECT id, name, description, color, enabled, run_in_parallel,
+                   stop_on_failure, tags, created_at, updated_at
+            FROM check_groups
+            ORDER BY name ASC
+            "#
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let groups: Vec<CheckGroup> = stmt
+            .query_map([], |row| self.row_to_check_group_without_checks(row))
+            .map_err(|e| format!("Failed to query check groups: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Populate checks for each group
+        let mut result = Vec::new();
+        for mut group in groups {
+            group.checks = self.get_checks_in_group(&group.id)?;
+            result.push(group);
+        }
+
+        Ok(result)
+    }
+
+    /// Get a check group by ID.
+    pub fn get_check_group(&self, id: &str) -> Result<Option<CheckGroup>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<CheckGroup> = conn.query_row(
+            r#"
+            SELECT id, name, description, color, enabled, run_in_parallel,
+                   stop_on_failure, tags, created_at, updated_at
+            FROM check_groups
+            WHERE id = ?1
+            "#,
+            params![id],
+            |row| self.row_to_check_group_without_checks(row),
+        );
+
+        match result {
+            Ok(mut group) => {
+                group.checks = self.get_checks_in_group(id)?;
+                Ok(Some(group))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get check group: {}", e)),
+        }
+    }
+
+    /// Create a new check group.
+    pub fn create_check_group(&self, input: &CreateCheckGroupInput) -> Result<CheckGroup, String> {
+        let conn = self.get_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        let tags_json = serde_json::to_string(&input.tags)
+            .map_err(|e| format!("Failed to serialize tags: {}", e))?;
+
+        conn.execute(
+            r#"
+            INSERT INTO check_groups (
+                id, name, description, color, enabled,
+                run_in_parallel, stop_on_failure, tags,
+                created_at, updated_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9
+            )
+            "#,
+            params![
+                id,
+                input.name,
+                input.description,
+                input.color,
+                input.enabled as i32,
+                input.run_in_parallel as i32,
+                input.stop_on_failure as i32,
+                tags_json,
+                now,
+            ],
+        )
+        .map_err(|e| format!("Failed to create check group: {}", e))?;
+
+        // Add checks to the group
+        for (index, check_id) in input.check_ids.iter().enumerate() {
+            self.add_check_to_group(&id, check_id, index as i32)?;
+        }
+
+        self.get_check_group(&id)?
+            .ok_or_else(|| "Failed to retrieve created check group".to_string())
+    }
+
+    /// Update an existing check group.
+    pub fn update_check_group(
+        &self,
+        id: &str,
+        input: &UpdateCheckGroupInput,
+    ) -> Result<CheckGroup, String> {
+        let existing = self
+            .get_check_group(id)?
+            .ok_or_else(|| format!("Check group not found: {}", id))?;
+
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        let name = input.name.as_ref().unwrap_or(&existing.name);
+        let description = input.description.clone().or(existing.description);
+        let color = input.color.clone().or(existing.color);
+        let enabled = input.enabled.unwrap_or(existing.enabled);
+        let run_in_parallel = input.run_in_parallel.unwrap_or(existing.run_in_parallel);
+        let stop_on_failure = input.stop_on_failure.unwrap_or(existing.stop_on_failure);
+        let tags = input.tags.clone().unwrap_or(existing.tags);
+
+        let tags_json =
+            serde_json::to_string(&tags).map_err(|e| format!("Failed to serialize tags: {}", e))?;
+
+        let rows = conn
+            .execute(
+                r#"
+                UPDATE check_groups SET
+                    name = ?2,
+                    description = ?3,
+                    color = ?4,
+                    enabled = ?5,
+                    run_in_parallel = ?6,
+                    stop_on_failure = ?7,
+                    tags = ?8,
+                    updated_at = ?9
+                WHERE id = ?1
+                "#,
+                params![
+                    id,
+                    name,
+                    description,
+                    color,
+                    enabled as i32,
+                    run_in_parallel as i32,
+                    stop_on_failure as i32,
+                    tags_json,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to update check group: {}", e))?;
+
+        if rows == 0 {
+            return Err(format!("Check group not found: {}", id));
+        }
+
+        self.get_check_group(id)?
+            .ok_or_else(|| "Failed to retrieve updated check group".to_string())
+    }
+
+    /// Delete a check group by ID.
+    pub fn delete_check_group(&self, id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let rows = conn
+            .execute("DELETE FROM check_groups WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete check group: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Add a check to a group.
+    pub fn add_check_to_group(
+        &self,
+        group_id: &str,
+        check_id: &str,
+        sort_order: i32,
+    ) -> Result<(), String> {
+        let conn = self.get_conn()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO check_group_members (id, group_id, check_id, sort_order, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            "#,
+            params![id, group_id, check_id, sort_order, now],
+        )
+        .map_err(|e| format!("Failed to add check to group: {}", e))?;
+
+        Ok(())
+    }
+
+    /// Remove a check from a group.
+    pub fn remove_check_from_group(&self, group_id: &str, check_id: &str) -> Result<bool, String> {
+        let conn = self.get_conn()?;
+
+        let rows = conn
+            .execute(
+                "DELETE FROM check_group_members WHERE group_id = ?1 AND check_id = ?2",
+                params![group_id, check_id],
+            )
+            .map_err(|e| format!("Failed to remove check from group: {}", e))?;
+
+        Ok(rows > 0)
+    }
+
+    /// Get all checks in a group (ordered by sort_order).
+    pub fn get_checks_in_group(&self, group_id: &str) -> Result<Vec<Check>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT c.id, c.name, c.description, c.check_type, c.tool,
+                       c.command, c.working_directory, c.config_path,
+                       c.auto_fix, c.fail_on_warning, c.timeout_seconds,
+                       c.is_critical, c.enabled, c.ai_generated, c.ai_generation_prompt,
+                       c.tags, c.created_at, c.updated_at
+                FROM checks c
+                INNER JOIN check_group_members cgm ON c.id = cgm.check_id
+                WHERE cgm.group_id = ?1
+                ORDER BY cgm.sort_order ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let checks: Vec<Check> = stmt
+            .query_map(params![group_id], Self::row_to_check)
+            .map_err(|e| format!("Failed to query checks in group: {}", e))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(checks)
+    }
+
+    /// Update the checks in a group (replace all).
+    pub fn set_checks_in_group(&self, group_id: &str, check_ids: &[String]) -> Result<(), String> {
+        let conn = self.get_conn()?;
+
+        // Remove all existing members
+        conn.execute(
+            "DELETE FROM check_group_members WHERE group_id = ?1",
+            params![group_id],
+        )
+        .map_err(|e| format!("Failed to clear group members: {}", e))?;
+
+        // Add new members
+        for (index, check_id) in check_ids.iter().enumerate() {
+            self.add_check_to_group(group_id, check_id, index as i32)?;
+        }
+
+        Ok(())
+    }
+
+    /// Helper to map a row to CheckGroup (without checks populated).
+    fn row_to_check_group_without_checks(&self, row: &rusqlite::Row) -> SqliteResult<CheckGroup> {
+        let tags_json: String = row.get(7)?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+
+        Ok(CheckGroup {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2).ok(),
+            color: row.get(3).ok(),
+            enabled: row.get::<_, i32>(4)? != 0,
+            run_in_parallel: row.get::<_, i32>(5)? != 0,
+            stop_on_failure: row.get::<_, i32>(6)? != 0,
+            tags,
+            checks: Vec::new(), // Will be populated separately
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
     /// Get check results for a specific check.
     pub fn get_check_results(
         &self,
@@ -7144,6 +7626,199 @@ impl CheckpointDb {
     }
 
     // ========================================================================
+    // Workflow Verification Phase Results (Step-Executor Based)
+    // ========================================================================
+
+    /// Store a verification phase result from unified workflow execution.
+    ///
+    /// This stores the results from `execute_verification_steps` in the step_executor,
+    /// which uses the workflow's explicit `verification_steps` (tests, checks) rather
+    /// than the orchestrator's AI-generated verification criteria.
+    ///
+    /// Uses upsert semantics: if a result already exists for (task_run_id, iteration),
+    /// it will be updated with the new data while preserving the original id and created_at.
+    pub fn store_verification_phase_result(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+        result: &serde_json::Value,
+    ) -> Result<String, String> {
+        let conn = self.get_conn()?;
+        let now = Utc::now().to_rfc3339();
+
+        // Extract summary fields from the result
+        let all_passed = result
+            .get("all_passed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let total_steps = result
+            .get("total_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let passed_steps = result
+            .get("passed_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let failed_steps = result
+            .get("failed_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let skipped_steps = result
+            .get("skipped_steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i32;
+        let total_duration_ms = result
+            .get("total_duration_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i64;
+        let critical_failure = result
+            .get("critical_failure")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let result_json = serde_json::to_string(result)
+            .map_err(|e| format!("Failed to serialize verification result: {}", e))?;
+
+        // Check if a result already exists for this task_run_id and iteration
+        let existing_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM workflow_verification_phase_results WHERE task_run_id = ?1 AND iteration = ?2",
+                params![task_run_id, iteration],
+                |row| row.get(0),
+            )
+            .ok();
+
+        let id = if let Some(existing_id) = existing_id {
+            // Update existing record, preserving id and created_at
+            conn.execute(
+                r#"
+                UPDATE workflow_verification_phase_results
+                SET all_passed = ?1, total_steps = ?2, passed_steps = ?3, failed_steps = ?4,
+                    skipped_steps = ?5, total_duration_ms = ?6, critical_failure = ?7, result_json = ?8
+                WHERE task_run_id = ?9 AND iteration = ?10
+                "#,
+                params![
+                    all_passed as i32,
+                    total_steps,
+                    passed_steps,
+                    failed_steps,
+                    skipped_steps,
+                    total_duration_ms,
+                    critical_failure as i32,
+                    result_json,
+                    task_run_id,
+                    iteration,
+                ],
+            )
+            .map_err(|e| format!("Failed to update verification phase result: {}", e))?;
+
+            info!(
+                "Updated verification phase result for task {} iteration {}: all_passed={}, {}/{} steps",
+                task_run_id, iteration, all_passed, passed_steps, total_steps
+            );
+
+            existing_id
+        } else {
+            // Insert new record
+            let new_id = uuid::Uuid::new_v4().to_string();
+
+            conn.execute(
+                r#"
+                INSERT INTO workflow_verification_phase_results (
+                    id, task_run_id, iteration,
+                    all_passed, total_steps, passed_steps, failed_steps, skipped_steps,
+                    total_duration_ms, critical_failure, result_json, created_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+                params![
+                    new_id,
+                    task_run_id,
+                    iteration,
+                    all_passed as i32,
+                    total_steps,
+                    passed_steps,
+                    failed_steps,
+                    skipped_steps,
+                    total_duration_ms,
+                    critical_failure as i32,
+                    result_json,
+                    now,
+                ],
+            )
+            .map_err(|e| format!("Failed to store verification phase result: {}", e))?;
+
+            info!(
+                "Stored verification phase result for task {} iteration {}: all_passed={}, {}/{} steps",
+                task_run_id, iteration, all_passed, passed_steps, total_steps
+            );
+
+            new_id
+        };
+
+        Ok(id)
+    }
+
+    /// Get verification phase results for a specific iteration.
+    pub fn get_verification_phase_result(
+        &self,
+        task_run_id: &str,
+        iteration: u32,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+
+        let result: SqliteResult<String> = conn.query_row(
+            r#"
+            SELECT result_json FROM workflow_verification_phase_results
+            WHERE task_run_id = ?1 AND iteration = ?2
+            LIMIT 1
+            "#,
+            params![task_run_id, iteration],
+            |row| row.get(0),
+        );
+
+        match result {
+            Ok(json_str) => {
+                let parsed: serde_json::Value = serde_json::from_str(&json_str)
+                    .map_err(|e| format!("Failed to parse verification result JSON: {}", e))?;
+                Ok(Some(parsed))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("Failed to get verification phase result: {}", e)),
+        }
+    }
+
+    /// Get all verification phase results for a task run.
+    /// With the unique constraint on (task_run_id, iteration), there's exactly one result per iteration.
+    pub fn get_all_verification_phase_results(
+        &self,
+        task_run_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.get_conn()?;
+
+        let mut stmt = conn
+            .prepare(
+                r#"
+                SELECT result_json FROM workflow_verification_phase_results
+                WHERE task_run_id = ?1
+                ORDER BY iteration ASC
+                "#,
+            )
+            .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+        let results: Vec<serde_json::Value> = stmt
+            .query_map(params![task_run_id], |row| {
+                let json_str: String = row.get(0)?;
+                Ok(json_str)
+            })
+            .map_err(|e| format!("Failed to query verification results: {}", e))?
+            .filter_map(|r| r.ok())
+            .filter_map(|json_str| serde_json::from_str(&json_str).ok())
+            .collect();
+
+        Ok(results)
+    }
+
+    // ========================================================================
     // Saved API Requests Operations
     // ========================================================================
 
@@ -7785,8 +8460,8 @@ impl CheckpointDb {
             .unwrap_or_else(|_| "\"default\"".to_string());
         let context_ids_json =
             serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
-        let disabled_context_ids_json =
-            serde_json::to_string(&request.disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
+        let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
+            .unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"
@@ -7848,8 +8523,8 @@ impl CheckpointDb {
             .unwrap_or_else(|_| "\"default\"".to_string());
         let context_ids_json =
             serde_json::to_string(&request.context_ids).unwrap_or_else(|_| "[]".to_string());
-        let disabled_context_ids_json =
-            serde_json::to_string(&request.disabled_context_ids).unwrap_or_else(|_| "[]".to_string());
+        let disabled_context_ids_json = serde_json::to_string(&request.disabled_context_ids)
+            .unwrap_or_else(|_| "[]".to_string());
 
         conn.execute(
             r#"

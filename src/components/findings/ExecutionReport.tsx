@@ -347,7 +347,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
   }
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+    <div data-ui-id="findings-execution-report" className="flex-1 flex flex-col min-h-0 overflow-hidden">
       {/* Header */}
       <div className="flex-shrink-0 border-b border-border p-4 space-y-3">
         {/* Report Title and Status */}
@@ -448,6 +448,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
           {/* Filter Dropdown */}
           <div className="relative">
             <button
+              data-ui-id="findings-filter-btn"
               onClick={() => setShowFilterMenu(!showFilterMenu)}
               className="flex items-center gap-2 px-3 py-1.5 bg-muted/50 hover:bg-muted rounded-lg text-sm transition-colors"
             >
@@ -493,6 +494,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
           <div className="flex items-center gap-2">
             {/* Auto-Fix Toggle */}
             <button
+              data-ui-id="findings-auto-fix-toggle-btn"
               onClick={toggleAutoFix}
               disabled={autoFixLoading}
               className={`flex items-center gap-1.5 px-3 py-1.5 text-sm rounded-lg transition-colors ${
@@ -520,6 +522,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
             {/* Analyze & Fix All Button */}
             {summary.autoFixable > 0 && (
               <button
+                data-ui-id="findings-fix-all-btn"
                 onClick={handleAnalyzeAll}
                 disabled={isAnalyzingAll}
                 className={`flex items-center gap-1.5 px-3 py-1.5 text-sm ${getAccentColors("purple").bgSolid} hover:bg-purple-600 disabled:bg-gray-600 disabled:cursor-not-allowed text-white rounded-lg transition-colors`}
@@ -542,6 +545,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
             {/* Continue Button */}
             {report?.status === "paused_for_input" && onContinue && (
               <button
+                data-ui-id="findings-report-continue-btn"
                 onClick={onContinue}
                 className="flex items-center gap-2 px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
               >
@@ -552,6 +556,7 @@ Work through ALL findings systematically. Fix each one and report your resolutio
 
             {/* Clear All Button */}
             <button
+              data-ui-id="findings-clear-all-btn"
               onClick={handleClearAll}
               className="flex items-center gap-1 px-2 py-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
               title="Clear all findings"

@@ -112,6 +112,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
           <button
             onClick={onClose}
             className="p-1 text-muted-foreground hover:text-foreground transition-colors"
+            data-ui-id="macro-builder-step-editor-close-btn"
           >
             <X className="w-5 h-5" />
           </button>
@@ -128,6 +129,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
               onChange={(e) => setName(e.target.value)}
               placeholder="Enter step name"
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              data-ui-id="macro-builder-step-name-input"
             />
           </div>
 
@@ -138,6 +140,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
               value={actionType}
               onChange={(e) => setActionType(e.target.value as MacroActionType)}
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              data-ui-id="macro-builder-step-action-type-select"
             >
               <option value="click">Click</option>
               <option value="double_click">Double Click</option>
@@ -217,6 +220,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
                 placeholder="Enter text to type..."
                 rows={3}
                 className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm resize-none focus:outline-none focus:ring-2 focus:ring-primary"
+                data-ui-id="macro-builder-step-text-input"
               />
             </div>
           )}
@@ -230,6 +234,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
                 onChange={(e) => setHotkey(e.target.value)}
                 placeholder="e.g., Ctrl+C, Alt+Tab"
                 className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+                data-ui-id="macro-builder-step-hotkey-input"
               />
               <p className="text-xs text-muted-foreground mt-1">
                 Use + to combine keys (e.g., Ctrl+Shift+S)
@@ -304,6 +309,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
               min={0}
               step={100}
               className="w-full px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              data-ui-id="macro-builder-step-pause-input"
             />
           </div>
 
@@ -324,6 +330,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
           <button
             onClick={onClose}
             className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
+            data-ui-id="macro-builder-step-editor-cancel-btn"
           >
             Cancel
           </button>
@@ -331,6 +338,7 @@ export function StepEditor({ step, open, onClose }: StepEditorProps) {
             onClick={handleSave}
             disabled={!validation.valid}
             className="flex-1 px-4 py-2 bg-primary text-primary-foreground rounded-md font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            data-ui-id="macro-builder-step-editor-save-btn"
           >
             Save Changes
           </button>

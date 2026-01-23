@@ -349,7 +349,10 @@ impl ExplorationTask {
 
         // Load config via Python bridge - use a separate scope to ensure lock is dropped before await
         {
-            let mut bridge_lock = self.app_state.python_bridge.lock().unwrap();
+            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
+                &self.app_state.python_bridge,
+                "python_bridge",
+            );
             if let Some(ref mut bridge) = *bridge_lock {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -369,7 +372,10 @@ impl ExplorationTask {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Get the loaded config from app state
-        let config_lock = self.app_state.current_config.lock().unwrap();
+        let config_lock = crate::safe_lock::safe_lock_or_recover(
+            &self.app_state.current_config,
+            "current_config",
+        );
         if let Some(ref config) = *config_lock {
             // Convert to Value for graph building
             serde_json::to_value(config).map_err(|e| format!("Failed to serialize config: {}", e))
@@ -615,7 +621,10 @@ impl ExplorationTask {
 
         // Use a separate scope to ensure lock is dropped before await
         let result = {
-            let mut bridge_lock = self.app_state.python_bridge.lock().unwrap();
+            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
+                &self.app_state.python_bridge,
+                "python_bridge",
+            );
             if let Some(ref mut bridge) = *bridge_lock {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -659,7 +668,10 @@ impl ExplorationTask {
 
         // Use a separate scope to ensure lock is dropped before await
         let result = {
-            let mut bridge_lock = self.app_state.python_bridge.lock().unwrap();
+            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
+                &self.app_state.python_bridge,
+                "python_bridge",
+            );
             if let Some(ref mut bridge) = *bridge_lock {
                 if !bridge.is_running() {
                     return Err("Python executor not running".to_string());
@@ -771,7 +783,10 @@ impl ExplorationTask {
 
         // Use Python bridge to capture actual screenshot
         let result = {
-            let mut bridge_lock = self.app_state.python_bridge.lock().unwrap();
+            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(
+                &self.app_state.python_bridge,
+                "python_bridge",
+            );
             if let Some(ref mut bridge) = *bridge_lock {
                 if !bridge.is_running() {
                     warn!("Python executor not running, cannot capture screenshot");
@@ -815,7 +830,8 @@ impl ExplorationTask {
 
     /// Execute a transition via Python bridge
     async fn execute_transition(&self, transition_id: &str) -> Result<(), String> {
-        let mut bridge_lock = self.app_state.python_bridge.lock().unwrap();
+        let mut bridge_lock =
+            crate::safe_lock::safe_lock_or_recover(&self.app_state.python_bridge, "python_bridge");
         if let Some(ref mut bridge) = *bridge_lock {
             if !bridge.is_running() {
                 return Err("Python executor not running".to_string());

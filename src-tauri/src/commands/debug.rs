@@ -70,7 +70,8 @@ pub fn set_debug_settings(
         .map_err(|e| format!("Failed to save debug settings: {}", e))?;
 
     // If Python bridge is running, send the settings
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if bridge.is_running() {
             bridge

@@ -258,6 +258,10 @@ mod tests {
             skip_ai_summary: false,
             category: "test".to_string(),
             tags: vec![],
+            context_ids: vec![],
+            disabled_context_ids: vec![],
+            auto_include_contexts: true,
+            prompt_template: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

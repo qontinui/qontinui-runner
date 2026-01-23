@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Qontinui Capture",
-  "version": "1.4.0",
-  "description": "Capture page DOM and HTTP requests for qontinui-runner",
+  "name": "Qontinui DevTools",
+  "version": "2.0.0",
+  "description": "AI-powered debugging: DOM capture, API recording, and UI Bridge inspection",
   "permissions": ["activeTab", "scripting", "webRequest", "storage"],
   "host_permissions": ["http://localhost:9876/*", "<all_urls>"],
   "action": {
@@ -33,11 +33,23 @@
       "js": ["request-interceptor-bridge.js"],
       "run_at": "document_start",
       "world": "ISOLATED"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-scripts/ui-bridge-inspector.js"],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content-scripts/ui-bridge-bridge.js"],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["request-interceptor.js"],
+      "resources": ["request-interceptor.js", "content-scripts/ui-bridge-inspector.js"],
       "matches": ["<all_urls>"]
     }
   ]

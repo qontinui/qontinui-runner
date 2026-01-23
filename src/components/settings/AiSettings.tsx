@@ -473,7 +473,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       )}
 
       {/* Provider Selection */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-provider-section">
         <h4 className="font-medium text-sm">Provider</h4>
 
         <div className="space-y-3">
@@ -485,6 +485,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   ? "bg-primary/10"
                   : "bg-muted/30 hover:bg-muted/50"
               }`}
+              data-ui-id={`settings-ai-provider-${option.value}-label`}
             >
               <input
                 type="radio"
@@ -493,6 +494,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 checked={settings.provider === option.value}
                 onChange={() => setSettings((prev) => ({ ...prev, provider: option.value }))}
                 className="mt-1 accent-primary"
+                data-ui-id={`settings-ai-provider-${option.value}-radio`}
               />
               <div className="space-y-1">
                 <div className="font-medium text-sm">{option.label}</div>
@@ -505,7 +507,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Claude CLI Settings */}
       {settings.provider === "claude_cli" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-claude-cli-section">
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Terminal className="w-4 h-4 text-primary" />
             Claude Code CLI Settings
@@ -526,6 +528,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                data-ui-id="settings-ai-claude-cli-execution-mode-select"
               >
                 {EXECUTION_MODE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -557,6 +560,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 }
                 placeholder="Leave empty to use default (claude or claude.exe)"
                 className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-claude-cli-custom-path-input"
               />
               <p className="text-[10px] text-muted-foreground">
                 Specify a custom path to the Claude Code executable if it's not in your PATH.
@@ -579,6 +583,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 }
                 placeholder="e.g., C:\Users\Name\.claude-work"
                 className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-claude-cli-config-dir-input"
               />
               <p className="text-[10px] text-muted-foreground">
                 Set CLAUDE_CONFIG_DIR to use a different Claude account. Useful for multi-account
@@ -606,6 +611,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-claude-cli-timeout-input"
               />
               <p className="text-[10px] text-muted-foreground">
                 Maximum time to wait for Claude Code to respond (60-3600 seconds).
@@ -617,7 +623,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Claude API Settings */}
       {settings.provider === "claude_api" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-claude-api-section">
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Zap className="w-4 h-4 text-primary" />
             Claude API Settings
@@ -634,6 +640,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   <button
                     onClick={deleteApiKey}
                     className={`px-3 py-1.5 ${getAccentColors("red").bg} hover:bg-red-500/30 ${getAccentColors("red").text} rounded-md transition-colors text-xs`}
+                    data-ui-id="settings-ai-claude-api-delete-key-btn"
                   >
                     Delete
                   </button>
@@ -647,11 +654,13 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       onChange={(e) => setApiKey(e.target.value)}
                       placeholder="sk-ant-..."
                       className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                      data-ui-id="settings-ai-claude-api-key-input"
                     />
                     <button
                       type="button"
                       onClick={() => setShowApiKey(!showApiKey)}
                       className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      data-ui-id="settings-ai-claude-api-toggle-visibility-btn"
                     >
                       {showApiKey ? (
                         <EyeOff className="w-3.5 h-3.5" />
@@ -664,6 +673,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     onClick={saveApiKey}
                     disabled={savingApiKey || !apiKey.trim()}
                     className="px-3 py-1.5 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 text-xs"
+                    data-ui-id="settings-ai-claude-api-save-key-btn"
                   >
                     {savingApiKey ? "Saving..." : "Save Key"}
                   </button>
@@ -696,6 +706,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                data-ui-id="settings-ai-claude-api-model-select"
               >
                 {MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -722,6 +733,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-claude-api-max-tokens-input"
               />
               <p className="text-[10px] text-muted-foreground">
                 Maximum tokens in the response (256-32768).
@@ -740,7 +752,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Gemini CLI Settings */}
       {settings.provider === "gemini_cli" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-gemini-cli-section">
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
             Gemini CLI Settings
@@ -758,6 +770,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                         ? "bg-primary/10"
                         : "bg-muted/30 hover:bg-muted/50"
                     }`}
+                    data-ui-id={`settings-ai-gemini-cli-auth-${option.value}-label`}
                   >
                     <input
                       type="radio"
@@ -798,6 +811,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                data-ui-id="settings-ai-gemini-cli-model-select"
               >
                 {GEMINI_MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -821,6 +835,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                data-ui-id="settings-ai-gemini-cli-execution-mode-select"
               >
                 {EXECUTION_MODE_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -850,6 +865,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-32 px-3 py-2 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-gemini-cli-timeout-input"
               />
             </div>
 
@@ -867,7 +883,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
 
       {/* Gemini API Settings */}
       {settings.provider === "gemini_api" && (
-        <div className="space-y-4 rounded-lg bg-card/50 p-4">
+        <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-gemini-api-section">
           <h4 className="font-medium text-sm flex items-center gap-2">
             <Sparkles className="w-4 h-4 text-primary" />
             Gemini API Settings
@@ -884,6 +900,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   <button
                     onClick={deleteGeminiApiKey}
                     className={`px-3 py-1.5 ${getAccentColors("red").bg} hover:bg-red-500/30 ${getAccentColors("red").text} rounded-md transition-colors text-xs`}
+                    data-ui-id="settings-ai-gemini-api-delete-key-btn"
                   >
                     Delete
                   </button>
@@ -897,11 +914,13 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                       onChange={(e) => setGeminiApiKey(e.target.value)}
                       placeholder="AIza..."
                       className="w-full px-2.5 py-1.5 pr-10 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                      data-ui-id="settings-ai-gemini-api-key-input"
                     />
                     <button
                       type="button"
                       onClick={() => setShowGeminiApiKey(!showGeminiApiKey)}
                       className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                      data-ui-id="settings-ai-gemini-api-toggle-visibility-btn"
                     >
                       {showGeminiApiKey ? (
                         <EyeOff className="w-3.5 h-3.5" />
@@ -914,6 +933,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                     onClick={saveGeminiApiKey}
                     disabled={savingGeminiApiKey || !geminiApiKey.trim()}
                     className="px-3 py-1.5 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 text-xs"
+                    data-ui-id="settings-ai-gemini-api-save-key-btn"
                   >
                     {savingGeminiApiKey ? "Saving..." : "Save Key"}
                   </button>
@@ -946,6 +966,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-full px-2.5 py-1.5 bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 text-sm"
+                data-ui-id="settings-ai-gemini-api-model-select"
               >
                 {GEMINI_MODEL_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
@@ -975,6 +996,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-gemini-api-max-tokens-input"
               />
             </div>
 
@@ -996,6 +1018,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                   }))
                 }
                 className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                data-ui-id="settings-ai-gemini-api-temperature-input"
               />
               <p className="text-[10px] text-muted-foreground">
                 Controls randomness (0 = deterministic, 2 = very creative).
@@ -1013,7 +1036,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       )}
 
       {/* Auto-Refine Defaults */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-auto-refine-section">
         <h4 className="font-medium text-sm flex items-center gap-2">
           <Video className="w-4 h-4 text-primary" />
           Auto-Refine Defaults
@@ -1037,6 +1060,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
                 }))
               }
               className="w-32 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+              data-ui-id="settings-ai-auto-refine-video-iterations-input"
             />
             <p className="text-[10px] text-muted-foreground">
               Default number of failed iterations before including video frames in AI analysis. Set
@@ -1054,7 +1078,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
       </div>
 
       {/* Test Connection */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-ai-test-connection-section">
         <h4 className="font-medium text-sm">Test Connection</h4>
         <p className="text-xs text-muted-foreground">
           Verify that your AI configuration is working correctly.
@@ -1068,6 +1092,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
             (settings.provider === "gemini_api" && !hasGeminiApiKey)
           }
           className="px-4 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 flex items-center gap-2 text-sm font-medium"
+          data-ui-id="settings-ai-test-connection-btn"
         >
           {testing ? (
             <>
@@ -1108,6 +1133,7 @@ export function AiSettings({ onLog }: AiSettingsProps) {
           onClick={saveSettings}
           disabled={saving}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
+          data-ui-id="settings-ai-save-btn"
         >
           {saving ? (
             <>

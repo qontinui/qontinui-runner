@@ -376,7 +376,7 @@ export function UserInputPanel({
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div data-ui-id="findings-user-input-panel" className="flex flex-col h-full">
       {/* Header */}
       <div className="flex-shrink-0 border-b border-border p-4 space-y-3">
         <div className="flex items-center justify-between">
@@ -410,6 +410,7 @@ export function UserInputPanel({
         {onContinue && (
           <div className="flex justify-end">
             <button
+              data-ui-id="findings-continue-btn"
               onClick={handleContinue}
               disabled={!stats.allRequiredAnswered || isContinuing}
               className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
@@ -439,7 +440,7 @@ export function UserInputPanel({
       </div>
 
       {/* Questions List */}
-      <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
+      <div data-ui-id="findings-questions-list" className="flex-1 min-h-0 overflow-y-auto p-4 space-y-3">
         {findingsNeedingInput.map((finding) => (
           <QuestionCard
             key={finding.id}

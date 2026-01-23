@@ -45,6 +45,16 @@ import { ScriptWidget, ScriptSummary, useScriptData } from "./script";
 // Import Workflow Ref widget
 import { WorkflowRefWidget, WorkflowRefSummary, useWorkflowRefData } from "./workflow-ref";
 
+// Import MCP Call widget
+import { McpCallWidget, McpCallSummary, useMcpCallData } from "./mcp-call";
+
+// Import Execution Timeline widget
+import {
+  ExecutionTimelineWidget,
+  ExecutionTimelineSummary,
+  useExecutionTimelineData,
+} from "./execution-timeline";
+
 /**
  * Register all dashboard widgets.
  * Call this once at app initialization.
@@ -54,6 +64,20 @@ export function registerAllWidgets(): void {
   if (widgetRegistry.isInitialized()) {
     return;
   }
+
+  // Execution Timeline - high-level overview of all workflow steps
+  widgetRegistry.register({
+    id: "execution_timeline",
+    displayName: "Execution Timeline",
+    icon: "ListOrdered",
+    accentColor: "cyan",
+    FullComponent: ExecutionTimelineWidget,
+    SummaryComponent: ExecutionTimelineSummary,
+    useData: useExecutionTimelineData,
+    detectActivity: defaultDetectors.execution_timeline,
+    defaultPriority: 5, // Highest priority - shows first
+    detailRoute: "/logs/timeline",
+  });
 
   // GUI Automation - primary widget for GUI automation setup/navigation
   widgetRegistry.register({
@@ -191,8 +215,22 @@ export function registerAllWidgets(): void {
     SummaryComponent: WorkflowRefSummary,
     useData: useWorkflowRefData,
     detectActivity: defaultDetectors.workflow_ref,
-    defaultPriority: 23,
+    defaultPriority: 25,
     detailRoute: "/logs/workflows",
+  });
+
+  // MCP Call - MCP tool calls to external servers
+  widgetRegistry.register({
+    id: "mcp_call",
+    displayName: "MCP Calls",
+    icon: "Plug",
+    accentColor: "violet",
+    FullComponent: McpCallWidget,
+    SummaryComponent: McpCallSummary,
+    useData: useMcpCallData,
+    detectActivity: defaultDetectors.mcp_call,
+    defaultPriority: 24,
+    detailRoute: "/logs/mcp",
   });
 
   // Mark registry as initialized

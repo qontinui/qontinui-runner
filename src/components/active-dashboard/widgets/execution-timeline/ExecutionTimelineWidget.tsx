@@ -1,0 +1,297 @@
+/**
+ * ExecutionTimelineWidget Component
+ *
+ * Full widget view for execution timeline activity.
+ * Displays all workflow steps chronologically, grouped by phase.
+ * Provides a high-level overview of workflow execution progress.
+ */
+
+import { useState } from "react";
+import {
+  Terminal,
+  CheckCircle,
+  Bot,
+  Globe2,
+  FileCode,
+  GitBranch,
+  Plug,
+  Monitor,
+  FlaskConical,
+  ChevronRight,
+  ChevronDown,
+  Loader2,
+  Clock,
+  AlertCircle,
+} from "lucide-react";
+import { cn } from "../../../../lib/utils";
+import { Badge, ScrollArea } from "../../../ui";
+import { StepStatsBar, StepStatusBadge } from "../shared";
+import { getAccentColors, getStatusColors } from "@/design-system";
+import { WORKFLOW_STAGE_CONFIG } from "../../../../types/dashboard/activity-types";
+import type { ExecutionTimelineWidgetProps, TimelineStep, PhaseGroup, StepType } from "./types";
+
+/**
+ * Get icon component for step type.
+ */
+function getStepIcon(type: StepType) {
+  const iconMap: Record<StepType, typeof Terminal> = {
+    shell: Terminal,
+    check_group: FlaskConical,
+    check: CheckCircle,
+    prompt: Bot,
+    api_request: Globe2,
+    script: FileCode,
+    workflow_ref: GitBranch,
+    mcp_call: Plug,
+    gui_action: Monitor,
+    playwright: Globe2,
+    unknown: FileCode,
+  };
+  return iconMap[type] || FileCode;
+}
+
+/**
+ * Get accent color for step type.
+ */
+function getStepAccentColor(type: StepType): string {
+  const colorMap: Record<StepType, string> = {
+    shell: "slate",
+    check_group: "teal",
+    check: "teal",
+    prompt: "green",
+    api_request: "orange",
+    script: "indigo",
+    workflow_ref: "pink",
+    mcp_call: "violet",
+    gui_action: "blue",
+    playwright: "purple",
+    unknown: "zinc",
+  };
+  return colorMap[type] || "zinc";
+}
+
+/**
+ * Format duration for display.
+ */
+function formatDuration(ms: number | undefined): string {
+  if (!ms) return "";
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  const mins = Math.floor(ms / 60000);
+  const secs = Math.floor((ms % 60000) / 1000);
+  return `${mins}m ${secs}s`;
+}
+
+/**
+ * Individual step row component.
+ */
+function StepRow({ step }: { step: TimelineStep }) {
+  const Icon = getStepIcon(step.type);
+  const accentColor = getStepAccentColor(step.type);
+  const colors = getAccentColors(accentColor as Parameters<typeof getAccentColors>[0]);
+  const errorColors = getStatusColors("error");
+  const isActive = step.status === "running";
+  const pendingColors = getStatusColors("pending");
+
+  return (
+    <div
+      className={cn(
+        "flex items-center gap-3 px-3 py-2 border-l-2 transition-colors",
+        isActive
+          ? cn(pendingColors.border, pendingColors.bg)
+          : "border-transparent hover:bg-muted/30",
+      )}
+    >
+      {/* Status indicator */}
+      <StepStatusBadge status={step.status} iconOnly size="sm" />
+
+      {/* Step type badge */}
+      <Badge
+        className={cn(
+          "text-[10px] flex-shrink-0 font-mono border",
+          colors.bg,
+          colors.text,
+          colors.border,
+        )}
+      >
+        <Icon className="h-2.5 w-2.5 mr-1" />
+        {step.type}
+      </Badge>
+
+      {/* Step name */}
+      <span className="flex-1 text-sm truncate text-foreground">{step.name}</span>
+
+      {/* Duration */}
+      {step.durationMs !== undefined && (
+        <span className="text-xs text-muted-foreground font-mono">
+          {formatDuration(step.durationMs)}
+        </span>
+      )}
+
+      {/* Running indicator */}
+      {isActive && (
+        <Loader2 className={cn("h-3.5 w-3.5 animate-spin", pendingColors.text)} />
+      )}
+
+      {/* Error indicator */}
+      {step.error && (
+        <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} title={step.error} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Phase section component with collapsible steps.
+ */
+function PhaseSection({
+  group,
+  defaultExpanded = true,
+}: {
+  group: PhaseGroup;
+  defaultExpanded?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded || group.isActive);
+  const config = WORKFLOW_STAGE_CONFIG[group.phase];
+  const colors = getAccentColors(config.color as Parameters<typeof getAccentColors>[0]);
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
+
+  return (
+    <div className="border-b border-border/50 last:border-b-0">
+      {/* Phase header */}
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className={cn(
+          "w-full flex items-center gap-3 px-4 py-2.5 transition-colors",
+          "hover:bg-muted/30",
+          group.isActive && cn(colors.bg, colors.border, "border-l-2"),
+        )}
+      >
+        {/* Expand/collapse icon */}
+        {expanded ? (
+          <ChevronDown className="h-4 w-4 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-4 w-4 text-muted-foreground" />
+        )}
+
+        {/* Phase badge */}
+        <Badge
+          className={cn(
+            "px-2 py-0.5 text-xs font-medium border",
+            group.isActive
+              ? cn(colors.bg, colors.text, colors.border)
+              : group.isComplete
+                ? "bg-muted/50 text-muted-foreground border-border/50"
+                : "bg-muted/20 text-muted-foreground/50 border-transparent",
+          )}
+        >
+          {config.label}
+        </Badge>
+
+        {/* Running indicator */}
+        {group.isActive && (
+          <Loader2 className={cn("h-3.5 w-3.5 animate-spin", colors.text)} />
+        )}
+
+        {/* Step count */}
+        <span className="text-xs text-muted-foreground ml-auto">
+          {group.stats.completed}/{group.stats.total} steps
+        </span>
+
+        {/* Success/fail indicators */}
+        {group.stats.successful > 0 && (
+          <Badge variant="muted" className={cn("text-[10px]", successColors.text)}>
+            {group.stats.successful} passed
+          </Badge>
+        )}
+        {group.stats.failed > 0 && (
+          <Badge variant="muted" className={cn("text-[10px]", errorColors.text)}>
+            {group.stats.failed} failed
+          </Badge>
+        )}
+      </button>
+
+      {/* Steps list */}
+      {expanded && (
+        <div className="bg-muted/10">
+          {group.steps.map((step) => (
+            <StepRow key={step.id} step={step} />
+          ))}
+          {group.steps.length === 0 && (
+            <div className="px-4 py-3 text-sm text-muted-foreground text-center">
+              No steps in this phase yet
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Full Execution Timeline widget component.
+ */
+export function ExecutionTimelineWidget({
+  isSummary,
+  data,
+  className,
+}: ExecutionTimelineWidgetProps) {
+  // If summary mode, don't render (use ExecutionTimelineSummary instead)
+  if (isSummary) {
+    return null;
+  }
+
+  const { phaseGroups, stats, isLoading, workflowName, currentPhase } = data;
+
+  if (isLoading) {
+    return (
+      <div className={cn("flex items-center justify-center h-full", className)}>
+        <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <div className={cn("flex flex-col h-full overflow-hidden", className)}>
+      {/* Stats Bar */}
+      <StepStatsBar stats={stats} />
+
+      {/* Workflow name header */}
+      {workflowName && (
+        <div className="flex items-center justify-between border-b border-border px-4 py-2 bg-muted/10 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <Clock className="h-4 w-4 text-muted-foreground" />
+            <h3 className="text-sm font-semibold text-foreground">{workflowName}</h3>
+          </div>
+          {currentPhase && (
+            <Badge variant="muted" className="text-xs">
+              {WORKFLOW_STAGE_CONFIG[currentPhase].label}
+            </Badge>
+          )}
+        </div>
+      )}
+
+      {/* Phase groups */}
+      <ScrollArea className="flex-1">
+        <div className="flex flex-col">
+          {phaseGroups.map((group) => (
+            <PhaseSection
+              key={group.phase}
+              group={group}
+              defaultExpanded={group.isActive || group.steps.length < 10}
+            />
+          ))}
+          {phaseGroups.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
+              <Clock className="h-8 w-8 mb-2 opacity-50" />
+              <span className="text-sm">Waiting for steps to execute...</span>
+            </div>
+          )}
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
+export default ExecutionTimelineWidget;

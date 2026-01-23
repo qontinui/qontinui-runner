@@ -34,7 +34,9 @@ import {
   Loader2,
   X,
   Sparkles,
+  Check,
 } from "lucide-react";
+import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
 import { ShellCommandBuilderProvider, useShellCommandBuilder } from "./ShellCommandBuilderContext";
 import { AiShellCommandGenerator } from "./AiShellCommandGenerator";
 import type { ShellCommand, ExecuteShellCommandResult, CreateShellCommandInput } from "./types";
@@ -75,11 +77,14 @@ function CategoryIcon({
 interface CommandListItemProps {
   command: ShellCommand;
   isSelected: boolean;
+  isSelectionMode: boolean;
+  isChecked: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  onToggleSelection: () => void;
 }
 
-function CommandListItem({ command, isSelected, onSelect, onDelete }: CommandListItemProps) {
+function CommandListItem({ command, isSelected, isSelectionMode, isChecked, onSelect, onDelete, onToggleSelection }: CommandListItemProps) {
   const [showMenu, setShowMenu] = useState(false);
 
   return (
@@ -93,9 +98,21 @@ function CommandListItem({ command, isSelected, onSelect, onDelete }: CommandLis
             : "hover:bg-muted/30"
         }
         ${!command.enabled ? "opacity-50" : ""}
+        ${isSelectionMode && isChecked ? "bg-red-500/10" : ""}
       `}
-      onClick={onSelect}
+      onClick={isSelectionMode ? onToggleSelection : onSelect}
     >
+      {isSelectionMode && (
+        <div
+          className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+            isChecked
+              ? "bg-red-500 border-red-500"
+              : "border-neutral-500 hover:border-red-400"
+          }`}
+        >
+          {isChecked && <Check className="w-3 h-3 text-white" />}
+        </div>
+      )}
       <CategoryIcon
         category={command.category}
         className={`w-4 h-4 flex-shrink-0 ${getCategoryColorClass(command.category)}`}
@@ -106,35 +123,37 @@ function CommandListItem({ command, isSelected, onSelect, onDelete }: CommandLis
           {command.command.length > 40 ? command.command.slice(0, 40) + "..." : command.command}
         </div>
       </div>
-      <div className="relative">
-        <button
-          className="p-1 opacity-0 group-hover:opacity-100 hover:bg-muted rounded transition-opacity"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowMenu(!showMenu);
-          }}
-        >
-          <MoreVertical className="w-4 h-4" />
-        </button>
-        {showMenu && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
-            <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[120px]">
-              <button
-                className="w-full px-3 py-1.5 text-sm text-left hover:bg-muted flex items-center gap-2 text-destructive"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete();
-                  setShowMenu(false);
-                }}
-              >
-                <Trash2 className="w-4 h-4" />
-                Delete
-              </button>
-            </div>
-          </>
-        )}
-      </div>
+      {!isSelectionMode && (
+        <div className="relative">
+          <button
+            className="p-1 opacity-0 group-hover:opacity-100 hover:bg-muted rounded transition-opacity"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowMenu(!showMenu);
+            }}
+          >
+            <MoreVertical className="w-4 h-4" />
+          </button>
+          {showMenu && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
+              <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[120px]">
+                <button
+                  className="w-full px-3 py-1.5 text-sm text-left hover:bg-muted flex items-center gap-2 text-destructive"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete();
+                    setShowMenu(false);
+                  }}
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -156,6 +175,54 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(
     new Set(SHELL_COMMAND_CATEGORIES.map((c) => c.id)),
   );
+
+  // Bulk deletion state
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // Toggle selection for bulk delete
+  const toggleSelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit selection mode
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Delete selected commands
+  const deleteSelectedCommands = useCallback(async () => {
+    setIsDeleting(true);
+    try {
+      for (const id of selectedIds) {
+        await deleteCommand(id);
+      }
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+    } catch (error) {
+      console.error("Failed to delete commands:", error);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [selectedIds, deleteCommand, exitSelectionMode]);
+
+  // Get names of selected commands for dialog
+  const getSelectedNames = useCallback(() => {
+    return shellCommands
+      .filter((c) => selectedIds.has(c.id))
+      .map((c) => c.name);
+  }, [shellCommands, selectedIds]);
 
   const filteredCommands = shellCommands.filter((command) => {
     const matchesSearch =
@@ -215,35 +282,51 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
     <div className="h-full flex flex-col bg-card border-r border-border/50 w-72 flex-shrink-0">
       {/* Header */}
       <div className="p-4 border-b border-border/50">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-2">
           <h2 className="text-sm font-semibold flex items-center gap-2">
             <Terminal className="w-4 h-4" />
             Shell Commands
           </h2>
-          <div className="relative">
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-1 mb-3">
+          <button
+            onClick={onOpenAiGenerator}
+            className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-blue-400 hover:text-blue-300 text-xs"
+            title="Generate with AI"
+            data-ui-id="shell-builder-ai-btn"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>AI</span>
+          </button>
+          <button
+            onClick={() => setIsSelectionMode(!isSelectionMode)}
+            className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg transition-colors text-xs ${
+              isSelectionMode
+                ? "bg-red-500/20 text-red-400"
+                : "hover:bg-muted text-muted-foreground hover:text-foreground"
+            }`}
+            title={isSelectionMode ? "Exit selection mode" : "Select commands to delete"}
+            data-ui-id="shell-builder-delete-mode-btn"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Delete</span>
+          </button>
+          <div className="relative flex-1">
             <button
-              className="p-1.5 hover:bg-muted rounded-md transition-colors"
+              className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-xs"
               onClick={() => setShowNewMenu(!showNewMenu)}
               title="Create new command"
+              data-ui-id="shell-builder-new-btn"
             >
-              <Plus className="w-4 h-4" />
+              <Plus className="w-3.5 h-3.5" />
+              <span>New</span>
             </button>
             {showNewMenu && (
               <>
                 <div className="fixed inset-0 z-10" onClick={() => setShowNewMenu(false)} />
                 <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[180px]">
-                  {/* AI Generator option */}
-                  <button
-                    className="w-full px-3 py-2 text-sm text-left hover:bg-muted flex items-center gap-2 text-violet-400"
-                    onClick={() => {
-                      setShowNewMenu(false);
-                      onOpenAiGenerator();
-                    }}
-                  >
-                    <Sparkles className="w-4 h-4" />
-                    <span>Generate with AI</span>
-                  </button>
-                  <div className="border-t border-border my-1" />
                   {/* Category options */}
                   {SHELL_COMMAND_CATEGORIES.map((category) => {
                     const Icon = categoryIcons[category.id] || Terminal;
@@ -252,6 +335,7 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
                         key={category.id}
                         className="w-full px-3 py-2 text-sm text-left hover:bg-muted flex items-center gap-2"
                         onClick={() => handleCreateCommand(category.id)}
+                        data-ui-id={`shell-builder-new-${category.id}-btn`}
                       >
                         <Icon className={`w-4 h-4 ${getCategoryColorClass(category.id)}`} />
                         <span>{category.name}</span>
@@ -274,6 +358,7 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="shell-builder-search-input"
           />
         </div>
 
@@ -284,6 +369,7 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
             onChange={(e) => setFilterCategory(e.target.value)}
             className="w-full px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="shell-builder-filter-select"
           >
             <option value="all">All Categories</option>
             {SHELL_COMMAND_CATEGORIES.map((category) => (
@@ -294,6 +380,48 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
           </select>
         </div>
       </div>
+
+      {/* Selection Mode Header */}
+      {isSelectionMode && (
+        <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+          <span className="text-sm text-red-400">
+            {selectedIds.size} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedIds(new Set(filteredCommands.map(c => c.id)))}
+              className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
+              data-ui-id="shell-builder-select-all-btn"
+            >
+              Select All
+            </button>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              disabled={selectedIds.size === 0}
+              className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded disabled:opacity-50"
+              data-ui-id="shell-builder-clear-selection-btn"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => setShowBatchDeleteDialog(true)}
+              disabled={selectedIds.size === 0}
+              className="px-2 py-1 text-xs bg-red-600 hover:bg-red-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              data-ui-id="shell-builder-delete-selected-btn"
+            >
+              Delete Selected
+            </button>
+            <button
+              onClick={exitSelectionMode}
+              className="p-1 text-neutral-400 hover:text-neutral-200"
+              title="Cancel selection"
+              data-ui-id="shell-builder-cancel-selection-btn"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Command List */}
       <div className="flex-1 overflow-y-auto p-2 space-y-2">
@@ -335,8 +463,11 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
                         key={command.id}
                         command={command}
                         isSelected={selectedCommandId === command.id}
+                        isSelectionMode={isSelectionMode}
+                        isChecked={selectedIds.has(command.id)}
                         onSelect={() => selectCommand(command.id)}
                         onDelete={() => handleDelete(command.id)}
+                        onToggleSelection={() => toggleSelection(command.id)}
                       />
                     ))}
                   </div>
@@ -351,8 +482,11 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
                 key={command.id}
                 command={command}
                 isSelected={selectedCommandId === command.id}
+                isSelectionMode={isSelectionMode}
+                isChecked={selectedIds.has(command.id)}
                 onSelect={() => selectCommand(command.id)}
                 onDelete={() => handleDelete(command.id)}
+                onToggleSelection={() => toggleSelection(command.id)}
               />
             ))}
           </div>
@@ -365,6 +499,17 @@ function CommandLibraryPanel({ onOpenAiGenerator }: { onOpenAiGenerator: () => v
           {shellCommands.length} command{shellCommands.length !== 1 ? "s" : ""} total
         </span>
       </div>
+
+      {/* Batch Delete Dialog */}
+      <BatchDeleteDialog
+        open={showBatchDeleteDialog}
+        title="Delete Commands"
+        itemType="command"
+        itemNames={getSelectedNames()}
+        isDeleting={isDeleting}
+        onClose={() => setShowBatchDeleteDialog(false)}
+        onConfirm={deleteSelectedCommands}
+      />
     </div>
   );
 }
@@ -494,6 +639,7 @@ function CommandEditorPanel() {
             disabled={isSaving}
             className="px-3 py-1.5 text-sm bg-neutral-700 hover:bg-neutral-600 rounded-md flex items-center gap-1.5 transition-colors disabled:opacity-50"
             title="Save command configuration"
+            data-ui-id="shell-builder-save-btn"
           >
             <Save className="w-3.5 h-3.5" />
             {isSaving ? "Saving..." : "Save"}
@@ -503,6 +649,7 @@ function CommandEditorPanel() {
             disabled={isExecuting || !command.trim()}
             className="px-3 py-1.5 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded-md flex items-center gap-1.5 transition-colors disabled:opacity-50"
             title="Execute this command"
+            data-ui-id="shell-builder-execute-btn"
           >
             {isExecuting ? (
               <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -529,6 +676,7 @@ function CommandEditorPanel() {
             placeholder="Command name"
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="shell-builder-name-input"
           />
         </div>
 
@@ -548,6 +696,7 @@ function CommandEditorPanel() {
             placeholder="What does this command do?"
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-none"
+            data-ui-id="shell-builder-description-input"
           />
         </div>
 
@@ -562,6 +711,7 @@ function CommandEditorPanel() {
             }}
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="shell-builder-category-select"
           >
             {SHELL_COMMAND_CATEGORIES.map((cat) => (
               <option key={cat.id} value={cat.id}>
@@ -587,6 +737,7 @@ function CommandEditorPanel() {
             placeholder="Enter shell command..."
             className="w-full px-3 py-2 text-sm font-mono bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-none"
+            data-ui-id="shell-builder-command-input"
           />
           <p className="text-xs text-muted-foreground">
             Multi-line commands supported. Use && for chaining commands.
@@ -609,6 +760,7 @@ function CommandEditorPanel() {
             placeholder="Current directory (default)"
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="shell-builder-working-dir-input"
           />
         </div>
 
@@ -629,6 +781,7 @@ function CommandEditorPanel() {
             max={3600}
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="shell-builder-timeout-input"
           />
         </div>
 
@@ -647,6 +800,7 @@ function CommandEditorPanel() {
                 setDirty(true);
               }}
               className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="shell-builder-fail-on-error-checkbox"
             />
           </label>
           <p className="text-xs text-muted-foreground ml-6">
@@ -666,6 +820,7 @@ function CommandEditorPanel() {
                 setDirty(true);
               }}
               className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-blue-500/50"
+              data-ui-id="shell-builder-enabled-checkbox"
             />
           </label>
         </div>
@@ -690,10 +845,12 @@ function CommandEditorPanel() {
               className="flex-1 px-3 py-1.5 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                        focus:outline-none focus:ring-2 focus:ring-blue-500/50"
               placeholder="Add tag..."
+              data-ui-id="shell-builder-tag-input"
             />
             <button
               onClick={handleAddTag}
               className="px-3 py-1.5 text-sm bg-muted hover:bg-muted/80 rounded-md"
+              data-ui-id="shell-builder-add-tag-btn"
             >
               Add
             </button>

@@ -5,7 +5,7 @@
  * Active widget takes 65%, summaries stack on the right (35%).
  */
 
-import { useCallback, memo } from "react";
+import { useCallback, useMemo, memo } from "react";
 import { cn } from "../../lib/utils";
 import type { ActivityType, ActivityStatus } from "../../types/dashboard/activity-types";
 import type { DashboardLayoutState } from "../../hooks/dashboard/useDashboardLayout";
@@ -24,6 +24,8 @@ import { useShellCommandData } from "./widgets/shell-command";
 import { useApiRequestData } from "./widgets/api-request";
 import { useScriptData } from "./widgets/script";
 import { useWorkflowRefData } from "./widgets/workflow-ref";
+import { useMcpCallData } from "./widgets/mcp-call";
+import { useExecutionTimelineData } from "./widgets/execution-timeline";
 
 /**
  * Props for DashboardLayout.
@@ -37,6 +39,10 @@ interface DashboardLayoutProps {
   onNavigateToDetail: (type: ActivityType) => void;
   /** Callback to go to execute page */
   onGoToExecute: () => void;
+  /** Callback to go to recap page */
+  onGoToRecap?: () => void;
+  /** Name of the last run workflow */
+  lastRunWorkflowName?: string | null;
 }
 
 /**
@@ -528,6 +534,90 @@ const WorkflowRefRenderer = memo(function WorkflowRefRenderer({
 });
 
 /**
+ * MCP Call widget renderer - calls useMcpCallData statically.
+ */
+const McpCallRenderer = memo(function McpCallRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("mcp_call")!;
+  const data = useMcpCallData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
+ * Execution Timeline widget renderer - calls useExecutionTimelineData statically.
+ */
+const ExecutionTimelineRenderer = memo(function ExecutionTimelineRenderer({
+  status,
+  onNavigateToDetail,
+}: WidgetRendererProps) {
+  const config = widgetRegistry.get("execution_timeline")!;
+  const data = useExecutionTimelineData();
+  const FullComponent = config.FullComponent;
+  const borderClasses = getWidgetBorderClasses(config.accentColor, status, true);
+
+  return (
+    <div
+      className={cn(
+        "h-full rounded-xl border-2 overflow-hidden bg-background",
+        "transition-colors duration-200",
+        borderClasses,
+      )}
+    >
+      <WidgetHeader
+        title={config.displayName}
+        icon={config.icon}
+        accentColor={config.accentColor}
+        status={status}
+        isActive={true}
+        detailRoute={config.detailRoute}
+        onViewAll={onNavigateToDetail}
+      />
+      <div className="h-[calc(100%-48px)] overflow-hidden">
+        <FullComponent
+          isActive={true}
+          isSummary={false}
+          status={status}
+          data={data}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      </div>
+    </div>
+  );
+});
+
+/**
  * Active widget dispatcher - renders the correct type-specific component.
  * Each type has its own component with static hook calls.
  * Memoized to prevent unnecessary re-renders when parent state changes.
@@ -563,6 +653,10 @@ const ActiveWidget = memo(function ActiveWidget({
       return <ScriptRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     case "workflow_ref":
       return <WorkflowRefRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "mcp_call":
+      return <McpCallRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
+    case "execution_timeline":
+      return <ExecutionTimelineRenderer status={status} onNavigateToDetail={onNavigateToDetail} />;
     default:
       return (
         <div className="flex items-center justify-center h-full text-muted-foreground">
@@ -588,7 +682,7 @@ function SummaryContainer({
   config,
   status,
   onClick,
-  onNavigateToDetail,
+  onNavigateToDetail: _onNavigateToDetail,
   data,
 }: SummaryRendererProps & {
   config: NonNullable<ReturnType<typeof widgetRegistry.get>>;
@@ -618,7 +712,7 @@ function SummaryContainer({
         status={status}
         isActive={false}
         compact={true}
-        onViewAll={onNavigateToDetail}
+        onViewAll={onClick}
       />
       <div className="p-3">
         <SummaryComponent isActive={false} isSummary={true} status={status} data={data} />
@@ -734,6 +828,26 @@ const WorkflowRefSummaryRenderer = memo(function WorkflowRefSummaryRenderer(
 });
 
 /**
+ * MCP Call summary renderer.
+ */
+const McpCallSummaryRenderer = memo(function McpCallSummaryRenderer(props: SummaryRendererProps) {
+  const config = widgetRegistry.get("mcp_call")!;
+  const data = useMcpCallData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
+ * Execution Timeline summary renderer.
+ */
+const ExecutionTimelineSummaryRenderer = memo(function ExecutionTimelineSummaryRenderer(
+  props: SummaryRendererProps,
+) {
+  const config = widgetRegistry.get("execution_timeline")!;
+  const data = useExecutionTimelineData();
+  return <SummaryContainer {...props} config={config} data={data} />;
+});
+
+/**
  * Summary widget dispatcher - renders the correct type-specific component.
  * Memoized to prevent unnecessary re-renders when parent state changes.
  */
@@ -829,6 +943,22 @@ const SummaryWidget = memo(function SummaryWidget({
           onNavigateToDetail={onNavigateToDetail}
         />
       );
+    case "mcp_call":
+      return (
+        <McpCallSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
+    case "execution_timeline":
+      return (
+        <ExecutionTimelineSummaryRenderer
+          status={status}
+          onClick={onClick}
+          onNavigateToDetail={onNavigateToDetail}
+        />
+      );
     default:
       return null;
   }
@@ -842,6 +972,8 @@ export function DashboardLayout({
   onWidgetClick,
   onNavigateToDetail,
   onGoToExecute,
+  onGoToRecap,
+  lastRunWorkflowName,
 }: DashboardLayoutProps) {
   const { activeWidget, summaryWidgets, activities, isIdle, detectedWidgets } = layout;
 
@@ -853,6 +985,19 @@ export function DashboardLayout({
     [activities],
   );
 
+  // Find the currently running activity (if any)
+  const runningWidget = useMemo(() => {
+    for (const [type, state] of activities) {
+      if (state.status === "running") {
+        return type;
+      }
+    }
+    return null;
+  }, [activities]);
+
+  // Check if user has switched away from the running widget
+  const showRestoreButton = runningWidget && activeWidget !== runningWidget;
+
   // Handle navigation to detail
   const handleNavigateToDetail = useCallback(
     (type: ActivityType) => {
@@ -861,9 +1006,22 @@ export function DashboardLayout({
     [onNavigateToDetail],
   );
 
+  // Handle restore to running widget
+  const handleRestoreToRunning = useCallback(() => {
+    if (runningWidget) {
+      onWidgetClick(runningWidget);
+    }
+  }, [runningWidget, onWidgetClick]);
+
   // Show idle state if no widgets detected
   if (detectedWidgets.length === 0 || isIdle) {
-    return <IdleState onGoToExecute={onGoToExecute} />;
+    return (
+      <IdleState
+        onGoToExecute={onGoToExecute}
+        onGoToRecap={onGoToRecap}
+        lastRunWorkflowName={lastRunWorkflowName}
+      />
+    );
   }
 
   // Single widget case - show full width
@@ -895,6 +1053,16 @@ export function DashboardLayout({
 
       {/* Summary Widgets - 35% */}
       <div className="w-[35%] flex flex-col gap-3 overflow-y-auto">
+        {/* Restore to Active Process button */}
+        {showRestoreButton && (
+          <button
+            onClick={handleRestoreToRunning}
+            className="flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium text-primary bg-primary/10 hover:bg-primary/20 border border-primary/30 rounded-lg transition-colors"
+          >
+            <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
+            Restore to Active Process
+          </button>
+        )}
         {summaryWidgets.map((type) => (
           <SummaryWidget
             key={type}

@@ -401,7 +401,8 @@ impl EventBus {
 
     /// Subscribe to a specific event type.
     pub fn subscribe(&self, event_type: EventType, handler: impl EventHandler + 'static) {
-        let mut subscribers = self.subscribers.write().unwrap();
+        let mut subscribers =
+            crate::safe_lock::safe_write_or_recover(&self.subscribers, "event_bus_subscribers");
         subscribers
             .entry(event_type)
             .or_insert_with(Vec::new)
@@ -410,7 +411,10 @@ impl EventBus {
 
     /// Subscribe to all events.
     pub fn subscribe_all(&self, handler: impl EventHandler + 'static) {
-        let mut global = self.global_subscribers.write().unwrap();
+        let mut global = crate::safe_lock::safe_write_or_recover(
+            &self.global_subscribers,
+            "event_bus_global_subscribers",
+        );
         global.push(Arc::new(handler));
     }
 
@@ -435,7 +439,8 @@ impl EventBus {
 
         // Store in history
         if self.keep_history {
-            let mut history = self.history.write().unwrap();
+            let mut history =
+                crate::safe_lock::safe_write_or_recover(&self.history, "event_bus_history");
             history.push(event.clone());
             if history.len() > self.max_history {
                 history.remove(0);
@@ -444,7 +449,10 @@ impl EventBus {
 
         // Notify global subscribers first
         {
-            let global = self.global_subscribers.read().unwrap();
+            let global = crate::safe_lock::safe_read_or_recover(
+                &self.global_subscribers,
+                "event_bus_global_subscribers",
+            );
             for handler in global.iter() {
                 if !handler.handle(&event) {
                     warn!(
@@ -458,7 +466,8 @@ impl EventBus {
 
         // Notify type-specific subscribers
         {
-            let subscribers = self.subscribers.read().unwrap();
+            let subscribers =
+                crate::safe_lock::safe_read_or_recover(&self.subscribers, "event_bus_subscribers");
             if let Some(handlers) = subscribers.get(&event.event_type) {
                 for handler in handlers {
                     if !handler.handle(&event) {
@@ -475,14 +484,12 @@ impl EventBus {
 
     /// Get event history.
     pub fn history(&self) -> Vec<OrchestratorEvent> {
-        self.history.read().unwrap().clone()
+        crate::safe_lock::safe_read_or_recover(&self.history, "event_bus_history").clone()
     }
 
     /// Get events of a specific type from history.
     pub fn history_by_type(&self, event_type: EventType) -> Vec<OrchestratorEvent> {
-        self.history
-            .read()
-            .unwrap()
+        crate::safe_lock::safe_read_or_recover(&self.history, "event_bus_history")
             .iter()
             .filter(|e| e.event_type == event_type)
             .cloned()
@@ -491,9 +498,7 @@ impl EventBus {
 
     /// Get events for a specific task from history.
     pub fn history_by_task(&self, task_id: &str) -> Vec<OrchestratorEvent> {
-        self.history
-            .read()
-            .unwrap()
+        crate::safe_lock::safe_read_or_recover(&self.history, "event_bus_history")
             .iter()
             .filter(|e| e.task_id.as_deref() == Some(task_id))
             .cloned()
@@ -502,14 +507,12 @@ impl EventBus {
 
     /// Clear event history.
     pub fn clear_history(&self) {
-        self.history.write().unwrap().clear();
+        crate::safe_lock::safe_write_or_recover(&self.history, "event_bus_history").clear();
     }
 
     /// Get subscriber count for an event type.
     pub fn subscriber_count(&self, event_type: EventType) -> usize {
-        self.subscribers
-            .read()
-            .unwrap()
+        crate::safe_lock::safe_read_or_recover(&self.subscribers, "event_bus_subscribers")
             .get(&event_type)
             .map(|v| v.len())
             .unwrap_or(0)
@@ -517,7 +520,11 @@ impl EventBus {
 
     /// Get global subscriber count.
     pub fn global_subscriber_count(&self) -> usize {
-        self.global_subscribers.read().unwrap().len()
+        crate::safe_lock::safe_read_or_recover(
+            &self.global_subscribers,
+            "event_bus_global_subscribers",
+        )
+        .len()
     }
 }
 
@@ -591,15 +598,15 @@ impl CollectorHandler {
     }
 
     pub fn events(&self) -> Vec<OrchestratorEvent> {
-        self.events.read().unwrap().clone()
+        crate::safe_lock::safe_read_or_recover(&self.events, "collector_handler_events").clone()
     }
 
     pub fn clear(&self) {
-        self.events.write().unwrap().clear();
+        crate::safe_lock::safe_write_or_recover(&self.events, "collector_handler_events").clear();
     }
 
     pub fn count(&self) -> usize {
-        self.events.read().unwrap().len()
+        crate::safe_lock::safe_read_or_recover(&self.events, "collector_handler_events").len()
     }
 }
 
@@ -619,7 +626,8 @@ impl Clone for CollectorHandler {
 
 impl EventHandler for CollectorHandler {
     fn handle(&self, event: &OrchestratorEvent) -> bool {
-        self.events.write().unwrap().push(event.clone());
+        crate::safe_lock::safe_write_or_recover(&self.events, "collector_handler_events")
+            .push(event.clone());
         true
     }
 
@@ -717,15 +725,17 @@ impl MetricsHandler {
     }
 
     pub fn get_count(&self, event_type: EventType) -> u64 {
-        *self.counters.read().unwrap().get(&event_type).unwrap_or(&0)
+        *crate::safe_lock::safe_read_or_recover(&self.counters, "metrics_handler_counters")
+            .get(&event_type)
+            .unwrap_or(&0)
     }
 
     pub fn get_all_counts(&self) -> HashMap<EventType, u64> {
-        self.counters.read().unwrap().clone()
+        crate::safe_lock::safe_read_or_recover(&self.counters, "metrics_handler_counters").clone()
     }
 
     pub fn reset(&self) {
-        self.counters.write().unwrap().clear();
+        crate::safe_lock::safe_write_or_recover(&self.counters, "metrics_handler_counters").clear();
     }
 }
 
@@ -745,7 +755,8 @@ impl Clone for MetricsHandler {
 
 impl EventHandler for MetricsHandler {
     fn handle(&self, event: &OrchestratorEvent) -> bool {
-        let mut counters = self.counters.write().unwrap();
+        let mut counters =
+            crate::safe_lock::safe_write_or_recover(&self.counters, "metrics_handler_counters");
         *counters.entry(event.event_type).or_insert(0) += 1;
         true
     }

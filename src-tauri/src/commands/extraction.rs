@@ -32,6 +32,10 @@ pub struct WebExtractionConfig {
 }
 
 /// Start a web extraction process
+///
+/// This command uses the dedicated ExtractionExecutor which runs in parallel
+/// with the main PythonBridge, allowing extraction to run concurrently with
+/// GUI automation workflows.
 #[tauri::command]
 pub fn start_web_extraction(
     state: State<Arc<AppState>>,
@@ -39,15 +43,17 @@ pub fn start_web_extraction(
 ) -> Result<CommandResponse, String> {
     info!("Starting web extraction for URLs: {:?}", config.urls);
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
 
         let params = json!({
             "config": {
@@ -62,7 +68,7 @@ pub fn start_web_extraction(
             }
         });
 
-        bridge
+        executor
             .send_command("start_web_extraction", Some(params))
             .map_err(|e| e.to_string())?;
 
@@ -72,7 +78,7 @@ pub fn start_web_extraction(
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 
@@ -81,17 +87,17 @@ pub fn start_web_extraction(
 pub fn stop_web_extraction(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping web extraction");
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
+    if let Some(ref mut executor) = *executor_lock {
+        if !executor.is_running() {
+            return Err("Extraction executor not running".to_string());
         }
 
-        bridge
+        executor
             .send_command("stop_web_extraction", None)
             .map_err(|e| e.to_string())?;
 
@@ -101,7 +107,7 @@ pub fn stop_web_extraction(state: State<Arc<AppState>>) -> Result<CommandRespons
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 
@@ -110,17 +116,22 @@ pub fn stop_web_extraction(state: State<Arc<AppState>>) -> Result<CommandRespons
 pub fn get_extraction_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting extraction status");
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
+    if let Some(ref mut executor) = *executor_lock {
+        if !executor.is_running() {
+            // Executor not running means no extraction in progress
+            return Ok(CommandResponse {
+                success: true,
+                message: Some("Extraction executor not running".to_string()),
+                data: Some(json!({ "is_running": false })),
+            });
         }
 
-        bridge
+        executor
             .send_command("get_extraction_status", None)
             .map_err(|e| e.to_string())?;
 
@@ -130,7 +141,7 @@ pub fn get_extraction_status(state: State<Arc<AppState>>) -> Result<CommandRespo
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 
@@ -151,22 +162,24 @@ pub fn request_extraction_screenshot(
         request.screenshot_id, request.resolution
     );
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
 
         let params = json!({
             "screenshot_id": request.screenshot_id,
             "resolution": request.resolution,
         });
 
-        bridge
+        executor
             .send_command("get_extraction_screenshot", Some(params))
             .map_err(|e| e.to_string())?;
 
@@ -176,7 +189,7 @@ pub fn request_extraction_screenshot(
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 
@@ -201,15 +214,17 @@ pub fn export_training_data(
         config.extraction_id, config.format, config.output_path
     );
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
 
         let params = json!({
             "extraction_id": config.extraction_id,
@@ -219,7 +234,7 @@ pub fn export_training_data(
             "include_states": config.include_states.unwrap_or(true),
         });
 
-        bridge
+        executor
             .send_command("export_training_data", Some(params))
             .map_err(|e| e.to_string())?;
 
@@ -229,7 +244,7 @@ pub fn export_training_data(
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 
@@ -251,15 +266,17 @@ pub fn export_state_structure(
         config.extraction_id, config.output_path
     );
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
 
         let params = json!({
             "extraction_id": config.extraction_id,
@@ -267,7 +284,7 @@ pub fn export_state_structure(
             "include_screenshots": config.include_screenshots.unwrap_or(true),
         });
 
-        bridge
+        executor
             .send_command("export_state_structure", Some(params))
             .map_err(|e| e.to_string())?;
 
@@ -277,7 +294,7 @@ pub fn export_state_structure(
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 
@@ -286,17 +303,19 @@ pub fn export_state_structure(
 pub fn list_extractions(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Listing available extractions");
 
-    let mut bridge_lock = state
-        .python_bridge
+    let mut executor_lock = state
+        .extraction_executor
         .lock()
         .map_err(|e| format!("Failed to acquire lock: {}", e))?;
 
-    if let Some(ref mut bridge) = *bridge_lock {
-        if !bridge.is_running() {
-            return Err("Python executor not running".to_string());
-        }
+    if let Some(ref mut executor) = *executor_lock {
+        // Start executor on-demand if not running
+        executor.ensure_started().map_err(|e| {
+            error!("Failed to start extraction executor: {}", e);
+            e
+        })?;
 
-        bridge
+        executor
             .send_command("list_extractions", None)
             .map_err(|e| e.to_string())?;
 
@@ -306,7 +325,7 @@ pub fn list_extractions(state: State<Arc<AppState>>) -> Result<CommandResponse, 
             data: None,
         })
     } else {
-        Err("Python executor not initialized".to_string())
+        Err("Extraction executor not initialized".to_string())
     }
 }
 

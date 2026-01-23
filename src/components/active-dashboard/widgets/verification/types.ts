@@ -5,6 +5,8 @@
  * This widget answers "Did the fix work?" by showing verification test results.
  */
 
+import type { StepStats, StepExecutionStatus } from "../shared/types";
+
 /**
  * Status of the verification process.
  */
@@ -13,7 +15,7 @@ export type VerificationStatus = "pending" | "running" | "passed" | "failed" | "
 /**
  * Type of verification test that was run.
  */
-export type VerificationTestType = "repo_test" | "playwright" | "gui_automation";
+export type VerificationTestType = "repo_test" | "playwright" | "gui_automation" | "check_group";
 
 /**
  * Evidence collected during verification.
@@ -27,6 +29,30 @@ export interface VerificationEvidence {
   content?: string;
   /** When this evidence was captured */
   timestamp: number;
+}
+
+/**
+ * Individual check step in verification.
+ */
+export interface CheckStep {
+  /** Unique step ID */
+  id: string;
+  /** Step name/description */
+  name: string;
+  /** Execution status */
+  status: StepExecutionStatus;
+  /** Check type (check_group, check, playwright, etc.) */
+  checkType: VerificationTestType;
+  /** Start timestamp */
+  startTime?: number;
+  /** End timestamp */
+  endTime?: number;
+  /** Duration in ms */
+  durationMs?: number;
+  /** Error message if failed */
+  error?: string;
+  /** Output/result preview */
+  output?: string;
 }
 
 /**
@@ -47,6 +73,12 @@ export interface VerificationData {
   durationMs: number;
   /** Error message if verification failed */
   error?: string;
+  /** List of check steps (for step-based verification) */
+  checkSteps: CheckStep[];
+  /** Overall statistics for check steps */
+  stats: StepStats;
+  /** Whether data is loading */
+  isLoading: boolean;
 }
 
 /**
@@ -59,4 +91,15 @@ export const DEFAULT_VERIFICATION_DATA: VerificationData = {
   description: null,
   evidence: [],
   durationMs: 0,
+  checkSteps: [],
+  stats: {
+    total: 0,
+    completed: 0,
+    successful: 0,
+    failed: 0,
+    pending: 0,
+    elapsedTime: 0,
+    successRate: 100,
+  },
+  isLoading: true,
 };

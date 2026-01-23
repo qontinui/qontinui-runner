@@ -53,7 +53,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
 
         {/* Login Card */}
         <div className="card p-8 space-y-6 glow-cyan">
-          <form onSubmit={handleLogin} className="space-y-5">
+          <form onSubmit={handleLogin} className="space-y-5" data-ui-id="form-login">
             {/* Email Input */}
             <div className="space-y-2">
               <label htmlFor="email" className="block text-sm font-medium text-foreground">
@@ -66,6 +66,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  data-ui-id="form-login-email-input"
                   className="w-full pl-11 pr-4 py-3 bg-input border border-border/50 rounded-lg
                            text-foreground placeholder:text-muted-foreground
                            focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent
@@ -89,6 +90,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
+                  data-ui-id="form-login-password-input"
                   className="w-full pl-11 pr-4 py-3 bg-input border border-border/50 rounded-lg
                            text-foreground placeholder:text-muted-foreground
                            focus:outline-none focus:ring-2 focus:ring-primary focus:border-transparent
@@ -112,6 +114,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
             <button
               type="submit"
               disabled={loading}
+              data-ui-id="form-login-submit-btn"
               className="w-full btn-primary py-3 text-base font-semibold flex items-center justify-center gap-2"
             >
               {loading ? (
@@ -133,6 +136,7 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
                 href="https://qontinui.io"
                 target="_blank"
                 rel="noopener noreferrer"
+                data-ui-id="form-login-signup-link"
                 className="text-primary hover:text-primary/80 font-medium transition-colors"
               >
                 Sign up on qontinui.io

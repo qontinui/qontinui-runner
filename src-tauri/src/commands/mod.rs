@@ -29,7 +29,7 @@
 use crate::config::QontinuiConfig;
 use crate::database::CheckpointDb;
 use crate::display::DisplayProcessor;
-use crate::executor::PythonBridge;
+use crate::executor::{ExtractionExecutor, PythonBridge};
 use crate::mcp_client::McpClientManager;
 use crate::storage::LocalStorage;
 use crate::tiered_info::RunRecordingHandler;
@@ -42,6 +42,7 @@ use tokio::sync::Mutex as TokioMutex;
 // Command modules organized by domain
 pub mod accessibility;
 pub mod ai_data;
+pub mod ai_generation; // AI generation for builder tabs (context, api request, task, exploration)
 pub mod ai_settings;
 pub mod auth;
 pub mod backup; // Comprehensive backup and restore
@@ -56,6 +57,7 @@ pub mod debug;
 pub mod discoveries;
 pub mod execution;
 pub mod execution_reporting;
+pub mod execution_variables; // Execution variables (auth source, custom variables)
 pub mod extraction;
 pub mod findings;
 pub mod flow; // Flow designer commands
@@ -78,10 +80,13 @@ pub mod self_healing_settings;
 pub mod shell_commands; // Shell command management and execution
 pub mod state_explorer; // State explorer for AI-driven state machine exploration
 pub mod state_machine;
+pub mod step_outputs; // Step output collection for test builder
 pub mod storage;
 pub mod task_sync; // renamed from ai_task_reporting
+pub mod test_orchestrator; // AI-driven multi-step API test orchestration
 pub mod testing;
 pub mod tiered_info;
+pub mod ui_bridge; // UI Bridge for AI-driven UI automation
 pub mod verification;
 pub mod video;
 pub mod websocket;
@@ -92,6 +97,7 @@ pub mod websocket;
 ///
 /// This structure holds the core application state including:
 /// - Python bridge for executor communication
+/// - Extraction executor for parallel extraction operations
 /// - Current loaded configuration
 /// - Display processor for UI views
 /// - Local storage service
@@ -101,6 +107,10 @@ pub mod websocket;
 /// - Run recording handler for automatic run recording
 pub struct AppState {
     pub python_bridge: Mutex<Option<PythonBridge>>,
+    /// Separate executor for extraction operations (runs in parallel with python_bridge).
+    /// This allows extraction (which uses Playwright) to run concurrently with
+    /// GUI automation workflows (which use HAL).
+    pub extraction_executor: Mutex<Option<ExtractionExecutor>>,
     pub current_config: Mutex<Option<QontinuiConfig>>,
     pub display_processor: Arc<TokioMutex<DisplayProcessor>>,
     pub local_storage: Arc<Mutex<LocalStorage>>,

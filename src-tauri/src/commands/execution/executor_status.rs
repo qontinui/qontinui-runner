@@ -77,7 +77,7 @@ pub fn get_executor_status(state: State<Arc<AppState>>) -> Result<CommandRespons
             data: Some(serde_json::json!({
                 "python_running": false,
                 "executor_state": "not_started",
-                "config_loaded": state.current_config.lock().unwrap().is_some()
+                "config_loaded": crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config").is_some()
             })),
         })
     }
@@ -202,7 +202,8 @@ pub fn set_input_capture_enabled(
 ) -> Result<CommandResponse, String> {
     info!("Setting input capture enabled: {}", enabled);
 
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err("Python executor is not running".to_string());
@@ -239,7 +240,8 @@ pub fn set_input_capture_enabled(
 /// * `Err(String)` - Error if executor not running
 #[tauri::command]
 pub fn get_input_validation_status(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Ok(CommandResponse {

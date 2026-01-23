@@ -34,6 +34,9 @@ import type {
 } from "../types";
 import { getDefaultSavedExploration } from "../types";
 import { getAccentColors } from "@/design-system";
+import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
+import { AiExplorationAdvisor } from "./state-explorer/AiExplorationAdvisor";
+import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 
 const API_BASE = "http://localhost:9876";
 
@@ -98,6 +101,13 @@ export function StateExplorerBuilderTab({
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedExploration, setSelectedExploration] = useState<SavedExploration | null>(null);
   const [isCreating, setIsCreating] = useState(false);
+  const [showAiAdvisor, setShowAiAdvisor] = useState(false);
+
+  // Selection mode state (for batch delete)
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   // Config file state
   const [configPath, setConfigPath] = useState("");
@@ -446,6 +456,28 @@ export function StateExplorerBuilderTab({
     );
   };
 
+  // Handle AI suggestion accepted
+  const handleAiSuggestionAccepted = (suggestion: {
+    strategy: typeof formStrategy;
+    target_state_ids: string[];
+    target_transition_ids: string[];
+    max_states: number;
+    max_duration_seconds: number;
+    rationale: string;
+  }) => {
+    // Apply suggested settings
+    setFormStrategy(suggestion.strategy);
+    setFormTargetStateIds(suggestion.target_state_ids);
+    setFormTargetTransitionIds(suggestion.target_transition_ids);
+    setFormMaxStates(suggestion.max_states);
+    setFormMaxDuration(suggestion.max_duration_seconds);
+
+    // Close modal
+    setShowAiAdvisor(false);
+
+    onLog?.("success", "AI suggestions applied - review and save");
+  };
+
   // Filter explorations
   const filteredExplorations = explorations.filter((exploration) => {
     if (!searchQuery) return true;
@@ -457,25 +489,89 @@ export function StateExplorerBuilderTab({
     );
   });
 
+  // Toggle selection for batch delete
+  const toggleSelection = useCallback((explorationId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(explorationId)) {
+        next.delete(explorationId);
+      } else {
+        next.add(explorationId);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit selection mode
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Delete selected explorations
+  const deleteSelected = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+
+    setIsDeleting(true);
+    try {
+      // Delete in parallel
+      const deletePromises = Array.from(selectedIds).map((id) =>
+        fetch(`${API_BASE}/saved-explorations/${id}`, { method: "DELETE" })
+      );
+      await Promise.all(deletePromises);
+
+      // Refresh the list
+      await fetchExplorations();
+
+      // If currently selected exploration was deleted, clear it
+      if (selectedExploration && selectedIds.has(selectedExploration.id)) {
+        setSelectedExploration(null);
+        setIsCreating(false);
+      }
+
+      // Exit selection mode
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+      onLog?.("success", `Deleted ${selectedIds.size} exploration(s)`);
+    } catch (error) {
+      onLog?.("error", `Failed to delete explorations: ${error}`);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [selectedIds, fetchExplorations, selectedExploration, exitSelectionMode, onLog]);
+
+  // Get names of selected explorations for the delete dialog
+  const getSelectedNames = useCallback((): string[] => {
+    return explorations
+      .filter((e) => selectedIds.has(e.id))
+      .map((e) => e.name);
+  }, [explorations, selectedIds]);
+
   return (
     <div className="h-full flex">
       {/* Left Panel - Exploration List */}
       <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
         {/* Header */}
         <div className="p-4 border-b border-neutral-700">
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between mb-2">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <Compass className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
               State Explorer
             </h2>
-            <button
-              onClick={startCreate}
-              className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
-              title="New Exploration"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
           </div>
+
+          {/* Action buttons */}
+          <BuilderToolbar
+            className="mb-3"
+            actions={[
+              toolbarActions.ai(() => setShowAiAdvisor(true)),
+              toolbarActions.new(startCreate, "New"),
+              toolbarActions.delete(
+                () => setIsSelectionMode(!isSelectionMode),
+                isSelectionMode
+              ),
+            ]}
+          />
 
           {/* Search */}
           <div className="relative">
@@ -489,6 +585,32 @@ export function StateExplorerBuilderTab({
             />
           </div>
         </div>
+
+        {/* Selection Mode Header */}
+        {isSelectionMode && (
+          <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+            <span className="text-sm text-red-400">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              {selectedIds.size > 0 && (
+                <button
+                  onClick={() => setShowBatchDeleteDialog(true)}
+                  className="flex items-center gap-1 px-3 py-1 text-sm font-medium bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete
+                </button>
+              )}
+              <button
+                onClick={exitSelectionMode}
+                className="px-3 py-1 text-sm text-neutral-400 hover:text-neutral-200 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Exploration List */}
         <div className="flex-1 overflow-y-auto p-2">
@@ -506,21 +628,49 @@ export function StateExplorerBuilderTab({
               {filteredExplorations.map((exploration) => (
                 <button
                   key={exploration.id}
-                  onClick={() => selectExploration(exploration)}
-                  className={`w-full text-left p-3 rounded-lg transition-colors ${
-                    selectedExploration?.id === exploration.id
-                      ? "bg-neutral-700"
-                      : "hover:bg-neutral-800"
+                  onClick={() => {
+                    if (isSelectionMode) {
+                      toggleSelection(exploration.id);
+                    } else {
+                      selectExploration(exploration);
+                    }
+                  }}
+                  className={`w-full text-left p-3 rounded-lg transition-colors flex items-start gap-3 ${
+                    isSelectionMode && selectedIds.has(exploration.id)
+                      ? "bg-red-500/20 border border-red-500/50"
+                      : selectedExploration?.id === exploration.id
+                        ? "bg-neutral-700"
+                        : "hover:bg-neutral-800"
+                  } ${isSelectionMode ? "border" : ""} ${
+                    isSelectionMode && !selectedIds.has(exploration.id)
+                      ? "border-transparent"
+                      : ""
                   }`}
                 >
-                  <div className="font-medium text-sm truncate">{exploration.name}</div>
-                  <div className="flex items-center gap-2 mt-1">
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
-                      {exploration.config.strategy}
-                    </span>
-                    {exploration.run_count > 0 && (
-                      <span className="text-xs text-neutral-500">{exploration.run_count} runs</span>
-                    )}
+                  {/* Checkbox in selection mode */}
+                  {isSelectionMode && (
+                    <div
+                      className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
+                        selectedIds.has(exploration.id)
+                          ? "bg-red-500 border-red-500"
+                          : "border-neutral-500"
+                      }`}
+                    >
+                      {selectedIds.has(exploration.id) && (
+                        <Check className="w-3 h-3 text-white" />
+                      )}
+                    </div>
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm truncate">{exploration.name}</div>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
+                        {exploration.config.strategy}
+                      </span>
+                      {exploration.run_count > 0 && (
+                        <span className="text-xs text-neutral-500">{exploration.run_count} runs</span>
+                      )}
+                    </div>
                   </div>
                 </button>
               ))}
@@ -938,6 +1088,27 @@ export function StateExplorerBuilderTab({
           </>
         )}
       </div>
+
+      {/* AI Exploration Advisor Modal */}
+      {showAiAdvisor && (
+        <AiExplorationAdvisor
+          availableStates={availableStates}
+          availableTransitions={availableTransitions}
+          onSuggestionAccepted={handleAiSuggestionAccepted}
+          onClose={() => setShowAiAdvisor(false)}
+        />
+      )}
+
+      {/* Batch Delete Dialog */}
+      <BatchDeleteDialog
+        open={showBatchDeleteDialog}
+        title="Delete Explorations"
+        itemType="exploration"
+        itemNames={getSelectedNames()}
+        isDeleting={isDeleting}
+        onClose={() => setShowBatchDeleteDialog(false)}
+        onConfirm={deleteSelected}
+      />
     </div>
   );
 }

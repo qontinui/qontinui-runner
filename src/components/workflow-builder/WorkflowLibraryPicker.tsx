@@ -1,61 +1,39 @@
 /**
- * WorkflowLibraryPicker.tsx
+ * Workflow Library Picker
  *
- * Modal dialog for selecting a saved workflow from the library.
- * Used when opening an existing workflow in the Workflow Builder.
+ * Modal dialog for selecting a saved workflow to reference as a workflow step.
+ * Used for workflow composition - running one workflow as a step in another.
  */
 
-import { useState, useEffect, useMemo, useRef } from "react";
-import { GitBranch, Search, X, Loader2, Check, Play, Clock, Download, Upload, MoreVertical } from "lucide-react";
-import type { UnifiedWorkflow, WorkflowExport } from "../../types";
-import { getAccentColors } from "@/design-system";
+import { useState, useEffect, useCallback } from "react";
+import { Search, X, Check as CheckIcon, Workflow, FolderOpen, Layers } from "lucide-react";
+import type { WorkflowPhase, UnifiedWorkflow } from "../../types/unified-workflow";
+
+interface WorkflowLibraryPickerProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSelect: (workflow: UnifiedWorkflow, phase: WorkflowPhase) => void;
+  phase: WorkflowPhase;
+  /** Current workflow ID to exclude from the list (prevent self-reference) */
+  excludeWorkflowId?: string;
+}
 
 const API_BASE = "http://localhost:9876";
 
-interface WorkflowLibraryPickerProps {
-  /** Whether the picker is open */
-  isOpen: boolean;
-  /** Called when the picker is closed */
-  onClose: () => void;
-  /** Called when a workflow is selected */
-  onSelect: (workflow: UnifiedWorkflow) => void;
-  /** Called when a workflow is imported */
-  onImport?: (workflow: UnifiedWorkflow) => void;
-}
-
-// Get step count for display
-function getStepCount(workflow: UnifiedWorkflow): number {
-  return (
-    workflow.setup_steps.length + workflow.verification_steps.length + workflow.agentic_steps.length
-  );
-}
-
-// Format date for display
-function formatDate(dateStr: string): string {
-  try {
-    const date = new Date(dateStr);
-    return date.toLocaleDateString(undefined, {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-    });
-  } catch {
-    return dateStr;
-  }
-}
-
-export function WorkflowLibraryPicker({ isOpen, onClose, onSelect, onImport }: WorkflowLibraryPickerProps) {
+export function WorkflowLibraryPicker({
+  isOpen,
+  onClose,
+  onSelect,
+  phase,
+  excludeWorkflowId,
+}: WorkflowLibraryPickerProps) {
   const [workflows, setWorkflows] = useState<UnifiedWorkflow[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
-  const [searchQuery, setSearchQuery] = useState("");
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [categoryFilter, setCategoryFilter] = useState<string>("");
-  const [menuOpenId, setMenuOpenId] = useState<string | null>(null);
-  const [isExporting, setIsExporting] = useState(false);
-  const [importError, setImportError] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterCategory, setFilterCategory] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
 
-  // Fetch saved workflows
+  // Fetch workflows from API
   useEffect(() => {
     if (!isOpen) return;
 
@@ -63,210 +41,123 @@ export function WorkflowLibraryPicker({ isOpen, onClose, onSelect, onImport }: W
       setIsLoading(true);
       try {
         const response = await fetch(`${API_BASE}/unified-workflows`);
-        const data = await response.json();
-        if (data.success && data.data) {
-          setWorkflows(data.data);
+        const result = await response.json();
+        if (result.success && result.data) {
+          setWorkflows(result.data);
+        } else if (Array.isArray(result)) {
+          setWorkflows(result);
+        } else {
+          setWorkflows([]);
         }
-      } catch (error) {
-        console.error("Failed to fetch workflows:", error);
+      } catch (err) {
+        console.error("Failed to fetch workflows:", err);
       } finally {
         setIsLoading(false);
       }
     };
 
     fetchWorkflows();
-    setSearchQuery("");
-    setSelectedId(null);
-    setCategoryFilter("");
   }, [isOpen]);
 
-  // Get unique categories
-  const categories = useMemo(() => {
-    const cats = new Set<string>();
-    workflows.forEach((w) => {
-      if (w.category) cats.add(w.category);
-    });
-    return Array.from(cats).sort();
-  }, [workflows]);
+  // Reset selection when modal opens
+  useEffect(() => {
+    if (isOpen) {
+      setSelectedId(null);
+      setSearchQuery("");
+      setFilterCategory(null);
+    }
+  }, [isOpen]);
 
-  // Filter workflows
-  const filteredWorkflows = useMemo(() => {
-    return workflows.filter((w) => {
-      const matchesSearch =
-        !searchQuery ||
-        w.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        w.description?.toLowerCase().includes(searchQuery.toLowerCase());
+  // Filter workflows (excluding current workflow to prevent self-reference)
+  const filteredWorkflows = workflows.filter((workflow) => {
+    // Exclude current workflow
+    if (excludeWorkflowId && workflow.id === excludeWorkflowId) return false;
 
-      const matchesCategory = !categoryFilter || w.category === categoryFilter;
+    const matchesSearch =
+      !searchQuery ||
+      workflow.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      workflow.description?.toLowerCase().includes(searchQuery.toLowerCase());
 
-      return matchesSearch && matchesCategory;
-    });
-  }, [workflows, searchQuery, categoryFilter]);
+    const matchesCategory = !filterCategory || workflow.category === filterCategory;
 
-  // Handle selection
-  const handleSelect = () => {
+    return matchesSearch && matchesCategory;
+  });
+
+  // Get unique categories for filter
+  const categories = [...new Set(workflows.map((w) => w.category).filter(Boolean))];
+
+  // Get step count for a workflow
+  const getStepCount = (workflow: UnifiedWorkflow): number => {
+    return (
+      (workflow.setup_steps?.length || 0) +
+      (workflow.verification_steps?.length || 0) +
+      (workflow.agentic_steps?.length || 0) +
+      (workflow.completion_steps?.length || 0)
+    );
+  };
+
+  const handleSelect = useCallback(() => {
     const selected = workflows.find((w) => w.id === selectedId);
     if (selected) {
-      onSelect(selected);
+      onSelect(selected, phase);
       onClose();
     }
-  };
+  }, [workflows, selectedId, onSelect, phase, onClose]);
 
-  // Export a workflow
-  const handleExport = async (workflowId: string) => {
-    setIsExporting(true);
-    setMenuOpenId(null);
-    try {
-      const response = await fetch(`${API_BASE}/unified-workflows/${workflowId}/export`);
-      const data = await response.json();
-      if (data.success && data.data) {
-        const exportData = data.data as WorkflowExport;
-        const blob = new Blob([JSON.stringify(exportData, null, 2)], {
-          type: "application/json",
-        });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `workflow-${exportData.workflow.name.replace(/[^a-zA-Z0-9]/g, "-")}.json`;
-        a.click();
-        URL.revokeObjectURL(url);
-      }
-    } catch (error) {
-      console.error("Failed to export workflow:", error);
-    } finally {
-      setIsExporting(false);
-    }
-  };
-
-  // Import a workflow from file
-  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file) return;
-
-    setImportError(null);
-    setIsLoading(true);
-
-    try {
-      const text = await file.text();
-      const data = JSON.parse(text);
-
-      // Validate the import format
-      let workflowData: UnifiedWorkflow;
-      if (data.manifest && data.workflow) {
-        // Full export format
-        workflowData = data.workflow;
-      } else if (data.setup_steps !== undefined) {
-        // Direct workflow object
-        workflowData = data;
-      } else {
-        throw new Error("Invalid workflow file format");
-      }
-
-      // Call the import API
-      const response = await fetch(`${API_BASE}/unified-workflows/import`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          workflow: workflowData,
-          conflict_strategy: "generate",
-        }),
-      });
-
-      const result = await response.json();
-      if (result.success && result.data) {
-        // Refresh the list
-        const listResponse = await fetch(`${API_BASE}/unified-workflows`);
-        const listData = await listResponse.json();
-        if (listData.success && listData.data) {
-          setWorkflows(listData.data);
-        }
-        // If there's an onImport callback, call it
-        if (onImport) {
-          onImport(result.data.workflow);
-        }
-      } else {
-        setImportError(result.error || "Failed to import workflow");
-      }
-    } catch (error) {
-      console.error("Failed to import workflow:", error);
-      setImportError(error instanceof Error ? error.message : "Failed to import workflow");
-    } finally {
-      setIsLoading(false);
-      // Reset the file input
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
-    }
-  };
+  const handleDoubleClick = useCallback(
+    (workflow: UnifiedWorkflow) => {
+      onSelect(workflow, phase);
+      onClose();
+    },
+    [onSelect, phase, onClose],
+  );
 
   if (!isOpen) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
-
-      {/* Dialog */}
-      <div className="relative bg-card border border-border rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] flex flex-col overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+      <div
+        data-ui-id="dialog-workflow-library-picker"
+        className="bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl w-[700px] max-w-[90vw] max-h-[80vh] flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
-          <div className="flex items-center gap-2">
-            <GitBranch className={`w-5 h-5 ${getAccentColors("purple").text}`} />
-            <h3 className="text-lg font-semibold">Open Workflow</h3>
+        <div className="flex items-center justify-between px-4 py-3 border-b border-neutral-700">
+          <div>
+            <h2 className="text-lg font-semibold">Select Workflow to Reference</h2>
+            <p className="text-sm text-muted-foreground">
+              Choose a workflow to run as a {phase} step
+            </p>
           </div>
-          <div className="flex items-center gap-2">
-            {/* Import button */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept=".json"
-              onChange={handleImport}
-              className="hidden"
-              id="workflow-import-input"
-            />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={isLoading}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-muted hover:bg-muted/80 rounded-md transition-colors disabled:opacity-50"
-              title="Import workflow from file"
-            >
-              <Upload className="w-4 h-4" />
-              Import
-            </button>
-            <button
-              onClick={onClose}
-              className="p-1 text-muted-foreground hover:text-foreground transition-colors"
-            >
-              <X className="w-5 h-5" />
-            </button>
-          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 hover:bg-neutral-700 rounded-md transition-colors"
+            data-ui-id="workflow-builder-workflow-picker-close-btn"
+          >
+            <X className="w-5 h-5" />
+          </button>
         </div>
 
-        {/* Import error message */}
-        {importError && (
-          <div className="mx-6 mt-3 p-2 bg-red-500/10 border border-red-500/30 rounded-md text-red-500 text-sm">
-            {importError}
-          </div>
-        )}
-
         {/* Search and Filter */}
-        <div className="px-6 py-3 border-b border-border flex gap-3">
+        <div className="flex items-center gap-3 px-4 py-3 border-b border-neutral-800">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
             <input
               type="text"
+              placeholder="Search workflows..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search by name or description..."
-              className="w-full pl-10 pr-4 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              className="w-full pl-9 pr-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+                       focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               autoFocus
+              data-ui-id="workflow-builder-workflow-picker-search-input"
             />
           </div>
           {categories.length > 0 && (
             <select
-              value={categoryFilter}
-              onChange={(e) => setCategoryFilter(e.target.value)}
-              className="px-3 py-2 bg-background border border-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-primary"
+              value={filterCategory || ""}
+              onChange={(e) => setFilterCategory(e.target.value || null)}
+              className="px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
+                       focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+              data-ui-id="workflow-builder-workflow-picker-category-select"
             >
               <option value="">All Categories</option>
               {categories.map((cat) => (
@@ -278,111 +169,126 @@ export function WorkflowLibraryPicker({ isOpen, onClose, onSelect, onImport }: W
           )}
         </div>
 
-        {/* Content */}
+        {/* Workflow List */}
         <div className="flex-1 overflow-y-auto p-4">
           {isLoading ? (
-            <div className="flex items-center justify-center h-40">
-              <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
-            </div>
+            <div className="text-center py-8 text-muted-foreground">Loading workflows...</div>
           ) : filteredWorkflows.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-40 text-muted-foreground">
-              <GitBranch className="w-8 h-8 mb-2 opacity-50" />
-              <p className="text-sm">
-                {searchQuery ? "No matching workflows found" : "No saved workflows yet"}
-              </p>
-              <p className="text-xs mt-1">
-                {searchQuery ? "Try a different search term" : "Save a workflow to see it here"}
-              </p>
+            <div className="text-center py-8 text-muted-foreground">
+              {workflows.length === 0
+                ? "No workflows saved yet. Create workflows in the Workflow Builder first."
+                : "No workflows match your search."}
             </div>
           ) : (
             <div className="grid grid-cols-1 gap-2">
-              {filteredWorkflows.map((workflow) => (
-                <div
-                  key={workflow.id}
-                  className={`relative w-full text-left p-3 rounded-lg border transition-colors ${
-                    selectedId === workflow.id
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:border-muted-foreground hover:bg-muted/50"
-                  }`}
-                >
+              {filteredWorkflows.map((workflow) => {
+                const isSelected = selectedId === workflow.id;
+                const stepCount = getStepCount(workflow);
+
+                return (
                   <button
+                    key={workflow.id}
                     onClick={() => setSelectedId(workflow.id)}
-                    onDoubleClick={() => {
-                      setSelectedId(workflow.id);
-                      handleSelect();
-                    }}
-                    className="w-full text-left"
+                    onDoubleClick={() => handleDoubleClick(workflow)}
+                    className={`
+                      relative flex items-start gap-3 p-3 rounded-lg text-left transition-all
+                      ${
+                        isSelected
+                          ? "bg-cyan-500/15 border-2 border-cyan-500"
+                          : "bg-neutral-800/50 border-2 border-transparent hover:bg-neutral-800 hover:border-neutral-600"
+                      }
+                    `}
+                    data-ui-id={`workflow-builder-workflow-picker-item-${workflow.id}`}
                   >
-                    <div className="flex items-start gap-3">
-                      <GitBranch className="w-5 h-5 text-purple-400 flex-shrink-0 mt-0.5" />
-                      <div className="flex-1 min-w-0 pr-8">
-                        <div className="flex items-center gap-2">
-                          <span className="font-medium text-sm">{workflow.name || "Untitled"}</span>
-                          {selectedId === workflow.id && (
-                            <Check className="w-4 h-4 text-primary flex-shrink-0" />
-                          )}
-                        </div>
-                        {workflow.description && (
-                          <div className="text-xs text-muted-foreground mt-0.5 line-clamp-1">
-                            {workflow.description}
-                          </div>
-                        )}
-                        <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground">
-                          <span className="flex items-center gap-1">
-                            <Play className="w-3 h-3" />
-                            {getStepCount(workflow)} steps
-                          </span>
-                          <span className="flex items-center gap-1">
-                            <Clock className="w-3 h-3" />
-                            {formatDate(workflow.modified_at)}
-                          </span>
-                          {workflow.category && workflow.category !== "general" && (
-                            <span className="px-1.5 py-0.5 bg-muted rounded text-xs">
+                    {isSelected && (
+                      <div className="absolute top-2 right-2">
+                        <CheckIcon className="w-4 h-4 text-cyan-400" />
+                      </div>
+                    )}
+                    <div className="p-2 rounded-md bg-neutral-900 text-blue-400">
+                      <Workflow className="w-4 h-4" />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium">{workflow.name}</span>
+                      </div>
+                      {workflow.description && (
+                        <p className="text-sm text-muted-foreground mt-0.5 line-clamp-1">
+                          {workflow.description}
+                        </p>
+                      )}
+                      <div className="flex items-center gap-3 mt-1.5 text-xs text-muted-foreground">
+                        <span className="flex items-center gap-1">
+                          <Layers className="w-3 h-3" />
+                          {stepCount} step{stepCount !== 1 ? "s" : ""}
+                        </span>
+                        {workflow.category && (
+                          <>
+                            <span className="text-neutral-600">|</span>
+                            <span className="flex items-center gap-1">
+                              <FolderOpen className="w-3 h-3" />
                               {workflow.category}
+                            </span>
+                          </>
+                        )}
+                        {workflow.max_iterations && workflow.max_iterations > 1 && (
+                          <>
+                            <span className="text-neutral-600">|</span>
+                            <span>Max {workflow.max_iterations} iterations</span>
+                          </>
+                        )}
+                      </div>
+                      {/* Show tags */}
+                      {workflow.tags && workflow.tags.length > 0 && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {workflow.tags.slice(0, 5).map((tag) => (
+                            <span
+                              key={tag}
+                              className="text-xs px-1.5 py-0.5 bg-neutral-700 rounded"
+                            >
+                              {tag}
+                            </span>
+                          ))}
+                          {workflow.tags.length > 5 && (
+                            <span className="text-xs px-1.5 py-0.5 text-muted-foreground">
+                              +{workflow.tags.length - 5} more
                             </span>
                           )}
                         </div>
-                      </div>
+                      )}
                     </div>
                   </button>
-                  {/* Export button */}
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      handleExport(workflow.id);
-                    }}
-                    disabled={isExporting}
-                    className="absolute right-3 top-3 p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted rounded transition-colors"
-                    title="Export workflow"
-                  >
-                    <Download className="w-4 h-4" />
-                  </button>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
 
         {/* Footer */}
-        <div className="flex gap-3 px-6 py-4 border-t border-border">
-          <button
-            onClick={onClose}
-            className="flex-1 px-4 py-2 bg-muted text-foreground rounded-md font-medium hover:bg-muted/80 transition-colors"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={handleSelect}
-            disabled={!selectedId}
-            className={`flex-1 flex items-center justify-center gap-2 px-4 py-2 ${getAccentColors("purple").bgSolid} text-white rounded-md font-medium hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors`}
-          >
-            <Check className="w-4 h-4" />
-            Open
-          </button>
+        <div className="flex items-center justify-between px-4 py-3 border-t border-neutral-700 bg-neutral-800/50">
+          <span className="text-sm text-muted-foreground">
+            {filteredWorkflows.length} workflow{filteredWorkflows.length !== 1 ? "s" : ""} available
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 text-sm rounded-md hover:bg-neutral-700 transition-colors"
+              data-ui-id="workflow-builder-workflow-picker-cancel-btn"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleSelect}
+              disabled={!selectedId}
+              className="px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded-md
+                       transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              data-ui-id="workflow-builder-workflow-picker-add-btn"
+            >
+              Add to Workflow
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
 }
-
-export default WorkflowLibraryPicker;

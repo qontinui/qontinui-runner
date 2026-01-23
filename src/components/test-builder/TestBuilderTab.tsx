@@ -10,7 +10,7 @@
  */
 
 import { useState, useEffect, useCallback } from "react";
-import { Sparkles, Code, ScanSearch } from "lucide-react";
+import { Sparkles, Code, ScanSearch, Zap } from "lucide-react";
 import { TestBuilderProvider, useTestBuilder } from "./TestBuilderContext";
 import { TestLibraryPanel } from "./TestLibraryPanel";
 import { TestEditorPanel, getCodeFromTest } from "./TestEditorPanel";
@@ -19,6 +19,7 @@ import { TestExecutionPanel } from "./TestExecutionPanel";
 import { PageAnalyzer } from "./PageAnalyzer";
 import { ElementPicker } from "./ElementPicker";
 import { AiTestGenerator } from "./AiTestGenerator";
+import { TestOrchestratorPanel } from "./TestOrchestratorPanel";
 import type {
   PageAnalysis,
   TestType,
@@ -32,14 +33,14 @@ interface TestBuilderTabProps {
 }
 
 function TestBuilderContent({ onLog }: TestBuilderTabProps) {
-  const { selectedTest, state, setDirty, isDraftSelected, updateDraft, setCollectedAnalyses } =
+  const { selectedTest, state, setDirty, isDraftSelected, updateDraft, setCollectedAnalyses, startNewTest } =
     useTestBuilder();
 
   // Track the code in local state for the editor
   const [code, setCode] = useState("");
 
-  // Tab state: "ai", "code", or "analysis" - AI selected by default
-  const [activeTab, setActiveTab] = useState<"ai" | "code" | "analysis">("ai");
+  // Tab state: "ai", "code", "analysis", or "orchestrator" - AI selected by default
+  const [activeTab, setActiveTab] = useState<"ai" | "code" | "analysis" | "orchestrator">("ai");
   const [analysisData, setAnalysisData] = useState<AnalysisData | null>(null);
   const [showGenerator, setShowGenerator] = useState(false);
 
@@ -72,6 +73,9 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
 
   // Selected test type for AI generation - defaults to python_script
   const [selectedTestType, setSelectedTestType] = useState<TestType>("python_script");
+
+  // Get current test type for AI generator - use selected test's type or the dropdown selection
+  const currentTestType: TestType = selectedTest?.test_type || selectedTestType;
 
   // Sync code with selected test (or draft)
   useEffect(() => {
@@ -138,9 +142,21 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
   // Handle AI-generated test code
   const handleTestGenerated = useCallback(
     (generatedCode: string) => {
+      setShowGenerator(false);
+
+      // If no draft or test is selected, auto-create a draft with the generated code
+      // This fixes the bug where users could generate AI code but have no way to save it
+      if (!isDraftSelected && !selectedTest) {
+        startNewTest(currentTestType, generatedCode);
+        setCode(generatedCode);
+        if (onLog) {
+          onLog("info", "AI-generated test code applied - created new draft");
+        }
+        return;
+      }
+
       setCode(generatedCode);
       setDirty(true);
-      setShowGenerator(false);
       // If editing a draft, update the draft's code for persistence
       if (isDraftSelected) {
         updateDraft({}, generatedCode);
@@ -149,18 +165,15 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
         onLog("info", "AI-generated test code applied to editor");
       }
     },
-    [setDirty, onLog, isDraftSelected, updateDraft],
+    [setDirty, onLog, isDraftSelected, updateDraft, selectedTest, startNewTest, currentTestType],
   );
-
-  // Get current test type for AI generator - use selected test's type or the dropdown selection
-  const currentTestType: TestType = selectedTest?.test_type || selectedTestType;
 
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Main content area */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
         {/* Left: Test Library */}
-        <TestLibraryPanel />
+        <TestLibraryPanel onOpenAiTab={() => setActiveTab("ai")} />
 
         {/* Center: Tabbed panel for AI Generator and Code Editor */}
         <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
@@ -173,6 +186,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                   ? "text-purple-400 border-purple-400 bg-neutral-900/50"
                   : "text-neutral-400 border-transparent hover:text-neutral-200 hover:bg-neutral-700/30"
               }`}
+              data-ui-id="test-builder-ai-tab-btn"
             >
               <Sparkles className="w-4 h-4" />
               AI Generator
@@ -184,6 +198,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                   ? "text-blue-400 border-blue-400 bg-neutral-900/50"
                   : "text-neutral-400 border-transparent hover:text-neutral-200 hover:bg-neutral-700/30"
               }`}
+              data-ui-id="test-builder-code-tab-btn"
             >
               <Code className="w-4 h-4" />
               Code Editor
@@ -195,6 +210,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                   ? "text-green-400 border-green-400 bg-neutral-900/50"
                   : "text-neutral-400 border-transparent hover:text-neutral-200 hover:bg-neutral-700/30"
               }`}
+              data-ui-id="test-builder-analysis-tab-btn"
             >
               <ScanSearch className="w-4 h-4" />
               Page Analysis
@@ -208,6 +224,18 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                 </span>
               )}
             </button>
+            <button
+              onClick={() => setActiveTab("orchestrator")}
+              className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 ${
+                activeTab === "orchestrator"
+                  ? "text-yellow-400 border-yellow-400 bg-neutral-900/50"
+                  : "text-neutral-400 border-transparent hover:text-neutral-200 hover:bg-neutral-700/30"
+              }`}
+              data-ui-id="test-builder-orchestrator-tab-btn"
+            >
+              <Zap className="w-4 h-4" />
+              Orchestrator
+            </button>
             {/* Test type selector - only show when no test is selected */}
             {!selectedTest && activeTab === "ai" && (
               <div className="ml-auto mr-4 flex items-center gap-2">
@@ -216,6 +244,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                   value={selectedTestType}
                   onChange={(e) => setSelectedTestType(e.target.value as TestType)}
                   className="text-xs bg-neutral-700 text-neutral-200 border border-neutral-600 rounded px-2 py-1 focus:outline-none focus:border-purple-500"
+                  data-ui-id="test-builder-test-type-select"
                 >
                   <option value="python_script">Python Script</option>
                   <option value="playwright_cdp">Playwright CDP</option>
@@ -309,6 +338,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                           <PageAnalyzer
                             onAnalysisComplete={handleAnalysisComplete}
                             onError={(error) => onLog?.("error", error)}
+                            initialAnalyses={collectedAnalyses?.analyses}
                           />
                         </div>
                       ) : (
@@ -386,6 +416,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                     <PageAnalyzer
                       onAnalysisComplete={handleAnalysisComplete}
                       onError={(error) => onLog?.("error", error)}
+                      initialAnalyses={collectedAnalyses?.analyses}
                     />
                   </div>
                 ) : analysisData.type === "single" ? (
@@ -449,6 +480,7 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                       <PageAnalyzer
                         onAnalysisComplete={handleAnalysisComplete}
                         onError={(error) => onLog?.("error", error)}
+                        initialAnalyses={collectedAnalyses?.analyses}
                       />
                     </div>
                   </div>
@@ -458,9 +490,29 @@ function TestBuilderContent({ onLog }: TestBuilderTabProps) {
                     <PageAnalyzer
                       onAnalysisComplete={handleAnalysisComplete}
                       onError={(error) => onLog?.("error", error)}
+                      initialAnalyses={collectedAnalyses?.analyses}
                     />
                   </div>
                 )}
+              </div>
+            )}
+
+            {activeTab === "orchestrator" && (
+              /* Test Orchestrator Panel - AI-driven multi-step API test creation */
+              <div className="h-full">
+                <TestOrchestratorPanel
+                  onTestGenerated={(generatedCode, generatedTestType) => {
+                    setCode(generatedCode);
+                    setDirty(true);
+                    setSelectedTestType(generatedTestType);
+                    setActiveTab("code");
+                    if (isDraftSelected) {
+                      updateDraft({}, generatedCode);
+                    }
+                    onLog?.("info", "Orchestrator-generated test code applied to editor");
+                  }}
+                  onLog={onLog}
+                />
               </div>
             )}
           </div>

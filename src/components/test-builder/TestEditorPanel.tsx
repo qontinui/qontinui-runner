@@ -208,6 +208,7 @@ export function TestEditorPanel({ onCodeChange, code }: TestEditorPanelProps) {
         <button
           className="p-1.5 hover:bg-muted rounded-md transition-colors flex items-center gap-1 text-sm"
           onClick={handleCopy}
+          data-ui-id="test-builder-copy-code-btn"
         >
           {copied ? (
             <Check className={`w-4 h-4 ${getStatusColors("success").icon}`} />

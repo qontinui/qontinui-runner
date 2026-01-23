@@ -32,11 +32,20 @@ import {
   Power,
   AlignLeft,
   FileType,
+  FolderOpen,
+  Layers,
+  Check as CheckIcon,
+  X,
 } from "lucide-react";
+import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
 import { CheckBuilderProvider, useCheckBuilder } from "./CheckBuilderContext";
+import { AiConfigureChecksModal } from "./AiConfigureChecksModal";
+import { CheckGroupsPanel } from "./CheckGroupsPanel";
 import { PageTutorialMenu } from "../tutorial";
 import type { Check, CheckType, CheckTool, CheckExecutionResult, CreateCheckInput } from "./types";
 import { CHECK_TOOLS, CHECK_TYPE_INFO, getToolInfo, getStatusInfo } from "./types";
+
+type TabView = "checks" | "groups";
 
 interface CheckBuilderTabProps {
   onLog?: (level: string, message: string) => void;
@@ -66,11 +75,14 @@ function ToolIcon({ tool }: { tool: CheckTool }) {
 interface CheckListItemProps {
   check: Check;
   isSelected: boolean;
+  isSelectionMode: boolean;
+  isChecked: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  onToggleSelection: () => void;
 }
 
-function CheckListItem({ check, isSelected, onSelect, onDelete }: CheckListItemProps) {
+function CheckListItem({ check, isSelected, isSelectionMode, isChecked, onSelect, onDelete, onToggleSelection }: CheckListItemProps) {
   const [showMenu, setShowMenu] = useState(false);
   const toolInfo = getToolInfo(check.tool);
   const TypeIcon = checkTypeIcons[check.check_type] || Terminal;
@@ -85,9 +97,21 @@ function CheckListItem({ check, isSelected, onSelect, onDelete }: CheckListItemP
             ? "bg-cyan-500/15 text-cyan-400 border-l-2 border-cyan-400 ml-[-1px]"
             : "hover:bg-muted/30"
         }
+        ${isSelectionMode && isChecked ? "bg-red-500/10" : ""}
       `}
-      onClick={onSelect}
+      onClick={isSelectionMode ? onToggleSelection : onSelect}
     >
+      {isSelectionMode && (
+        <div
+          className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+            isChecked
+              ? "bg-red-500 border-red-500"
+              : "border-neutral-500 hover:border-red-400"
+          }`}
+        >
+          {isChecked && <CheckIcon className="w-3 h-3 text-white" />}
+        </div>
+      )}
       <TypeIcon className="w-4 h-4 flex-shrink-0 text-muted-foreground" />
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium truncate">{check.name}</div>
@@ -96,47 +120,101 @@ function CheckListItem({ check, isSelected, onSelect, onDelete }: CheckListItemP
           {check.auto_fix && <span className="ml-1 text-emerald-500">auto-fix</span>}
         </div>
       </div>
-      <div className="relative">
-        <button
-          className="p-1 opacity-0 group-hover:opacity-100 hover:bg-muted rounded transition-opacity"
-          onClick={(e) => {
-            e.stopPropagation();
-            setShowMenu(!showMenu);
-          }}
-        >
-          <MoreVertical className="w-4 h-4" />
-        </button>
-        {showMenu && (
-          <>
-            <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
-            <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[120px]">
-              <button
-                className="w-full px-3 py-1.5 text-sm text-left hover:bg-muted flex items-center gap-2 text-destructive"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onDelete();
-                  setShowMenu(false);
-                }}
-              >
-                <Trash2 className="w-4 h-4" />
-                Delete
-              </button>
-            </div>
-          </>
-        )}
-      </div>
+      {!isSelectionMode && (
+        <div className="relative">
+          <button
+            className="p-1 opacity-0 group-hover:opacity-100 hover:bg-muted rounded transition-opacity"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowMenu(!showMenu);
+            }}
+          >
+            <MoreVertical className="w-4 h-4" />
+          </button>
+          {showMenu && (
+            <>
+              <div className="fixed inset-0 z-10" onClick={() => setShowMenu(false)} />
+              <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[120px]">
+                <button
+                  className="w-full px-3 py-1.5 text-sm text-left hover:bg-muted flex items-center gap-2 text-destructive"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onDelete();
+                    setShowMenu(false);
+                  }}
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
     </div>
   );
 }
 
 // Library Panel
-function CheckLibraryPanel() {
+interface CheckLibraryPanelProps {
+  onOpenAiModal?: () => void;
+}
+
+function CheckLibraryPanel({ onOpenAiModal }: CheckLibraryPanelProps) {
   const { checks, selectedCheckId, isLoading, selectCheck, deleteCheck, createCheck } =
     useCheckBuilder();
 
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<CheckType | "all">("all");
   const [showNewMenu, setShowNewMenu] = useState(false);
+
+  // Bulk deletion state
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // Toggle selection for bulk delete
+  const toggleSelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit selection mode
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Delete selected checks
+  const deleteSelectedChecks = useCallback(async () => {
+    setIsDeleting(true);
+    try {
+      for (const id of selectedIds) {
+        await deleteCheck(id);
+      }
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+    } catch (error) {
+      console.error("Failed to delete checks:", error);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [selectedIds, deleteCheck, exitSelectionMode]);
+
+  // Get names of selected checks for dialog
+  const getSelectedNames = useCallback(() => {
+    return checks
+      .filter((c) => selectedIds.has(c.id))
+      .map((c) => c.name);
+  }, [checks, selectedIds]);
 
   const filteredChecks = checks.filter((check) => {
     const matchesSearch = check.name.toLowerCase().includes(searchQuery.toLowerCase());
@@ -188,53 +266,88 @@ function CheckLibraryPanel() {
     >
       {/* Header */}
       <div className="p-4 border-b border-border/50">
-        <div className="flex items-center justify-between mb-3">
+        <div className="flex items-center justify-between mb-2">
           <h2 className="text-sm font-semibold flex items-center gap-2">
             <Shield className="w-4 h-4" />
             Checks
           </h2>
-          <div className="flex items-center gap-1">
-            <PageTutorialMenu page="check-builder" variant="compact" />
-            <div className="relative">
-              <button
-                className="p-1.5 hover:bg-muted rounded-md transition-colors"
-                onClick={() => setShowNewMenu(!showNewMenu)}
-                data-tutorial-id="new-check-button"
-                title="Create new check"
-              >
-                <Plus className="w-4 h-4" />
-              </button>
-              {showNewMenu && (
-                <>
-                  <div className="fixed inset-0 z-10" onClick={() => setShowNewMenu(false)} />
-                  <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[200px] max-h-80 overflow-y-auto">
-                    {CHECK_TYPE_INFO.map((typeInfo) => (
-                      <div key={typeInfo.type}>
-                        <div className="px-3 py-1.5 text-xs font-semibold text-muted-foreground/70 uppercase bg-muted/20">
-                          {typeInfo.name}
-                        </div>
-                        {CHECK_TOOLS.filter((t) => t.check_type === typeInfo.type).map((tool) => {
-                          const Icon = checkTypeIcons[tool.check_type] || Terminal;
-                          return (
-                            <button
-                              key={tool.tool}
-                              className="w-full px-3 py-2 text-sm text-left hover:bg-muted flex items-center gap-2"
-                              onClick={() => handleCreateCheck(tool.tool)}
-                            >
-                              <Icon className="w-4 h-4" />
-                              <div>
-                                <div>{tool.name}</div>
-                                <div className="text-xs text-muted-foreground">{tool.language}</div>
-                              </div>
-                            </button>
-                          );
-                        })}
+          <PageTutorialMenu page="check-builder" variant="compact" />
+        </div>
+
+        {/* Action buttons */}
+        <div className="flex items-center gap-1 mb-3">
+          {onOpenAiModal ? (
+            <button
+              onClick={onOpenAiModal}
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-blue-400 hover:text-blue-300 text-xs"
+              title="Detect project and suggest checks"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>AI</span>
+            </button>
+          ) : (
+            <button
+              disabled
+              className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg text-xs text-muted-foreground cursor-not-allowed"
+              title="AI detection coming soon"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>AI</span>
+            </button>
+          )}
+          <button
+            onClick={() => setIsSelectionMode(!isSelectionMode)}
+            className={`flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg transition-colors text-xs ${
+              isSelectionMode
+                ? "bg-red-500/20 text-red-400"
+                : "hover:bg-muted text-muted-foreground hover:text-foreground"
+            }`}
+            title={isSelectionMode ? "Exit selection mode" : "Select checks to delete"}
+            data-ui-id="check-builder-delete-mode-btn"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            <span>Delete</span>
+          </button>
+          <div className="relative flex-1">
+            <button
+              className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg hover:bg-muted transition-colors text-xs"
+              onClick={() => setShowNewMenu(!showNewMenu)}
+              data-tutorial-id="new-check-button"
+              title="Create new check"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>New</span>
+            </button>
+            {showNewMenu && (
+              <>
+                <div className="fixed inset-0 z-10" onClick={() => setShowNewMenu(false)} />
+                <div className="absolute right-0 top-full mt-1 z-20 bg-popover border border-border rounded-md shadow-lg py-1 min-w-[200px] max-h-80 overflow-y-auto">
+                  {CHECK_TYPE_INFO.map((typeInfo) => (
+                    <div key={typeInfo.type}>
+                      <div className="px-3 py-1.5 text-xs font-semibold text-muted-foreground/70 uppercase bg-muted/20">
+                        {typeInfo.name}
                       </div>
-                    ))}
-                  </div>
-                </>
-              )}
-            </div>
+                      {CHECK_TOOLS.filter((t) => t.check_type === typeInfo.type).map((tool) => {
+                        const Icon = checkTypeIcons[tool.check_type] || Terminal;
+                        return (
+                          <button
+                            key={tool.tool}
+                            className="w-full px-3 py-2 text-sm text-left hover:bg-muted flex items-center gap-2"
+                            onClick={() => handleCreateCheck(tool.tool)}
+                          >
+                            <Icon className="w-4 h-4" />
+                            <div>
+                              <div>{tool.name}</div>
+                              <div className="text-xs text-muted-foreground">{tool.language}</div>
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -248,6 +361,7 @@ function CheckLibraryPanel() {
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full pl-8 pr-3 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+            data-ui-id="check-builder-search-input"
           />
         </div>
 
@@ -258,6 +372,7 @@ function CheckLibraryPanel() {
             onChange={(e) => setFilterType(e.target.value as CheckType | "all")}
             className="w-full px-2 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+            data-ui-id="check-builder-filter-type-select"
           >
             <option value="all">All Types</option>
             {CHECK_TYPE_INFO.map((type) => (
@@ -268,6 +383,48 @@ function CheckLibraryPanel() {
           </select>
         </div>
       </div>
+
+      {/* Selection Mode Header */}
+      {isSelectionMode && (
+        <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+          <span className="text-sm text-red-400">
+            {selectedIds.size} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedIds(new Set(filteredChecks.map(c => c.id)))}
+              className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
+              data-ui-id="check-builder-select-all-btn"
+            >
+              Select All
+            </button>
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              disabled={selectedIds.size === 0}
+              className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded disabled:opacity-50"
+              data-ui-id="check-builder-clear-selection-btn"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => setShowBatchDeleteDialog(true)}
+              disabled={selectedIds.size === 0}
+              className="px-2 py-1 text-xs bg-red-600 hover:bg-red-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              data-ui-id="check-builder-delete-selected-btn"
+            >
+              Delete Selected
+            </button>
+            <button
+              onClick={exitSelectionMode}
+              className="p-1 text-neutral-400 hover:text-neutral-200"
+              title="Cancel selection"
+              data-ui-id="check-builder-cancel-selection-btn"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Check List */}
       <div className="flex-1 overflow-y-auto p-2 space-y-4">
@@ -296,8 +453,11 @@ function CheckLibraryPanel() {
                       key={check.id}
                       check={check}
                       isSelected={selectedCheckId === check.id}
+                      isSelectionMode={isSelectionMode}
+                      isChecked={selectedIds.has(check.id)}
                       onSelect={() => selectCheck(check.id)}
                       onDelete={() => handleDelete(check.id)}
+                      onToggleSelection={() => toggleSelection(check.id)}
                     />
                   ))}
                 </div>
@@ -311,8 +471,11 @@ function CheckLibraryPanel() {
                 key={check.id}
                 check={check}
                 isSelected={selectedCheckId === check.id}
+                isSelectionMode={isSelectionMode}
+                isChecked={selectedIds.has(check.id)}
                 onSelect={() => selectCheck(check.id)}
                 onDelete={() => handleDelete(check.id)}
+                onToggleSelection={() => toggleSelection(check.id)}
               />
             ))}
           </div>
@@ -325,12 +488,29 @@ function CheckLibraryPanel() {
           {checks.length} check{checks.length !== 1 ? "s" : ""} total
         </span>
       </div>
+
+      {/* Batch Delete Dialog */}
+      <BatchDeleteDialog
+        open={showBatchDeleteDialog}
+        title="Delete Checks"
+        itemType="check"
+        itemNames={getSelectedNames()}
+        isDeleting={isDeleting}
+        onClose={() => setShowBatchDeleteDialog(false)}
+        onConfirm={deleteSelectedChecks}
+      />
     </div>
   );
 }
 
 // Editor Panel (center) - Check configuration
-function CheckEditorPanel() {
+interface CheckEditorPanelProps {
+  showAiConfigureModal: boolean;
+  onOpenAiModal: () => void;
+  onCloseAiModal: () => void;
+}
+
+function CheckEditorPanel({ showAiConfigureModal, onOpenAiModal, onCloseAiModal }: CheckEditorPanelProps) {
   const { selectedCheck, updateCheck, setDirty, executeCheck, lastExecutionResult, isSaving } =
     useCheckBuilder();
 
@@ -394,6 +574,25 @@ function CheckEditorPanel() {
         <p className="text-xs text-muted-foreground/70 mt-2">
           or create a new one from the library
         </p>
+
+        {/* AI Detection Button - also available when no check selected */}
+        <div className="mt-6">
+          <button
+            className="px-4 py-3 bg-purple-900/30 hover:bg-purple-900/50 border border-purple-700/30 rounded-lg flex items-center justify-center gap-2 transition-colors"
+            onClick={() => onOpenAiModal()}
+            data-tutorial-id="detect-project-button-empty"
+            title="Scan project and suggest appropriate checks"
+          >
+            <Sparkles className="w-4 h-4 text-purple-400" />
+            <span className="text-sm text-purple-300">Detect Project & Suggest Checks</span>
+          </button>
+        </div>
+
+        {/* AI Configure Checks Modal */}
+        <AiConfigureChecksModal
+          isOpen={showAiConfigureModal}
+          onClose={() => onCloseAiModal()}
+        />
       </div>
     );
   }
@@ -457,6 +656,7 @@ function CheckEditorPanel() {
               className="flex-1 px-3 py-2 text-sm font-mono bg-neutral-800 border border-neutral-700 rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               data-tutorial-id="check-command-input"
+              data-ui-id="check-builder-command-input"
               title="The command to execute for this check"
             />
           </div>
@@ -489,6 +689,7 @@ function CheckEditorPanel() {
             placeholder="Current directory (default)"
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+            data-ui-id="check-builder-working-directory-input"
           />
         </div>
 
@@ -508,6 +709,7 @@ function CheckEditorPanel() {
             placeholder={toolInfo?.config_files?.join(", ") || "Optional config file path"}
             className="w-full px-3 py-2 text-sm bg-neutral-800 border border-neutral-700 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+            data-ui-id="check-builder-config-path-input"
           />
           {toolInfo?.config_files && toolInfo.config_files.length > 0 && (
             <p className="text-xs text-muted-foreground">
@@ -536,6 +738,7 @@ function CheckEditorPanel() {
                 }}
                 className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-emerald-500/50"
                 title="Automatically fix issues when possible"
+                data-ui-id="check-builder-auto-fix-checkbox"
               />
             </label>
             <p className="text-xs text-emerald-400/80 mt-1.5">
@@ -550,10 +753,7 @@ function CheckEditorPanel() {
         <div className="pt-4 border-t border-neutral-700">
           <button
             className="w-full px-4 py-3 bg-purple-900/30 hover:bg-purple-900/50 border border-purple-700/30 rounded-lg flex items-center justify-center gap-2 transition-colors"
-            onClick={() => {
-              // TODO: Implement AI project detection
-              console.log("AI project detection not yet implemented");
-            }}
+            onClick={() => onOpenAiModal()}
             data-tutorial-id="detect-project-button"
             title="Scan project and suggest appropriate checks"
           >
@@ -562,6 +762,12 @@ function CheckEditorPanel() {
           </button>
         </div>
       </div>
+
+      {/* AI Configure Checks Modal */}
+      <AiConfigureChecksModal
+        isOpen={showAiConfigureModal}
+        onClose={() => onCloseAiModal()}
+      />
 
       {/* Execution Results */}
       {lastExecutionResult && (
@@ -740,6 +946,7 @@ function CheckPropertiesPanel() {
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
             title="A descriptive name for this check"
             placeholder="e.g., Lint Python Code"
+            data-ui-id="check-builder-name-input"
           />
         </div>
 
@@ -760,6 +967,7 @@ function CheckPropertiesPanel() {
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50 resize-none"
             placeholder="What does this check verify?"
             title="Describe what this check validates and why it's important"
+            data-ui-id="check-builder-description-input"
           />
         </div>
 
@@ -781,52 +989,12 @@ function CheckPropertiesPanel() {
             className="w-full px-3 py-2 text-sm bg-muted/30 border border-border/50 rounded-md
                      focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
             title="Maximum time in seconds before the check is considered timed out. Type checks may need longer timeouts."
+            data-ui-id="check-builder-timeout-input"
           />
         </div>
 
-        {/* Toggles */}
+        {/* Enabled Toggle - always visible */}
         <div className="space-y-3">
-          <label
-            className="flex items-center justify-between cursor-pointer"
-            title="Mark as critical to fail the entire workflow if this check fails"
-          >
-            <span className="text-sm flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-500" />
-              Critical Check
-            </span>
-            <input
-              type="checkbox"
-              checked={isCritical}
-              onChange={(e) => {
-                setIsCritical(e.target.checked);
-                setDirty(true);
-              }}
-              className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-cyan-500/50"
-            />
-          </label>
-          <p className="text-xs text-muted-foreground ml-6">
-            Critical check failure will fail the entire workflow
-          </p>
-
-          <label
-            className="flex items-center justify-between cursor-pointer"
-            title="Treat warnings as failures (stricter checking)"
-          >
-            <span className="text-sm flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-500" />
-              Fail on Warning
-            </span>
-            <input
-              type="checkbox"
-              checked={failOnWarning}
-              onChange={(e) => {
-                setFailOnWarning(e.target.checked);
-                setDirty(true);
-              }}
-              className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-cyan-500/50"
-            />
-          </label>
-
           <label
             className="flex items-center justify-between cursor-pointer"
             title="Enable or disable this check without deleting it"
@@ -843,9 +1011,67 @@ function CheckPropertiesPanel() {
                 setDirty(true);
               }}
               className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-cyan-500/50"
+              data-ui-id="check-builder-enabled-checkbox"
             />
           </label>
         </div>
+
+        {/* Advanced Options - Collapsible */}
+        <details className="space-y-3">
+          <summary className="cursor-pointer text-sm font-medium text-muted-foreground hover:text-foreground flex items-center gap-2">
+            <Settings className="w-3 h-3" />
+            Advanced Options
+          </summary>
+          <div className="mt-3 pl-5 space-y-3 border-l-2 border-border/30">
+            <label
+              className="flex items-center justify-between cursor-pointer"
+              title="Mark as critical to STOP the entire workflow if this check fails. Use sparingly - most checks should not be critical."
+            >
+              <span className="text-sm flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-500" />
+                Critical Check
+              </span>
+              <input
+                type="checkbox"
+                checked={isCritical}
+                onChange={(e) => {
+                  setIsCritical(e.target.checked);
+                  setDirty(true);
+                }}
+                className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-cyan-500/50"
+                data-ui-id="check-builder-critical-checkbox"
+              />
+            </label>
+            <p className="text-xs text-amber-500/80">
+              ⚠️ Critical check failure will STOP the entire workflow immediately.
+              Other checks will be skipped and the AI will not attempt to fix issues.
+              Only enable for checks that must pass before any work can proceed.
+            </p>
+
+            <label
+              className="flex items-center justify-between cursor-pointer"
+              title="Treat warnings as failures (stricter checking)"
+            >
+              <span className="text-sm flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-500" />
+                Fail on Warning
+              </span>
+              <input
+                type="checkbox"
+                checked={failOnWarning}
+                onChange={(e) => {
+                  setFailOnWarning(e.target.checked);
+                  setDirty(true);
+                }}
+                className="w-4 h-4 rounded border-border focus:ring-2 focus:ring-cyan-500/50"
+                data-ui-id="check-builder-fail-on-warning-checkbox"
+              />
+            </label>
+            <p className="text-xs text-muted-foreground">
+              Treat warnings from this check as failures (stricter checking)
+            </p>
+          </div>
+        </details>
 
         {/* Tags */}
         <div className="space-y-1.5">
@@ -867,10 +1093,12 @@ function CheckPropertiesPanel() {
               className="flex-1 px-3 py-1.5 text-sm bg-muted/30 border border-border/50 rounded-md
                        focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
               placeholder="Add tag..."
+              data-ui-id="check-builder-tag-input"
             />
             <button
               onClick={handleAddTag}
               className="px-3 py-1.5 text-sm bg-muted hover:bg-muted/80 rounded-md"
+              data-ui-id="check-builder-add-tag-btn"
             >
               Add
             </button>
@@ -914,19 +1142,72 @@ function CheckPropertiesPanel() {
   );
 }
 
+// Tab Switcher Component
+function TabSwitcher({ activeTab, onTabChange }: { activeTab: TabView; onTabChange: (tab: TabView) => void }) {
+  return (
+    <div className="flex items-center border-b border-border/50 bg-card px-4">
+      <button
+        onClick={() => onTabChange("checks")}
+        className={`
+          flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors
+          ${activeTab === "checks"
+            ? "border-cyan-500 text-cyan-400"
+            : "border-transparent text-muted-foreground hover:text-foreground"
+          }
+        `}
+        data-ui-id="check-builder-checks-tab-btn"
+      >
+        <Shield className="w-4 h-4" />
+        Checks
+      </button>
+      <button
+        onClick={() => onTabChange("groups")}
+        className={`
+          flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors
+          ${activeTab === "groups"
+            ? "border-cyan-500 text-cyan-400"
+            : "border-transparent text-muted-foreground hover:text-foreground"
+          }
+        `}
+        data-ui-id="check-builder-groups-tab-btn"
+      >
+        <FolderOpen className="w-4 h-4" />
+        Groups
+      </button>
+    </div>
+  );
+}
+
 // Main content component
 function CheckBuilderContent({ onLog }: CheckBuilderTabProps) {
+  const [activeTab, setActiveTab] = useState<TabView>("checks");
+  const [showAiConfigureModal, setShowAiConfigureModal] = useState(false);
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
+      {/* Tab Switcher */}
+      <TabSwitcher activeTab={activeTab} onTabChange={setActiveTab} />
+
+      {/* Content based on active tab */}
       <div className="flex-1 flex min-h-0 overflow-hidden">
-        {/* Left: Check Library */}
-        <CheckLibraryPanel />
+        {activeTab === "checks" ? (
+          <>
+            {/* Left: Check Library */}
+            <CheckLibraryPanel onOpenAiModal={() => setShowAiConfigureModal(true)} />
 
-        {/* Center: Check Editor */}
-        <CheckEditorPanel />
+            {/* Center: Check Editor */}
+            <CheckEditorPanel
+              showAiConfigureModal={showAiConfigureModal}
+              onOpenAiModal={() => setShowAiConfigureModal(true)}
+              onCloseAiModal={() => setShowAiConfigureModal(false)}
+            />
 
-        {/* Right: Properties */}
-        <CheckPropertiesPanel />
+            {/* Right: Properties */}
+            <CheckPropertiesPanel />
+          </>
+        ) : (
+          <CheckGroupsPanel />
+        )}
       </div>
     </div>
   );

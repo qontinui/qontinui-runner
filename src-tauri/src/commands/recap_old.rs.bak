@@ -1,0 +1,1605 @@
+//! Recap commands for the Session Recap page.
+//!
+//! Provides a quick overview of what happened during a task run,
+//! prominently showing failure reasons and displaying all steps with brief summaries.
+
+use crate::commands::AppState;
+use crate::database::{StoredVerificationResult, TaskRun, TaskRunAutomation, TaskRunEvent};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tauri::State;
+use tracing::{info, warn};
+
+/// A step in the recap timeline.
+#[derive(Debug, Serialize, Clone)]
+pub struct RecapStep {
+    /// Step name
+    pub name: String,
+    /// Step type: "workflow", "action", "ai_session", "test", "check"
+    pub step_type: String,
+    /// Status: "success", "failed", "running", "skipped"
+    pub status: String,
+    /// Workflow phase: "setup", "agentic", "verification", "completion"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Icon type for frontend rendering (maps to STEP_ICON_CONFIG).
+    /// More specific than step_type (e.g., "check_lint" vs "check").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_type: Option<String>,
+    /// AI-generated summary of work done (for AI steps).
+    /// Extracted from structured output's work_summary field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_summary: Option<String>,
+    /// Brief summary of what happened (deterministic summary for non-AI steps)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// Error message if failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Nested steps (for workflows containing actions)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<RecapStep>,
+}
+
+/// Information about why a run failed.
+#[derive(Debug, Serialize)]
+pub struct FailureInfo {
+    /// Primary reason for failure
+    pub reason: String,
+    /// Name of the step that failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<String>,
+    /// Detailed error message or stack trace
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_details: Option<String>,
+    /// Error type category
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+}
+
+/// Quick statistics about the run.
+#[derive(Debug, Serialize, Default)]
+pub struct RecapStats {
+    /// Total number of actions executed
+    pub total_actions: i32,
+    /// Number of successful actions
+    pub successful_actions: i32,
+    /// Number of failed actions
+    pub failed_actions: i32,
+    /// Number of skipped actions
+    pub skipped_actions: i32,
+    /// Total number of AI sessions
+    pub ai_sessions: i32,
+    /// Number of tests run
+    pub tests_run: i32,
+    /// Number of tests passed
+    pub tests_passed: i32,
+}
+
+/// A stage in the recap timeline, grouping related steps.
+/// Stages represent the 4 workflow phases: setup, agentic, verification, completion.
+#[derive(Debug, Serialize, Clone)]
+pub struct StageRecap {
+    /// Stage identifier: "setup", "agentic", "verification", "completion"
+    pub stage: String,
+    /// Display name: "Setup", "Agentic", "Verification", "Completion"
+    pub display_name: String,
+    /// Status: "success", "failed", "running", "skipped", "pending"
+    pub status: String,
+    /// When this stage started (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// When this stage ended (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    /// Duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// Steps in this stage
+    pub steps: Vec<RecapStep>,
+    /// Iteration number (for agentic/verification in loop)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iteration: Option<u32>,
+}
+
+/// Complete recap data for a task run.
+#[derive(Debug, Serialize)]
+pub struct RecapData {
+    /// Task run ID
+    pub task_run_id: String,
+    /// Task name
+    pub task_name: String,
+    /// Overall status: "running", "complete", "failed", "stopped"
+    pub status: String,
+    /// Total duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// When the run started
+    pub created_at: String,
+    /// When the run completed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+
+    /// Failure info (prominent if failed)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_info: Option<FailureInfo>,
+
+    /// AI-generated or extracted summary
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+
+    /// Whether the goal was achieved (from orchestrator)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal_achieved: Option<bool>,
+
+    /// Steps grouped by stage (with timing from transition_history)
+    pub stages: Vec<StageRecap>,
+
+    /// Steps overview (timeline) - flat list for backwards compatibility
+    pub steps: Vec<RecapStep>,
+
+    /// Quick statistics
+    pub stats: RecapStats,
+}
+
+/// Response wrapper for recap commands.
+#[derive(Debug, Serialize)]
+pub struct RecapResponse<T> {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl<T> RecapResponse<T> {
+    pub fn ok(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
+        }
+    }
+
+    pub fn err(message: String) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message),
+        }
+    }
+}
+
+/// Map step type and name to a specific icon type for frontend rendering.
+///
+/// This provides more granular icon selection than just step_type.
+/// For example, a "check" step can be rendered with different icons
+/// depending on whether it's a lint check, type check, or build check.
+fn get_icon_type(step_type: &str, step_name: &str) -> Option<String> {
+    let name_lower = step_name.to_lowercase();
+
+    match step_type {
+        "workflow" => Some("workflow".to_string()),
+        "workflow_ref" => Some("workflow_ref".to_string()),
+        "action" => Some("gui_action".to_string()),
+        "ai_session" => Some("prompt".to_string()), // Use "prompt" for consistency with Workflows builder
+        "test" => {
+            // Determine specific test type from name
+            if name_lower.contains("playwright") {
+                Some("test_playwright".to_string())
+            } else if name_lower.contains("vision") {
+                Some("test_vision".to_string())
+            } else if name_lower.contains("python") {
+                Some("test_python".to_string())
+            } else {
+                Some("test".to_string())
+            }
+        }
+        "check" => {
+            // Determine specific check type from name
+            if name_lower.contains("lint") || name_lower.contains("ruff") || name_lower.contains("eslint") {
+                Some("check_lint".to_string())
+            } else if name_lower.contains("type") || name_lower.contains("mypy") || name_lower.contains("typescript") {
+                Some("check_typecheck".to_string())
+            } else if name_lower.contains("build") {
+                Some("check_build".to_string())
+            } else {
+                Some("check".to_string())
+            }
+        }
+        "screenshot" => Some("screenshot".to_string()),
+        "script" => Some("script".to_string()),
+        "shell_command" => Some("shell_command".to_string()),
+        "api_request" => Some("api_request".to_string()),
+        "prompt" => Some("prompt".to_string()),
+        _ => None, // Let frontend use step_type as fallback
+    }
+}
+
+/// Extract work_summary from AI session output for a specific iteration.
+///
+/// Looks for structured JSON output containing "work_summary" field,
+/// or falls back to extracting the first meaningful lines.
+fn extract_work_summary_for_iteration(output_log: &str, iteration: u32) -> Option<String> {
+    // Find session marker for this iteration
+    let marker = format!("[SESSION_START:{}]", iteration);
+    let start = output_log.find(&marker)?;
+    let content = &output_log[start..];
+
+    // Find the end of this session (next session start or end of content)
+    let end = content[1..]
+        .find("[SESSION_START:")
+        .map(|i| i + 1)
+        .unwrap_or(content.len());
+    let session_content = &content[..end];
+
+    // Try to find structured JSON work_summary
+    // Pattern: "work_summary": "..." or "work_summary":"..."
+    if let Some(json_start) = session_content.find("\"work_summary\"") {
+        let after = &session_content[json_start..];
+        // Skip to the colon and whitespace
+        if let Some(colon_pos) = after.find(':') {
+            let after_colon = &after[colon_pos + 1..];
+            let trimmed = after_colon.trim_start();
+            if trimmed.starts_with('"') {
+                // Find the closing quote (handling escaped quotes)
+                let value_start = 1;
+                let mut i = value_start;
+                let chars: Vec<char> = trimmed.chars().collect();
+                while i < chars.len() {
+                    if chars[i] == '"' && (i == 0 || chars[i - 1] != '\\') {
+                        let summary: String = chars[value_start..i].iter().collect();
+                        if !summary.is_empty() && summary.len() < 500 {
+                            // Unescape any escaped characters
+                            let unescaped = summary
+                                .replace("\\\"", "\"")
+                                .replace("\\n", " ")
+                                .replace("\\t", " ");
+                            return Some(unescaped);
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse actions summary JSON to get counts.
+fn parse_actions_summary(json_str: &str) -> (i32, i32, i32, i32) {
+    #[derive(Deserialize)]
+    struct ActionsSummary {
+        total: Option<i32>,
+        success: Option<i32>,
+        failed: Option<i32>,
+        skipped: Option<i32>,
+    }
+
+    if let Ok(summary) = serde_json::from_str::<ActionsSummary>(json_str) {
+        (
+            summary.total.unwrap_or(0),
+            summary.success.unwrap_or(0),
+            summary.failed.unwrap_or(0),
+            summary.skipped.unwrap_or(0),
+        )
+    } else {
+        (0, 0, 0, 0)
+    }
+}
+
+/// Generate a human-readable summary for an automation workflow step.
+///
+/// Creates meaningful summary text based on action counts, status, duration, or workflow name.
+/// Ensures every automation step has a displayable summary.
+fn generate_automation_summary(
+    automation: &TaskRunAutomation,
+    total: i32,
+    success: i32,
+    failed: i32,
+) -> String {
+    // If we have action counts, use them
+    if total > 0 {
+        return format!(
+            "{} actions ({} success, {} failed)",
+            total, success, failed
+        );
+    }
+
+    // Fall back to status-based description with context
+    match automation.automation_status.as_str() {
+        "success" => {
+            if let Some(duration) = automation.duration_ms {
+                format!("Completed in {}ms", duration)
+            } else {
+                "Workflow completed successfully".to_string()
+            }
+        }
+        "failed" => {
+            if let Some(ref error) = automation.error_message {
+                // Truncate long error messages
+                if error.len() > 60 {
+                    format!("Failed: {}...", &error[..60])
+                } else {
+                    format!("Failed: {}", error)
+                }
+            } else {
+                "Workflow failed".to_string()
+            }
+        }
+        "running" => "Workflow in progress...".to_string(),
+        "timeout" => "Workflow timed out".to_string(),
+        "cancelled" => "Workflow cancelled".to_string(),
+        _ => {
+            // For unknown status, use duration if available
+            if let Some(duration) = automation.duration_ms {
+                format!("Executed in {}ms", duration)
+            } else {
+                "Workflow executed".to_string()
+            }
+        }
+    }
+}
+
+/// Generate a summary for a verification result step.
+///
+/// Uses observations if available, otherwise generates a status-based summary.
+fn generate_verification_summary(result: &StoredVerificationResult) -> String {
+    // If we have observations, use them
+    if !result.observations.is_empty() {
+        return result.observations.join("; ");
+    }
+
+    // Fall back to status-based summary
+    if result.passed {
+        format!("{} check passed", result.criterion_type)
+    } else if !result.issues.is_empty() {
+        // Use first issue as summary
+        let first_issue = &result.issues[0];
+        if first_issue.len() > 60 {
+            format!("{}...", &first_issue[..60])
+        } else {
+            first_issue.clone()
+        }
+    } else {
+        format!("{} check failed", result.criterion_type)
+    }
+}
+
+/// Generate a summary for an AI session step.
+///
+/// Uses event message if non-empty, otherwise generates a session-based summary.
+fn generate_ai_session_summary(event_message: &str, session_num: u32, status: &str) -> String {
+    // If the event message is meaningful, use it
+    let trimmed = event_message.trim();
+    if !trimmed.is_empty() && trimmed.len() > 5 {
+        if trimmed.len() > 80 {
+            return format!("{}...", &trimmed[..80]);
+        }
+        return trimmed.to_string();
+    }
+
+    // Fall back to generic session description
+    match status {
+        "success" => format!("Session {} completed", session_num),
+        "failed" => format!("Session {} encountered errors", session_num),
+        _ => format!("Session {} executed", session_num),
+    }
+}
+
+/// Calculate duration between two timestamps (ISO 8601 format).
+fn calculate_duration_ms(start: &str, end: &str) -> Option<i64> {
+    use chrono::DateTime;
+
+    let start_dt = DateTime::parse_from_rfc3339(start).ok()?;
+    let end_dt = DateTime::parse_from_rfc3339(end).ok()?;
+
+    Some((end_dt - start_dt).num_milliseconds())
+}
+
+/// Determine the workflow phase based on workflow name patterns.
+fn determine_workflow_phase(workflow_name: &str) -> String {
+    let name_lower = workflow_name.to_lowercase();
+    if name_lower.contains("setup")
+        || name_lower.contains("init")
+        || name_lower.contains("prepare")
+        || name_lower.contains("configure")
+    {
+        "setup".to_string()
+    } else if name_lower.contains("verify")
+        || name_lower.contains("test")
+        || name_lower.contains("check")
+        || name_lower.contains("validate")
+    {
+        "verification".to_string()
+    } else if name_lower.contains("summary")
+        || name_lower.contains("complete")
+        || name_lower.contains("cleanup")
+        || name_lower.contains("finish")
+    {
+        "completion".to_string()
+    } else {
+        "agentic".to_string()
+    }
+}
+
+/// Build AI session steps from task run data and events.
+///
+/// Uses the agentic step name from execution_steps_json config,
+/// with session number suffix for multiple sessions.
+fn build_ai_session_steps(
+    task_run: &TaskRun,
+    events: &[TaskRunEvent],
+    _verification_results: &[StoredVerificationResult],
+) -> Vec<RecapStep> {
+    let mut steps = Vec::new();
+
+    // Get the agentic step name from config, fallback to "Execute task"
+    let base_step_name = extract_agentic_step_name(task_run)
+        .unwrap_or_else(|| "Execute task".to_string());
+
+    // First try to build from events
+    let session_events: Vec<&TaskRunEvent> = events
+        .iter()
+        .filter(|e| {
+            e.event_type == "ai_session" || e.event_subtype.as_deref() == Some("session_start")
+        })
+        .collect();
+
+    let total_sessions = if !session_events.is_empty() {
+        session_events.len()
+    } else {
+        task_run.output_log.matches("[SESSION_START:").count()
+    };
+
+    if !session_events.is_empty() {
+        for (i, event) in session_events.iter().enumerate() {
+            let session_num = (i + 1) as u32;
+            // Use step name with session number if multiple sessions
+            let session_name = if total_sessions > 1 {
+                format!("{} (session {})", base_step_name, session_num)
+            } else {
+                base_step_name.clone()
+            };
+
+            let status = if event.event_subtype.as_deref() == Some("error") {
+                "failed"
+            } else {
+                "success"
+            };
+
+            // Try to extract work_summary from output_log for this session
+            let work_summary = extract_work_summary_for_iteration(&task_run.output_log, session_num);
+
+            // Always generate a summary - use event message if meaningful, otherwise generate one
+            let summary = Some(generate_ai_session_summary(&event.message, session_num, status));
+
+            steps.push(RecapStep {
+                name: session_name,
+                step_type: "ai_session".to_string(),
+                status: status.to_string(),
+                phase: Some("agentic".to_string()),
+                icon_type: Some("prompt".to_string()), // Use "prompt" icon for AI steps
+                work_summary,
+                summary,
+                duration_ms: event.duration_ms,
+                error: None,
+                children: Vec::new(),
+            });
+        }
+        return steps;
+    }
+
+    // Fall back to output_log parsing
+    let output = &task_run.output_log;
+    let session_count = output.matches("[SESSION_START:").count();
+
+    if session_count > 0 {
+        let parts: Vec<&str> = output.split("[SESSION_START:").collect();
+
+        for (i, part) in parts.iter().enumerate().skip(1) {
+            let session_num = if let Some(end) = part.find(']') {
+                part[..end].parse::<u32>().unwrap_or(i as u32)
+            } else {
+                i as u32
+            };
+
+            let content_start = part.find(']').map(|idx| idx + 1).unwrap_or(0);
+            let content = &part[content_start..];
+
+            // Extract work_summary from this session's content
+            let work_summary = extract_work_summary_for_iteration(output, session_num);
+
+            let is_last = i == parts.len() - 1;
+            let has_error = content.to_lowercase().contains("error")
+                || content.to_lowercase().contains("failed")
+                || content.to_lowercase().contains("timed out");
+
+            let status = if is_last && task_run.status == "failed" {
+                "failed"
+            } else if has_error {
+                "failed"
+            } else {
+                "success"
+            };
+
+            // Use step name with session number
+            let session_name = if session_count > 1 {
+                format!("{} (session {})", base_step_name, session_num)
+            } else {
+                base_step_name.clone()
+            };
+
+            // Try to extract summary from content, fall back to generated summary
+            let summary = extract_session_summary(content)
+                .or_else(|| Some(generate_ai_session_summary("", session_num, status)));
+
+            steps.push(RecapStep {
+                name: session_name,
+                step_type: "ai_session".to_string(),
+                status: status.to_string(),
+                phase: Some("agentic".to_string()),
+                icon_type: Some("prompt".to_string()),
+                work_summary,
+                summary,
+                duration_ms: None,
+                error: if status == "failed" && is_last {
+                    task_run.error_message.clone()
+                } else {
+                    None
+                },
+                children: Vec::new(),
+            });
+        }
+    } else if task_run.sessions_count > 0 {
+        // No markers found but we have session count - generate summaries
+        for i in 1..=task_run.sessions_count {
+            let is_last = i == task_run.sessions_count;
+            let status = if is_last && task_run.status == "failed" {
+                "failed"
+            } else {
+                "success"
+            };
+
+            let session_name = if task_run.sessions_count > 1 {
+                format!("{} (session {})", base_step_name, i)
+            } else {
+                base_step_name.clone()
+            };
+
+            // Always generate a summary for each session
+            let summary = Some(generate_ai_session_summary("", i, status));
+
+            steps.push(RecapStep {
+                name: session_name,
+                step_type: "ai_session".to_string(),
+                status: status.to_string(),
+                phase: Some("agentic".to_string()),
+                icon_type: Some("prompt".to_string()),
+                work_summary: None,
+                summary,
+                duration_ms: None,
+                error: if status == "failed" {
+                    task_run.error_message.clone()
+                } else {
+                    None
+                },
+                children: Vec::new(),
+            });
+        }
+    }
+
+    steps
+}
+
+/// Extract agentic step name from execution_steps_json.
+///
+/// The execution_steps_json contains step definitions including the agentic step name.
+/// This name should be used for AI sessions.
+fn extract_agentic_step_name(task_run: &TaskRun) -> Option<String> {
+    let json_str = task_run.execution_steps_json.as_ref()?;
+
+    #[derive(Deserialize)]
+    struct ExecutionStep {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default, alias = "id")]
+        step_id: Option<String>,
+        #[serde(default)]
+        phase: Option<String>,
+    }
+
+    if let Ok(steps) = serde_json::from_str::<Vec<ExecutionStep>>(json_str) {
+        // Find the agentic phase step
+        for step in steps {
+            if step.phase.as_deref() == Some("agentic") {
+                return step.name.or(step.step_id);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parsed execution step from execution_steps_json.
+#[derive(Deserialize)]
+struct ExecutionStep {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default, alias = "id")]
+    step_id: Option<String>,
+    #[serde(default, rename = "type")]
+    step_type: Option<String>,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    config: Option<serde_json::Value>,
+}
+
+/// Check if a step type represents an AI task.
+fn is_ai_step_type(step_type: &str) -> bool {
+    matches!(step_type, "ai" | "prompt" | "ai_session" | "claude" | "llm")
+}
+
+/// Get step metadata from execution_steps_json by step name.
+///
+/// Used to enrich steps from actual execution records with metadata
+/// from the configuration (descriptions, etc.).
+/// Returns (step_type, description) if found.
+#[allow(dead_code)]
+fn get_step_metadata_from_config(task_run: &TaskRun, step_name: &str) -> Option<(String, Option<String>)> {
+    let json_str = task_run.execution_steps_json.as_ref()?;
+
+    if let Ok(exec_steps) = serde_json::from_str::<Vec<ExecutionStep>>(json_str) {
+        for s in exec_steps {
+            let name = s.name.clone().or(s.step_id.clone())?;
+            if name != step_name {
+                continue;
+            }
+
+            let raw_type = s.step_type.as_deref().unwrap_or("action");
+
+            // Check if this is an AI-type step
+            let step_type = if is_ai_step_type(raw_type) {
+                "ai_session".to_string()
+            } else {
+                match raw_type {
+                    "screenshot" => "screenshot",
+                    "workflow" => "workflow",
+                    "playwright" => "test",
+                    "shell_command" => "shell_command",
+                    "script" => "script",
+                    "api_request" => "api_request",
+                    _ => "action",
+                }
+                .to_string()
+            };
+
+            // Extract description from config
+            let description = s.config.as_ref().and_then(|c| {
+                c.get("description")
+                    .or_else(|| c.get("script"))
+                    .and_then(|v| v.as_str())
+                    .map(|desc| {
+                        if desc.len() > 80 {
+                            format!("{}...", &desc[..80])
+                        } else {
+                            desc.to_string()
+                        }
+                    })
+            });
+
+            return Some((step_type, description));
+        }
+    }
+
+    None
+}
+
+/// Get all AI step names from execution_steps_json.
+///
+/// Used to detect when a workflow automation is actually an AI task.
+fn get_ai_step_names(task_run: &TaskRun) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+
+    let json_str = match task_run.execution_steps_json.as_ref() {
+        Some(s) => s,
+        None => return names,
+    };
+
+    if let Ok(exec_steps) = serde_json::from_str::<Vec<ExecutionStep>>(json_str) {
+        for s in exec_steps {
+            let step_type = s.step_type.as_deref().unwrap_or("");
+            if is_ai_step_type(step_type) {
+                if let Some(name) = s.name.or(s.step_id) {
+                    names.insert(name);
+                }
+            }
+        }
+    }
+
+    names
+}
+
+/// Check if an automation workflow represents an AI task.
+///
+/// An automation is considered an AI task if:
+/// 1. The workflow_name is in the set of AI step names (direct match), OR
+/// 2. The workflow_name matches the task_name AND the task has AI sessions
+///
+/// This handles the case where the task_name is "Organize Planning and Development Documents"
+/// (the parent workflow) but the agentic step name is "fix failed verification tasks".
+/// When an automation runs for the parent workflow in an AI task context, it should
+/// be treated as an AI task even if the automation's workflow_name doesn't match
+/// the specific agentic step name.
+fn is_automation_ai_task(
+    workflow_name: &str,
+    ai_step_names: &std::collections::HashSet<String>,
+    task_run: &TaskRun,
+) -> bool {
+    // Direct match: workflow_name is an AI step name
+    if ai_step_names.contains(workflow_name) {
+        return true;
+    }
+
+    // Indirect match: workflow_name matches task_name AND task has AI sessions
+    // This handles parent workflow automations in AI tasks
+    if task_run.sessions_count > 0 {
+        if task_run.task_name == workflow_name {
+            return true;
+        }
+        // Also check workflow_name field if present
+        if let Some(ref task_workflow) = task_run.workflow_name {
+            if task_workflow == workflow_name {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Build steps from EXECUTED records only.
+///
+/// Shows ONLY steps that actually ran (from actual execution records):
+/// - Workflow automations from task_run_automation table
+/// - Verification results from orchestrator_verification_results table
+/// - AI sessions from output_log markers or session count
+/// - Events from task_run_events table
+///
+/// NOTE: Steps are NOT extracted from execution_steps_json config.
+/// The config is only used to look up metadata (names, descriptions) for
+/// steps that we know ran from execution records.
+fn build_steps(
+    task_run: &TaskRun,
+    automations: &[TaskRunAutomation],
+    events: &[TaskRunEvent],
+    verification_results: &[StoredVerificationResult],
+) -> Vec<RecapStep> {
+    let mut steps = Vec::new();
+    let mut seen_step_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Get AI step names to detect when workflows are actually AI tasks
+    let ai_step_names = get_ai_step_names(task_run);
+
+    // 1. Add verification results as verification phase steps (these actually ran)
+    if !verification_results.is_empty() {
+        info!(
+            "Adding {} verification results to steps",
+            verification_results.len()
+        );
+
+        for result in verification_results {
+            // Skip if we already have this step
+            if seen_step_names.contains(&result.criterion_id) {
+                continue;
+            }
+
+            let status = if result.passed { "success" } else { "failed" };
+            let error = if !result.passed {
+                if !result.issues.is_empty() {
+                    Some(result.issues.join("; "))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Always generate a summary - use observations if available, otherwise status-based
+            let summary = Some(generate_verification_summary(result));
+
+            let step_type = if result.criterion_type == "deterministic" {
+                "check".to_string()
+            } else {
+                "test".to_string()
+            };
+            let icon_type = get_icon_type(&step_type, &result.criterion_id);
+
+            seen_step_names.insert(result.criterion_id.clone());
+            steps.push(RecapStep {
+                name: result.criterion_id.clone(),
+                step_type,
+                status: status.to_string(),
+                phase: Some("verification".to_string()),
+                icon_type,
+                work_summary: None,
+                summary,
+                duration_ms: None,
+                error,
+                children: Vec::new(),
+            });
+        }
+    }
+
+    // 2. Add automation records as workflow steps (these actually ran)
+    for automation in automations {
+        let workflow_name = automation
+            .workflow_name
+            .clone()
+            .unwrap_or_else(|| "Workflow".to_string());
+
+        // Skip if we already have this step
+        if seen_step_names.contains(&workflow_name) {
+            continue;
+        }
+
+        // Parse actions summary for this workflow
+        let (total, success, failed, _skipped) = automation
+            .actions_summary
+            .as_ref()
+            .map(|s| parse_actions_summary(s))
+            .unwrap_or((0, 0, 0, 0));
+
+        // Always generate a summary - use action counts if available, otherwise status-based
+        let summary = Some(generate_automation_summary(automation, total, success, failed));
+
+        let status = match automation.automation_status.as_str() {
+            "success" => "success",
+            "failed" => "failed",
+            "running" => "running",
+            "timeout" => "failed",
+            "cancelled" => "skipped",
+            _ => "running",
+        };
+
+        // Determine phase based on workflow name
+        let phase = determine_workflow_phase(&workflow_name);
+
+        // Check if this workflow is actually an AI task
+        let is_ai_task = is_automation_ai_task(&workflow_name, &ai_step_names, task_run);
+        let (step_type, icon_type) = if is_ai_task {
+            ("ai_session".to_string(), Some("prompt".to_string()))
+        } else {
+            ("workflow".to_string(), get_icon_type("workflow", &workflow_name))
+        };
+
+        seen_step_names.insert(workflow_name.clone());
+        steps.push(RecapStep {
+            name: workflow_name.clone(),
+            step_type,
+            status: status.to_string(),
+            phase: Some(phase),
+            icon_type,
+            work_summary: None,
+            summary,
+            duration_ms: automation.duration_ms,
+            error: automation.error_message.clone(),
+            children: Vec::new(),
+        });
+    }
+
+    // 3. Add AI sessions from task run (these actually ran)
+    if task_run.sessions_count > 0 {
+        let ai_steps = build_ai_session_steps(task_run, events, verification_results);
+        for step in ai_steps {
+            // AI sessions use generic names, so we add them all
+            steps.push(step);
+        }
+    }
+
+    // 4. Fallback: if no steps yet, try to build from events with named workflows
+    if steps.is_empty() && !events.is_empty() {
+        let mut workflow_events: std::collections::HashMap<String, Vec<&TaskRunEvent>> =
+            std::collections::HashMap::new();
+
+        for event in events {
+            let key = event
+                .workflow_name
+                .clone()
+                .unwrap_or_else(|| "Main".to_string());
+            workflow_events.entry(key).or_default().push(event);
+        }
+
+        let has_named_workflows = workflow_events.keys().any(|k| k != "Main");
+
+        if has_named_workflows {
+            for (workflow_name, wf_events) in workflow_events {
+                if workflow_name == "Main" {
+                    continue;
+                }
+
+                // Skip if we already have this step
+                if seen_step_names.contains(&workflow_name) {
+                    continue;
+                }
+
+                let has_error = wf_events.iter().any(|e| {
+                    e.event_subtype.as_deref() == Some("error")
+                        || e.event_subtype.as_deref() == Some("failed")
+                });
+
+                let status = if has_error { "failed" } else { "success" };
+                let event_count = wf_events.len();
+                let phase = determine_workflow_phase(&workflow_name);
+
+                // Check if this workflow is actually an AI task
+                let is_ai_task = is_automation_ai_task(&workflow_name, &ai_step_names, task_run);
+                let (step_type, icon_type) = if is_ai_task {
+                    ("ai_session".to_string(), Some("prompt".to_string()))
+                } else {
+                    ("workflow".to_string(), get_icon_type("workflow", &workflow_name))
+                };
+
+                seen_step_names.insert(workflow_name.clone());
+                steps.push(RecapStep {
+                    name: workflow_name.clone(),
+                    step_type,
+                    status: status.to_string(),
+                    phase: Some(phase),
+                    icon_type,
+                    work_summary: None,
+                    summary: Some(format!("{} events", event_count)),
+                    duration_ms: None,
+                    error: None,
+                    children: Vec::new(),
+                });
+            }
+        }
+    }
+
+    // NOTE: We no longer extract steps from execution_steps_json config.
+    // Steps that didn't actually execute should NOT appear in the recap.
+    // The config is only used to look up metadata for steps that ran.
+
+    steps
+}
+
+/// Extract a brief summary from session content.
+fn extract_session_summary(content: &str) -> Option<String> {
+    // Get first meaningful line
+    let lines: Vec<&str> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("---") && !l.starts_with("==="))
+        .take(2)
+        .collect();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    let summary = lines.join(" ");
+
+    // Truncate if too long
+    if summary.len() > 100 {
+        Some(format!("{}...", &summary[..100]))
+    } else {
+        Some(summary)
+    }
+}
+
+/// Extract failure info from task run and automation records.
+fn extract_failure_info(
+    task_run: &TaskRun,
+    automations: &[TaskRunAutomation],
+) -> Option<FailureInfo> {
+    if task_run.status != "failed" {
+        return None;
+    }
+
+    // Check for error in task run itself
+    if let Some(ref error_msg) = task_run.error_message {
+        // Find which step failed from automations
+        let failed_automation = automations.iter().find(|a| a.automation_status == "failed");
+        let failed_step = failed_automation.and_then(|a| a.workflow_name.clone());
+        let error_type = failed_automation.and_then(|a| a.error_type.clone());
+
+        return Some(FailureInfo {
+            reason: error_msg.clone(),
+            failed_step,
+            error_details: failed_automation.and_then(|a| a.error_message.clone()),
+            error_type,
+        });
+    }
+
+    // Check automations for failures
+    if let Some(failed) = automations.iter().find(|a| a.automation_status == "failed") {
+        let reason = failed
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "Workflow execution failed".to_string());
+
+        return Some(FailureInfo {
+            reason,
+            failed_step: failed.workflow_name.clone(),
+            error_details: failed.error_message.clone(),
+            error_type: failed.error_type.clone(),
+        });
+    }
+
+    // Generic failure
+    Some(FailureInfo {
+        reason: "Task failed".to_string(),
+        failed_step: None,
+        error_details: None,
+        error_type: None,
+    })
+}
+
+/// Calculate statistics from automation records.
+fn calculate_stats(
+    task_run: &TaskRun,
+    automations: &[TaskRunAutomation],
+    _events: &[TaskRunEvent],
+) -> RecapStats {
+    let mut stats = RecapStats::default();
+
+    // Count from automations
+    for automation in automations {
+        if let Some(ref summary) = automation.actions_summary {
+            let (total, success, failed, skipped) = parse_actions_summary(summary);
+            stats.total_actions += total;
+            stats.successful_actions += success;
+            stats.failed_actions += failed;
+            stats.skipped_actions += skipped;
+        }
+    }
+
+    // AI sessions count
+    stats.ai_sessions = task_run.sessions_count as i32;
+
+    stats
+}
+
+/// Stage transition data parsed from transition_history_json.
+#[derive(Debug, Deserialize)]
+struct StageTransition {
+    from: String,
+    to: String,
+    timestamp: String,
+    iteration: u32,
+}
+
+/// Map TaskState names (from orchestrator) to UI stage names.
+/// The orchestrator uses TaskState enum which serializes to snake_case names like
+/// "execution", "deterministic_verification", etc. We need to map these to the
+/// 4 UI stages: setup, agentic, verification, completion.
+fn map_state_to_stage(state: &str) -> Option<&'static str> {
+    match state {
+        // Setup phase
+        "setup" => Some("setup"),
+        "planning" => Some("setup"), // Planning is part of setup
+
+        // Agentic phase (execution)
+        "execution" => Some("agentic"),
+
+        // Verification phase (both deterministic and AI verification)
+        "deterministic_verification" => Some("verification"),
+        "ai_verification" => Some("verification"),
+
+        // Completion phase
+        "completion" => Some("completion"),
+        "ai_summary" => Some("completion"), // AI summary is part of completion
+
+        // Non-displayed states (initialize, complete, stopped, paused)
+        "initialize" | "complete" | "stopped" | "paused" => None,
+
+        _ => None,
+    }
+}
+
+/// Build stages from transition history or heuristically from steps.
+fn build_stages(
+    task_run: &TaskRun,
+    steps: &[RecapStep],
+    _verification_results: &[StoredVerificationResult],
+) -> Vec<StageRecap> {
+    // Try to parse transition history
+    if let Some(ref history_json) = task_run.transition_history_json {
+        if let Ok(transitions) = serde_json::from_str::<Vec<StageTransition>>(history_json) {
+            if !transitions.is_empty() {
+                return build_stages_from_history(&transitions, steps, task_run);
+            }
+        }
+    }
+
+    // Fallback: build stages heuristically from steps
+    build_stages_heuristic(task_run, steps)
+}
+
+/// Information about a stage occurrence (may repeat for iterations).
+#[derive(Debug)]
+struct StageOccurrence {
+    stage: String,
+    iteration: u32,
+    started_at: String,
+    ended_at: Option<String>,
+}
+
+/// Build stages from persisted transition history.
+///
+/// Creates SEPARATE stage containers for each iteration of agentic/verification phases.
+/// This properly shows the agentic → verification → agentic cycle.
+fn build_stages_from_history(
+    transitions: &[StageTransition],
+    steps: &[RecapStep],
+    task_run: &TaskRun,
+) -> Vec<StageRecap> {
+    let mut stage_occurrences: Vec<StageOccurrence> = Vec::new();
+
+    // Process transitions to build ordered list of stage occurrences
+    for (i, transition) in transitions.iter().enumerate() {
+        if let Some(ui_stage) = map_state_to_stage(&transition.to) {
+            // Find end time from next transition
+            let ended_at = transitions.get(i + 1).map(|t| t.timestamp.clone());
+
+            // Check if this is a new occurrence or continuation
+            let is_new = stage_occurrences.last().map_or(true, |last| {
+                last.stage != ui_stage || last.iteration != transition.iteration
+            });
+
+            if is_new {
+                stage_occurrences.push(StageOccurrence {
+                    stage: ui_stage.to_string(),
+                    iteration: transition.iteration,
+                    started_at: transition.timestamp.clone(),
+                    ended_at,
+                });
+            } else if let Some(last) = stage_occurrences.last_mut() {
+                // Update end time for continuing stage
+                last.ended_at = ended_at;
+            }
+        }
+    }
+
+    // If no occurrences found, fall back to heuristic
+    if stage_occurrences.is_empty() && !steps.is_empty() {
+        return build_stages_heuristic(task_run, steps);
+    }
+
+    // Build stages from occurrences, distributing steps appropriately
+    let mut stages: Vec<StageRecap> = Vec::new();
+    let mut remaining_steps: Vec<RecapStep> = steps.to_vec();
+
+    for occurrence in &stage_occurrences {
+        // Extract steps that belong to this stage occurrence
+        let (stage_steps, leftover): (Vec<RecapStep>, Vec<RecapStep>) =
+            remaining_steps.into_iter().partition(|s| {
+                // Match by phase
+                s.phase.as_deref() == Some(&occurrence.stage)
+            });
+        remaining_steps = leftover;
+
+        let status = compute_stage_status(&stage_steps, task_run);
+
+        // Calculate duration
+        let duration_ms = occurrence
+            .ended_at
+            .as_ref()
+            .and_then(|end| calculate_duration_ms(&occurrence.started_at, end));
+
+        // Show iteration number for agentic/verification when iteration > 1
+        let iteration_num = if occurrence.stage == "agentic" || occurrence.stage == "verification" {
+            Some(occurrence.iteration)
+        } else {
+            None
+        };
+
+        stages.push(StageRecap {
+            stage: occurrence.stage.clone(),
+            display_name: get_stage_display_name(&occurrence.stage),
+            status,
+            started_at: Some(occurrence.started_at.clone()),
+            ended_at: occurrence.ended_at.clone(),
+            duration_ms,
+            steps: stage_steps,
+            iteration: iteration_num,
+        });
+    }
+
+    // Handle any remaining steps by adding them to appropriate stages
+    if !remaining_steps.is_empty() {
+        // Group remaining steps by phase and add to existing stages or create new ones
+        for step in remaining_steps {
+            let phase = step.phase.as_deref().unwrap_or("agentic");
+            // Try to find last matching stage
+            if let Some(stage) = stages.iter_mut().rev().find(|s| s.stage == phase) {
+                stage.steps.push(step);
+            } else {
+                // Create new stage for orphan steps
+                stages.push(StageRecap {
+                    stage: phase.to_string(),
+                    display_name: get_stage_display_name(phase),
+                    status: compute_stage_status(&[step.clone()], task_run),
+                    started_at: None,
+                    ended_at: None,
+                    duration_ms: None,
+                    steps: vec![step],
+                    iteration: None,
+                });
+            }
+        }
+    }
+
+    stages
+}
+
+/// Build stages heuristically from steps when no transition history is available.
+fn build_stages_heuristic(task_run: &TaskRun, steps: &[RecapStep]) -> Vec<StageRecap> {
+    let mut stages: Vec<StageRecap> = Vec::new();
+
+    // Group steps by phase (using explicit phase field when available)
+    let mut setup_steps: Vec<RecapStep> = Vec::new();
+    let mut verification_steps: Vec<RecapStep> = Vec::new();
+    let mut agentic_steps: Vec<RecapStep> = Vec::new();
+    let mut completion_steps: Vec<RecapStep> = Vec::new();
+
+    for step in steps {
+        // First check if the step has an explicit phase
+        if let Some(ref phase) = step.phase {
+            match phase.as_str() {
+                "setup" => setup_steps.push(step.clone()),
+                "verification" => verification_steps.push(step.clone()),
+                "agentic" => agentic_steps.push(step.clone()),
+                "completion" => completion_steps.push(step.clone()),
+                _ => agentic_steps.push(step.clone()), // Default to agentic for unknown phases
+            }
+            continue;
+        }
+
+        // Fall back to inferring phase from step_type and name
+        match step.step_type.as_str() {
+            "check" | "test" => verification_steps.push(step.clone()),
+            "ai_session" => agentic_steps.push(step.clone()),
+            "workflow" => {
+                // Classify workflows by name pattern
+                let name_lower = step.name.to_lowercase();
+                if name_lower.contains("setup")
+                    || name_lower.contains("init")
+                    || name_lower.contains("plan")
+                {
+                    setup_steps.push(step.clone());
+                } else if name_lower.contains("summary")
+                    || name_lower.contains("completion")
+                    || name_lower.contains("cleanup")
+                {
+                    completion_steps.push(step.clone());
+                } else {
+                    agentic_steps.push(step.clone());
+                }
+            }
+            "action" => agentic_steps.push(step.clone()),
+            _ => agentic_steps.push(step.clone()),
+        }
+    }
+
+    // Create stages for non-empty groups
+    if !setup_steps.is_empty() {
+        let status = compute_stage_status(&setup_steps, task_run);
+        stages.push(StageRecap {
+            stage: "setup".to_string(),
+            display_name: "Setup".to_string(),
+            status,
+            started_at: Some(task_run.created_at.clone()),
+            ended_at: None,
+            duration_ms: None,
+            steps: setup_steps,
+            iteration: None,
+        });
+    }
+
+    if !agentic_steps.is_empty() {
+        let status = compute_stage_status(&agentic_steps, task_run);
+        stages.push(StageRecap {
+            stage: "agentic".to_string(),
+            display_name: "Agentic".to_string(),
+            status,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            steps: agentic_steps,
+            iteration: None,
+        });
+    }
+
+    if !verification_steps.is_empty() {
+        let status = compute_stage_status(&verification_steps, task_run);
+        stages.push(StageRecap {
+            stage: "verification".to_string(),
+            display_name: "Verification".to_string(),
+            status,
+            started_at: None,
+            ended_at: None,
+            duration_ms: None,
+            steps: verification_steps,
+            iteration: None,
+        });
+    }
+
+    // Add completion stage for completed/failed tasks, or if we have completion steps
+    if task_run.status == "complete" || task_run.status == "failed" || !completion_steps.is_empty()
+    {
+        let completion_status = if !completion_steps.is_empty() {
+            compute_stage_status(&completion_steps, task_run)
+        } else if task_run.status == "complete" {
+            "success".to_string()
+        } else {
+            "failed".to_string()
+        };
+
+        stages.push(StageRecap {
+            stage: "completion".to_string(),
+            display_name: "Completion".to_string(),
+            status: completion_status,
+            started_at: None,
+            ended_at: task_run.completed_at.clone(),
+            duration_ms: None,
+            steps: completion_steps,
+            iteration: None,
+        });
+    }
+
+    stages
+}
+
+/// Filter steps that belong to a particular stage.
+///
+/// Uses the explicit `phase` field on steps when available.
+/// Falls back to heuristics based on step_type and name patterns when phase is not set.
+fn filter_steps_for_stage(stage: &str, steps: &[RecapStep]) -> Vec<RecapStep> {
+    steps
+        .iter()
+        .filter(|s| {
+            // If the step has an explicit phase, use it
+            if let Some(ref step_phase) = s.phase {
+                return step_phase == stage;
+            }
+
+            // Fall back to heuristics based on step_type and name
+            match stage {
+                "setup" => {
+                    // Setup includes workflows with setup-related names,
+                    // or steps explicitly marked as setup
+                    (s.step_type == "workflow" && is_setup_step(s))
+                        || is_step_name_setup_related(&s.name)
+                }
+                "verification" => {
+                    // Verification includes check, test, and verification-named steps
+                    s.step_type == "check"
+                        || s.step_type == "test"
+                        || is_step_name_verification_related(&s.name)
+                }
+                "agentic" => {
+                    // Agentic includes AI sessions, actions, and workflows not classified elsewhere
+                    s.step_type == "ai_session"
+                        || s.step_type == "action"
+                        || (s.step_type == "workflow"
+                            && !is_setup_step(s)
+                            && !is_step_name_completion_related(&s.name))
+                }
+                "completion" => {
+                    // Completion includes summary steps and completion-named steps
+                    is_step_name_completion_related(&s.name)
+                }
+                _ => false,
+            }
+        })
+        .cloned()
+        .collect()
+}
+
+/// Check if a step name suggests it's setup-related.
+fn is_step_name_setup_related(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    name_lower.contains("setup")
+        || name_lower.contains("init")
+        || name_lower.contains("plan")
+        || name_lower.contains("configure")
+        || name_lower.contains("prepare")
+}
+
+/// Check if a step name suggests it's verification-related.
+fn is_step_name_verification_related(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    name_lower.contains("test")
+        || name_lower.contains("check")
+        || name_lower.contains("verify")
+        || name_lower.contains("validate")
+        || name_lower.contains("assert")
+}
+
+/// Check if a step name suggests it's completion-related.
+fn is_step_name_completion_related(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    name_lower.contains("summary")
+        || name_lower.contains("complete")
+        || name_lower.contains("completion")
+        || name_lower.contains("finish")
+        || name_lower.contains("cleanup")
+        || name_lower.contains("teardown")
+}
+
+/// Check if a step is a setup-related step based on name patterns.
+fn is_setup_step(step: &RecapStep) -> bool {
+    let name_lower = step.name.to_lowercase();
+    name_lower.contains("setup")
+        || name_lower.contains("init")
+        || name_lower.contains("plan")
+        || name_lower.contains("configure")
+}
+
+/// Compute overall status for a stage based on its steps.
+fn compute_stage_status(steps: &[RecapStep], task_run: &TaskRun) -> String {
+    if steps.is_empty() {
+        return if task_run.status == "running" {
+            "pending".to_string()
+        } else {
+            "skipped".to_string()
+        };
+    }
+
+    // Check for any running steps
+    if steps.iter().any(|s| s.status == "running") {
+        return "running".to_string();
+    }
+
+    // Check for any failed steps
+    if steps.iter().any(|s| s.status == "failed") {
+        return "failed".to_string();
+    }
+
+    // All steps succeeded or skipped
+    "success".to_string()
+}
+
+/// Get display name for a stage.
+fn get_stage_display_name(stage: &str) -> String {
+    match stage {
+        "setup" => "Setup",
+        "agentic" => "Agentic",
+        "verification" => "Verification",
+        "completion" => "Completion",
+        _ => stage,
+    }
+    .to_string()
+}
+
+/// Get recap data for a specific task run.
+#[tauri::command]
+pub async fn get_task_run_recap(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<RecapResponse<RecapData>, String> {
+    info!("Getting recap for task run: {}", task_run_id);
+
+    // Get the task run
+    let task_run = match state.checkpoint_db.get_task_run(&task_run_id) {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return Ok(RecapResponse::err(format!(
+                "Task run not found: {}",
+                task_run_id
+            )));
+        }
+        Err(e) => {
+            warn!("Failed to get task run {}: {}", task_run_id, e);
+            return Ok(RecapResponse::err(e));
+        }
+    };
+
+    // Get automation records
+    let automations = state
+        .checkpoint_db
+        .get_task_run_automations(&task_run_id)
+        .unwrap_or_else(|e| {
+            warn!("Failed to get automations for {}: {}", task_run_id, e);
+            Vec::new()
+        });
+
+    // Get events (limited for performance)
+    let events = state
+        .checkpoint_db
+        .get_task_run_events(&task_run_id, None, Some(500))
+        .unwrap_or_else(|e| {
+            warn!("Failed to get events for {}: {}", task_run_id, e);
+            Vec::new()
+        });
+
+    // Get verification results for this task run
+    let verification_results = state
+        .checkpoint_db
+        .get_latest_verification_results(&task_run_id)
+        .unwrap_or_else(|e| {
+            warn!(
+                "Failed to get verification results for {}: {}",
+                task_run_id, e
+            );
+            Vec::new()
+        });
+
+    // Build steps
+    let steps = build_steps(&task_run, &automations, &events, &verification_results);
+
+    // Build stages from transition history or heuristically
+    let stages = build_stages(&task_run, &steps, &verification_results);
+
+    // Extract failure info
+    let failure_info = extract_failure_info(&task_run, &automations);
+
+    // Calculate stats
+    let stats = calculate_stats(&task_run, &automations, &events);
+
+    // Calculate duration
+    let duration_ms = if let Some(ref completed) = task_run.completed_at {
+        calculate_duration_ms(&task_run.created_at, completed)
+    } else {
+        None
+    };
+
+    // Extract summary from output log (first meaningful line after session markers)
+    let summary = extract_summary(&task_run.output_log);
+
+    let recap = RecapData {
+        task_run_id: task_run.id.clone(),
+        task_name: task_run.task_name.clone(),
+        status: task_run.status.clone(),
+        duration_ms,
+        created_at: task_run.created_at.clone(),
+        completed_at: task_run.completed_at.clone(),
+        failure_info,
+        summary,
+        goal_achieved: task_run.goal_achieved,
+        stages,
+        steps,
+        stats,
+    };
+
+    Ok(RecapResponse::ok(recap))
+}
+
+/// Extract a brief summary from the output log.
+fn extract_summary(output_log: &str) -> Option<String> {
+    // Skip session markers and find first substantive content
+    let lines: Vec<&str> = output_log
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && !trimmed.starts_with("[SESSION_START:")
+                && !trimmed.starts_with("---")
+                && !trimmed.starts_with("===")
+        })
+        .collect();
+
+    if lines.is_empty() {
+        return None;
+    }
+
+    // Take first few meaningful lines
+    let summary: String = lines.into_iter().take(3).collect::<Vec<_>>().join(" ");
+
+    // Truncate if too long
+    let truncated = if summary.len() > 200 {
+        format!("{}...", &summary[..200])
+    } else {
+        summary
+    };
+
+    Some(truncated)
+}

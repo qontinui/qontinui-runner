@@ -155,6 +155,7 @@ export function AiShellCommandGenerator({
           <button
             onClick={onCancel}
             className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
+            data-ui-id="shell-builder-ai-close-btn"
           >
             <X className="w-4 h-4" />
           </button>
@@ -176,6 +177,7 @@ export function AiShellCommandGenerator({
                     ? "bg-violet-600 text-white"
                     : "bg-neutral-800 text-neutral-400 hover:bg-neutral-700"
                 }`}
+                data-ui-id={`shell-builder-ai-os-${os}-btn`}
               >
                 {os === "windows"
                   ? "Windows (PowerShell)"
@@ -218,6 +220,7 @@ export function AiShellCommandGenerator({
                 onChange={(e) => setPrompt(e.target.value)}
                 placeholder="Example: Create a backup branch with today's date for all git repos in the parent directory"
                 className="flex-1 px-3 py-2 bg-neutral-800 border border-neutral-700 rounded text-sm text-neutral-200 placeholder-neutral-500 resize-none focus:outline-none focus:border-violet-500 min-h-[100px]"
+                data-ui-id="shell-builder-ai-prompt-input"
               />
             </div>
 
@@ -233,6 +236,7 @@ export function AiShellCommandGenerator({
               onClick={handleGenerate}
               disabled={isGenerating || !prompt.trim()}
               className="mt-4 flex items-center justify-center gap-2 px-4 py-2 bg-violet-600 text-white rounded hover:bg-violet-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              data-ui-id="shell-builder-ai-generate-btn"
             >
               {isGenerating ? (
                 <>
@@ -257,6 +261,7 @@ export function AiShellCommandGenerator({
                   onClick={handleCopy}
                   className="p-1 text-neutral-500 hover:text-neutral-300 transition-colors"
                   title="Copy to clipboard"
+                  data-ui-id="shell-builder-ai-copy-btn"
                 >
                   <Copy className="w-4 h-4" />
                 </button>
@@ -284,6 +289,7 @@ export function AiShellCommandGenerator({
                   setGeneratedDescription(null);
                 }}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-neutral-700 text-white rounded hover:bg-neutral-600 transition-colors"
+                data-ui-id="shell-builder-ai-retry-btn"
               >
                 <RefreshCw className="w-4 h-4" />
                 Try Again
@@ -291,6 +297,7 @@ export function AiShellCommandGenerator({
               <button
                 onClick={handleAccept}
                 className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-green-600 text-white rounded hover:bg-green-700 transition-colors"
+                data-ui-id="shell-builder-ai-accept-btn"
               >
                 <Check className="w-4 h-4" />
                 Use Command

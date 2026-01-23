@@ -168,6 +168,10 @@ export const widgetRegistry = new WidgetRegistryImpl();
  * These can be used when registering widgets.
  */
 export const defaultDetectors: Record<ActivityType, (info: TaskActivityInfo) => boolean> = {
+  execution_timeline: (info) => {
+    // Show execution timeline when there's an active task (high-level overview)
+    return info.taskId !== null || info.activities.includes("execution_timeline");
+  },
   gui_automation: (info) => {
     return info.hasConfig || info.activities.includes("gui_automation");
   },
@@ -205,5 +209,9 @@ export const defaultDetectors: Record<ActivityType, (info: TaskActivityInfo) => 
   workflow_ref: (info) => {
     // Show workflow ref widget when sub-workflows are being executed
     return info.activities.includes("workflow_ref");
+  },
+  mcp_call: (info) => {
+    // Show MCP call widget when MCP tool calls are being made
+    return info.activities.includes("mcp_call");
   },
 };

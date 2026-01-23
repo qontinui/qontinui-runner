@@ -4,10 +4,12 @@
 mod action_service;
 mod ai_provider;
 mod ai_router;
+mod ai_workflows;
 mod api_request;
 mod auth;
 mod backup;
 mod check_executor;
+mod check_generation;
 mod commands;
 mod config;
 mod config_storage;
@@ -17,15 +19,15 @@ mod debug_lifecycle;
 mod discoveries;
 mod display;
 mod dom_capture;
-mod ai_workflows;
 mod error;
 mod executor;
 mod findings;
-mod macros;
+mod health_monitor;
 mod iteration_bundle;
 mod log_consolidation;
 mod log_migration;
 mod logging;
+mod macros;
 mod mcp;
 mod mcp_api;
 mod mcp_client;
@@ -35,6 +37,7 @@ mod paths;
 mod playwright;
 mod prompts;
 mod rag;
+mod safe_lock;
 mod saved_api_requests;
 mod scheduler;
 mod scheduler_service;
@@ -50,6 +53,7 @@ mod summary_generator;
 mod task_monitor;
 mod task_recorder;
 mod test_executor;
+mod test_orchestrator;
 mod tiered_info;
 mod unified_workflows;
 mod video_recorder;
@@ -96,6 +100,9 @@ fn main() {
 fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     init_logging(LoggingConfig::default())?;
     setup_panic_handler();
+
+    // Start health monitoring to detect resource exhaustion
+    health_monitor::start_health_monitor();
 
     info!("Starting Qontinui Runner v{}", env!("CARGO_PKG_VERSION"));
 
@@ -191,6 +198,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // Create shared AppState for both Tauri and MCP API
     let shared_app_state = Arc::new(AppState {
         python_bridge: Mutex::new(None),
+        extraction_executor: Mutex::new(None), // Initialized on-demand
         current_config: Mutex::new(None),
         display_processor,
         local_storage,
@@ -313,6 +321,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::logging::list_session_checkpoints,
             commands::logging::delete_session_checkpoints,
             commands::logging::clear_all_run_history,
+            // Render logging commands (for UI testing)
+            commands::logging::append_render_log,
+            commands::logging::clear_render_log,
+            commands::logging::load_render_log,
+            commands::logging::get_render_log_path_cmd,
             // Verification commands (AI self-healing)
             commands::verification::save_pending_verification,
             commands::verification::load_pending_verification,
@@ -369,6 +382,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::self_healing_settings::save_self_healing_api_key,
             commands::self_healing_settings::delete_self_healing_api_key,
             commands::self_healing_settings::has_self_healing_api_key,
+            // Execution variables settings commands
+            commands::execution_variables::get_execution_variables_settings,
+            commands::execution_variables::save_execution_variables_settings,
+            commands::execution_variables::get_resolved_execution_context,
+            commands::execution_variables::test_env_var,
             // Issues sync commands
             commands::issues::sync_issues_to_backend,
             // Unified execution reporting commands
@@ -458,6 +476,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::ai_data::get_task_run_migrated_logs_summary,
             commands::ai_data::get_task_run_api_requests_from_db,
             commands::ai_data::get_task_run_awas_steps_from_db,
+            commands::ai_data::get_task_run_verification_results_from_db,
             // Recap commands (Session overview)
             commands::recap::get_task_run_recap,
             // Task Sync commands (sync to qontinui-web)
@@ -497,7 +516,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::testing::analyze_page_playwright,
             commands::testing::analyze_page_playwright_script,
             commands::testing::analyze_page_vision,
+            // Step output collection commands (for test builder auto-population)
+            commands::step_outputs::collect_step_outputs,
+            commands::step_outputs::get_step_outputs_for_test_builder,
             commands::testing::generate_test_with_ai,
+            commands::testing::generate_test_metadata,
+            commands::testing::list_recent_task_runs,
+            commands::testing::get_workflow_run_context,
             // Code quality check commands
             commands::checks::execute_code_check,
             commands::checks::execute_code_check_suite,
@@ -510,6 +535,15 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::checks::detect_project_check_suggestions,
             commands::checks::get_check_tool_info,
             commands::checks::get_check_results,
+            // Check group commands
+            commands::checks::list_check_groups,
+            commands::checks::get_check_group,
+            commands::checks::create_check_group,
+            commands::checks::update_check_group,
+            commands::checks::delete_check_group,
+            commands::checks::get_checks_in_group,
+            commands::checks::set_checks_in_group,
+            commands::checks::execute_check_group,
             // Screenshot listing commands
             commands::screenshots::list_screenshots,
             // Lifecycle Hooks commands
@@ -610,6 +644,11 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::shell_commands::get_shell_command_categories,
             commands::shell_commands::set_shell_command_enabled,
             commands::shell_commands::generate_shell_command_with_ai,
+            // AI generation commands for builder tabs
+            commands::ai_generation::generate_context_with_ai,
+            commands::ai_generation::generate_api_request_with_ai,
+            commands::ai_generation::generate_task_prompt_with_ai,
+            commands::ai_generation::suggest_exploration_strategy_with_ai,
             // MCP client management commands
             commands::mcp::list_mcp_servers,
             commands::mcp::get_mcp_server,
@@ -653,6 +692,23 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             commands::global_log_sources::read_log_sources_by_profile,
             commands::global_log_sources::migrate_project_sources_to_global,
             commands::global_log_sources::select_log_sources_for_context,
+            // Test Orchestrator commands (AI-driven multi-step API test creation)
+            commands::test_orchestrator::plan_test_orchestration,
+            commands::test_orchestrator::execute_test_orchestration,
+            commands::test_orchestrator::generate_test_from_orchestration,
+            commands::test_orchestrator::get_saved_requests_for_orchestration,
+            commands::test_orchestrator::save_orchestration_plan,
+            commands::test_orchestrator::list_orchestration_plans,
+            commands::test_orchestrator::delete_orchestration_plan,
+            // UI Bridge commands (AI-driven UI automation)
+            commands::ui_bridge::ui_bridge_get_elements,
+            commands::ui_bridge::ui_bridge_get_element,
+            commands::ui_bridge::ui_bridge_execute_action,
+            commands::ui_bridge::ui_bridge_get_components,
+            commands::ui_bridge::ui_bridge_get_component,
+            commands::ui_bridge::ui_bridge_execute_component_action,
+            commands::ui_bridge::ui_bridge_discover,
+            commands::ui_bridge::ui_bridge_get_snapshot,
         ])
         .setup(|app| {
             info!("Tauri application setup starting");
@@ -727,7 +783,7 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // Auto-start Python executor for screenshot capture and other features
             info!("Auto-starting Python executor");
             let app_state = app.state::<Arc<AppState>>();
-            let mut bridge_lock = app_state.python_bridge.lock().unwrap();
+            let mut bridge_lock = crate::safe_lock::safe_lock_or_recover(&app_state.python_bridge, "python_bridge");
             let mut bridge = executor::PythonBridge::new(app.handle().clone());
             match bridge.start() {
                 Ok(_) => {
@@ -741,6 +797,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             drop(bridge_lock);
+
+            // Initialize extraction executor (starts on-demand when first extraction is requested)
+            info!("Initializing extraction executor (will start on-demand)");
+            let mut extraction_lock = crate::safe_lock::safe_lock_or_recover(&app_state.extraction_executor, "extraction_executor");
+            let extraction_executor = executor::ExtractionExecutor::new(app.handle().clone());
+            *extraction_lock = Some(extraction_executor);
+            drop(extraction_lock);
 
             // Start MCP API server in background using the shared AppState
             info!("Starting MCP API server on port {}", mcp_api::MCP_API_PORT);
@@ -771,11 +834,20 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
                 info!("Window close requested");
                 let app_state = window.state::<Arc<AppState>>();
+
+                // Stop Python bridge
                 if let Ok(mut bridge) = app_state.python_bridge.lock() {
                     if let Some(ref mut pb) = *bridge {
                         let _ = pb.stop();
                     }
-                }; // Add semicolon to drop the temporary earlier
+                };
+
+                // Stop extraction executor
+                if let Ok(mut executor) = app_state.extraction_executor.lock() {
+                    if let Some(ref mut ee) = *executor {
+                        let _ = ee.stop();
+                    }
+                };
             }
         })
         .build(tauri::generate_context!())?;

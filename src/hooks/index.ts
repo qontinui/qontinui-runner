@@ -128,3 +128,5 @@ export type {
 } from "./useRealtimeUpdates";
 
 export { useTaskRunRecap, recapKeys } from "./useTaskRunRecap";
+
+export { useUIBridgeEventHandler, UIBridgeEventHandler } from "./useUIBridgeEventHandler";

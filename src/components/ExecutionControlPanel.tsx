@@ -169,6 +169,7 @@ export function ExecutionControlPanel({
           <button
             onClick={() => onWorkflowDropdownToggle(!showWorkflowDropdown)}
             disabled={!configLoaded || workflows.length === 0}
+            data-ui-id="execution-workflow-select"
             className="w-full flex items-center justify-between gap-2 px-3 py-2 text-sm rounded-lg bg-muted/50 hover:bg-muted transition-colors disabled:opacity-50"
           >
             <span className="truncate">
@@ -192,6 +193,7 @@ export function ExecutionControlPanel({
                       <div key={category}>
                         <button
                           onClick={() => setExpandedCategory(isExpanded ? null : category)}
+                          data-ui-id={`execution-category-${category}`}
                           className="w-full flex items-center justify-between px-3 py-2 text-sm text-left hover:bg-muted/50 transition-colors font-medium"
                         >
                           <span>{displayName}</span>
@@ -213,6 +215,7 @@ export function ExecutionControlPanel({
                                   onWorkflowSelect(workflow.id);
                                   setExpandedCategory(null);
                                 }}
+                                data-ui-id={`execution-workflow-${workflow.id}`}
                                 className={`w-full px-5 py-1.5 text-sm text-left hover:bg-muted/50 transition-colors ${
                                   selectedWorkflow === workflow.id
                                     ? "bg-primary/10 text-primary"
@@ -237,6 +240,7 @@ export function ExecutionControlPanel({
                     <button
                       key={workflow.id}
                       onClick={() => onWorkflowSelect(workflow.id)}
+                      data-ui-id={`execution-workflow-${workflow.id}`}
                       className={`w-full px-3 py-2 text-sm text-left hover:bg-muted/50 transition-colors ${
                         selectedWorkflow === workflow.id ? "bg-primary/10 text-primary" : ""
                       }`}
@@ -275,9 +279,10 @@ export function ExecutionControlPanel({
 
         {/* Initial States Section */}
         {showInitialStates && (
-          <div className="rounded-lg bg-muted/30 overflow-hidden">
+          <div className="rounded-lg bg-muted/30 overflow-hidden" data-ui-id="execution-initial-states">
             <button
               onClick={() => setInitialStatesExpanded(!initialStatesExpanded)}
+              data-ui-id="execution-initial-states-toggle"
               className="w-full flex items-center justify-between px-3 py-2 hover:bg-muted/50 transition-colors"
             >
               <div className="flex items-center gap-2">
@@ -317,6 +322,7 @@ export function ExecutionControlPanel({
             type="checkbox"
             checked={autoMinimize}
             onChange={(e) => onAutoMinimizeChange(e.target.checked)}
+            data-ui-id="execution-auto-minimize-checkbox"
             className="rounded w-3.5 h-3.5"
           />
           <span>Auto-minimize on start</span>
@@ -326,6 +332,7 @@ export function ExecutionControlPanel({
         <div className="flex gap-2">
           <button
             data-tutorial-id="start-execution-button"
+            data-ui-id="execution-start-btn"
             onClick={() => {
               onStartExecution();
               onNavigateToActive?.();
@@ -339,6 +346,7 @@ export function ExecutionControlPanel({
           <button
             onClick={onStopExecution}
             disabled={!executionActive}
+            data-ui-id="execution-stop-btn"
             className={`flex-1 flex items-center justify-center gap-2 px-3 py-2 text-xs rounded-lg transition-colors disabled:opacity-50 ${getAccentColors("red").bg} ${getAccentColors("red").text} hover:opacity-80`}
           >
             <Square className="w-3.5 h-3.5" />

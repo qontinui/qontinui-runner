@@ -15,7 +15,10 @@ use crate::check_executor::{
     CheckExecutionResult, CheckSuiteSummary, CheckToolInfoSerialized, ProjectDetectionResult,
     CHECK_TOOLS, CHECK_TYPE_INFO,
 };
-use crate::database::{Check, CreateCheckInput, UpdateCheckInput};
+use crate::database::{
+    Check, CheckGroup, CreateCheckGroupInput, CreateCheckInput, UpdateCheckGroupInput,
+    UpdateCheckInput,
+};
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -433,4 +436,319 @@ fn check_to_definition(check: &Check) -> CheckDefinition {
         timeout_seconds: check.timeout_seconds,
         is_critical: check.is_critical,
     }
+}
+
+// ============================================================================
+// Check Group Commands
+// ============================================================================
+
+/// List all check groups
+#[tauri::command]
+pub async fn list_check_groups(
+    enabled_only: Option<bool>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    match db.list_check_groups(enabled_only.unwrap_or(false)) {
+        Ok(groups) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} check groups", groups.len())),
+            data: Some(serde_json::to_value(groups).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to list check groups: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Get a single check group by ID
+#[tauri::command]
+pub async fn get_check_group(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    match db.get_check_group(&id) {
+        Ok(Some(group)) => Ok(CommandResponse {
+            success: true,
+            message: None,
+            data: Some(serde_json::to_value(group).unwrap_or_default()),
+        }),
+        Ok(None) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Check group not found: {}", id)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to get check group: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Create a new check group
+#[tauri::command]
+pub async fn create_check_group(
+    input: CreateCheckGroupInput,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Creating check group: {}", input.name);
+
+    match db.create_check_group(&input) {
+        Ok(group) => {
+            info!("Created check group: {} ({})", group.name, group.id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Check group created: {}", group.name)),
+                data: Some(serde_json::to_value(group).unwrap_or_default()),
+            })
+        }
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to create check group: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Update an existing check group
+#[tauri::command]
+pub async fn update_check_group(
+    id: String,
+    input: UpdateCheckGroupInput,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Updating check group: {}", id);
+
+    match db.update_check_group(&id, &input) {
+        Ok(group) => {
+            info!("Updated check group: {} ({})", group.name, group.id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Check group updated: {}", group.name)),
+                data: Some(serde_json::to_value(group).unwrap_or_default()),
+            })
+        }
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to update check group: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Delete a check group
+#[tauri::command]
+pub async fn delete_check_group(
+    id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Deleting check group: {}", id);
+
+    match db.delete_check_group(&id) {
+        Ok(true) => {
+            info!("Deleted check group: {}", id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some("Check group deleted".to_string()),
+                data: None,
+            })
+        }
+        Ok(false) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Check group not found: {}", id)),
+            data: None,
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to delete check group: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Get checks in a group
+#[tauri::command]
+pub async fn get_checks_in_group(
+    group_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    match db.get_checks_in_group(&group_id) {
+        Ok(checks) => Ok(CommandResponse {
+            success: true,
+            message: Some(format!("Found {} checks in group", checks.len())),
+            data: Some(serde_json::to_value(checks).unwrap_or_default()),
+        }),
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to get checks in group: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Set checks in a group (replaces existing)
+#[tauri::command]
+pub async fn set_checks_in_group(
+    group_id: String,
+    check_ids: Vec<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Setting {} checks in group: {}", check_ids.len(), group_id);
+
+    match db.set_checks_in_group(&group_id, &check_ids) {
+        Ok(()) => {
+            info!("Updated checks in group: {}", group_id);
+            Ok(CommandResponse {
+                success: true,
+                message: Some(format!("Set {} checks in group", check_ids.len())),
+                data: None,
+            })
+        }
+        Err(e) => Ok(CommandResponse {
+            success: false,
+            message: Some(format!("Failed to set checks in group: {}", e)),
+            data: None,
+        }),
+    }
+}
+
+/// Execute all checks in a group
+#[tauri::command]
+pub async fn execute_check_group(
+    group_id: String,
+    task_run_id: Option<String>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    let db = &state.checkpoint_db;
+
+    info!("Executing check group: {}", group_id);
+
+    // Get the group
+    let group = match db.get_check_group(&group_id) {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Check group not found: {}", group_id)),
+                data: None,
+            });
+        }
+        Err(e) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Failed to get check group: {}", e)),
+                data: None,
+            });
+        }
+    };
+
+    // Get checks in the group
+    let checks = match db.get_checks_in_group(&group_id) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(CommandResponse {
+                success: false,
+                message: Some(format!("Failed to get checks in group: {}", e)),
+                data: None,
+            });
+        }
+    };
+
+    if checks.is_empty() {
+        return Ok(CommandResponse {
+            success: true,
+            message: Some("No checks in group".to_string()),
+            data: Some(serde_json::json!({
+                "group": group,
+                "results": [],
+                "summary": {
+                    "total": 0,
+                    "passed": 0,
+                    "failed": 0,
+                    "fixed": 0,
+                    "skipped": 0,
+                    "duration_ms": 0
+                }
+            })),
+        });
+    }
+
+    // Convert checks to definitions
+    let check_defs: Vec<CheckDefinition> = checks.iter().map(check_to_definition).collect();
+
+    // Execute the checks
+    let (results, summary) = execute_check_suite(&check_defs, group.stop_on_failure);
+
+    // Store results if task_run_id provided
+    if let Some(ref run_id) = task_run_id {
+        for result in &results {
+            let status_str = serde_json::to_string(&result.status)
+                .unwrap_or("\"pending\"".to_string())
+                .trim_matches('"')
+                .to_string();
+            let structured = result
+                .structured_output
+                .as_ref()
+                .map(|o| serde_json::to_string(o).unwrap_or_default());
+
+            if let Err(e) = db.save_check_result(
+                &result.check_id,
+                &status_str,
+                Some(result.started_at.as_str()),
+                Some(result.completed_at.as_str()),
+                Some(result.duration_ms as i64),
+                Some(result.output.as_str()),
+                result.error.as_deref(),
+                result.issues_found as i32,
+                result.issues_fixed as i32,
+                result.files_checked as i32,
+                structured.as_deref(),
+                Some(run_id.as_str()),
+            ) {
+                error!("Failed to store check result: {}", e);
+            }
+        }
+    }
+
+    let success = summary.all_passed();
+
+    info!(
+        "Check group {} completed: {}/{} passed ({:.1}% pass rate, {}ms total)",
+        group.name,
+        summary.passed + summary.fixed,
+        summary.total,
+        summary.pass_rate(),
+        summary.duration_ms
+    );
+
+    Ok(CommandResponse {
+        success,
+        message: Some(format!(
+            "Check group {} completed: {}/{} passed",
+            group.name,
+            summary.passed + summary.fixed,
+            summary.total
+        )),
+        data: Some(serde_json::json!({
+            "group": group,
+            "results": results,
+            "summary": summary
+        })),
+    })
 }

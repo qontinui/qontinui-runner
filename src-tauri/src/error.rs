@@ -40,6 +40,9 @@ pub enum AppError {
 
     #[error("Health check error: {0}")]
     HealthCheckError(String),
+
+    #[error("Lock poisoned: {0}")]
+    LockError(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -194,6 +197,18 @@ impl AppError {
                 severity: ErrorSeverity::Error,
                 recoverable: true,
                 suggested_action: Some("Restart the executor.".to_string()),
+            },
+
+            AppError::LockError(msg) => UserFacingError {
+                title: "Lock Error".to_string(),
+                message: "A thread synchronization lock was poisoned.".to_string(),
+                details: Some(msg.clone()),
+                error_code: "LOCK_001".to_string(),
+                severity: ErrorSeverity::Critical,
+                recoverable: false,
+                suggested_action: Some(
+                    "This indicates a previous thread panic. Restart the application.".to_string(),
+                ),
             },
         }
     }

@@ -146,6 +146,7 @@ export function TestExecutionPanel() {
               handleRunTest();
             }}
             disabled={!selectedTest || state.isExecuting}
+            data-ui-id="test-builder-run-test-btn"
           >
             {state.isExecuting ? (
               <Loader2 className="w-4 h-4 animate-spin" />

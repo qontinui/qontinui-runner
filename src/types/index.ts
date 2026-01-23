@@ -246,14 +246,6 @@ export type {
   UpdateMacroRequest,
   MacroStepResult,
   MacroRunResult,
-  // Backward compatibility aliases (deprecated)
-  GuiActionType,
-  GuiWorkflowStep,
-  SavedGuiWorkflow,
-  CreateGuiWorkflowRequest,
-  UpdateGuiWorkflowRequest,
-  GuiWorkflowStepResult,
-  GuiWorkflowRunResult,
 } from "./macro";
 
 export {
@@ -264,11 +256,6 @@ export {
   getActionTypeLabel,
   validateMacroStep,
   validateMacro,
-  // Backward compatibility aliases (deprecated)
-  getDefaultGuiWorkflowStep,
-  getDefaultGuiWorkflow,
-  validateGuiWorkflowStep,
-  validateGuiWorkflow,
 } from "./macro";
 
 // DOM Capture types (browser DOM snapshot capture)
@@ -289,6 +276,7 @@ export type {
   ScriptStep,
   StateStep,
   WorkflowRefStep,
+  MacroRefStep,
   GuiActionStep,
   TestStep,
   ScreenshotStep,
@@ -465,3 +453,52 @@ export {
 
 // Recap types (Session overview)
 export type { RecapStep, FailureInfo, RecapStats, RecapData, RecapResponse } from "./recap";
+
+// Step Output types (modular piping system for verification tests)
+export type {
+  StepOutput,
+  StepOutputType,
+  BaseStepOutput,
+  ApiRequestStepOutput,
+  GuiActionStepOutput,
+  ShellCommandStepOutput,
+  McpCallStepOutput,
+  ScreenshotStepOutput,
+  WorkflowRefStepOutput,
+  PlaywrightScriptStepOutput,
+  StateNavigationStepOutput,
+  CheckStepOutput,
+  ScreenBoundingBox,
+  DetectedScreenElement,
+  CheckIssue,
+} from "./step-output";
+
+export {
+  generateStepOutputId,
+  isApiRequestOutput,
+  isGuiActionOutput,
+  isShellCommandOutput,
+  isMcpCallOutput,
+  isScreenshotOutput,
+  isWorkflowRefOutput,
+  isPlaywrightScriptOutput,
+  isStateNavigationOutput,
+  isCheckOutput,
+} from "./step-output";
+
+// Execution Variables types (auth source, custom variables)
+export type {
+  AuthSource,
+  VariableSource,
+  CustomVariable,
+  ExecutionVariablesSettings,
+  ResolvedVariableStatus,
+  ResolvedExecutionContext,
+} from "./execution-variables";
+
+export {
+  DEFAULT_EXECUTION_VARIABLES,
+  createDefaultCustomVariable,
+  getAuthSourceLabel,
+  getAuthSourceDescription,
+} from "./execution-variables";

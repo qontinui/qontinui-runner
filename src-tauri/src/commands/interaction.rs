@@ -61,7 +61,8 @@ pub fn start_interaction_recording(
         config.session_id, config.fps
     );
 
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err(
@@ -106,7 +107,8 @@ pub fn start_interaction_recording(
 pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Stopping interaction recording");
 
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err(
@@ -145,7 +147,8 @@ pub fn stop_interaction_recording(state: State<Arc<AppState>>) -> Result<Command
 pub fn get_interaction_recording_status(
     state: State<Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             // Return not recording if executor is not running

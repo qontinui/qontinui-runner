@@ -7,9 +7,6 @@
 
 import React from "react";
 import {
-  FileCode,
-  Navigation,
-  GitBranch,
   MousePointer2,
   MousePointerClick,
   MousePointer,
@@ -21,42 +18,18 @@ import {
   Code,
   Package,
   Terminal,
-  Camera,
-  MessageSquare,
-  Globe,
   ChevronUp,
   ChevronDown,
   Trash2,
   GripVertical,
   AlertCircle,
-  Search,
-  CheckCircle,
-  List,
-  Play,
-  FileSearch,
   Lock,
+  Check,
 } from "lucide-react";
 import type { UnifiedStep, WorkflowPhase, PromptStep } from "../../types";
+import { getStepIconConfig } from "@/lib/step-icons";
 
-// Icon mapping for step types
-const STEP_ICONS: Record<string, React.ElementType> = {
-  script: FileCode,
-  state: Navigation,
-  workflow_ref: GitBranch,
-  gui_action: MousePointer2,
-  api_request: Globe,
-  test: TestTube2,
-  screenshot: Camera,
-  prompt: MessageSquare,
-  // AWAS step types
-  awas_discover: Search,
-  awas_execute: Play,
-  awas_check_support: CheckCircle,
-  awas_list_actions: List,
-  awas_extract_elements: FileSearch,
-};
-
-// Icon mapping for GUI action types
+// Icon mapping for GUI action types (sub-types of gui_action)
 const GUI_ACTION_ICONS: Record<string, React.ElementType> = {
   click: MousePointer2,
   double_click: MousePointerClick,
@@ -66,31 +39,13 @@ const GUI_ACTION_ICONS: Record<string, React.ElementType> = {
   scroll: ArrowUpDown,
 };
 
-// Icon mapping for test types
+// Icon mapping for test types (sub-types of test)
 const TEST_ICONS: Record<string, React.ElementType> = {
   playwright: TestTube2,
   qontinui_vision: Eye,
   python: Code,
   repository: Package,
   custom_command: Terminal,
-};
-
-// Color classes for step types
-const STEP_COLORS: Record<string, string> = {
-  script: "text-emerald-400 bg-emerald-500/10",
-  state: "text-blue-400 bg-blue-500/10",
-  workflow_ref: "text-purple-400 bg-purple-500/10",
-  gui_action: "text-orange-400 bg-orange-500/10",
-  api_request: "text-cyan-400 bg-cyan-500/10",
-  test: "text-green-400 bg-green-500/10",
-  screenshot: "text-pink-400 bg-pink-500/10",
-  prompt: "text-amber-400 bg-amber-500/10",
-  // AWAS step types - teal color scheme
-  awas_discover: "text-teal-400 bg-teal-500/10",
-  awas_execute: "text-teal-400 bg-teal-500/10",
-  awas_check_support: "text-teal-400 bg-teal-500/10",
-  awas_list_actions: "text-teal-400 bg-teal-500/10",
-  awas_extract_elements: "text-teal-400 bg-teal-500/10",
 };
 
 interface StepItemProps {
@@ -104,6 +59,12 @@ interface StepItemProps {
   onMoveDown: () => void;
   onDelete: () => void;
   onClick: () => void;
+  /** Whether the phase is in selection mode for batch delete */
+  isSelectionMode?: boolean;
+  /** Whether this step is selected for deletion */
+  isSelectedForDelete?: boolean;
+  /** Callback to toggle selection for batch delete */
+  onToggleSelect?: () => void;
 }
 
 export function StepItem({
@@ -117,25 +78,38 @@ export function StepItem({
   onMoveDown,
   onDelete,
   onClick,
+  isSelectionMode = false,
+  isSelectedForDelete = false,
+  onToggleSelect,
 }: StepItemProps) {
   // Check if this is a summary step (locked to last position)
   const isSummaryStep =
     step.type === "prompt" && (step as PromptStep).is_summary_step === true;
 
-  // Get the appropriate icon
-  const getIcon = (): React.ElementType => {
-    if (step.type === "gui_action") {
-      return GUI_ACTION_ICONS[step.action] || MousePointer2;
+  // Get the appropriate icon and colors from shared config
+  const getIconAndColors = () => {
+    // Handle sub-types that have their own icon mappings
+    if (step.type === "gui_action" && step.action) {
+      const SubIcon = GUI_ACTION_ICONS[step.action];
+      if (SubIcon) {
+        const config = getStepIconConfig("gui_action");
+        return { Icon: SubIcon, bgClass: config.bgClass, textClass: config.textClass };
+      }
     }
-    if (step.type === "test") {
-      return TEST_ICONS[step.test_type] || TestTube2;
+    if (step.type === "test" && step.test_type) {
+      const SubIcon = TEST_ICONS[step.test_type];
+      if (SubIcon) {
+        const config = getStepIconConfig("test");
+        return { Icon: SubIcon, bgClass: config.bgClass, textClass: config.textClass };
+      }
     }
-    return STEP_ICONS[step.type] || FileCode;
+
+    // Use shared icon config for all other step types
+    const config = getStepIconConfig(step.type);
+    return { Icon: config.icon, bgClass: config.bgClass, textClass: config.textClass };
   };
 
-  const Icon = getIcon();
-  const colorClass = STEP_COLORS[step.type] || "text-zinc-400 bg-zinc-500/10";
-  const [textColor, bgColor] = colorClass.split(" ");
+  const { Icon, bgClass: bgColor, textClass: textColor } = getIconAndColors();
 
   // Get step subtitle/description
   const getSubtitle = (): string => {
@@ -176,6 +150,10 @@ export function StepItem({
         return step.url || "List available actions";
       case "awas_extract_elements":
         return step.base_url || "Extract AWAS elements";
+      case "shell_command":
+        return step.command
+          ? step.command.substring(0, 50) + (step.command.length > 50 ? "..." : "")
+          : "Enter command...";
       default:
         return "";
     }
@@ -212,6 +190,8 @@ export function StepItem({
         return !step.url;
       case "awas_extract_elements":
         return !step.html;
+      case "shell_command":
+        return !step.command;
       default:
         return false;
     }
@@ -221,23 +201,44 @@ export function StepItem({
 
   return (
     <div
-      onClick={onClick}
+      onClick={isSelectionMode && onToggleSelect ? onToggleSelect : onClick}
       data-step-type={step.type}
       className={`
         flex items-center gap-2 p-2 rounded-md
         bg-zinc-800 hover:bg-zinc-750
-        border border-zinc-700
-        ${isSelected ? "ring-2 ring-blue-500/50 border-blue-500/30" : "hover:border-zinc-600"}
+        border
+        ${isSelectionMode && isSelectedForDelete
+          ? "border-red-500/50 bg-red-500/10"
+          : isSelected
+            ? "ring-2 ring-blue-500/50 border-blue-500/30"
+            : "border-zinc-700 hover:border-zinc-600"
+        }
         cursor-pointer transition-all group
       `}
     >
-      {/* Drag Handle - hidden for summary steps */}
-      {!isSummaryStep && (
+      {/* Checkbox in selection mode */}
+      {isSelectionMode && (
+        <div
+          className={`flex-shrink-0 w-5 h-5 rounded border-2 flex items-center justify-center transition-colors ${
+            isSelectedForDelete
+              ? "bg-red-500 border-red-500"
+              : "border-zinc-500"
+          }`}
+          data-ui-id={`workflow-builder-step-${step.id}-select-checkbox`}
+        >
+          {isSelectedForDelete && (
+            <Check className="w-3 h-3 text-white" />
+          )}
+        </div>
+      )}
+
+      {/* Drag Handle - hidden for summary steps and in selection mode */}
+      {!isSelectionMode && !isSummaryStep && (
         <div className="text-zinc-600 group-hover:text-zinc-500 cursor-grab">
           <GripVertical className="w-4 h-4" />
         </div>
       )}
-      {isSummaryStep && <div className="w-4" />}
+      {!isSelectionMode && isSummaryStep && <div className="w-4" />}
 
       {/* Step Icon */}
       <div className={`p-1.5 rounded ${bgColor}`}>
@@ -268,47 +269,52 @@ export function StepItem({
         <div className="text-xs text-zinc-500 truncate">{getSubtitle()}</div>
       </div>
 
-      {/* Action Buttons */}
-      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onMoveUp();
-          }}
-          disabled={isFirst || isSummaryStep}
-          className={`
-            p-1 rounded hover:bg-zinc-700 transition-colors
-            ${isFirst || isSummaryStep ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
-          `}
-          title={isSummaryStep ? "Summary step cannot be moved" : "Move up"}
-        >
-          <ChevronUp className="w-4 h-4" />
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onMoveDown();
-          }}
-          disabled={isLast || isSummaryStep}
-          className={`
-            p-1 rounded hover:bg-zinc-700 transition-colors
-            ${isLast || isSummaryStep ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
-          `}
-          title={isSummaryStep ? "Summary step cannot be moved" : "Move down"}
-        >
-          <ChevronDown className="w-4 h-4" />
-        </button>
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete();
-          }}
-          className="p-1 rounded hover:bg-red-500/20 text-zinc-400 hover:text-red-400 transition-colors"
-          title="Delete"
-        >
-          <Trash2 className="w-4 h-4" />
-        </button>
-      </div>
+      {/* Action Buttons - hidden in selection mode */}
+      {!isSelectionMode && (
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onMoveUp();
+            }}
+            disabled={isFirst || isSummaryStep}
+            className={`
+              p-1 rounded hover:bg-zinc-700 transition-colors
+              ${isFirst || isSummaryStep ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
+            `}
+            title={isSummaryStep ? "Summary step cannot be moved" : "Move up"}
+            data-ui-id={`workflow-builder-step-${step.id}-move-up-btn`}
+          >
+            <ChevronUp className="w-4 h-4" />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onMoveDown();
+            }}
+            disabled={isLast || isSummaryStep}
+            className={`
+              p-1 rounded hover:bg-zinc-700 transition-colors
+              ${isLast || isSummaryStep ? "text-zinc-600 cursor-not-allowed" : "text-zinc-400 hover:text-zinc-200"}
+            `}
+            title={isSummaryStep ? "Summary step cannot be moved" : "Move down"}
+            data-ui-id={`workflow-builder-step-${step.id}-move-down-btn`}
+          >
+            <ChevronDown className="w-4 h-4" />
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+            className="p-1 rounded hover:bg-red-500/20 text-zinc-400 hover:text-red-400 transition-colors"
+            title="Delete"
+            data-ui-id={`workflow-builder-step-${step.id}-delete-btn`}
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+        </div>
+      )}
     </div>
   );
 }

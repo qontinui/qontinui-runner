@@ -1046,6 +1046,164 @@ impl Orchestrator {
         Ok(state)
     }
 
+    // ========================================================================
+    // Phase Transition Methods
+    // ========================================================================
+
+    /// Mark setup phase as complete and transition to verification phase.
+    ///
+    /// This should be called after setup steps have completed successfully.
+    /// Setup steps are deterministic (shell commands, workflows, etc.) and don't
+    /// require AI interaction or explicit [WORK_COMPLETE] signals.
+    ///
+    /// After this call, the orchestrator state will be in the "verification" stage,
+    /// ready for the verification loop to begin.
+    pub fn complete_setup_phase(&self, state: &mut OrchestratorState) {
+        info!(
+            "Setup phase complete for task {}, transitioning to verification phase",
+            state.task_run_id
+        );
+
+        // Record the stage transition
+        state.record_stage_transition("verification");
+
+        // Persist the transition history
+        self.persist_transition_history(state);
+
+        // Note: Custom hooks could be added here if HookTrigger is extended
+        // For now, use the PostIteration hook as a proxy
+        self.execute_hooks(HookTrigger::PostIteration, state);
+
+        // Emit event for UI updates
+        if let Some(app_handle) = &self.app_handle {
+            use crate::orchestrator::output::emit_phase_transition;
+            emit_phase_transition(
+                app_handle,
+                "setup",
+                "verification",
+                state.iteration,
+                self.session_ctx_ref(),
+            );
+        }
+    }
+
+    /// Mark completion phase as complete and finalize the task.
+    ///
+    /// This should be called after completion steps have run successfully.
+    /// Completion steps run once after the verification loop exits (either due to
+    /// success or max iterations).
+    ///
+    /// After this call, the orchestrator state will be marked as complete.
+    pub fn complete_completion_phase(
+        &self,
+        state: &mut OrchestratorState,
+        success: bool,
+    ) -> TaskCompletionResult {
+        info!(
+            "Completion phase complete for task {} (success={})",
+            state.task_run_id, success
+        );
+
+        // Record the stage transition
+        state.record_stage_transition("complete");
+
+        // Persist the transition history
+        self.persist_transition_history(state);
+
+        // Get findings for the result
+        let findings = self
+            .get_findings(&state.task_run_id)
+            .unwrap_or_default()
+            .iter()
+            .filter(|f| f.category == "finding")
+            .map(|f| crate::orchestrator::types::Finding {
+                id: f.id.clone(),
+                finding_type: f.category.clone(),
+                description: f.content.clone(),
+                evidence: f.evidence.clone(),
+                confidence: crate::orchestrator::types::Confidence::Medium,
+                related_files: f.related_files.clone(),
+            })
+            .collect();
+
+        // Build the completion result
+        let result = if success {
+            TaskCompletionResult::Success {
+                iterations: state.iteration,
+                findings,
+                verification_results: state
+                    .last_verification
+                    .clone()
+                    .unwrap_or_else(|| IterationVerificationResults::all_passed(state.iteration)),
+            }
+        } else {
+            TaskCompletionResult::Failed {
+                reason: "Verification failed after max iterations".to_string(),
+                iterations: state.iteration,
+                last_results: state.last_verification.clone(),
+                findings,
+            }
+        };
+
+        // Complete the task
+        self.complete_task(state, result.clone());
+
+        result
+    }
+
+    /// Check if the orchestrator is currently in the setup phase.
+    ///
+    /// Returns true if the current stage is "setup", meaning setup steps
+    /// should be executed before transitioning to verification.
+    pub fn is_in_setup_phase(&self, state: &OrchestratorState) -> bool {
+        state.current_stage == "setup"
+    }
+
+    /// Check if the orchestrator is currently in the completion phase.
+    ///
+    /// Returns true if the current stage is "completion", meaning the
+    /// verification loop has finished and completion steps should run.
+    pub fn is_in_completion_phase(&self, state: &OrchestratorState) -> bool {
+        state.current_stage == "completion"
+    }
+
+    /// Check if the orchestrator is in the verification/agentic phase.
+    ///
+    /// Returns true if the current stage is "verification" or "agentic",
+    /// meaning the AI verification loop is active.
+    pub fn is_in_verification_phase(&self, state: &OrchestratorState) -> bool {
+        state.current_stage == "verification" || state.current_stage == "agentic"
+    }
+
+    /// Transition to the completion phase.
+    ///
+    /// This should be called when the verification loop exits (either due to
+    /// success or max iterations) and completion steps need to run.
+    pub fn transition_to_completion_phase(&self, state: &mut OrchestratorState) {
+        info!(
+            "Transitioning task {} to completion phase",
+            state.task_run_id
+        );
+
+        // Record the stage transition
+        state.record_stage_transition("completion");
+
+        // Persist the transition history
+        self.persist_transition_history(state);
+
+        // Emit event for UI updates
+        if let Some(app_handle) = &self.app_handle {
+            use crate::orchestrator::output::emit_phase_transition;
+            emit_phase_transition(
+                app_handle,
+                "verification",
+                "completion",
+                state.iteration,
+                self.session_ctx_ref(),
+            );
+        }
+    }
+
     /// Run initial verification before the first worker iteration.
     ///
     /// This is used for verification-first workflows (like improve-all) where:
@@ -2557,6 +2715,10 @@ pub enum WorkerOutputAction {
     Replan { reason: String },
     /// Max iterations reached, need user decision
     MaxIterationsReached,
+    /// Setup phase completed, transition to verification phase
+    SetupPhaseComplete,
+    /// Completion phase completed, task is done
+    CompletionPhaseComplete,
 }
 
 // ============================================================================
@@ -2668,6 +2830,24 @@ pub async fn run_orchestrated_task(
                     findings: vec![],
                 };
                 orchestrator.complete_task(&mut state, result.clone());
+                return Ok(result);
+            }
+            WorkerOutputAction::SetupPhaseComplete => {
+                // Setup steps completed, transition to verification phase
+                // This is handled automatically - the orchestrator knows to continue
+                // without requiring explicit AI signals
+                orchestrator.complete_setup_phase(&mut state);
+                // Continue to verification loop
+                continue;
+            }
+            WorkerOutputAction::CompletionPhaseComplete => {
+                // Completion steps finished, task is done
+                let success = state
+                    .last_verification
+                    .as_ref()
+                    .map(|v| v.all_passed)
+                    .unwrap_or(false);
+                let result = orchestrator.complete_completion_phase(&mut state, success);
                 return Ok(result);
             }
         }

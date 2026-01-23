@@ -13,7 +13,58 @@ import { getSeverityColors, getStatusColors } from "@/design-system";
 const POLL_INTERVAL_MS = 5000;
 
 /** API endpoint for findings */
-const FINDINGS_API_URL = "http://localhost:9876/findings/list";
+const FINDINGS_API_URL = "http://localhost:9876/findings/summary";
+
+/**
+ * Backend finding format (from Rust API).
+ */
+interface BackendFinding {
+  id: string;
+  taskRunId: string;
+  sessionNum: number;
+  categoryId: string;
+  severity: string;
+  status: string;
+  actionType: string;
+  title: string;
+  description: string;
+  resolution?: string;
+  codeContext?: {
+    file?: string;
+    line?: number;
+    column?: number;
+    snippet?: string;
+  };
+  signatureHash: string;
+  userInput?: {
+    question: string;
+    inputType: string;
+    options?: string[];
+  };
+  userResponse?: string;
+  detectedAt: string;
+  resolvedAt?: string;
+  resolvedInSession?: number;
+  updatedAt: string;
+}
+
+/**
+ * Map backend finding to frontend Finding type.
+ */
+function mapBackendFinding(backend: BackendFinding): Finding {
+  return {
+    id: backend.id,
+    category: (backend.categoryId || "code_bug") as Finding["category"],
+    severity: (backend.severity || "medium") as FindingSeverity,
+    status: (backend.status || "detected") as FindingStatus,
+    title: backend.title,
+    description: backend.description,
+    filePath: backend.codeContext?.file,
+    lineNumber: backend.codeContext?.line,
+    suggestedFix: backend.resolution,
+    detectedAt: backend.detectedAt ? new Date(backend.detectedAt).getTime() : Date.now(),
+  };
+}
 
 /**
  * Compute aggregated counts from findings array.
@@ -84,14 +135,12 @@ export function useFindingsData(): FindingsData {
       }
 
       const data = await response.json();
-      // Expect API to return { findings: Finding[] } or Finding[]
-      const findingsArray = Array.isArray(data)
-        ? data
-        : Array.isArray(data.findings)
-          ? data.findings
-          : [];
+      // API returns { success: true, data: { findings: BackendFinding[], ... } }
+      const backendFindings: BackendFinding[] = data?.data?.findings || data?.findings || [];
 
-      setFindings(findingsArray);
+      // Map backend findings to frontend format
+      const mappedFindings = backendFindings.map(mapBackendFinding);
+      setFindings(mappedFindings);
     } catch {
       // Network error or API not available
       setFindings([]);

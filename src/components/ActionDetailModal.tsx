@@ -133,6 +133,7 @@ function ScreenshotViewer({ screenshotPath, isOpen, onClose }: ScreenshotViewerP
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/80 z-50" />
         <Dialog.Content
+          data-ui-id="dialog-screenshot-viewer"
           className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 max-h-[90vh] max-w-[90vw]"
           aria-describedby="screenshot-description"
         >
@@ -148,6 +149,7 @@ function ScreenshotViewer({ screenshotPath, isOpen, onClose }: ScreenshotViewerP
             />
             <Dialog.Close asChild>
               <button
+                data-ui-id="dialog-screenshot-viewer-close-btn"
                 className="absolute top-4 right-4 p-2 bg-black/50 hover:bg-black/70 rounded-full text-white transition-colors"
                 aria-label="Close screenshot viewer"
               >
@@ -235,6 +237,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
         <Dialog.Portal>
           <Dialog.Overlay className="fixed inset-0 bg-black/50 z-40" />
           <Dialog.Content
+            data-ui-id="dialog-action-detail"
             className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 bg-background border border-border rounded-lg shadow-lg w-full max-w-4xl max-h-[90vh] overflow-hidden z-50 flex flex-col"
             aria-describedby="action-detail-description"
           >
@@ -251,6 +254,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
               </Dialog.Title>
               <Dialog.Close asChild>
                 <button
+                  data-ui-id="dialog-action-detail-close-btn"
                   className="p-1 hover:bg-accent rounded-md transition-colors"
                   aria-label="Close modal"
                 >
@@ -806,6 +810,7 @@ export default function ActionDetailModal({ action, isOpen, onClose }: ActionDet
             {/* Footer */}
             <div className="border-t border-border p-4 flex justify-end gap-2">
               <button
+                data-ui-id="dialog-action-detail-confirm-btn"
                 onClick={onClose}
                 className="px-4 py-2 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 transition-colors text-sm font-medium"
               >

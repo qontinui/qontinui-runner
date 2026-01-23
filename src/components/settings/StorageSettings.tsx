@@ -140,7 +140,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
         icon={<HardDrive className="w-6 h-6" />}
       />
 
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-storage-main-section">
         <div className="flex items-center gap-2">
           <HardDrive className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Local Storage</h4>
@@ -210,6 +210,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
                     onClick={() => handleOpenStorageFolder("screenshots")}
                     className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
                     title="Open folder"
+                    data-ui-id="settings-storage-open-screenshots-folder-btn"
                   >
                     <FolderOpen className="w-3 h-3" />
                   </button>
@@ -225,6 +226,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
                     onClick={() => handleOpenStorageFolder("videos")}
                     className="px-2 py-1 bg-primary/10 hover:bg-primary/20 text-primary rounded-md transition-colors"
                     title="Open folder"
+                    data-ui-id="settings-storage-open-videos-folder-btn"
                   >
                     <FolderOpen className="w-3 h-3" />
                   </button>
@@ -234,12 +236,13 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
           </div>
 
           {/* Cleanup Actions */}
-          <div className="space-y-2">
+          <div className="space-y-2" data-ui-id="settings-storage-cleanup-section">
             <div className="text-xs font-medium">Storage Cleanup</div>
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => handleDeleteOldSessions("screenshots", 30)}
                 className={`px-2.5 py-1.5 ${getAccentColors("amber").bg} hover:bg-amber-500/20 ${getAccentColors("amber").text} rounded-md transition-colors flex items-center gap-1.5 text-xs`}
+                data-ui-id="settings-storage-delete-old-screenshots-btn"
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 Delete Screenshots (30+ days)
@@ -247,6 +250,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
               <button
                 onClick={() => handleDeleteOldSessions("videos", 30)}
                 className={`px-2.5 py-1.5 ${getAccentColors("amber").bg} hover:bg-amber-500/20 ${getAccentColors("amber").text} rounded-md transition-colors flex items-center gap-1.5 text-xs`}
+                data-ui-id="settings-storage-delete-old-videos-btn"
               >
                 <Trash2 className="w-3.5 h-3.5" />
                 Delete Videos (30+ days)
@@ -254,6 +258,7 @@ export function StorageSettings({ onLog }: StorageSettingsProps) {
               <button
                 onClick={handleClearAllStorage}
                 className={`px-2.5 py-1.5 ${getAccentColors("red").bg} hover:bg-red-500/20 ${getAccentColors("red").text} rounded-md transition-colors flex items-center gap-1.5 text-xs`}
+                data-ui-id="settings-storage-clear-all-btn"
               >
                 <Trash className="w-3.5 h-3.5" />
                 Clear All Storage

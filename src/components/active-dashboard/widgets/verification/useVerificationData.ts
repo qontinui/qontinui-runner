@@ -2,14 +2,16 @@
  * useVerificationData Hook
  *
  * Fetches and manages verification result data for the widget.
- * Currently returns mock/placeholder data - will integrate with verification API later.
+ * Fetches from both the verification log API and the steps API for check_group steps.
  */
 
-import { useState, useEffect, useCallback } from "react";
-import type { VerificationData } from "./types";
+import { useState, useEffect, useCallback, useMemo } from "react";
+import type { VerificationData, CheckStep, VerificationTestType } from "./types";
+import type { StepStats, StepExecutionStatus } from "../shared/types";
 import { DEFAULT_VERIFICATION_DATA } from "./types";
 
 const API_BASE = "http://localhost:9876";
+const POLL_INTERVAL_MS = 2000;
 
 /**
  * Response shape from the verification log API.
@@ -38,96 +40,240 @@ interface VerificationLogResponse {
 }
 
 /**
- * Parse log entries into VerificationData structure.
+ * Response from the current-execution/steps API.
  */
-function parseLogEntries(response: VerificationLogResponse): VerificationData {
-  const { entries, is_running, status, duration_ms } = response;
+interface CurrentExecutionStepsResponse {
+  success: boolean;
+  task_run_id: string | null;
+  workflow_name?: string;
+  executions: Array<{
+    id: string;
+    step_type: string;
+    step_name: string;
+    status: string;
+    start_time?: number;
+    end_time?: number;
+    duration_ms?: number;
+    error?: string;
+    output?: string;
+    stdout?: string;
+  }>;
+  count: number;
+}
 
-  const result: VerificationData = {
-    ...DEFAULT_VERIFICATION_DATA,
-    status: is_running ? "running" : (status as VerificationData["status"]) || "pending",
-    durationMs: duration_ms,
+/**
+ * Map API step type to check type.
+ */
+function mapCheckType(stepType: string): VerificationTestType {
+  const typeMap: Record<string, VerificationTestType> = {
+    check_group: "check_group",
+    check: "check_group",
+    playwright: "playwright",
+    gui_automation: "gui_automation",
+    repo_test: "repo_test",
   };
-
-  for (const entry of entries) {
-    switch (entry.type) {
-      case "start":
-        if (entry.data.test_type) {
-          result.testType = entry.data.test_type as VerificationData["testType"];
-        }
-        if (entry.data.test_name) {
-          result.testName = entry.data.test_name;
-        }
-        if (entry.data.description) {
-          result.description = entry.data.description;
-        }
-        break;
-
-      case "result":
-        if (entry.data.status) {
-          result.status = entry.data.status as VerificationData["status"];
-        }
-        if (entry.data.error) {
-          result.error = entry.data.error;
-        }
-        if (entry.data.duration_ms) {
-          result.durationMs = entry.data.duration_ms;
-        }
-        break;
-
-      case "evidence":
-        result.evidence.push({
-          type: entry.data.evidence_type as VerificationData["evidence"][0]["type"],
-          path: entry.data.evidence_path,
-          content: entry.data.evidence_content,
-          timestamp: new Date(entry.timestamp).getTime(),
-        });
-        break;
-    }
-  }
-
-  return result;
+  return typeMap[stepType.toLowerCase()] || "check_group";
 }
 
 /**
  * Hook to fetch verification result data.
- * Polls every 2 seconds while mounted.
+ * Polls both the verification log API and steps API every 2 seconds.
  *
  * Returns VerificationData directly for consistency with widget registry's useData pattern.
  */
 export function useVerificationData(): VerificationData {
   const [data, setData] = useState<VerificationData>(DEFAULT_VERIFICATION_DATA);
+  const [checkSteps, setCheckSteps] = useState<CheckStep[]>([]);
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [elapsedTime, setElapsedTime] = useState(0);
 
-  const fetchData = useCallback(async () => {
+  // Fetch check steps from current-execution/steps API
+  const fetchCheckSteps = useCallback(async () => {
+    try {
+      // Fetch check_group and check steps
+      const response = await fetch(`${API_BASE}/current-execution/steps?step_type=check`);
+      if (response.ok) {
+        const apiData: CurrentExecutionStepsResponse = await response.json();
+        if (apiData.success && apiData.executions) {
+          const steps: CheckStep[] = apiData.executions.map((exec) => ({
+            id: exec.id,
+            name: exec.step_name || "Check",
+            status: exec.status as StepExecutionStatus,
+            checkType: mapCheckType(exec.step_type),
+            startTime: exec.start_time,
+            endTime: exec.end_time,
+            durationMs: exec.duration_ms,
+            error: exec.error,
+            output: exec.stdout || exec.output,
+          }));
+          setCheckSteps(steps);
+
+          // Set start time from first step
+          if (steps.length > 0 && !startTime) {
+            const earliest = Math.min(
+              ...steps.filter((s) => s.startTime).map((s) => s.startTime!),
+            );
+            if (earliest && earliest !== Infinity) {
+              setStartTime(earliest);
+            }
+          }
+        }
+      }
+    } catch {
+      // Silently ignore - API may not be available
+    }
+  }, [startTime]);
+
+  // Fetch verification log data
+  const fetchVerificationLog = useCallback(async () => {
     try {
       const response = await fetch(`${API_BASE}/logs/verification`);
 
       if (!response.ok) {
-        // If endpoint doesn't exist yet, return defaults
         if (response.status === 404) {
-          setData(DEFAULT_VERIFICATION_DATA);
+          // Endpoint doesn't exist, keep existing data
           return;
         }
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
 
       const json: VerificationLogResponse = await response.json();
-      const parsed = parseLogEntries(json);
-      setData(parsed);
+      const { entries, is_running, status, duration_ms } = json;
+
+      const result: Partial<VerificationData> = {
+        status: is_running ? "running" : (status as VerificationData["status"]) || "pending",
+        durationMs: duration_ms,
+        evidence: [],
+      };
+
+      for (const entry of entries) {
+        switch (entry.type) {
+          case "start":
+            if (entry.data.test_type) {
+              result.testType = entry.data.test_type as VerificationData["testType"];
+            }
+            if (entry.data.test_name) {
+              result.testName = entry.data.test_name;
+            }
+            if (entry.data.description) {
+              result.description = entry.data.description;
+            }
+            break;
+
+          case "result":
+            if (entry.data.status) {
+              result.status = entry.data.status as VerificationData["status"];
+            }
+            if (entry.data.error) {
+              result.error = entry.data.error;
+            }
+            if (entry.data.duration_ms) {
+              result.durationMs = entry.data.duration_ms;
+            }
+            break;
+
+          case "evidence":
+            result.evidence = result.evidence || [];
+            result.evidence.push({
+              type: entry.data.evidence_type as VerificationData["evidence"][0]["type"],
+              path: entry.data.evidence_path,
+              content: entry.data.evidence_content,
+              timestamp: new Date(entry.timestamp).getTime(),
+            });
+            break;
+        }
+      }
+
+      setData((prev) => ({ ...prev, ...result }));
     } catch {
       // Silently handle errors - API may not be available
-      setData(DEFAULT_VERIFICATION_DATA);
     }
   }, []);
 
   // Initial fetch and polling
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 2000);
+    const fetchAll = () => {
+      fetchCheckSteps();
+      fetchVerificationLog();
+    };
+    fetchAll();
+    const interval = setInterval(fetchAll, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [fetchData]);
+  }, [fetchCheckSteps, fetchVerificationLog]);
 
-  return data;
+  // Update elapsed time
+  useEffect(() => {
+    if (!startTime) {
+      setElapsedTime(0);
+      return;
+    }
+
+    const updateElapsed = () => {
+      const now = Date.now();
+      setElapsedTime(Math.floor((now - startTime) / 1000));
+    };
+
+    updateElapsed();
+    const interval = setInterval(updateElapsed, 1000);
+    return () => clearInterval(interval);
+  }, [startTime]);
+
+  // Calculate statistics from check steps
+  const stats: StepStats = useMemo(() => {
+    const total = checkSteps.length;
+    const completed = checkSteps.filter(
+      (s) => s.status === "success" || s.status === "failed",
+    ).length;
+    const successful = checkSteps.filter((s) => s.status === "success").length;
+    const failed = checkSteps.filter((s) => s.status === "failed").length;
+    const pending = checkSteps.filter(
+      (s) => s.status === "pending" || s.status === "running",
+    ).length;
+    const successRate = completed > 0 ? (successful / completed) * 100 : 100;
+
+    return {
+      total,
+      completed,
+      successful,
+      failed,
+      pending,
+      elapsedTime,
+      successRate,
+    };
+  }, [checkSteps, elapsedTime]);
+
+  // Derive overall status from check steps if we have them
+  const derivedStatus = useMemo((): VerificationData["status"] => {
+    if (checkSteps.length === 0) return data.status;
+
+    const hasRunning = checkSteps.some((s) => s.status === "running");
+    if (hasRunning) return "running";
+
+    const hasFailed = checkSteps.some((s) => s.status === "failed");
+    if (hasFailed) return "failed";
+
+    const allSuccess = checkSteps.every((s) => s.status === "success");
+    if (allSuccess && checkSteps.length > 0) return "passed";
+
+    const hasPending = checkSteps.some((s) => s.status === "pending");
+    if (hasPending) return "pending";
+
+    return data.status;
+  }, [checkSteps, data.status]);
+
+  // Combine all data
+  const combinedData: VerificationData = useMemo(
+    () => ({
+      ...data,
+      status: derivedStatus,
+      checkSteps,
+      stats,
+      isLoading: false,
+    }),
+    [data, derivedStatus, checkSteps, stats],
+  );
+
+  return combinedData;
 }
 
 /**
@@ -138,42 +284,12 @@ export function useVerificationDataWithStatus(): {
   isLoading: boolean;
   error: string | null;
 } {
-  const [data, setData] = useState<VerificationData>(DEFAULT_VERIFICATION_DATA);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const fetchData = useCallback(async () => {
-    try {
-      const response = await fetch(`${API_BASE}/logs/verification`);
-
-      if (!response.ok) {
-        if (response.status === 404) {
-          setData(DEFAULT_VERIFICATION_DATA);
-          setError(null);
-          return;
-        }
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
-
-      const json: VerificationLogResponse = await response.json();
-      const parsed = parseLogEntries(json);
-      setData(parsed);
-      setError(null);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch verification data");
-      setData(DEFAULT_VERIFICATION_DATA);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 2000);
-    return () => clearInterval(interval);
-  }, [fetchData]);
-
-  return { data, isLoading, error };
+  const data = useVerificationData();
+  return {
+    data,
+    isLoading: data.isLoading,
+    error: null,
+  };
 }
 
 export default useVerificationData;

@@ -34,6 +34,7 @@ import {
   List,
 } from "lucide-react";
 import { getAccentColors } from "@/design-system";
+import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 
 const API_BASE = "http://localhost:9876";
 
@@ -107,6 +108,12 @@ export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: Awa
   const [selectedConfig, setSelectedConfig] = useState<SavedAwasConfig | null>(null);
   const [isCreating, setIsCreating] = useState(false);
 
+  // Bulk deletion state
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
   // Discovery state
   const [discoveryUrl, setDiscoveryUrl] = useState("");
   const [discovering, setDiscovering] = useState(false);
@@ -134,6 +141,49 @@ export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: Awa
   const [expandedActions, setExpandedActions] = useState<Set<string>>(new Set());
 
   const accentColors = getAccentColors("teal");
+
+  // Toggle selection for bulk delete
+  const toggleSelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit selection mode
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Delete selected configs
+  const deleteSelectedConfigs = useCallback(async () => {
+    setIsDeleting(true);
+    try {
+      const updated = savedConfigs.filter((c) => !selectedIds.has(c.id));
+      localStorage.setItem("qontinui-awas-configs", JSON.stringify(updated));
+      setSavedConfigs(updated);
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+      onLog?.("success", `Deleted ${selectedIds.size} AWAS config(s)`);
+    } catch (error) {
+      onLog?.("error", `Failed to delete AWAS configs: ${error}`);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [savedConfigs, selectedIds, exitSelectionMode, onLog]);
+
+  // Get names of selected configs for dialog
+  const getSelectedNames = useCallback(() => {
+    return savedConfigs
+      .filter((c) => selectedIds.has(c.id))
+      .map((c) => c.name);
+  }, [savedConfigs, selectedIds]);
 
   // Fetch saved configs from storage (simulated - would be from database)
   const fetchSavedConfigs = useCallback(async () => {
@@ -436,13 +486,26 @@ export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: Awa
               <Wifi className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
               AWAS Configs
             </h2>
-            <button
-              onClick={startCreate}
-              className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
-              title="New AWAS Config"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setIsSelectionMode(!isSelectionMode)}
+                className={`p-2 rounded-lg transition-colors ${
+                  isSelectionMode
+                    ? "bg-red-500/20 text-red-400"
+                    : "hover:bg-neutral-800 text-neutral-400"
+                }`}
+                title={isSelectionMode ? "Exit selection mode" : "Select configs to delete"}
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+              <button
+                onClick={startCreate}
+                className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
+                title="New AWAS Config"
+              >
+                <Plus className="w-4 h-4" />
+              </button>
+            </div>
           </div>
 
           {/* Search */}
@@ -457,6 +520,44 @@ export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: Awa
             />
           </div>
         </div>
+
+        {/* Selection Mode Header */}
+        {isSelectionMode && (
+          <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+            <span className="text-sm text-red-400">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setSelectedIds(new Set(filteredConfigs.map(c => c.id)))}
+                className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
+              >
+                Select All
+              </button>
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                disabled={selectedIds.size === 0}
+                className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded disabled:opacity-50"
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => setShowBatchDeleteDialog(true)}
+                disabled={selectedIds.size === 0}
+                className="px-2 py-1 text-xs bg-red-600 hover:bg-red-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Delete Selected
+              </button>
+              <button
+                onClick={exitSelectionMode}
+                className="p-1 text-neutral-400 hover:text-neutral-200"
+                title="Cancel selection"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Config List */}
         <div className="flex-1 overflow-y-auto p-2">
@@ -474,12 +575,23 @@ export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: Awa
               {filteredConfigs.map((config) => (
                 <button
                   key={config.id}
-                  onClick={() => selectConfig(config)}
+                  onClick={() => isSelectionMode ? toggleSelection(config.id) : selectConfig(config)}
                   className={`w-full text-left p-3 rounded-lg transition-colors ${
                     selectedConfig?.id === config.id ? "bg-neutral-700" : "hover:bg-neutral-800"
-                  }`}
+                  } ${isSelectionMode && selectedIds.has(config.id) ? "bg-red-500/10" : ""}`}
                 >
                   <div className="flex items-center gap-2">
+                    {isSelectionMode && (
+                      <div
+                        className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+                          selectedIds.has(config.id)
+                            ? "bg-red-500 border-red-500"
+                            : "border-neutral-500 hover:border-red-400"
+                        }`}
+                      >
+                        {selectedIds.has(config.id) && <Check className="w-3 h-3 text-white" />}
+                      </div>
+                    )}
                     <Wifi className="w-4 h-4 text-teal-400 flex-shrink-0" />
                     <span className="font-medium text-sm truncate flex-1">{config.name}</span>
                   </div>
@@ -893,6 +1005,17 @@ export function AwasBuilderTab({ onLog, editConfigId, onNavigateToLibrary }: Awa
           </>
         )}
       </div>
+
+      {/* Batch Delete Dialog */}
+      <BatchDeleteDialog
+        open={showBatchDeleteDialog}
+        title="Delete AWAS Configs"
+        itemType="config"
+        itemNames={getSelectedNames()}
+        isDeleting={isDeleting}
+        onClose={() => setShowBatchDeleteDialog(false)}
+        onConfirm={deleteSelectedConfigs}
+      />
     </div>
   );
 }

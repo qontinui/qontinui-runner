@@ -135,7 +135,8 @@ pub async fn preview_exploration_plan(
     info!("Generating exploration plan for {}", config.config_path);
 
     // Load the current config
-    let config_lock = state.current_config.lock().unwrap();
+    let config_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config");
     let qontinui_config = match config_lock.as_ref() {
         Some(c) => c,
         None => {

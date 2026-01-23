@@ -56,6 +56,67 @@ struct PythonAssertion {
     actual: Option<serde_json::Value>,
 }
 
+/// Extract the last JSON object from a string containing multiple JSON outputs.
+/// This handles the case where user code prints JSON before the wrapper.
+/// The wrapper always prints last, so we want that JSON.
+fn extract_last_json(input: &str) -> Option<String> {
+    // Split by common line endings and find the last valid JSON
+    let lines: Vec<&str> = input.lines().collect();
+
+    // Work backwards through lines to find the last complete JSON
+    for i in (0..lines.len()).rev() {
+        let line = lines[i].trim();
+        if line.starts_with('{') && line.ends_with('}') {
+            // This looks like a complete JSON object on a single line
+            // Try to parse it to make sure it's valid
+            if serde_json::from_str::<serde_json::Value>(line).is_ok() {
+                return Some(line.to_string());
+            }
+        }
+    }
+
+    // If no single-line JSON found, try to find the last JSON object
+    // by looking for the last '{' and matching '}'
+    if let Some(last_open) = input.rfind('{') {
+        let potential_json = &input[last_open..];
+        // Find where this JSON object ends
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut escape_next = false;
+
+        for (i, c) in potential_json.chars().enumerate() {
+            if escape_next {
+                escape_next = false;
+                continue;
+            }
+            if c == '\\' && in_string {
+                escape_next = true;
+                continue;
+            }
+            if c == '"' {
+                in_string = !in_string;
+                continue;
+            }
+            if !in_string {
+                if c == '{' {
+                    depth += 1;
+                } else if c == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        let json_str = &potential_json[..=i];
+                        if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
+                            return Some(json_str.to_string());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Generate a wrapper script that provides helpers and enforces JSON output
 fn generate_python_wrapper(
     user_code: &str,
@@ -354,7 +415,19 @@ pub fn execute_python_script(test_def: &TestDefinition) -> TestExecutionResult {
             }
 
             // Try to parse JSON output
-            match serde_json::from_str::<PythonScriptOutput>(&stdout) {
+            // First try to parse the whole stdout as JSON
+            // If that fails (e.g., multiple JSON objects), try to extract the LAST JSON object
+            // The wrapper always outputs the last JSON, so that's the one we want
+            let json_to_parse = match serde_json::from_str::<PythonScriptOutput>(&stdout) {
+                Ok(_) => stdout.to_string(),
+                Err(_) => {
+                    // Try to extract the last JSON object from stdout
+                    // This handles the case where user code also prints JSON before the wrapper
+                    extract_last_json(&stdout).unwrap_or_else(|| stdout.to_string())
+                }
+            };
+
+            match serde_json::from_str::<PythonScriptOutput>(&json_to_parse) {
                 Ok(script_output) => {
                     let status = match script_output.status.as_str() {
                         "passed" => TestStatus::Passed,
@@ -492,5 +565,69 @@ mod tests {
         assert_eq!(output.status, "passed");
         assert_eq!(output.assertions.len(), 1);
         assert!(output.assertions[0].passed);
+    }
+
+    #[test]
+    fn test_extract_last_json_single_line() {
+        // Test with two JSON objects on separate lines (like the actual error case)
+        let input = r#"{"status": "error", "assertions": [], "output": "Log file not found", "metrics": {}}
+{"status": "passed", "assertions": [], "output": "", "error": null, "metrics": {}}"#;
+
+        let result = extract_last_json(input);
+        assert!(result.is_some());
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["status"], "passed");
+        assert_eq!(json["error"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_extract_last_json_with_carriage_return() {
+        // Test with CRLF line endings (Windows)
+        let input = "{\"status\": \"error\", \"output\": \"first\"}\r\n{\"status\": \"passed\", \"output\": \"second\"}";
+
+        let result = extract_last_json(input);
+        assert!(result.is_some());
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["status"], "passed");
+    }
+
+    #[test]
+    fn test_extract_last_json_single_object() {
+        // Test with a single JSON object (should still work)
+        let input = r#"{"status": "passed", "assertions": [], "metrics": {}}"#;
+
+        let result = extract_last_json(input);
+        assert!(result.is_some());
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["status"], "passed");
+    }
+
+    #[test]
+    fn test_extract_last_json_with_nested_objects() {
+        // Test with nested JSON to ensure brace matching works
+        let input = r#"{"outer": {"inner": {}}}
+{"status": "passed", "data": {"nested": {"deep": 1}}}"#;
+
+        let result = extract_last_json(input);
+        assert!(result.is_some());
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["status"], "passed");
+    }
+
+    #[test]
+    fn test_extract_last_json_with_strings_containing_braces() {
+        // Test with strings containing braces (should not confuse the parser)
+        let input = r#"{"text": "{ not json }"}
+{"status": "passed", "msg": "has { and } in string"}"#;
+
+        let result = extract_last_json(input);
+        assert!(result.is_some());
+
+        let json: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
+        assert_eq!(json["status"], "passed");
     }
 }

@@ -297,4 +297,8 @@ export interface BottomBarProps {
 /** Props for IdleState component */
 export interface IdleStateProps {
   onGoToExecute: () => void;
+  /** Callback to navigate to Recap page and set session workflow */
+  onGoToRecap?: () => void;
+  /** Name of the last run workflow (if any) */
+  lastRunWorkflowName?: string | null;
 }

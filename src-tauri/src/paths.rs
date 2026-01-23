@@ -135,6 +135,12 @@ pub fn get_runner_playwright_jsonl_path() -> PathBuf {
     get_dev_logs_dir().join("runner-playwright.jsonl")
 }
 
+/// Get the component render log path (`<dev_logs>/runner-render.jsonl`).
+/// Used for testing that UI components render the correct data.
+pub fn get_render_log_path() -> PathBuf {
+    get_dev_logs_dir().join("runner-render.jsonl")
+}
+
 /// Get the DOM capture log path (`<dev_logs>/dom-capture.jsonl`).
 pub fn get_dom_capture_log_path() -> PathBuf {
     get_dev_logs_dir().join("dom-capture.jsonl")

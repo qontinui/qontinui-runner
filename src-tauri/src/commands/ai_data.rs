@@ -893,33 +893,84 @@ pub struct LoadedConfigInfo {
 }
 
 /// Get the currently loaded config
+///
+/// This returns config information in priority order:
+/// 1. Unified workflow config (last-unified-workflow.json) - phase-based workflow
+/// 2. GUI automation config (last-loaded-gui-config.json) - model-based GUI automation
+/// 3. Legacy config (last-loaded-config.json) - backward compatibility
 #[tauri::command]
 pub async fn get_loaded_config_for_viewer() -> Result<AiDataResponse<LoadedConfigInfo>, String> {
     let dev_logs_dir = get_dev_logs_dir();
 
-    // Try to read config file (JSON or YAML)
-    let json_path = dev_logs_dir.join("last-loaded-config.json");
-    let yaml_path = dev_logs_dir.join("last-loaded-config.yaml");
-    let meta_path = dev_logs_dir.join("last-loaded-config.meta.json");
+    // Priority 1: Unified workflow config (recommended for AI agents)
+    let unified_workflow_path = dev_logs_dir.join("last-unified-workflow.json");
+    let unified_workflow_meta = dev_logs_dir.join("last-unified-workflow.meta.json");
 
-    let (config_content, config_path, config_format) = if json_path.exists() {
+    // Priority 2: GUI automation config (model-based GUI automation)
+    let gui_json_path = dev_logs_dir.join("last-loaded-gui-config.json");
+    let gui_yaml_path = dev_logs_dir.join("last-loaded-gui-config.yaml");
+    let gui_meta_path = dev_logs_dir.join("last-loaded-gui-config.meta.json");
+
+    // Priority 3: Legacy config (backward compatibility)
+    let legacy_json_path = dev_logs_dir.join("last-loaded-config.json");
+    let legacy_yaml_path = dev_logs_dir.join("last-loaded-config.yaml");
+    let legacy_meta_path = dev_logs_dir.join("last-loaded-config.meta.json");
+
+    // Try unified workflow first
+    if unified_workflow_path.exists() {
+        let config_content = fs::read_to_string(&unified_workflow_path).ok();
+        let meta = if unified_workflow_meta.exists() {
+            fs::read_to_string(&unified_workflow_meta)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        } else {
+            None
+        };
+        return Ok(AiDataResponse::ok(LoadedConfigInfo {
+            config_content,
+            config_path: Some(unified_workflow_path.to_string_lossy().to_string()),
+            config_format: Some("json".to_string()),
+            meta,
+        }));
+    }
+
+    // Try GUI config next
+    let (config_content, config_path, config_format) = if gui_json_path.exists() {
         (
-            fs::read_to_string(&json_path).ok(),
-            Some(json_path.to_string_lossy().to_string()),
+            fs::read_to_string(&gui_json_path).ok(),
+            Some(gui_json_path.to_string_lossy().to_string()),
             Some("json".to_string()),
         )
-    } else if yaml_path.exists() {
+    } else if gui_yaml_path.exists() {
         (
-            fs::read_to_string(&yaml_path).ok(),
-            Some(yaml_path.to_string_lossy().to_string()),
+            fs::read_to_string(&gui_yaml_path).ok(),
+            Some(gui_yaml_path.to_string_lossy().to_string()),
+            Some("yaml".to_string()),
+        )
+    } else if legacy_json_path.exists() {
+        // Fall back to legacy path
+        (
+            fs::read_to_string(&legacy_json_path).ok(),
+            Some(legacy_json_path.to_string_lossy().to_string()),
+            Some("json".to_string()),
+        )
+    } else if legacy_yaml_path.exists() {
+        (
+            fs::read_to_string(&legacy_yaml_path).ok(),
+            Some(legacy_yaml_path.to_string_lossy().to_string()),
             Some("yaml".to_string()),
         )
     } else {
         (None, None, None)
     };
 
-    let meta = if meta_path.exists() {
-        fs::read_to_string(&meta_path)
+    // Get metadata from appropriate path
+    let meta = if gui_meta_path.exists() {
+        fs::read_to_string(&gui_meta_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else if legacy_meta_path.exists() {
+        fs::read_to_string(&legacy_meta_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
     } else {
@@ -1346,6 +1397,60 @@ pub async fn get_task_run_awas_steps_from_db(
                 count,
                 success_count,
                 failed_count,
+            }))
+        }
+        Err(e) => Ok(AiDataResponse::err(e)),
+    }
+}
+
+// =============================================================================
+// Verification Phase Results (Unified Workflow Test Results)
+// =============================================================================
+
+/// Result of querying verification phase results from SQLite.
+#[derive(Debug, Serialize)]
+pub struct TaskRunVerificationResultsDbResult {
+    pub task_run_id: String,
+    /// Results from each verification iteration
+    pub results: Vec<serde_json::Value>,
+    pub count: usize,
+    /// Count of iterations where all tests passed
+    pub passed_iterations: usize,
+    /// Count of iterations where some tests failed
+    pub failed_iterations: usize,
+}
+
+/// Get verification phase results for a task run from SQLite database.
+///
+/// Returns all verification results across all iterations, including individual
+/// step results (tests, checks, etc.) from the unified workflow's verification phase.
+#[tauri::command]
+pub async fn get_task_run_verification_results_from_db(
+    state: State<'_, Arc<AppState>>,
+    task_run_id: String,
+) -> Result<AiDataResponse<TaskRunVerificationResultsDbResult>, String> {
+    match state
+        .checkpoint_db
+        .get_all_verification_phase_results(&task_run_id)
+    {
+        Ok(results) => {
+            let count = results.len();
+            let passed_iterations = results
+                .iter()
+                .filter(|r| {
+                    r.get("all_passed")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                })
+                .count();
+            let failed_iterations = count - passed_iterations;
+
+            Ok(AiDataResponse::ok(TaskRunVerificationResultsDbResult {
+                task_run_id,
+                results,
+                count,
+                passed_iterations,
+                failed_iterations,
             }))
         }
         Err(e) => Ok(AiDataResponse::err(e)),

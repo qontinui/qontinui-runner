@@ -13,11 +13,24 @@ use tracing::{debug, error, info, warn};
 /// 5. System Python (fallback with warning)
 pub struct ProcessManager {
     app_handle: tauri::AppHandle,
+    /// Script name to execute (e.g., "qontinui_executor.py" or "extraction_executor.py")
+    script_name: String,
 }
 
 impl ProcessManager {
     pub fn new(app_handle: tauri::AppHandle) -> Self {
-        Self { app_handle }
+        Self {
+            app_handle,
+            script_name: "qontinui_executor.py".to_string(),
+        }
+    }
+
+    /// Creates a ProcessManager for the extraction executor.
+    pub fn new_for_extraction(app_handle: tauri::AppHandle) -> Self {
+        Self {
+            app_handle,
+            script_name: "extraction_executor.py".to_string(),
+        }
     }
 
     /// Spawns the Python executor process.
@@ -133,9 +146,9 @@ impl ProcessManager {
         Ok(child)
     }
 
-    /// Finds the Python executor script (qontinui_executor.py)
+    /// Finds the Python executor script
     fn find_bridge_script(&self) -> Result<PathBuf, String> {
-        const SCRIPT_NAME: &str = "qontinui_executor.py";
+        let script_name = &self.script_name;
 
         let possible_paths = vec![
             // Based on executable location (most reliable - works with supervisor)
@@ -147,7 +160,7 @@ impl ProcessManager {
                     .and_then(|p| p.parent()) // target/
                     .and_then(|p| p.parent()) // src-tauri/
                     .and_then(|p| p.parent()) // qontinui-runner/
-                    .map(|p| p.join("python-bridge").join(SCRIPT_NAME))
+                    .map(|p| p.join("python-bridge").join(script_name))
             }),
             // When running from src-tauri/target/debug or release
             std::env::current_dir().ok().and_then(|p| {
@@ -155,10 +168,10 @@ impl ProcessManager {
                     p.parent()
                         .and_then(|p| p.parent())
                         .and_then(|p| p.parent())
-                        .map(|p| p.join("python-bridge").join(SCRIPT_NAME))
+                        .map(|p| p.join("python-bridge").join(script_name))
                 } else if p.ends_with("src-tauri") {
                     p.parent()
-                        .map(|p| p.join("python-bridge").join(SCRIPT_NAME))
+                        .map(|p| p.join("python-bridge").join(script_name))
                 } else {
                     None
                 }
@@ -166,11 +179,11 @@ impl ProcessManager {
             // When running from qontinui-runner directory
             std::env::current_dir()
                 .ok()
-                .map(|p| p.join("python-bridge").join(SCRIPT_NAME)),
+                .map(|p| p.join("python-bridge").join(script_name)),
             // When in src-tauri directory
             std::env::current_dir()
                 .ok()
-                .map(|p| p.join("..").join("python-bridge").join(SCRIPT_NAME)),
+                .map(|p| p.join("..").join("python-bridge").join(script_name)),
         ];
 
         debug!("Current exe: {:?}", std::env::current_exe());
@@ -186,7 +199,7 @@ impl ProcessManager {
             .ok_or_else(|| {
                 format!(
                     "Python executor script {} not found in any expected location",
-                    SCRIPT_NAME
+                    script_name
                 )
             })
     }

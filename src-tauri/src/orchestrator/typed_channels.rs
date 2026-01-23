@@ -365,9 +365,7 @@ impl SharedChannelState {
         name: impl Into<String>,
         reducer: Option<Reducer>,
     ) {
-        self.inner
-            .write()
-            .unwrap()
+        crate::safe_lock::safe_write_or_recover(&self.inner, "shared_channel_state")
             .create_channel::<T>(name, reducer);
     }
 
@@ -378,40 +376,42 @@ impl SharedChannelState {
         initial: T,
         reducer: Option<Reducer>,
     ) {
-        self.inner
-            .write()
-            .unwrap()
+        crate::safe_lock::safe_write_or_recover(&self.inner, "shared_channel_state")
             .create_channel_with_value(name, initial, reducer);
     }
 
     /// Get a value.
     pub fn get<T: Any + Clone>(&self, name: &str) -> Option<T> {
-        self.inner.read().unwrap().get(name)
+        crate::safe_lock::safe_read_or_recover(&self.inner, "shared_channel_state").get(name)
     }
 
     /// Update a value.
     pub fn update<T: Any + Send + Sync + Clone>(&self, name: &str, value: T) -> bool {
-        self.inner.write().unwrap().update(name, value)
+        crate::safe_lock::safe_write_or_recover(&self.inner, "shared_channel_state")
+            .update(name, value)
     }
 
     /// Set a value directly.
     pub fn set<T: Any + Send + Sync + Clone>(&self, name: &str, value: T) -> bool {
-        self.inner.write().unwrap().set(name, value)
+        crate::safe_lock::safe_write_or_recover(&self.inner, "shared_channel_state")
+            .set(name, value)
     }
 
     /// Check if channel exists.
     pub fn has_channel(&self, name: &str) -> bool {
-        self.inner.read().unwrap().has_channel(name)
+        crate::safe_lock::safe_read_or_recover(&self.inner, "shared_channel_state")
+            .has_channel(name)
     }
 
     /// Get global version.
     pub fn global_version(&self) -> u64 {
-        self.inner.read().unwrap().global_version()
+        crate::safe_lock::safe_read_or_recover(&self.inner, "shared_channel_state").global_version()
     }
 
     /// Get channel version.
     pub fn channel_version(&self, name: &str) -> Option<u64> {
-        self.inner.read().unwrap().channel_version(name)
+        crate::safe_lock::safe_read_or_recover(&self.inner, "shared_channel_state")
+            .channel_version(name)
     }
 }
 

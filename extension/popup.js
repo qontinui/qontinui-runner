@@ -1,5 +1,5 @@
 /**
- * Popup Script for Qontinui DOM Capture Extension
+ * Popup Script for Qontinui Capture Extension
  *
  * Handles UI interactions and communicates with the background service worker.
  */
@@ -40,19 +40,46 @@ const resultEl = document.getElementById("result");
 // Recorder DOM elements
 const recordBtn = document.getElementById("recordBtn");
 const recordBtnText = document.getElementById("recordBtnText");
+const saveAllBtn = document.getElementById("saveAllBtn");
 const clearRecordingsBtn = document.getElementById("clearRecordingsBtn");
 const recordingIndicator = document.getElementById("recordingIndicator");
 const requestCountEl = document.getElementById("requestCount");
 const requestList = document.getElementById("requestList");
-const tabs = document.querySelectorAll(".tab");
-const recorderTab = document.getElementById("recorderTab");
-const manualTab = document.getElementById("manualTab");
+
+// Main tab elements
+const mainTabs = document.querySelectorAll(".main-tab");
+const domTabContent = document.getElementById("domTabContent");
+const apiTabContent = document.getElementById("apiTabContent");
+const uibridgeTabContent = document.getElementById("uibridgeTabContent");
+
+// UI Bridge DOM elements
+const uibridgeStatusBox = document.getElementById("uibridgeStatusBox");
+const uibridgeStatusText = document.getElementById("uibridgeStatusText");
+const togglePickerBtn = document.getElementById("togglePickerBtn");
+const togglePickerBtnText = document.getElementById("togglePickerBtnText");
+const refreshElementsBtn = document.getElementById("refreshElementsBtn");
+const showOverlaysBtn = document.getElementById("showOverlaysBtn");
+const elementList = document.getElementById("elementList");
+const activeStatesCount = document.getElementById("activeStatesCount");
+const transitionsCount = document.getElementById("transitionsCount");
+const viewSnapshotBtn = document.getElementById("viewSnapshotBtn");
+
+// Sub-tab elements (for API section)
+const subTabs = document.querySelectorAll(".sub-tab");
+const recorderSubTab = document.getElementById("recorderSubTab");
+const manualSubTab = document.getElementById("manualSubTab");
 
 // State
 let isRunnerAvailable = false;
 let isCapturing = false;
 let isRecording = false;
 let refreshInterval = null;
+
+// UI Bridge State
+let isUIBridgeAvailable = false;
+let isPickerActive = false;
+let showingOverlays = false;
+let uibridgeElements = [];
 
 /**
  * Update UI based on runner availability
@@ -248,23 +275,51 @@ setInterval(async () => {
 }, 5000);
 
 // =============================================================================
-// Tab Switching
+// Main Tab Switching (DOM / API)
 // =============================================================================
 
-tabs.forEach((tab) => {
+mainTabs.forEach((tab) => {
   tab.addEventListener("click", () => {
     // Update tab buttons
-    tabs.forEach((t) => t.classList.remove("active"));
+    mainTabs.forEach((t) => t.classList.remove("active"));
     tab.classList.add("active");
 
     // Show/hide content
-    const tabId = tab.dataset.tab;
+    const tabId = tab.dataset.mainTab;
+    domTabContent.classList.remove("active");
+    apiTabContent.classList.remove("active");
+    uibridgeTabContent.classList.remove("active");
+
+    if (tabId === "dom") {
+      domTabContent.classList.add("active");
+    } else if (tabId === "api") {
+      apiTabContent.classList.add("active");
+    } else if (tabId === "uibridge") {
+      uibridgeTabContent.classList.add("active");
+      // Check UI Bridge status when tab is opened
+      checkUIBridgeStatus();
+    }
+  });
+});
+
+// =============================================================================
+// Sub-Tab Switching (Record / Manual within API tab)
+// =============================================================================
+
+subTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    // Update tab buttons
+    subTabs.forEach((t) => t.classList.remove("active"));
+    tab.classList.add("active");
+
+    // Show/hide content
+    const tabId = tab.dataset.subTab;
     if (tabId === "recorder") {
-      recorderTab.classList.add("active");
-      manualTab.classList.remove("active");
+      recorderSubTab.classList.add("active");
+      manualSubTab.classList.remove("active");
     } else {
-      recorderTab.classList.remove("active");
-      manualTab.classList.add("active");
+      recorderSubTab.classList.remove("active");
+      manualSubTab.classList.add("active");
     }
   });
 });
@@ -333,8 +388,13 @@ async function refreshRequestList() {
     if (!isRecording) {
       requestList.innerHTML = '<div class="request-list-empty">No requests captured. Click "Start Recording" to begin.</div>';
     }
+    saveAllBtn.style.display = "none";
     return;
   }
+
+  // Show Save All button when there are requests
+  saveAllBtn.style.display = "flex";
+  saveAllBtn.disabled = !isRunnerAvailable;
 
   // Build request list HTML
   const html = response.requests
@@ -455,16 +515,40 @@ async function copyRequestAsCurl(requestId) {
 }
 
 /**
+ * Save all captured requests to the API Request Library
+ */
+async function saveAllRequestsToRunner() {
+  saveAllBtn.disabled = true;
+  const originalHtml = saveAllBtn.innerHTML;
+  saveAllBtn.innerHTML = '<div class="spinner"></div>';
+
+  const response = await safeSendMessage({
+    action: "sendAllRequestsToRunner",
+  });
+
+  saveAllBtn.innerHTML = originalHtml;
+  saveAllBtn.disabled = !isRunnerAvailable;
+
+  if (response?.success) {
+    showResult(true, `Saved ${response.count} request${response.count !== 1 ? "s" : ""} to Library!`);
+  } else {
+    showResult(false, response?.error || "Failed to save requests");
+  }
+}
+
+/**
  * Clear all captured requests
  */
 async function clearCapturedRequests() {
   await safeSendMessage({ action: "clearCapturedRequests" });
   requestList.innerHTML = '<div class="request-list-empty">No requests captured. Click "Start Recording" to begin.</div>';
   requestCountEl.textContent = "0";
+  saveAllBtn.style.display = "none";
 }
 
 // Event listeners for recorder
 recordBtn.addEventListener("click", toggleRecording);
+saveAllBtn.addEventListener("click", saveAllRequestsToRunner);
 clearRecordingsBtn.addEventListener("click", clearCapturedRequests);
 
 // Check if recording is already in progress when popup opens
@@ -472,5 +556,262 @@ safeSendMessage({ action: "getRecordingStatus" }).then((response) => {
   if (response?.isRecording) {
     updateRecordingUI(true);
     refreshRequestList();
+  }
+});
+
+// =============================================================================
+// UI Bridge Functions
+// =============================================================================
+
+/**
+ * Send command to UI Bridge content script via background
+ */
+async function sendUIBridgeCommand(action, params = {}) {
+  return safeSendMessage({
+    type: "UI_BRIDGE_POPUP_COMMAND",
+    action,
+    params,
+  });
+}
+
+/**
+ * Update UI Bridge status display
+ */
+function updateUIBridgeStatus(available, message = null) {
+  isUIBridgeAvailable = available;
+
+  if (available) {
+    uibridgeStatusBox.className = "status connected";
+    uibridgeStatusText.textContent = message || "UI Bridge detected";
+    togglePickerBtn.disabled = false;
+    refreshElementsBtn.disabled = false;
+    showOverlaysBtn.disabled = false;
+    viewSnapshotBtn.disabled = false;
+  } else {
+    uibridgeStatusBox.className = "status disconnected";
+    uibridgeStatusText.textContent = message || "UI Bridge not detected";
+    togglePickerBtn.disabled = true;
+    refreshElementsBtn.disabled = true;
+    showOverlaysBtn.disabled = true;
+    viewSnapshotBtn.disabled = true;
+  }
+}
+
+/**
+ * Check if UI Bridge is available on the current page
+ */
+async function checkUIBridgeStatus() {
+  updateUIBridgeStatus(false, "Checking...");
+
+  const response = await sendUIBridgeCommand("ping");
+
+  if (response?.success && response?.data?.available) {
+    const version = response.data.version || "unknown";
+    updateUIBridgeStatus(true, `UI Bridge v${version}`);
+    // Auto-refresh elements when UI Bridge is detected
+    refreshUIBridgeElements();
+  } else {
+    updateUIBridgeStatus(false, "UI Bridge not found on this page");
+  }
+}
+
+/**
+ * Refresh the list of registered UI Bridge elements
+ */
+async function refreshUIBridgeElements() {
+  if (!isUIBridgeAvailable) return;
+
+  const response = await sendUIBridgeCommand("getElements");
+
+  if (response?.success && response?.data) {
+    uibridgeElements = response.data.elements || [];
+    renderElementList();
+
+    // Update state info
+    activeStatesCount.textContent = response.data.activeStatesCount || 0;
+    transitionsCount.textContent = response.data.transitionsCount || 0;
+  } else {
+    elementList.innerHTML = '<div class="request-list-empty">Failed to fetch elements</div>';
+  }
+}
+
+/**
+ * Render the element list
+ */
+function renderElementList() {
+  if (uibridgeElements.length === 0) {
+    elementList.innerHTML = '<div class="request-list-empty">No UI Bridge elements registered</div>';
+    return;
+  }
+
+  const html = uibridgeElements
+    .map((el) => {
+      const typeClass = el.type === "button" ? "post" : el.type === "input" ? "put" : "get";
+      const stateInfo = [];
+      if (el.state?.visible === false) stateInfo.push("hidden");
+      if (el.state?.enabled === false) stateInfo.push("disabled");
+      if (el.state?.focused) stateInfo.push("focused");
+
+      return `
+        <div class="request-item" data-element-id="${escapeHtml(el.id)}">
+          <div class="request-main-row">
+            <span class="request-method ${typeClass}">${el.type || "elem"}</span>
+            <span class="request-url" title="${escapeHtml(el.id)}">${escapeHtml(el.id)}</span>
+            ${el.label ? `<span class="request-host">${escapeHtml(el.label)}</span>` : ""}
+          </div>
+          ${stateInfo.length > 0 ? `<div class="request-body-preview">${stateInfo.join(", ")}</div>` : ""}
+          <div class="request-actions">
+            <button class="btn-send uibridge-highlight" data-element-id="${escapeHtml(el.id)}" title="Highlight element">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"></circle>
+                <circle cx="12" cy="12" r="3"></circle>
+              </svg>
+            </button>
+            ${el.actions?.includes("click") ? `<button class="btn-copy uibridge-action" data-element-id="${escapeHtml(el.id)}" data-action="click" title="Click">Click</button>` : ""}
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  elementList.innerHTML = html;
+
+  // Add event listeners
+  elementList.querySelectorAll(".uibridge-highlight").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      highlightElement(btn.dataset.elementId);
+    });
+  });
+
+  elementList.querySelectorAll(".uibridge-action").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      executeUIBridgeAction(btn.dataset.elementId, btn.dataset.action);
+    });
+  });
+}
+
+/**
+ * Toggle element picker mode
+ */
+async function togglePicker() {
+  if (isPickerActive) {
+    const response = await sendUIBridgeCommand("disablePicker");
+    if (response?.success) {
+      isPickerActive = false;
+      togglePickerBtn.classList.remove("recording");
+      togglePickerBtnText.textContent = "Start Picker";
+    }
+  } else {
+    const response = await sendUIBridgeCommand("enablePicker");
+    if (response?.success) {
+      isPickerActive = true;
+      togglePickerBtn.classList.add("recording");
+      togglePickerBtnText.textContent = "Stop Picker";
+    }
+  }
+}
+
+/**
+ * Toggle element overlays
+ */
+async function toggleOverlays() {
+  if (showingOverlays) {
+    const response = await sendUIBridgeCommand("hideOverlays");
+    if (response?.success) {
+      showingOverlays = false;
+      showOverlaysBtn.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <rect x="7" y="7" width="3" height="9"></rect>
+          <rect x="14" y="7" width="3" height="9"></rect>
+        </svg>
+        Show Overlays
+      `;
+    }
+  } else {
+    const elementIds = uibridgeElements.map((el) => el.id);
+    const response = await sendUIBridgeCommand("showOverlays", { elementIds });
+    if (response?.success) {
+      showingOverlays = true;
+      showOverlaysBtn.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <line x1="9" y1="9" x2="15" y2="15"></line>
+          <line x1="15" y1="9" x2="9" y2="15"></line>
+        </svg>
+        Hide Overlays
+      `;
+    }
+  }
+}
+
+/**
+ * Highlight a specific element
+ */
+async function highlightElement(elementId) {
+  await sendUIBridgeCommand("highlightElement", { elementId });
+  showResult(true, `Highlighting: ${elementId}`);
+}
+
+/**
+ * Execute an action on a UI Bridge element
+ */
+async function executeUIBridgeAction(elementId, action, params = {}) {
+  const response = await sendUIBridgeCommand("executeAction", { elementId, action, params });
+
+  if (response?.success) {
+    showResult(true, `Action "${action}" executed on ${elementId}`);
+    // Refresh elements to see state changes
+    setTimeout(refreshUIBridgeElements, 500);
+  } else {
+    showResult(false, response?.error || `Failed to execute ${action}`);
+  }
+}
+
+/**
+ * View state snapshot
+ */
+async function viewStateSnapshot() {
+  const response = await sendUIBridgeCommand("getStateSnapshot");
+
+  if (response?.success && response?.data) {
+    const snapshot = response.data;
+    const info = [
+      `Active States: ${snapshot.activeStates?.join(", ") || "none"}`,
+      `States: ${snapshot.states?.length || 0}`,
+      `Transitions: ${snapshot.transitions?.length || 0}`,
+      `Timestamp: ${new Date(snapshot.timestamp).toLocaleTimeString()}`,
+    ];
+    showResult(true, "State Snapshot", info.join("<br>"));
+  } else {
+    showResult(false, "Failed to get state snapshot");
+  }
+}
+
+// UI Bridge event listeners
+togglePickerBtn.addEventListener("click", togglePicker);
+refreshElementsBtn.addEventListener("click", refreshUIBridgeElements);
+showOverlaysBtn.addEventListener("click", toggleOverlays);
+viewSnapshotBtn.addEventListener("click", viewStateSnapshot);
+
+// Listen for UI Bridge events from background
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === "UI_BRIDGE_EVENT") {
+    const { eventType, data } = message;
+
+    if (eventType === "elementPicked") {
+      // Element was picked via the picker
+      showResult(true, `Picked: ${data.id}`, `Type: ${data.type}, Tag: ${data.tagName}`);
+      // Auto-disable picker after selection
+      if (isPickerActive) {
+        togglePicker();
+      }
+      // Refresh elements
+      refreshUIBridgeElements();
+    } else if (eventType === "elementHovered") {
+      // Could show hover info in status
+    }
   }
 });

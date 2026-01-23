@@ -27,6 +27,7 @@ import {
 import { ContextSelector, useContexts } from "./contexts";
 import type { ContextSelection } from "../types/context";
 import { getAccentColors, getStatusColors } from "@/design-system";
+import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
 
 // Types for the prompt library
 // Simplified model: every task runs until [TASK_COMPLETE] marker is found
@@ -703,29 +704,24 @@ export function PromptLibraryTab({ onLog }: PromptLibraryTabProps) {
           <h2 className="text-xl font-semibold">Task Library</h2>
           <span className="text-sm text-muted-foreground">({prompts.length} tasks)</span>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={importPrompts}
-            className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
-          >
-            <Upload className="w-4 h-4" />
-            Import
-          </button>
-          <button
-            onClick={exportPrompts}
-            className="btn-secondary flex items-center gap-2 px-3 py-2 text-sm"
-          >
-            <Download className="w-4 h-4" />
-            Export
-          </button>
-          <button
-            onClick={startCreating}
-            className="btn-primary flex items-center gap-2 px-3 py-2 text-sm"
-          >
-            <Plus className="w-4 h-4" />
-            New Task
-          </button>
-        </div>
+        <BuilderToolbar
+          actions={[
+            toolbarActions.aiPlaceholder(),
+            toolbarActions.new(startCreating, "New Task"),
+            {
+              key: "import",
+              icon: Upload,
+              label: "Import",
+              onClick: importPrompts,
+            },
+            {
+              key: "export",
+              icon: Download,
+              label: "Export",
+              onClick: exportPrompts,
+            },
+          ]}
+        />
       </div>
 
       {/* Search and Filter */}

@@ -651,6 +651,49 @@ pub fn emit_overrides_summary(
 }
 
 // ============================================================================
+// Phase Transition Events
+// ============================================================================
+
+/// Emit a phase transition event (setup -> verification -> completion).
+///
+/// This is emitted when the orchestrator transitions between phases:
+/// - "setup" -> "verification": Setup steps complete, entering verification loop
+/// - "verification" -> "completion": Verification loop done, running completion steps
+/// - "completion" -> "complete": All phases done
+pub fn emit_phase_transition(
+    app_handle: &tauri::AppHandle,
+    from_phase: &str,
+    to_phase: &str,
+    iteration: u32,
+    session_ctx: Option<&AiOutputSessionContext>,
+) {
+    let message = match (from_phase, to_phase) {
+        ("setup", "verification") => {
+            "Setup phase complete. Transitioning to verification phase.".to_string()
+        }
+        ("verification", "completion") => {
+            format!(
+                "Verification loop finished at iteration {}. Running completion steps.",
+                iteration
+            )
+        }
+        ("completion", "complete") => "Completion phase done. Task finished.".to_string(),
+        _ => format!(
+            "Phase transition: {} -> {} (iteration {})",
+            from_phase, to_phase, iteration
+        ),
+    };
+
+    emit_ai_output(
+        app_handle,
+        &format!("[Orchestrator] {}", message),
+        SOURCE_ORCHESTRATOR,
+        None,
+        session_ctx,
+    );
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 

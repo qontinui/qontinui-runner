@@ -79,7 +79,7 @@ pub fn load_configuration(
     }
 
     // Store the configuration
-    *state.current_config.lock().unwrap() = Some(config);
+    *crate::safe_lock::safe_lock_or_recover(&state.current_config, "current_config") = Some(config);
     info!(
         "Configuration loaded successfully: {} (config_id: {}, project_id: {:?})",
         summary, config_id, project_id
@@ -94,7 +94,9 @@ pub fn load_configuration(
     file_logger::copy_config_file(&path);
 
     // If Python bridge is running, send the configuration and debug settings
-    if let Some(ref mut bridge) = *state.python_bridge.lock().unwrap() {
+    if let Some(ref mut bridge) =
+        *crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge")
+    {
         if bridge.is_running() {
             // First send debug settings to ensure they're applied before config execution
             let debug_settings = settings::get_debug_settings();

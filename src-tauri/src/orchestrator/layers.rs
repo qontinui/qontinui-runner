@@ -567,7 +567,10 @@ impl OrchestratorLayer for ExecutionLimitsLayer {
                 }
 
                 // Track iteration start time
-                *self.last_iteration.lock().unwrap() = Some(Instant::now());
+                *crate::safe_lock::safe_lock_or_recover(
+                    &self.last_iteration,
+                    "execution_limits_last_iteration",
+                ) = Some(Instant::now());
 
                 // Reset consecutive errors on new iteration
                 self.consecutive_errors
@@ -670,12 +673,17 @@ impl DebugLayer {
 
     /// Get captured events.
     pub fn get_events(&self) -> Vec<OrchestratorEvent> {
-        self.captured_events.lock().unwrap().clone()
+        crate::safe_lock::safe_lock_or_recover(&self.captured_events, "debug_layer_captured_events")
+            .clone()
     }
 
     /// Clear captured events.
     pub fn clear_events(&self) {
-        self.captured_events.lock().unwrap().clear();
+        crate::safe_lock::safe_lock_or_recover(
+            &self.captured_events,
+            "debug_layer_captured_events",
+        )
+        .clear();
     }
 }
 
@@ -686,7 +694,10 @@ impl OrchestratorLayer for DebugLayer {
         }
 
         // Capture event
-        let mut events = self.captured_events.lock().unwrap();
+        let mut events = crate::safe_lock::safe_lock_or_recover(
+            &self.captured_events,
+            "debug_layer_captured_events",
+        );
         if events.len() < self.max_captured {
             events.push(event.clone());
         }

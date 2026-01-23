@@ -183,11 +183,13 @@ fn default_input_type() -> String {
 
 /// A finding detected by AI analysis
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Finding {
     pub id: String,
     pub task_run_id: String,
     pub session_num: u32,
 
+    #[serde(rename = "categoryId")]
     pub category: FindingCategory,
     pub severity: FindingSeverity,
     pub status: FindingStatus,

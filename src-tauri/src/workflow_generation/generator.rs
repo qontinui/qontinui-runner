@@ -21,7 +21,6 @@ pub struct GenerateWorkflowRequest {
     pub tags: Option<Vec<String>>,
 
     // === Workflow Configuration Options ===
-
     /// Maximum iterations for agentic phase (default: 10)
     #[serde(default)]
     pub max_iterations: Option<u32>,
@@ -159,16 +158,14 @@ Remember: Return ONLY valid JSON, no markdown code blocks or explanations."#,
     if let Some(ref log_source) = request.log_source_selection {
         // Parse log source selection - can be "default", "ai", "all", or a profile_id
         use crate::unified_workflows::LogSourceSelection;
-        workflow.log_source_selection = if log_source == "default"
-            || log_source == "ai"
-            || log_source == "all"
-        {
-            LogSourceSelection::Mode(log_source.clone())
-        } else {
-            LogSourceSelection::Profile {
-                profile_id: log_source.clone(),
-            }
-        };
+        workflow.log_source_selection =
+            if log_source == "default" || log_source == "ai" || log_source == "all" {
+                LogSourceSelection::Mode(log_source.clone())
+            } else {
+                LogSourceSelection::Profile {
+                    profile_id: log_source.clone(),
+                }
+            };
     }
     if let Some(prompt_template) = request.prompt_template {
         workflow.prompt_template = Some(prompt_template);

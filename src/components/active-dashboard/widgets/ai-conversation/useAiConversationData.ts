@@ -7,6 +7,7 @@
 
 import { useState, useEffect, useMemo } from "react";
 import { logManager } from "../../../../managers";
+import { useCurrentTaskRunId } from "../../../../contexts/TaskContext";
 import type { AiConversationData, AiOutputEntry } from "./types";
 
 /** Threshold in milliseconds to consider AI as "thinking" based on recent activity */
@@ -70,10 +71,24 @@ const EMPTY_DATA: AiConversationData = {
 /**
  * Hook for accessing AI conversation data.
  * Returns transformed data suitable for widget display.
- * Only shows entries from the most recent session/task.
+ * Only shows entries from the current active session (not historical data).
+ * Uses TaskContext to determine if a task is running and filter appropriately.
  */
 export function useAiConversationData(): AiConversationData {
+  const currentTaskRunId = useCurrentTaskRunId();
   const [allEntries, setAllEntries] = useState<AiOutputEntry[]>([]);
+  const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
+
+  // Track when a new task starts (to filter out stale data)
+  useEffect(() => {
+    if (currentTaskRunId) {
+      // New task started - record the time to filter out older entries
+      setSessionStartTime(Date.now());
+    } else {
+      // No task running - clear session start time
+      setSessionStartTime(null);
+    }
+  }, [currentTaskRunId]);
 
   // Subscribe to log changes
   useEffect(() => {
@@ -108,13 +123,22 @@ export function useAiConversationData(): AiConversationData {
   // Filter to current session and deduplicate
   const entries = useMemo(() => {
     try {
-      const sessionFiltered = filterToCurrentSession(allEntries);
+      // If no task is running (no sessionStartTime), return empty array to avoid showing stale data
+      if (sessionStartTime === null) {
+        return [];
+      }
+
+      // Filter to entries that arrived after session started
+      const recentEntries = allEntries.filter((entry) => entry.timestamp >= sessionStartTime);
+
+      // Then filter to current session and deduplicate
+      const sessionFiltered = filterToCurrentSession(recentEntries);
       return deduplicateEntries(sessionFiltered);
     } catch (e) {
       console.error("useAiConversationData: Error filtering entries:", e);
       return [];
     }
-  }, [allEntries]);
+  }, [allEntries, sessionStartTime]);
 
   // Compute derived state
   const data = useMemo((): AiConversationData => {

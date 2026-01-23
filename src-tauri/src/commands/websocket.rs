@@ -46,7 +46,8 @@ pub fn configure_websocket(
         config.enabled, config.url, config.runner_name
     );
 
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err(
@@ -91,7 +92,8 @@ pub fn configure_websocket(
 pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Connecting WebSocket");
 
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err(
@@ -128,7 +130,8 @@ pub fn connect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse,
 pub fn disconnect_websocket(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Disconnecting WebSocket");
 
-    let mut bridge_lock = state.python_bridge.lock().unwrap();
+    let mut bridge_lock =
+        crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
     if let Some(ref mut bridge) = *bridge_lock {
         if !bridge.is_running() {
             return Err(

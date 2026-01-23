@@ -291,7 +291,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
   const IconComponent = (iconName: string) => iconMap[iconName] || Info;
 
   return (
-    <div className="h-full flex flex-col p-4">
+    <div data-ui-id="findings-category-manager" className="h-full flex flex-col p-4">
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div>
@@ -302,6 +302,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
         </div>
         <div className="flex items-center gap-2">
           <button
+            data-ui-id="findings-reset-categories-btn"
             onClick={handleResetToDefaults}
             className="flex items-center gap-2 px-3 py-2 text-sm border border-border rounded-lg hover:bg-muted transition-colors"
             title="Reset to defaults"
@@ -310,6 +311,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
             Reset
           </button>
           <button
+            data-ui-id="findings-new-category-btn"
             onClick={() => {
               resetForm();
               setIsCreating(true);
@@ -351,7 +353,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
       )}
 
       {/* Category List */}
-      <div className="flex-1 overflow-y-auto space-y-2">
+      <div data-ui-id="findings-category-list" className="flex-1 overflow-y-auto space-y-2">
         {categories.length === 0 ? (
           <div className="text-center text-muted-foreground py-8">
             No categories found. Create one to get started!
@@ -367,6 +369,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
             return (
               <div
                 key={category.id}
+                data-ui-id={`findings-category-item-${category.id}`}
                 className={`rounded-lg border ${isHidden ? "opacity-50" : ""} ${
                   isEditing ? "border-primary/50" : "border-border"
                 } bg-card overflow-hidden transition-all`}
@@ -430,6 +433,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
                     <div className="flex items-center gap-1 flex-shrink-0">
                       {/* Visibility Toggle */}
                       <button
+                        data-ui-id="findings-visibility-toggle-btn"
                         onClick={() => handleToggleVisibility(category.id, isHidden)}
                         className={`p-2 rounded-lg transition-colors ${
                           isHidden
@@ -444,6 +448,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
                       {/* Edit Button (custom only) */}
                       {!isBuiltIn && (
                         <button
+                          data-ui-id="findings-edit-category-btn"
                           onClick={() => {
                             if (isEditing) {
                               setEditingId(null);
@@ -465,6 +470,7 @@ export function CategoryManager({ onLog }: CategoryManagerProps) {
                       {/* Delete Button (custom only) */}
                       {!isBuiltIn && (
                         <button
+                          data-ui-id="findings-delete-category-btn"
                           onClick={() => handleDelete(category.id, category.name)}
                           className={`p-2 hover:${getAccentColors("red").bg} rounded-lg transition-colors`}
                           title="Delete category"

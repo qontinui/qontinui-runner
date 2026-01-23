@@ -98,6 +98,7 @@ export function WidgetHeader({
 
   return (
     <div
+      data-ui-id={`widget-header-${title.toLowerCase().replace(/\s+/g, '-')}`}
       className={cn(
         "flex items-center justify-between border-b border-border",
         compact ? "px-3 py-2" : "px-4 py-3",
@@ -143,6 +144,7 @@ export function WidgetHeader({
         {/* View All link */}
         {onViewAll && (
           <button
+            data-ui-id="widget-view-all-btn"
             onClick={onViewAll}
             className={cn("flex items-center gap-1 text-xs hover:underline", colors.text)}
           >

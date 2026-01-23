@@ -229,10 +229,11 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       )}
 
       {/* Action Caching Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden">
+      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-selfhealing-caching-section">
         <button
           onClick={() => setCachingExpanded(!cachingExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
+          data-ui-id="settings-selfhealing-caching-toggle-btn"
         >
           <div className="flex items-center gap-3">
             <Database className="w-5 h-5 text-primary" />
@@ -284,6 +285,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                   }
                   disabled={!settings.action_caching_enabled}
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50 disabled:opacity-50"
+                  data-ui-id="settings-selfhealing-cache-ttl-input"
                 />
                 <p className="text-[10px] text-muted-foreground">
                   How long cached action results remain valid (30-3600 seconds)
@@ -303,10 +305,11 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       </div>
 
       {/* Visual Validation Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden">
+      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-selfhealing-validation-section">
         <button
           onClick={() => setValidationExpanded(!validationExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
+          data-ui-id="settings-selfhealing-validation-toggle-btn"
         >
           <div className="flex items-center gap-3">
             <Eye className="w-5 h-5 text-primary" />
@@ -350,10 +353,11 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
       </div>
 
       {/* LLM Assistance Section */}
-      <div className="rounded-lg bg-card/50 overflow-hidden">
+      <div className="rounded-lg bg-card/50 overflow-hidden" data-ui-id="settings-selfhealing-llm-section">
         <button
           onClick={() => setLlmExpanded(!llmExpanded)}
           className="w-full p-4 flex items-center justify-between hover:bg-muted/30 transition-colors"
+          data-ui-id="settings-selfhealing-llm-toggle-btn"
         >
           <div className="flex items-center gap-3">
             <Bot className="w-5 h-5 text-primary" />
@@ -388,6 +392,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                     }))
                   }
                   className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                  data-ui-id="settings-selfhealing-llm-mode-select"
                 >
                   {LLM_MODE_OPTIONS.map((option) => (
                     <option key={option.value} value={option.value}>
@@ -420,6 +425,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                       }
                       placeholder="llava"
                       className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      data-ui-id="settings-selfhealing-ollama-model-input"
                     />
                     <p className="text-[10px] text-muted-foreground">
                       Model to use for visual understanding (e.g., llava, bakllava, llava-phi3)
@@ -447,6 +453,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                         }))
                       }
                       className="w-full px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                      data-ui-id="settings-selfhealing-api-provider-select"
                     >
                       {API_PROVIDER_OPTIONS.map((option) => (
                         <option key={option.value} value={option.value}>
@@ -469,6 +476,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                         <button
                           onClick={deleteApiKey}
                           className="px-3 py-1.5 text-xs bg-red-500/10 text-red-500 hover:bg-red-500/20 rounded-md transition-colors"
+                          data-ui-id="settings-selfhealing-api-key-remove-btn"
                         >
                           Remove
                         </button>
@@ -482,10 +490,12 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                             onChange={(e) => setApiKey(e.target.value)}
                             placeholder={`Enter ${settings.api_provider === "open_ai" ? "OpenAI" : "Anthropic"} API key`}
                             className="flex-1 px-2.5 py-1.5 text-sm bg-muted/50 rounded-md outline-none focus:ring-1 focus:ring-primary/50"
+                            data-ui-id="settings-selfhealing-api-key-input"
                           />
                           <button
                             onClick={() => setApiKeyVisible(!apiKeyVisible)}
                             className="px-3 py-1.5 text-xs bg-muted hover:bg-muted/80 rounded-md transition-colors"
+                            data-ui-id="settings-selfhealing-api-key-visibility-btn"
                           >
                             {apiKeyVisible ? "Hide" : "Show"}
                           </button>
@@ -494,6 +504,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
                           onClick={saveApiKey}
                           disabled={!apiKey.trim()}
                           className="w-full px-3 py-1.5 text-xs bg-primary hover:bg-primary/80 text-primary-foreground rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          data-ui-id="settings-selfhealing-api-key-save-btn"
                         >
                           Save API Key
                         </button>
@@ -524,6 +535,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
         <button
           onClick={resetToDefaults}
           className="px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md font-medium transition-colors text-sm"
+          data-ui-id="settings-selfhealing-reset-defaults-btn"
         >
           Reset to Defaults
         </button>
@@ -532,6 +544,7 @@ export function SelfHealingSettings({ onLog }: SelfHealingSettingsProps) {
           onClick={saveSettings}
           disabled={saving}
           className="px-6 py-2 bg-primary hover:bg-primary/80 text-primary-foreground rounded-md font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-sm"
+          data-ui-id="settings-selfhealing-save-btn"
         >
           {saving ? (
             <>

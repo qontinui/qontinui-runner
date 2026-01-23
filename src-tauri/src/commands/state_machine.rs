@@ -33,7 +33,7 @@ pub async fn execute_transition(
     transition_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Executing transition: {}", transition_id);
-    let mut bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
@@ -79,7 +79,7 @@ pub async fn navigate_to_state(
     state_id: String,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to state: {}", state_id);
-    let mut bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
@@ -123,7 +123,7 @@ pub async fn navigate_to_multiple_states(
     state_ids: Vec<String>,
 ) -> Result<CommandResponse, String> {
     info!("Navigating to multiple states: {:?}", state_ids);
-    let mut bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
@@ -165,7 +165,7 @@ pub async fn navigate_to_multiple_states(
 #[tauri::command]
 pub async fn get_active_states(state: State<'_, Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting active states");
-    let mut bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {
@@ -205,7 +205,7 @@ pub async fn get_available_transitions(
     state: State<'_, Arc<AppState>>,
 ) -> Result<CommandResponse, String> {
     info!("Getting available transitions");
-    let mut bridge = state.python_bridge.lock().unwrap();
+    let mut bridge = crate::safe_lock::safe_lock_or_recover(&state.python_bridge, "python_bridge");
 
     if let Some(ref mut bridge) = *bridge {
         if !bridge.is_running() {

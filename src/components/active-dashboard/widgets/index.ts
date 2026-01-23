@@ -77,6 +77,22 @@ export {
   type WorkflowRefData,
 } from "./workflow-ref";
 
+// MCP Call
+export {
+  McpCallWidget,
+  McpCallSummary,
+  useMcpCallData,
+  type McpCallData,
+} from "./mcp-call";
+
+// Execution Timeline
+export {
+  ExecutionTimelineWidget,
+  ExecutionTimelineSummary,
+  useExecutionTimelineData,
+  type ExecutionTimelineData,
+} from "./execution-timeline";
+
 // Shared components
 export {
   StepStatusBadge,

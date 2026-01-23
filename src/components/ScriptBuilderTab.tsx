@@ -20,7 +20,10 @@ import {
   ImageIcon,
   CheckSquare,
   Search,
+  Trash2,
+  Check,
 } from "lucide-react";
+import { BatchDeleteDialog } from "./ui/BatchDeleteDialog";
 import type {
   PlaywrightScript,
   PlaywrightResult,
@@ -31,6 +34,7 @@ import type {
 import { ScriptletSelector, useScriptletMention } from "./ScriptletSelector";
 import { executeAiTask } from "../hooks";
 import { getAccentColors, getStatusColors } from "@/design-system";
+import { BuilderToolbar, toolbarActions } from "./ui/BuilderToolbar";
 
 type LogLevel = "info" | "warning" | "error" | "debug" | "success";
 
@@ -66,6 +70,12 @@ export function ScriptBuilderTab({
   const [searchQuery, _setSearchQuery] = useState("");
   const [selectedCategory, _setSelectedCategory] = useState<string | null>(null);
   const [categories, setCategories] = useState<string[]>([]);
+
+  // Bulk deletion state
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isBatchDeleting, setIsBatchDeleting] = useState(false);
 
   // Storage key for persisting create form state
   const CREATE_FORM_STORAGE_KEY = "qontinui-script-create-form";
@@ -552,6 +562,50 @@ export function ScriptBuilderTab({
       setLoading(false);
     }
   }, [onLog]);
+
+  // Toggle selection for bulk delete
+  const toggleSelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit selection mode
+  const exitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedIds(new Set());
+  }, []);
+
+  // Delete selected scripts
+  const deleteSelectedScripts = useCallback(async () => {
+    setIsBatchDeleting(true);
+    try {
+      for (const id of selectedIds) {
+        await fetch(`${API_BASE}/playwright/scripts/${id}`, { method: "DELETE" });
+      }
+      exitSelectionMode();
+      setShowBatchDeleteDialog(false);
+      await loadScripts();
+      onLog("success", `Deleted ${selectedIds.size} script(s)`);
+    } catch (error) {
+      onLog("error", `Failed to delete scripts: ${error}`);
+    } finally {
+      setIsBatchDeleting(false);
+    }
+  }, [selectedIds, exitSelectionMode, loadScripts, onLog]);
+
+  // Get names of selected scripts for dialog
+  const getSelectedNames = useCallback(() => {
+    return scripts
+      .filter((s) => selectedIds.has(s.id))
+      .map((s) => s.name);
+  }, [scripts, selectedIds]);
 
   const loadCategories = async () => {
     try {
@@ -1982,19 +2036,25 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
       <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
         {/* Header */}
         <div className="p-4 border-b border-neutral-700">
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center justify-between mb-2">
             <h2 className="text-lg font-semibold flex items-center gap-2">
               <TestTube className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
               Scripts
             </h2>
-            <button
-              onClick={startCreate}
-              className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
-              title="New Script"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
           </div>
+
+          {/* Action buttons */}
+          <BuilderToolbar
+            className="mb-3"
+            actions={[
+              toolbarActions.aiPlaceholder(),
+              toolbarActions.delete(
+                () => setIsSelectionMode(!isSelectionMode),
+                isSelectionMode
+              ),
+              toolbarActions.new(startCreate, "New"),
+            ]}
+          />
 
           {/* Search */}
           <div className="relative">
@@ -2008,6 +2068,44 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
             />
           </div>
         </div>
+
+        {/* Selection Mode Header */}
+        {isSelectionMode && (
+          <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+            <span className="text-sm text-red-400">
+              {selectedIds.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setSelectedIds(new Set(filteredScripts.map(s => s.id)))}
+                className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded"
+              >
+                Select All
+              </button>
+              <button
+                onClick={() => setSelectedIds(new Set())}
+                disabled={selectedIds.size === 0}
+                className="px-2 py-1 text-xs bg-neutral-700 hover:bg-neutral-600 text-neutral-200 rounded disabled:opacity-50"
+              >
+                Clear
+              </button>
+              <button
+                onClick={() => setShowBatchDeleteDialog(true)}
+                disabled={selectedIds.size === 0}
+                className="px-2 py-1 text-xs bg-red-600 hover:bg-red-500 text-white rounded disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                Delete Selected
+              </button>
+              <button
+                onClick={exitSelectionMode}
+                className="p-1 text-neutral-400 hover:text-neutral-200"
+                title="Cancel selection"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Script List */}
         <div className="flex-1 overflow-y-auto p-2">
@@ -2025,22 +2123,37 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
               {filteredScripts.map((script) => (
                 <button
                   key={script.id}
-                  onClick={() => selectScript(script)}
+                  onClick={() => isSelectionMode ? toggleSelection(script.id) : selectScript(script)}
                   className={`w-full text-left p-3 rounded-lg transition-colors ${
                     editingScript?.id === script.id ? "bg-neutral-700" : "hover:bg-neutral-800"
-                  }`}
+                  } ${isSelectionMode && selectedIds.has(script.id) ? "bg-red-500/10" : ""}`}
                 >
-                  <div className="font-medium text-sm truncate">{script.name}</div>
-                  {script.target_url && (
-                    <div className="text-xs text-neutral-400 truncate mt-0.5">
-                      {script.target_url}
+                  <div className="flex items-center gap-2">
+                    {isSelectionMode && (
+                      <div
+                        className={`w-4 h-4 rounded border flex-shrink-0 flex items-center justify-center ${
+                          selectedIds.has(script.id)
+                            ? "bg-red-500 border-red-500"
+                            : "border-neutral-500 hover:border-red-400"
+                        }`}
+                      >
+                        {selectedIds.has(script.id) && <Check className="w-3 h-3 text-white" />}
+                      </div>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <div className="font-medium text-sm truncate">{script.name}</div>
+                      {script.target_url && (
+                        <div className="text-xs text-neutral-400 truncate mt-0.5">
+                          {script.target_url}
+                        </div>
+                      )}
+                      {script.category && (
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 mt-1.5 inline-block">
+                          {script.category}
+                        </span>
+                      )}
                     </div>
-                  )}
-                  {script.category && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400 mt-1.5 inline-block">
-                      {script.category}
-                    </span>
-                  )}
+                  </div>
                 </button>
               ))}
             </div>
@@ -2720,6 +2833,17 @@ Example: "Navigate to the dashboard, click the Create button, then select Extrac
           </div>
         )}
       </div>
+
+      {/* Batch Delete Dialog */}
+      <BatchDeleteDialog
+        open={showBatchDeleteDialog}
+        title="Delete Scripts"
+        itemType="script"
+        itemNames={getSelectedNames()}
+        isDeleting={isBatchDeleting}
+        onClose={() => setShowBatchDeleteDialog(false)}
+        onConfirm={deleteSelectedScripts}
+      />
     </div>
   );
 }

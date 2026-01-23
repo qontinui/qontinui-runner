@@ -245,6 +245,49 @@ pub struct ApiRequestLogParams<'a> {
     pub error: Option<&'a str>,
 }
 
+/// UI Bridge event log entry
+#[derive(Debug, Serialize, Deserialize)]
+pub struct UIBridgeLogEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub sequence: u32,
+    pub event_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<f64>,
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Parameters for logging a UI Bridge event
+pub struct UIBridgeLogParams<'a> {
+    pub event_type: &'a str,
+    pub element_id: Option<&'a str>,
+    pub state_id: Option<&'a str>,
+    pub transition_id: Option<&'a str>,
+    pub action: Option<&'a str>,
+    pub params: Option<&'a serde_json::Value>,
+    pub result: Option<&'a serde_json::Value>,
+    pub duration_ms: Option<f64>,
+    pub success: bool,
+    pub error_message: Option<&'a str>,
+    pub metadata: Option<&'a serde_json::Value>,
+}
+
 /// Parameters for logging a Playwright test execution
 pub struct PlaywrightLogParams<'a> {
     pub script_id: &'a str,
@@ -501,6 +544,37 @@ impl FileLogger {
         );
     }
 
+    /// Log a UI Bridge event
+    pub fn log_ui_bridge_event(params: &UIBridgeLogParams<'_>, sequence: u32) {
+        if let Err(e) = ensure_dirs() {
+            error!("Failed to ensure log directories: {}", e);
+            return;
+        }
+
+        let entry = UIBridgeLogEntry {
+            id: format!("uib-{}", uuid::Uuid::new_v4()),
+            timestamp: format_timestamp_now(),
+            sequence,
+            event_type: params.event_type.to_string(),
+            element_id: params.element_id.map(String::from),
+            state_id: params.state_id.map(String::from),
+            transition_id: params.transition_id.map(String::from),
+            action: params.action.map(String::from),
+            params: params.params.cloned(),
+            result: params.result.cloned(),
+            duration_ms: params.duration_ms,
+            success: params.success,
+            error_message: params.error_message.map(String::from),
+            metadata: params.metadata.cloned(),
+        };
+
+        Self::append_to_jsonl("runner-ui-bridge.jsonl", &entry);
+        debug!(
+            "Logged UI Bridge event: {} (element: {:?}, state: {:?})",
+            params.event_type, params.element_id, params.state_id
+        );
+    }
+
     /// Log an API request execution
     pub fn log_api_request(params: &ApiRequestLogParams<'_>) {
         if let Err(e) = ensure_dirs() {
@@ -640,6 +714,7 @@ impl FileLogger {
             "runner-actions.jsonl",
             "runner-playwright.jsonl",
             "runner-api-requests.jsonl",
+            "runner-ui-bridge.jsonl",
         ];
 
         for filename in files {
@@ -688,7 +763,11 @@ impl FileLogger {
     }
 }
 
-/// Copy a config file to .dev-logs for Claude Code access
+/// Copy a GUI automation config file to .dev-logs for Claude Code access.
+///
+/// NOTE: This is for model-based GUI automation configs (images, states, etc.),
+/// NOT unified workflow configs. The file is saved as "last-loaded-gui-config.*"
+/// to avoid confusion with unified workflow configurations.
 pub fn copy_config_file(source_path: &str) {
     if let Err(e) = ensure_dirs() {
         error!("Failed to ensure log directories: {}", e);
@@ -702,26 +781,29 @@ pub fn copy_config_file(source_path: &str) {
     }
 
     // Determine the destination filename based on extension
+    // Using "gui-config" to distinguish from unified workflow configs
     let extension = source
         .extension()
         .and_then(|ext| ext.to_str())
         .unwrap_or("json");
 
-    let dest_filename = format!("last-loaded-config.{}", extension);
+    let dest_filename = format!("last-loaded-gui-config.{}", extension);
     let dest_path = get_dev_logs_dir().join(&dest_filename);
 
     match fs::copy(source, &dest_path) {
         Ok(_) => {
-            debug!("Copied config to: {}", dest_path.display());
+            debug!("Copied GUI config to: {}", dest_path.display());
 
             // Also write a metadata file with source path and timestamp
             let metadata = serde_json::json!({
                 "source_path": source_path,
                 "copied_at": chrono::Utc::now().to_rfc3339(),
-                "filename": dest_filename
+                "filename": dest_filename,
+                "config_type": "gui_automation",
+                "description": "Model-based GUI automation config (images, states, transitions). This is NOT a unified workflow."
             });
 
-            let meta_path = get_dev_logs_dir().join("last-loaded-config.meta.json");
+            let meta_path = get_dev_logs_dir().join("last-loaded-gui-config.meta.json");
             if let Ok(json) = serde_json::to_string_pretty(&metadata) {
                 if let Err(e) = fs::write(&meta_path, json) {
                     warn!("Failed to write config metadata: {}", e);
@@ -730,6 +812,48 @@ pub fn copy_config_file(source_path: &str) {
         }
         Err(e) => {
             error!("Failed to copy config file: {}", e);
+        }
+    }
+}
+
+/// Save a unified workflow config to .dev-logs for Claude Code access.
+///
+/// This is for unified workflow configurations (setup_steps, verification_steps,
+/// agentic_steps, completion_steps). Saved as "last-unified-workflow.json".
+pub fn save_unified_workflow_config(workflow: &serde_json::Value, workflow_name: &str) {
+    if let Err(e) = ensure_dirs() {
+        error!("Failed to ensure log directories: {}", e);
+        return;
+    }
+
+    let dest_path = get_dev_logs_dir().join("last-unified-workflow.json");
+
+    match serde_json::to_string_pretty(workflow) {
+        Ok(json) => {
+            if let Err(e) = fs::write(&dest_path, &json) {
+                error!("Failed to write unified workflow config: {}", e);
+                return;
+            }
+            debug!("Saved unified workflow config to: {}", dest_path.display());
+
+            // Also write a metadata file
+            let metadata = serde_json::json!({
+                "workflow_name": workflow_name,
+                "saved_at": chrono::Utc::now().to_rfc3339(),
+                "filename": "last-unified-workflow.json",
+                "config_type": "unified_workflow",
+                "description": "Unified workflow with phases: setup_steps, verification_steps, agentic_steps, completion_steps"
+            });
+
+            let meta_path = get_dev_logs_dir().join("last-unified-workflow.meta.json");
+            if let Ok(meta_json) = serde_json::to_string_pretty(&metadata) {
+                if let Err(e) = fs::write(&meta_path, meta_json) {
+                    warn!("Failed to write unified workflow metadata: {}", e);
+                }
+            }
+        }
+        Err(e) => {
+            error!("Failed to serialize unified workflow config: {}", e);
         }
     }
 }

@@ -222,11 +222,183 @@ export interface TestAssociation {
 }
 
 // ============================================================================
+// Workflow Run Context (for AI Test Generation)
+// ============================================================================
+
+/** Summary of a task run for selection in UI */
+export interface TaskRunSummary {
+  id: string;
+  task_name: string;
+  workflow_name?: string;
+  status: string;
+  created_at: string;
+  completed_at?: string;
+  duration_ms?: number;
+  goal_achieved?: boolean;
+}
+
+/** Automation metrics from a workflow run */
+export interface AutomationMetrics {
+  workflow_name?: string;
+  automation_status: string;
+  duration_ms?: number;
+  actions_summary?: {
+    total: number;
+    success: number;
+    failed: number;
+    skipped: number;
+  };
+  states_visited?: string[];
+  transitions_executed?: Array<{
+    from: string;
+    to: string;
+    action: string;
+    success: boolean;
+    duration_ms?: number;
+  }>;
+}
+
+/** Screenshot captured during workflow execution */
+export interface CapturedScreenshot {
+  id: string;
+  file_path: string;
+  screenshot_type: string;
+  template_name?: string;
+  confidence?: number;
+  match_location?: BoundingBox;
+  created_at: string;
+}
+
+/** API request result from workflow execution */
+export interface ApiRequestResult {
+  id: string;
+  step_name?: string;
+  method: string;
+  url: string;
+  status_code: number;
+  response_time_ms: number;
+  success: boolean;
+  response_body?: unknown;
+  extractions?: Array<{
+    variable_name: string;
+    extracted_value: unknown;
+    success: boolean;
+  }>;
+  error_message?: string;
+}
+
+/** Playwright test result from workflow execution */
+export interface PlaywrightResult {
+  id: string;
+  test_name: string;
+  status: string;
+  duration_ms?: number;
+  error_message?: string;
+  assertions_passed: number;
+  assertions_failed: number;
+  page_snapshot?: string;
+}
+
+/** Event from workflow execution */
+export interface WorkflowEvent {
+  id: number;
+  event_type: string;
+  event_subtype?: string;
+  message: string;
+  data?: unknown;
+  timestamp: string;
+  duration_ms?: number;
+}
+
+/** Knowledge/finding from AI analysis during workflow */
+export interface TaskKnowledgeItem {
+  id: string;
+  category: string;
+  content: string;
+  evidence?: string;
+  confidence: string;
+  is_resolved: boolean;
+  created_at: string;
+}
+
+/** Full workflow run context for AI test generation */
+export interface WorkflowRunContext {
+  /** Task run metadata */
+  task_run: {
+    id: string;
+    task_name: string;
+    prompt?: string;
+    status: string;
+    workflow_name?: string;
+    summary?: string;
+    goal_achieved?: boolean;
+    remaining_work?: string;
+    created_at: string;
+    completed_at?: string;
+  };
+
+  /** Automation metrics (if automation was run) */
+  automation?: AutomationMetrics;
+
+  /** Screenshots captured during execution */
+  screenshots: CapturedScreenshot[];
+
+  /** API requests made during execution */
+  api_requests: ApiRequestResult[];
+
+  /** Playwright test results */
+  playwright_results: PlaywrightResult[];
+
+  /** Execution events (limited to most relevant) */
+  events: WorkflowEvent[];
+
+  /** AI-detected knowledge/findings */
+  knowledge: TaskKnowledgeItem[];
+
+  /** Test results from verification tests */
+  test_results: Array<{
+    id: string;
+    test_name: string;
+    status: string;
+    output?: string;
+    error_message?: string;
+    assertions_passed: number;
+    assertions_failed: number;
+  }>;
+}
+
+// ============================================================================
+// Reference Documents (for AI Test Generation)
+// ============================================================================
+
+/** Document type for reference materials uploaded for AI test generation */
+export type ReferenceDocumentType = "markdown" | "text" | "image" | "json";
+
+/** A reference document uploaded by the user to provide context for AI test generation */
+export interface ReferenceDocument {
+  /** Unique ID for this document */
+  id: string;
+  /** Display name for the document */
+  name: string;
+  /** Document type */
+  type: ReferenceDocumentType;
+  /** Document content (text for markdown/text/json, base64 for images) */
+  content: string;
+  /** Original file name if uploaded */
+  filename?: string;
+  /** File size in bytes */
+  size?: number;
+}
+
+// ============================================================================
 // Collected Analysis Types (for AI Test Generation)
 // ============================================================================
 
-// Analysis source type
-export type AnalysisSourceType = "playwright" | "vision" | "api_request";
+// Import step output types for the modular piping system
+import type { StepOutput, StepOutputType } from "../../types/step-output";
+
+// Analysis source type (extended to include step_output)
+export type AnalysisSourceType = "playwright" | "vision" | "api_request" | "step_output";
 
 // API Request analysis result (from executing a saved API request)
 export interface ApiRequestAnalysis {
@@ -260,10 +432,76 @@ export interface ApiRequestAnalysis {
 }
 
 // A single collected analysis (can be any type)
+// Extended with step_output to support the modular piping system
 export type CollectedAnalysis =
   | { type: "playwright"; id: string; name: string; data: PageAnalysis }
   | { type: "vision"; id: string; name: string; data: PageAnalysis }
-  | { type: "api_request"; id: string; name: string; data: ApiRequestAnalysis };
+  | { type: "api_request"; id: string; name: string; data: ApiRequestAnalysis }
+  | { type: "step_output"; id: string; name: string; data: StepOutput };
+
+// Re-export step output types for convenience
+export type { StepOutput, StepOutputType };
+
+// ============================================================================
+// Helper Functions for Step Output Integration
+// ============================================================================
+
+/**
+ * Create a CollectedAnalysis from a StepOutput.
+ * This bridges the new modular step output system with the existing analysis system.
+ */
+export function createAnalysisFromStepOutput(output: StepOutput): CollectedAnalysis {
+  return {
+    type: "step_output",
+    id: output.id,
+    name: output.step_name,
+    data: output,
+  };
+}
+
+/**
+ * Extract StepOutput from a CollectedAnalysis.
+ * Handles both step_output type and converts api_request type to StepOutput.
+ * Returns undefined for other analysis types (playwright, vision).
+ */
+export function getStepOutputFromAnalysis(analysis: CollectedAnalysis): StepOutput | undefined {
+  if (analysis.type === "step_output") {
+    return analysis.data;
+  }
+
+  // Convert api_request to ApiRequestStepOutput
+  if (analysis.type === "api_request") {
+    const apiData = analysis.data;
+    return {
+      id: apiData.id,
+      step_type: "api_request",
+      step_name: apiData.request_name,
+      executed_at: apiData.executed_at,
+      duration_ms: apiData.duration_ms ?? 0,
+      success: !apiData.error && (apiData.status_code ?? 0) < 400,
+      error: apiData.error,
+      method: apiData.method,
+      url: apiData.url,
+      status_code: apiData.status_code,
+      response: apiData.response,
+      source_config: apiData.source_request_config ?? {
+        method: apiData.method,
+        url: apiData.url,
+      },
+    } as StepOutput;
+  }
+
+  return undefined;
+}
+
+/**
+ * Check if a CollectedAnalysis is a step output type.
+ */
+export function isStepOutputAnalysis(
+  analysis: CollectedAnalysis,
+): analysis is { type: "step_output"; id: string; name: string; data: StepOutput } {
+  return analysis.type === "step_output";
+}
 
 // All collected analyses for AI test generation
 export interface CollectedAnalysisSet {

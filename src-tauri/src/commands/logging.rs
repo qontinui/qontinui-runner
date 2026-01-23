@@ -1,7 +1,11 @@
-//! Logging commands for AI output persistence
+//! Logging commands for AI output and render logging persistence
 //!
 //! Provides commands for persisting AI output logs to disk for use by
 //! the QA feedback loop in `/analyze-automation`.
+//!
+//! Also provides render logging for UI component testing - components log
+//! what data they render, and Python tests can read these logs to verify
+//! the UI displays the correct information.
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -423,5 +427,200 @@ pub fn clear_all_run_history() -> CommandResponse {
                 "errors": errors
             })),
         }
+    }
+}
+
+// ============================================================================
+// Render Logging - For UI Component Testing
+// ============================================================================
+
+/// Render log entry structure for component render logging.
+/// Components log what data they are rendering so tests can verify display.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RenderLogEntry {
+    /// Unique ID for this log entry
+    pub id: String,
+    /// Timestamp when the render occurred
+    pub timestamp: i64,
+    /// Component name (e.g., "RunRecapTab", "StatusBanner")
+    pub component: String,
+    /// What triggered this render (e.g., "mount", "data_update", "prop_change")
+    pub trigger: String,
+    /// The data that was rendered (component-specific structure)
+    pub data: serde_json::Value,
+    /// Optional: sections that are visible/expanded
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_sections: Option<Vec<String>>,
+    /// Optional: task run ID if applicable
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_run_id: Option<i64>,
+}
+
+/// Get the path to the render log file
+fn get_render_log_path() -> PathBuf {
+    crate::paths::get_render_log_path()
+}
+
+/// Append a render log entry to the log file.
+/// Called by UI components when they render data.
+#[tauri::command]
+pub fn append_render_log(entry: RenderLogEntry) -> CommandResponse {
+    let log_path = get_render_log_path();
+
+    // Ensure directory exists
+    if let Some(parent) = log_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            error!("Failed to create render log directory: {}", e);
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to create log directory: {}", e)),
+                data: None,
+            };
+        }
+    }
+
+    // Serialize to JSON
+    let json_line = match serde_json::to_string(&entry) {
+        Ok(json) => json,
+        Err(e) => {
+            error!("Failed to serialize render log entry: {}", e);
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to serialize: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    // Append to file
+    let mut file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open render log file: {}", e);
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to open log file: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    if let Err(e) = writeln!(file, "{}", json_line) {
+        error!("Failed to write to render log: {}", e);
+        return CommandResponse {
+            success: false,
+            message: Some(format!("Failed to write: {}", e)),
+            data: None,
+        };
+    }
+
+    CommandResponse {
+        success: true,
+        message: None,
+        data: None,
+    }
+}
+
+/// Clear the render log file.
+/// Called at the start of a test run to ensure fresh logs.
+#[tauri::command]
+pub fn clear_render_log() -> CommandResponse {
+    let log_path = get_render_log_path();
+
+    if log_path.exists() {
+        if let Err(e) = fs::remove_file(&log_path) {
+            error!("Failed to clear render log: {}", e);
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to clear log: {}", e)),
+                data: None,
+            };
+        }
+        info!("Cleared render log");
+    }
+
+    CommandResponse {
+        success: true,
+        message: Some("Render log cleared".to_string()),
+        data: None,
+    }
+}
+
+/// Load all render log entries from the log file.
+/// Used by Python tests to verify component rendering.
+#[tauri::command]
+pub fn load_render_log() -> CommandResponse {
+    let log_path = get_render_log_path();
+
+    if !log_path.exists() {
+        return CommandResponse {
+            success: true,
+            message: Some("No render log file exists".to_string()),
+            data: Some(serde_json::json!({
+                "entries": []
+            })),
+        };
+    }
+
+    let file = match fs::File::open(&log_path) {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Failed to open render log file: {}", e);
+            return CommandResponse {
+                success: false,
+                message: Some(format!("Failed to open log file: {}", e)),
+                data: None,
+            };
+        }
+    };
+
+    let reader = BufReader::new(file);
+    let mut entries: Vec<RenderLogEntry> = Vec::new();
+    let mut line_number = 0;
+
+    for line_result in reader.lines() {
+        line_number += 1;
+        match line_result {
+            Ok(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<RenderLogEntry>(&line) {
+                    Ok(entry) => entries.push(entry),
+                    Err(e) => {
+                        warn!(
+                            "Failed to parse render log entry at line {}: {}",
+                            line_number, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read line {} from render log: {}", line_number, e);
+            }
+        }
+    }
+
+    info!("Loaded {} render log entries", entries.len());
+
+    CommandResponse {
+        success: true,
+        message: Some(format!("Loaded {} entries", entries.len())),
+        data: Some(serde_json::json!({
+            "entries": entries
+        })),
+    }
+}
+
+/// Get the path to the render log file
+#[tauri::command]
+pub fn get_render_log_path_cmd() -> CommandResponse {
+    let log_path = get_render_log_path();
+    CommandResponse {
+        success: true,
+        message: None,
+        data: Some(serde_json::json!({
+            "path": log_path.to_string_lossy()
+        })),
     }
 }

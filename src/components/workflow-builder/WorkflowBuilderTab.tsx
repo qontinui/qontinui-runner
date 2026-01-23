@@ -19,6 +19,9 @@ import {
   Search,
   Sparkles,
   Info,
+  Trash2,
+  Check,
+  Download,
 } from "lucide-react";
 import type {
   WorkflowPhase,
@@ -28,6 +31,7 @@ import type {
   AgenticStep,
   CompletionStep,
   UnifiedWorkflow,
+  WorkflowExport,
   SavedPrompt,
   SavedShellCommand,
   LogSourceSelection,
@@ -41,11 +45,21 @@ import { AddStepDropdown, AddStepButton } from "./AddStepDropdown";
 import { StepConfigPanel } from "./StepConfigPanel";
 import { PromptLibraryPicker } from "./PromptLibraryPicker";
 import { ShellCommandLibraryPicker } from "./ShellCommandLibraryPicker";
+import { CheckLibraryPicker } from "./CheckLibraryPicker";
+import { CheckGroupLibraryPicker } from "./CheckGroupLibraryPicker";
+import { MacroLibraryPicker } from "./MacroLibraryPicker";
+import { PlaywrightScriptLibraryPicker } from "./PlaywrightScriptLibraryPicker";
+import { TestLibraryPicker } from "./TestLibraryPicker";
+import { WorkflowLibraryPicker } from "./WorkflowLibraryPicker";
+import { StateLibraryPicker } from "./StateLibraryPicker";
+import { McpServerToolPicker } from "./McpServerToolPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
 import { getAccentColors } from "@/design-system";
+import { BatchDeleteDialog } from "../ui/BatchDeleteDialog";
+import { BuilderToolbar, toolbarActions } from "../ui/BuilderToolbar";
 
 const API_BASE = "http://localhost:9876";
 
@@ -200,6 +214,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           onChange={(e) => updateWorkflow({ name: e.target.value })}
           placeholder="Workflow name..."
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-name-input"
         />
       </div>
 
@@ -211,6 +226,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           placeholder="What does this workflow do?"
           rows={2}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-none"
+          data-ui-id="workflow-builder-description-input"
         />
       </div>
 
@@ -225,6 +241,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             min={1}
             max={100}
             className="w-32 px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-iterations-input"
           />
           <p className="text-xs text-zinc-500 mt-1">
             Maximum number of verification {"<->"} agentic loops
@@ -258,6 +275,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 });
               }}
               className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+              data-ui-id="workflow-builder-provider-select"
             >
               {PROVIDER_OPTIONS.map((opt) => (
                 <option key={opt.value} value={opt.value}>
@@ -270,6 +288,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
                 value={workflow.model ?? ""}
                 onChange={(e) => updateWorkflow({ model: e.target.value || undefined })}
                 className="flex-1 px-3 py-2 bg-zinc-700 border border-zinc-600 rounded-md text-zinc-200 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                data-ui-id="workflow-builder-model-select"
               >
                 {MODELS_BY_PROVIDER[workflow.provider].map((opt) => (
                   <option key={opt.value} value={opt.value}>
@@ -301,6 +320,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
               transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/50
               ${!workflow.skip_ai_summary ? "bg-blue-600" : "bg-zinc-600"}
             `}
+            data-ui-id="workflow-builder-ai-summary-toggle"
           >
             <span
               className={`
@@ -329,6 +349,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
           value={getLogSourceDisplayValue()}
           onChange={(e) => handleLogSourceChange(e.target.value)}
           className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+          data-ui-id="workflow-builder-log-sources-select"
         >
           <option value="default">Default (use global setting)</option>
           <option value="ai">AI-based selection</option>
@@ -357,6 +378,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             onChange={(e) => updateWorkflow({ category: e.target.value })}
             placeholder="general"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-category-input"
           />
         </div>
         <div>
@@ -374,6 +396,7 @@ function SettingsPanel({ nameInputRef }: SettingsPanelProps) {
             }
             placeholder="tag1, tag2"
             className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-md text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+            data-ui-id="workflow-builder-tags-input"
           />
         </div>
       </div>
@@ -422,6 +445,38 @@ function WorkflowBuilderContent({
   const [shellCommandPickerOpen, setShellCommandPickerOpen] = useState(false);
   const [shellCommandPickerPhase, setShellCommandPickerPhase] = useState<WorkflowPhase>("setup");
 
+  // Check library picker state
+  const [checkPickerOpen, setCheckPickerOpen] = useState(false);
+  const [checkPickerPhase, setCheckPickerPhase] = useState<WorkflowPhase>("verification");
+
+  // Test library picker state
+  const [testPickerOpen, setTestPickerOpen] = useState(false);
+  const [testPickerPhase, setTestPickerPhase] = useState<WorkflowPhase>("verification");
+
+  // Check group library picker state
+  const [checkGroupPickerOpen, setCheckGroupPickerOpen] = useState(false);
+  const [checkGroupPickerPhase, setCheckGroupPickerPhase] = useState<WorkflowPhase>("verification");
+
+  // Macro library picker state
+  const [macroPickerOpen, setMacroPickerOpen] = useState(false);
+  const [macroPickerPhase, setMacroPickerPhase] = useState<WorkflowPhase>("setup");
+
+  // Playwright script library picker state
+  const [playwrightScriptPickerOpen, setPlaywrightScriptPickerOpen] = useState(false);
+  const [playwrightScriptPickerPhase, setPlaywrightScriptPickerPhase] = useState<WorkflowPhase>("verification");
+
+  // Workflow library picker state
+  const [workflowPickerOpen, setWorkflowPickerOpen] = useState(false);
+  const [workflowPickerPhase, setWorkflowPickerPhase] = useState<WorkflowPhase>("setup");
+
+  // State library picker state
+  const [statePickerOpen, setStatePickerOpen] = useState(false);
+  const [statePickerPhase, setStatePickerPhase] = useState<WorkflowPhase>("setup");
+
+  // MCP server tool picker state
+  const [mcpPickerOpen, setMcpPickerOpen] = useState(false);
+  const [mcpPickerPhase, setMcpPickerPhase] = useState<WorkflowPhase>("setup");
+
   // AI generate workflow modal state
   const [aiGenerateModalOpen, setAiGenerateModalOpen] = useState(false);
 
@@ -432,6 +487,16 @@ function WorkflowBuilderContent({
   const [savedWorkflows, setSavedWorkflows] = useState<UnifiedWorkflow[]>([]);
   const [workflowsLoading, setWorkflowsLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
+
+  // Workflow selection mode state (for batch delete)
+  const [isWorkflowSelectionMode, setIsWorkflowSelectionMode] = useState(false);
+  const [selectedWorkflowIds, setSelectedWorkflowIds] = useState<Set<string>>(new Set());
+  const [showBatchDeleteDialog, setShowBatchDeleteDialog] = useState(false);
+  const [isDeletingWorkflows, setIsDeletingWorkflows] = useState(false);
+
+  // Workflow import/export state
+  const [isExportingWorkflow, setIsExportingWorkflow] = useState(false);
+  const [workflowImportError, setWorkflowImportError] = useState<string | null>(null);
 
   // Handle creating a new workflow with visual feedback
   const handleNewWorkflow = useCallback(() => {
@@ -476,6 +541,143 @@ function WorkflowBuilderContent({
       fetchWorkflows();
     }
   }, [state.isSaving, state.workflow.id, fetchWorkflows]);
+
+  // Toggle workflow selection for batch delete
+  const toggleWorkflowSelection = useCallback((workflowId: string) => {
+    setSelectedWorkflowIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(workflowId)) {
+        next.delete(workflowId);
+      } else {
+        next.add(workflowId);
+      }
+      return next;
+    });
+  }, []);
+
+  // Exit workflow selection mode
+  const exitWorkflowSelectionMode = useCallback(() => {
+    setIsWorkflowSelectionMode(false);
+    setSelectedWorkflowIds(new Set());
+  }, []);
+
+  // Delete selected workflows
+  const deleteSelectedWorkflows = useCallback(async () => {
+    if (selectedWorkflowIds.size === 0) return;
+
+    setIsDeletingWorkflows(true);
+    try {
+      const deletePromises = Array.from(selectedWorkflowIds).map((id) =>
+        fetch(`${API_BASE}/unified-workflows/${id}`, { method: "DELETE" })
+      );
+      await Promise.all(deletePromises);
+
+      // Refresh the list
+      await fetchWorkflows();
+
+      // If the currently edited workflow was deleted, reset to new
+      if (state.workflow.id && selectedWorkflowIds.has(state.workflow.id)) {
+        resetToNew();
+      }
+
+      // Exit selection mode
+      exitWorkflowSelectionMode();
+      setShowBatchDeleteDialog(false);
+    } catch (error) {
+      console.error("Failed to delete workflows:", error);
+    } finally {
+      setIsDeletingWorkflows(false);
+    }
+  }, [selectedWorkflowIds, fetchWorkflows, state.workflow.id, resetToNew, exitWorkflowSelectionMode]);
+
+  // Get names of selected workflows for the delete dialog
+  const getSelectedWorkflowNames = useCallback((): string[] => {
+    return savedWorkflows
+      .filter((w) => selectedWorkflowIds.has(w.id))
+      .map((w) => w.name);
+  }, [savedWorkflows, selectedWorkflowIds]);
+
+  // Export the current workflow to JSON file
+  const handleExportWorkflow = useCallback(async () => {
+    if (!state.workflow.id) return;
+
+    setIsExportingWorkflow(true);
+    try {
+      const response = await fetch(`${API_BASE}/unified-workflows/${state.workflow.id}/export`);
+      const data = await response.json();
+      if (data.success && data.data) {
+        const exportData = data.data as WorkflowExport;
+        const blob = new Blob([JSON.stringify(exportData, null, 2)], {
+          type: "application/json",
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `workflow-${exportData.workflow.name.replace(/[^a-zA-Z0-9]/g, "-")}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } else {
+        console.error("Failed to export workflow:", data.error);
+      }
+    } catch (error) {
+      console.error("Failed to export workflow:", error);
+    } finally {
+      setIsExportingWorkflow(false);
+    }
+  }, [state.workflow.id]);
+
+  // Import a workflow from JSON file
+  const handleImportWorkflow = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setWorkflowImportError(null);
+    setWorkflowsLoading(true);
+
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+
+      // Validate the import format
+      let workflowData: UnifiedWorkflow;
+      if (data.manifest && data.workflow) {
+        // Full export format
+        workflowData = data.workflow;
+      } else if (data.setup_steps !== undefined) {
+        // Direct workflow object
+        workflowData = data;
+      } else {
+        throw new Error("Invalid workflow file format");
+      }
+
+      // Call the import API
+      const response = await fetch(`${API_BASE}/unified-workflows/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          workflow: workflowData,
+          conflict_strategy: "generate",
+        }),
+      });
+
+      const result = await response.json();
+      if (result.success && result.data) {
+        // Refresh the list and select the imported workflow
+        await fetchWorkflows();
+        await loadWorkflow(result.data.workflow.id);
+      } else {
+        setWorkflowImportError(result.error || "Failed to import workflow");
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : "Failed to import workflow";
+      setWorkflowImportError(errorMsg);
+      console.error("Failed to import workflow:", error);
+    } finally {
+      setWorkflowsLoading(false);
+      // Reset the file input via event target
+      event.target.value = "";
+    }
+  }, [fetchWorkflows, loadWorkflow]);
 
   // Filter workflows
   const filteredWorkflows = savedWorkflows.filter((w) => {
@@ -540,76 +742,40 @@ function WorkflowBuilderContent({
     setExecutionError(null);
     setExecutionSuccess(null);
 
-    // Navigate to Active page IMMEDIATELY so user can see the workflow in progress
-    // The Active page polls for running tasks and will show this workflow
-    onNavigateToActive?.();
-
     try {
-      console.log(
-        "[WorkflowBuilder] Starting unified workflow execution:",
-        workflowIdToRun,
-        state.workflow.name,
-      );
+      console.log("[WorkflowBuilder] Running workflow:", workflowIdToRun, state.workflow.name);
 
-      // Use the unified workflow run endpoint
-      const response = await fetch(`${API_BASE}/unified-workflows/${workflowIdToRun}/run`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          monitor_index: 0, // Default to primary monitor
-          timeout_seconds: 300, // 5 minute timeout
-        }),
+      // CRITICAL: Fire the fetch request using .then()/.catch() pattern.
+      // This ensures the request is sent before we navigate away.
+      // The workflow runs in the background - we don't wait for it to complete.
+      const runUrl = `${API_BASE}/unified-workflows/${workflowIdToRun}/run`;
+      const requestBody = JSON.stringify({
+        monitor_index: 0, // Default to primary monitor
+        timeout_seconds: 300, // 5 minute timeout
       });
 
-      // Check HTTP response status first
-      if (!response.ok) {
-        const errorText = await response.text();
-        let errorMsg: string;
-        try {
-          const errorJson = JSON.parse(errorText);
-          errorMsg = errorJson.error || `HTTP ${response.status}`;
-        } catch {
-          errorMsg = errorText || `HTTP ${response.status}`;
-        }
+      // Fire the request - don't await it, just let it run
+      fetch(runUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: requestBody,
+      }).then(response => {
+        console.log("[WorkflowBuilder] Workflow run response:", response.status);
+      }).catch(error => {
+        console.error("[WorkflowBuilder] Workflow run error:", error);
+      });
 
-        // Handle 404 specifically - workflow may have been deleted
-        if (response.status === 404) {
-          // Clear the stale ID so the workflow will be saved as new
-          updateWorkflow({ id: undefined });
-          setExecutionError(
-            `Workflow not found (stale ID cleared). Click Run again to save and execute.`,
-          );
-        } else {
-          setExecutionError(`Execution failed: ${errorMsg}`);
-        }
-        console.error("[WorkflowBuilder] Execution failed:", errorMsg);
-        return;
-      }
+      // Use a small delay to ensure the fetch request is sent before we navigate
+      // This gives the browser time to actually initiate the network request
+      setTimeout(() => {
+        onNavigateToActive?.();
+      }, 100);
 
-      const result = await response.json();
-      console.log("[WorkflowBuilder] Execution result:", result);
-
-      if (result.success && result.data?.success) {
-        const totalDuration = result.data.total_duration_ms || 0;
-        const durationInfo = totalDuration > 0 ? ` in ${(totalDuration / 1000).toFixed(1)}s` : "";
-        const successMsg = `Workflow completed successfully${durationInfo} (${result.data.successful_steps}/${result.data.total_steps} steps)`;
-        setExecutionSuccess(successMsg);
-        console.log(`[WorkflowBuilder] ${successMsg}`);
-        // Clear success message after 8 seconds
-        setTimeout(() => setExecutionSuccess(null), 8000);
-      } else {
-        // Find first failed step for the error message
-        const failedStep = result.data?.steps?.find((s: { success: boolean }) => !s.success);
-        const stepInfo = failedStep
-          ? `Step "${failedStep.step_name || failedStep.step_type}" failed: `
-          : "";
-        const errorDetail =
-          failedStep?.error || result.data?.steps?.[0]?.error || result.error || "Unknown error";
-        const errorMsg = `${stepInfo}${errorDetail}`;
-        setExecutionError(errorMsg);
-        console.error("[WorkflowBuilder] Execution failed:", errorMsg);
-        // Don't clear error message automatically - let user dismiss it
-      }
+      // Don't wait for the response - the workflow runs in the background
+      // The Active page will show the running task
+      setExecutionSuccess("Workflow started! Check the Active tab to monitor progress.");
+      // Clear success message after 5 seconds
+      setTimeout(() => setExecutionSuccess(null), 5000);
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       setExecutionError(`Failed to run workflow: ${errorMsg}`);
@@ -718,6 +884,314 @@ function WorkflowBuilderContent({
     [addStep],
   );
 
+  // Handler to open the check library picker
+  const handleOpenCheckLibrary = useCallback((phase: WorkflowPhase) => {
+    setCheckPickerPhase(phase);
+    setCheckPickerOpen(true);
+  }, []);
+
+  // Type for saved check from CheckLibraryPicker
+  interface SavedCheck {
+    id: string;
+    name: string;
+    description?: string;
+    check_type: string;
+    tool: string;
+    command?: string;
+    working_directory?: string;
+    config_path?: string;
+    auto_fix: boolean;
+    fail_on_warning: boolean;
+    timeout_seconds: number;
+    is_critical: boolean;
+    enabled: boolean;
+    tags: string[];
+  }
+
+  // Handler for when a check is selected from the library
+  const handleCheckSelected = useCallback(
+    (check: SavedCheck, phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "check",
+        phase: "verification",
+        name: check.name,
+        check_type: check.check_type as "lint" | "format" | "typecheck" | "analyze" | "security" | "custom_command",
+        check_id: check.id,
+        command: check.command,
+        working_directory: check.working_directory,
+        config_path: check.config_path,
+        auto_fix: check.auto_fix,
+        fail_on_warning: check.fail_on_warning,
+        timeout_seconds: check.timeout_seconds,
+        is_blocking: check.is_critical,
+      };
+
+      addStep(step, phase);
+      setCheckPickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the test library picker
+  const handleOpenTestLibrary = useCallback((phase: WorkflowPhase) => {
+    setTestPickerPhase(phase);
+    setTestPickerOpen(true);
+  }, []);
+
+  // Type for saved test from TestLibraryPicker
+  interface SavedTest {
+    id: string;
+    name: string;
+    description?: string;
+    test_type: "playwright_cdp" | "qontinui_vision" | "python_script" | "repository_test";
+    category?: string;
+    timeout_seconds: number;
+    is_critical: boolean;
+    enabled: boolean;
+    tags: string[];
+  }
+
+  // Handler for when a test is selected from the library
+  const handleTestSelected = useCallback(
+    (test: SavedTest, phase: WorkflowPhase) => {
+      // Map test_type to the workflow step test_type format
+      const testTypeMap: Record<string, "playwright" | "qontinui_vision" | "python" | "repository" | "custom_command"> = {
+        playwright_cdp: "playwright",
+        qontinui_vision: "qontinui_vision",
+        python_script: "python",
+        repository_test: "repository",
+      };
+
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "test",
+        phase: phase as "setup" | "verification" | "completion",
+        name: test.name,
+        test_type: testTypeMap[test.test_type] || "custom_command",
+        test_id: test.id,
+        timeout_seconds: test.timeout_seconds,
+        is_critical: test.is_critical,
+      };
+
+      addStep(step, phase);
+      setTestPickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the check group library picker
+  const handleOpenCheckGroupLibrary = useCallback((phase: WorkflowPhase) => {
+    setCheckGroupPickerPhase(phase);
+    setCheckGroupPickerOpen(true);
+  }, []);
+
+  // Type for check group from CheckGroupLibraryPicker
+  interface CheckGroup {
+    id: string;
+    name: string;
+    description?: string;
+    color?: string;
+    enabled: boolean;
+    run_in_parallel: boolean;
+    stop_on_failure: boolean;
+    tags: string[];
+  }
+
+  // Handler for when a check group is selected from the library
+  const handleCheckGroupSelected = useCallback(
+    (group: CheckGroup, checksInGroup: { id: string; name: string }[], phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "check_group",
+        phase: "verification",
+        name: group.name,
+        check_group_id: group.id,
+        is_blocking: true, // Check groups are blocking by default
+      };
+
+      addStep(step, phase);
+      setCheckGroupPickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the macro library picker
+  const handleOpenMacroLibrary = useCallback((phase: WorkflowPhase) => {
+    setMacroPickerPhase(phase);
+    setMacroPickerOpen(true);
+  }, []);
+
+  // Type for saved macro from MacroLibraryPicker
+  interface SavedMacro {
+    id: string;
+    name: string;
+    description: string;
+    steps: { id: string; action_type: string; description: string }[];
+    category: string;
+    tags: string[];
+  }
+
+  // Handler for when a macro is selected from the library
+  const handleMacroSelected = useCallback(
+    (macro: SavedMacro, phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "macro",
+        phase: "setup",
+        name: macro.name || "Run Macro",
+        macro_id: macro.id,
+      };
+
+      addStep(step, phase);
+      setMacroPickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the playwright script library picker
+  const handleOpenPlaywrightScriptLibrary = useCallback((phase: WorkflowPhase) => {
+    setPlaywrightScriptPickerPhase(phase);
+    setPlaywrightScriptPickerOpen(true);
+  }, []);
+
+  // Type for saved playwright script from PlaywrightScriptLibraryPicker
+  interface SavedPlaywrightScript {
+    id: string;
+    name: string;
+    description: string;
+    target_url: string;
+    script_content: string;
+    category: string;
+    tags: string[];
+    timeout_seconds: number;
+    display_mode: string;
+    browser: string;
+    headless: boolean;
+  }
+
+  // Handler for when a playwright script is selected from the library
+  const handlePlaywrightScriptSelected = useCallback(
+    (script: SavedPlaywrightScript, phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "test",
+        phase: "verification",
+        name: script.name || "Playwright Test",
+        test_type: "playwright",
+        script_id: script.id,
+        script_content: script.script_content,
+        target_url: script.target_url,
+        timeout_seconds: script.timeout_seconds,
+        is_critical: true,
+      };
+
+      addStep(step, phase);
+      setPlaywrightScriptPickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the workflow library picker
+  const handleOpenWorkflowLibrary = useCallback((phase: WorkflowPhase) => {
+    setWorkflowPickerPhase(phase);
+    setWorkflowPickerOpen(true);
+  }, []);
+
+  // Handler for when a workflow is selected from the library
+  const handleWorkflowSelected = useCallback(
+    (workflow: UnifiedWorkflow, phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "workflow_ref",
+        phase: phase as "setup" | "verification" | "completion",
+        name: workflow.name || "Run Workflow",
+        workflow_id: workflow.id,
+      };
+
+      addStep(step, phase);
+      setWorkflowPickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the state library picker
+  const handleOpenStateLibrary = useCallback((phase: WorkflowPhase) => {
+    setStatePickerPhase(phase);
+    setStatePickerOpen(true);
+  }, []);
+
+  // Type for state from StateLibraryPicker
+  interface StateInfo {
+    id: string;
+    name: string;
+    description?: string;
+    tags?: string[];
+    is_initial?: boolean;
+    is_terminal?: boolean;
+  }
+
+  // Handler for when a state is selected from the library
+  const handleStateSelected = useCallback(
+    (stateInfo: StateInfo, phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "state",
+        phase: phase as "setup" | "verification",
+        name: stateInfo.name || "Navigate to State",
+        state_id: stateInfo.id,
+      };
+
+      addStep(step, phase);
+      setStatePickerOpen(false);
+    },
+    [addStep],
+  );
+
+  // Handler to open the MCP server tool picker
+  const handleOpenMcpServerToolPicker = useCallback((phase: WorkflowPhase) => {
+    setMcpPickerPhase(phase);
+    setMcpPickerOpen(true);
+  }, []);
+
+  // Types for MCP server and tool from McpServerToolPicker
+  interface McpServerConfig {
+    id: string;
+    name: string;
+    description?: string;
+    server_type: string;
+    command?: string;
+    url?: string;
+    enabled: boolean;
+    auto_start: boolean;
+    tags?: string[];
+  }
+
+  interface McpToolInfo {
+    name: string;
+    description?: string;
+    input_schema?: Record<string, unknown>;
+  }
+
+  // Handler for when an MCP server tool is selected
+  const handleMcpToolSelected = useCallback(
+    (server: McpServerConfig, tool: McpToolInfo, phase: WorkflowPhase) => {
+      const step: UnifiedStep = {
+        id: generateStepId(),
+        type: "mcp_call",
+        phase: phase as "setup" | "verification" | "completion",
+        name: `${server.name}: ${tool.name}`,
+        server_id: server.id,
+        tool_name: tool.name,
+        tool_description: tool.description,
+      };
+
+      addStep(step, phase);
+      setMcpPickerOpen(false);
+    },
+    [addStep],
+  );
+
   // Handler for when an AI-generated workflow is ready to load
   const handleAiWorkflowGenerated = useCallback(
     (workflow: UnifiedWorkflow) => {
@@ -746,7 +1220,15 @@ function WorkflowBuilderContent({
   );
 
   const renderStep = useCallback(
-    (step: UnifiedStep, index: number, phase: WorkflowPhase, steps: UnifiedStep[]) => (
+    (
+      step: UnifiedStep,
+      index: number,
+      phase: WorkflowPhase,
+      steps: UnifiedStep[],
+      isSelectionMode: boolean = false,
+      isSelectedForDelete: boolean = false,
+      onToggleSelect?: () => void
+    ) => (
       <StepItem
         key={step.id}
         step={step}
@@ -759,6 +1241,9 @@ function WorkflowBuilderContent({
         onMoveDown={() => moveStep(step.id, phase, "down")}
         onDelete={() => removeStep(step.id, phase)}
         onClick={() => selectStep(step.id)}
+        isSelectionMode={isSelectionMode}
+        isSelectedForDelete={isSelectedForDelete}
+        onToggleSelect={onToggleSelect}
       />
     ),
     [state.selectedStepId, moveStep, removeStep, selectStep],
@@ -780,31 +1265,41 @@ function WorkflowBuilderContent({
       <div className="w-80 border-r border-neutral-700 flex flex-col bg-neutral-900">
         {/* Header */}
         <div className="p-4 border-b border-neutral-700">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-lg font-semibold flex items-center gap-2">
+          {/* Title row */}
+          <div className="flex items-center justify-between mb-2">
+            <h2 className="text-lg font-semibold flex items-center gap-2" data-ui-id="workflow-builder-title">
               <Sparkles className="w-5 h-5" style={{ color: accentColors.bgSolid }} />
               Workflows
             </h2>
-            <div className="flex items-center gap-1">
-              <PageTutorialMenu page="unified-workflow-builder" variant="compact" />
+            <PageTutorialMenu page="unified-workflow-builder" variant="compact" />
+          </div>
+
+          {/* Action buttons row */}
+          <BuilderToolbar
+            className="mb-3"
+            actions={[
+              toolbarActions.ai(() => setAiGenerateModalOpen(true)),
+              toolbarActions.new(handleNewWorkflow, "New"),
+              toolbarActions.import(handleImportWorkflow, ".json", workflowsLoading),
+              toolbarActions.delete(
+                () => setIsWorkflowSelectionMode(!isWorkflowSelectionMode),
+                isWorkflowSelectionMode
+              ),
+            ]}
+          />
+
+          {/* Import error message */}
+          {workflowImportError && (
+            <div className="mx-4 mb-2 p-2 bg-red-500/10 border border-red-500/30 rounded-md text-red-400 text-xs flex items-center justify-between">
+              <span>{workflowImportError}</span>
               <button
-                data-tutorial-id="ai-generate-workflow-button"
-                onClick={() => setAiGenerateModalOpen(true)}
-                className="p-2 rounded-lg hover:bg-neutral-800 transition-colors text-blue-400 hover:text-blue-300"
-                title="Generate with AI"
+                onClick={() => setWorkflowImportError(null)}
+                className="p-0.5 hover:bg-red-500/20 rounded"
               >
-                <Sparkles className="w-4 h-4" />
-              </button>
-              <button
-                data-tutorial-id="new-workflow-button"
-                onClick={handleNewWorkflow}
-                className="p-2 rounded-lg hover:bg-neutral-800 transition-colors"
-                title="New Workflow"
-              >
-                <Plus className="w-4 h-4" />
+                <span className="text-red-400">×</span>
               </button>
             </div>
-          </div>
+          )}
 
           {/* Search */}
           <div className="relative">
@@ -815,9 +1310,36 @@ function WorkflowBuilderContent({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-sm focus:outline-none focus:border-neutral-600"
+              data-ui-id="workflow-builder-search-input"
             />
           </div>
         </div>
+
+        {/* Selection Mode Header */}
+        {isWorkflowSelectionMode && (
+          <div className="flex items-center justify-between px-4 py-2 bg-red-500/10 border-b border-red-500/30">
+            <span className="text-sm text-red-400">
+              {selectedWorkflowIds.size} selected
+            </span>
+            <div className="flex items-center gap-2">
+              {selectedWorkflowIds.size > 0 && (
+                <button
+                  onClick={() => setShowBatchDeleteDialog(true)}
+                  className="flex items-center gap-1 px-3 py-1 text-sm font-medium bg-red-600 hover:bg-red-500 text-white rounded-md transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete
+                </button>
+              )}
+              <button
+                onClick={exitWorkflowSelectionMode}
+                className="px-3 py-1 text-sm text-neutral-400 hover:text-neutral-200 transition-colors"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Workflow List */}
         <div className="flex-1 overflow-y-auto p-2">
@@ -835,24 +1357,55 @@ function WorkflowBuilderContent({
               {filteredWorkflows.map((workflow) => (
                 <button
                   key={workflow.id}
-                  onClick={() => selectWorkflow(workflow)}
-                  className={`w-full text-left p-3 rounded-lg transition-colors ${
-                    state.workflow.id === workflow.id ? "bg-neutral-700" : "hover:bg-neutral-800"
+                  data-ui-id={`workflow-builder-list-item-${workflow.id}`}
+                  onClick={() => {
+                    if (isWorkflowSelectionMode) {
+                      toggleWorkflowSelection(workflow.id);
+                    } else {
+                      selectWorkflow(workflow);
+                    }
+                  }}
+                  className={`w-full text-left p-3 rounded-lg transition-colors flex items-start gap-3 ${
+                    isWorkflowSelectionMode && selectedWorkflowIds.has(workflow.id)
+                      ? "bg-red-500/20 border border-red-500/50"
+                      : state.workflow.id === workflow.id
+                        ? "bg-neutral-700"
+                        : "hover:bg-neutral-800"
+                  } ${isWorkflowSelectionMode ? "border" : ""} ${
+                    isWorkflowSelectionMode && !selectedWorkflowIds.has(workflow.id)
+                      ? "border-transparent"
+                      : ""
                   }`}
                 >
-                  <div className="font-medium text-sm truncate">{workflow.name}</div>
-                  {workflow.description && (
-                    <div className="text-xs text-neutral-400 truncate mt-0.5">
-                      {workflow.description}
+                  {/* Checkbox in selection mode */}
+                  {isWorkflowSelectionMode && (
+                    <div
+                      className={`flex-shrink-0 w-5 h-5 mt-0.5 rounded border-2 flex items-center justify-center transition-colors ${
+                        selectedWorkflowIds.has(workflow.id)
+                          ? "bg-red-500 border-red-500"
+                          : "border-neutral-500"
+                      }`}
+                    >
+                      {selectedWorkflowIds.has(workflow.id) && (
+                        <Check className="w-3 h-3 text-white" />
+                      )}
                     </div>
                   )}
-                  <div className="flex items-center gap-2 mt-1.5">
-                    <span className="text-xs text-neutral-500">{getStepCount(workflow)} steps</span>
-                    {workflow.category && (
-                      <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
-                        {workflow.category}
-                      </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm truncate">{workflow.name}</div>
+                    {workflow.description && (
+                      <div className="text-xs text-neutral-400 truncate mt-0.5">
+                        {workflow.description}
+                      </div>
                     )}
+                    <div className="flex items-center gap-2 mt-1.5">
+                      <span className="text-xs text-neutral-500">{getStepCount(workflow)} steps</span>
+                      {workflow.category && (
+                        <span className="text-xs px-1.5 py-0.5 rounded bg-neutral-800 text-neutral-400">
+                          {workflow.category}
+                        </span>
+                      )}
+                    </div>
                   </div>
                 </button>
               ))}
@@ -875,6 +1428,7 @@ function WorkflowBuilderContent({
           <div className="flex items-center gap-2">
             <button
               data-tutorial-id="workflow-settings"
+              data-ui-id="workflow-builder-settings-btn"
               onClick={() => setShowSettings(!showSettings)}
               className={`
                 flex items-center gap-2 px-3 py-1.5 rounded-md transition-colors
@@ -888,6 +1442,7 @@ function WorkflowBuilderContent({
 
             <button
               data-tutorial-id="save-workflow-button"
+              data-ui-id="workflow-builder-save-btn"
               onClick={handleSave}
               disabled={state.isSaving || (!hasUnsavedChanges && !!state.originalWorkflow)}
               className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -901,11 +1456,27 @@ function WorkflowBuilderContent({
               <span className="text-sm">{state.isSaving ? "Saving..." : "Save"}</span>
             </button>
 
+            <button
+              onClick={handleExportWorkflow}
+              disabled={!state.workflow.id || isExportingWorkflow}
+              className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-zinc-700 hover:bg-zinc-600 text-zinc-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Export workflow to file"
+              data-ui-id="workflow-builder-export-btn"
+            >
+              {isExportingWorkflow ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Download className="w-4 h-4" />
+              )}
+              <span className="text-sm">Export</span>
+            </button>
+
             {isExecuting ? (
               <button
                 onClick={handleStop}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 text-white transition-colors"
                 title="Stop execution"
+                data-ui-id="workflow-builder-stop-btn"
               >
                 <Square className="w-4 h-4" />
                 <span className="text-sm">Stop</span>
@@ -916,6 +1487,7 @@ function WorkflowBuilderContent({
                 disabled={isEmpty}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-md bg-blue-600 hover:bg-blue-500 text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Run workflow"
+                data-ui-id="workflow-builder-run-btn"
               >
                 <Play className="w-4 h-4" />
                 <span className="text-sm">Run</span>
@@ -967,8 +1539,8 @@ function WorkflowBuilderContent({
                   phase="setup"
                   steps={state.workflow.setup_steps}
                   onAddStep={handleAddStep}
-                  renderStep={(step, index) =>
-                    renderStep(step, index, "setup", state.workflow.setup_steps)
+                  renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
+                    renderStep(step, index, "setup", state.workflow.setup_steps, isSelectionMode, isSelectedForDelete, onToggleSelect)
                   }
                 />
 
@@ -977,8 +1549,8 @@ function WorkflowBuilderContent({
                   phase="verification"
                   steps={state.workflow.verification_steps}
                   onAddStep={handleAddStep}
-                  renderStep={(step, index) =>
-                    renderStep(step, index, "verification", state.workflow.verification_steps)
+                  renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
+                    renderStep(step, index, "verification", state.workflow.verification_steps, isSelectionMode, isSelectedForDelete, onToggleSelect)
                   }
                 />
 
@@ -987,8 +1559,8 @@ function WorkflowBuilderContent({
                   phase="agentic"
                   steps={state.workflow.agentic_steps}
                   onAddStep={handleAddStep}
-                  renderStep={(step, index) =>
-                    renderStep(step, index, "agentic", state.workflow.agentic_steps)
+                  renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
+                    renderStep(step, index, "agentic", state.workflow.agentic_steps, isSelectionMode, isSelectedForDelete, onToggleSelect)
                   }
                 />
 
@@ -997,8 +1569,8 @@ function WorkflowBuilderContent({
                   phase="completion"
                   steps={state.workflow.completion_steps ?? []}
                   onAddStep={handleAddStep}
-                  renderStep={(step, index) =>
-                    renderStep(step, index, "completion", state.workflow.completion_steps ?? [])
+                  renderStep={(step, index, isSelectionMode, isSelectedForDelete, onToggleSelect) =>
+                    renderStep(step, index, "completion", state.workflow.completion_steps ?? [], isSelectionMode, isSelectedForDelete, onToggleSelect)
                   }
                 />
 
@@ -1023,6 +1595,14 @@ function WorkflowBuilderContent({
                     onClose={() => setDropdownOpen(false)}
                     onOpenPromptLibrary={handleOpenPromptLibrary}
                     onOpenShellCommandLibrary={handleOpenShellCommandLibrary}
+                    onOpenCheckLibrary={handleOpenCheckLibrary}
+                    onOpenCheckGroupLibrary={handleOpenCheckGroupLibrary}
+                    onOpenMacroLibrary={handleOpenMacroLibrary}
+                    onOpenPlaywrightScriptLibrary={handleOpenPlaywrightScriptLibrary}
+                    onOpenTestLibrary={handleOpenTestLibrary}
+                    onOpenWorkflowLibrary={handleOpenWorkflowLibrary}
+                    onOpenStateLibrary={handleOpenStateLibrary}
+                    onOpenMcpServerToolPicker={handleOpenMcpServerToolPicker}
                   />
                 </div>
               </div>
@@ -1044,11 +1624,87 @@ function WorkflowBuilderContent({
               phase={shellCommandPickerPhase}
             />
 
+            {/* Check Library Picker */}
+            <CheckLibraryPicker
+              isOpen={checkPickerOpen}
+              onClose={() => setCheckPickerOpen(false)}
+              onSelect={handleCheckSelected}
+              phase={checkPickerPhase}
+            />
+
+            {/* Test Library Picker */}
+            <TestLibraryPicker
+              isOpen={testPickerOpen}
+              onClose={() => setTestPickerOpen(false)}
+              onSelect={handleTestSelected}
+              phase={testPickerPhase}
+            />
+
+            {/* Check Group Library Picker */}
+            <CheckGroupLibraryPicker
+              isOpen={checkGroupPickerOpen}
+              onClose={() => setCheckGroupPickerOpen(false)}
+              onSelect={handleCheckGroupSelected}
+              phase={checkGroupPickerPhase}
+            />
+
+            {/* Macro Library Picker */}
+            <MacroLibraryPicker
+              isOpen={macroPickerOpen}
+              onClose={() => setMacroPickerOpen(false)}
+              onSelect={handleMacroSelected}
+              phase={macroPickerPhase}
+            />
+
+            {/* Playwright Script Library Picker */}
+            <PlaywrightScriptLibraryPicker
+              isOpen={playwrightScriptPickerOpen}
+              onClose={() => setPlaywrightScriptPickerOpen(false)}
+              onSelect={handlePlaywrightScriptSelected}
+              phase={playwrightScriptPickerPhase}
+            />
+
+            {/* Workflow Library Picker */}
+            <WorkflowLibraryPicker
+              isOpen={workflowPickerOpen}
+              onClose={() => setWorkflowPickerOpen(false)}
+              onSelect={handleWorkflowSelected}
+              phase={workflowPickerPhase}
+              excludeWorkflowId={state.workflow.id}
+            />
+
+            {/* State Library Picker */}
+            <StateLibraryPicker
+              isOpen={statePickerOpen}
+              onClose={() => setStatePickerOpen(false)}
+              onSelect={handleStateSelected}
+              phase={statePickerPhase}
+            />
+
+            {/* MCP Server Tool Picker */}
+            <McpServerToolPicker
+              isOpen={mcpPickerOpen}
+              onClose={() => setMcpPickerOpen(false)}
+              onSelect={handleMcpToolSelected}
+              phase={mcpPickerPhase}
+            />
+
             {/* AI Generate Workflow Modal */}
             <AiGenerateWorkflowModal
               isOpen={aiGenerateModalOpen}
               onClose={() => setAiGenerateModalOpen(false)}
               onWorkflowGenerated={handleAiWorkflowGenerated}
+            />
+
+            {/* Batch Delete Workflows Dialog */}
+            <BatchDeleteDialog
+              open={showBatchDeleteDialog}
+              title="Delete Workflows"
+              itemType="workflow"
+              itemNames={getSelectedWorkflowNames()}
+              isDeleting={isDeletingWorkflows}
+              onClose={() => setShowBatchDeleteDialog(false)}
+              onConfirm={deleteSelectedWorkflows}
             />
           </div>
 

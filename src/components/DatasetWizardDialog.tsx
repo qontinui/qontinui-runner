@@ -721,7 +721,9 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
-        <Dialog.Content className="fixed left-[50%] top-[50%] z-50 max-h-[90vh] w-full max-w-[600px] translate-x-[-50%] translate-y-[-50%] bg-card border border-border/50 rounded-lg shadow-lg overflow-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]">
+        <Dialog.Content
+          data-ui-id="dialog-dataset-wizard"
+          className="fixed left-[50%] top-[50%] z-50 max-h-[90vh] w-full max-w-[600px] translate-x-[-50%] translate-y-[-50%] bg-card border border-border/50 rounded-lg shadow-lg overflow-hidden data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%]">
           {/* Header */}
           <div className="flex items-start justify-between p-6 border-b border-border/50">
             <div className="flex items-center gap-3">
@@ -739,6 +741,7 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
             </div>
             <Dialog.Close asChild>
               <button
+                data-ui-id="dialog-dataset-wizard-close-btn"
                 className="rounded-md p-2 hover:bg-muted transition-colors"
                 aria-label="Close"
                 disabled={packaging}
@@ -769,6 +772,7 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
           {!packageResult && !packaging && (
             <div className="flex items-center justify-between p-6 border-t border-border/50">
               <button
+                data-ui-id="dialog-dataset-wizard-back-btn"
                 onClick={handleBack}
                 disabled={currentStep === 1}
                 className="px-4 py-2 text-sm font-medium text-muted-foreground hover:text-foreground disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex items-center gap-1"
@@ -781,6 +785,7 @@ export function DatasetWizardDialog({ open, onOpenChange }: DatasetWizardDialogP
 
               {currentStep < 3 ? (
                 <button
+                  data-ui-id="dialog-dataset-wizard-next-btn"
                   onClick={handleNext}
                   disabled={
                     (currentStep === 1 && !canProceedToStep2) ||

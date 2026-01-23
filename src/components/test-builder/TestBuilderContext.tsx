@@ -16,6 +16,8 @@ import type {
   CollectedAnalysisSet,
   CollectedAnalysis,
 } from "./types";
+import { getStepOutputFromAnalysis } from "./types";
+import { stepOutputRegistry } from "../../lib/step-output-handlers";
 
 // Storage key for persisting draft test state
 const DRAFT_TEST_STORAGE_KEY = "qontinui-test-builder-draft";
@@ -198,9 +200,9 @@ interface TestBuilderContextValue {
   setDirty: (dirty: boolean) => void;
   clearError: () => void;
   // Draft test functions
-  startNewTest: (testType: TestType) => void;
+  startNewTest: (testType: TestType, initialCode?: string) => void;
   updateDraft: (input: Partial<CreateTestInput>, code?: string) => void;
-  saveDraft: () => Promise<VerificationTest | null>;
+  saveDraft: (finalInput?: CreateTestInput) => Promise<VerificationTest | null>;
   discardDraft: () => void;
   isDraftSelected: boolean;
   // Collected analyses functions
@@ -235,7 +237,7 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
         success_criteria: draft.input.success_criteria,
         config: draft.input.config || {},
         timeout_seconds: draft.input.timeout_seconds || 60,
-        is_critical: draft.input.is_critical ?? true,
+        is_critical: draft.input.is_critical ?? false,
         enabled: draft.input.enabled ?? true,
         tags: draft.input.tags || [],
         created_at: new Date(draft.createdAt).toISOString(),
@@ -308,7 +310,7 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
               success_criteria: input.success_criteria,
               config: input.config || {},
               timeout_seconds: input.timeout_seconds || 60,
-              is_critical: input.is_critical ?? true,
+              is_critical: input.is_critical ?? false,
               enabled: input.enabled ?? true,
               tags: input.tags || [],
             },
@@ -356,7 +358,7 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
               success_criteria: input.success_criteria,
               config: input.config || {},
               timeout_seconds: input.timeout_seconds || 60,
-              is_critical: input.is_critical ?? true,
+              is_critical: input.is_critical ?? false,
               enabled: input.enabled ?? true,
               tags: input.tags || [],
             },
@@ -504,7 +506,8 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Start creating a new test (creates draft, does not save)
-  const startNewTest = useCallback((testType: TestType) => {
+  // Optional initialCode parameter allows creating a draft with code already populated (e.g., from AI generation)
+  const startNewTest = useCallback((testType: TestType, initialCode?: string) => {
     const testTypeLabels: Record<TestType, string> = {
       playwright_cdp: "Playwright CDP",
       qontinui_vision: "Vision",
@@ -523,7 +526,7 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
               ? "visual"
               : "custom",
       },
-      code: "",
+      code: initialCode || "",
       createdAt: Date.now(),
     };
     dispatch({ type: "START_NEW_TEST", draft });
@@ -546,29 +549,39 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
   );
 
   // Save draft test to database
-  const saveDraft = useCallback(async (): Promise<VerificationTest | null> => {
+  // Optional finalInput parameter allows passing the final values directly,
+  // avoiding race conditions with state updates from updateDraft
+  const saveDraft = useCallback(async (finalInput?: CreateTestInput): Promise<VerificationTest | null> => {
     if (!state.draftTest) return null;
 
     dispatch({ type: "SET_SAVING", saving: true });
     dispatch({ type: "SET_ERROR", error: null });
 
     try {
-      const input = { ...state.draftTest.input };
+      // Use finalInput if provided, otherwise fall back to draft state
+      const input = finalInput ? { ...finalInput } : { ...state.draftTest.input };
 
-      // Auto-populate api_request_config from collected API request analysis
-      if (state.collectedAnalyses && input.test_type === "python_script") {
-        const apiAnalysis = state.collectedAnalyses.analyses.find(
-          (a): a is CollectedAnalysis & { type: "api_request" } => a.type === "api_request",
-        );
-        if (apiAnalysis?.data.source_request_config) {
-          // Only set if not already configured
-          const existingConfig = input.config as Record<string, unknown> | undefined;
-          if (!existingConfig?.api_request_config) {
-            input.config = {
-              ...existingConfig,
-              api_request_config: apiAnalysis.data.source_request_config,
-            };
+      // Auto-populate test config from collected analyses using the registry pattern
+      if (state.collectedAnalyses) {
+        const existingConfig = (input.config as Record<string, unknown>) ?? {};
+
+        for (const analysis of state.collectedAnalyses.analyses) {
+          // Handle step_output type using the registry
+          const stepOutput = getStepOutputFromAnalysis(analysis);
+          if (stepOutput) {
+            const handler = stepOutputRegistry.get(stepOutput.step_type);
+            if (handler) {
+              const testConfig = handler.toTestConfig(stepOutput);
+              if (testConfig && !existingConfig[testConfig.config_key]) {
+                existingConfig[testConfig.config_key] = testConfig.config_value;
+              }
+            }
           }
+        }
+
+        // Only update config if we added something
+        if (Object.keys(existingConfig).length > 0) {
+          input.config = existingConfig;
         }
       }
 
@@ -585,7 +598,7 @@ export function TestBuilderProvider({ children }: { children: ReactNode }) {
           success_criteria: input.success_criteria,
           config: input.config || {},
           timeout_seconds: input.timeout_seconds || 60,
-          is_critical: input.is_critical ?? true,
+          is_critical: input.is_critical ?? false,
           enabled: input.enabled ?? true,
           tags: input.tags || [],
         },

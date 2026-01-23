@@ -18,6 +18,7 @@
  * - api_request: HTTP API request/response details
  * - script: Script execution (Python, JS, etc.) with output
  * - workflow_ref: Referenced sub-workflow execution status
+ * - mcp_call: MCP (Model Context Protocol) tool calls to external servers
  */
 export type ActivityType =
   | "gui_automation"
@@ -29,7 +30,9 @@ export type ActivityType =
   | "shell_command"
   | "api_request"
   | "script"
-  | "workflow_ref";
+  | "workflow_ref"
+  | "mcp_call"
+  | "execution_timeline";
 
 /**
  * Status of an individual activity.
@@ -115,6 +118,12 @@ export interface ActivityDisplayConfig {
  * Default display configurations for each activity type.
  */
 export const ACTIVITY_DISPLAY_CONFIG: Record<ActivityType, ActivityDisplayConfig> = {
+  execution_timeline: {
+    displayName: "Execution Timeline",
+    icon: "ListOrdered",
+    accentColor: "cyan",
+    detailRoute: "/logs/timeline",
+  },
   gui_automation: {
     displayName: "GUI Automation",
     icon: "Monitor",
@@ -175,20 +184,28 @@ export const ACTIVITY_DISPLAY_CONFIG: Record<ActivityType, ActivityDisplayConfig
     accentColor: "pink",
     detailRoute: "/logs/workflows",
   },
+  mcp_call: {
+    displayName: "MCP Calls",
+    icon: "Plug",
+    accentColor: "violet",
+    detailRoute: "/logs/mcp",
+  },
 };
 
 /**
  * Default priorities for activity types (lower = shown first).
  */
 export const ACTIVITY_PRIORITIES: Record<ActivityType, number> = {
+  execution_timeline: 5, // Highest priority - shows overview
   gui_automation: 10,
   playwright: 15,
   shell_command: 18,
   script: 19,
   ai_conversation: 20,
   api_request: 22,
-  workflow_ref: 23,
-  verification: 25,
+  mcp_call: 24,
+  workflow_ref: 25,
+  verification: 27,
   findings: 30,
   execution_status: 35,
 };

@@ -11,6 +11,20 @@ export { EventManagerProvider, useEventManager } from "./EventManagerContext";
 
 export { AutoContinueProvider, useAutoContinue } from "./AutoContinueContext";
 
+export {
+  TaskProvider,
+  useTaskContext,
+  useCurrentTaskRunId,
+  useIsTaskRunning,
+} from "./TaskContext";
+
+export {
+  RenderLogProvider,
+  useRenderLog,
+  useRenderLogOptional,
+} from "./RenderLogContext";
+export type { RenderLogEntry } from "./RenderLogContext";
+
 // Re-export execution-related hooks for convenience
 export {
   usePythonExecutor,

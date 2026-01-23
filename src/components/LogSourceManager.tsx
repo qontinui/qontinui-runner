@@ -333,11 +333,17 @@ export function LogSourceManager({
       <div className="absolute inset-0 bg-black/50" onClick={handleCancel} />
 
       {/* Modal */}
-      <div className="relative bg-background border border-border rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+      <div
+        data-ui-id="dialog-log-source-manager"
+        className="relative bg-background border border-border rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-border">
           <h2 className="text-lg font-semibold">Configure Log Sources</h2>
-          <button onClick={handleCancel} className="p-1 hover:bg-muted rounded transition-colors">
+          <button
+            data-ui-id="dialog-log-source-manager-close-btn"
+            onClick={handleCancel}
+            className="p-1 hover:bg-muted rounded transition-colors"
+          >
             <X className="w-5 h-5" />
           </button>
         </div>

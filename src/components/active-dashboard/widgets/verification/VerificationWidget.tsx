@@ -2,7 +2,7 @@
  * VerificationWidget Component
  *
  * Full widget for displaying verification test results.
- * Shows a prominent pass/fail indicator, test details, evidence, and error messages.
+ * Shows a list of check steps with pass/fail status, plus overall results.
  * Answers the question: "Did the fix work?"
  */
 
@@ -25,12 +25,14 @@ import {
 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
 import { Badge, ScrollArea } from "../../../ui";
+import { StepStatsBar, StepStatusBadge } from "../shared";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
 import type {
   VerificationData,
   VerificationEvidence,
   VerificationTestType,
   VerificationStatus,
+  CheckStep,
 } from "./types";
 import { useVerificationDataWithStatus } from "./useVerificationData";
 import { getStatusColors, getAccentColors } from "@/design-system";
@@ -54,6 +56,8 @@ function TestTypeIcon({
       return <Globe className={iconClass} />;
     case "gui_automation":
       return <Monitor className={iconClass} />;
+    case "check_group":
+      return <CheckCircle className={iconClass} />;
     default:
       return <FlaskConical className={iconClass} />;
   }
@@ -70,6 +74,8 @@ function getTestTypeLabel(type: VerificationTestType | null): string {
       return "Playwright Test";
     case "gui_automation":
       return "GUI Automation";
+    case "check_group":
+      return "Check Group";
     default:
       return "Test";
   }
@@ -78,7 +84,8 @@ function getTestTypeLabel(type: VerificationTestType | null): string {
 /**
  * Format duration for display.
  */
-function formatDuration(ms: number): string {
+function formatDuration(ms: number | undefined): string {
+  if (!ms) return "";
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
   const mins = Math.floor(ms / 60000);
@@ -87,126 +94,164 @@ function formatDuration(ms: number): string {
 }
 
 /**
- * Large pass/fail indicator - the main visual element of this widget.
+ * Compact status indicator for the overall result.
  */
-function StatusIndicator({ status }: { status: VerificationStatus }) {
-  const pendingColors = getStatusColors("pending");
-  const _runningColors = getStatusColors("running");
+function StatusIndicatorCompact({ status }: { status: VerificationStatus }) {
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
+  const pendingColors = getStatusColors("pending");
   const pausedColors = getStatusColors("paused");
 
   const config = {
     pending: {
       icon: Clock,
-      bgClass: "bg-muted/30",
       iconClass: "text-muted-foreground",
-      borderClass: "border-muted",
       label: "Pending",
-      sublabel: "Waiting for verification",
+      badgeClass: "bg-muted text-muted-foreground border-border",
     },
     running: {
       icon: Loader2,
-      bgClass: pendingColors.bg,
       iconClass: cn(pendingColors.text, "animate-spin"),
-      borderClass: pendingColors.border,
-      label: "Verifying",
-      sublabel: "Running verification test...",
+      label: "Running",
+      badgeClass: cn(pendingColors.bg, pendingColors.text, pendingColors.border),
     },
     passed: {
       icon: CheckCircle,
-      bgClass: successColors.bg,
       iconClass: successColors.text,
-      borderClass: successColors.border,
       label: "Passed",
-      sublabel: "Verification successful",
+      badgeClass: cn(successColors.bg, successColors.text, successColors.border),
     },
     failed: {
       icon: XCircle,
-      bgClass: errorColors.bg,
       iconClass: errorColors.text,
-      borderClass: errorColors.border,
       label: "Failed",
-      sublabel: "Verification unsuccessful",
+      badgeClass: cn(errorColors.bg, errorColors.text, errorColors.border),
     },
     skipped: {
       icon: SkipForward,
-      bgClass: pausedColors.bg,
       iconClass: pausedColors.text,
-      borderClass: pausedColors.border,
       label: "Skipped",
-      sublabel: "Verification was skipped",
+      badgeClass: cn(pausedColors.bg, pausedColors.text, pausedColors.border),
     },
   };
 
-  const { icon: Icon, bgClass, iconClass, borderClass, label, sublabel } = config[status];
+  const { icon: Icon, iconClass, label, badgeClass } = config[status];
 
   return (
-    <div
-      className={cn(
-        "flex flex-col items-center justify-center py-8 px-4 border-b",
-        bgClass,
-        borderClass,
-      )}
-    >
-      <Icon className={cn("h-16 w-16 mb-3", iconClass)} />
-      <span className="text-2xl font-bold">{label}</span>
-      <span className="text-sm text-muted-foreground">{sublabel}</span>
-    </div>
+    <Badge className={cn("px-3 py-1.5 text-sm font-medium border", badgeClass)}>
+      <Icon className={cn("h-4 w-4 mr-2", iconClass)} />
+      {label}
+    </Badge>
   );
 }
 
 /**
- * Test details section showing what was tested.
+ * Check step row component.
  */
-function TestDetails({ data }: { data: VerificationData }) {
-  if (!data.testName && !data.testType && !data.description) {
-    return null;
-  }
+function CheckStepRow({
+  step,
+  isExpanded,
+  onToggle,
+}: {
+  step: CheckStep;
+  isExpanded: boolean;
+  onToggle: () => void;
+}) {
+  const tealColors = getAccentColors("cyan"); // Using cyan as teal substitute
+  const errorColors = getStatusColors("error");
+  const isActive = step.status === "running";
+  const pendingColors = getStatusColors("pending");
 
   return (
-    <div className="px-4 py-3 border-b border-border">
-      <div className="flex items-start gap-3">
-        <TestTypeIcon type={data.testType} className="text-muted-foreground mt-0.5" />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-1">
-            {data.testType && (
-              <Badge variant="muted" size="sm">
-                {getTestTypeLabel(data.testType)}
-              </Badge>
-            )}
-            {data.durationMs > 0 && (
-              <span className="text-xs text-muted-foreground font-mono">
-                {formatDuration(data.durationMs)}
-              </span>
-            )}
-          </div>
-          {data.testName && <p className="text-sm font-medium truncate">{data.testName}</p>}
-          {data.description && (
-            <p className="text-sm text-muted-foreground mt-1">{data.description}</p>
+    <div className="flex flex-col">
+      <div
+        className={cn(
+          "flex items-center gap-3 border-l-2 px-4 py-2.5 transition-colors cursor-pointer",
+          isActive
+            ? cn(pendingColors.border, pendingColors.bg)
+            : isExpanded
+              ? "border-primary bg-muted/50"
+              : "border-transparent hover:bg-muted/30",
+        )}
+        onClick={onToggle}
+      >
+        {/* Expand/collapse indicator */}
+        <div className="flex-shrink-0 text-muted-foreground">
+          {isExpanded ? (
+            <ChevronDown className="h-4 w-4" />
+          ) : (
+            <ChevronRight className="h-4 w-4" />
           )}
         </div>
-      </div>
-    </div>
-  );
-}
 
-/**
- * Error message section.
- */
-function ErrorSection({ error }: { error: string }) {
-  const errorColors = getStatusColors("error");
-  return (
-    <div className={cn("px-4 py-3 border-b", errorColors.bg, errorColors.border)}>
-      <div className="flex items-start gap-2">
-        <AlertCircle className={cn("h-4 w-4 flex-shrink-0 mt-0.5", errorColors.text)} />
-        <div className="flex-1 min-w-0">
-          <span className={cn("text-sm font-medium", errorColors.text)}>Error Details</span>
-          <p className={cn("text-sm mt-1 whitespace-pre-wrap break-words", errorColors.text)}>
-            {error}
-          </p>
-        </div>
+        {/* Status icon */}
+        <StepStatusBadge status={step.status} iconOnly size="md" />
+
+        {/* Check type badge */}
+        <Badge
+          className={cn(
+            "text-xs flex-shrink-0 font-mono border",
+            tealColors.bg,
+            tealColors.text,
+            tealColors.border,
+          )}
+        >
+          <TestTypeIcon type={step.checkType} className="h-3 w-3 mr-1" />
+          {getTestTypeLabel(step.checkType)}
+        </Badge>
+
+        {/* Step name */}
+        <span className="flex-1 text-sm truncate text-foreground">{step.name}</span>
+
+        {/* Duration */}
+        {step.durationMs !== undefined && (
+          <span className="text-xs text-muted-foreground font-mono">
+            {formatDuration(step.durationMs)}
+          </span>
+        )}
+
+        {/* Error indicator */}
+        {step.error && (
+          <AlertCircle className={cn("h-3.5 w-3.5", errorColors.text)} title={step.error} />
+        )}
       </div>
+
+      {/* Expanded details */}
+      {isExpanded && (
+        <div className="border-l-2 border-primary bg-muted/30 ml-4 mr-4 mb-2 rounded-b overflow-hidden">
+          {step.output && (
+            <div className="px-4 py-2 border-b border-border/50">
+              <div className="flex items-center gap-2 mb-1">
+                <Terminal className="h-3 w-3 text-muted-foreground" />
+                <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
+                  Output
+                </span>
+              </div>
+              <pre className="text-xs font-mono text-muted-foreground whitespace-pre-wrap overflow-auto max-h-32">
+                {step.output}
+              </pre>
+            </div>
+          )}
+          {step.error && (
+            <div className={cn("px-4 py-2", errorColors.bg)}>
+              <div className="flex items-center gap-2 mb-1">
+                <AlertCircle className={cn("h-3 w-3", errorColors.text)} />
+                <span className={cn("text-[10px] uppercase tracking-wide font-medium", errorColors.text)}>
+                  Error
+                </span>
+              </div>
+              <p className={cn("text-xs whitespace-pre-wrap", errorColors.text)}>
+                {step.error}
+              </p>
+            </div>
+          )}
+          {!step.output && !step.error && (
+            <div className="px-4 py-3 text-center text-xs text-muted-foreground">
+              No output captured
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -330,26 +375,119 @@ function EvidenceSection({ evidence }: { evidence: VerificationEvidence[] }) {
  */
 export function VerificationWidget({ isActive, className }: BaseWidgetProps) {
   const { data, isLoading } = useVerificationDataWithStatus();
+  const [expandedStepId, setExpandedStepId] = useState<string | null>(null);
 
-  // Note: teal not in design system, using cyan as closest match
-  const cyanColors = getAccentColors("cyan");
+  const tealColors = getAccentColors("cyan"); // Using cyan as teal substitute
+
+  const handleToggleStep = (stepId: string) => {
+    setExpandedStepId((prev) => (prev === stepId ? null : stepId));
+  };
 
   return (
-    <div className={cn("flex flex-col h-full", isActive ? cyanColors.border : "", className)}>
+    <div className={cn("flex flex-col h-full", isActive ? tealColors.border : "", className)}>
       {isLoading ? (
         <div className="flex items-center justify-center p-8">
-          <Loader2 className={cn("h-6 w-6 animate-spin", cyanColors.text)} />
+          <Loader2 className={cn("h-6 w-6 animate-spin", tealColors.text)} />
         </div>
       ) : (
         <>
-          {/* Prominent Pass/Fail Indicator */}
-          <StatusIndicator status={data.status} />
+          {/* Stats Bar (if we have check steps) */}
+          {data.checkSteps.length > 0 && <StepStatsBar stats={data.stats} />}
 
-          {/* Test Details */}
-          <TestDetails data={data} />
+          {/* Overall Status and Check Steps Header */}
+          <div className="flex items-center justify-between border-b border-border px-4 py-3 bg-muted/10 flex-shrink-0">
+            <div className="flex items-center gap-3">
+              <StatusIndicatorCompact status={data.status} />
+              {data.testName && (
+                <span className="text-sm text-muted-foreground truncate">{data.testName}</span>
+              )}
+            </div>
+            {data.checkSteps.length > 0 && (
+              <Badge variant="muted" className="text-xs">
+                {data.checkSteps.length} checks
+              </Badge>
+            )}
+          </div>
 
-          {/* Error Message (if failed) */}
-          {data.error && <ErrorSection error={data.error} />}
+          {/* Check Steps List */}
+          {data.checkSteps.length > 0 ? (
+            <ScrollArea className="flex-1">
+              <div className="flex flex-col-reverse">
+                {data.checkSteps.map((step) => (
+                  <CheckStepRow
+                    key={step.id}
+                    step={step}
+                    isExpanded={step.id === expandedStepId}
+                    onToggle={() => handleToggleStep(step.id)}
+                  />
+                ))}
+              </div>
+            </ScrollArea>
+          ) : (
+            /* Legacy single-result view when no check steps */
+            <div className="flex-1 overflow-auto">
+              {/* Test Details */}
+              {(data.testName || data.testType || data.description) && (
+                <div className="px-4 py-3 border-b border-border">
+                  <div className="flex items-start gap-3">
+                    <TestTypeIcon type={data.testType} className="text-muted-foreground mt-0.5" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 mb-1">
+                        {data.testType && (
+                          <Badge variant="muted" size="sm">
+                            {getTestTypeLabel(data.testType)}
+                          </Badge>
+                        )}
+                        {data.durationMs > 0 && (
+                          <span className="text-xs text-muted-foreground font-mono">
+                            {formatDuration(data.durationMs)}
+                          </span>
+                        )}
+                      </div>
+                      {data.testName && (
+                        <p className="text-sm font-medium truncate">{data.testName}</p>
+                      )}
+                      {data.description && (
+                        <p className="text-sm text-muted-foreground mt-1">{data.description}</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Error Message */}
+              {data.error && (
+                <div className={cn("px-4 py-3 border-b", getStatusColors("error").bg)}>
+                  <div className="flex items-start gap-2">
+                    <AlertCircle
+                      className={cn("h-4 w-4 flex-shrink-0 mt-0.5", getStatusColors("error").text)}
+                    />
+                    <div className="flex-1 min-w-0">
+                      <span className={cn("text-sm font-medium", getStatusColors("error").text)}>
+                        Error Details
+                      </span>
+                      <p
+                        className={cn(
+                          "text-sm mt-1 whitespace-pre-wrap break-words",
+                          getStatusColors("error").text,
+                        )}
+                      >
+                        {data.error}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Waiting message when no data */}
+              {!data.testName && !data.description && !data.error && data.status === "pending" && (
+                <div className="flex flex-col items-center justify-center h-32 text-muted-foreground">
+                  <Clock className="h-8 w-8 mb-2 opacity-50" />
+                  <span className="text-sm">Waiting for verification...</span>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Evidence Section */}
           <EvidenceSection evidence={data.evidence} />

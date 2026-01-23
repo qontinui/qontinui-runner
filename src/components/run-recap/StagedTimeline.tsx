@@ -14,19 +14,15 @@ import {
   ChevronDown,
   ChevronRight,
   Activity,
-  CheckCircle2,
-  XCircle,
-  AlertCircle,
-  Clock,
-  Zap,
-  TestTube,
-  Play,
 } from "lucide-react";
 import {
   WORKFLOW_STAGE_CONFIG,
   type WorkflowStage,
 } from "@/types/dashboard/activity-types";
 import type { StageRecap, RecapStep } from "@/types/recap";
+import { getStepIconConfigWithFallback } from "@/lib/step-icons";
+import { formatDuration } from "@/lib/formatting";
+import { getStatusIcon } from "@/lib/status-icons";
 
 // Stage icons mapping
 const STAGE_ICONS: Record<WorkflowStage, React.ElementType> = {
@@ -44,86 +40,32 @@ const COLOR_CLASSES: Record<string, { bg: string; text: string }> = {
   teal: { bg: "bg-teal-500/10", text: "text-teal-500" },
 };
 
-/**
- * Format duration in milliseconds to a human-readable string.
- */
-function formatDuration(ms: number | undefined): string {
-  if (ms === undefined || ms === null) return "-";
-
-  if (ms < 1000) {
-    return `${ms}ms`;
-  }
-
-  const seconds = Math.floor(ms / 1000);
-  if (seconds < 60) {
-    return `${seconds}s`;
-  }
-
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
-  if (minutes < 60) {
-    return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
-  }
-
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
-  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
-}
-
-/**
- * Get the status icon component.
- */
-function getStatusIcon(status: string) {
-  switch (status) {
-    case "success":
-    case "complete":
-      return <CheckCircle2 className="w-4 h-4 text-green-500" />;
-    case "failed":
-      return <XCircle className="w-4 h-4 text-red-500" />;
-    case "running":
-      return <Activity className="w-4 h-4 text-blue-500 animate-pulse" />;
-    case "skipped":
-    case "pending":
-      return <AlertCircle className="w-4 h-4 text-yellow-500" />;
-    default:
-      return <Clock className="w-4 h-4 text-muted-foreground" />;
-  }
-}
-
-/**
- * Get the icon for a step type.
- */
-function getStepIcon(stepType: string) {
-  switch (stepType) {
-    case "workflow":
-      return Play;
-    case "action":
-      return Zap;
-    case "ai_session":
-      return Bot;
-    case "test":
-    case "check":
-      return TestTube;
-    default:
-      return Activity;
-  }
-}
 
 interface StepItemProps {
   step: RecapStep;
 }
 
 function StepItem({ step }: StepItemProps) {
-  const Icon = getStepIcon(step.step_type);
+  // Use icon_type if available, falling back to step_type
+  const { icon: Icon, bgClass, textClass } = getStepIconConfigWithFallback(
+    step.icon_type,
+    step.step_type
+  );
+
+  // Prefer work_summary (AI-generated) over summary (deterministic)
+  const displaySummary = step.work_summary || step.summary;
+
+  // Don't show error if it's identical to the summary (avoid duplication)
+  const showError = step.error && step.error !== displaySummary;
 
   return (
-    <div className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/30 transition-colors">
+    <div data-ui-id={`recap-staged-step-${step.step_type}`} className="flex items-center gap-3 px-3 py-2 rounded-lg hover:bg-muted/30 transition-colors">
       {/* Status icon */}
       {getStatusIcon(step.status)}
 
-      {/* Step type icon */}
-      <div className="p-1 rounded bg-muted/50">
-        <Icon className="w-3 h-3 text-muted-foreground" />
+      {/* Step type icon - using shared icon config with proper colors */}
+      <div className={`p-1 rounded ${bgClass}`}>
+        <Icon className={`w-3 h-3 ${textClass}`} />
       </div>
 
       {/* Content */}
@@ -136,10 +78,10 @@ function StepItem({ step }: StepItemProps) {
             </span>
           )}
         </div>
-        {step.summary && (
-          <p className="text-xs text-muted-foreground truncate mt-0.5">{step.summary}</p>
+        {displaySummary && (
+          <p className="text-xs text-muted-foreground truncate mt-0.5">{displaySummary}</p>
         )}
-        {step.error && <p className="text-xs text-red-400 truncate mt-0.5">{step.error}</p>}
+        {showError && <p className="text-xs text-red-400 truncate mt-0.5">{step.error}</p>}
       </div>
     </div>
   );
@@ -160,8 +102,9 @@ function StageSection({ stage }: StageSectionProps) {
   const colorClasses = COLOR_CLASSES[config?.color] || COLOR_CLASSES.blue;
 
   return (
-    <div className="card overflow-hidden">
+    <div data-ui-id={`recap-stage-section-${stage.stage}`} className="card overflow-hidden">
       <button
+        data-ui-id="recap-stage-toggle-btn"
         onClick={() => setExpanded(!expanded)}
         className="w-full px-4 py-3 flex items-center justify-between hover:bg-muted/50 transition-colors"
       >
@@ -171,11 +114,9 @@ function StageSection({ stage }: StageSectionProps) {
           </div>
           <span className="font-medium">{stage.display_name}</span>
           {getStatusIcon(stage.status)}
-          {stage.iteration !== undefined && stage.iteration > 0 && (
-            <span className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-              Iteration {stage.iteration}
-            </span>
-          )}
+          <span data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration ?? 0}`} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+            Iteration {stage.iteration ?? 0}
+          </span>
           <span className="text-sm text-muted-foreground">
             ({stage.steps.length} {stage.steps.length === 1 ? "step" : "steps"})
           </span>
@@ -210,13 +151,63 @@ interface StagedTimelineProps {
   stages: StageRecap[];
 }
 
-export function StagedTimeline({ stages }: StagedTimelineProps) {
-  // Filter out empty skipped stages
-  const visibleStages = stages.filter(
-    (s) => s.steps.length > 0 || s.status !== "skipped"
-  );
+// Default stage order and labels
+// Note: verification comes before agentic because the typical flow is:
+// setup -> verification (check initial state) -> agentic (fix issues) -> verification (re-check) -> ...
+const DEFAULT_STAGES: WorkflowStage[] = ["setup", "verification", "agentic", "completion"];
+const STAGE_LABELS: Record<WorkflowStage, string> = {
+  setup: "Setup",
+  agentic: "Agentic",
+  verification: "Verification",
+  completion: "Completion",
+};
 
-  if (visibleStages.length === 0) {
+export function StagedTimeline({ stages }: StagedTimelineProps) {
+  // Build a map of existing stages for quick lookup
+  const stageMap = new Map<string, StageRecap>();
+  stages.forEach((s) => {
+    const key = `${s.stage}-${s.iteration ?? 0}`;
+    stageMap.set(key, s);
+  });
+
+  // Collect all stages - start with actual data from backend
+  const allStages: StageRecap[] = [...stages];
+
+  // Add placeholder stages for any missing iteration 0 stages
+  // (only if no stages exist for that phase at all)
+  DEFAULT_STAGES.forEach((stageName) => {
+    const hasAnyIterationOfStage = stages.some((s) => s.stage === stageName);
+    if (!hasAnyIterationOfStage) {
+      // Create a placeholder stage only if this phase never ran
+      allStages.push({
+        stage: stageName,
+        display_name: STAGE_LABELS[stageName],
+        status: "pending",
+        steps: [],
+        iteration: 0,
+      });
+    }
+  });
+
+  // Sort stages chronologically by started_at timestamp
+  // This preserves the actual execution order including iteration loops
+  allStages.sort((a, b) => {
+    // Stages with timestamps should be sorted by time
+    if (a.started_at && b.started_at) {
+      return new Date(a.started_at).getTime() - new Date(b.started_at).getTime();
+    }
+    // Stages with timestamps come before those without
+    if (a.started_at && !b.started_at) return -1;
+    if (!a.started_at && b.started_at) return 1;
+    // For stages without timestamps, use the default phase order
+    const aIndex = DEFAULT_STAGES.indexOf(a.stage as WorkflowStage);
+    const bIndex = DEFAULT_STAGES.indexOf(b.stage as WorkflowStage);
+    if (aIndex !== bIndex) return aIndex - bIndex;
+    // Same phase - sort by iteration
+    return (a.iteration ?? 0) - (b.iteration ?? 0);
+  });
+
+  if (allStages.length === 0) {
     return (
       <div className="card p-6 text-center text-muted-foreground">
         <Activity className="w-8 h-8 mx-auto mb-2 opacity-50" />
@@ -226,8 +217,8 @@ export function StagedTimeline({ stages }: StagedTimelineProps) {
   }
 
   return (
-    <div className="space-y-3">
-      {visibleStages.map((stage, index) => (
+    <div data-ui-id="recap-staged-timeline" className="space-y-3">
+      {allStages.map((stage, index) => (
         <StageSection key={`${stage.stage}-${stage.iteration ?? index}`} stage={stage} />
       ))}
     </div>

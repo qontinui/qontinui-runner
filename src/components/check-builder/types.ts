@@ -257,6 +257,65 @@ export interface AiCheckGenerationResult {
 }
 
 // ============================================================================
+// Check Group Types
+// ============================================================================
+
+// Check group stored in database
+export interface CheckGroup {
+  id: string;
+  name: string;
+  description?: string;
+  color?: string;
+  enabled: boolean;
+  run_in_parallel: boolean;
+  stop_on_failure: boolean;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+// Input for creating a new check group
+export interface CreateCheckGroupInput {
+  name: string;
+  description?: string;
+  color?: string;
+  enabled?: boolean;
+  run_in_parallel?: boolean;
+  stop_on_failure?: boolean;
+  tags?: string[];
+}
+
+// Input for updating an existing check group
+export interface UpdateCheckGroupInput {
+  name?: string;
+  description?: string;
+  color?: string;
+  enabled?: boolean;
+  run_in_parallel?: boolean;
+  stop_on_failure?: boolean;
+  tags?: string[];
+}
+
+// Check group with its member checks (for display)
+export interface CheckGroupWithChecks extends CheckGroup {
+  checks: Check[];
+}
+
+// Check group execution result
+export interface CheckGroupExecutionResult {
+  group: CheckGroup;
+  results: CheckExecutionResult[];
+  summary: {
+    total: number;
+    passed: number;
+    failed: number;
+    fixed: number;
+    skipped: number;
+    duration_ms: number;
+  };
+}
+
+// ============================================================================
 // Tool Configuration Constants
 // ============================================================================
 

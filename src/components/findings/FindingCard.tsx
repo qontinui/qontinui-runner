@@ -116,6 +116,7 @@ export function FindingCard({
 
   return (
     <div
+      data-ui-id={`findings-card-${finding.id}`}
       className={`rounded-lg border ${categoryColors.border} ${categoryColors.bg} overflow-hidden transition-all`}
     >
       {/* Header */}
@@ -166,6 +167,7 @@ export function FindingCard({
           <div className="flex items-center gap-1 flex-shrink-0">
             {/* Expand/Collapse */}
             <button
+              data-ui-id="findings-expand-btn"
               onClick={() => setIsExpanded(!isExpanded)}
               className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50 rounded transition-colors"
               title={isExpanded ? "Collapse" : "Expand"}
@@ -176,6 +178,7 @@ export function FindingCard({
             {/* Analyze & Fix Button */}
             {canAnalyze && onAnalyze && (
               <button
+                data-ui-id="findings-fix-btn"
                 onClick={() => onAnalyze(finding)}
                 disabled={isProcessing}
                 className="flex items-center gap-1 px-2 py-1 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-colors"
@@ -193,6 +196,7 @@ export function FindingCard({
             {/* Provide Input Button */}
             {needsInput && !showInputForm && (
               <button
+                data-ui-id="findings-respond-btn"
                 onClick={() => setShowInputForm(true)}
                 className={`flex items-center gap-1 px-2 py-1 text-xs rounded transition-colors ${getAccentColors("purple").bgSolid} text-white hover:opacity-90`}
                 title="Provide input for this finding"
@@ -205,6 +209,7 @@ export function FindingCard({
             {/* Dismiss Button */}
             {finding.status !== "resolved" && onDismiss && (
               <button
+                data-ui-id="findings-dismiss-btn"
                 onClick={() => onDismiss(finding)}
                 className="p-1.5 text-muted-foreground hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
                 title="Dismiss this finding"
@@ -317,6 +322,7 @@ export function FindingCard({
           {finding.pendingQuestion.inputType === "text" && (
             <div className="flex gap-2">
               <input
+                data-ui-id="findings-text-input"
                 type="text"
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
@@ -324,6 +330,7 @@ export function FindingCard({
                 className="flex-1 px-3 py-2 text-sm bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
               />
               <button
+                data-ui-id="findings-submit-btn"
                 onClick={handleProvideInput}
                 disabled={!inputValue.trim()}
                 className="px-3 py-2 text-sm bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-colors"

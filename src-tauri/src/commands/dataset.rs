@@ -138,7 +138,7 @@ pub fn scan_local_images(
     );
 
     // Get screenshot base path from storage
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     let screenshot_path = &storage.config.screenshot_path;
 
     let mut matched: Vec<MatchedImage> = Vec::new();
@@ -341,7 +341,7 @@ pub fn package_dataset(
     info!("Extracted {} annotations from ZIP", annotations.len());
 
     // Get screenshot base path from storage
-    let storage = _state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&_state.local_storage, "local_storage");
     let screenshot_path = &storage.config.screenshot_path;
 
     // Build a map of all local images (same as scan_local_images)

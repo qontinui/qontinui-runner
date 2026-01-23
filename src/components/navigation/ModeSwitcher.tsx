@@ -62,6 +62,7 @@ export function ModeSwitcher({ mode, onModeChange, collapsed }: ModeSwitcherProp
       <div className="px-1.5 py-2">
         <button
           onClick={() => onModeChange(nextMode.id)}
+          data-ui-id="sidebar-mode-toggle-btn"
           className="w-full flex items-center justify-center p-2 rounded-md
                      bg-muted/50 hover:bg-muted transition-colors group"
           title={`Switch to ${nextMode.label} mode`}
@@ -83,6 +84,7 @@ export function ModeSwitcher({ mode, onModeChange, collapsed }: ModeSwitcherProp
             <button
               key={modeConfig.id}
               onClick={() => onModeChange(modeConfig.id)}
+              data-ui-id={`sidebar-mode-${modeConfig.id}-btn`}
               className={`
                 flex-1 flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-md
                 text-xs font-medium transition-all duration-200

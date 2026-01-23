@@ -35,6 +35,9 @@ interface CurrentExecutionStepsResponse {
     exit_code?: number;
     stdout?: string;
     stderr?: string;
+    // Variable expansion fields
+    template_command?: string;
+    resolved_variables?: Record<string, string>;
   }>;
   count: number;
 }
@@ -71,6 +74,9 @@ export function useShellCommandData(): ShellCommandData {
             exitCode: exec.exit_code,
             stdout: exec.stdout,
             stderr: exec.stderr,
+            // Variable expansion fields
+            templateCommand: exec.template_command,
+            resolvedVariables: exec.resolved_variables,
           }));
           setCommands(shellCommands);
 

@@ -19,6 +19,7 @@ import { SelfHealingSettings } from "./SelfHealingSettings";
 import { MobileSettings } from "./MobileSettings";
 import { LogSourcesSettings } from "./LogSourcesSettings";
 import { McpSettings } from "./McpSettings";
+import { ExecutionVariablesSettings } from "./ExecutionVariablesSettings";
 import type { Project, ConnectionInfo } from "../../types/auth";
 
 interface WebSocketState {
@@ -51,6 +52,7 @@ type SettingsTab =
   | "mobile"
   | "mcp"
   | "log-sources"
+  | "execution-variables"
   | "general"
   | "storage"
   | "backup"
@@ -78,6 +80,7 @@ export function Settings({
     "mobile",
     "mcp",
     "log-sources",
+    "execution-variables",
     "general",
     "storage",
     "backup",
@@ -141,6 +144,8 @@ export function Settings({
         return <McpSettings onLog={onLog} />;
       case "log-sources":
         return <LogSourcesSettings onLog={onLog} />;
+      case "execution-variables":
+        return <ExecutionVariablesSettings onLog={onLog} />;
       case "general":
         return <GeneralSettings onLog={onLog} />;
       case "storage":

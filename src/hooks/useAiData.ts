@@ -27,6 +27,7 @@ import type {
   TaskRunMigratedLogsSummary,
   TaskRunApiRequestsDbResult,
   TaskRunAwasStepsDbResult,
+  TaskRunVerificationResultsDbResult,
 } from "../types/aiData";
 import type { RunDetails } from "../types/statistics";
 import type { TaskRunMcpCallsDbResult } from "../types/mcp-config";
@@ -63,6 +64,8 @@ export const aiDataKeys = {
     [...aiDataKeys.all, "taskRunAwasSteps", taskRunId, stepType] as const,
   taskRunMcpCalls: (taskRunId: string, successFilter?: boolean) =>
     [...aiDataKeys.all, "taskRunMcpCalls", taskRunId, successFilter] as const,
+  taskRunVerificationResults: (taskRunId: string) =>
+    [...aiDataKeys.all, "taskRunVerificationResults", taskRunId] as const,
 };
 
 /**
@@ -533,6 +536,27 @@ export function useTaskRunMcpCalls(taskRunId: string | null, successFilter?: boo
       const response = await aiDataService.getTaskRunMcpCalls(taskRunId, successFilter);
       if (!response.success || !response.data) {
         throw new Error(response.error || "Failed to load MCP calls");
+      }
+      return response.data;
+    },
+    enabled: !!taskRunId,
+    staleTime: 10000,
+  });
+}
+
+/**
+ * Hook to get verification phase results from SQLite database.
+ * Returns results from all verification iterations including individual test/check results.
+ * @param taskRunId - Task run ID to get verification results for
+ */
+export function useTaskRunVerificationResults(taskRunId: string | null) {
+  return useQuery({
+    queryKey: aiDataKeys.taskRunVerificationResults(taskRunId ?? ""),
+    queryFn: async (): Promise<TaskRunVerificationResultsDbResult | null> => {
+      if (!taskRunId) return null;
+      const response = await aiDataService.getTaskRunVerificationResults(taskRunId);
+      if (!response.success || !response.data) {
+        throw new Error(response.error || "Failed to load verification results");
       }
       return response.data;
     },

@@ -746,6 +746,96 @@ export interface TaskRunMcpCallsDbResult {
 }
 
 // =============================================================================
+// Verification Phase Results (Unified Workflow Test Results)
+// =============================================================================
+
+/**
+ * Step execution config from the verification phase.
+ * Matches StepExecutionConfig from step_executor.rs
+ */
+export interface StepExecutionConfig {
+  action_type?: string | null;
+  target_image_id?: string | null;
+  target_image_name?: string | null;
+  monitor_index?: number | null;
+  screenshot_delay?: number | null;
+  timeout_seconds?: number | null;
+  playwright_script_id?: string | null;
+  initial_state_ids?: string[] | null;
+  check_type?: string | null;
+  command?: string | null;
+  test_id?: string | null;
+  test_type?: string | null;
+  working_directory?: string | null;
+}
+
+/**
+ * Verification-specific details for test and check steps.
+ * Matches VerificationStepDetails from step_executor.rs
+ */
+export interface VerificationStepDetails {
+  step_id: string;
+  phase: string;
+  is_critical: boolean;
+  is_blocking: boolean;
+  stdout?: string | null;
+  stderr?: string | null;
+  assertions_passed?: number | null;
+  assertions_total?: number | null;
+  /** For test steps: console output from browser/runtime */
+  console_output?: string | null;
+  /** For Playwright tests: page snapshot (YAML accessibility tree) */
+  page_snapshot?: string | null;
+  /** Exit code from command execution */
+  exit_code?: number | null;
+}
+
+/**
+ * Individual step execution result from the verification phase.
+ * Matches StepExecutionResult from step_executor.rs
+ */
+export interface VerificationStepResult {
+  step_index: number;
+  step_name: string;
+  step_type: string;
+  success: boolean;
+  error?: string | null;
+  duration_ms: number;
+  screenshot_path?: string | null;
+  /** Step configuration (matches StepExecutionConfig) */
+  config: StepExecutionConfig;
+  /** Verification-specific fields (for test/check steps) */
+  verification_details?: VerificationStepDetails | null;
+}
+
+/**
+ * Result of running verification steps for a single iteration.
+ */
+export interface VerificationPhaseResult {
+  iteration: number;
+  all_passed: boolean;
+  total_steps: number;
+  passed_steps: number;
+  failed_steps: number;
+  skipped_steps: number;
+  total_duration_ms: number;
+  step_results: VerificationStepResult[];
+  critical_failure: boolean;
+}
+
+/**
+ * Result of querying verification phase results from SQLite.
+ */
+export interface TaskRunVerificationResultsDbResult {
+  task_run_id: string;
+  /** Results from each verification iteration (VerificationPhaseResult as JSON) */
+  results: VerificationPhaseResult[];
+  count: number;
+  passed_iterations: number;
+  failed_iterations: number;
+}
+
+// =============================================================================
 // Re-export RunDetails from statistics (automation runs)
 // =============================================================================
 

@@ -133,6 +133,7 @@ export function StepItem({
           className="p-1.5 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
           onClick={onEdit}
           title="Edit step"
+          data-ui-id={`macro-builder-step-${step.id}-edit-btn`}
         >
           <Edit2 className="h-3.5 w-3.5" />
         </button>
@@ -141,6 +142,7 @@ export function StepItem({
           onClick={onMoveUp}
           disabled={isFirst}
           title="Move up"
+          data-ui-id={`macro-builder-step-${step.id}-move-up-btn`}
         >
           <ChevronUp className="h-3.5 w-3.5" />
         </button>
@@ -149,6 +151,7 @@ export function StepItem({
           onClick={onMoveDown}
           disabled={isLast}
           title="Move down"
+          data-ui-id={`macro-builder-step-${step.id}-move-down-btn`}
         >
           <ChevronDown className="h-3.5 w-3.5" />
         </button>
@@ -156,6 +159,7 @@ export function StepItem({
           className="p-1.5 rounded hover:bg-muted text-destructive hover:text-destructive transition-colors"
           onClick={onRemove}
           title="Remove step"
+          data-ui-id={`macro-builder-step-${step.id}-remove-btn`}
         >
           <Trash2 className="h-3.5 w-3.5" />
         </button>

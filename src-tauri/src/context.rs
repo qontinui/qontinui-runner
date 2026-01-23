@@ -1370,6 +1370,859 @@ The raw input events are saved to `.dev-logs/input_events/{session_id}_events.js
             modified_at: now.clone(),
         },
         Context {
+            id: "builtin-runner-test-api".to_string(),
+            name: "Runner Test API Reference".to_string(),
+            content: r#"## Runner Test API Reference
+
+This document provides accurate context for generating Python tests that interact with the qontinui-runner via HTTP APIs.
+
+### Base Configuration
+
+```python
+BASE_URL = "http://localhost:9876"
+```
+
+### Navigation API
+
+**DO NOT click sidebar elements for navigation.** Use the dedicated navigation API:
+
+```python
+def navigate_to_page(page: str, select_run: int = None) -> dict:
+    """Navigate to a page using the navigation API."""
+    payload = {"page": page}
+    if select_run is not None:
+        payload["select_run"] = select_run
+    response = requests.post(f"{BASE_URL}/navigate", json=payload, timeout=10)
+    response.raise_for_status()
+    return response.json()
+```
+
+**Valid page names:** `run-recap`, `run-dashboard`, `run`, `active`, `history`, `library`, `logs`, `ai`, `settings`, `test-builder`, `unified-workflow-builder`
+
+### UI Bridge API
+
+**Get All Elements:**
+```python
+def get_elements_by_id() -> dict[str, dict]:
+    """Get elements indexed by their ID."""
+    response = requests.get(f"{BASE_URL}/ui-bridge/control/elements", timeout=10)
+    response.raise_for_status()
+    elements = response.json().get("data", {}).get("elements", [])
+    return {elem["id"]: elem for elem in elements}
+```
+
+**IMPORTANT:** Elements are returned as an ARRAY, not a dictionary. Convert to dict by ID.
+
+**Response structure for each element:**
+```json
+{
+  "id": "recap-status-banner",
+  "element_type": "div",
+  "state": {
+    "visible": true,
+    "enabled": true,
+    "text_content": "Complete"
+  }
+}
+```
+
+**Click an Element:**
+```python
+def click_element(element_id: str) -> dict:
+    response = requests.post(
+        f"{BASE_URL}/ui-bridge/control/element/{element_id}/action",
+        json={"action": "click"},
+        timeout=10
+    )
+    response.raise_for_status()
+    return response.json()
+```
+
+### Helper Functions
+
+```python
+def get_element_text(elements: dict, element_id: str) -> str:
+    """Get text content of an element."""
+    elem = elements.get(element_id, {})
+    return elem.get("state", {}).get("text_content", "") or ""
+
+def element_visible(elements: dict, element_id: str) -> bool:
+    """Check if element exists and is visible."""
+    elem = elements.get(element_id)
+    return elem.get("state", {}).get("visible", False) if elem else False
+
+def find_run_by_name(elements: dict, name: str) -> Optional[str]:
+    """Find a run selector item by name (case-insensitive partial match)."""
+    for elem_id, elem_data in elements.items():
+        if elem_id.startswith("run-selector-item-"):
+            text = elem_data.get("state", {}).get("text_content", "") or ""
+            if name.lower() in text.lower():
+                return elem_id
+    return None
+
+def wait_for_element(element_id: str, timeout: float = 10.0) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            elements = get_elements_by_id()
+            if element_visible(elements, element_id):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+```
+
+### Element ID Reference
+
+**Run Selector:**
+| Element ID | Description | Data Attributes |
+|------------|-------------|-----------------|
+| `run-selector` | Main container | `data-selected-run-id`, `data-is-open` |
+| `run-selector-trigger` | Dropdown trigger button | - |
+| `run-selector-dropdown` | Dropdown menu (when open) | `data-run-count` |
+| `run-selector-list` | Scrollable run list | - |
+| `run-selector-item-{id}` | Individual run item | `data-run-id`, `data-run-status`, `data-run-name` |
+| `run-selector-current-run` | "Current Run" option | - |
+| `run-selector-clear` | Clear selection button | - |
+
+**Recap Page:**
+| Element ID | Description |
+|------------|-------------|
+| `recap-tab` | Main recap container |
+| `recap-status-banner` | Status banner section |
+| `recap-status-label` | Status text (e.g., "Complete", "Failed") |
+| `recap-ai-summary-section` | AI summary container |
+| `recap-ai-summary-text` | Summary text content |
+| `recap-goal-badge` | Goal achieved badge |
+| `recap-failure-section` | Failure details (if failed) |
+| `recap-failure-reason` | Failure reason text |
+| `recap-staged-timeline` | Timeline container |
+| `recap-stage-section-{stage}` | Stage section (setup, verification, agentic, completion) |
+
+### Common Patterns
+
+**Navigate and Select Run:**
+```python
+# 1. Navigate to recap page
+navigate_to_page("run-recap")
+time.sleep(1.0)
+
+# 2. Open run selector
+click_element("run-selector-trigger")
+time.sleep(0.5)
+
+# 3. Get elements and find the run
+elements = get_elements_by_id()
+run_item_id = find_run_by_name(elements, "My Workflow Name")
+
+# 4. Click the run item
+if run_item_id:
+    click_element(run_item_id)
+    time.sleep(1.0)
+```
+
+**Verify Page State:**
+```python
+elements = get_elements_by_id()
+assert element_visible(elements, "recap-status-banner"), "Status banner not visible"
+status_text = get_element_text(elements, "recap-status-label")
+assert "complete" in status_text.lower(), f"Expected complete, got: {status_text}"
+```
+
+### Common Mistakes to Avoid
+
+1. **DON'T** click sidebar items for navigation - use `POST /navigate`
+2. **DON'T** assume elements are returned as a dict - they're an array, convert first
+3. **DON'T** search for text in element IDs - use `state.text_content`
+4. **DON'T** forget to wait after navigation/clicks - UI needs time to update
+5. **DON'T** use hard-coded run IDs - find runs by name dynamically
+6. **DON'T** assume failure section exists - only present for failed runs
+
+### Test Script Template
+
+```python
+import requests
+import time
+import json
+from typing import Any, Optional
+
+BASE_URL = "http://localhost:9876"
+_results = {"passed": [], "failed": [], "logs": []}
+
+def log(message: str) -> None:
+    _results["logs"].append(message)
+    print(message)
+
+def assertion(condition: bool, message: str) -> None:
+    if condition:
+        _results["passed"].append(message)
+        log(f"[PASS] {message}")
+    else:
+        _results["failed"].append(message)
+        log(f"[FAIL] {message}")
+
+def test_main() -> None:
+    log("=" * 60)
+    log("TEST: <Test Name>")
+    log("=" * 60)
+
+    # TODO: Implement test steps using the APIs above
+
+    # Summary
+    total = len(_results["passed"]) + len(_results["failed"])
+    log(f"\nPassed: {len(_results['passed'])}/{total}")
+    result = {
+        "passed": len(_results["failed"]) == 0,
+        "summary": f"{len(_results['passed'])}/{total} assertions passed",
+        "details": _results
+    }
+    print("\n" + json.dumps(result, indent=2))
+
+if __name__ == "__main__":
+    test_main()
+```
+"#
+            .to_string(),
+            category: Some("testing".to_string()),
+            tags: vec!["testing".to_string(), "api".to_string(), "ui-bridge".to_string(), "python".to_string()],
+            auto_include: Some(ContextAutoInclude {
+                task_mentions: Some(vec![
+                    "test".to_string(),
+                    "ui-bridge".to_string(),
+                    "playwright".to_string(),
+                    "python script".to_string(),
+                    "verify".to_string(),
+                    "assertion".to_string(),
+                ]),
+                ..Default::default()
+            }),
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        // ============================================================================
+        // UI Bridge Control Contexts (Modular)
+        // ============================================================================
+        Context {
+            id: "builtin-ui-bridge-core".to_string(),
+            name: "UI Bridge Control - Core API".to_string(),
+            content: r#"## UI Bridge Control - Core API Reference
+
+UI Bridge enables AI-driven control of applications through a unified HTTP API. This context covers the core API that works with ANY UI Bridge-enabled application.
+
+### Connection Setup
+
+```python
+from ui_bridge import UIBridgeClient
+
+# Default connection (localhost:9876)
+client = UIBridgeClient()
+
+# Custom connection
+client = UIBridgeClient(
+    base_url="http://localhost:9876",
+    timeout=30.0,
+    api_path="/ui-bridge"
+)
+
+# Common connection targets:
+# - Local runner:        http://localhost:9876
+# - Android emulator:    http://10.0.2.2:9876
+# - iOS simulator:       http://localhost:9876
+# - Physical device:     http://<device-ip>:9876
+# - Web app (dev):       http://localhost:3001 (check app's configured port)
+```
+
+### Element Discovery
+
+```python
+# Get all registered elements
+elements = client.get_elements()
+for elem in elements:
+    print(f"{elem.id}: {elem.type} - {elem.label}")
+    print(f"  Actions: {elem.actions}")
+    print(f"  State: visible={elem.state.visible}, enabled={elem.state.enabled}")
+
+# Get specific element
+elem = client.get_element("submit-button")
+
+# Find elements by criteria
+found = client.find(
+    types=["button", "input"],      # Filter by element type
+    interactive_only=True,           # Only interactive elements
+    include_hidden=False,            # Exclude hidden elements
+    limit=20                         # Max results
+)
+
+# Get full UI snapshot
+snapshot = client.get_snapshot()
+```
+
+### Element Actions
+
+All actions support wait options: `wait_visible=True`, `wait_enabled=True`, `timeout=10.0`
+
+```python
+# Click actions
+client.click("button-id")
+client.double_click("button-id")
+client.right_click("button-id")
+
+# Input actions
+client.type("input-id", "hello world")
+client.type("input-id", "replace", clear=True)  # Clear first
+client.clear("input-id")
+
+# Focus actions
+client.focus("input-id")
+client.blur("input-id")
+
+# Selection actions (dropdowns, checkboxes)
+client.select("dropdown-id", "option-value")
+client.select("dropdown-id", "Option Label", by_label=True)
+client.check("checkbox-id")
+client.uncheck("checkbox-id")
+client.toggle("checkbox-id")
+
+# Scroll actions
+client.scroll("container-id", direction="down", amount=100)
+client.scroll("container-id", to_element="target-element-id")
+
+# Hover
+client.hover("element-id")
+```
+
+### Component Actions
+
+Components expose high-level operations that orchestrate multiple element interactions:
+
+```python
+# List all components
+components = client.get_components()
+for comp in components:
+    print(f"{comp.id}: {comp.name}")
+    for action in comp.actions:
+        print(f"  - {action.id}: {action.label}")
+
+# Execute component action
+result = client.execute_component_action(
+    component_id="login-form",
+    action_id="submit",
+    params={"email": "user@example.com", "password": "secret"}
+)
+
+# Fluent syntax
+result = client.component("login-form").action("submit", {...})
+```
+
+### Element State
+
+```python
+# Get current state
+state = client.get_element_state("element-id")
+print(f"Visible: {state.visible}")
+print(f"Enabled: {state.enabled}")
+print(f"Focused: {state.focused}")
+print(f"Value: {state.value}")
+print(f"Text: {state.text}")
+print(f"Bounds: {state.rect}")  # {x, y, width, height}
+
+# Wait for state
+client.click("element-id", wait_visible=True, wait_enabled=True, timeout=10.0)
+```
+
+### Health & Connection
+
+```python
+# Check if server is reachable
+if client.is_connected():
+    print("Connected!")
+
+# Get server health
+health = client.health()
+print(f"Status: {health.status}")
+```
+
+### Error Handling
+
+```python
+from ui_bridge import (
+    UIBridgeError,
+    ElementNotFoundError,
+    ActionFailedError,
+)
+
+try:
+    client.click("non-existent")
+except ElementNotFoundError as e:
+    print(f"Element not found: {e}")
+except ActionFailedError as e:
+    print(f"Action failed: {e}")
+except UIBridgeError as e:
+    print(f"Bridge error: {e}, code: {e.code}")
+```
+
+### HTTP API Endpoints (Raw)
+
+If not using the Python client:
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/ui-bridge/control/elements` | List all elements |
+| GET | `/ui-bridge/control/element/:id` | Get element details |
+| GET | `/ui-bridge/control/element/:id/state` | Get element state |
+| POST | `/ui-bridge/control/element/:id/action` | Execute action |
+| GET | `/ui-bridge/control/components` | List all components |
+| POST | `/ui-bridge/control/component/:id/action/:actionId` | Execute component action |
+| POST | `/ui-bridge/control/find` | Find elements |
+| GET | `/ui-bridge/control/snapshot` | Get UI snapshot |
+| GET | `/health` | Health check |
+
+### Common Patterns
+
+**Wait for element to appear:**
+```python
+import time
+
+def wait_for_element(client, element_id, timeout=10.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            elem = client.get_element(element_id)
+            if elem and elem.state.visible:
+                return elem
+        except ElementNotFoundError:
+            pass
+        time.sleep(0.5)
+    raise TimeoutError(f"Element {element_id} not found after {timeout}s")
+```
+
+**Interact with dynamic lists:**
+```python
+# Find all items matching a pattern
+elements = client.get_elements()
+list_items = [e for e in elements if e.id.startswith("list-item-")]
+
+# Click first matching item
+for item in list_items:
+    if "target-text" in item.state.text:
+        client.click(item.id)
+        break
+```
+"#
+            .to_string(),
+            category: Some("ui-bridge".to_string()),
+            tags: vec!["ui-bridge".to_string(), "automation".to_string(), "api".to_string(), "control".to_string()],
+            auto_include: Some(ContextAutoInclude {
+                task_mentions: Some(vec![
+                    "ui-bridge".to_string(),
+                    "ui bridge".to_string(),
+                    "control app".to_string(),
+                    "automate".to_string(),
+                    "click element".to_string(),
+                    "mobile app".to_string(),
+                    "web app".to_string(),
+                ]),
+                ..Default::default()
+            }),
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-ui-bridge-mobile".to_string(),
+            name: "UI Bridge Control - qontinui-mobile".to_string(),
+            content: r#"## UI Bridge Control - qontinui-mobile
+
+This context documents the UI Bridge elements available in the qontinui-mobile React Native app.
+
+### Connection
+
+```python
+from ui_bridge import UIBridgeClient
+
+# Android emulator (special IP for host access)
+client = UIBridgeClient("http://10.0.2.2:9876")
+
+# iOS simulator
+client = UIBridgeClient("http://localhost:9876")
+
+# Physical device (use device's IP on your network)
+client = UIBridgeClient("http://192.168.1.100:9876")
+```
+
+**Note:** The server only runs in development mode (`__DEV__`).
+
+### Available Elements
+
+#### Run Cards
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `run-card-{runId}` | pressable | Individual run history card |
+
+**Actions:** `click` (navigates to run details)
+
+**State:** `label` contains workflow name and status
+
+#### Finding Cards
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `finding-card-{findingId}` | pressable | Individual finding card |
+
+**Actions:** `click` (opens finding details)
+
+**State:** `label` contains finding title and severity
+
+#### Execution Controls
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `execution-stop-btn` | button | Stop running workflow |
+| `execution-resume-btn` | button | Resume paused workflow |
+| `execution-force-btn` | button | Force continue workflow |
+
+**Component:** `execution-controls`
+
+**Component Actions:**
+- `stop` - Stop the current workflow
+- `resume` - Resume a paused workflow
+- `force-continue` - Force continue past a waiting point
+
+```python
+# Using component action (recommended)
+client.execute_component_action("execution-controls", "stop")
+
+# Using element directly
+client.click("execution-stop-btn")
+```
+
+#### Quick Actions
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `quick-action-rerun-btn` | button | Re-run last workflow |
+| `quick-action-reload-btn` | button | Reload configuration |
+| `quick-action-monitor-btn` | button | Change target monitor |
+
+**Component:** `quick-actions`
+
+**Component Actions:**
+- `rerun-last` - Re-run the last executed workflow
+- `reload-config` - Reload the last loaded configuration
+
+```python
+# Re-run the last workflow
+client.execute_component_action("quick-actions", "rerun-last")
+```
+
+#### Stats Cards (Dashboard)
+| Element ID Pattern | Type | Description |
+|-------------------|------|-------------|
+| `stats-card-{label}` | view | Statistics display card |
+
+**Examples:** `stats-card-total-runs`, `stats-card-success-rate`, `stats-card-active-workflows`
+
+**State:** `label` contains the stat name and value
+
+### Common Automation Patterns
+
+**Check if a workflow is running:**
+```python
+elements = client.get_elements()
+stop_btn = next((e for e in elements if e.id == "execution-stop-btn"), None)
+is_running = stop_btn is not None and stop_btn.state.visible
+```
+
+**Stop a running workflow:**
+```python
+client.execute_component_action("execution-controls", "stop")
+```
+
+**Navigate to a specific run:**
+```python
+# Find the run card by workflow name
+elements = client.get_elements()
+for elem in elements:
+    if elem.id.startswith("run-card-") and "MyWorkflow" in elem.label:
+        client.click(elem.id)
+        break
+```
+
+**Re-run the last workflow:**
+```python
+client.execute_component_action("quick-actions", "rerun-last")
+```
+
+**Wait for workflow completion:**
+```python
+import time
+
+def wait_for_completion(client, timeout=300):
+    start = time.time()
+    while time.time() - start < timeout:
+        elements = client.get_elements()
+        resume_btn = next((e for e in elements if e.id == "execution-resume-btn"), None)
+        stop_btn = next((e for e in elements if e.id == "execution-stop-btn"), None)
+
+        # If resume is visible but stop isn't, workflow is paused/complete
+        if resume_btn and resume_btn.state.visible and (not stop_btn or not stop_btn.state.visible):
+            return "paused"
+        # If neither is visible, no workflow is active
+        if (not resume_btn or not resume_btn.state.visible) and (not stop_btn or not stop_btn.state.visible):
+            return "completed"
+
+        time.sleep(2)
+    return "timeout"
+```
+
+### App Structure
+
+```
+qontinui-mobile/
+├── app/
+│   ├── _layout.tsx          # UIBridgeNativeProvider here
+│   ├── (tabs)/               # Tab navigation
+│   └── run/[id].tsx          # Run details screen
+└── src/components/
+    ├── runs/RunCard.tsx      # run-card-{id} elements
+    ├── findings/FindingCard.tsx  # finding-card-{id} elements
+    ├── workflow/
+    │   ├── ExecutionControls.tsx  # execution-* elements
+    │   └── QuickActions.tsx       # quick-action-* elements
+    └── dashboard/StatsCard.tsx    # stats-card-* elements
+```
+"#
+            .to_string(),
+            category: Some("ui-bridge".to_string()),
+            tags: vec!["ui-bridge".to_string(), "mobile".to_string(), "qontinui-mobile".to_string(), "react-native".to_string()],
+            auto_include: Some(ContextAutoInclude {
+                task_mentions: Some(vec![
+                    "qontinui-mobile".to_string(),
+                    "mobile app".to_string(),
+                    "react native".to_string(),
+                    "android".to_string(),
+                    "ios".to_string(),
+                ]),
+                file_patterns: Some(vec![
+                    "**/qontinui-mobile/**".to_string(),
+                ]),
+                ..Default::default()
+            }),
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-ui-bridge-web".to_string(),
+            name: "UI Bridge Control - qontinui-web".to_string(),
+            content: r#"## UI Bridge Control - qontinui-web
+
+This context documents the UI Bridge elements available in the qontinui-web Next.js application.
+
+### Connection
+
+```python
+from ui_bridge import UIBridgeClient
+
+# Development server (check your frontend port)
+client = UIBridgeClient("http://localhost:3001")
+
+# Production (if UI Bridge server is enabled)
+client = UIBridgeClient("https://your-domain.com")
+```
+
+### Available Elements
+
+#### Navigation
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `nav-projects` | button | Navigate to projects |
+| `nav-workflows` | button | Navigate to workflows |
+| `nav-runs` | button | Navigate to run history |
+| `nav-settings` | button | Navigate to settings |
+
+#### Project Management
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `project-card-{projectId}` | pressable | Project card in list |
+| `project-create-btn` | button | Create new project |
+| `project-edit-btn` | button | Edit current project |
+| `project-delete-btn` | button | Delete project |
+
+#### Workflow Builder
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `workflow-canvas` | view | Main workflow canvas |
+| `workflow-save-btn` | button | Save workflow |
+| `workflow-run-btn` | button | Run workflow |
+| `workflow-export-btn` | button | Export workflow |
+
+#### State Explorer
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `state-node-{stateId}` | pressable | State node in explorer |
+| `transition-edge-{transitionId}` | view | Transition between states |
+| `explorer-zoom-in` | button | Zoom in |
+| `explorer-zoom-out` | button | Zoom out |
+| `explorer-fit-view` | button | Fit to view |
+
+#### Forms
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `form-{formName}-submit` | button | Submit form |
+| `form-{formName}-cancel` | button | Cancel form |
+| `input-{fieldName}` | input | Form input field |
+
+### Common Automation Patterns
+
+**Create a new project:**
+```python
+client.click("project-create-btn")
+client.type("input-project-name", "My New Project")
+client.type("input-project-description", "Project description")
+client.click("form-create-project-submit")
+```
+
+**Navigate to a specific project:**
+```python
+elements = client.get_elements()
+for elem in elements:
+    if elem.id.startswith("project-card-") and "MyProject" in elem.state.text:
+        client.click(elem.id)
+        break
+```
+
+**Run a workflow:**
+```python
+client.click("workflow-run-btn")
+# Wait for run to start
+time.sleep(2)
+```
+
+**Export workflow configuration:**
+```python
+client.click("workflow-export-btn")
+# Handle file download dialog if needed
+```
+
+### App Structure
+
+```
+qontinui-web/frontend/
+├── src/
+│   ├── app/
+│   │   ├── layout.tsx           # UIBridgeProvider here
+│   │   ├── projects/
+│   │   │   └── page.tsx         # project-* elements
+│   │   ├── workflows/
+│   │   │   └── [id]/page.tsx    # workflow-* elements
+│   │   └── explorer/
+│   │       └── page.tsx         # state-*, transition-* elements
+│   └── components/
+│       ├── projects/ProjectCard.tsx
+│       ├── workflows/WorkflowCanvas.tsx
+│       └── explorer/StateExplorer.tsx
+```
+
+### Notes
+
+- UI Bridge is typically only enabled in development mode
+- Some elements may only appear after certain user actions (e.g., opening modals)
+- Check the actual element IDs by calling `client.get_elements()` if elements have changed
+"#
+            .to_string(),
+            category: Some("ui-bridge".to_string()),
+            tags: vec!["ui-bridge".to_string(), "web".to_string(), "qontinui-web".to_string(), "next.js".to_string()],
+            auto_include: Some(ContextAutoInclude {
+                task_mentions: Some(vec![
+                    "qontinui-web".to_string(),
+                    "web app".to_string(),
+                    "next.js".to_string(),
+                    "frontend".to_string(),
+                ]),
+                file_patterns: Some(vec![
+                    "**/qontinui-web/**".to_string(),
+                ]),
+                ..Default::default()
+            }),
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
+            id: "builtin-ui-bridge-custom".to_string(),
+            name: "UI Bridge Control - Custom App Template".to_string(),
+            content: r#"## UI Bridge Control - Custom App Template
+
+Use this template to document UI Bridge elements for your own application. Copy this to a User Context and customize it.
+
+### Connection
+
+```python
+from ui_bridge import UIBridgeClient
+
+# Your app's UI Bridge server
+client = UIBridgeClient("http://localhost:YOUR_PORT")
+```
+
+### Available Elements
+
+Document your app's elements here:
+
+| Element ID | Type | Description |
+|------------|------|-------------|
+| `your-element-id` | button | Description |
+
+### Available Components
+
+Document your app's components here:
+
+**Component:** `your-component-id`
+
+| Action ID | Description | Parameters |
+|-----------|-------------|------------|
+| `action-name` | What it does | `param1`, `param2` |
+
+### Common Automation Patterns
+
+Add patterns specific to your app:
+
+```python
+# Example pattern
+client.click("your-element")
+```
+
+### Discovery Script
+
+Run this to discover your app's elements:
+
+```python
+from ui_bridge import UIBridgeClient
+
+client = UIBridgeClient("http://localhost:YOUR_PORT")
+
+print("=== Elements ===")
+for elem in client.get_elements():
+    print(f"| `{elem.id}` | {elem.type} | {elem.label} |")
+
+print("\n=== Components ===")
+for comp in client.get_components():
+    print(f"\n**Component:** `{comp.id}` - {comp.name}")
+    for action in comp.actions:
+        print(f"- `{action.id}`: {action.label}")
+```
+
+### Tips for Documenting Your App
+
+1. **Run discovery first** - Use the script above to find all elements
+2. **Group by feature** - Organize elements by screens/features
+3. **Document state** - Note what state properties are available
+4. **Add patterns** - Include common automation sequences
+5. **Keep updated** - Update docs when you add new elements
+"#
+            .to_string(),
+            category: Some("ui-bridge".to_string()),
+            tags: vec!["ui-bridge".to_string(), "template".to_string(), "custom".to_string()],
+            auto_include: None, // Manual inclusion only
+            created_at: now.clone(),
+            modified_at: now.clone(),
+        },
+        Context {
             id: "builtin-service-restart".to_string(),
             name: "Service Restart Commands".to_string(),
             content: r#"## Service Restart Commands

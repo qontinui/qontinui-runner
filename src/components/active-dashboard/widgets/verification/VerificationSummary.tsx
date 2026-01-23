@@ -2,13 +2,15 @@
  * VerificationSummary Component
  *
  * Compact summary view for the Verification widget.
- * Shows a pass/fail badge with icon, test name, and "View Details" link.
+ * Shows overall pass/fail status, check step counts, and progress.
  */
 
-import { CheckCircle, XCircle, Clock, Loader2, SkipForward, FlaskConical } from "lucide-react";
+import { CheckCircle, XCircle, Clock, Loader2, SkipForward, FlaskConical, CheckCircle2 } from "lucide-react";
 import { cn } from "../../../../lib/utils";
+import { Badge } from "../../../ui";
+import { StepStatsBar } from "../shared";
 import type { BaseWidgetProps } from "../../../../types/dashboard/widget-props";
-import type { VerificationStatus } from "./types";
+import type { VerificationStatus, VerificationData } from "./types";
 import { useVerificationDataWithStatus } from "./useVerificationData";
 import { getStatusColors, getAccentColors } from "@/design-system";
 
@@ -28,7 +30,6 @@ function formatDuration(ms: number): string {
  */
 function getStatusConfig(status: VerificationStatus) {
   const pendingColors = getStatusColors("pending");
-  const _runningColors = getStatusColors("running");
   const successColors = getStatusColors("success");
   const errorColors = getStatusColors("error");
   const pausedColors = getStatusColors("paused");
@@ -70,6 +71,22 @@ function getStatusConfig(status: VerificationStatus) {
 }
 
 /**
+ * Compact check stats display.
+ */
+function CheckStats({ data }: { data: VerificationData }) {
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
+
+  if (data.checkSteps.length === 0) return null;
+
+  return (
+    <div className="flex items-center gap-3 mt-1.5">
+      <StepStatsBar stats={data.stats} compact />
+    </div>
+  );
+}
+
+/**
  * VerificationSummary - Compact widget for dashboard summary row.
  */
 export function VerificationSummary({
@@ -95,75 +112,84 @@ export function VerificationSummary({
 
   const statusConfig = getStatusConfig(data.status);
   const StatusIcon = statusConfig.icon;
-
-  // Note: teal not in design system, using cyan as closest match
   const cyanColors = getAccentColors("cyan");
+  const successColors = getStatusColors("success");
+  const errorColors = getStatusColors("error");
 
   return (
-    <button
-      onClick={handleClick}
-      className={cn(
-        "flex items-center gap-3 px-3 py-2 rounded-lg border transition-all",
-        `hover:${cyanColors.bg} hover:${cyanColors.border}`,
-        isActive ? cn(cyanColors.bg, cyanColors.border) : "bg-card border-border",
-        className,
-      )}
-    >
-      {/* Main Status Icon */}
-      <div className="flex-shrink-0">
-        <FlaskConical className={cn("h-5 w-5", cyanColors.text)} />
-      </div>
+    <div className={cn("space-y-2", className)}>
+      {isLoading ? (
+        <div className="flex items-center justify-center py-2">
+          <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+        </div>
+      ) : (
+        <>
+          {/* Status Badge Row */}
+          <div className="flex items-center gap-2">
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium",
+                statusConfig.badgeClass,
+              )}
+            >
+              <StatusIcon className={cn("h-3 w-3", statusConfig.iconClass)} />
+              {statusConfig.label}
+            </span>
 
-      {/* Content */}
-      <div className="flex-1 min-w-0 text-left">
-        {isLoading ? (
-          <span className="text-sm text-muted-foreground">Loading...</span>
-        ) : (
-          <>
-            {/* Status Badge */}
-            <div className="flex items-center gap-2">
-              <span
-                className={cn(
-                  "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium",
-                  statusConfig.badgeClass,
-                )}
-              >
-                <StatusIcon className={cn("h-3 w-3", statusConfig.iconClass)} />
-                {statusConfig.label}
-              </span>
-            </div>
-
-            {/* Test Name or Description */}
-            {data.testName ? (
-              <p className="text-xs text-muted-foreground truncate mt-0.5">{data.testName}</p>
-            ) : data.description ? (
-              <p className="text-xs text-muted-foreground truncate mt-0.5">{data.description}</p>
-            ) : (
-              <p className="text-xs text-muted-foreground mt-0.5">
-                {data.status === "pending" ? "Awaiting verification" : "Verification result"}
-              </p>
+            {/* Check count badge */}
+            {data.checkSteps.length > 0 && (
+              <Badge variant="muted" className="text-[10px]">
+                {data.stats.completed}/{data.stats.total}
+              </Badge>
             )}
-          </>
-        )}
-      </div>
 
-      {/* Right Side: Duration + View Details */}
-      <div className="flex items-center gap-2 flex-shrink-0">
-        {data.durationMs > 0 && (
-          <span className="text-xs text-muted-foreground font-mono">
-            {formatDuration(data.durationMs)}
-          </span>
-        )}
-        {onNavigateToDetail && (
-          <button
-            onClick={handleViewDetails}
-            className={cn("text-xs hover:underline", cyanColors.text)}
-          >
-            Details
-          </button>
-        )}
-      </div>
-    </button>
+            {/* Duration */}
+            {data.durationMs > 0 && (
+              <span className="text-xs text-muted-foreground font-mono ml-auto">
+                {formatDuration(data.durationMs)}
+              </span>
+            )}
+          </div>
+
+          {/* Check Stats (if we have steps) */}
+          {data.checkSteps.length > 0 ? (
+            <div className="flex items-center gap-3 text-xs">
+              {data.stats.successful > 0 && (
+                <div className="flex items-center gap-1">
+                  <CheckCircle2 className={cn("h-3 w-3", successColors.text)} />
+                  <span className={successColors.text}>{data.stats.successful}</span>
+                </div>
+              )}
+              {data.stats.failed > 0 && (
+                <div className="flex items-center gap-1">
+                  <XCircle className={cn("h-3 w-3", errorColors.text)} />
+                  <span className={errorColors.text}>{data.stats.failed}</span>
+                </div>
+              )}
+              {data.stats.pending > 0 && (
+                <div className="flex items-center gap-1 text-muted-foreground">
+                  <Clock className="h-3 w-3" />
+                  <span>{data.stats.pending} pending</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            /* Legacy: Test name or description */
+            <>
+              {data.testName ? (
+                <p className="text-xs text-muted-foreground truncate">{data.testName}</p>
+              ) : data.description ? (
+                <p className="text-xs text-muted-foreground truncate">{data.description}</p>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {data.status === "pending" ? "Awaiting verification" : "Verification result"}
+                </p>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
   );
 }
 

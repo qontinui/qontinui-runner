@@ -343,7 +343,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       />
 
       {/* Export Summary */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-backup-data-summary-section">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Database className="w-4 h-4 text-primary" />
@@ -353,6 +353,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
             onClick={loadExportSummary}
             className="text-xs text-muted-foreground hover:text-foreground"
             disabled={isLoadingSummary}
+            data-ui-id="settings-backup-refresh-summary-btn"
           >
             {isLoadingSummary ? "Loading..." : "Refresh"}
           </button>
@@ -373,7 +374,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       </div>
 
       {/* Comprehensive Export Section */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-backup-export-section">
         <div className="flex items-center gap-2">
           <Download className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Export All Data</h4>
@@ -388,6 +389,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
         <button
           onClick={() => setShowExportOptions(!showExportOptions)}
           className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+          data-ui-id="settings-backup-export-options-toggle-btn"
         >
           <Settings className="w-3 h-3" />
           Export Options
@@ -429,6 +431,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
             onClick={handleExportAllData}
             disabled={isExporting || getTotalExportCount() === 0}
             className="px-4 py-2 bg-primary hover:bg-primary/90 text-primary-foreground rounded-md transition-colors flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+            data-ui-id="settings-backup-export-btn"
           >
             {isExporting ? (
               <>
@@ -446,7 +449,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
       </div>
 
       {/* Import Section */}
-      <div className="space-y-4 rounded-lg bg-card/50 p-4">
+      <div className="space-y-4 rounded-lg bg-card/50 p-4" data-ui-id="settings-backup-import-section">
         <div className="flex items-center gap-2">
           <Upload className="w-4 h-4 text-primary" />
           <h4 className="font-medium text-sm">Import Data</h4>
@@ -469,6 +472,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
               onClick={handleSelectImportFile}
               disabled={isImporting}
               className="px-4 py-2 bg-muted hover:bg-muted/80 text-foreground rounded-md transition-colors flex items-center gap-2 disabled:opacity-50"
+              data-ui-id="settings-backup-select-file-btn"
             >
               <Upload className="w-4 h-4" />
               Select Backup File
@@ -491,6 +495,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
               <button
                 onClick={cancelImport}
                 className="text-sm text-muted-foreground hover:text-foreground"
+                data-ui-id="settings-backup-import-cancel-btn"
               >
                 Cancel
               </button>
@@ -527,6 +532,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
               <button
                 onClick={() => setShowImportOptions(!showImportOptions)}
                 className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                data-ui-id="settings-backup-import-options-toggle-btn"
               >
                 <Settings className="w-3 h-3" />
                 Import Options
@@ -635,6 +641,7 @@ export function BackupSettings({ onLog }: BackupSettingsProps) {
                   ? `${getAccentColors("amber").bgSolid} hover:bg-amber-700`
                   : "bg-primary hover:bg-primary/90"
               } text-white rounded-md transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed`}
+              data-ui-id="settings-backup-import-btn"
             >
               {isImporting ? (
                 <>

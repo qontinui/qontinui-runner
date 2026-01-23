@@ -44,7 +44,7 @@ pub fn save_screenshot_to_disk(
         data.len()
     );
 
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     let path = storage
         .save_screenshot(&session_id, &screenshot_id, &data)
         .map_err(|e| {
@@ -88,7 +88,7 @@ pub fn save_video_to_disk(
         data.len()
     );
 
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     let path = storage.save_video(&session_id, &data).map_err(|e| {
         error!("Failed to save video: {}", e);
         format!("Failed to save video: {}", e)
@@ -120,7 +120,7 @@ pub fn save_video_to_disk(
 pub fn get_local_storage_usage(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting local storage usage");
 
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     let usage = storage.get_storage_usage().map_err(|e| {
         error!("Failed to get storage usage: {}", e);
         format!("Failed to get storage usage: {}", e)
@@ -164,7 +164,7 @@ pub fn delete_old_sessions(
         storage_type, older_than_days
     );
 
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     storage
         .delete_old_sessions(&storage_type, older_than_days)
         .map_err(|e| {
@@ -198,7 +198,7 @@ pub fn delete_old_sessions(
 pub fn clear_all_storage(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Clearing all local storage");
 
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     storage.clear_all_storage().map_err(|e| {
         error!("Failed to clear all storage: {}", e);
         format!("Failed to clear all storage: {}", e)
@@ -228,7 +228,7 @@ pub fn clear_all_storage(state: State<Arc<AppState>>) -> Result<CommandResponse,
 pub fn get_storage_paths(state: State<Arc<AppState>>) -> Result<CommandResponse, String> {
     info!("Getting storage paths");
 
-    let storage = state.local_storage.lock().unwrap();
+    let storage = crate::safe_lock::safe_lock_or_recover(&state.local_storage, "local_storage");
     let config = &storage.config;
 
     Ok(CommandResponse {
