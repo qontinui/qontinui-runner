@@ -1466,14 +1466,19 @@ class WebExtractionService:
             )
 
             # Convert result to serializable dict
-            vision_data = {
+            techniques_run: list[str] = []
+            edge_results: list[dict[str, Any]] = []
+            sam3_results: list[dict[str, Any]] = []
+            ocr_results: list[dict[str, Any]] = []
+            merged_candidates: list[dict[str, Any]] = []
+            vision_data: dict[str, Any] = {
                 "extraction_id": result.extraction_id,
                 "duration_ms": result.duration_ms,
-                "techniques_run": [],
-                "edge_results": [],
-                "sam3_results": [],
-                "ocr_results": [],
-                "merged_candidates": [],
+                "techniques_run": techniques_run,
+                "edge_results": edge_results,
+                "sam3_results": sam3_results,
+                "ocr_results": ocr_results,
+                "merged_candidates": merged_candidates,
                 "edge_overlay": result.edge_overlay_image,
                 "sam3_overlay": result.sam3_mask_image,
                 "ocr_overlay": result.ocr_overlay_image,
@@ -1481,9 +1486,9 @@ class WebExtractionService:
 
             # Serialize edge detection results
             if result.edge_detection_results:
-                vision_data["techniques_run"].append("edge")
+                techniques_run.append("edge")
                 for edge in result.edge_detection_results:
-                    vision_data["edge_results"].append(
+                    edge_results.append(
                         {
                             "id": edge.id,
                             "bbox": {
@@ -1502,9 +1507,9 @@ class WebExtractionService:
 
             # Serialize SAM3 results
             if result.sam3_segments:
-                vision_data["techniques_run"].append("sam3")
+                techniques_run.append("sam3")
                 for seg in result.sam3_segments:
-                    vision_data["sam3_results"].append(
+                    sam3_results.append(
                         {
                             "id": seg.id,
                             "bbox": {
@@ -1522,9 +1527,9 @@ class WebExtractionService:
 
             # Serialize OCR results
             if result.ocr_results:
-                vision_data["techniques_run"].append("ocr")
+                techniques_run.append("ocr")
                 for ocr in result.ocr_results:
-                    vision_data["ocr_results"].append(
+                    ocr_results.append(
                         {
                             "id": ocr.id,
                             "bbox": {
@@ -1542,7 +1547,7 @@ class WebExtractionService:
             # Serialize merged candidates
             if result.candidates:
                 for candidate in result.candidates:
-                    vision_data["merged_candidates"].append(
+                    merged_candidates.append(
                         {
                             "id": candidate.id,
                             "bbox": {
@@ -1637,48 +1642,32 @@ class WebExtractionService:
 
             # Use the new image-matching state machine builder from qontinui library
             if HAS_STATE_MACHINE_BUILDER:
-                print(
-                    "[STATE_MACHINE_DEBUG] Calling build_state_machine_from_extraction_result...",
-                    flush=True,
+                runtime_states_count = (
+                    len(result.runtime_extraction.states) if result.runtime_extraction else 0
                 )
-                print(f"[STATE_MACHINE_DEBUG] extraction_result: {result}", flush=True)
-                print(
-                    f"[STATE_MACHINE_DEBUG] runtime_extraction: {result.runtime_extraction}",
-                    flush=True,
+                logger.info(
+                    f"[STATE_MACHINE] Building state machine with {runtime_states_count} runtime states"
                 )
-                if result.runtime_extraction:
-                    print(
-                        f"[STATE_MACHINE_DEBUG] runtime_extraction.states count: {len(result.runtime_extraction.states)}",
-                        flush=True,
-                    )
-                    for i, state in enumerate(result.runtime_extraction.states):
-                        print(
-                            f"[STATE_MACHINE_DEBUG]   State {i}: screenshot_id={state.screenshot.id if state.screenshot else 'None'}, elements={len(state.elements)}",
-                            flush=True,
-                        )
 
                 states_config, transitions_config = build_state_machine_from_extraction_result(
                     extraction_result=result,
                     screenshots_dir=screenshots_dir,
                     similarity_threshold=0.8,
                 )
-                print(
-                    f"[STATE_MACHINE_DEBUG] Image matching returned {len(states_config)} states",
-                    flush=True,
+                logger.info(
+                    f"[STATE_MACHINE] Image matching returned {len(states_config)} states, {len(transitions_config)} transitions"
                 )
                 for i, state in enumerate(states_config):
-                    print(
-                        f"[STATE_MACHINE_DEBUG]   State {i}: name={state.get('name')}, images={len(state.get('stateImages', []))}, screensFound={state.get('screensFound', [])}",
-                        flush=True,
+                    images_count = len(state.get("stateImages", []))
+                    screens_found = state.get("screensFound", [])
+                    logger.debug(
+                        f"[STATE_MACHINE]   State {i}: images={images_count}, screensFound={screens_found}"
                     )
-                logger.info(f"Image matching produced {len(states_config)} states")
             else:
-                print(
-                    "[STATE_MACHINE_DEBUG] State machine builder NOT available, using fallback",
-                    flush=True,
-                )
                 # Fallback: Create a single state with all elements (old behavior)
-                logger.warning("State machine builder not available - falling back to single state")
+                logger.warning(
+                    "[STATE_MACHINE] State machine builder not available - falling back to single state"
+                )
                 state_images = []
                 for elem in serialized_elements:
                     elem_id = elem.get("id", "")

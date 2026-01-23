@@ -2013,7 +2013,7 @@ class QontinuiExecutor:
         """Get or create the accessibility capture service."""
         if self._accessibility_capture_service is None:
             self._accessibility_capture_service = AccessibilityCaptureService()
-        return self._accessibility_capture_service
+        return self._accessibility_capture_service  # type: ignore[no-any-return]
 
     def _handle_analyze_page_playwright(self, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -2215,7 +2215,7 @@ class QontinuiExecutor:
             self._ai_test_generator_service = AiTestGeneratorService(
                 event_manager=self.event_manager,
             )
-        return self._ai_test_generator_service
+        return self._ai_test_generator_service  # type: ignore[no-any-return]
 
     def _handle_generate_test_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -2244,6 +2244,8 @@ class QontinuiExecutor:
         page_analysis = params.get("page_analysis")
         multi_request_analysis = params.get("multi_request_analysis")
         collected_analyses = params.get("collected_analyses")
+        reference_documents = params.get("reference_documents")
+        workflow_run_context = params.get("workflow_run_context")
         ai_provider = params.get("ai_provider", "claude_cli")
         ai_settings = params.get("ai_settings", {})
 
@@ -2268,6 +2270,8 @@ class QontinuiExecutor:
                 page_analysis=page_analysis,
                 multi_request_analysis=multi_request_analysis,
                 collected_analyses=collected_analyses,
+                reference_documents=reference_documents,
+                workflow_run_context=workflow_run_context,
                 ai_provider=ai_provider,
                 ai_settings=ai_settings,
             )
@@ -2289,7 +2293,7 @@ class QontinuiExecutor:
             self._ai_shell_command_generator_service = AiShellCommandGeneratorService(
                 event_manager=self.event_manager,
             )
-        return self._ai_shell_command_generator_service
+        return self._ai_shell_command_generator_service  # type: ignore[no-any-return]
 
     def _handle_generate_shell_command_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
         """
@@ -2388,7 +2392,7 @@ class QontinuiExecutor:
             self._ai_builder_generator_service = AiBuilderGeneratorService(
                 event_manager=self.event_manager,
             )
-        return self._ai_builder_generator_service
+        return self._ai_builder_generator_service  # type: ignore[no-any-return]
 
     def _handle_generate_context_with_ai(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle AI context generation for knowledge base entries."""
@@ -2710,7 +2714,7 @@ class QontinuiExecutor:
             self._playwright_collector_service = PlaywrightCollectorService(
                 event_manager=self.event_manager,
             )
-        return self._playwright_collector_service
+        return self._playwright_collector_service  # type: ignore[no-any-return]
 
     def _handle_start_playwright_collection(self, params: dict[str, Any]) -> dict[str, Any]:
         """Handle start Playwright collection command."""
@@ -2751,7 +2755,8 @@ class QontinuiExecutor:
                 }
 
             job_id = params.get("job_id")
-            return self._playwright_collector_service.get_job_status(job_id)
+            result: dict[str, Any] = self._playwright_collector_service.get_job_status(job_id)
+            return result
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to get Playwright collection status: {e}")
@@ -2764,7 +2769,8 @@ class QontinuiExecutor:
                 return {"success": False, "error": "No Playwright collection service"}
 
             job_id = params.get("job_id")
-            return self._playwright_collector_service.get_results(job_id)
+            result: dict[str, Any] = self._playwright_collector_service.get_results(job_id)
+            return result
 
         except Exception as e:
             self.event_manager.emit_log(
@@ -2778,7 +2784,8 @@ class QontinuiExecutor:
             if self._playwright_collector_service is None:
                 return {"success": False, "error": "No collection in progress"}
 
-            return self._playwright_collector_service.stop_collection()
+            result: dict[str, Any] = self._playwright_collector_service.stop_collection()
+            return result
 
         except Exception as e:
             self.event_manager.emit_log("error", f"Failed to stop Playwright collection: {e}")
@@ -3776,7 +3783,7 @@ class QontinuiExecutor:
                 emit_log_fn=self.event_manager.emit_log,
                 emit_event_fn=self.event_manager.emit_event,
             )
-        return self._integration_testing_service
+        return self._integration_testing_service  # type: ignore[no-any-return]
 
     def _handle_testing_get_states(self) -> dict[str, Any]:
         """Handle get states command for integration testing."""

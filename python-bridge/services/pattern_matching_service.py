@@ -9,6 +9,7 @@ import base64
 import io
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,8 +20,6 @@ from PIL import Image as PILImage
 logger = logging.getLogger(__name__)
 
 # Check if qontinui library is available
-from typing import Any, Callable
-
 QONTINUI_AVAILABLE = False
 _get_hal_func: Callable[[], Any] | None = None
 

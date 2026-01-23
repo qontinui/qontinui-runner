@@ -30,10 +30,10 @@ try:
 except ImportError as e:
     logger.warning(f"Playwright collector not available: {e}")
     HAS_PLAYWRIGHT_COLLECTOR = False
-    SafePlaywrightStateCollector = None
-    CollectionResult = None
-    SafetyConfig = None
-    ActionRisk = None
+    SafePlaywrightStateCollector = None  # type: ignore[assignment, misc]
+    CollectionResult = None  # type: ignore[assignment, misc]
+    SafetyConfig = None  # type: ignore[assignment, misc]
+    ActionRisk = None  # type: ignore[assignment, misc]
 
 
 @dataclass
@@ -187,17 +187,17 @@ class PlaywrightCollectorService:
             config = job.config
 
             # Build safety config
-            safety_kwargs = {}
+            safety_kwargs: dict[str, Any] = {}
 
             # Handle risk level
             risk_level = config.get("max_risk_level", "safe")
             if risk_level == "dry_run":
                 safety_kwargs["dry_run"] = True
-                safety_kwargs["max_risk"] = ActionRisk.SAFE
+                safety_kwargs["max_risk"] = ActionRisk.SAFE  # type: ignore[union-attr]
             elif risk_level == "caution":
-                safety_kwargs["max_risk"] = ActionRisk.CAUTION
+                safety_kwargs["max_risk"] = ActionRisk.CAUTION  # type: ignore[union-attr]
             else:
-                safety_kwargs["max_risk"] = ActionRisk.SAFE
+                safety_kwargs["max_risk"] = ActionRisk.SAFE  # type: ignore[union-attr]
 
             # Handle dry_run flag (explicit override)
             if config.get("dry_run", False):
@@ -217,7 +217,7 @@ class PlaywrightCollectorService:
             if config.get("blocked_selectors"):
                 safety_kwargs["blocked_selectors"] = config["blocked_selectors"]
 
-            safety_config = SafetyConfig(**safety_kwargs)
+            safety_config = SafetyConfig(**safety_kwargs)  # type: ignore[misc]
 
             # Create collector
             collector = SafePlaywrightStateCollector(
@@ -351,8 +351,8 @@ class PlaywrightCollectorService:
                 "risk_level": c.risk_level,
                 "risk_reason": c.risk_reason,
                 "was_clicked": c.was_clicked,
-                "verification_confidence": c.verification_confidence,
-                "verified": c.verified,
+                "verification_confidence": getattr(c, "verification_confidence", None),
+                "verified": getattr(c, "is_verified", getattr(c, "verified", None)),
                 "error": c.error,
             }
 

@@ -21,6 +21,8 @@ def build_test_generation_prompt(
     test_type: str,
     multi_request_analysis: dict[str, Any] | None = None,
     collected_analyses: dict[str, Any] | None = None,
+    reference_documents: list[dict[str, Any]] | None = None,
+    workflow_run_context: dict[str, Any] | None = None,
 ) -> str:
     """Build the full prompt for AI test generation.
 
@@ -30,6 +32,8 @@ def build_test_generation_prompt(
         test_type: Type of test to generate (playwright_cdp, qontinui_vision, etc.)
         multi_request_analysis: Optional multi-request ground truth data
         collected_analyses: Optional collected analyses (multiple types)
+        reference_documents: Optional list of reference documents (specs, expected data, images)
+        workflow_run_context: Optional workflow run context (data from previous execution)
 
     Returns:
         Complete prompt string for the AI
@@ -40,6 +44,183 @@ def build_test_generation_prompt(
     lines.append(f"Generate a {test_type} test based on the following requirements.")
     lines.append("Return ONLY the test code, no explanations or markdown code blocks.")
     lines.append("")
+
+    # Include reference documents (specs, expected data, images)
+    if reference_documents:
+        lines.append("## Reference Documents")
+        lines.append("")
+        lines.append("The following reference documents were provided to guide test creation.")
+        lines.append("Use these as specifications for what the test should verify.")
+        lines.append("")
+
+        for doc in reference_documents:
+            doc_name = doc.get("name", "Unnamed Document")
+            doc_type = doc.get("type", "text")
+            doc_content = doc.get("content", "")
+            doc_filename = doc.get("filename", "")
+
+            lines.append(f"### {doc_name}")
+            if doc_filename:
+                lines.append(f"*Source: {doc_filename}*")
+            lines.append("")
+
+            if doc_type == "image":
+                # For images, include as base64 (the AI will see it as an image)
+                lines.append("**[Image Document]**")
+                lines.append("")
+                lines.append(
+                    "This is a visual reference. The test should verify that the UI matches this reference."
+                )
+                lines.append("")
+                # Note: In practice, for multi-modal AI we'd include the base64
+                # For CLI-based AI, we describe that an image was provided
+                lines.append(f"Image data provided (base64, {len(doc_content)} chars)")
+                lines.append("")
+            elif doc_type == "json":
+                lines.append("**Expected Data Structure:**")
+                lines.append("```json")
+                # Truncate very long JSON
+                content_to_show = doc_content
+                if len(content_to_show) > 15000:
+                    content_to_show = content_to_show[:15000] + "\n... (truncated)"
+                lines.append(content_to_show)
+                lines.append("```")
+                lines.append("")
+            else:
+                # markdown or text
+                lines.append("**Document Content:**")
+                lines.append("")
+                # Truncate very long documents
+                content_to_show = doc_content
+                if len(content_to_show) > 20000:
+                    content_to_show = content_to_show[:20000] + "\n... (truncated)"
+                lines.append(content_to_show)
+                lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    # Include workflow run context (data from previous execution)
+    if workflow_run_context:
+        lines.append("## Workflow Run Context")
+        lines.append("")
+        lines.append("The following data was captured from a previous workflow execution.")
+        lines.append(
+            "Use this data to verify that the application correctly displays or processes this information."
+        )
+        lines.append("")
+
+        # Task run summary
+        task_run = workflow_run_context.get("task_run", {})
+        lines.append("### Task Run Summary")
+        lines.append(f"- **Task Name:** {task_run.get('task_name', 'Unknown')}")
+        lines.append(f"- **Status:** {task_run.get('status', 'Unknown')}")
+        if task_run.get("workflow_name"):
+            lines.append(f"- **Workflow:** {task_run.get('workflow_name')}")
+        if task_run.get("goal_achieved") is not None:
+            lines.append(f"- **Goal Achieved:** {'Yes' if task_run.get('goal_achieved') else 'No'}")
+        if task_run.get("summary"):
+            lines.append(f"- **Summary:** {task_run.get('summary')}")
+        lines.append("")
+
+        # Automation metrics
+        automation = workflow_run_context.get("automation")
+        if automation:
+            lines.append("### Automation Metrics")
+            lines.append(f"- **Status:** {automation.get('automation_status', 'Unknown')}")
+            if automation.get("duration_ms"):
+                lines.append(f"- **Duration:** {automation.get('duration_ms')}ms")
+
+            actions_summary = automation.get("actions_summary")
+            if actions_summary:
+                lines.append(
+                    f"- **Actions:** {actions_summary.get('total', 0)} total, "
+                    f"{actions_summary.get('success', 0)} success, "
+                    f"{actions_summary.get('failed', 0)} failed"
+                )
+
+            states_visited = automation.get("states_visited")
+            if states_visited:
+                lines.append(f"- **States Visited:** {', '.join(states_visited[:10])}")
+                if len(states_visited) > 10:
+                    lines.append(f"  *(and {len(states_visited) - 10} more)*")
+            lines.append("")
+
+        # API Requests
+        api_requests = workflow_run_context.get("api_requests", [])
+        if api_requests:
+            lines.append("### API Requests Captured")
+            lines.append("")
+            for idx, req in enumerate(api_requests[:10]):
+                status_emoji = "✓" if req.get("success") else "✗"
+                lines.append(
+                    f"{idx + 1}. {status_emoji} **{req.get('method', 'GET')}** {req.get('url', '')}"
+                )
+                lines.append(
+                    f"   - Status: {req.get('status_code', 'N/A')}, Time: {req.get('response_time_ms', 'N/A')}ms"
+                )
+
+                # Include response body for successful requests (truncated)
+                if req.get("success") and req.get("response_body"):
+                    try:
+                        response_str = json.dumps(req["response_body"], indent=2)
+                        if len(response_str) > 2000:
+                            response_str = response_str[:2000] + "\n... (truncated)"
+                        lines.append("   ```json")
+                        lines.append(f"   {response_str}")
+                        lines.append("   ```")
+                    except (TypeError, ValueError):
+                        pass
+                lines.append("")
+
+            if len(api_requests) > 10:
+                lines.append(f"*... and {len(api_requests) - 10} more API requests*")
+            lines.append("")
+
+        # Playwright results
+        playwright_results = workflow_run_context.get("playwright_results", [])
+        if playwright_results:
+            lines.append("### Playwright Test Results")
+            lines.append("")
+            for result in playwright_results[:10]:
+                status_emoji = "✓" if result.get("status") == "passed" else "✗"
+                lines.append(
+                    f"- {status_emoji} **{result.get('test_name', 'Unknown')}**: {result.get('status', 'Unknown')}"
+                )
+                if result.get("error_message"):
+                    lines.append(f"  - Error: {result.get('error_message')[:200]}")
+            lines.append("")
+
+        # Knowledge/findings
+        knowledge = workflow_run_context.get("knowledge", [])
+        if knowledge:
+            lines.append("### AI Findings & Observations")
+            lines.append("")
+            for item in knowledge[:15]:
+                resolved = "✓" if item.get("is_resolved") else "○"
+                lines.append(
+                    f"- {resolved} [{item.get('category', 'finding')}] {item.get('content', '')[:300]}"
+                )
+            if len(knowledge) > 15:
+                lines.append(f"*... and {len(knowledge) - 15} more findings*")
+            lines.append("")
+
+        # Test results
+        test_results = workflow_run_context.get("test_results", [])
+        if test_results:
+            lines.append("### Verification Test Results")
+            lines.append("")
+            for result in test_results:
+                status_emoji = "✓" if result.get("status") == "passed" else "✗"
+                lines.append(
+                    f"- {status_emoji} **{result.get('test_name', 'Unknown')}**: "
+                    f"{result.get('assertions_passed', 0)} passed, "
+                    f"{result.get('assertions_failed', 0)} failed"
+                )
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
 
     if page_analysis:
         elements = page_analysis.get("elements", [])
@@ -453,6 +634,8 @@ class AiTestGeneratorService:
         page_analysis: dict[str, Any] | None = None,
         multi_request_analysis: dict[str, Any] | None = None,
         collected_analyses: dict[str, Any] | None = None,
+        reference_documents: list[dict[str, Any]] | None = None,
+        workflow_run_context: dict[str, Any] | None = None,
         ai_provider: str = "claude_cli",
         ai_settings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -464,6 +647,8 @@ class AiTestGeneratorService:
             page_analysis: Optional page analysis data
             multi_request_analysis: Optional multi-request ground truth data
             collected_analyses: Optional collected analyses (multiple types)
+            reference_documents: Optional list of reference documents (specs, expected data, images)
+            workflow_run_context: Optional workflow run context (data from previous execution)
             ai_provider: AI provider to use (claude_cli, claude_api, gemini_cli, gemini_api)
             ai_settings: Provider-specific settings
 
@@ -474,7 +659,13 @@ class AiTestGeneratorService:
 
         # Build the prompt
         full_prompt = build_test_generation_prompt(
-            user_prompt, page_analysis, test_type, multi_request_analysis, collected_analyses
+            user_prompt,
+            page_analysis,
+            test_type,
+            multi_request_analysis,
+            collected_analyses,
+            reference_documents,
+            workflow_run_context,
         )
         self._log("debug", f"Built prompt with {len(full_prompt)} characters")
 
