@@ -684,6 +684,8 @@ const {{ chromium }} = require('playwright');
             # Decode image
             nparr = np.frombuffer(screenshot_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return elements
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
             # Run OCR
