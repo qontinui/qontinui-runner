@@ -676,7 +676,7 @@ const {{ chromium }} = require('playwright');
 
     def _simple_ocr_analysis(self, screenshot_bytes: bytes) -> list[dict[str, Any]]:
         """Simple fallback OCR analysis when vision service is not available."""
-        elements = []
+        elements: list[dict[str, Any]] = []
 
         try:
             import easyocr

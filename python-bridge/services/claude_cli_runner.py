@@ -33,6 +33,19 @@ def _debug_log(msg: str) -> None:
     print(f"[DEBUG CLI_RUNNER] {msg}", file=sys.stderr, flush=True)
 
 
+def _sanitize_text_for_utf8(text: str) -> str:
+    """Remove invalid UTF-8 surrogate characters from text.
+
+    Some files may contain invalid Unicode surrogates (e.g., from incorrect
+    encoding detection). This function removes them to ensure valid UTF-8.
+
+    Surrogates are in the range U+D800 to U+DFFF and are invalid in UTF-8.
+    """
+    # Filter out surrogate characters directly - this is the most reliable method
+    # Surrogates are code points in range 0xD800-0xDFFF
+    return "".join(c for c in text if not (0xD800 <= ord(c) <= 0xDFFF))
+
+
 def run_claude_cli(
     prompt: str,
     timeout_seconds: int = 120,
@@ -195,13 +208,10 @@ def _run_native(
     result = {"success": False, "output": "", "error": "", "exit_code": -1, "duration_seconds": 0.0}
 
     # Determine the Claude command
-    if custom_path:
-        claude_cmd = custom_path
-    elif system == "Windows":
-        # On Windows, use claude.cmd for better subprocess compatibility
-        claude_cmd = "claude.cmd"
-    else:
-        claude_cmd = "claude"
+    # Use 'claude' on all platforms - let the OS resolve the extension
+    # On Windows, this finds claude.exe via PATH/PATHEXT
+    # On Unix, this finds the claude binary
+    claude_cmd = custom_path or "claude"
 
     _debug_log(f"claude_cmd={claude_cmd}")
 
@@ -283,8 +293,11 @@ def _run_native_windows_stdin(
     _debug_log(f"Writing prompt to: {prompt_file}")
 
     try:
+        # Sanitize prompt to remove invalid UTF-8 surrogates (can occur from
+        # reading files with incorrect encoding, e.g., component source)
+        sanitized_prompt = _sanitize_text_for_utf8(prompt)
         with open(prompt_file, "w", encoding="utf-8") as f:
-            f.write(prompt)
+            f.write(sanitized_prompt)
         _debug_log(f"Prompt written successfully, file size={os.path.getsize(prompt_file)} bytes")
     except Exception as e:
         _debug_log(f"ERROR writing prompt file: {e}")
@@ -396,10 +409,12 @@ def _run_via_wsl(
 
     try:
         # Write prompt to temp file for WSL (handles escaping issues)
+        # Sanitize prompt to remove invalid UTF-8 surrogates
+        sanitized_prompt = _sanitize_text_for_utf8(prompt)
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
         ) as f:
-            f.write(prompt)
+            f.write(sanitized_prompt)
             prompt_file = f.name
 
         # Convert paths to WSL format
