@@ -43,6 +43,7 @@ warn_return_any = true
 warn_unused_configs = true
 ignore_missing_imports = true
 check_untyped_defs = false
+disable_error_code = ["import-untyped"]
 
 [tool.ruff]
 line-length = 100
