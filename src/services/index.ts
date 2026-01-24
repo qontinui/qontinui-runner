@@ -124,3 +124,19 @@ export { flowService } from "./flow-service";
 
 // Checkpoint Service (Checkpoint Browser for time-travel debugging)
 export { checkpointService } from "./checkpoint-service";
+
+// Workflow Generator Service (State Machine → Unified Workflow conversion)
+export {
+  WorkflowGeneratorService,
+  workflowGeneratorService,
+} from "./WorkflowGeneratorService";
+export type {
+  GeneratorState,
+  GeneratorStateImage,
+  GeneratorStateRegion,
+  GeneratorStateLocation,
+  GeneratorStateString,
+  GeneratorContext,
+  GeneratorConfig,
+  GeneratorOptions,
+} from "./WorkflowGeneratorService";

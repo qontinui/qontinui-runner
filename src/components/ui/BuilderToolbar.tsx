@@ -6,7 +6,7 @@
  */
 
 import { useRef } from "react";
-import { Sparkles, Plus, Upload, Download, Trash2 } from "lucide-react";
+import { Sparkles, Plus, Upload, Download, Trash2, GitBranch } from "lucide-react";
 
 export interface BuilderToolbarAction {
   /** Unique key for the action */
@@ -144,6 +144,17 @@ export const toolbarActions = {
     disabled: true,
     className: "text-neutral-600 cursor-not-allowed",
     title: "AI generation coming soon",
+  }),
+
+  /** Generate from State Machine action */
+  stateMachine: (onClick: () => void, disabled = false): BuilderToolbarAction => ({
+    key: "state-machine",
+    icon: GitBranch,
+    label: "States",
+    onClick,
+    disabled,
+    className: "text-emerald-400 hover:text-emerald-300 hover:bg-neutral-800",
+    title: "Generate from loaded state machine",
   }),
 
   /** New item action */

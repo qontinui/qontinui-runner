@@ -6,13 +6,16 @@
  */
 
 import { useCallback } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useDashboardState } from "../../hooks/dashboard";
 import { TaskProvider } from "../../contexts";
 import { DashboardLayout } from "./DashboardLayout";
 import { ControlBar } from "./ControlBar";
 import { BottomBar } from "./BottomBar";
 import { registerAllWidgets } from "./widgets";
+import { windowManager } from "../../managers";
 import type { ActivityType } from "../../types/dashboard/activity-types";
+import type { CommandResponse } from "../../types/displayProfile";
 
 // Register widgets at module load time (before any component renders)
 // This ensures widgets are available when hooks run
@@ -64,6 +67,21 @@ export function DashboardPage({
     [navigateToDetail],
   );
 
+  // Handle stop execution
+  const handleStop = useCallback(async () => {
+    try {
+      console.log("[DASHBOARD] Stop execution called");
+      const result = await invoke<CommandResponse>("stop_execution");
+      if (result.success) {
+        console.log("[DASHBOARD] Execution stopped successfully");
+        // Restore window if it was auto-minimized
+        await windowManager.restoreIfMinimized();
+      }
+    } catch (error) {
+      console.error("[DASHBOARD] Failed to stop execution:", error);
+    }
+  }, []);
+
   // Get current action text for bottom bar
   const _currentAction = state.layout.activeWidget
     ? state.layout.activities.get(state.layout.activeWidget)?.type
@@ -84,6 +102,7 @@ export function DashboardPage({
           isFailed={state.status === "failed"}
           iteration={state.isOrchestrated ? state.iteration : undefined}
           maxIterations={state.isOrchestrated ? state.maxIterations : undefined}
+          onStop={handleStop}
         />
 
         {/* Main Content Area */}

@@ -114,9 +114,12 @@ function StageSection({ stage }: StageSectionProps) {
           </div>
           <span className="font-medium">{stage.display_name}</span>
           {getStatusIcon(stage.status)}
-          <span data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration ?? 0}`} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-            Iteration {stage.iteration ?? 0}
-          </span>
+          {/* Only show iteration badge for stages that loop (verification/agentic) */}
+          {(stage.stage === "verification" || stage.stage === "agentic") && stage.iteration !== undefined && (
+            <span data-ui-id={`recap-iteration-${stage.stage}-${stage.iteration}`} className="text-xs text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+              Iteration {stage.iteration}
+            </span>
+          )}
           <span className="text-sm text-muted-foreground">
             ({stage.steps.length} {stage.steps.length === 1 ? "step" : "steps"})
           </span>

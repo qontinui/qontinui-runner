@@ -130,3 +130,6 @@ export type {
 export { useTaskRunRecap, recapKeys } from "./useTaskRunRecap";
 
 export { useUIBridgeEventHandler, UIBridgeEventHandler } from "./useUIBridgeEventHandler";
+
+export { useWorkflowGenerator } from "./useWorkflowGenerator";
+export type { UseWorkflowGeneratorReturn, GeneratorResult } from "./useWorkflowGenerator";
