@@ -140,3 +140,14 @@ export type {
   AddStateToWorkflowOptions,
   AddStateToWorkflowResult,
 } from "./useStateToWorkflow";
+
+export { useLiveBrowser } from "./useLiveBrowser";
+export type {
+  UseLiveBrowserReturn,
+  TargetType,
+  BrowserTab,
+  MobileDevice,
+  DiscoveredElement,
+  ConnectionStatus,
+  ConnectedTarget,
+} from "./useLiveBrowser";

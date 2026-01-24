@@ -55,6 +55,7 @@ impl LoopController {
                 app_handle.clone(),
             ),
             agentic_executor: AgenticExecutor::new(
+                app_state.clone(),
                 app_handle.clone(),
                 pid_tracker.clone(),
             ),
@@ -293,7 +294,7 @@ impl LoopController {
 
             let (verification_result, step_results) = self
                 .verification_executor
-                .execute(verification_steps, &config.execution_id, iteration)
+                .execute(verification_steps, &config.execution_id, iteration, &config.workflow_name)
                 .await;
 
             // Add step results to overall results

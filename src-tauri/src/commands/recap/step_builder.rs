@@ -580,10 +580,9 @@ pub fn build_steps(
                 .and_then(|v| v.as_str())
                 .unwrap_or("step");
 
-            // Only process setup and completion phase events
-            // (verification is handled by workflow_verification_results)
+            // Process setup, verification, agentic, and completion phase events
             match phase {
-                Some("setup") | Some("completion") => {}
+                Some("setup") | Some("verification") | Some("agentic") | Some("completion") => {}
                 _ => continue,
             }
 

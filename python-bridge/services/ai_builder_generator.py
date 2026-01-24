@@ -255,6 +255,90 @@ Return a JSON object with exactly these fields:
 Return ONLY the JSON object, no explanations or markdown code blocks."""
 
 
+def build_test_and_agentic_prompt(
+    user_prompt: str,
+    page_context: dict | None = None,
+) -> str:
+    """Build prompt for test and agentic step generation."""
+    context_section = ""
+    if page_context:
+        url = page_context.get("url", "Unknown URL")
+        title = page_context.get("title", "Unknown Title")
+        elements = page_context.get("elements", [])
+
+        elements_text = ""
+        if elements:
+            element_lines = []
+            for el in elements[:30]:  # Limit to avoid token overflow
+                el_type = el.get("type", "")
+                el_text = el.get("text", "") or el.get("label", "")
+                el_id = el.get("id", "")
+                visible = "visible" if el.get("visible", True) else "hidden"
+                enabled = "enabled" if el.get("enabled", True) else "disabled"
+                line = f"  - {el.get('tagName', 'element')}"
+                if el_id:
+                    line += f" (id: {el_id})"
+                if el_type:
+                    line += f" [{el_type}]"
+                if el_text:
+                    line += f": {el_text[:50]}"
+                line += f" ({visible}, {enabled})"
+                element_lines.append(line)
+            elements_text = "\n".join(element_lines)
+            if len(elements) > 30:
+                elements_text += f"\n  ... and {len(elements) - 30} more elements"
+
+        context_section = f"""
+## Current Page Context
+- **URL**: {url}
+- **Title**: {title}
+- **Elements on page** ({len(elements)} total):
+{elements_text}
+"""
+
+    return f"""## Task
+Generate BOTH a Python verification test AND an agentic step prompt based on the user's instructions.
+
+## User Instructions
+{user_prompt}
+{context_section}
+## Requirements
+
+### 1. Verification Test (Python)
+Create a Python test that:
+- Uses Playwright for browser automation
+- Has clear setup, action, and assertion phases
+- Includes appropriate waits for dynamic content
+- Has meaningful assertions that verify the expected outcomes
+- Uses descriptive function and variable names
+
+### 2. Agentic Step (AI Prompt)
+Create a prompt for an AI agent that:
+- Clearly describes the task objective
+- Provides context from the page if available
+- Specifies expected outcomes
+- Includes guidance for handling edge cases
+- Is optimized for AI understanding
+
+## Output Format
+Return a JSON object with exactly these fields:
+```json
+{{
+  "verification_test": "import pytest\\nfrom playwright.sync_api import Page\\n\\n\\ndef test_example(page: Page):\\n    # Test implementation\\n    page.goto('...')\\n    # Actions and assertions",
+  "agentic_step": "Your task is to...\\n\\n## Context\\n...\\n\\n## Expected Outcome\\n...\\n\\n## Guidelines\\n...",
+  "test_name": "test_descriptive_name",
+  "agentic_name": "Descriptive Task Name"
+}}
+```
+
+- `verification_test`: Complete Python test code using Playwright (properly escaped for JSON)
+- `agentic_step`: Complete AI prompt for the agentic step
+- `test_name`: Python function name for the test (snake_case, starts with test_)
+- `agentic_name`: Human-readable name for the agentic task (Title Case)
+
+Return ONLY the JSON object, no explanations or markdown code blocks."""
+
+
 # =============================================================================
 # AI Provider Functions
 # =============================================================================
@@ -508,5 +592,30 @@ class AiBuilderGeneratorService:
             )
         else:
             self._log("error", f"Exploration suggestion failed: {result['error']}")
+
+        return result
+
+    def generate_test_and_agentic_step(
+        self,
+        user_prompt: str,
+        page_context: dict | None = None,
+        ai_provider: str = "claude_cli",
+        ai_settings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Generate a verification test and agentic step from user instructions."""
+        self._log("info", f"Generating test and agentic step using {ai_provider}")
+
+        prompt = build_test_and_agentic_prompt(user_prompt, page_context)
+        result = self._generate(prompt, ai_provider, ai_settings or {})
+
+        if result["success"]:
+            test_name = result["data"].get("test_name", "Unknown")
+            agentic_name = result["data"].get("agentic_name", "Unknown")
+            self._log(
+                "info",
+                f"Successfully generated test '{test_name}' and agentic step '{agentic_name}'",
+            )
+        else:
+            self._log("error", f"Test and agentic step generation failed: {result['error']}")
 
         return result

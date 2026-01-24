@@ -1543,6 +1543,9 @@ class QontinuiExecutor:
         elif cmd_type == "suggest_exploration_strategy_with_ai":
             return self._handle_suggest_exploration_strategy_with_ai(params)
 
+        elif cmd_type == "generate_test_and_agentic_step":
+            return self._handle_generate_test_and_agentic_step(params)
+
         # Pattern matching commands
         elif cmd_type == "pattern_find":
             return self._handle_pattern_find(params)
@@ -2561,6 +2564,33 @@ class QontinuiExecutor:
             return {
                 "success": False,
                 "error": f"Exploration strategy suggestion failed: {e}",
+                "traceback": traceback.format_exc(),
+            }
+
+    def _handle_generate_test_and_agentic_step(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Handle AI test and agentic step generation."""
+        user_prompt = params.get("user_prompt", "")
+        page_context = params.get("page_context")
+        ai_provider = params.get("ai_provider", "claude_cli")
+        ai_settings = params.get("ai_settings", {})
+
+        if not user_prompt:
+            return {"success": False, "error": "user_prompt is required"}
+
+        try:
+            service = self._get_ai_builder_generator_service()
+            return service.generate_test_and_agentic_step(
+                user_prompt=user_prompt,
+                page_context=page_context,
+                ai_provider=ai_provider,
+                ai_settings=ai_settings,
+            )
+        except Exception as e:
+            import traceback
+
+            return {
+                "success": False,
+                "error": f"Test and agentic step generation failed: {e}",
                 "traceback": traceback.format_exc(),
             }
 

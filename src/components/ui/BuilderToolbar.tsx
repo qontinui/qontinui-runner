@@ -168,6 +168,17 @@ export const toolbarActions = {
     title: "Add verification and agentic steps from a state",
   }),
 
+  /** Live browser mode action */
+  liveBrowser: (onClick: () => void, disabled = false): BuilderToolbarAction => ({
+    key: "live-browser",
+    icon: Sparkles,
+    label: "Live",
+    onClick,
+    disabled,
+    className: "text-cyan-400 hover:text-cyan-300 hover:bg-neutral-800",
+    title: "Live Browser Mode - connect to open pages without config",
+  }),
+
   /** New item action */
   new: (onClick: () => void, label = "New"): BuilderToolbarAction => ({
     key: "new",

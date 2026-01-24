@@ -56,6 +56,7 @@ import { McpServerToolPicker } from "./McpServerToolPicker";
 import { AiGenerateWorkflowModal } from "./AiGenerateWorkflowModal";
 import { GenerateFromStatesModal } from "./GenerateFromStatesModal";
 import { AddStateStepsModal } from "./AddStateStepsModal";
+import { LiveBrowserPanel } from "./LiveBrowserPanel";
 import { PromptTemplateEditor } from "./PromptTemplateEditor";
 import { ContextManagement } from "./ContextManagement";
 import { PageTutorialMenu } from "../tutorial";
@@ -487,6 +488,9 @@ function WorkflowBuilderContent({
 
   // Add state steps modal state
   const [addStateStepsModalOpen, setAddStateStepsModalOpen] = useState(false);
+
+  // Live browser panel state
+  const [liveBrowserPanelOpen, setLiveBrowserPanelOpen] = useState(false);
 
   // Ref for focusing the name input when creating new workflow
   const nameInputRef = useRef<HTMLInputElement | null>(null);
@@ -1287,6 +1291,7 @@ function WorkflowBuilderContent({
             className="mb-3"
             actions={[
               toolbarActions.ai(() => setAiGenerateModalOpen(true)),
+              toolbarActions.liveBrowser(() => setLiveBrowserPanelOpen(true)),
               toolbarActions.stateMachine(() => setGenerateFromStatesModalOpen(true)),
               toolbarActions.addFromState(() => setAddStateStepsModalOpen(true)),
               toolbarActions.new(handleNewWorkflow, "New"),
@@ -1721,6 +1726,21 @@ function WorkflowBuilderContent({
               onStepsAdded={(result) => {
                 console.log(
                   "[WorkflowBuilder] Added steps from state:",
+                  result.verificationSteps.length,
+                  "verification,",
+                  result.agenticStep ? "1 agentic" : "0 agentic"
+                );
+              }}
+            />
+
+            {/* Live Browser Panel */}
+            <LiveBrowserPanel
+              isOpen={liveBrowserPanelOpen}
+              onClose={() => setLiveBrowserPanelOpen(false)}
+              addStep={addStep}
+              onStepsAdded={(result) => {
+                console.log(
+                  "[WorkflowBuilder] Added steps from live browser:",
                   result.verificationSteps.length,
                   "verification,",
                   result.agenticStep ? "1 agentic" : "0 agentic"

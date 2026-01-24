@@ -439,6 +439,129 @@ pub async fn suggest_exploration_strategy_with_ai(
 }
 
 // ============================================================================
+// Test and Agentic Step Generation
+// ============================================================================
+
+/// Page context from UI Bridge for test generation
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PageContext {
+    pub url: Option<String>,
+    pub title: Option<String>,
+    pub elements: Option<Vec<ElementInfo>>,
+}
+
+/// Element information from UI Bridge
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ElementInfo {
+    pub id: String,
+    #[serde(rename = "tagName")]
+    pub tag_name: String,
+    #[serde(rename = "type")]
+    pub element_type: String,
+    pub text: Option<String>,
+    pub label: Option<String>,
+    pub visible: bool,
+    pub enabled: bool,
+}
+
+/// Input for generating test and agentic step with AI
+#[derive(Debug, Deserialize)]
+pub struct GenerateTestAndAgenticInput {
+    pub user_prompt: String,
+    pub page_context: Option<PageContext>,
+}
+
+/// Generate a verification test and agentic step using AI.
+///
+/// Creates both a Python verification test and an agentic prompt
+/// based on user instructions and optional page context.
+#[tauri::command]
+pub async fn generate_test_and_agentic_step(
+    input: GenerateTestAndAgenticInput,
+    state: State<'_, Arc<AppState>>,
+) -> Result<CommandResponse, String> {
+    use crate::settings;
+
+    info!(
+        "Generating test and agentic step with AI: {}",
+        input.user_prompt.chars().take(50).collect::<String>()
+    );
+
+    let ai_settings = settings::get_ai_settings();
+    let ai_provider = match ai_settings.provider {
+        settings::AiProvider::ClaudeCli => "claude_cli",
+        settings::AiProvider::ClaudeApi => "claude_api",
+        settings::AiProvider::GeminiCli => "gemini_cli",
+        settings::AiProvider::GeminiApi => "gemini_api",
+    };
+
+    let provider_settings = build_provider_settings(&ai_settings);
+    let app_state = state.inner().clone();
+    let user_prompt = input.user_prompt;
+    let page_context = input.page_context;
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut guard = match app_state.python_bridge.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                tracing::warn!("Python bridge mutex was poisoned, recovering...");
+                poisoned.into_inner()
+            }
+        };
+
+        if let Some(ref mut bridge) = *guard {
+            let params = serde_json::json!({
+                "user_prompt": user_prompt,
+                "page_context": page_context,
+                "ai_provider": ai_provider,
+                "ai_settings": provider_settings,
+            });
+
+            match bridge.send_command_and_wait(
+                "generate_test_and_agentic_step",
+                Some(params),
+                std::time::Duration::from_secs(180), // Longer timeout for complex generation
+            ) {
+                Ok(response) => {
+                    if response.success {
+                        Ok(CommandResponse {
+                            success: true,
+                            message: Some("Test and agentic step generated successfully".to_string()),
+                            data: response.data,
+                        })
+                    } else {
+                        Ok(CommandResponse {
+                            success: false,
+                            message: Some(
+                                response
+                                    .error
+                                    .unwrap_or_else(|| "Generation failed".to_string()),
+                            ),
+                            data: None,
+                        })
+                    }
+                }
+                Err(e) => Ok(CommandResponse {
+                    success: false,
+                    message: Some(format!("Command failed: {}", e)),
+                    data: None,
+                }),
+            }
+        } else {
+            Ok(CommandResponse {
+                success: false,
+                message: Some("Python executor not initialized".to_string()),
+                data: None,
+            })
+        }
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking error: {}", e))?;
+
+    result
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 

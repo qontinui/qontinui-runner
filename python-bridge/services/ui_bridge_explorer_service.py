@@ -241,9 +241,15 @@ class UIBridgeExplorerService:
                 on_progress=on_progress,
             )
 
-            # Run exploration
+            # Connect to target
             job.progress_message = "Connecting..."
-            result = await explorer.explore()
+            await explorer.connect()
+
+            # Run exploration
+            try:
+                result = await explorer.explore()
+            finally:
+                await explorer.disconnect()
 
             # Store result
             job.result = result

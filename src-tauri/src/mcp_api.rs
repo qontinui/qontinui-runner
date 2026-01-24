@@ -104,6 +104,7 @@ use crate::summary_generator;
 use crate::task_monitor::TaskMonitor;
 use crate::task_recorder::{TaskConfig, TaskRecorder};
 use crate::tiered_info::{self, RunDetails};
+use crate::step_event_builder::categorize_steps;
 use crate::workflow_generation;
 // WorkflowManager import removed - using unified SessionManager instead
 use axum::routing::{delete, put};
@@ -19194,12 +19195,10 @@ async fn run_unified_workflow(
         )));
     }
 
-    // Check if any steps are prompt steps (require AI execution)
-    let has_prompt_steps = all_steps.iter().any(|s| s.step_type == "prompt");
-
-    // Separate automation steps from prompt steps
-    let (automation_steps, prompt_steps): (Vec<_>, Vec<_>) =
-        all_steps.into_iter().partition(|s| s.step_type != "prompt");
+    // Separate automation steps from AI steps using the robust categorize_steps helper.
+    // This replaces the fragile string-based partition logic.
+    let (automation_steps, prompt_steps) = categorize_steps(all_steps, |s| &s.step_type);
+    let has_prompt_steps = !prompt_steps.is_empty();
 
     let execution_id = format!(
         "unified-workflow-{}-{}",
@@ -19269,6 +19268,18 @@ async fn run_unified_workflow(
                 .filter(|s| s.phase.as_deref() == Some("verification"))
                 .cloned()
                 .collect();
+
+            // Warn if verification_steps is empty but workflow had verification steps
+            // This can happen if all verification steps were prompt-type (which shouldn't happen)
+            if verification_steps.is_empty() && !workflow.verification_steps.is_empty() {
+                warn!(
+                    "WARNING: workflow.verification_steps has {} items but extracted verification_steps is empty! \
+                     This means all verification steps have step_type='prompt' which is not supported. \
+                     Verification will auto-pass, causing completion to run immediately.",
+                    workflow.verification_steps.len()
+                );
+            }
+
             // Filter prompt_steps by phase - agentic prompts only
             let agentic_steps: Vec<_> = prompt_steps
                 .iter()
@@ -19310,10 +19321,8 @@ async fn run_unified_workflow(
             }
 
             // Separate completion steps into automation and prompt steps
-            let (completion_automation_steps, completion_prompt_steps): (Vec<_>, Vec<_>) =
-                completion_steps
-                    .into_iter()
-                    .partition(|s| s.step_type != "prompt");
+            let (completion_automation_steps, completion_prompt_steps) =
+                categorize_steps(completion_steps, |s| &s.step_type);
 
             // Run the verification-agentic loop using the new modular architecture
             let timeout_seconds = request.timeout_seconds.unwrap_or(1800);

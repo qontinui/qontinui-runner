@@ -11,18 +11,34 @@ import type { WorkflowStage } from "../../../../types/dashboard/activity-types";
 
 /**
  * Step type categories for grouping and icons.
+ * Aligned with backend StepType enum in src-tauri/src/step_types.rs
  */
 export type StepType =
-  | "shell"
-  | "check_group"
-  | "check"
-  | "prompt"
-  | "api_request"
-  | "script"
-  | "workflow_ref"
-  | "mcp_call"
-  | "gui_action"
+  // GUI Automation
+  | "workflow"
+  | "state"
+  | "action"
+  | "screenshot"
+  | "gui_action" // Alias for backward compatibility
+  | "workflow_ref" // Alias for backward compatibility
+  // Verification
   | "playwright"
+  | "test"
+  | "check"
+  | "check_group"
+  // Command
+  | "shell"
+  | "api_request"
+  | "mcp_call"
+  // AI
+  | "prompt"
+  | "ai_session"
+  // AWAS (Web Automation)
+  | "awas"
+  // Utility
+  | "macro"
+  | "script" // Alias for backward compatibility
+  // Unknown fallback
   | "unknown";
 
 /**

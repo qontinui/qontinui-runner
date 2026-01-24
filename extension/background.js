@@ -18,6 +18,9 @@ let wsReconnectTimeout = null;
 let wsConnected = false;
 let wsPendingRequests = new Map(); // requestId -> { resolve, reject, timeout }
 
+// Selected tab for exploration (null = use active tab)
+let selectedExplorationTabId = null;
+
 /**
  * Connect to the runner's WebSocket endpoint
  * Only call this after verifying the runner is available via health check
@@ -137,33 +140,135 @@ async function handleWebSocketMessage(message) {
 }
 
 /**
- * Execute an exploration command by forwarding to the active tab's content script
+ * Get the target tab for exploration commands.
+ * Uses selectedExplorationTabId if set, otherwise falls back to active tab.
  */
-async function executeExplorationCommand(action, params) {
-  // Get the active tab
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.id) {
-    throw new Error("No active tab found");
+async function getTargetTab() {
+  // If a specific tab is selected, use it
+  if (selectedExplorationTabId !== null) {
+    try {
+      const tab = await chrome.tabs.get(selectedExplorationTabId);
+      if (tab) {
+        return tab;
+      }
+    } catch (e) {
+      // Tab no longer exists, clear selection
+      console.log("[Qontinui] Selected tab no longer exists, clearing selection");
+      selectedExplorationTabId = null;
+    }
   }
 
-  // Handle different actions
+  // Fall back to active tab
+  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  return tab;
+}
+
+/**
+ * Execute an exploration command by forwarding to the target tab's content script
+ */
+async function executeExplorationCommand(action, params) {
+  // Handle tab management actions first (don't need a target tab)
+  switch (action) {
+    case "listTabs":
+      // List all tabs that could be explored
+      const allTabs = await chrome.tabs.query({});
+      return {
+        tabs: allTabs
+          .filter(t => t.url && !t.url.startsWith("chrome://") && !t.url.startsWith("chrome-extension://"))
+          .map(t => ({
+            id: t.id,
+            url: t.url,
+            title: t.title,
+            active: t.active,
+            windowId: t.windowId,
+            favIconUrl: t.favIconUrl,
+          })),
+        selectedTabId: selectedExplorationTabId,
+      };
+
+    case "selectTab":
+      // Select a specific tab for exploration
+      if (params.tabId !== undefined && params.tabId !== null) {
+        try {
+          const tab = await chrome.tabs.get(params.tabId);
+          if (tab) {
+            selectedExplorationTabId = params.tabId;
+            console.log("[Qontinui] Selected tab for exploration:", tab.url);
+            return { success: true, tabId: params.tabId, url: tab.url, title: tab.title };
+          }
+        } catch (e) {
+          throw new Error(`Tab ${params.tabId} not found`);
+        }
+      }
+      throw new Error("tabId is required");
+
+    case "clearSelectedTab":
+      // Clear tab selection (will use active tab)
+      selectedExplorationTabId = null;
+      console.log("[Qontinui] Cleared tab selection, will use active tab");
+      return { success: true, selectedTabId: null };
+
+    case "getSelectedTab":
+      // Get currently selected tab info
+      if (selectedExplorationTabId !== null) {
+        try {
+          const tab = await chrome.tabs.get(selectedExplorationTabId);
+          return { selectedTabId: selectedExplorationTabId, url: tab.url, title: tab.title };
+        } catch (e) {
+          selectedExplorationTabId = null;
+          return { selectedTabId: null };
+        }
+      }
+      return { selectedTabId: null };
+  }
+
+  // For other actions, get the target tab
+  const tab = await getTargetTab();
+  if (!tab || !tab.id) {
+    throw new Error("No target tab available. Select a tab or ensure a browser tab is active.");
+  }
+
+  // Handle exploration actions
   switch (action) {
     case "ping":
-      return { available: true, tabId: tab.id, url: tab.url, title: tab.title };
+      return { available: true, tabId: tab.id, url: tab.url, title: tab.title, isSelectedTab: tab.id === selectedExplorationTabId };
 
     case "connect":
       // Connect to the tab (verify UI Bridge is available)
-      return new Promise((resolve, reject) => {
+      // First, try to inject content scripts if they're not already there
+      return new Promise(async (resolve, reject) => {
+        // Try to inject content scripts first
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["content-scripts/ui-bridge-inspector.js"],
+            world: "MAIN"
+          });
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["content-scripts/ui-bridge-bridge.js"],
+            world: "ISOLATED"
+          });
+          console.log("[Qontinui] Injected content scripts into tab", tab.id);
+        } catch (e) {
+          // Scripts might already be there, or page doesn't allow injection
+          console.log("[Qontinui] Could not inject scripts (may already exist):", e.message);
+        }
+
+        // Small delay to let scripts initialize
+        await new Promise(r => setTimeout(r, 100));
+
+        // Now try to communicate
         chrome.tabs.sendMessage(
           tab.id,
           { type: "UI_BRIDGE_COMMAND", action: "ping", params: {} },
           (response) => {
             if (chrome.runtime.lastError) {
-              reject(new Error(chrome.runtime.lastError.message || "Failed to communicate with content script"));
+              reject(new Error(chrome.runtime.lastError.message || "Failed to communicate with content script. Try refreshing the page."));
               return;
             }
             if (response && response.success) {
-              resolve({ tabId: tab.id, url: tab.url, title: tab.title });
+              resolve({ tabId: tab.id, url: tab.url, title: tab.title, isSelectedTab: tab.id === selectedExplorationTabId });
             } else {
               reject(new Error(response?.error || "UI Bridge not available on this page"));
             }
@@ -173,7 +278,24 @@ async function executeExplorationCommand(action, params) {
 
     case "getElements":
       // Get all elements with data-ui-id from the page
-      return new Promise((resolve, reject) => {
+      return new Promise(async (resolve, reject) => {
+        // Try to inject scripts if not already there
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["content-scripts/ui-bridge-inspector.js"],
+            world: "MAIN"
+          });
+          await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            files: ["content-scripts/ui-bridge-bridge.js"],
+            world: "ISOLATED"
+          });
+        } catch (e) {
+          // Ignore - scripts may already exist
+        }
+        await new Promise(r => setTimeout(r, 50));
+
         chrome.tabs.sendMessage(
           tab.id,
           { type: "UI_BRIDGE_COMMAND", action: "getElements", params: params || {} },

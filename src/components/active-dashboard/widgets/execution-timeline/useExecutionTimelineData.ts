@@ -88,24 +88,52 @@ interface RecapDataResponse {
 
 /**
  * Map API step_type to our StepType.
+ * Aligned with backend StepType enum in src-tauri/src/step_types.rs
  */
 function mapStepType(apiType: string): StepType {
   const typeMap: Record<string, StepType> = {
-    shell: "shell",
-    shell_command: "shell",
-    check_group: "check_group",
-    check: "check",
-    prompt: "prompt",
-    api_request: "api_request",
-    api: "api_request",
-    script: "script",
-    workflow_ref: "workflow_ref",
-    workflow: "workflow_ref",
-    mcp_call: "mcp_call",
-    mcp: "mcp_call",
+    // GUI Automation
+    workflow: "workflow",
+    gui_workflow: "workflow",
+    state: "state",
+    action: "action",
+    screenshot: "screenshot",
     gui_action: "gui_action",
     gui_automation: "gui_action",
+    workflow_ref: "workflow_ref",
+
+    // Verification
     playwright: "playwright",
+    test: "test",
+    check: "check",
+    check_group: "check_group",
+
+    // Command
+    shell: "shell",
+    shell_command: "shell",
+    command: "shell",
+    api_request: "api_request",
+    api: "api_request",
+    http: "api_request",
+    mcp_call: "mcp_call",
+    mcp: "mcp_call",
+
+    // AI
+    prompt: "prompt",
+    ai_prompt: "prompt",
+    ai_session: "ai_session",
+    agentic: "ai_session",
+
+    // AWAS (Web Automation)
+    awas_discover: "awas",
+    awas_execute: "awas",
+    awas_check_support: "awas",
+    awas_list_actions: "awas",
+    awas_extract_elements: "awas",
+
+    // Utility
+    macro: "macro",
+    script: "script",
   };
   return typeMap[apiType.toLowerCase()] || "unknown";
 }
